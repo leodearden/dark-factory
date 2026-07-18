@@ -136,3 +136,59 @@ class TestVerifyGreenCheckpointSkipsVerify:
         # (3) NO new workflow_verify row under the current run (suppressed) —
         #     the run-scoped reader on run-now sees none.
         assert store_now.fetch_events_by_type(EventType.workflow_verify) == []
+
+
+class TestVerifyCheckpointTipFetchFailSafe:
+    @pytest.mark.asyncio
+    async def test_raising_get_head_commit_falls_through_to_normal_verify(
+        self, tmp_path: Path
+    ) -> None:
+        # Regression pin (reviewer robustness finding, task 2752 amendment): a
+        # RAISING _get_head_commit at the checkpoint site (e.g. git not on PATH
+        # → FileNotFoundError, or a None worktree) must NOT crash
+        # _execute_verify_review_loop.  It must fall through to the normal
+        # verify path (the tip cannot be read → checkpoint miss →
+        # _verify_debugfix_loop runs), exactly as the checkpoint comment
+        # promises — never propagate out of the loop.
+        db_path = tmp_path / 'runs.db'
+
+        # A durable prior-run green DOES exist at GREEN_TIP, but it must be
+        # ignored: the checkpoint can never read the current tip to compare.
+        prior = EventStore(db_path, run_id='run-prior')
+        prior.emit(
+            EventType.workflow_verify,
+            task_id=TASK_ID,
+            data={'passed': True, 'tip_sha': GREEN_TIP, 'base_sha': 'deadbeef'},
+        )
+
+        store_now = EventStore(db_path, run_id='run-now')
+        wf = _make_e2e_workflow(tmp_path, store_now)
+
+        # 1st call (checkpoint site) RAISES; 2nd call (post-verify capture)
+        # returns the tip so the passing-verify fall-through proceeds normally.
+        wf._get_head_commit = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[FileNotFoundError('git'), GREEN_TIP]
+        )
+        wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+        wf._review = AsyncMock(return_value=ReviewAggregation(  # type: ignore[method-assign]
+            has_blocking_issues=False,
+            blocking_issues=[],
+            suggestions=[],
+            reviews={'analyst': {}},
+        ))
+        wf._suggestions_in_scope = lambda s: []  # type: ignore[method-assign]
+        wf._write_suggestions_to_memory = AsyncMock()  # type: ignore[method-assign]
+
+        # Must NOT raise despite the checkpoint tip fetch failing.
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+
+        # verify RAN (the checkpoint missed because the tip could not be read).
+        wf._verify_debugfix_loop.assert_awaited_once()
+
+        # NO phase_skipped(verify) — nothing was skipped this cycle.
+        skipped = store_now.fetch_events_by_type_all_runs(
+            EventType.phase_skipped, task_id=TASK_ID
+        )
+        assert not any(row['phase'] == 'verify' for row in skipped), skipped

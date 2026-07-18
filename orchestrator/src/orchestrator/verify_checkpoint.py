@@ -24,9 +24,13 @@ a false green; a tip change simply misses the checkpoint and a normal verify
 runs. base_sha is carried in the payload for telemetry only, never matched here.
 
 Strict fail-closed, mirroring ``merge_completion.merge_completion_eligible``:
-a None ``event_store`` / ``task_id`` / ``tip_sha``, no matching row, or ANY
-read error returns False and NEVER raises — the safe direction is always "run
-the verify", never "skip it on thin evidence". ``event_store`` is duck-typed
+a None-or-empty ``event_store`` / ``task_id`` / ``tip_sha``, no matching row,
+or ANY read error returns False and NEVER raises — the safe direction is always
+"run the verify", never "skip it on thin evidence". An EMPTY ``tip_sha`` is
+treated as absent (not a valid key): ``_get_head_commit`` returns ``''`` when
+``git rev-parse`` fails without raising, and matching ``'' == ''`` against a
+green whose tip was likewise recorded empty would manufacture a false skip — so
+an empty tip fails closed exactly like None. ``event_store`` is duck-typed
 (only ``fetch_events_by_type_all_runs`` is used), and this module imports
 nothing beyond ``EventType`` + stdlib logging/typing, keeping it
 dependency-light like ``orchestrator.merge_completion`` / ``orchestrator.b3_gate``.
@@ -56,15 +60,17 @@ def green_checkpoint_at_tip(
     so a green recorded in a PRIOR run (pre-restart) still counts — this is the
     cross-restart durability the checkpoint relies on.
 
-    Strict fail-closed: returns False when *event_store*, *task_id*, or
-    *tip_sha* is None, and on any read error (never raises) — see the module
-    docstring for the tip-only-key rationale and the fail-closed contract.
+    Strict fail-closed: returns False when *event_store* or *task_id* is None,
+    when *tip_sha* is None OR empty (an empty tip is a failed/absent
+    ``git rev-parse``, never a valid match key), and on any read error (never
+    raises) — see the module docstring for the tip-only-key rationale and the
+    fail-closed contract.
     *event_store* is duck-typed: only
     ``fetch_events_by_type_all_runs(event_type, *, task_id=...) -> list[dict]``
     is called, matching ``EventStore.fetch_events_by_type_all_runs``'s shape
     (each row a dict with at least 'task_id' and a JSON-parsed 'data').
     """
-    if event_store is None or task_id is None or tip_sha is None:
+    if event_store is None or task_id is None or not tip_sha:
         return False
     try:
         rows = event_store.fetch_events_by_type_all_runs(event_type, task_id=task_id)

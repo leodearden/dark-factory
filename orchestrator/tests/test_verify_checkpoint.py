@@ -139,6 +139,19 @@ class TestGreenCheckpointAtTip:
             store, EventType.workflow_verify, '42', None
         ) is False
 
+    def test_false_when_tip_sha_is_empty_string(self):
+        # A failed `git rev-parse` returns '' (not None) from _get_head_commit;
+        # an empty tip must fail closed EVEN when a stored green also recorded an
+        # empty tip — matching '' == '' would manufacture a false skip.
+        from orchestrator.verify_checkpoint import green_checkpoint_at_tip
+
+        store = _FakeEventStore({
+            EventType.workflow_verify: [_verify_row('42', passed=True, tip_sha='')],
+        })
+        assert green_checkpoint_at_tip(
+            store, EventType.workflow_verify, '42', ''
+        ) is False
+
     def test_false_and_never_raises_when_fetch_raises(self):
         from orchestrator.verify_checkpoint import green_checkpoint_at_tip
 

@@ -4811,15 +4811,33 @@ class TaskWorkflow:
             # a skip is phase_skipped(verify); the VERIFY→REVIEW workflow_verify
             # re-emit is suppressed in _enter_phase (gated on
             # _verify_checkpoint_hit) so we never assert a verify that did not
-            # run this cycle.  Fail-closed: no event store, a checkpoint miss, or
-            # a _get_head_commit error all fall through to the normal verify path
-            # (green_checkpoint_at_tip never raises).  Task 2749's tree-hash
-            # verdict cache then skips REVIEW below, composing into the fast-path
-            # to merge.
+            # run this cycle.  Fail-closed on every axis: no event store, a
+            # checkpoint miss, a RAISING _get_head_commit (caught below →
+            # tip=None → miss), an empty tip, or a green_checkpoint_at_tip read
+            # error all fall through to the normal verify path
+            # (green_checkpoint_at_tip never raises, and the tip fetch is
+            # wrapped in try/except so a spawn failure cannot crash the loop).
+            # Task 2749's tree-hash verdict cache then skips REVIEW below,
+            # composing into the fast-path to merge.
             self._verify_checkpoint_hit = False
             self._enter_phase(WorkflowState.VERIFY)
             if self.event_store is not None:
-                tip = await self._get_head_commit()
+                try:
+                    tip = await self._get_head_commit()
+                except Exception:
+                    # A raising _get_head_commit (git not on PATH →
+                    # FileNotFoundError, a None worktree, a transient spawn
+                    # failure) must NOT crash the loop: degrade to the normal
+                    # verify path (tip=None → green_checkpoint_at_tip miss →
+                    # _verify_debugfix_loop runs).  This is exactly the
+                    # fail-safe the comment above promises for a
+                    # _get_head_commit error.
+                    logger.warning(
+                        'Task %s: VERIFY checkpoint tip fetch failed; running '
+                        'the normal verify (fail-safe) (task 2752)',
+                        self.task_id, exc_info=True,
+                    )
+                    tip = None
                 if green_checkpoint_at_tip(
                     self.event_store, EventType.workflow_verify, self.task_id, tip,
                 ):
@@ -4870,7 +4888,12 @@ class TaskWorkflow:
                 # capture the verified branch tip so the subsequent
                 # _enter_phase(REVIEW) records it in the workflow_verify payload
                 # as the durable checkpoint key for the next run (task 2752).
-                self._verify_green_tip_sha = await self._get_head_commit()
+                # Normalize an empty tip (a failed `git rev-parse` returns '' —
+                # see _get_head_commit) to None so we never record '' as a
+                # green key: a later run that also read '' must MISS the
+                # checkpoint (green_checkpoint_at_tip fails closed on an empty
+                # tip), not match '' == '' and falsely skip verify.
+                self._verify_green_tip_sha = (await self._get_head_commit()) or None
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
