@@ -771,6 +771,97 @@ def _within_fleet_deploy_min_interval() -> bool:
     return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
 
 
+def _read_last_fm_deploy_epoch() -> float | None:
+    """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
+
+    fm sibling of _read_last_fleet_deploy_epoch: reads the same ``{ts, iso}``
+    JSON schema _stamp_fm_deploy_clock writes (which itself mirrors
+    restart-all-orchestrators.sh's stamp_fleet_deploy_clock), so ``float(ts)``
+    reads it identically.
+
+    Fail-open: returns None (never raises) when the file is missing (no fm
+    deploy has ever verified fresh, or a fresh checkout with no data/ yet), or
+    when it is corrupt, unreadable, or missing its ``ts`` key. Callers must
+    treat None as "the min-interval cap does not apply" (fail toward running
+    the backstop, not toward silence).
+    """
+    try:
+        with open(FM_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        return float(raw["ts"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log(
+            f"ignoring unreadable/corrupt fm-deploy clock at "
+            f"{FM_DEPLOY_CLOCK_PATH}: {exc!r}"
+        )
+        return None
+
+
+def _within_fm_deploy_min_interval() -> bool:
+    """Return True iff we are still inside fm's own deploy min-interval window.
+
+    fm sibling of _within_fleet_deploy_min_interval, reading fm's OWN clock
+    (FM_DEPLOY_CLOCK_PATH) and honoring fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS)
+    — independent of the orchestrator fleet clock. FM_RESTART_MIN_INTERVAL_SECS<=0
+    disables the cap outright (the clock is not even read). A missing/unreadable
+    clock (_read_last_fm_deploy_epoch returns None) is treated as "outside the
+    window" — fail toward letting the backstop run, not toward silencing it
+    indefinitely.
+    """
+    if FM_RESTART_MIN_INTERVAL_SECS <= 0:
+        return False
+    last = _read_last_fm_deploy_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < FM_RESTART_MIN_INTERVAL_SECS
+
+
+def _stamp_fm_deploy_clock() -> None:
+    """Atomically stamp FM_DEPLOY_CLOCK_PATH with the current ``{ts, iso}`` time.
+
+    Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock
+    (mkdir -p, mktemp a sibling, write, atomic rename). Needed because
+    restart-fused-memory.sh — unlike restart-all-orchestrators.sh — does NOT
+    stamp its own clock; the watchdog owns fm's clock. Called ONLY from the
+    ``--stamp-fm-deploy-clock`` CLI subcommand, which _delegate_fm_restart
+    chains after restart-fused-memory.sh's verified exit-0 (``&&``), so the fm
+    clock advances only after a genuinely-verified restart (I2: a failed fm
+    restart can never silence the backstop).
+
+    Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
+    (the temp file, if created, is unlinked) rather than raised — a stamp
+    failure must not crash the detached unit. The backstop still self-heals via
+    ActiveEnterTimestamp next tick, so the clock is only a secondary flap-guard.
+    """
+    tmp_path: str | None = None
+    try:
+        clock_dir = os.path.dirname(FM_DEPLOY_CLOCK_PATH)
+        os.makedirs(clock_dir, exist_ok=True)
+        now = time.time()
+        payload = json.dumps(
+            {
+                "ts": int(now),
+                "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+            }
+        )
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".last_redeploy_fused_memory.", dir=clock_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload + "\n")
+        os.replace(tmp_path, FM_DEPLOY_CLOCK_PATH)
+        tmp_path = None  # renamed away — nothing to clean up
+    except Exception as exc:  # noqa: BLE001
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        log(f"_stamp_fm_deploy_clock: failed to stamp {FM_DEPLOY_CLOCK_PATH}: {exc!r}")
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
@@ -1148,6 +1239,13 @@ def _cli(argv: list[str] | None = None) -> int:
     fall through to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
+    if "--stamp-fm-deploy-clock" in argv:
+        # Checked FIRST (before --report): this subcommand does exactly one
+        # thing — stamp fm's deploy clock — and is chained after a verified
+        # restart-fused-memory.sh exit-0 inside the detached _delegate_fm_restart
+        # unit. It runs none of the liveness/staleness/report passes.
+        _stamp_fm_deploy_clock()
+        return 0
     if "--report" in argv:
         rc = report()
         _print_fused_memory_liveness()
