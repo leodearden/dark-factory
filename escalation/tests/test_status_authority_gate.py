@@ -173,7 +173,10 @@ def http_server(
     task still pending at that point is cancelled and drained
     (``_drain_pending_tasks``) inside the serving thread before the loop
     closes, so cleanup runs inside a live task context instead of at
-    uncontrolled GC time.
+    uncontrolled GC time. A teardown that fails to stop the thread within
+    the 5s join bound is asserted rather than swallowed, so a genuine hang
+    surfaces loudly instead of silently leaking a daemon thread past this
+    fixture.
     """
     queue_dir = tmp_path_factory.mktemp('status_authority_gate_http')
     queue = EscalationQueue(queue_dir)
@@ -235,6 +238,11 @@ def http_server(
         stopping = True
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5.0)
+        assert not thread.is_alive(), (
+            'status-authority-gate-http serving thread did not stop within '
+            'the 5s teardown bound -- event loop stop is hung or the server '
+            'task is stuck in a non-cancellable await (task 2741)'
+        )
 
 
 async def _resolve_over_http(

@@ -121,6 +121,9 @@ def http_server(
     deliberate, stop-induced ``RuntimeError`` from a genuine startup
     failure, so ``serve_error`` below still reflects only real errors
     (mirrors ``test_status_authority_gate.py``'s ``http_server`` fixture).
+    A teardown that fails to stop the thread within the 5s join bound is
+    asserted rather than swallowed, so a genuine hang surfaces loudly
+    instead of silently leaking a daemon thread past this fixture.
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
     queue = EscalationQueue(queue_dir)
@@ -177,6 +180,11 @@ def http_server(
         stopping = True
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5.0)
+        assert not thread.is_alive(), (
+            'escalation-capability-guard-http serving thread did not stop '
+            'within the 5s teardown bound -- event loop stop is hung or the '
+            'server task is stuck in a non-cancellable await (task 2741)'
+        )
 
 
 # ---------------------------------------------------------------------------
