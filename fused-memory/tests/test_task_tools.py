@@ -33,6 +33,11 @@ def passthrough_main_checkout(monkeypatch):
 def task_interceptor():
     ti = AsyncMock()
     ti.update_task = AsyncMock(return_value={'success': True})
+    # The other three mutating tools return a dict too, so call_tool can
+    # serialize their result (task 2712 forwarding tests rely on these).
+    ti.set_task_status = AsyncMock(return_value={'success': True})
+    ti.add_dependency = AsyncMock(return_value={'success': True})
+    ti.remove_dependency = AsyncMock(return_value={'success': True})
     return ti
 
 
@@ -2516,3 +2521,53 @@ tasks:
     # The flip PROCEEDED despite the malformed sidecar.
     assert gamma_task['status'] == 'pending'
     assert 'delivered_checks' not in gamma_task['metadata']
+
+
+# ---------------------------------------------------------------------------
+# client_op_id wire-forwarding (task 2712)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name, method, extra_args', [
+    ('update_task', 'update_task', {}),
+    ('set_task_status', 'set_task_status', {'status': 'in-progress'}),
+    ('add_dependency', 'add_dependency', {'depends_on': '5'}),
+    ('remove_dependency', 'remove_dependency', {'depends_on': '5'}),
+])
+async def test_client_op_id_forwarded_to_interceptor(
+    tool_name, method, extra_args, mcp_server_with_tasks, task_interceptor,
+):
+    """A supplied client_op_id is forwarded verbatim to the matching
+    interceptor method (task 2712)."""
+    args = {'id': '1', 'project_root': '/project', 'client_op_id': 'op-xyz', **extra_args}
+    await mcp_server_with_tasks._tool_manager.call_tool(tool_name, args)
+
+    getattr(task_interceptor, method).assert_called_once()
+    kwargs = getattr(task_interceptor, method).call_args.kwargs
+    assert kwargs['client_op_id'] == 'op-xyz', (
+        f'{tool_name} must forward client_op_id; got {kwargs.get("client_op_id")!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name, method, extra_args', [
+    ('update_task', 'update_task', {}),
+    ('set_task_status', 'set_task_status', {'status': 'in-progress'}),
+    ('add_dependency', 'add_dependency', {'depends_on': '5'}),
+    ('remove_dependency', 'remove_dependency', {'depends_on': '5'}),
+])
+async def test_client_op_id_defaults_to_none_when_omitted(
+    tool_name, method, extra_args, mcp_server_with_tasks, task_interceptor,
+):
+    """Omitting client_op_id forwards client_op_id=None — byte-identical to
+    today's behavior."""
+    args = {'id': '1', 'project_root': '/project', **extra_args}
+    await mcp_server_with_tasks._tool_manager.call_tool(tool_name, args)
+
+    getattr(task_interceptor, method).assert_called_once()
+    kwargs = getattr(task_interceptor, method).call_args.kwargs
+    assert kwargs['client_op_id'] is None, (
+        f'{tool_name} must forward client_op_id=None when omitted; '
+        f'got {kwargs.get("client_op_id")!r}'
+    )
