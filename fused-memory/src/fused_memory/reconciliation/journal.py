@@ -137,6 +137,13 @@ CREATE TABLE IF NOT EXISTS halt_state (
     unhalted_at TEXT,
     unhalt_grace_remaining INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS judge_pending (
+    run_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    marked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_judge_pending_project ON judge_pending(project_id);
 """
 
 
@@ -600,6 +607,43 @@ class ReconciliationJournal:
             )
             for row in rows
         ]
+
+    # ── Judge pending markers (durable across restarts) ─────────────────
+
+    async def mark_judge_pending(self, run_id: str, project_id: str) -> None:
+        """Durably record that a judge review is owed for ``run_id``.
+
+        Written (awaited) BEFORE the fire-and-forget judge task is created so a
+        process killed the instant after cycle completion still has a
+        recoverable marker. ``INSERT OR REPLACE`` makes startup re-marking
+        idempotent. The marker is cleared atomically inside ``add_verdict``.
+        """
+        async with self._txn() as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO judge_pending
+                   (run_id, project_id, marked_at) VALUES (?, ?, ?)""",
+                (run_id, project_id, datetime.now(UTC).isoformat()),
+            )
+
+    async def clear_judge_pending(self, run_id: str) -> None:
+        """Remove the pending-judge marker for ``run_id`` (no-op if absent)."""
+        async with self._txn() as db:
+            await db.execute(
+                'DELETE FROM judge_pending WHERE run_id = ?', (run_id,)
+            )
+
+    async def get_pending_judge_runs(self) -> list[tuple[str, str]]:
+        """Return every run still owed a judge review as (run_id, project_id).
+
+        Ordered oldest-marked first. Used by startup recovery to re-fire judge
+        tasks whose verdicts were dropped by a restart.
+        """
+        db = self._require_db()
+        async with db.execute(
+            'SELECT run_id, project_id FROM judge_pending ORDER BY marked_at'
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [(row['run_id'], row['project_id']) for row in rows]
 
     # ── Halt state (persistent across service restarts) ─────────────────
 
