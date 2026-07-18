@@ -337,6 +337,32 @@ class TestStubMcpSessionGetExternalStatuses:
         assert content[0]['type'] == 'text'
 
 
+class TestStubMcpSessionAddDependency:
+    """Tests for _StubMcpSession.call_tool('add_dependency', ...).
+
+    ``add_dependency`` is NOT currently dispatched by scheduler.py (so it is not
+    covered by the B3 dispatch-literal tripwire); the branch is added defensively
+    per task spec so a future dispatch site is already stubbed.  Covered here by
+    a direct unit test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_dependency_returns_envelope_echoing_id(self):
+        """add_dependency returns a well-formed envelope whose text echoes the id."""
+        stub = _StubMcpSession()
+        resp = await stub.call_tool(
+            'add_dependency',
+            {'id': 't1', 'depends_on': 't2', 'project_root': '/p'},
+        )
+        assert resp['jsonrpc'] == '2.0'
+        assert isinstance(resp['id'], int)
+        content = resp['result']['content']
+        assert isinstance(content, list) and len(content) >= 1
+        assert content[0]['type'] == 'text'
+        decoded = json.loads(content[0]['text'])
+        assert decoded['id'] == 't1'
+
+
 class TestStubMcpSessionUnknownTool:
     """Tests for _StubMcpSession.call_tool with an unknown tool name."""
 
