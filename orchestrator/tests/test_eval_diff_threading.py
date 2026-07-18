@@ -11,6 +11,7 @@ Follows the test_snapshots.py convention: drive the async entrypoints with
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ import pytest
 
 from orchestrator.evals.compare import _assess_task
 from orchestrator.evals.judge import run_judge
+from orchestrator.evals.rereview import Candidate, rereview_one
 from orchestrator.evals.runner import EvalResult
 
 
@@ -126,3 +128,41 @@ def test_assess_task_threads_pre_task_commit(
 
     assert len(recorded) == 2
     assert all(base == 'BASESHA' for _, base in recorded)
+
+
+def test_rereview_one_threads_candidate_base_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rereview_one must call get_diff(cand.worktree_path, cand.base_commit).
+
+    The recorder returns '' so rereview_one short-circuits to a ``skip``
+    outcome, avoiding the real reviewer call and all file writes.
+
+    RED before the fix: rereview_one calls ``get_diff(cand.worktree_path)``
+    one-arg; its try/except turns the TypeError into an ``error`` outcome, so
+    ``recorded`` stays empty and ``outcome.status`` is 'error', not 'skip'.
+    """
+    recorded: list[tuple[Path, str]] = []
+
+    async def rec(worktree_path: Path, base_commit: str) -> str:
+        recorded.append((worktree_path, base_commit))
+        return ''
+
+    monkeypatch.setattr('orchestrator.evals.rereview.get_diff', rec)
+
+    cand = Candidate(
+        result_path=Path('/tmp/none.json'),
+        task_id='t',
+        config_name='c',
+        run_id='r',
+        worktree_path=Path('/tmp/wt'),
+        base_commit='BASESHA',
+        current_blocking=0,
+        current_suggestions=0,
+        mtime=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    outcome = asyncio.run(rereview_one(cand))
+
+    assert recorded == [(Path('/tmp/wt'), 'BASESHA')]
+    assert outcome.status == 'skip'
