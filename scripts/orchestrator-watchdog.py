@@ -1322,14 +1322,68 @@ def report() -> int:
     return 1 if any_stale else 0
 
 
-def _print_fused_memory_liveness() -> None:
-    """Print a single labelled fused-memory liveness row for ``--report``.
+def _fused_memory_recon_busy_verdict() -> str:
+    """Classify fused-memory's in-flight reconciliation state for ``--report``.
 
-    Strictly read-only, mirroring report()'s I7/I8 guarantee: computes the
-    verdict via _fused_memory_liveness_verdict() (port probe + /health fetch
-    only — no is_unit_enabled/STARTUP_GRACE_SECS gating, since report()
-    likewise shows every unit's raw verdict unconditionally) and prints it.
-    No systemctl mutation, no clock write, no restart.
+    Reuses scripts/recon_busy_check.py's parse_health()/classify() (task 2703
+    δ) via a lazy import — the SAME busy/idle/unreachable gate
+    restart-fused-memory.sh's default defer-if-busy path consumes — so this
+    ``--report`` column predicts the restart script's recon gate exactly
+    rather than risking a reimplementation drifting from it. Mirrors
+    _classify_unit_heartbeat's lazy-reuse-of-a-sibling-script pattern.
+
+    Fetches FUSED_MEMORY_HEALTH_URL's body and runs it through
+    parse_health()+classify():
+      - 'busy'        — a full reconciliation cycle is in flight
+      - 'idle'        — no cycle running (recon_busy empty/absent)
+      - 'unreachable' — the endpoint answered with a blank/unparseable body
+      - 'unknown'     — the fetch/import itself failed (fail-soft, logged)
+
+    Read-only: no restart, no clock write, no mutating call. Any exception
+    (recon_busy_check missing/unimportable, the /health fetch failing, or
+    anything else) is swallowed and degrades this single column to 'unknown'
+    rather than breaking ``--report``.
+
+    Inserts this module's own directory onto sys.path (guarded — a no-op if
+    already present, e.g. via tests/scripts/conftest.py under test) so
+    ``import recon_busy_check`` resolves regardless of how this script was
+    invoked.
+    """
+    try:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import recon_busy_check  # noqa: PLC0415
+
+        with urllib.request.urlopen(
+            FUSED_MEMORY_HEALTH_URL, timeout=FUSED_MEMORY_HEALTH_TIMEOUT_SECS
+        ) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        return recon_busy_check.classify(recon_busy_check.parse_health(body))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_fused_memory_recon_busy_verdict: swallowed {exc!r}; returning 'unknown'"
+        )
+        return "unknown"
+
+
+def _print_fused_memory_liveness() -> None:
+    """Print a single labelled fused-memory row for ``--report``.
+
+    Strictly read-only, mirroring report()'s I7/I8 guarantee. Three fields,
+    all read-only:
+      - liveness verdict via _fused_memory_liveness_verdict() (port probe +
+        /health fetch only — no is_unit_enabled/STARTUP_GRACE_SECS gating,
+        since report() likewise shows every unit's raw verdict
+        unconditionally);
+      - DEPLOY-AGE from fused-memory's OWN deploy clock
+        (_read_last_fm_deploy_epoch), rendered hours-to-one-decimal exactly
+        like report()'s DEPLOY-AGE column, or 'unknown' when the fm clock has
+        never been stamped / is unreadable (fail-open);
+      - recon-busy via _fused_memory_recon_busy_verdict() (fail-soft
+        'unknown').
+    No systemctl mutation, no clock write, no restart — the DEPLOY-AGE read
+    and the recon-busy /health fetch are both read-only.
 
     Informational only: called from _cli's --report branch AFTER report()'s
     own staleness table, and never affects report()'s staleness-only exit
@@ -1340,14 +1394,25 @@ def _print_fused_memory_liveness() -> None:
     TimeoutExpired, so an unusual subprocess failure (e.g. PermissionError)
     could otherwise propagate out of the verdict chain and crash --report
     after report() has already computed its exit code. An unexpected failure
-    here degrades to a logged 'unknown' row instead.
+    here degrades to a logged 'unknown' liveness verdict instead; DEPLOY-AGE
+    (fail-open None) and recon-busy (fail-soft 'unknown') never raise.
     """
     try:
         verdict = _fused_memory_liveness_verdict()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error printing {FUSED_MEMORY_UNIT} liveness row: {exc}")
         verdict = "unknown"
-    print(f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): {verdict}")
+    deploy_epoch = _read_last_fm_deploy_epoch()
+    deploy_age_str = (
+        f"{(time.time() - deploy_epoch) / 3600:.1f}h"
+        if deploy_epoch is not None
+        else "unknown"
+    )
+    recon_busy = _fused_memory_recon_busy_verdict()
+    print(
+        f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): "
+        f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy}"
+    )
 
 
 def _cli(argv: list[str] | None = None) -> int:
