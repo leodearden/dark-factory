@@ -1,5 +1,5 @@
 """Fleet-staleness δ (task 2027): scenarios 9-10 — coordinator composition
-against the COMMITTED orchestrator/config.yaml, and burst-coalescing under
+against the COMMITTED dark-factory-orchestrator.yaml, and burst-coalescing under
 that same committed config.
 
 Context — what α/β/γ already cover vs. what δ adds
@@ -13,7 +13,7 @@ Context — what α/β/γ already cover vs. what δ adds
   watch_prefixes=``['orchestrator/src/']`` (a single-unit placeholder, not the
   fleet script the PRD ships).
 - ``tests/scripts/test_orchestrator_restart_config_drift.py`` (γ) guards the
-  COMMITTED ``orchestrator/config.yaml`` bytes and their pydantic round-trip,
+  COMMITTED ``dark-factory-orchestrator.yaml`` bytes and their pydantic round-trip,
   but never drives that config through the harness builder or a fire.
 
 δ closes the remaining gap: that ``_build_orchestrator_restart_coordinator``
@@ -175,7 +175,7 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         watched-path diff; once the merge pipeline is drained, the systemd-run
         argv targets the FLEET script (restart-all-orchestrators.sh) — not
         restart-orchestrator.sh — with the resulting on_active_secs. Note:
-        orchestrator/config.yaml does not set orchestrator_restart_on_active_secs,
+        dark-factory-orchestrator.yaml does not set orchestrator_restart_on_active_secs,
         so the asserted value (10) comes from config.py's pydantic default, not
         a value pinned in the committed YAML.
         """
