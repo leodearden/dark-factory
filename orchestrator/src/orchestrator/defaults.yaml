@@ -380,6 +380,12 @@ fairness:
 # Default == idle_secs (72h) fires on idle alone with zero new false positives
 # (all 209 prior firings starved < 6h); raise it above idle_secs to restore a
 # two-tier fast-skip / slow-idle scheme.
+#
+# COUPLING GOTCHA (task 2755): idle_only_secs defaults to 259200 (== the idle_secs
+# default), so raising idle_secs ABOVE 259200 WITHOUT also raising idle_only_secs
+# violates the idle_only_secs >= idle_secs validator and FAILS config load AND
+# hot-reload (both knobs are green-tier reloadable).  This is loud-over-silent by
+# design — bump BOTH knobs together whenever you push idle_secs past 259200.
 starvation_watchdog:
   enabled: true
   skip_threshold: 50
