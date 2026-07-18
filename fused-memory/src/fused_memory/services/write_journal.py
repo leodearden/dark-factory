@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS backend_ops (
 CREATE INDEX IF NOT EXISTS idx_bo_write_op ON backend_ops(write_op_id);
 CREATE INDEX IF NOT EXISTS idx_bo_causation ON backend_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
+
+CREATE TABLE IF NOT EXISTS mem0_intents (
+    id TEXT PRIMARY KEY,
+    write_op_id TEXT,
+    causation_id TEXT,
+    project_id TEXT,
+    agent_id TEXT,
+    session_id TEXT,
+    category TEXT,
+    payload_digest TEXT,
+    content TEXT,
+    metadata TEXT DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
+CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
 """
 
 
@@ -262,6 +281,107 @@ class WriteJournal:
         async with db.execute(
             'SELECT * FROM backend_ops WHERE write_op_id = ? ORDER BY created_at',
             (write_op_id,),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # mem0_intents: write-ahead intent journal for the dual-store add path
+    # (task 2710 / survey finding D3)
+    # ------------------------------------------------------------------
+
+    async def log_mem0_intent(
+        self,
+        *,
+        intent_id: str,
+        write_op_id: str,
+        causation_id: str | None = None,
+        project_id: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        category: str | None = None,
+        content: str,
+        metadata: dict | None = None,
+        payload_digest: str,
+    ) -> None:
+        """Write-ahead a Mem0 write intent.
+
+        Committed synchronously (durable-before-await) BEFORE the risky
+        Mem0 ``add()`` call — mirrors ``DurableWriteQueue.enqueue``'s
+        commit-before-return so a crash mid-Mem0-write leaves a durable
+        ``pending`` trace instead of a silently orphaned Graphiti twin.
+        Stores the FULL content + metadata + scope so recovery can faithfully
+        re-issue (``write_ops`` truncates content to 200 chars).
+
+        Fire-and-forget: logs loudly (ERROR) on failure but never raises — a
+        journaling hiccup must not fail an otherwise-good write.
+        """
+        try:
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO mem0_intents
+                       (id, write_op_id, causation_id, project_id, agent_id,
+                        session_id, category, payload_digest, content, metadata,
+                        status, reason, created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
+                    (
+                        intent_id,
+                        write_op_id,
+                        causation_id,
+                        project_id,
+                        agent_id,
+                        session_id,
+                        category,
+                        payload_digest,
+                        content,
+                        json.dumps(metadata) if metadata else '{}',
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f'Failed to log mem0_intent {intent_id}: {e}')
+
+    async def resolve_mem0_intent(
+        self, intent_id: str, status: str, reason: str | None = None
+    ) -> None:
+        """Stamp a mem0_intent terminal (``completed``|``failed``|``dead``).
+
+        Fire-and-forget — logs loudly on failure but never raises.
+        """
+        try:
+            async with self._txn() as db:
+                await db.execute(
+                    'UPDATE mem0_intents SET status = ?, reason = ?, resolved_at = ? '
+                    'WHERE id = ?',
+                    (status, reason, datetime.now(UTC).isoformat(), intent_id),
+                )
+        except Exception as e:
+            logger.error(
+                f'Failed to resolve mem0_intent {intent_id} -> {status}: {e}'
+            )
+
+    async def get_incomplete_mem0_intents(self) -> list[dict]:
+        """Return mem0_intents still ``pending``.
+
+        A ``pending`` row is one whose process died between the intent write
+        and its terminal stamp — the set the startup reconciler resolves.
+        """
+        db = self._require_db()
+        async with db.execute(
+            "SELECT * FROM mem0_intents WHERE status = 'pending' ORDER BY created_at"
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_mem0_intents(self, status: str | None = None) -> list[dict]:
+        """Return mem0_intents, optionally filtered by status."""
+        db = self._require_db()
+        if status is not None:
+            async with db.execute(
+                'SELECT * FROM mem0_intents WHERE status = ? ORDER BY created_at',
+                (status,),
+            ) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+        async with db.execute(
+            'SELECT * FROM mem0_intents ORDER BY created_at'
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
