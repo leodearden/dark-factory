@@ -83,6 +83,8 @@ class TestModuleLevelAll:
             'build_failure_message',
             'classify_agent_failure',
             'count_transcript_turns',
+            'detect_ended_awaiting_background',
+            'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
             'is_timed_out_with_progress',
