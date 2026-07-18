@@ -48,7 +48,9 @@ def _make_checkpoint() -> ReviewCheckpoint:
     cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
     # event_store is wired post-construction in the harness (task η); a
     # recording store here lets _run_review emit its routing_decision event.
-    cp.event_store = _RecordingEventStore()
+    # _RecordingEventStore is a duck-typed double, not an EventStore subclass
+    # (repo-wide pattern — see test_delivered_check_gate_e2e.py).
+    cp.event_store = _RecordingEventStore()  # type: ignore[assignment]
     return cp
 
 

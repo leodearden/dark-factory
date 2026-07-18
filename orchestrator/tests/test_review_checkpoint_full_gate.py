@@ -36,7 +36,9 @@ def _make_checkpoint(
     mcp = MagicMock()
     mcp.mcp_config_json.return_value = {'mcpServers': {}}
     cp = ReviewCheckpoint(config, mcp=mcp, usage_gate=None)
-    cp.event_store = _RecordingEventStore()
+    # _RecordingEventStore is a duck-typed double, not an EventStore subclass
+    # (repo-wide pattern — see test_delivered_check_gate_e2e.py).
+    cp.event_store = _RecordingEventStore()  # type: ignore[assignment]
     return cp
 
 
