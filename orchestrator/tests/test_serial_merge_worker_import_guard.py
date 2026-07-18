@@ -20,6 +20,60 @@ a real import statement.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).name
+_TESTS_DIR = Path(__file__).parent
+
+_SERIAL_WORKER_MODULE = '_serial_merge_worker'
+
+
+def _serial_worker_importers(source: str) -> list[int]:
+    """Return the line numbers of every REAL import of the
+    ``_serial_merge_worker`` module in *source*: ``import
+    _serial_merge_worker`` (``ast.Import``) or ``from _serial_merge_worker
+    import ...`` (``ast.ImportFrom`` with ``level == 0``), at module or
+    function scope.
+
+    AST-based (not regex), so a comment or docstring that merely mentions
+    the module name -- including this guard's own docstring and other test
+    files' retirement notes -- is never mistaken for a real import
+    statement. Returns ``[]`` on ``SyntaxError`` so a transiently-
+    unparseable sibling file never crashes the ratchet.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    linenos: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == _SERIAL_WORKER_MODULE for alias in node.names):
+                linenos.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == _SERIAL_WORKER_MODULE and node.level == 0:
+                linenos.append(node.lineno)
+    return linenos
+
+
+# ALLOWLIST -- the frozen file-level residual: the test files that currently
+# import the retired _serial_merge_worker fixture. No NEW file may join this
+# set (test_no_new_serial_merge_worker_imports); an entry that stops
+# importing the fixture must be removed (test_allowlist_has_no_stale_entries).
+ALLOWLIST: frozenset[str] = frozenset({
+    'test_merge_worker_retired.py',
+    'test_merge_queue_equivalence.py',
+    'test_train_integration.py',
+    'test_merge_guard_pipeline.py',
+    'test_merge_queue_auto_heal.py',
+    '_workflow_helpers.py',
+    'test_verify_scope_inversion_boundary.py',
+    'test_atomic_train_merge.py',
+    'test_merge_queue.py',
+})
+
 
 # ---------------------------------------------------------------------------
 # _serial_worker_importers(source) -- inline-fixture unit tests.
