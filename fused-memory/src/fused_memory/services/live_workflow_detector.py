@@ -255,8 +255,21 @@ def detect_live_workflow(
     # unknown count (missing branch, rev-list error) is NOT bare (fail-safe
     # toward live). A bare branch's recent-looking tip timestamp is not
     # evidence of task work, so it is stripped from recent_commit here.
-    own_commit_count = _branch_own_commit_count(root, base_branch, branch)
-    branch_bare = own_commit_count == 0
+    #
+    # Skip the rev-list subprocess call when its result cannot change any
+    # output field: if a LIVE worktree is already registered, worktree_registered
+    # is already True, so rule 4 below (which requires `not worktree_registered`)
+    # can never fire regardless of branch_bare; and if recent_commit is already
+    # False, `recent_commit and not branch_bare` stays False regardless of
+    # branch_bare. When BOTH hold, branch_bare cannot affect anything it feeds
+    # into, so computing it is skipped — saving a git subprocess call on this
+    # common already-live path, which matters when this detector is fanned out
+    # across many tasks in a recon sweep.
+    if worktree_registered and not recent_commit:
+        branch_bare = False
+    else:
+        own_commit_count = _branch_own_commit_count(root, base_branch, branch)
+        branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
     # orchestrator_live is the project-level lock signal (True when the
     # orchestrator process holds an active lock for this project_root, regardless
@@ -401,6 +414,14 @@ def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bo
 
     Any subprocess error or unexpected output silently returns ``(False, False)``
     (fail-safe).
+
+    Note: git only started emitting the ``prunable`` porcelain annotation in
+    git 2.36 (2022). On an older git binary, a reaped worktree's directory can
+    be gone yet no ``prunable`` line is ever produced, so ``prunable`` silently
+    stays False and a reaped worktree keeps counting as registered — the same
+    silent-degradation shape reify#5245 hardened against, just one layer down
+    in the toolchain. If a stale/reaped-worktree false positive resists this
+    fix, check ``git --version`` on the host running this detector first.
     """
     try:
         result = subprocess.run(
