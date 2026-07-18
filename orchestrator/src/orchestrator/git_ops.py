@@ -1125,6 +1125,59 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     return result
 
 
+def parse_diff_added_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """Parse a unified diff and return new-side (HEAD) line ranges per file.
+
+    NEW-side counterpart of :func:`parse_diff_line_ranges`.  Given the output
+    of ``git diff <from>..HEAD --unified=0 --no-color``, returns a mapping of
+    new file path (from ``+++ b/<path>``) → list of (start, end) tuples
+    representing the new-side (HEAD-relative) changed line ranges.  Reviewer
+    ``location`` line numbers are new-side, so these ranges — not the old-side
+    ranges the sibling parser produces — are what a suggestion's line number
+    is matched against when scoping a post-amendment review to the amendment
+    delta.
+
+    A hunk header ``@@ -x,y +a,b @@`` describes new-side lines
+    ``[a, a + max(b, 1) - 1]`` (``,b`` defaults to 1 when absent).  Hunks whose
+    new-side count is ``0`` (pure deletions, e.g. ``@@ -5,3 +4,0 @@``)
+    contribute NO new-side range.  A fully deleted file (``+++ /dev/null``) has
+    no new-side path and produces no entry.  Pure renames (no ``+++ b/`` line,
+    no content change) likewise produce no new-side entry.
+
+    Returns an empty dict for an empty or header-only diff.
+    """
+    import re
+
+    result: dict[str, list[tuple[int, int]]] = {}
+    current_file: str | None = None
+
+    hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
+
+    for line in diff_text.splitlines():
+        if line.startswith('diff --git '):
+            # Start of a new file block — reset per-file state.
+            current_file = None
+        elif line.startswith('+++ b/'):
+            current_file = line[6:]
+            if current_file not in result:
+                result[current_file] = []
+        elif line.startswith('+++ /dev/null'):
+            # File deletion: no new-side path — skip hunk parsing for this block.
+            current_file = None
+        elif current_file is not None:
+            m = hunk_re.match(line)
+            if m:
+                new_start = int(m.group(1))
+                new_count = int(m.group(2)) if m.group(2) is not None else 1
+                # Pure-deletion hunk (new_count == 0): no new-side lines.
+                if new_count == 0:
+                    continue
+                end = new_start + new_count - 1
+                result[current_file].append((new_start, end))
+
+    return result
+
+
 class GitOps:
     """Git worktree and merge operations."""
 
