@@ -1832,6 +1832,8 @@ def _make_force_fire_coordinator(
     wall_now: list[float] | None = None,
     debounce_secs: float = 300.0,
     restart_executor: AsyncMock | None = None,
+    merge_phase_hold=None,
+    merge_phase_grace_secs: float = 0.0,
 ) -> tuple[StaleServiceRestartCoordinator, list[float], list[float], AsyncMock]:
     """Build a coordinator with independently-mutable monotonic (owed-age +
     debounce) and wall (min-interval rate cap) clocks.
@@ -1840,6 +1842,10 @@ def _make_force_fire_coordinator(
     and ``wall_now`` are single-element mutable lists a test advances
     directly, mirroring ``_make_coordinator_with_mutable_clock`` and
     ``_make_rate_capped_coordinator`` above.
+
+    ``merge_phase_hold`` / ``merge_phase_grace_secs`` (task 2753) are passed to
+    the constructor ONLY when set, so existing callers stay byte-identical
+    (they never construct with the new kwargs).
     """
     git_ops = MagicMock()
     git_ops.get_merge_diff_files = AsyncMock(
@@ -1849,6 +1855,12 @@ def _make_force_fire_coordinator(
     executor = restart_executor or AsyncMock()
     current_time: list[float] = [0.0]
     resolved_wall_now = wall_now if wall_now is not None else [0.0]
+
+    extra_kwargs: dict[str, object] = {}
+    if merge_phase_hold is not None:
+        extra_kwargs['merge_phase_hold'] = merge_phase_hold
+    if merge_phase_grace_secs != 0.0:
+        extra_kwargs['merge_phase_grace_secs'] = merge_phase_grace_secs
 
     coord = StaleServiceRestartCoordinator(
         git_ops=git_ops,
@@ -1864,6 +1876,7 @@ def _make_force_fire_coordinator(
         min_interval_secs=min_interval_secs,
         wall_clock=lambda: resolved_wall_now[0],
         force_fire_after_secs=force_fire_after_secs,
+        **extra_kwargs,
     )
     return coord, current_time, resolved_wall_now, executor
 
@@ -2043,3 +2056,141 @@ async def test_force_fire_anchor_restamps_fresh_on_next_burst_after_fire() -> No
     assert executor.await_count == 2
     assert coord.is_pending is False
     assert coord._first_pending_monotonic is None
+
+
+# ---------------------------------------------------------------------------
+# Bounded MERGE-phase hold on the force-fire path (task 2753): the force-fire
+# escape additionally HOLDS while a pre-enqueue MERGE-phase workflow is racing
+# to the durable merge journal — but only up to an ABSOLUTE owed-age ceiling of
+# force_fire_after_secs + merge_phase_grace_secs, so a rolling merge stream can
+# never push the redeploy past that ceiling ("grace must bound, not veto").
+# ---------------------------------------------------------------------------
+
+
+def test_merge_phase_hold_defaults_stored_on_coordinator() -> None:
+    """(a) Constructor defaults: merge_phase_hold=None / merge_phase_grace_secs
+    =0.0 — byte-identical for the fused-memory / dashboard instances (which
+    never pass these kwargs); explicit values are stored verbatim.
+    """
+    coord, _, _, _ = _make_coordinator_with_mutable_clock([])
+    assert coord._merge_phase_hold is None
+    assert coord._merge_phase_grace_secs == 0.0
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
+    hold = lambda: True  # noqa: E731
+    coord2 = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=MagicMock(),
+        watch_prefixes=['orchestrator/src/'],
+        restart_executor=AsyncMock(),
+        clock=lambda: 0.0,
+        force_fire_after_secs=4500.0,
+        merge_phase_hold=hold,
+        merge_phase_grace_secs=600.0,
+    )
+    assert coord2._merge_phase_hold is hold
+    assert coord2._merge_phase_grace_secs == 600.0
+
+
+@pytest.mark.asyncio
+async def test_merge_phase_hold_defers_within_ceiling() -> None:
+    """(b) Force-fire eligible AND merge_phase_hold()=True → maybe_restart
+    DEFERS (pending retained, executor not awaited) while owed-age is inside
+    [force_fire_after_secs, force_fire_after_secs + merge_phase_grace_secs).
+    """
+    hold = MagicMock(return_value=True)
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        merge_phase_hold=hold,
+        merge_phase_grace_secs=600.0,  # ceiling = 5100
+        require_idle=True,
+        debounce_secs=300.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')  # arms at t=0
+
+    # At the plain force-fire bound: owed-age 4500 < 5100 ceiling AND hold
+    # True → held (would have fired without the merge-phase grace).
+    current_time[0] = 4500.0
+    assert await coord.maybe_restart(agents_idle=False) is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+
+    # Just short of the ceiling — still held.
+    current_time[0] = 5099.0
+    assert await coord.maybe_restart(agents_idle=False) is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+
+
+@pytest.mark.asyncio
+async def test_merge_phase_hold_fires_at_absolute_ceiling_despite_hold() -> None:
+    """(c) Hard bound: once owed-age >= force_fire_after_secs +
+    merge_phase_grace_secs, maybe_restart FIRES even though merge_phase_hold()
+    is STILL True — the grace bounds, it does not indefinitely veto.
+    """
+    hold = MagicMock(return_value=True)  # never releases
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        merge_phase_hold=hold,
+        merge_phase_grace_secs=600.0,  # ceiling = 5100
+        require_idle=True,
+        debounce_secs=300.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')  # arms at t=0
+
+    current_time[0] = 5100.0  # owed-age == ceiling
+    assert await coord.maybe_restart(agents_idle=False) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+    assert coord._first_pending_monotonic is None
+
+
+@pytest.mark.asyncio
+async def test_merge_phase_hold_none_fires_at_plain_force_fire_bound() -> None:
+    """(d) Regression: merge_phase_hold=None (the default) leaves force-fire
+    byte-identical — it fires at the plain force_fire_after_secs bound, with
+    NO ceiling extension.
+    """
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        merge_phase_hold=None,  # default — no hold
+        require_idle=True,
+        debounce_secs=300.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 4500.0
+    assert await coord.maybe_restart(agents_idle=False) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_merge_phase_hold_raising_is_fail_open(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """(e) A raising merge_phase_hold is fail-open: force-fire proceeds (fires)
+    rather than the hold vetoing, preserving force-fire's anti-starvation
+    guarantee, and a WARNING is logged.
+    """
+    hold = MagicMock(side_effect=RuntimeError('boom'))
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        merge_phase_hold=hold,
+        merge_phase_grace_secs=600.0,
+        require_idle=True,
+        debounce_secs=300.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Inside [4500, 5100): the hold WOULD defer if it returned True, but it
+    # raises → fail-open → fire.
+    current_time[0] = 4500.0
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        assert await coord.maybe_restart(agents_idle=False) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+    assert any(
+        'merge_phase_hold' in r.message for r in caplog.records
+    ), 'a raising merge_phase_hold must log a WARNING'
