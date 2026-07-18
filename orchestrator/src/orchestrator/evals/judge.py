@@ -71,9 +71,18 @@ async def run_judge(
 
     result_a/b are EvalResult dicts with 'worktree_path' and 'config_name'.
     """
-    # Get diffs (use pre-computed diff if available, e.g. for reference impl)
-    diff_a = result_a.get('diff') or await get_diff(Path(result_a['worktree_path']))
-    diff_b = result_b.get('diff') or await get_diff(Path(result_b['worktree_path']))
+    # Get diffs (use pre-computed diff if available, e.g. for reference impl).
+    # Thread the authoritative base commit so get_diff yields the full
+    # committed diff on the eval branch. run_judge's callers always load the
+    # task JSON, so pre_task_commit is present (hard key); the reference
+    # contender still short-circuits get_diff via result.get('diff').
+    base = task['pre_task_commit']
+    diff_a = result_a.get('diff') or await get_diff(
+        Path(result_a['worktree_path']), base,
+    )
+    diff_b = result_b.get('diff') or await get_diff(
+        Path(result_b['worktree_path']), base,
+    )
 
     # Randomize assignment to prevent position bias
     swapped = random.random() > 0.5
