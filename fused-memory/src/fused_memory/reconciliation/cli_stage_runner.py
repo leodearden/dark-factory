@@ -302,6 +302,8 @@ async def run_stage_via_cli(
     output_schema: dict | None = None,
     session_id: str | None = None,
     config_dir: TaskConfigDir | None = None,
+    resume_session_id: str | None = None,
+    resume_delivers_prompt: bool = False,
 ) -> StageResult:
     """Invoke a reconciliation stage via Claude CLI with MCP tools.
 
@@ -314,6 +316,15 @@ async def run_stage_via_cli(
     engages when BOTH are set). They default to None so existing cutover/sandbox
     call sites keep today's behavior. BaseStage.run mints/persists the session
     before calling here (mint-before-spawn); this runner stays generic.
+
+    ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
+    forwarded straight to ``invoke_with_cap_retry`` for the startup
+    adopt-and-resume path: when set, the stage subprocess ``--resume``s an
+    in-flight session and (with ``resume_delivers_prompt=True``) receives the
+    caller's real ``payload`` as its continuation prompt instead of the generic
+    CRASH_RECOVERY placeholder. Both default to None/False so non-resume call
+    sites are byte-identical. BaseStage.run validates the transcript exists and
+    builds the recovery prompt before setting these; this runner stays generic.
     """
     effective_model = model or config.agent_llm_model
     # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
@@ -368,6 +379,8 @@ async def run_stage_via_cli(
             sandbox_wrap=sandbox_wrap,
             session_id=session_id,
             config_dir=config_dir,
+            resume_session_id=resume_session_id,
+            resume_delivers_prompt=resume_delivers_prompt,
         )
     except AllAccountsCappedException:
         logger.warning(
