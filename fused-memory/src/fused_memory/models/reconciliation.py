@@ -142,6 +142,9 @@ class ReconciliationRun(BaseModel):
     status: RunStatus = RunStatus.running
     triggered_by: str | None = None  # parent run_id for remediation runs
     instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
+    session_id: str | None = None  # CLI session id of the in-flight stage subprocess (cleared between stages)
+    stage_cursor: str | None = None  # StageId.value of the in-flight stage (cleared between stages)
+    attempt: int = 0  # monotonic count of stage-subprocess launches for this run
 
     @field_validator('project_id', mode='before')
     @classmethod
