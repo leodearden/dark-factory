@@ -136,6 +136,23 @@ async def test_judge_verdict(journal):
 
 
 @pytest.mark.asyncio
+async def test_judge_pending_marker_roundtrip(journal):
+    """mark_judge_pending / get_pending_judge_runs / clear_judge_pending
+    round-trip: two markers persist as (run_id, project_id) tuples, and a
+    targeted clear removes only the named run."""
+    await journal.mark_judge_pending('run-a', 'proj-1')
+    await journal.mark_judge_pending('run-b', 'proj-2')
+
+    pending = await journal.get_pending_judge_runs()
+    assert set(pending) == {('run-a', 'proj-1'), ('run-b', 'proj-2')}
+
+    await journal.clear_judge_pending('run-a')
+
+    pending = await journal.get_pending_judge_runs()
+    assert set(pending) == {('run-b', 'proj-2')}
+
+
+@pytest.mark.asyncio
 async def test_recent_runs(journal):
     for i in range(3):
         run = ReconciliationRun(
