@@ -13161,68 +13161,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             permit=item_permit,
         )
 
-    async def _verify_and_advance(self, item: RealMergeItem) -> bool:
-        """Thin compat shim: acquire LOCAL lease → _run_inflight_verify → _finalize_inflight.
-
-        Retained so the ~18 tests calling _verify_and_advance(item) directly stay
-        green via the single-item trust-anchor path (β decision 5, γ design decision 5).
-
-        Acquires a local lease (prefer-local policy), wraps the result in an
-        InflightEntry, and awaits _finalize_inflight.  Returns True iff main was
-        advanced (matches the original _verify_and_advance return contract).
-
-        was_speculative=False: the shim path never manages the speculation semaphore
-        (the old _verifier_loop managed it in its finally; the new _dispatch_item/
-        _finalize_inflight manage it via InflightEntry.was_speculative in the loop).
-        Direct-call tests that care about speculation test the full loop.
-        """
-        req = item.request
-        allocator = self._ensure_host_allocator(req.config)
-
-        _item_for_factory = item
-        _req_for_factory = req
-
-        def _local_factory() -> LocalRunner:
-            assert _item_for_factory.merge_wt is not None, \
-                'shim path: merge_wt must be non-None for a real item'
-            return LocalRunner(
-                _item_for_factory.merge_wt,
-                _req_for_factory.config,
-                _req_for_factory.module_configs,
-                None,
-                run_scoped=run_scoped_verification,
-                run_unscoped=_run_unscoped_typechecks,
-                task_id=_req_for_factory.task_id,
-            )
-
-        lease = await allocator.acquire(_local_factory)
-        if lease is None:
-            # Fallback: force-acquire the local slot (shim path; no competing acquirers
-            # in direct-call tests).
-            lease = allocator.acquire_local(_local_factory)
-        if lease is None:
-            # Still None: all slots parked.  Resolve as blocked and return.
-            if not req.result.done():
-                req.result.set_result(MergeOutcome(
-                    'blocked', reason='No verify host available (shim path)',
-                ))
-            return False
-
-        verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-            self._run_inflight_verify(item, lease)
-        )
-
-        entry = InflightEntry(
-            item=item,
-            lease=lease,
-            verify_task=verify_task,
-            merge_wt=item.merge_wt,
-            was_speculative=False,  # shim does not manage the speculation slot
-            started_at=time.time(),
-        )
-
-        return await self._finalize_inflight(entry)
-
 
 # ── MQ-invariants iota (task 1994): resource-audit escalation ───────────────
 #
