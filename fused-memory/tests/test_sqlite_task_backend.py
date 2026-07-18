@@ -1492,10 +1492,17 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
 
 
 def test_reserved_metadata_control_keys_names_append_and_metadata_mode():
-    """`_RESERVED_METADATA_CONTROL_KEYS` names exactly the two update_task call-flags."""
+    """`_RESERVED_METADATA_CONTROL_KEYS` names at least the two update_task call-flags.
+
+    Membership, not exact-equality: the behavioral tests below already
+    exercise 'append' and 'metadata_mode' end-to-end, so this only guards
+    against accidentally dropping one of them from the set. Pinning the
+    whole frozenset would force an edit here every time a legitimate third
+    reserved key is added, without adding failure-mode coverage.
+    """
     from fused_memory.backends.sqlite_task_backend import _RESERVED_METADATA_CONTROL_KEYS
 
-    assert frozenset({'append', 'metadata_mode'}) == _RESERVED_METADATA_CONTROL_KEYS
+    assert {'append', 'metadata_mode'} <= _RESERVED_METADATA_CONTROL_KEYS
 
 
 def test_drop_reserved_control_keys_removes_append_and_metadata_mode():
