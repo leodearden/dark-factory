@@ -566,6 +566,63 @@ def _unit_start_epoch(unit: str) -> int | None:
         return None
 
 
+def _unit_active_enter_epoch(unit: str) -> int | None:
+    """Return *unit*'s realtime ActiveEnterTimestamp epoch (Unix seconds), or None.
+
+    fm sibling of _unit_start_epoch, structurally identical but querying
+    ``ActiveEnterTimestamp`` instead of ``ExecMainStartTimestamp``.
+    fused_memory_staleness_pass() (task 2714) uses this field per the task's
+    explicit choice: ActiveEnterTimestamp marks when a Type=notify service
+    signalled readiness (= "when did this version start serving"), which is
+    the semantically-correct staleness anchor for fused-memory and is exactly
+    the field restart-all-orchestrators.sh's own freshness verify reads.
+
+    Queries ``systemctl --user show --timestamp=unix`` which yields a clean,
+    timezone-independent ``@<epoch>`` value directly comparable to git's
+    ``%ct`` committer epoch. Returns None if the unit has never activated (the
+    ``@0`` sentinel), the value cannot be parsed, or any subprocess/OS error
+    occurs — callers must treat None as "staleness cannot be determined for
+    this unit" (skip, don't guess).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--timestamp=unix",
+                "-p",
+                "ActiveEnterTimestamp",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            val = line.split("=", 1)[1].strip()
+            if val.startswith("@"):
+                val = val[1:]
+            try:
+                epoch = int(val)
+            except ValueError:
+                return None
+            if epoch == 0:
+                return None  # unit has never activated (no readiness signal recorded)
+            return epoch
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_unit_active_enter_epoch({unit!r}): swallowed {exc!r}; "
+            "returning None (staleness undeterminable this tick)"
+        )
+        return None
+
+
 def _newest_watched_commit_epoch() -> int | None:
     """Return the newest committer epoch touching WATCHED_PATHS on HEAD, or None.
 
