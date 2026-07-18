@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from _orch_helpers import assert_update_wire_mode
+from _recording_event_store import _RecordingEventStore
 from shared.cli_invoke import AllAccountsCappedException
 
 import orchestrator.harness as harness_module
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import Scheduler
@@ -182,6 +184,68 @@ async def test_tag_task_modules_uses_correct_config(harness, config):
         assert call_kwargs['model'] == config.models.module_tagger
         assert call_kwargs['max_turns'] == config.max_turns.module_tagger
         assert call_kwargs['max_budget_usd'] == config.budgets.module_tagger
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_adopts_resolve_route(harness, config):
+    """_tag_task_modules resolves its route through resolve_and_record_route
+    (task η) and emits a routing_decision event.
+
+    The batch tag has NO single task in scope (``task_id`` intentionally
+    omitted), so the helper is called with no task_id/scheduler/in_memory_task
+    → event only, no ``metadata.routing`` mirror. ``effort`` is deliberately
+    NOT wired into the invoke (byte-equivalence: the site never passed effort,
+    and ``invoke_agent(effort=None)`` emits no ``model_reasoning_effort`` flag —
+    plan design decision 4). ``decision.effort`` is still carried in the event
+    for observability.
+
+    Uses the real ``OrchestratorConfig`` from the ``config`` fixture, so
+    ``resolve_route``'s membership/dict ops run against real ``routing.*``
+    defaults — no ``stamp_stock_routing_config`` needed (that helper is for the
+    MagicMock-config site fixtures). Stock config (empty rules, no override) →
+    config-layer resolution, byte-equivalent to pre-η.
+
+    RED before step-8: ``_tag_task_modules`` does not call the helper, so no
+    routing_decision event fires (len 0 != 1).
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=SAMPLE_TASKS)
+    harness.scheduler.update_task = AsyncMock()
+    rec = _RecordingEventStore()
+    harness.event_store = rec
+
+    agent_result = AgentResult(
+        success=True, output='{}', structured_output={'tasks': []},
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch(
+        'orchestrator.harness.invoke_with_cap_retry',
+        AsyncMock(return_value=agent_result),
+    ) as mock_iwcr:
+        await harness._tag_task_modules()
+
+    # Byte-equivalence: model/max_turns/max_budget_usd resolve to the stock
+    # config.*.module_tagger values via the resolver's config layer.
+    kwargs = mock_iwcr.call_args.kwargs
+    assert kwargs['model'] == config.models.module_tagger
+    assert kwargs['max_turns'] == config.max_turns.module_tagger
+    assert kwargs['max_budget_usd'] == config.budgets.module_tagger
+    # effort must NOT be wired into the invoke (unchanged — byte-equiv).
+    assert 'effort' not in kwargs
+
+    # Exactly one routing_decision event, role='module_tagger', config layer.
+    entries = [e for (t, e) in rec.events if t == EventType.routing_decision]
+    assert len(entries) == 1
+    data = entries[0]['data']
+    assert data['role'] == 'module_tagger'
+    assert data['model'] == config.models.module_tagger
+    assert data['source_layer'] == 'config'
+    # decision.effort is carried for observability even though it is not
+    # applied to the invoke.
+    assert data['effort'] == config.effort.module_tagger
+    assert data['inputs_digest']
+    # Batch tag → no single task_id on the event.
+    assert entries[0]['task_id'] is None
 
 
 @pytest.mark.asyncio
