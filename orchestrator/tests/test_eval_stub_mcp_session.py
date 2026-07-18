@@ -10,6 +10,7 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.runner import _build_eval_scheduler, _StubMcpSession
 from orchestrator.scheduler import extract_rejection
+from shared.mcp_envelope import parse_tool_result
 
 
 class TestStubMcpSessionSetTaskStatus:
@@ -287,6 +288,53 @@ class TestStubMcpSessionGetStatuses:
         decoded = json.loads(block['text'])
         assert decoded == {'statuses': {'a': 'done'}}
         assert 'b' not in decoded['statuses']
+
+
+class TestStubMcpSessionGetExternalStatuses:
+    """Tests for _StubMcpSession.call_tool('get_external_statuses', ...).
+
+    ``get_external_statuses`` is a REAL dispatched tool (cross-project dep
+    resolution at scheduler.py; it landed AFTER the PRD was written).  The
+    Scheduler parses the response via ``parse_tool_result(result, None, dict)``
+    (whole-inner-dict mode): a FLAT ``{dep: status}`` dict, no 'statuses' wrapper,
+    every requested dep key present.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_keys_each_requested_dep(self):
+        """Each requested dep is echoed with a status string (whole-inner-dict)."""
+        stub = _StubMcpSession()
+        resp = await stub.call_tool(
+            'get_external_statuses', {'deps': ['dark_factory:42']}
+        )
+        # Parsed exactly as the Scheduler parses it (key=None whole-inner-dict).
+        parsed, err = parse_tool_result(resp, None, dict)
+        assert err is None
+        assert isinstance(parsed, dict)
+        assert 'dark_factory:42' in parsed
+        assert isinstance(parsed['dark_factory:42'], str)
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_no_deps_returns_empty_dict(self):
+        """No 'deps' arg → the payload parses to a flat empty dict (not an error)."""
+        stub = _StubMcpSession()
+        resp = await stub.call_tool('get_external_statuses', {})
+        parsed, err = parse_tool_result(resp, None, dict)
+        assert err is None
+        assert parsed == {}
+
+    @pytest.mark.asyncio
+    async def test_get_external_statuses_envelope_shape(self):
+        """get_external_statuses returns a correctly-shaped JSON-RPC envelope."""
+        stub = _StubMcpSession()
+        resp = await stub.call_tool(
+            'get_external_statuses', {'deps': ['p:1']}
+        )
+        assert resp['jsonrpc'] == '2.0'
+        assert isinstance(resp['id'], int)
+        content = resp['result']['content']
+        assert isinstance(content, list) and len(content) >= 1
+        assert content[0]['type'] == 'text'
 
 
 class TestStubMcpSessionUnknownTool:
