@@ -70,7 +70,13 @@ from orchestrator.git_ops import (
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.module_charter import sanitize_files_for_persist
-from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
+from orchestrator.routing import (
+    PlanShape,
+    RoleDefaults,
+    RouteInputs,
+    _config_key,
+    resolve_route,
+)
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
     TaskAssignment,
@@ -4627,6 +4633,61 @@ class TaskWorkflow:
         self.artifacts.clear_false_premise()
         return result
 
+    def _reviewer_config_fingerprint(self) -> str | None:
+        """Stable digest of the review-input identity for the verdict cache.
+
+        Captures what determines the reviewers that WOULD run — the active
+        reviewer roster (``ALL_REVIEWERS``) plus, per reviewer role, its
+        configured model (``config.models`` at the ``_config_key`` collapsed
+        key the resolver itself reads — reviewer* → ``reviewer``), its
+        role-default model, and any per-task ``metadata.model_overrides`` pin
+        (keyed by the FULL role name, matching the resolver's override layer)
+        — so the tree-hash verdict cache (task 2749) can invalidate on a
+        roster or model-config change even when the committed tree is
+        byte-identical.
+
+        Deliberately EXCLUDES volatile per-dispatch inputs (dispatch count,
+        routing tier, plan shape, live model spend / ceilings): those are not
+        a change in review-input *identity*, and folding them in would make
+        the fingerprint churn every dispatch and defeat the cross-dispatch
+        cache this task exists to provide.
+
+        Returns a short sha256 hex digest, or ``None`` on any error — the
+        reader treats a ``None`` fingerprint as "cannot confirm config
+        identity" and forces a full review (fail-safe: a redundant review,
+        never a stale skip).
+        """
+        try:
+            models_cfg = getattr(self.config, 'models', None)
+            metadata = self.task.get('metadata') or {}
+            overrides = metadata.get('model_overrides') or {}
+            if not isinstance(overrides, dict):
+                overrides = {}
+            roster = []
+            for role in ALL_REVIEWERS:
+                # config.models uses the reviewer* → 'reviewer' collapsed key
+                # (the resolver's own _config_key); metadata.model_overrides
+                # uses the FULL role name (the collapsed key is inert there).
+                configured = getattr(models_cfg, _config_key(role.name), None)
+                override = overrides.get(role.name)
+                roster.append(
+                    [
+                        role.name,
+                        None if configured is None else str(configured),
+                        str(role.default_model),
+                        None if override is None else str(override),
+                    ]
+                )
+            payload = json.dumps(sorted(roster), sort_keys=True)
+            return hashlib.sha256(payload.encode()).hexdigest()[:16]
+        except Exception as exc:
+            logger.warning(
+                'Task %s: reviewer-config fingerprint failed (%s) — verdict '
+                'cache will force a full review',
+                self.task_id, exc,
+            )
+            return None
+
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
         # Clear stale merge-failure review from prior runs — prevents
@@ -4641,6 +4702,20 @@ class TaskWorkflow:
         # (task 2749) so max_amendment_rounds / max_review_cycles bound the
         # WHOLE task lifetime, not each dispatch — a re-dispatch (restart
         # churn, requeue, resume) no longer grants a fresh allowance.
+        #
+        # OPERATOR NOTE (task 2749 amendment): because the seed persists, a
+        # task that has EXHAUSTED its allowance and escalated keeps the
+        # exhausted counters across a human-driven re-pend. If an operator
+        # resolves the review escalation and re-pends the task (the standard
+        # manual re-pend recipe), the seeded review_cycle is already at the
+        # cap, so the very next blocking review re-escalates WITHOUT a fresh
+        # replan. resolve_issue / resume do NOT clear these counters. This is
+        # deliberate: the loop cannot distinguish churn (must keep the
+        # counters) from a legitimate re-pend (should reset them) without an
+        # out-of-band signal, so a fresh allowance is an EXPLICIT operator
+        # action — call TaskArtifacts.clear_review_counters() (the reset
+        # hook) on the re-pend to grant one. Auto-wiring that hook into the
+        # scheduler/escalation resume path is out of scope for this module.
         review_cycle = (
             self.artifacts.get_review_cycles_total() if self.artifacts else 0
         )
@@ -4724,23 +4799,46 @@ class TaskWorkflow:
             # when the verdict was first recorded; re-routing on every
             # re-dispatch is exactly the nit-loop churn this eliminates.
             # Blocking verdicts are never cached, so any hit is safe→DONE.
-            # Fail-safe: a None tree hash (git error) or a cache miss falls
-            # through to a normal review.  ``review_tree_hash`` stays in
-            # scope for verdict recording on the DONE path below.
+            #
+            # A cache hit is honoured ONLY when the reviewer-config
+            # fingerprint (active reviewer roster + resolved models) also
+            # matches (task 2749 amendment): the committed tree alone does
+            # not capture review-input identity, so a byte-identical tree
+            # reviewed under a CHANGED roster / re-pinned model (e.g. a new
+            # reviewer, or metadata.model_overrides) must force a fresh
+            # review rather than short-circuit to a stale verdict the new
+            # config never produced.
+            #
+            # Fail-safe: a None tree hash (git error), a None fingerprint
+            # (config unreadable), or a cache miss / stale fingerprint all
+            # fall through to a normal review — the strictest safe direction
+            # (a redundant review, never a masked blocking issue).
+            # ``review_tree_hash`` / ``review_fingerprint`` stay in scope for
+            # verdict recording on the DONE path below.
             review_tree_hash: str | None = None
+            review_fingerprint: str | None = None
             if self.worktree and self.artifacts:
                 try:
                     review_tree_hash = await self.git_ops.get_head_tree_hash(
                         self.worktree
                     )
+                    review_fingerprint = self._reviewer_config_fingerprint()
                     if review_tree_hash:
                         cached = self.artifacts.get_cached_verdict(
                             review_tree_hash
                         )
-                        if cached is not None:
+                        # Positive match required: skip only when a verdict
+                        # exists AND the current config fingerprint is known
+                        # AND it equals the one the verdict was minted under.
+                        if (
+                            cached is not None
+                            and review_fingerprint is not None
+                            and cached.get('reviewer_fingerprint')
+                            == review_fingerprint
+                        ):
                             logger.info(
                                 'Task %s: REVIEW skipped — cached %s verdict '
-                                'for tree %s',
+                                'for tree %s (reviewer config unchanged)',
                                 self.task_id, cached.get('verdict'),
                                 review_tree_hash,
                             )
@@ -4755,6 +4853,7 @@ class TaskWorkflow:
                         self.task_id, exc,
                     )
                     review_tree_hash = None
+                    review_fingerprint = None
             reviews = await self._review()
             if reviews.reviewer_errors:
                 names = ', '.join(reviews.reviewer_errors)
@@ -4818,12 +4917,16 @@ class TaskWorkflow:
                 # content skips the reviewer and its suggestion routing.  Only
                 # PASS / suggestions_only are cached — blocking verdicts are
                 # never recorded (a replan changes the tree anyway), so any
-                # cache hit is unconditionally safe→DONE.
+                # cache hit is unconditionally safe→DONE.  The reviewer-config
+                # fingerprint is stamped alongside so a later dispatch under a
+                # changed roster / model re-pin re-reviews instead of reusing
+                # this verdict (task 2749 amendment).
                 if review_tree_hash and self.artifacts:
                     self.artifacts.record_review_verdict(
                         review_tree_hash,
                         'suggestions_only' if reviews.suggestions else 'PASS',
                         suggestions_routed=bool(reviews.suggestions),
+                        reviewer_fingerprint=review_fingerprint,
                     )
                 return WorkflowOutcome.DONE
 

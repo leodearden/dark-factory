@@ -56,6 +56,12 @@ def _make_workflow(
     config.max_amendment_rounds = max_amendment_rounds
     config.lock_depth = 2
     config.project_root = tmp_path / 'proj'
+    # Real reviewer model string so _reviewer_config_fingerprint() (task 2749
+    # amendment) yields a deterministic, non-None digest instead of choking on
+    # an unserialisable auto-child MagicMock.  The fingerprint reads the
+    # reviewer* → 'reviewer' collapsed config key (the resolver's _config_key).
+    config.models = MagicMock()
+    config.models.reviewer = 'sonnet'
 
     scheduler = MagicMock()
     git_ops = MagicMock()
@@ -107,9 +113,13 @@ class TestVerdictCacheSkip:
     ):
         wf = _make_workflow(tmp_path=tmp_path)
         # Simulate a prior dispatch that already recorded a suggestions_only
-        # verdict (and routed its suggestions) for this committed tree.
+        # verdict (and routed its suggestions) for this committed tree — under
+        # the SAME reviewer config (fingerprint matches), so the skip fires.
         assert wf.artifacts is not None
-        wf.artifacts.record_review_verdict('TREE1', 'suggestions_only', True)
+        wf.artifacts.record_review_verdict(
+            'TREE1', 'suggestions_only', True,
+            reviewer_fingerprint=wf._reviewer_config_fingerprint(),
+        )
 
         outcome = await wf._execute_verify_review_loop()
 
@@ -119,6 +129,94 @@ class TestVerdictCacheSkip:
         cast(AsyncMock, wf._route_review_suggestions_to_curator).assert_not_called()
         cast(AsyncMock, wf._write_suggestions_to_memory).assert_not_called()
         cast(AsyncMock, wf._amend).assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestReviewerConfigFingerprint:
+    """A cached verdict is honoured only when the reviewer-config fingerprint
+    still matches (task 2749 amendment) — a roster/model change forces a
+    fresh review even on a byte-identical committed tree.
+    """
+
+    async def test_stale_fingerprint_forces_review(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        # A verdict recorded under a DIFFERENT reviewer config (e.g. a model
+        # re-pin) — the fingerprint no longer matches the current config.
+        wf.artifacts.record_review_verdict(
+            'TREE1', 'suggestions_only', True,
+            reviewer_fingerprint='STALE_CONFIG_FINGERPRINT',
+        )
+        # Current review: non-blocking, no suggestions → PASS.
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[],
+                reviews={'analyst': {}},
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        # The stale fingerprint must NOT short-circuit — the reviewer runs.
+        cast(AsyncMock, wf._review).assert_awaited_once()
+        # …and the verdict is re-recorded under the CURRENT fingerprint.
+        rec = wf.artifacts.get_cached_verdict('TREE1')
+        assert rec is not None
+        assert rec['reviewer_fingerprint'] == wf._reviewer_config_fingerprint()
+
+    async def test_missing_fingerprint_forces_review(self, tmp_path: Path):
+        # A pre-amendment record (no reviewer_fingerprint field) can never
+        # satisfy the positive-match requirement → full review, not a skip.
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        wf.artifacts.record_review_verdict('TREE1', 'suggestions_only', True)
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[],
+                reviews={'analyst': {}},
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        cast(AsyncMock, wf._review).assert_awaited_once()
+
+    async def test_fingerprint_stable_across_calls(self, tmp_path: Path):
+        # The digest must be deterministic within a fixed config, or the
+        # cross-dispatch cache would never hit.
+        wf = _make_workflow(tmp_path=tmp_path)
+        fp1 = wf._reviewer_config_fingerprint()
+        fp2 = wf._reviewer_config_fingerprint()
+        assert fp1 is not None
+        assert fp1 == fp2
+
+    async def test_model_repin_changes_fingerprint(self, tmp_path: Path):
+        # A per-role model re-pin (config.models change) must change the
+        # digest so a byte-identical tree re-reviews.
+        wf = _make_workflow(tmp_path=tmp_path)
+        fp_before = wf._reviewer_config_fingerprint()
+        wf.config.models.reviewer = 'opus'
+        fp_after = wf._reviewer_config_fingerprint()
+        assert fp_before is not None and fp_after is not None
+        assert fp_before != fp_after
+
+    async def test_metadata_override_changes_fingerprint(self, tmp_path: Path):
+        # A metadata.model_overrides pin on a reviewer role must change the
+        # digest (the reviewer's named scenario).
+        wf = _make_workflow(tmp_path=tmp_path)
+        fp_before = wf._reviewer_config_fingerprint()
+        wf.task['metadata'] = {
+            'model_overrides': {'reviewer_comprehensive': 'opus'}
+        }
+        fp_after = wf._reviewer_config_fingerprint()
+        assert fp_before is not None and fp_after is not None
+        assert fp_before != fp_after
 
 
 _OUT_OF_SCOPE_SUGGESTION = {

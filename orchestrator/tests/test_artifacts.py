@@ -1491,6 +1491,23 @@ class TestReviewVerdictCache:
         }
         assert artifacts.get_cached_verdict('tree_abc') is None
 
+    def test_reviewer_fingerprint_round_trips(self, artifacts: TaskArtifacts):
+        # The optional fingerprint (task 2749 amendment) is stored verbatim.
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', True, reviewer_fingerprint='FP1'
+        )
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['reviewer_fingerprint'] == 'FP1'
+
+    def test_reviewer_fingerprint_defaults_none(self, artifacts: TaskArtifacts):
+        # Omitting the fingerprint stores an explicit None (never absent), so
+        # the reader's positive-match test is well-defined.
+        artifacts.record_review_verdict('tree_abc', 'PASS', False)
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['reviewer_fingerprint'] is None
+
 
 class TestReviewCounters:
     """Tests for the persisted task-lifetime amendment/review counters."""
@@ -1522,3 +1539,27 @@ class TestReviewCounters:
         assert rec is not None and rec['verdict'] == 'suggestions_only'
         assert artifacts.get_amendment_rounds_total() == 3
         assert artifacts.get_review_cycles_total() == 2
+
+    def test_clear_review_counters_resets_both(self, artifacts: TaskArtifacts):
+        # The operator/resume-path reset hook (task 2749 amendment) zeroes
+        # both counters so a human re-pend can make fresh replan progress.
+        artifacts.set_review_counters(
+            amendment_rounds_total=3, review_cycles_total=2
+        )
+        artifacts.clear_review_counters()
+        assert artifacts.get_amendment_rounds_total() == 0
+        assert artifacts.get_review_cycles_total() == 0
+
+    def test_clear_review_counters_preserves_verdicts(
+        self, artifacts: TaskArtifacts
+    ):
+        # Clearing counters must NOT drop the verdict cache — an unchanged
+        # tree under an unchanged config legitimately still skips.
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', True, reviewer_fingerprint='FP1'
+        )
+        artifacts.set_review_counters(review_cycles_total=2)
+        artifacts.clear_review_counters()
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None and rec['verdict'] == 'suggestions_only'
+        assert rec['reviewer_fingerprint'] == 'FP1'
