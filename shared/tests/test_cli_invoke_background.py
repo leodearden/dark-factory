@@ -18,8 +18,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
@@ -29,7 +27,6 @@ from shared.cli_invoke import (
     detect_ended_awaiting_background,
     ended_awaiting_background_for_session,
 )
-
 
 # ── Fixture builders ────────────────────────────────────────────────────────
 # Hand-authored assistant/user record dicts mirroring the on-disk transcript
