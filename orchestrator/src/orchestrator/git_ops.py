@@ -938,6 +938,45 @@ def _git_clean_failure_is_benign(stderr: str) -> bool:
     )
 
 
+def _git_stderr_is_unresolved_ref(stderr: str) -> bool:
+    """Return True iff *stderr* is git's "this ref does not resolve" diagnostic.
+
+    A ``git diff <base>...<ref>`` for a ``<ref>`` that does not exist (e.g. a
+    not-yet-dispatched ``pending`` task whose ``task/<id>`` branch has never
+    been created) fails non-zero with a *fatal* rev-parse diagnostic rather
+    than a genuine git fault:
+
+    * ``fatal: bad revision 'main...task/999'``
+    * ``fatal: ambiguous argument 'main...nope': unknown revision or path not
+      in the working tree.``
+    * ``fatal: Not a valid object name ...`` (older git)
+
+    Callers that legitimately expect some refs to be absent — the merge-skew
+    pipeline-landing tripwire scans every in-flight task, many of which have
+    no branch yet — use this to classify the absent-ref case as an expected
+    quiet skip (DEBUG) while a genuine git failure (corrupt repo, I/O error,
+    permission denied — none of which carry these markers) still surfaces
+    loudly (WARNING), so the absent-ref noise never buries a real diff error.
+
+    Empty stderr → False: with no diagnostic there is no evidence it is a mere
+    absent ref, so it is treated as a genuine failure rather than silently
+    downgraded.  Substring matching is case-insensitive and robust to git's
+    ref/path quoting and version-to-version wording.
+    """
+    haystack = stderr.lower()
+    if not haystack.strip():
+        return False
+    return any(
+        marker in haystack
+        for marker in (
+            'unknown revision',
+            'bad revision',
+            'ambiguous argument',
+            'not a valid object name',
+        )
+    )
+
+
 def _merge_subject(branch: str, main_branch: str) -> str:
     """Return the canonical subject line for a no-ff merge of *branch* into *main_branch*.
 
@@ -6621,6 +6660,60 @@ class GitOps:
             if ln:
                 seen.add(ln)
         return sorted(seen)
+
+    async def get_branch_changed_files(
+        self, ref: str,
+    ) -> tuple[list[str], Exception | None]:
+        """Files *ref* changed relative to ``main_branch``, excluding ``.task/``.
+
+        Three-dot diff (``main_branch...ref``) — the files touched by *ref*
+        since it diverged from ``main_branch``, not a naive two-dot diff
+        against main's current (possibly since-advanced) tip.  Returns a
+        ``(files, error)`` tuple — **total, never raises** — mirroring
+        :meth:`get_merge_diff_files`'s contract and ``.task/`` exclusion:
+
+        * ``(files, None)`` on success.  An empty ``files`` list is a
+          legitimate outcome (a branch with no net changes vs main).
+        * ``([], exception)`` on any error: ``rc != 0`` from ``git diff``
+          (e.g. *ref* does not resolve — returns
+          :class:`subprocess.CalledProcessError`) or an unexpected raise
+          from the subprocess helper.
+
+        Used by the merge-skew pipeline-landing tripwire
+        (:mod:`orchestrator.merge_skew_tripwire`) to compute each in-flight
+        task's own changed-file set for overlap against a landing's
+        changed files.
+        """
+        cmd = [
+            'git', 'diff', '--name-only',
+            f'{self.config.main_branch}...{ref}', '--', ':!.task/',
+        ]
+        try:
+            rc, output, stderr = await _run(cmd, cwd=self.project_root)
+        except Exception as exc:
+            return [], exc
+        if rc != 0:
+            stderr_text = (stderr or '').strip()
+            if _git_stderr_is_unresolved_ref(stderr or ''):
+                # Expected for the merge-skew tripwire's active-task scan: a
+                # not-yet-dispatched (pending) task has no task/<id> branch
+                # yet, so git cannot resolve the ref.  A quiet DEBUG skip, not
+                # a WARNING — a project with many pending tasks would otherwise
+                # burst one WARNING per branchless task on every load-bearing
+                # landing, burying genuine diff failures (which still WARN
+                # below).  Return contract is unchanged: still ([], error).
+                logger.debug(
+                    'get_branch_changed_files: ref %s does not resolve vs %s '
+                    '(rc=%s): %s',
+                    ref, self.config.main_branch, rc, stderr_text[:200],
+                )
+            else:
+                logger.warning(
+                    'get_branch_changed_files: git diff %s...%s failed (rc=%s): %s',
+                    self.config.main_branch, ref, rc, stderr_text[:200],
+                )
+            return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
+        return [f for f in output.strip().splitlines() if f.strip()], None
 
     async def merge_to_main(
         self,

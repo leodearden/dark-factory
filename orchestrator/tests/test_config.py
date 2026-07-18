@@ -177,6 +177,65 @@ class TestDefaults:
         cfg = GitConfig(warm_lane_release_thin=True)
         assert cfg.warm_lane_release_thin is True
 
+    def test_load_bearing_oracle_cmd_defaults_none(self):
+        """GitConfig.load_bearing_oracle_cmd defaults to None — the merge-skew
+        pipeline-landing tripwire (task 2382) is a clean opt-in no-op until a
+        project sets a command (config knob absent -> logged no-op, I6)."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig()
+        assert cfg.load_bearing_oracle_cmd is None
+
+    def test_load_bearing_oracle_cmd_round_trips_list(self):
+        """An explicit oracle command list[str] round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        cmd = ['bash', 'scripts/verify-pipeline-guard.sh', 'requires-full-gate']
+        cfg = GitConfig(load_bearing_oracle_cmd=cmd)
+        assert cfg.load_bearing_oracle_cmd == cmd
+
+    def test_load_bearing_oracle_cmd_exposed_on_orchestrator_config_git(
+        self, monkeypatch, tmp_path,
+    ):
+        """OrchestratorConfig exposes the knob at config.git.load_bearing_oracle_cmd."""
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.git.load_bearing_oracle_cmd is None
+
+        cmd = ['bash', 'scripts/verify-pipeline-guard.sh', 'requires-full-gate']
+        config2 = OrchestratorConfig(git=GitConfig(load_bearing_oracle_cmd=cmd))
+        assert config2.git.load_bearing_oracle_cmd == cmd
+
+    def test_load_bearing_oracle_timeout_secs_defaults_60(self):
+        """GitConfig.load_bearing_oracle_timeout_secs defaults to 60.0 —
+        bounds the load-bearing oracle subprocess (task 2382) so a hung
+        operator-supplied script can never block the merge-landed hot path
+        indefinitely (invariant I6)."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig()
+        assert cfg.load_bearing_oracle_timeout_secs == 60.0
+
+    def test_load_bearing_oracle_timeout_secs_round_trips_override(self):
+        """An explicit override round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig(load_bearing_oracle_timeout_secs=15.0)
+        assert cfg.load_bearing_oracle_timeout_secs == 15.0
+
+    def test_load_bearing_oracle_timeout_secs_rejects_non_positive(self):
+        """Must be > 0 — a zero or negative timeout is nonsensical (mirrors
+        DeliveredChecksConfig.check_timeout_secs' gt=0 constraint)."""
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError):
+            GitConfig(load_bearing_oracle_timeout_secs=0)
+        with pytest.raises(ValidationError):
+            GitConfig(load_bearing_oracle_timeout_secs=-5.0)
+
     def test_fused_memory_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)

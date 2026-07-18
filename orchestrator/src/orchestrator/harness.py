@@ -55,6 +55,7 @@ from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
@@ -6864,6 +6865,19 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return
 
+        try:
+            await self._maybe_pipeline_landing_tripwire(
+                task_id, base_sha, head_sha, prefetched_diff,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                '_note_merge_all: pipeline-landing tripwire failed for %s..%s: %s',
+                base_sha[:12],
+                head_sha[:12],
+                exc,
+                exc_info=True,
+            )
+
         for coord in self._service_restart_coordinators:
             try:
                 await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
@@ -6874,6 +6888,74 @@ Output JSON matching the schema. Every task must appear in the output.
                     exc,
                     exc_info=True,
                 )
+
+    async def _maybe_pipeline_landing_tripwire(
+        self, task_id: str, base_sha: str, head_sha: str, prefetched_diff: list[str],
+    ) -> None:
+        """Advisory pipeline-landing tripwire adapter (task 2382, merge-skew δ).
+
+        Thin fail-open wiring over ``orchestrator.merge_skew_tripwire
+        .emit_pipeline_landing_tripwire``: reads the per-project
+        ``config.git.load_bearing_oracle_cmd`` knob (``None`` disables the
+        tripwire — logged no-op), enumerates in-flight tasks (excluding the
+        just-landed *task_id*) as ``(task_id, branch)`` pairs using the
+        project's configured ``config.git.branch_prefix`` (NOT a hardcoded
+        ``task/`` literal — a project that customizes ``branch_prefix`` must
+        still resolve real branch refs here, or every in-flight task is
+        silently skipped), and injects the real
+        ``git_ops.get_branch_changed_files`` / ``scheduler.update_task``
+        callables. The configured ``config.git.load_bearing_oracle_timeout_secs``
+        bounds the oracle subprocess so a hung operator-supplied script
+        cannot block this hot path indefinitely (I6).
+
+        Called from ``_note_merge_all`` inside its own try/except, after the
+        landing diff has already been fetched (``prefetched_diff`` reused,
+        no redundant git call) — this method additionally wraps its own body
+        in a try/except as a backstop so a bug here can never propagate up
+        and skip the service-restart coordinator fan-out (I6: the tripwire
+        must never block/delay/reorder the merge-landed hot path).
+        """
+        try:
+            oracle_cmd = self.config.git.load_bearing_oracle_cmd
+            if not oracle_cmd:
+                logger.debug(
+                    '_maybe_pipeline_landing_tripwire: no load_bearing_oracle_cmd '
+                    'configured, no-op',
+                )
+                return
+
+            tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+            branch_prefix = self.config.git.branch_prefix
+            inflight = [
+                (str(t['id']), f"{branch_prefix}{t['id']}")
+                for t in tasks
+                if str(t.get('id')) != str(task_id)
+            ]
+
+            async def get_branch_diff(branch: str) -> list[str] | None:
+                files, err = await self.git_ops.get_branch_changed_files(branch)
+                if err is not None:
+                    return None
+                return files
+
+            await emit_pipeline_landing_tripwire(
+                project_root=self.config.project_root,
+                oracle_cmd=oracle_cmd,
+                escalation_queue=self._escalation_queue,
+                landing_sha=head_sha,
+                landing_task_id=task_id,
+                landing_changed_files=prefetched_diff,
+                inflight=inflight,
+                get_branch_diff=get_branch_diff,
+                update_task=self.scheduler.update_task,
+                oracle_timeout_secs=self.config.git.load_bearing_oracle_timeout_secs,
+            )
+        except Exception:
+            logger.warning(
+                '_maybe_pipeline_landing_tripwire: unexpected error for landing %s',
+                head_sha,
+                exc_info=True,
+            )
 
     async def _note_offline_lane(
         self, task_id: str, base_sha: str, head_sha: str
