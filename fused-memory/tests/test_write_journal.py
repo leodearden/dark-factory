@@ -1,6 +1,7 @@
 """Tests for the write journal (SQLite persistence)."""
 
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -407,3 +408,146 @@ async def test_get_session_ops_with_limit(journal):
         )
     ops = await journal.get_session_ops('busy-agent', limit=3)
     assert len(ops) == 3
+
+
+# ------------------------------------------------------------------
+# mem0_intents: write-ahead intent journal (task 2710)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_log_mem0_intent_roundtrip_pending(journal):
+    """log_mem0_intent persists a pending row with FULL content + metadata intact."""
+    intent_id = str(uuid.uuid4())
+    write_op_id = str(uuid.uuid4())
+    # > 200 chars to prove content is stored untruncated (write_ops truncates
+    # to 200; a re-issued twin needs the full content).
+    long_content = 'the quick brown fox ' * 30
+    metadata = {'category': 'preferences_and_norms', 'kind': 'test', 'nested': {'a': 1}}
+    await journal.log_mem0_intent(
+        intent_id=intent_id,
+        write_op_id=write_op_id,
+        causation_id='cause-1',
+        project_id='proj',
+        agent_id='agent-a',
+        session_id='sess-1',
+        category='preferences_and_norms',
+        content=long_content,
+        metadata=metadata,
+        payload_digest='digest-abc',
+    )
+    incomplete = await journal.get_incomplete_mem0_intents()
+    assert len(incomplete) == 1
+    row = incomplete[0]
+    assert row['id'] == intent_id
+    assert row['write_op_id'] == write_op_id
+    assert row['causation_id'] == 'cause-1'
+    assert row['project_id'] == 'proj'
+    assert row['agent_id'] == 'agent-a'
+    assert row['session_id'] == 'sess-1'
+    assert row['category'] == 'preferences_and_norms'
+    assert row['status'] == 'pending'
+    assert row['payload_digest'] == 'digest-abc'
+    # Content is stored FULL (untruncated) so a re-issue is faithful.
+    assert row['content'] == long_content
+    assert len(row['content']) > 200
+    assert json.loads(row['metadata']) == metadata
+    assert row['resolved_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_mem0_intent_completed_removes_from_incomplete(journal):
+    """resolve_mem0_intent(id, 'completed') stamps status+resolved_at and clears pending."""
+    intent_id = str(uuid.uuid4())
+    await journal.log_mem0_intent(
+        intent_id=intent_id,
+        write_op_id=str(uuid.uuid4()),
+        content='hi',
+        metadata={},
+        payload_digest='d',
+    )
+    await journal.resolve_mem0_intent(intent_id, 'completed')
+
+    assert await journal.get_incomplete_mem0_intents() == []
+    rows = await journal.get_mem0_intents(status='completed')
+    assert len(rows) == 1
+    assert rows[0]['id'] == intent_id
+    assert rows[0]['status'] == 'completed'
+    assert rows[0]['resolved_at'] is not None
+
+
+@pytest.mark.asyncio
+async def test_resolve_mem0_intent_dead_persists_reason(journal):
+    """resolve_mem0_intent(id, 'dead', reason=...) persists the reason and status='dead'."""
+    intent_id = str(uuid.uuid4())
+    await journal.log_mem0_intent(
+        intent_id=intent_id,
+        write_op_id=str(uuid.uuid4()),
+        content='hi',
+        metadata={},
+        payload_digest='d',
+    )
+    reason = 'no backend_op: unknown outcome (not auto-re-issued)'
+    await journal.resolve_mem0_intent(intent_id, 'dead', reason=reason)
+
+    dead = await journal.get_mem0_intents(status='dead')
+    assert len(dead) == 1
+    assert dead[0]['id'] == intent_id
+    assert dead[0]['status'] == 'dead'
+    assert dead[0]['reason'] == reason
+    assert dead[0]['resolved_at'] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_mem0_intents_status_filter(journal):
+    """get_mem0_intents(status='dead') returns only dead rows; None returns all."""
+    ids = {}
+    for status in ['completed', 'failed', 'dead', 'pending']:
+        iid = str(uuid.uuid4())
+        ids[status] = iid
+        await journal.log_mem0_intent(
+            intent_id=iid,
+            write_op_id=str(uuid.uuid4()),
+            content=f'content-{status}',
+            metadata={},
+            payload_digest='d',
+        )
+        if status != 'pending':
+            await journal.resolve_mem0_intent(iid, status)
+
+    dead = await journal.get_mem0_intents(status='dead')
+    assert [r['id'] for r in dead] == [ids['dead']]
+
+    completed = await journal.get_mem0_intents(status='completed')
+    assert [r['id'] for r in completed] == [ids['completed']]
+
+    all_rows = await journal.get_mem0_intents()
+    assert len(all_rows) == 4
+
+
+@pytest.mark.asyncio
+async def test_get_incomplete_returns_only_pending(journal):
+    """get_incomplete_mem0_intents() excludes completed/failed/dead rows."""
+    pending_id = str(uuid.uuid4())
+    await journal.log_mem0_intent(
+        intent_id=pending_id,
+        write_op_id=str(uuid.uuid4()),
+        content='pending-one',
+        metadata={},
+        payload_digest='d',
+    )
+    for status in ['completed', 'failed', 'dead']:
+        iid = str(uuid.uuid4())
+        await journal.log_mem0_intent(
+            intent_id=iid,
+            write_op_id=str(uuid.uuid4()),
+            content=f'c-{status}',
+            metadata={},
+            payload_digest='d',
+        )
+        await journal.resolve_mem0_intent(iid, status)
+
+    incomplete = await journal.get_incomplete_mem0_intents()
+    assert len(incomplete) == 1
+    assert incomplete[0]['id'] == pending_id
+    assert incomplete[0]['status'] == 'pending'
