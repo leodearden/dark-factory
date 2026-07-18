@@ -1,6 +1,7 @@
 """Unit tests for Mem0Backend — filter construction and search delegation."""
 
 import contextlib
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -303,6 +304,31 @@ class TestMem0BackendGetPointById:
                 '00000000-0000-0000-0000-000000000000',
                 Scope(project_id='dark_factory'),
             )
+
+    @pytest.mark.asyncio
+    async def test_multiple_records_uses_first_and_warns(self, backend, caplog):
+        """A single-id retrieve returning >1 record is unexpected: use records[0]'s
+        payload and log a WARNING (defense-in-depth, mirroring scroll_by_metadata)."""
+        uuid = '77a3f6bc-0000-0000-0000-000000000000'
+        first_payload = {'data': 'first', 'category': 'observations_and_summaries'}
+        second_payload = {'data': 'second', 'category': 'observations_and_summaries'}
+        p1 = self._make_mock_point(uuid, first_payload)
+        p2 = self._make_mock_point(uuid, second_payload)
+
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[p1, p2])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.get_point_by_id(uuid, Scope(project_id='dark_factory'))
+
+        assert result == first_payload, f'expected the first record payload, got {result!r}'
+        assert any(
+            'retrieved 2 points for a single id' in rec.getMessage()
+            for rec in caplog.records
+        ), f'expected a >1-point WARNING, got {[r.getMessage() for r in caplog.records]!r}'
 
 
 class TestMem0BackendAddSystemRecord:

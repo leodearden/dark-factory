@@ -439,7 +439,10 @@ class Mem0Backend:
         behaviour is the whole reason this bypasses ``get``.
 
         Returns the point's full raw payload dict, or ``None`` when the point is
-        absent (empty ``retrieve`` result).
+        absent (empty ``retrieve`` result). A single-id ``retrieve`` returning
+        more than one record is not expected; the first is used and a WARNING is
+        logged for observability (defense-in-depth, mirroring
+        ``scroll_by_metadata``'s truncation warning).
         """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
@@ -452,7 +455,18 @@ class Mem0Backend:
             ),
             timeout=self._read_timeout,
         )
-        return dict(records[0].payload or {}) if records else None
+        if not records:
+            return None
+        if len(records) > 1:
+            logger.warning(
+                'Mem0 get_point_by_id retrieved %d points for a single id '
+                '(collection=%s, memory_id=%s); using the first — a single-id '
+                'retrieve returning >1 point is unexpected.',
+                len(records),
+                collection_name,
+                memory_id,
+            )
+        return dict(records[0].payload or {})
 
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""
