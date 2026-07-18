@@ -3089,15 +3089,13 @@ class GitOps:
                   stdout carries the ``@@REIFY_WARM_LANE_SOFT_PRESSURE@@``
                   sentinel per the reify contract — not parsed here).
             75  — hard disk pressure (EX_TEMPFAIL); takes precedence over
-                  soft per the reify script's own contract. When ε
-                  (``warm_lane_disk_guard``) is enabled, callers should rely
-                  on its own hard-floor check for this outcome — it always
-                  short-circuits first in ``_acquire_warm_lane_impl``, so
-                  this rc is unreachable from the θ path in that
-                  configuration. When ε is disabled, however,
+                  soft per the reify script's own contract.
                   :meth:`_warm_lane_soft_pressure_defer` treats this rc as a
-                  gap-closing defer signal instead of failing open on it —
-                  see that method's docstring (amendment,
+                  defer signal unconditionally (rc==75 is never healthy), so
+                  a below-hard-floor condition that slips past ε's upstream
+                  check (the narrow TOCTOU window) — or a soft-only
+                  configuration with ε disabled — still backpressures rather
+                  than failing open. See that method's docstring (amendment,
                   reviewer_comprehensive robustness).
             127 — script absent or exception (fail-open sentinel).
             other non-zero — script error (treated as fail-open by caller).
@@ -3471,27 +3469,27 @@ class GitOps:
         earlier: runs :meth:`_run_warm_lane_soft_guard` and defers (True) on
         rc==3 (soft pressure — above the hard floor, below the soft one).
 
-        Gap-closing belt-and-suspenders (amendment, reviewer_comprehensive
-        robustness): rc==75 (hard pressure — the same script, run with both
-        the hard AND soft flags, reports this per the reify contract's "75
-        takes precedence over soft") ALSO defers, but ONLY when ε
-        (``warm_lane_disk_guard``) is disabled. When ε is enabled, a genuine
-        rc==75 is always caught upstream by
-        :meth:`_warm_lane_disk_admission_blocked` in
-        ``_acquire_warm_lane_impl`` BEFORE this method ever runs (ε
-        short-circuits first), so this method still fails open on rc==75 in
-        that configuration — ε remains the sole owner of that outcome, byte-
-        identical to before. But when an operator has enabled ONLY the soft
-        floor (``warm_lane_soft_floor=True``, ``warm_lane_disk_guard=False``
-        — an explicitly supported "either axis alone" configuration),
-        nothing else observes the hard-floor signal for a FRESH allocation;
-        failing open here would silently allocate a new divergent lane into
-        a below-hard-floor disk — the exact ENOSPC/SIGBUS condition ε exists
-        to prevent. Deferring here instead is still pure backpressure
-        (inv.11: routes through the same WarmLaneSoftPressure REQUEUE, never
-        an escalation or ε's exit-75/WarmLaneDiskPressure fault path) — it
-        only widens *when* θ's own backpressure fires, without touching ε's
-        byte-identical path.
+        rc==75 (hard pressure) ALSO defers, unconditionally — independent of
+        the ε (``warm_lane_disk_guard``) knob (amendment,
+        reviewer_comprehensive robustness). The soft guard runs the same
+        reify script with both the hard AND soft flags, so it reports rc==75
+        whenever free space/inodes are actually below the hard floor ("75
+        takes precedence over soft" per the reify contract); rc==75 is never
+        healthy, so deferring is strictly safer than failing open. In the
+        common ε-enabled case a genuine below-hard-floor condition is caught
+        UPSTREAM by :meth:`_warm_lane_disk_admission_blocked` in
+        ``_acquire_warm_lane_impl`` (ε short-circuits to DISK_PRESSURE before
+        this method runs), so this rc==75 arm only fires in the narrow TOCTOU
+        window where free space fell below the hard floor BETWEEN ε's check
+        and this one — deferring there (rather than failing open into a fresh
+        below-hard-floor allocation) closes that window. It also covers the
+        soft-only configuration (``warm_lane_soft_floor=True``,
+        ``warm_lane_disk_guard=False``), where nothing else observes the
+        hard-floor signal for a FRESH allocation. Either way the defer is
+        pure backpressure (inv.11: routes through the same
+        WarmLaneSoftPressure REQUEUE, never an escalation or ε's
+        exit-75/WarmLaneDiskPressure fault path) and never touches ε's
+        byte-identical hard path.
 
         Every other outcome fails open (False): 0 (healthy), 127 (script
         absent), 2 (usage error), or any other unrecognized code.
@@ -3509,17 +3507,20 @@ class GitOps:
         Never raises.
         """
         rc = await self._run_warm_lane_soft_guard()
-        gap_closing = rc == 75 and not self.config.warm_lane_disk_guard
-        if rc != 3 and not gap_closing:
+        # Defer on soft pressure (rc==3) OR hard pressure (rc==75). rc==75 is
+        # never healthy — the soft guard runs the same reify script with both
+        # the hard and soft thresholds, so it reports 75 whenever free space
+        # is actually below the hard floor ("75 takes precedence over soft").
+        # Deferring is strictly safer than failing open, so we do it
+        # unconditionally, independent of the ε (warm_lane_disk_guard) knob
+        # (amendment, reviewer_comprehensive robustness). See docstring.
+        if rc not in (3, 75):
             return False
         headroom = await self._run_warm_lane_audit()
         reason = (
             'soft disk pressure'
             if rc == 3
-            else (
-                'hard disk pressure (warm_lane_disk_guard is disabled — no ε '
-                'backstop is active)'
-            )
+            else 'hard disk pressure (rc=75 — free fell below the hard floor)'
         )
         logger.warning(
             'θ soft-floor throttle: %s (rc=%d) for branch %r — deferring '
@@ -3985,12 +3986,13 @@ class GitOps:
         # is a reuse/live-requeue, not new resident-divergent growth, so it
         # is never throttled — only a fresh lane allocation defers.
         #
-        # Amendment (reviewer_comprehensive robustness): when warm_lane_disk_guard
-        # is disabled (ε off, θ on alone), _warm_lane_soft_pressure_defer also
+        # Amendment (reviewer_comprehensive robustness): _warm_lane_soft_pressure_defer
         # treats the soft-guard's own rc==75 (hard pressure) as a defer signal
-        # — closing the gap where a soft-only configuration would otherwise
-        # allocate a fresh lane straight past the hard floor with nothing
-        # backpressuring it. See that method's docstring for detail.
+        # unconditionally — closing the narrow TOCTOU window where free space
+        # falls below the hard floor between ε's check above and the soft
+        # guard, and covering the soft-only config (ε off, θ on alone). Either
+        # way a fresh lane is never allocated straight past the hard floor.
+        # See that method's docstring for detail.
         if (
             self.config.warm_lane_soft_floor
             and self.warm_lane_pool.assignment_for(branch_name) is None

@@ -398,10 +398,10 @@ class TestWarmLaneSoftPressureDefer:
     ):
         """Fail-open: healthy(0)/absent(127)/usage(2)/unknown(9) never defer.
 
-        rc=75 is deliberately excluded here — see
+        rc=75 is deliberately excluded here — it is never healthy, so it
+        DEFERS (unconditionally, independent of warm_lane_disk_guard); see
         TestWarmLaneSoftPressureDeferHardRc75Gap below (amendment,
-        reviewer_comprehensive robustness): its fail-open-vs-defer behavior
-        now depends on warm_lane_disk_guard.
+        reviewer_comprehensive robustness).
         """
         await _add_disk_guard_scripts(git_repo)
         _write_check_exits(git_repo, [stub_rc])
@@ -443,24 +443,34 @@ class TestWarmLaneSoftPressureDefer:
 
 @pytest.mark.asyncio
 class TestWarmLaneSoftPressureDeferHardRc75Gap:
-    """Amendment (reviewer_comprehensive robustness, git_ops.py:3894): closes
-    a protection gap for the soft-only configuration
-    (warm_lane_soft_floor=True, warm_lane_disk_guard=False). The soft-guard
-    script is invoked with BOTH the hard and soft thresholds, so if free
-    space/inodes are actually below the HARD floor it still returns rc=75
-    (hard pressure takes precedence over soft per the reify contract) even
-    though only the soft check ran. Previously `_warm_lane_soft_pressure_defer`
-    treated rc=75 as fail-open unconditionally, so with ε disabled NOTHING
-    deferred a fresh allocation below the hard floor — exactly the
-    ENOSPC/SIGBUS condition ε exists to prevent. Now rc=75 defers too, but
-    ONLY when warm_lane_disk_guard is disabled; when it's enabled, ε already
-    short-circuits before this method ever runs on a genuine rc=75, so this
-    method still fails open there (ε remains the sole owner of that outcome).
+    """Amendment (reviewer_comprehensive robustness): closes a below-hard-
+    floor protection gap. The soft-guard script is invoked with BOTH the hard
+    and soft thresholds, so if free space/inodes are actually below the HARD
+    floor it returns rc=75 (hard pressure takes precedence over soft per the
+    reify contract) even though only the soft check ran. rc=75 is never
+    healthy, so `_warm_lane_soft_pressure_defer` now defers on it
+    UNCONDITIONALLY — independent of the warm_lane_disk_guard (ε) knob:
+
+    - ε disabled (soft-only config): nothing else observes the hard-floor
+      signal for a fresh allocation, so deferring here is the ONLY thing
+      preventing an allocation into a below-hard-floor disk (the ENOSPC/
+      SIGBUS condition ε exists to prevent).
+    - ε enabled: ε's own check short-circuits to DISK_PRESSURE upstream on a
+      genuine below-hard-floor condition, so this arm only fires in the
+      narrow TOCTOU window where free space fell below the hard floor BETWEEN
+      ε's check and the soft guard. Deferring there (rather than failing open
+      into a fresh below-hard-floor allocation) closes that window and is
+      strictly safer.
+
+    Either way the defer is pure backpressure (WarmLaneSoftPressure REQUEUE),
+    never ε's exit-75/WarmLaneDiskPressure fault path, and ε's hard path stays
+    byte-identical.
     """
 
     async def test_rc75_defers_when_disk_guard_disabled(self, git_repo: Path):
-        """Gap-closing case: soft floor alone, disk critically low (rc=75)
-        ⇒ still defers (backpressure), rather than silently allocating."""
+        """Soft-only config, disk critically low (rc=75) ⇒ defers
+        (backpressure), rather than silently allocating below the hard
+        floor."""
         await _add_disk_guard_scripts(git_repo)
         _write_check_exits(git_repo, [75])
         config = _make_soft_floor_config(warm_lane_disk_guard=False)
@@ -473,9 +483,14 @@ class TestWarmLaneSoftPressureDeferHardRc75Gap:
             'else backpressures a fresh allocation below the hard floor'
         )
 
-    async def test_rc75_fails_open_when_disk_guard_enabled(self, git_repo: Path):
-        """When ε is independently enabled, ε remains the sole owner of
-        rc=75 — this method still fails open (byte-identical to before)."""
+    async def test_rc75_defers_when_disk_guard_enabled(self, git_repo: Path):
+        """TOCTOU-closing case: even with ε enabled, rc=75 observed by the
+        soft guard defers unconditionally. In practice ε short-circuits
+        upstream on a genuine below-hard-floor condition, so this fires only
+        in the narrow window where free space dropped between ε's check and
+        the soft guard — deferring is strictly safer than failing open into a
+        fresh below-hard-floor allocation (amendment, reviewer_comprehensive
+        robustness)."""
         await _add_disk_guard_scripts(git_repo)
         _write_check_exits(git_repo, [75])
         config = _make_soft_floor_config(warm_lane_disk_guard=True)
@@ -483,18 +498,18 @@ class TestWarmLaneSoftPressureDeferHardRc75Gap:
 
         result = await git_ops._warm_lane_soft_pressure_defer('A')
 
-        assert result is False, (
-            'rc=75 with warm_lane_disk_guard enabled must fail-open here — '
-            'ε (_warm_lane_disk_admission_blocked) owns that outcome and '
-            'short-circuits before this method is reached in practice'
+        assert result is True, (
+            'rc=75 must defer unconditionally — it is never healthy, so '
+            'deferring (backpressure) is strictly safer than failing open '
+            'into a fresh allocation below the hard floor'
         )
 
-    async def test_rc75_defer_emits_warning_naming_disabled_guard(
+    async def test_rc75_defer_emits_warning_naming_hard_pressure(
         self, git_repo: Path, caplog: pytest.LogCaptureFixture,
     ):
-        """The gap-closing defer's WARNING is distinguishable from the
-        ordinary soft-pressure (rc=3) one — it should surface that the hard
-        floor, not the soft floor, was actually breached."""
+        """The rc=75 defer's WARNING is distinguishable from the ordinary
+        soft-pressure (rc=3) one — it surfaces that the HARD floor, not the
+        soft floor, was actually breached."""
         await _add_disk_guard_scripts(git_repo)
         _write_check_exits(git_repo, [75])
         config = _make_soft_floor_config(warm_lane_disk_guard=False)
