@@ -754,7 +754,7 @@ class TestMergePhaseGraceStampLifecycle:
         result = await wf._run_merge_phase('task/2656')
 
         assert result is None  # fell through to SUCCESS
-        wf.scheduler.note_merge_phase_entered.assert_called_once_with('2656')
+        cast(MagicMock, wf.scheduler.note_merge_phase_entered).assert_called_once_with('2656')
         cast(AsyncMock, wf._submit_to_merge_queue).assert_awaited_once()
 
 

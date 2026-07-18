@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -577,7 +578,7 @@ class TestMergePipelineIdle:
         worker.snapshot.return_value = {'depth': 0}
         harness._merge_worker = worker
         assert harness._merge_queue.empty()
-        harness.scheduler.merge_phase_grace_active.return_value = True
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.return_value = True
 
         assert harness._merge_pipeline_idle() is False
 
@@ -588,7 +589,7 @@ class TestMergePipelineIdle:
         worker = MagicMock()
         worker.snapshot.return_value = {'depth': 0}
         harness._merge_worker = worker
-        harness.scheduler.merge_phase_grace_active.return_value = False
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.return_value = False
 
         assert harness._merge_pipeline_idle() is True
 
@@ -609,10 +610,10 @@ class TestMergePhaseGraceActive:
         """Passes the config grace to scheduler.merge_phase_grace_active and
         returns its result."""
         harness.config.orchestrator_restart_merge_phase_grace_secs = 600.0
-        harness.scheduler.merge_phase_grace_active.return_value = True
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.return_value = True
 
         assert harness._merge_phase_grace_active() is True
-        harness.scheduler.merge_phase_grace_active.assert_called_once_with(600.0)
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.assert_called_once_with(600.0)
 
     def test_false_when_config_grace_zero_without_calling_scheduler(
         self, harness: Harness
@@ -620,7 +621,7 @@ class TestMergePhaseGraceActive:
         """grace_secs <= 0 short-circuits to False (kill switch) — the scheduler
         is never consulted."""
         harness.config.orchestrator_restart_merge_phase_grace_secs = 0
-        harness.scheduler.merge_phase_grace_active.side_effect = AssertionError(
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.side_effect = AssertionError(
             'scheduler must not be consulted when the config grace is disabled'
         )
 
@@ -633,7 +634,7 @@ class TestMergePhaseGraceActive:
         NOT a defer, which would reintroduce the indefinite-veto failure mode
         this task fixes."""
         harness.config.orchestrator_restart_merge_phase_grace_secs = 600.0
-        harness.scheduler.merge_phase_grace_active.side_effect = RuntimeError('boom')
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.side_effect = RuntimeError('boom')
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             assert harness._merge_phase_grace_active() is False

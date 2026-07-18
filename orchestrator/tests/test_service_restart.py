@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1856,7 +1857,7 @@ def _make_force_fire_coordinator(
     current_time: list[float] = [0.0]
     resolved_wall_now = wall_now if wall_now is not None else [0.0]
 
-    extra_kwargs: dict[str, object] = {}
+    extra_kwargs: dict[str, Any] = {}
     if merge_phase_hold is not None:
         extra_kwargs['merge_phase_hold'] = merge_phase_hold
     if merge_phase_grace_secs != 0.0:
