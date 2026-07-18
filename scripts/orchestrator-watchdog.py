@@ -978,6 +978,64 @@ def _delegate_fleet_restart() -> None:
         log(f"_delegate_fleet_restart: systemd-run registration failed: {exc!r}")
 
 
+def _delegate_fm_restart() -> None:
+    """Delegate a fused-memory staleness redeploy to restart-fused-memory.sh (task 2714).
+
+    fm sibling of _delegate_fleet_restart: fires a detached, named transient
+    unit via ``systemd-run --user`` so the defer-if-busy restart and the
+    exit-0-gated clock stamp run identically whether triggered by this backstop
+    or (later) any other caller.
+
+    - ``--unit=fm-staleness-redeploy.service`` (FM_STALENESS_REDEPLOY_UNIT) is a
+      FIXED transient unit name — the natural overlap guard. A second tick while
+      a redeploy is still running fails to re-register the same unit name and
+      no-ops, so this stateless oneshot needs no cross-tick bookkeeping.
+    - ``--collect`` removes the transient unit once it exits so a LATER tick can
+      re-register the same name.
+    - ``--no-block`` detaches: this call returns as soon as the transient unit
+      is *registered*, without waiting for restart-fused-memory.sh to finish.
+      Essential because restart-fused-memory.sh's default defer-if-busy path can
+      hold up to RECON_GATE_TIMEOUT (35 min) while a full recon cycle runs — the
+      60s oneshot watchdog must never block on that (task 2703 δ).
+
+    KEY divergence from _delegate_fleet_restart (task ο design decision):
+    restart-fused-memory.sh is invoked in its DEFAULT defer-if-busy mode (NO
+    --now / --drain), and — because it does NOT stamp its own clock (unlike
+    restart-all-orchestrators.sh) — the command chains ``&& <self>
+    --stamp-fm-deploy-clock`` inside the SAME detached ``bash -c`` payload. The
+    ``&&`` short-circuit means the fm clock is stamped ONLY on the restart
+    script's verified exit-0, and the whole thing stays non-blocking (the stamp
+    runs inside the detached unit, not inline in the watchdog).
+
+    Fail-soft: a missing systemd-run binary, a timeout, or any other
+    registration error is logged and swallowed, never raised — a registration
+    hiccup must not crash the oneshot watchdog. The NEXT tick's
+    fused_memory_staleness_pass will simply try again (stateless — I6).
+    """
+    restart_script = os.path.join(REPO_DIR, "scripts", "restart-fused-memory.sh")
+    stamp_cmd = (
+        f"{shlex.quote(sys.executable)} "
+        f"{shlex.quote(os.path.abspath(__file__))} --stamp-fm-deploy-clock"
+    )
+    try:
+        subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--collect",
+                "--no-block",
+                f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
+                "/bin/bash",
+                "-c",
+                f"{shlex.quote(restart_script)} && {stamp_cmd}",
+            ],
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"_delegate_fm_restart: systemd-run registration failed: {exc!r}")
+
+
 def staleness_pass() -> None:
     """Restart any running orchestrator unit stale w.r.t. the newest watched commit.
 
