@@ -569,6 +569,13 @@ class ReconciliationJournal:
                     verdict.action_taken,
                 ),
             )
+            # Atomic clear of the judge_pending marker (task 2708): committing
+            # the verdict and clearing the marker in one transaction guarantees
+            # the invariant 'marker present ⟹ no committed verdict', so a
+            # startup re-run never collides with the run_id PK on judge_verdicts.
+            await db.execute(
+                'DELETE FROM judge_pending WHERE run_id = ?', (verdict.run_id,)
+            )
 
     async def get_recent_verdicts(
         self, project_id: str, limit: int = 10, since: datetime | None = None,
