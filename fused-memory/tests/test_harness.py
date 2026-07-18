@@ -680,6 +680,71 @@ async def test_mock_stage_run_before_return_callback(journal, event_buffer, mock
 
 
 # ---------------------------------------------------------------------------
+# Task 2734: pure predicate helper backing arm 2 of the widened Stage 1
+# cycle_summary harness backstop below — "Stage 1 completed but its own
+# in-stage ledger write failed" (report present,
+# stats['stage1_cycle_summary_ledger_written'] == 0), as distinct from task
+# 2440's arm 1 ("Stage 1 raised before producing a report at all").
+#
+# RED — _stage1_ledger_write_missing does not exist yet.
+# ---------------------------------------------------------------------------
+
+
+class TestStage1LedgerWriteMissingPredicate:
+    """`_stage1_ledger_write_missing(report)` is a pure, synchronous
+    predicate — no harness/journal/ledger fixtures needed."""
+
+    @staticmethod
+    def _report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=1,
+            tokens_used=10,
+        )
+
+    def test_explicit_zero_stat_returns_true(self):
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        report = self._report(stage1_cycle_summary_ledger_written=0)
+        assert _stage1_ledger_write_missing(report) is True
+
+    def test_explicit_one_stat_returns_false(self):
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        report = self._report(stage1_cycle_summary_ledger_written=1)
+        assert _stage1_ledger_write_missing(report) is False
+
+    def test_absent_stat_returns_false(self):
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        report = self._report()
+        assert _stage1_ledger_write_missing(report) is False
+
+    def test_degraded_backstop_synth_is_excluded(self):
+        """arm 1's own synthesized row must never re-trigger arm 2."""
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        report = self._report(
+            stage1_cycle_summary_ledger_written=0,
+            stage1_cycle_summary_degraded_backstop=True,
+        )
+        assert _stage1_ledger_write_missing(report) is False
+
+    def test_non_stagereport_object_returns_false(self):
+        """A plain dict — the shape run.stage_reports['_error'] entries use —
+        has no .stats attribute at all and must not raise."""
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        assert _stage1_ledger_write_missing({'error_type': 'RuntimeError'}) is False
+
+
+# ---------------------------------------------------------------------------
 # Task 2440: harness-level backstop for the Stage 1 cycle_summary write.
 #
 # Guarantees the deterministic write_cycle_summary(...) ledger row exists
