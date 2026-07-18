@@ -887,3 +887,118 @@ async def test_tag_prompt_uses_details_when_description_empty(harness):
     assert 'SPECIAL_DETAILS_TOKEN' in prompt, (
         f'Expected details fallback text in the prompt when description is empty; got prompt={prompt!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Force-retag merge-preservation: an all-directory or omitted prediction must
+# NOT clobber a task's pre-existing real files (task 2561 amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_force_all_directory_prediction_preserves_existing_files(harness):
+    """Force-retag: an all-directory prediction must not clobber real files.
+
+    In force mode a task that already carries real ``metadata.files`` is
+    re-tagged. If the agent's prediction for it is all directory-shaped paths,
+    ``sanitize_files_for_persist`` strips them to []. Writing ``{'files': []}``
+    under update_task's default merge mode would overwrite the pre-existing
+    valid file locks wholesale. The writeback must instead omit the 'files'
+    key entirely (sentinel alone) so merge preserves the existing files.
+
+    RED before the fix: the ``if files:`` gate keys off the raw (truthy)
+    prediction, so ``metadata['files'] = []`` is written and clobbers.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': 'desc',
+            'status': 'pending',
+            'metadata': {'files': ['src/existing.py']},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    # Prediction is a single directory-shaped path (no file extension) →
+    # sanitize_files_for_persist strips it to [].
+    agent_response = {'predictions': [{'id': '1', 'files': ['crates/reify-eval/src']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules(force=True)
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    metadata = json.loads(metadata_json)
+    # Sentinel is stamped …
+    assert metadata.get('files_tagged_at'), (
+        f'Expected files_tagged_at sentinel; got metadata={metadata!r}'
+    )
+    # … but NO 'files' key is written, so merge-mode preserves the existing
+    # ['src/existing.py'] rather than clobbering it to [].
+    assert 'files' not in metadata, (
+        f'All-directory prediction must not write a files key (would clobber '
+        f'pre-existing files under merge mode); got metadata={metadata!r}'
+    )
+    # Nothing to seed for an all-directory (→ empty after sanitize) prediction.
+    mock_seed_modules.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tag_force_omitted_task_preserves_existing_files(harness):
+    """Force-retag: a task the agent omits keeps only the sentinel (no clobber).
+
+    The persist loop iterates the untagged batch (not the agent response), so
+    a task omitted from the prediction list still gets stamped. In force mode
+    against a task that already has real ``metadata.files``, the write must
+    carry ONLY files_tagged_at (no 'files' key) so update_task's default merge
+    mode preserves the pre-existing file locks.
+
+    Regression guard for the documented no-clobber guarantee.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': 'desc',
+            'status': 'pending',
+            'metadata': {'files': ['src/existing.py']},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    # Agent omits task '1' entirely.
+    agent_response = {'predictions': []}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules(force=True)
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    metadata = json.loads(metadata_json)
+    assert metadata.get('files_tagged_at'), (
+        f'Expected files_tagged_at sentinel; got metadata={metadata!r}'
+    )
+    assert 'files' not in metadata, (
+        f'Omitted task must carry only the sentinel (no files key) so merge '
+        f'preserves pre-existing files; got metadata={metadata!r}'
+    )
+    mock_seed_modules.assert_not_called()

@@ -2175,11 +2175,15 @@ task, include it with an empty "files" list rather than omitting it.
         # agent can't (or won't) predict files for still gets marked as
         # processed and never re-enters the tagging batch on the next cycle
         # (defect 1: an LLM-spend leak — 73 tagger sessions mined in one
-        # month). The 'files' key is written ONLY when the prediction is
-        # non-empty; otherwise the sentinel is written alone, and
-        # scheduler.update_task's default merge mode preserves any
-        # pre-existing real files rather than clobbering them when a
-        # force-retag's agent response skips a task.
+        # month). The 'files' key is written ONLY when the prediction
+        # sanitizes to a NON-EMPTY file-level list; otherwise the sentinel is
+        # written alone, and scheduler.update_task's default merge mode
+        # preserves any pre-existing real files rather than clobbering them.
+        # This covers three no-clobber cases: the agent omits the task
+        # (files == []), predicts an explicit empty list, OR predicts only
+        # directory-shaped paths (sanitize strips them to []) — the last of
+        # which is why the gate keys off the SANITIZED result, not the raw
+        # (possibly all-directory but truthy) prediction.
         tagged_at = datetime.now(UTC).isoformat()
 
         tagged_count = 0
@@ -2189,22 +2193,28 @@ task, include it with an empty "files" list rather than omitting it.
                 continue
             files = pred_by_id.get(task_id, [])
             metadata_payload: dict[str, Any] = {'files_tagged_at': tagged_at}
-            if files:
-                # Persist file-level paths only: strip directory-shaped entries
-                # before writing so the lock-charter guard on update_task /
-                # task_interceptor.update_task accepts the write. Without this,
-                # any LLM-tagged directory entry makes update_task reject the
-                # ENTIRE payload (LockCharterViolation), silently dropping the
-                # valid file-level entries too. Consistent with the strip in
-                # _persist_files_metadata / _reconcile_metadata_files_for_done.
-                metadata_payload['files'] = sanitize_files_for_persist(files)
+            # Persist file-level paths only: strip directory-shaped entries
+            # before writing so the lock-charter guard on update_task /
+            # task_interceptor.update_task accepts the write. Without this,
+            # any LLM-tagged directory entry makes update_task reject the
+            # ENTIRE payload (LockCharterViolation), silently dropping the
+            # valid file-level entries too. Consistent with the strip in
+            # _persist_files_metadata / _reconcile_metadata_files_for_done.
+            # An all-directory prediction sanitizes to [] and is treated
+            # exactly like an empty/omitted one (sentinel alone, no clobber).
+            sanitized = sanitize_files_for_persist(files) if files else []
+            if sanitized:
+                metadata_payload['files'] = sanitized
             await self.scheduler.update_task(task_id, json.dumps(metadata_payload))
-            if files:
+            if sanitized:
                 # Populate in-memory cache via the single cache-writing seam.
                 # module_charter.derive_modules (called inside seed_modules)
                 # applies the α strip so a directory-only charter cannot
                 # poison the cache and bypass _get_modules' α strip on the
-                # next tick.
+                # next tick. Seed with the RAW predicted files (the α strip
+                # lives inside derive_modules); seeding is skipped whenever
+                # the sanitized result is empty, so tagged_count reflects only
+                # tasks that actually received file-level locks.
                 self.scheduler.seed_modules(task_id, files)
                 tagged_count += 1
 
