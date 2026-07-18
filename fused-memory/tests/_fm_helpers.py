@@ -734,10 +734,16 @@ async def reap_leaked_ticket_workers() -> int:
     teardown).
 
     Best-effort and bounded: never raises, and is a cheap no-op for the
-    (vast majority of) tests that leak no worker.
+    (vast majority of) tests that leak no worker. The suppressed-exception
+    set deliberately excludes bare ``BaseException`` so a ``CancelledError``
+    targeting the reaper's own task (as opposed to the worker task it is
+    draining) still propagates instead of being silently swallowed.
 
     Returns:
-        The number of orphaned worker tasks cancelled and drained.
+        The number of orphaned worker tasks actually cancelled and drained
+        (task.done() confirmed post-drain) — a worker that fails to unwind
+        within the bounded timeout is not counted, even though it was
+        cancel()-requested.
     """
     reaped = 0
     for task in list(asyncio.all_tasks()):
@@ -747,9 +753,10 @@ async def reap_leaked_ticket_workers() -> int:
         if not getattr(coro, '__qualname__', '').endswith('TaskInterceptor._curator_worker'):
             continue
         task.cancel()
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
             await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), timeout=10.0,
             )
-        reaped += 1
+        if task.done():
+            reaped += 1
     return reaped
