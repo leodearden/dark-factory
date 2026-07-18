@@ -210,7 +210,10 @@ orchestrator consumes none of these mechanisms cross-process.
    with the "loud escalation over silent degradation" directive.
 7. **Fused-memory restart via `scripts/restart-fused-memory.sh` (no args).**
    Resolved decision #6 of the program doc: out-of-cgroup `systemctl --user
-   restart`; the `--drain` path (hung, task 2090) is opt-in and not used. The
+   restart`. The bare script is now cycle-aware — it defers while a full recon
+   cycle is in flight and restarts between cycles or after the 35-min cap
+   (`--now` bypasses); the `--drain` path now converges (task 2702, no longer
+   the task-2090 hang) but is not needed here. The
    capstone is cross-unit (orchestrator → fused-memory), so the blocking
    deterministic path with fresh-`MainPID` verify applies.
 

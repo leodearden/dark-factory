@@ -73,8 +73,12 @@ Wave 2 sessions wire cross-batch deps against the wave-1/agent batches' real tas
    invert to terminal-unless-listed (explicit ACTIVE_ONLY allowlist), since new terminal
    outcomes are added far more often than new active ones.
 6. **Fused-memory restarts** in deploy capstones: out-of-cgroup
-   `systemctl --user restart fused-memory.service`; do NOT use
-   `restart-fused-memory.sh --drain` (hung — task 2090). Orchestrator restarts follow the
+   `systemctl --user restart fused-memory.service` (capstones restart
+   out-of-cgroup so they don't self-kill). The standalone
+   `restart-fused-memory.sh` is now cycle-aware: bare, it defers while a full
+   recon cycle is in flight and restarts between cycles or after the 35-min
+   cap (`--now` bypasses); its `--drain` path now converges (task 2702, no
+   longer the task-2090 hang). Orchestrator restarts follow the
    deterministic task-kind conventions in CLAUDE.md (2064/2105 are fixed and deployed).
 
 ## Shared conventions (every session)
