@@ -379,26 +379,36 @@ async def _assess_task(
     task_id = task.get('id', 'unknown')
     task_name = task.get('name', task_id)
 
-    # Get diffs
+    # Get diffs. Thread the authoritative base commit through get_diff. Use
+    # .get (not a hard key) because compare_models can pass a
+    # tasks.get(task_id, {'id':.., 'name':..}) fallback dict lacking the key;
+    # a missing base is the exact D1 silent-empty-diff failure this task
+    # removes, so warn loudly and skip the diff rather than swallow it.
     diff_a = ''
     diff_b = ''
+    base = task.get('pre_task_commit')
     wt_a = Path(result_a.worktree_path)
     wt_b = Path(result_b.worktree_path)
 
-    if wt_a.is_dir():
+    if not base:
+        logger.warning(
+            'No pre_task_commit for %s — cannot compute committed diff', task_id,
+        )
+
+    if wt_a.is_dir() and base:
         try:
-            diff_a = await get_diff(wt_a)
+            diff_a = await get_diff(wt_a, base)
         except Exception as e:
             logger.warning('Failed to get diff for %s (%s): %s', task_id, group_a_name, e)
-    else:
+    elif not wt_a.is_dir():
         logger.warning('Worktree missing for %s (%s): %s', task_id, group_a_name, wt_a)
 
-    if wt_b.is_dir():
+    if wt_b.is_dir() and base:
         try:
-            diff_b = await get_diff(wt_b)
+            diff_b = await get_diff(wt_b, base)
         except Exception as e:
             logger.warning('Failed to get diff for %s (%s): %s', task_id, group_b_name, e)
-    else:
+    elif not wt_b.is_dir():
         logger.warning('Worktree missing for %s (%s): %s', task_id, group_b_name, wt_b)
 
     # Read review artifacts
