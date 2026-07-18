@@ -63,6 +63,8 @@ from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.review_checkpoint import ReviewCheckpoint
+from orchestrator.routing import RoleDefaults
+from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
     Scheduler,
@@ -2197,6 +2199,27 @@ Every task must appear in the output. If you cannot predict any files for a
 task, include it with an empty "files" list rather than omitting it.
 """
 
+        # Route resolution (task η): resolve model/max_turns/budget through the
+        # single layered resolver + emit a routing_decision event. This is a
+        # BATCH tag over many untagged tasks (task_id intentionally omitted), so
+        # no task_id/scheduler/in_memory_task is passed → event only, no
+        # metadata.routing mirror. effort is deliberately NOT wired into the
+        # invoke below: the site never passed it, and invoke_agent(effort=None)
+        # emits no model_reasoning_effort flag, so wiring config.effort.
+        # module_tagger would be a real behaviour change (plan design decision
+        # 4). decision.effort is still carried in the routing_decision event.
+        decision = await resolve_and_record_route(
+            role_name='module_tagger',
+            role_defaults=RoleDefaults(
+                self.config.models.module_tagger,
+                self.config.effort.module_tagger,
+                self.config.budgets.module_tagger,
+                self.config.max_turns.module_tagger,
+            ),
+            config=self.config,
+            event_store=self.event_store,
+            cost_store=self.cost_store,
+        )
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -2214,9 +2237,9 @@ task, include it with an empty "files" list rather than omitting it.
                 prompt=prompt,
                 system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
                 cwd=self.config.project_root,
-                model=self.config.models.module_tagger,
-                max_turns=self.config.max_turns.module_tagger,
-                max_budget_usd=self.config.budgets.module_tagger,
+                model=decision.model,
+                max_turns=decision.max_turns,
+                max_budget_usd=decision.budget_usd,
                 output_schema=schema,
             )
         except AllAccountsCappedException as e:
