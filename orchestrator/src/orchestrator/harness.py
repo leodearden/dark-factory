@@ -97,6 +97,8 @@ from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflo
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
+    from escalation.models import Escalation
+
     from orchestrator.merge_queue import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -496,6 +498,80 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
         or metadata.get('gate_escalated_at')
         or metadata.get('done_provenance')
     )
+
+
+def _is_done_step_commit_orphan(esc: Escalation) -> bool:
+    """Return True iff *esc* is the done-step-commit orphan class filed by
+    ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488).
+
+    Task 2725: this is the sole, stable, machine-readable discriminator for
+    the one orphan-L0 class that is a false positive when its subject task
+    was requeue-rebased — the step's recorded ``commit`` SHA is a
+    pre-rebase intermediate no longer reachable from main, but the step's
+    content landed on main under a new SHA via the merge.
+    ``suggested_action='verify_wip_reconciliation'`` is set only by that
+    one filing site (grep-confirmed sole occurrence repo-wide), so matching
+    on it (plus ``agent_role``/``category``) is robust to summary-wording
+    changes, unlike a fragile summary-substring match.
+    """
+    return (
+        esc.agent_role == 'orchestrator'
+        and esc.category == 'infra_issue'
+        and esc.suggested_action == 'verify_wip_reconciliation'
+    )
+
+
+# The "merged family" of done_provenance.kind values that positively confirm
+# a done task's content actually landed on main (task 2725). Deliberately
+# EXCLUDES:
+#   'found_on_main'                 — the class this reaper's skip must NOT
+#                                      mask (a done task whose content did
+#                                      not land); it already has its own
+#                                      dedicated landing guards (PRD
+#                                      5dd39a4c42, batch 2674-2683), so this
+#                                      reaper is not that safety net.
+#   'dispatch-gate-already-on-main' — not in the Leo-ratified list; left out
+#                                      to avoid scope creep.
+#   commitless kinds (e.g. 'operational-verified', 'deterministic-deploy',
+#   'deterministic-deploy-scheduled', 'deterministic-milestone') — these
+#   never had a step commit to orphan in the first place.
+# Used only by _is_terminal_merged to gate the orphan-L0 reaper's
+# done-step-commit dismiss branch.
+_MERGED_DONE_PROVENANCE_KINDS: frozenset[str] = frozenset({
+    'merged',
+    'dispatch-gate-marker-found',
+    'dispatch-gate-content-equivalent',
+})
+
+
+def _is_terminal_merged(task: dict | None) -> bool:
+    """Return True iff *task* is a done task whose content is confirmed merged.
+
+    Task 2725: used by the orphan-L0 reaper to recognise a
+    rebase-superseded done-step-commit orphan as benign — the step's
+    recorded commit SHA is a pre-rebase intermediate no longer reachable
+    from main, but its content landed on main under a new SHA via the
+    merge. True iff ``task['status'] == 'done'`` AND
+    ``task['metadata']['done_provenance']`` is a dict whose ``kind`` is in
+    :data:`_MERGED_DONE_PROVENANCE_KINDS`.
+
+    Fail-safe: a ``None`` *task* (``get_task`` failure or absence), a
+    missing/non-dict ``metadata``, and a missing/non-dict
+    ``done_provenance`` are all treated as non-matching rather than
+    raising — the caller promotes (surfaces) instead of silently
+    dismissing whenever terminal+merged cannot be positively confirmed.
+    """
+    if task is None:
+        return False
+    if task.get('status') != 'done':
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    provenance = metadata.get('done_provenance')
+    if not isinstance(provenance, dict):
+        return False
+    return provenance.get('kind') in _MERGED_DONE_PROVENANCE_KINDS
 
 
 def _acquire_project_lock(project_root: Path) -> IO:
@@ -1368,12 +1444,15 @@ class Harness:
         self._lifecycle = registry
 
     async def _run_orphan_l0_reaper_pass(self) -> None:
-        """Async ``pass_fn`` wrapper for the (synchronous) orphan-L0 pass.
+        """Async ``pass_fn`` wrapper for the orphan-L0 pass.
 
-        ``_reap_orphan_l0_escalations`` is sync; ``BackgroundService``
-        requires an ``Awaitable[None]`` pass_fn (task 2241, W10-η).
+        ``_reap_orphan_l0_escalations`` is itself async (task 2725 — it
+        needs to ``await scheduler.get_task`` to check for a
+        terminal+merged subject task on the done-step-commit orphan
+        class); ``BackgroundService`` requires an ``Awaitable[None]``
+        pass_fn (task 2241, W10-η).
         """
-        self._reap_orphan_l0_escalations()
+        await self._reap_orphan_l0_escalations()
 
     async def _run_terminal_status_watcher_pass(self) -> None:
         """Async ``pass_fn`` wrapper discarding the terminal-scan cancelled count.
@@ -7942,13 +8021,18 @@ task, include it with an empty "files" list rather than omitting it.
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
-    def _reap_orphan_l0_escalations(self) -> int:
+    async def _reap_orphan_l0_escalations(self) -> int:
         """Single pass: promote any overdue orphan L0 to L1.  Returns count.
 
         Extracted from the loop so tests can drive it deterministically.
         An escalation is an orphan when its ``task_id`` is not in
         ``_escalation_events`` (no running workflow) and it is older than
         ``orphan_l0_timeout_secs``.
+
+        Async (task 2725): the done-step-commit orphan class needs to
+        ``await self.scheduler.get_task(...)`` to check whether its
+        subject task is terminal+merged (rebase-superseded false
+        positive) before promoting.
         """
         if self._escalation_queue is None:
             return 0
@@ -7989,6 +8073,35 @@ task, include it with an empty "files" list rather than omitting it.
                     resolved_by='harness-orphan-reaper',
                 )
                 continue
+
+            # Rebase-superseded false positive (task 2725): a done-step-commit
+            # orphan (_is_done_step_commit_orphan) whose subject task is done
+            # is a false positive — the step's recorded commit is a
+            # pre-rebase intermediate no longer reachable from main, but its
+            # content landed on main under a new SHA via the merge. Dismiss
+            # rather than promote a duplicate manual-triage L1.
+            if _is_done_step_commit_orphan(esc):
+                task = await self.scheduler.get_task(esc.task_id)
+                if _is_terminal_merged(task):
+                    self._escalation_queue.resolve(
+                        esc.id,
+                        (
+                            'Dismissed by orphan reaper — done-step-commit '
+                            f'orphan for task_id={esc.task_id} is '
+                            'rebase-superseded: subject task is done, so '
+                            'the step content landed on main under a new '
+                            'SHA via the merge'
+                        ),
+                        dismiss=True,
+                        resolved_by='harness-orphan-reaper',
+                    )
+                    logger.info(
+                        'Orphan L0 reaper: dismissed rebase-superseded '
+                        'done-step-commit orphan for task_id=%s (subject '
+                        'task is done)',
+                        esc.task_id,
+                    )
+                    continue
 
             # Cite a durable branch ref instead of the originating worktree:
             # the orphan's worktree is ephemeral and likely reaped before a

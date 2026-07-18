@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -65,32 +65,72 @@ def _submit_aged(
     return esc
 
 
+def _submit_aged_done_step_commit_orphan(
+    queue: EscalationQueue,
+    task_id: str,
+    seconds_ago: float,
+    *,
+    step_id: str = 'step-7',
+    stale_commit: str = 'fb62c8e439abc123',
+) -> Escalation:
+    """Submit an aged L0 matching the done-step-commit class filed by
+    ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488) —
+    ``agent_role='orchestrator'``, ``category='infra_issue'``,
+    ``suggested_action='verify_wip_reconciliation'``.
+    """
+    ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='orchestrator',
+        severity='info',
+        category='infra_issue',
+        summary=(
+            f"Done step {step_id}'s commit {stale_commit[:10]} is orphaned "
+            'and could not be auto-reconciled against WIP tip <none>'
+        ),
+        detail=(
+            f'Step {step_id} recorded commit {stale_commit}, which is no '
+            'longer reachable from HEAD.'
+        ),
+        suggested_action='verify_wip_reconciliation',
+        timestamp=ts,
+        level=0,
+    )
+    queue.submit(esc)
+    return esc
+
+
 class TestOrphanL0Reaper:
     """Harness._reap_orphan_l0_escalations promotes aged orphan L0s to L1."""
 
-    def test_no_queue_is_noop(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_no_queue_is_noop(self, harness: Harness):
         harness._escalation_queue = None
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
 
-    def test_empty_queue(self, harness: Harness):
-        assert harness._reap_orphan_l0_escalations() == 0
+    @pytest.mark.asyncio
+    async def test_empty_queue(self, harness: Harness):
+        assert await harness._reap_orphan_l0_escalations() == 0
 
-    def test_young_l0_not_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_young_l0_not_promoted(self, harness: Harness):
         assert harness._escalation_queue is not None
         _submit_aged(harness._escalation_queue, 'review-abc', seconds_ago=10.0)
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
         pending = harness._escalation_queue.get_pending()
         assert len(pending) == 1
         assert pending[0].level == 0
 
-    def test_aged_orphan_l0_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_aged_orphan_l0_promoted(self, harness: Harness):
         assert harness._escalation_queue is not None
         original = _submit_aged(
             harness._escalation_queue, 'review-abc', seconds_ago=300.0,
             worktree='/home/leo/src/dark-factory/.worktrees/review-abc',
         )
 
-        count = harness._reap_orphan_l0_escalations()
+        count = await harness._reap_orphan_l0_escalations()
         assert count == 1
 
         all_escs = [
@@ -118,7 +158,8 @@ class TestOrphanL0Reaper:
         assert l1.worktree is None
         assert 'branch=task/review-abc' in (l1.detail or '')
 
-    def test_aged_orphan_l0_with_open_l1_dismissed_not_promoted(
+    @pytest.mark.asyncio
+    async def test_aged_orphan_l0_with_open_l1_dismissed_not_promoted(
         self, harness: Harness,
     ):
         """B2: an aged orphan L0 for a task that already has an open L1 is
@@ -138,7 +179,7 @@ class TestOrphanL0Reaper:
             harness._escalation_queue, 'task-99', seconds_ago=300.0, level=0,
         )
 
-        count = harness._reap_orphan_l0_escalations()
+        count = await harness._reap_orphan_l0_escalations()
         assert count == 0  # nothing promoted
 
         # The orphan L0 was dismissed by the reaper...
@@ -155,39 +196,312 @@ class TestOrphanL0Reaper:
         l1s = [e for e in all_escs if e and e.level == 1]
         assert len(l1s) == 1
 
-    def test_active_workflow_l0_not_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_active_workflow_l0_not_promoted(self, harness: Harness):
         """An L0 for a task_id with an active workflow is left alone."""
         assert harness._escalation_queue is not None
         import asyncio
         _submit_aged(harness._escalation_queue, 'task-42', seconds_ago=300.0)
         harness._escalation_events['task-42'] = asyncio.Event()
 
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
 
-    def test_l1_not_touched(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
         _submit_aged(
             harness._escalation_queue, 'review-abc', seconds_ago=300.0, level=1,
         )
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
         pending = harness._escalation_queue.get_pending()
         assert len(pending) == 1
         assert pending[0].level == 1
 
-    def test_multiple_orphans_all_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_multiple_orphans_all_promoted(self, harness: Harness):
         assert harness._escalation_queue is not None
         _submit_aged(harness._escalation_queue, 'review-a', seconds_ago=300.0)
         _submit_aged(harness._escalation_queue, 'review-b', seconds_ago=300.0)
         _submit_aged(harness._escalation_queue, 'review-c', seconds_ago=10.0)  # young
 
-        assert harness._reap_orphan_l0_escalations() == 2
+        assert await harness._reap_orphan_l0_escalations() == 2
 
         pending = harness._escalation_queue.get_pending()
         l1s = [e for e in pending if e.level == 1]
         l0s = [e for e in pending if e.level == 0]
         assert len(l1s) == 2
         assert len(l0s) == 1  # the young one remains
+
+    @pytest.mark.asyncio
+    async def test_done_step_commit_orphan_dismissed_when_subject_terminal_merged(
+        self, harness: Harness,
+    ):
+        """Task 2725: a done-step-commit-class orphan (filed by
+        ``TaskWorkflow._escalate_unreconciled_done_step``) whose subject
+        task is terminal ('done') and merged
+        (``done_provenance.kind='merged'``) is a rebase-superseded false
+        positive — the step's content landed on main under a new SHA, so
+        the reaper dismisses the orphan instead of promoting a duplicate
+        manual-triage L1.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-2679', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'done',
+                'metadata': {'done_provenance': {'kind': 'merged'}},
+            },
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 0  # nothing promoted
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        # Positively distinguish this benign rebase-superseded dismiss path
+        # from the has_open_l1 dismiss branch and the promotion path, both
+        # of which also use resolved_by='harness-orphan-reaper'.
+        assert refreshed.resolution is not None
+        assert 'rebase-superseded' in refreshed.resolution
+
+        # No new L1 was created for this orphan.
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param(
+                {'done_provenance': {'kind': 'found_on_main'}}, id='found_on_main',
+            ),
+            pytest.param(
+                {'done_provenance': {'kind': 'operational-verified'}},
+                id='operational-verified',
+            ),
+            pytest.param({}, id='provenance-absent'),
+        ],
+    )
+    async def test_done_step_commit_orphan_promoted_when_subject_not_merged(
+        self, harness: Harness, metadata: dict,
+    ):
+        """Task 2725: a done-step-commit-class orphan whose subject task is
+        'done' but NOT in the terminal+merged family must still be
+        promoted — the dismiss skip is scoped narrowly to positively
+        confirmed merges only:
+
+        - 'found_on_main' is deliberately excluded — it is the class this
+          skip might otherwise mask, and it already has its own dedicated
+          landing guards (PRD 5dd39a4c42, batch 2674-2683).
+        - 'operational-verified' is a commitless closure kind — never had
+          a step commit to orphan in the first place.
+        - Absent provenance can't be positively confirmed benign — fail
+          open (promote).
+
+        Fails against step-2's naive status=='done' impl, which wrongly
+        dismisses all three instead of promoting.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-not-merged', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'status': 'done', 'metadata': metadata},
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 1
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].agent_role == 'harness-orphan-reaper'
+        assert l1s[0].task_id == 'task-not-merged'
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        # Dismissed via the PROMOTION path (superseded-by-L1), not the
+        # benign rebase-superseded skip message.
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
+        assert 'rebase-superseded' not in refreshed.resolution
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kind',
+        [
+            pytest.param(
+                'dispatch-gate-marker-found', id='dispatch-gate-marker-found',
+            ),
+            pytest.param(
+                'dispatch-gate-content-equivalent',
+                id='dispatch-gate-content-equivalent',
+            ),
+        ],
+    )
+    async def test_done_step_commit_orphan_dismissed_for_other_merged_kinds(
+        self, harness: Harness, kind: str,
+    ):
+        """Task 2725: the merged family covers three done_provenance.kind
+        values. 'merged' is covered by
+        test_done_step_commit_orphan_dismissed_when_subject_terminal_merged
+        above — this locks in the remaining two dispatch-gate kinds.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-merged-family', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'done',
+                'metadata': {'done_provenance': {'kind': kind}},
+            },
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 0  # nothing promoted
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        # Positively distinguish this benign rebase-superseded dismiss path
+        # from the has_open_l1 dismiss branch and the promotion path, both
+        # of which also use resolved_by='harness-orphan-reaper'.
+        assert refreshed.resolution is not None
+        assert 'rebase-superseded' in refreshed.resolution
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'status',
+        [
+            pytest.param('pending', id='pending'),
+            pytest.param('in-progress', id='in-progress'),
+            pytest.param('blocked', id='blocked'),
+        ],
+    )
+    async def test_done_step_commit_orphan_promoted_when_subject_still_live(
+        self, harness: Harness, status: str,
+    ):
+        """Task 2725: a done-step-commit orphan whose subject task has not
+        yet reached a terminal status is promoted as before — the
+        rebase-superseded false positive only exists once the task has
+        actually reached done+merged.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-still-live', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'status': status, 'metadata': {}},
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 1
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].agent_role == 'harness-orphan-reaper'
+        assert l1s[0].task_id == 'task-still-live'
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
+
+    @pytest.mark.asyncio
+    async def test_non_step_commit_class_orphan_unaffected_by_status_lookup(
+        self, harness: Harness,
+    ):
+        """Task 2725: the terminal+merged skip is scoped to the
+        done-step-commit class only. A differently-classed aged orphan
+        (agent_role='integration-reviewer', category='design_concern' —
+        see ``_submit_aged``) on a done+merged task is promoted exactly as
+        before, and the class-gate short-circuits before ever awaiting
+        ``scheduler.get_task``.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged(
+            harness._escalation_queue, 'task-other-class', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'done',
+                'metadata': {'done_provenance': {'kind': 'merged'}},
+            },
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 1
+        harness.scheduler.get_task.assert_not_awaited()
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-other-class'
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_done_step_commit_orphan_promoted_when_get_task_returns_none(
+        self, harness: Harness,
+    ):
+        """Task 2725: fail-safe — if scheduler.get_task cannot confirm the
+        subject task (``None`` on failure or absence), the orphan is
+        promoted rather than silently dismissed.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-unknown', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(return_value=None)
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 1
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-unknown'
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
 
 
 class TestReviewerEscalationPromotion:
