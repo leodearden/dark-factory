@@ -15,7 +15,7 @@ from typing import Any
 
 import anyio
 import httpx
-from shared.mcp_idempotency import MUTATING_TASK_TOOLS, maybe_inject_client_op_id
+from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
@@ -488,8 +488,9 @@ MCP_HEADERS = {
 #
 # Hoisted into shared.mcp_idempotency (task 2766) — this and the dashboard
 # McpSession twin (dashboard/src/dashboard/data/memory.py) import the same
-# frozenset + injection helper (MUTATING_TASK_TOOLS /
-# maybe_inject_client_op_id, imported above) so the two copies cannot drift.
+# injection helper (maybe_inject_client_op_id, imported above; it consults
+# the shared MUTATING_TASK_TOOLS frozenset internally) so the two copies
+# cannot drift.
 # maybe_inject_client_op_id is called ONCE per logical ``_raw_call`` below,
 # before the transport retry loop, so every transport retry within that call
 # reuses the same key (``payload`` holds ``params`` by reference and is

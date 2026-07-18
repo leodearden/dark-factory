@@ -25,6 +25,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+__all__ = ['MUTATING_TASK_TOOLS', 'maybe_inject_client_op_id']
+
 # Mutating task tools that must carry a client-supplied idempotency key so a
 # transport-level retry (after an ambiguous timeout/reset) dedupes server-side
 # instead of double-applying (task 2712). Reads/initialize are untouched.
