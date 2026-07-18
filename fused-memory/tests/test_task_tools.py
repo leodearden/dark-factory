@@ -189,6 +189,7 @@ async def test_update_task_param_forwarding(
         'status': None,
         'dependencies': None,
         'agent_id': None,
+        'client_op_id': None,
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)
@@ -756,6 +757,7 @@ async def test_set_task_status_accepts_merge_deferred(
         done_provenance=None,
         reopen_reason=None,
         agent_id=None,
+        client_op_id=None,
     )
 
 
@@ -857,6 +859,7 @@ async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
         status=None,
         dependencies=None,
         agent_id='recon-stage-7',
+        client_op_id=None,
     )
 
 
