@@ -97,6 +97,7 @@ from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflo
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
+    from escalation.models import Escalation
     from orchestrator.merge_queue import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -495,6 +496,27 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
         metadata.get('before_done_verified_at')
         or metadata.get('gate_escalated_at')
         or metadata.get('done_provenance')
+    )
+
+
+def _is_done_step_commit_orphan(esc: 'Escalation') -> bool:
+    """Return True iff *esc* is the done-step-commit orphan class filed by
+    ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488).
+
+    Task 2725: this is the sole, stable, machine-readable discriminator for
+    the one orphan-L0 class that is a false positive when its subject task
+    was requeue-rebased — the step's recorded ``commit`` SHA is a
+    pre-rebase intermediate no longer reachable from main, but the step's
+    content landed on main under a new SHA via the merge.
+    ``suggested_action='verify_wip_reconciliation'`` is set only by that
+    one filing site (grep-confirmed sole occurrence repo-wide), so matching
+    on it (plus ``agent_role``/``category``) is robust to summary-wording
+    changes, unlike a fragile summary-substring match.
+    """
+    return (
+        esc.agent_role == 'orchestrator'
+        and esc.category == 'infra_issue'
+        and esc.suggested_action == 'verify_wip_reconciliation'
     )
 
 
@@ -7997,6 +8019,35 @@ task, include it with an empty "files" list rather than omitting it.
                     resolved_by='harness-orphan-reaper',
                 )
                 continue
+
+            # Rebase-superseded false positive (task 2725): a done-step-commit
+            # orphan (_is_done_step_commit_orphan) whose subject task is done
+            # is a false positive — the step's recorded commit is a
+            # pre-rebase intermediate no longer reachable from main, but its
+            # content landed on main under a new SHA via the merge. Dismiss
+            # rather than promote a duplicate manual-triage L1.
+            if _is_done_step_commit_orphan(esc):
+                task = await self.scheduler.get_task(esc.task_id)
+                if task is not None and task.get('status') == 'done':
+                    self._escalation_queue.resolve(
+                        esc.id,
+                        (
+                            'Dismissed by orphan reaper — done-step-commit '
+                            f'orphan for task_id={esc.task_id} is '
+                            'rebase-superseded: subject task is done, so '
+                            'the step content landed on main under a new '
+                            'SHA via the merge'
+                        ),
+                        dismiss=True,
+                        resolved_by='harness-orphan-reaper',
+                    )
+                    logger.info(
+                        'Orphan L0 reaper: dismissed rebase-superseded '
+                        'done-step-commit orphan for task_id=%s (subject '
+                        'task is done)',
+                        esc.task_id,
+                    )
+                    continue
 
             # Cite a durable branch ref instead of the originating worktree:
             # the orphan's worktree is ephemeral and likely reaped before a
