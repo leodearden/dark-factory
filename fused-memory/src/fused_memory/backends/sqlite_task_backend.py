@@ -2595,11 +2595,18 @@ class SqliteTaskBackend:
         # ``details`` is passed it feeds the details path (replace, or append
         # when ``append=True``). ``metadata`` retains the merge-or-replace
         # semantics keyed off ``append``.
-        # Validate metadata_mode unconditionally — a bad value should always
-        # raise immediately, even if no metadata is supplied in this call.
-        # Resolution is stored so the metadata block can reuse it without a
-        # second call (and to keep the single call-site clear).
-        resolved_mode = _resolve_metadata_mode(metadata_mode, append)
+        # Validate the metadata_mode VALUE unconditionally — a bad value should
+        # always raise immediately, even if no metadata is supplied in this
+        # call. But scope the bare-append=False rejection (the task-2180
+        # metadata-wipe guard inside _resolve_metadata_mode) to metadata-present
+        # writes via metadata_present: ``append`` ALSO independently drives the
+        # details/prompt-append path below, so a details-only
+        # update_task(details=..., append=False) with no metadata must NOT be
+        # rejected. Resolution is stored so the metadata block can reuse it
+        # without a second call (and to keep the single call-site clear).
+        resolved_mode = _resolve_metadata_mode(
+            metadata_mode, append, metadata_present=metadata is not None,
+        )
 
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
