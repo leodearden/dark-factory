@@ -2985,7 +2985,8 @@ def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPat
 
 
 def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_cli([]) runs main(), fused_memory_liveness_pass(), then staleness_pass(), never report()."""
+    """_cli([]) runs main(), fused_memory_liveness_pass(), staleness_pass(), then
+    fused_memory_staleness_pass() (the fm staleness backstop, task 2714), never report()."""
     wdog = _load_watchdog()
     calls: list[str] = []
 
@@ -2995,12 +2996,18 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
         wdog, "fused_memory_liveness_pass", lambda: calls.append("fused_memory_liveness_pass")
     )
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
+    )
 
     wdog._cli([])
 
-    assert calls == ["main", "fused_memory_liveness_pass", "staleness_pass"], (
-        f"Expected main then fused_memory_liveness_pass then staleness_pass, got {calls}"
-    )
+    assert calls == [
+        "main",
+        "fused_memory_liveness_pass",
+        "staleness_pass",
+        "fused_memory_staleness_pass",
+    ], f"Expected liveness passes then both staleness passes (fm last), got {calls}"
 
 
 def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3014,11 +3021,36 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
         wdog, "fused_memory_liveness_pass", lambda: calls.append("fused_memory_liveness_pass")
     )
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
+    )
 
     # Must not raise
     wdog._cli(["--bogus"])
 
-    assert calls == ["main", "fused_memory_liveness_pass", "staleness_pass"]
+    assert calls == [
+        "main",
+        "fused_memory_liveness_pass",
+        "staleness_pass",
+        "fused_memory_staleness_pass",
+    ]
+
+
+def test_cli_report_does_not_run_fm_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--report must NOT invoke fused_memory_staleness_pass() (I7 at the CLI
+    boundary): the fm staleness backstop runs on the timer path only, never in
+    the read-only doctor mode."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "report", lambda: 0)
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
+    monkeypatch.setattr(
+        wdog,
+        "fused_memory_staleness_pass",
+        lambda: pytest.fail("fused_memory_staleness_pass() must not run under --report"),
+    )
+
+    assert wdog._cli(["--report"]) == 0
 
 
 def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
