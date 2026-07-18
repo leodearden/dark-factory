@@ -823,6 +823,33 @@ class _OfflineLaneTaskClient:
         return statuses.get(task_id, '')
 
 
+def _extract_tagger_entries(payload: Any) -> list:
+    """Peel known StructuredOutput wrapper keys and return the entries list.
+
+    The module tagger's output_schema is object-rooted with a top-level
+    ``predictions`` key (renamed from ``tasks`` — task 2561 defect 3). When
+    the schema's sole key collides with the StructuredOutput tool's own
+    parameter name and the prompt's dominant domain noun, the model
+    sometimes double-wraps its answer. This accepts, in order: the current
+    flat ``{"predictions": [...]}`` shape, the legacy single-wrap
+    ``{"tasks": [...]}``, and the legacy double-wrap
+    ``{"tasks": {"tasks": [...]}}``. Bounded to a few iterations so
+    pathological nesting fails safe to ``[]`` — no tagging, no crash —
+    rather than looping, matching the existing bad-output early-return
+    semantics. Pure function, no side effects.
+    """
+    for _ in range(3):
+        if not isinstance(payload, dict):
+            break
+        if 'predictions' in payload:
+            payload = payload['predictions']
+        elif 'tasks' in payload:
+            payload = payload['tasks']
+        else:
+            break
+    return payload if isinstance(payload, list) else []
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -2007,11 +2034,15 @@ class Harness:
         for t in tasks:
             if t.get('status') in skip_statuses:
                 continue
-            if not force:
-                metadata = t.get('metadata') or {}
-                files = metadata.get('files', [])
-                if files:
-                    continue
+            metadata = t.get('metadata') or {}
+            if metadata.get('task_kind') == 'deterministic':
+                # Deterministic tasks carry no worktree and no code (CLAUDE.md
+                # "Deterministic task kind"), so a file-lock prediction is
+                # meaningless for them — exclude them in every mode, including
+                # a force-retag.
+                continue
+            if not force and (metadata.get('files') or metadata.get('files_tagged_at')):
+                continue
             untagged.append(t)
 
         if not untagged:
@@ -2032,13 +2063,15 @@ class Harness:
             task_summaries.append({
                 'id': str(t.get('id', '')),
                 'title': t.get('title', ''),
-                'description': t.get('description', ''),
+                # Fall back to details when description is empty so the
+                # tagger still has context to predict from.
+                'description': t.get('description') or t.get('details') or '',
             })
 
         schema = {
             'type': 'object',
             'properties': {
-                'tasks': {
+                'predictions': {
                     'type': 'array',
                     'items': {
                         'type': 'object',
@@ -2054,7 +2087,7 @@ class Harness:
                     },
                 },
             },
-            'required': ['tasks'],
+            'required': ['predictions'],
         }
 
         prompt = f"""\
@@ -2072,7 +2105,13 @@ Directory paths are accepted when an entire directory will be touched.
 # Tasks to tag
 {json.dumps(task_summaries, indent=2)}
 
-Output JSON matching the schema. Every task must appear in the output.
+Output JSON matching the schema: a SINGLE top-level "predictions" array — do
+NOT nest it inside another "predictions" or "tasks" key. For example:
+
+{{"predictions":[{{"id":"12","files":["src/foo.py","tests/test_foo.py"]}},{{"id":"13","files":[]}}]}}
+
+Every task must appear in the output. If you cannot predict any files for a
+task, include it with an empty "files" list rather than omitting it.
 """
 
         try:
@@ -2108,35 +2147,74 @@ Output JSON matching the schema. Every task must appear in the output.
             logger.warning(f'Module tagger agent failed: {result.output[:200]}')
             return
 
-        # Parse the structured output
-        mapping = result.structured_output
-        if not mapping:
+        # Parse the structured output. _extract_tagger_entries peels known
+        # StructuredOutput wrapper keys ('predictions', legacy 'tasks') up to
+        # a bounded depth, so it accepts the current flat {"predictions": [...]}
+        # shape, the legacy single-wrap {"tasks": [...]}, and the legacy
+        # double-wrap {"tasks": {"tasks": [...]}} produced when the tool
+        # param name collided with the schema's old 'tasks' key (defect 3).
+        payload = result.structured_output
+        if not payload:
             try:
-                mapping = json.loads(result.output)
+                payload = json.loads(result.output)
             except (json.JSONDecodeError, TypeError):
                 logger.warning('Module tagger produced no parseable output')
                 return
 
+        # Index predictions by task id. A missing/empty files list normalizes
+        # to [] so a task the agent predicted no files for is still
+        # indexable (defect 1) rather than absent from the mapping.
+        pred_by_id = {
+            str(e.get('id', '')): (e.get('files') or [])
+            for e in _extract_tagger_entries(payload)
+            if isinstance(e, dict) and e.get('id') is not None
+        }
+
+        # Stamp files_tagged_at for EVERY task in the untagged batch — not
+        # just the ones present in the agent's response — so a task the
+        # agent can't (or won't) predict files for still gets marked as
+        # processed and never re-enters the tagging batch on the next cycle
+        # (defect 1: an LLM-spend leak — 73 tagger sessions mined in one
+        # month). The 'files' key is written ONLY when the prediction
+        # sanitizes to a NON-EMPTY file-level list; otherwise the sentinel is
+        # written alone, and scheduler.update_task's default merge mode
+        # preserves any pre-existing real files rather than clobbering them.
+        # This covers three no-clobber cases: the agent omits the task
+        # (files == []), predicts an explicit empty list, OR predicts only
+        # directory-shaped paths (sanitize strips them to []) — the last of
+        # which is why the gate keys off the SANITIZED result, not the raw
+        # (possibly all-directory but truthy) prediction.
+        tagged_at = datetime.now(UTC).isoformat()
+
         tagged_count = 0
-        for entry in mapping.get('tasks', []):
-            task_id = str(entry.get('id', ''))
-            files = entry.get('files', [])
-            if task_id and files:
-                # Persist file-level paths only: strip directory-shaped entries
-                # before writing so the lock-charter guard on update_task /
-                # task_interceptor.update_task accepts the write. Without this,
-                # any LLM-tagged directory entry makes update_task reject the
-                # ENTIRE payload (LockCharterViolation), silently dropping the
-                # valid file-level entries too. Consistent with the strip in
-                # _persist_files_metadata / _reconcile_metadata_files_for_done.
-                await self.scheduler.update_task(
-                    task_id, json.dumps({'files': sanitize_files_for_persist(files)})
-                )
+        for t in untagged:
+            task_id = str(t.get('id', ''))
+            if not task_id:
+                continue
+            files = pred_by_id.get(task_id, [])
+            metadata_payload: dict[str, Any] = {'files_tagged_at': tagged_at}
+            # Persist file-level paths only: strip directory-shaped entries
+            # before writing so the lock-charter guard on update_task /
+            # task_interceptor.update_task accepts the write. Without this,
+            # any LLM-tagged directory entry makes update_task reject the
+            # ENTIRE payload (LockCharterViolation), silently dropping the
+            # valid file-level entries too. Consistent with the strip in
+            # _persist_files_metadata / _reconcile_metadata_files_for_done.
+            # An all-directory prediction sanitizes to [] and is treated
+            # exactly like an empty/omitted one (sentinel alone, no clobber).
+            sanitized = sanitize_files_for_persist(files) if files else []
+            if sanitized:
+                metadata_payload['files'] = sanitized
+            await self.scheduler.update_task(task_id, json.dumps(metadata_payload))
+            if sanitized:
                 # Populate in-memory cache via the single cache-writing seam.
                 # module_charter.derive_modules (called inside seed_modules)
                 # applies the α strip so a directory-only charter cannot
                 # poison the cache and bypass _get_modules' α strip on the
-                # next tick.
+                # next tick. Seed with the RAW predicted files (the α strip
+                # lives inside derive_modules); seeding is skipped whenever
+                # the sanitized result is empty, so tagged_count reflects only
+                # tasks that actually received file-level locks.
                 self.scheduler.seed_modules(task_id, files)
                 tagged_count += 1
 

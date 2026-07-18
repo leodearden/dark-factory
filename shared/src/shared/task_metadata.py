@@ -698,6 +698,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
     'before_done_ran_at',
     'before_done_verified_at',
     'before_done_verified_pid',
+    'files_tagged_at',
     'origin_finding_id',
     'spawned_from',
     'program',

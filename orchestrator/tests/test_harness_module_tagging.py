@@ -10,6 +10,7 @@ import pytest
 from _orch_helpers import assert_update_wire_mode
 from shared.cli_invoke import AllAccountsCappedException
 
+import orchestrator.harness as harness_module
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
@@ -504,3 +505,500 @@ async def test_tag_task_modules_routes_through_seed_modules(tmp_path):
     task_id, metadata_json = h.scheduler.update_task.call_args.args
     assert task_id == '1'
     assert json.loads(metadata_json)['files'] == ['src/config/schema.py']
+
+
+# ---------------------------------------------------------------------------
+# StructuredOutput schema rename 'tasks'->'predictions' + double-wrap
+# acceptance (task 2561 defect 3 / acceptance c)
+# ---------------------------------------------------------------------------
+
+_ONE_UNTAGGED_TASK = [
+    {
+        'id': '1',
+        'title': 'Task',
+        'description': 'desc',
+        'status': 'pending',
+        'metadata': {},
+        'dependencies': [],
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_output_schema_uses_predictions_root(harness):
+    """The output_schema's top-level key must be 'predictions', not 'tasks'.
+
+    The StructuredOutput tool's sole parameter is named after the schema's
+    top-level key; when that key is 'tasks' — the same heavily-repeated
+    domain noun used throughout the prompt — the model double-wraps its
+    answer as {"tasks": {"tasks": [...]}} (9/11 mined sessions). Renaming
+    the key removes the param-name/schema-key/domain-noun collision.
+
+    Fails now: schema is still keyed 'tasks'.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=_ONE_UNTAGGED_TASK)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': [{'id': '1', 'files': ['a.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+        await harness._tag_task_modules()
+
+    schema = mock_invoke.call_args.kwargs['output_schema']
+    assert 'predictions' in schema['properties'], (
+        f"Expected 'predictions' key in schema['properties']; got {schema['properties']!r}"
+    )
+    assert 'tasks' not in schema['properties'], (
+        f"schema['properties'] must not retain the colliding 'tasks' key; got {schema['properties']!r}"
+    )
+    assert schema['required'] == ['predictions'], (
+        f"Expected schema['required'] == ['predictions']; got {schema['required']!r}"
+    )
+
+    prompt = mock_invoke.call_args.kwargs['prompt']
+    assert 'predictions' in prompt, "Expected the literal token 'predictions' in the tagger prompt"
+
+
+@pytest.mark.asyncio
+async def test_tag_accepts_legacy_double_wrap(harness):
+    """The parser must still accept the legacy double-wrap {"tasks": {"tasks": [...]}}.
+
+    A defensive normalizer (_extract_tagger_entries) tolerates old-format
+    stragglers during rollout, even after the schema key is renamed.
+
+    Fails now: the parser does `mapping.get('tasks', [])`, which on this
+    double-wrap returns the inner dict {'tasks': [...]}, not a list.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=_ONE_UNTAGGED_TASK)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'tasks': {'tasks': [{'id': '1', 'files': ['a.py']}]}}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    assert json.loads(metadata_json)['files'] == ['a.py']
+
+
+@pytest.mark.asyncio
+async def test_tag_accepts_new_flat_predictions(harness):
+    """The parser must accept the new flat {"predictions": [...]} shape.
+
+    Fails now: the parser does `mapping.get('tasks', [])`, which finds
+    nothing under the new 'predictions' key and silently tags 0 tasks.
+    """
+    harness.scheduler.get_tasks = AsyncMock(return_value=_ONE_UNTAGGED_TASK)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': [{'id': '1', 'files': ['a.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    assert json.loads(metadata_json)['files'] == ['a.py']
+
+
+# ---------------------------------------------------------------------------
+# Sentinel persist for empty/omitted predictions (task 2561 defect 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_persists_sentinel_for_empty_and_omitted(harness):
+    """Every task in the untagged batch must get files_tagged_at persisted,
+    even when the agent predicts empty files or omits the task entirely.
+
+    Without this sentinel, a task the agent can't (or won't) predict files
+    for re-enters the tagging batch every cycle forever — 73 tagger
+    sessions mined in one month, an LLM-spend leak.
+
+    Fails now: the persist gate `if task_id and files:` writes nothing for
+    an empty or omitted prediction, so neither '1' nor '2' get an
+    update_task call.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task A', 'description': '',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+        {
+            'id': '2', 'title': 'Task B', 'description': '',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    # '1' gets an explicit empty files prediction; '2' is omitted entirely.
+    agent_response = {'predictions': [{'id': '1', 'files': []}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules()
+
+    assert harness.scheduler.update_task.call_count == 2, (
+        f'Expected update_task for both tasks; got '
+        f'{harness.scheduler.update_task.call_args_list!r}'
+    )
+    calls = harness.scheduler.update_task.call_args_list
+    call_ids = {c.args[0] for c in calls}
+    assert call_ids == {'1', '2'}
+
+    for call in calls:
+        task_id, metadata_json = call.args
+        metadata = json.loads(metadata_json)
+        tagged_at = metadata.get('files_tagged_at')
+        assert isinstance(tagged_at, str) and tagged_at, (
+            f'Expected a truthy files_tagged_at string for task {task_id}; '
+            f'got metadata={metadata!r}'
+        )
+        assert not metadata.get('files'), (
+            f'Expected no non-empty files for task {task_id} (empty/omitted '
+            f'prediction); got metadata={metadata!r}'
+        )
+
+    mock_seed_modules.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _extract_tagger_entries: StructuredOutput wrapper-peeling normalizer
+# (task 2561 defect 3 / acceptance c)
+# ---------------------------------------------------------------------------
+
+_EXTRACT_TAGGER_ENTRIES_CASES = [
+    pytest.param(
+        {'predictions': [{'id': '1', 'files': ['a.py']}]},
+        [{'id': '1', 'files': ['a.py']}],
+        id='new_flat_predictions',
+    ),
+    pytest.param(
+        {'tasks': [{'id': '1', 'files': ['a.py']}]},
+        [{'id': '1', 'files': ['a.py']}],
+        id='legacy_single_wrap_tasks',
+    ),
+    pytest.param(
+        {'tasks': {'tasks': [{'id': '1', 'files': ['a.py']}]}},
+        [{'id': '1', 'files': ['a.py']}],
+        id='legacy_double_wrap_tasks_tasks',
+    ),
+    pytest.param({}, [], id='empty_dict'),
+    pytest.param(None, [], id='none'),
+    pytest.param({'tasks': {}}, [], id='tasks_maps_to_empty_dict'),
+]
+
+
+@pytest.mark.parametrize('payload, expected', _EXTRACT_TAGGER_ENTRIES_CASES)
+def test_extract_tagger_entries(payload, expected):
+    """_extract_tagger_entries must peel known wrapper keys up to a bounded depth.
+
+    Accepts the new flat {"predictions": [...]} shape (post-rename), the
+    legacy single-wrap {"tasks": [...]}, and the legacy double-wrap
+    {"tasks": {"tasks": [...]}} produced when the StructuredOutput tool's
+    sole parameter collides with the schema's top-level key. Anything that
+    doesn't resolve to a list fails safe to [] (no tagging, no crash).
+
+    Fails now with AttributeError: orchestrator.harness has no
+    _extract_tagger_entries yet (added in step-4).
+    """
+    assert harness_module._extract_tagger_entries(payload) == expected
+
+
+# ---------------------------------------------------------------------------
+# Sentinel skip: a sentinel-but-no-files task must not re-enter the batch
+# (task 2561 acceptance a-skip)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_skips_task_with_sentinel(harness):
+    """A task carrying only files_tagged_at (no files) must be skipped.
+
+    Without this, a task the agent couldn't predict files for — which only
+    ever gets the sentinel, never a files list — would re-enter the
+    tagging batch on every cycle forever.
+
+    Fails now: the skip-check keys off truthy `files` only, so a
+    sentinel-but-no-files task still enters the batch and invokes the
+    agent.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': '',
+            'status': 'pending',
+            'metadata': {'files_tagged_at': '2026-07-16T00:00:00+00:00'},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock()) as mock_invoke:
+        await harness._tag_task_modules()
+        mock_invoke.assert_not_called()
+
+    harness.scheduler.update_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic task exclusion (task 2561 defect 2 / acceptance b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_excludes_deterministic_tasks(harness):
+    """task_kind='deterministic' tasks must never enter the tagging batch.
+
+    Deterministic tasks carry no worktree and no code (CLAUDE.md
+    "Deterministic task kind"), so a file-lock prediction is meaningless
+    for them.
+
+    Fails now: the batch loop has no task_kind filter, so the
+    deterministic task '2' is included in the prompt and can be updated.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Normal task', 'description': '',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+        {
+            'id': '2', 'title': 'Deterministic task', 'description': '',
+            'status': 'pending', 'metadata': {'task_kind': 'deterministic'},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': [{'id': '1', 'files': ['a.py']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+        await harness._tag_task_modules()
+
+    prompt = mock_invoke.call_args.kwargs['prompt']
+    assert '"1"' in prompt
+    assert '"2"' not in prompt, (
+        f'Deterministic task "2" must not appear in the tagger prompt; got prompt={prompt!r}'
+    )
+
+    update_ids = {c.args[0] for c in harness.scheduler.update_task.call_args_list}
+    assert '2' not in update_ids, (
+        f'update_task must not be awaited for deterministic task "2"; got ids={update_ids!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_tag_skips_when_only_deterministic(harness):
+    """If the only untagged task is deterministic, the batch is empty and
+    the agent must not be invoked at all.
+
+    Fails now: no task_kind filter, so the deterministic task fills the
+    batch and the agent is invoked.
+    """
+    tasks = [
+        {
+            'id': '2', 'title': 'Deterministic task', 'description': '',
+            'status': 'pending', 'metadata': {'task_kind': 'deterministic'},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock()) as mock_invoke:
+        await harness._tag_task_modules()
+        mock_invoke.assert_not_called()
+
+    harness.scheduler.update_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# details fallback in the prompt when description is empty (task 2561
+# defect 3 prompt fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_prompt_uses_details_when_description_empty(harness):
+    """When a task's description is empty, the prompt must fall back to
+    its details field so the tagger still has context to predict from.
+
+    Fails now: task_summaries reads t.get('description', '') only, so
+    details is never surfaced in the prompt.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': '',
+            'details': 'SPECIAL_DETAILS_TOKEN',
+            'status': 'pending', 'metadata': {}, 'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+
+    agent_response = {'predictions': []}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)) as mock_invoke:
+        await harness._tag_task_modules()
+
+    prompt = mock_invoke.call_args.kwargs['prompt']
+    assert 'SPECIAL_DETAILS_TOKEN' in prompt, (
+        f'Expected details fallback text in the prompt when description is empty; got prompt={prompt!r}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Force-retag merge-preservation: an all-directory or omitted prediction must
+# NOT clobber a task's pre-existing real files (task 2561 amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tag_force_all_directory_prediction_preserves_existing_files(harness):
+    """Force-retag: an all-directory prediction must not clobber real files.
+
+    In force mode a task that already carries real ``metadata.files`` is
+    re-tagged. If the agent's prediction for it is all directory-shaped paths,
+    ``sanitize_files_for_persist`` strips them to []. Writing ``{'files': []}``
+    under update_task's default merge mode would overwrite the pre-existing
+    valid file locks wholesale. The writeback must instead omit the 'files'
+    key entirely (sentinel alone) so merge preserves the existing files.
+
+    RED before the fix: the ``if files:`` gate keys off the raw (truthy)
+    prediction, so ``metadata['files'] = []`` is written and clobbers.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': 'desc',
+            'status': 'pending',
+            'metadata': {'files': ['src/existing.py']},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    # Prediction is a single directory-shaped path (no file extension) →
+    # sanitize_files_for_persist strips it to [].
+    agent_response = {'predictions': [{'id': '1', 'files': ['crates/reify-eval/src']}]}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules(force=True)
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    metadata = json.loads(metadata_json)
+    # Sentinel is stamped …
+    assert metadata.get('files_tagged_at'), (
+        f'Expected files_tagged_at sentinel; got metadata={metadata!r}'
+    )
+    # … but NO 'files' key is written, so merge-mode preserves the existing
+    # ['src/existing.py'] rather than clobbering it to [].
+    assert 'files' not in metadata, (
+        f'All-directory prediction must not write a files key (would clobber '
+        f'pre-existing files under merge mode); got metadata={metadata!r}'
+    )
+    # Nothing to seed for an all-directory (→ empty after sanitize) prediction.
+    mock_seed_modules.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tag_force_omitted_task_preserves_existing_files(harness):
+    """Force-retag: a task the agent omits keeps only the sentinel (no clobber).
+
+    The persist loop iterates the untagged batch (not the agent response), so
+    a task omitted from the prediction list still gets stamped. In force mode
+    against a task that already has real ``metadata.files``, the write must
+    carry ONLY files_tagged_at (no 'files' key) so update_task's default merge
+    mode preserves the pre-existing file locks.
+
+    Regression guard for the documented no-clobber guarantee.
+    """
+    tasks = [
+        {
+            'id': '1', 'title': 'Task', 'description': 'desc',
+            'status': 'pending',
+            'metadata': {'files': ['src/existing.py']},
+            'dependencies': [],
+        },
+    ]
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    # Agent omits task '1' entirely.
+    agent_response = {'predictions': []}
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)):
+        await harness._tag_task_modules(force=True)
+
+    harness.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = harness.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    metadata = json.loads(metadata_json)
+    assert metadata.get('files_tagged_at'), (
+        f'Expected files_tagged_at sentinel; got metadata={metadata!r}'
+    )
+    assert 'files' not in metadata, (
+        f'Omitted task must carry only the sentinel (no files key) so merge '
+        f'preserves pre-existing files; got metadata={metadata!r}'
+    )
+    mock_seed_modules.assert_not_called()
