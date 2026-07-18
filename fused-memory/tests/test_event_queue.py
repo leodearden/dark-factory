@@ -1453,3 +1453,103 @@ async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
             journal.close()
     finally:
         await queue2.close()
+
+
+# ── Dead-letter replay (task 2709) ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
+    """replay_dead_letters re-enqueues dead-lettered events (drainer commits
+    them), clears them from the file, and a second call finds nothing to replay.
+    """
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=dl,
+        journal_path=tmp_path / 'ej.db',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(3):
+            q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+        assert len(dl.read_text().strip().splitlines()) == 3
+
+        counts = q.replay_dead_letters()
+        assert counts == {'replayed': 3, 'failed': 0}
+        # Drainer commits the replayed events to the buffer.
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 3
+        # File no longer holds the replayed records.
+        assert (dl.read_text().strip() if dl.exists() else '') == ''
+        # Second call → nothing to replay (no re-replay).
+        assert q.replay_dead_letters() == {'replayed': 0, 'failed': 0}
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
+    """With project_id set, only matching records are replayed; non-matching
+    records remain in the dead-letter file."""
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=dl,
+        journal_path=tmp_path / 'ej.db',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(2):
+            q._write_dead_letter(_make_event(project_id='proj-a'), reason='non_retriable', attempts=1)
+        for _ in range(3):
+            q._write_dead_letter(_make_event(project_id='proj-b'), reason='non_retriable', attempts=1)
+
+        counts = q.replay_dead_letters(project_id='proj-a')
+        assert counts == {'replayed': 2, 'failed': 0}
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        assert (await real_buffer.get_buffer_stats('proj-a'))['size'] == 2
+        # Non-matching proj-b records are preserved in the file.
+        remaining = q.read_dead_letters()
+        assert len(remaining) == 3
+        assert all(r['event']['project_id'] == 'proj-b' for r in remaining)
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
+    """A malformed/unparseable dead-letter line counts toward `failed` and is
+    preserved (loud-over-silent — never silently dropped)."""
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=dl,
+        journal_path=tmp_path / 'ej.db',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+        with dl.open('a', encoding='utf-8') as fh:
+            fh.write('{not valid json\n')
+
+        counts = q.replay_dead_letters()
+        assert counts == {'replayed': 1, 'failed': 1}
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        # The malformed line survives; the good record was replayed out.
+        assert dl.exists()
+        assert '{not valid json' in dl.read_text()
+    finally:
+        await q.close()
