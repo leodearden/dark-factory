@@ -140,29 +140,41 @@ def http_server(
     below); do not reuse a ``task_id`` across tests or depend on
     ``make_id`` sequencing, or tests can silently interfere via shared
     queue state.
+
+    Teardown is explicit (task 2741): the event loop is created here in the
+    fixture body (not inside the thread target), so it can be stopped
+    thread-safely at teardown — ``loop.call_soon_threadsafe(loop.stop)``
+    unblocks ``run_until_complete`` in the serving thread, which is then
+    joined (bounded to 5s). A ``stopping`` flag distinguishes that
+    deliberate, stop-induced ``RuntimeError`` from a genuine startup
+    failure, so ``serve_error`` below still reflects only real errors.
     """
     queue_dir = tmp_path_factory.mktemp('status_authority_gate_http')
     queue = EscalationQueue(queue_dir)
     mcp = create_server(queue, startup_sweep=False)
     port = _free_port()
+    loop = asyncio.new_event_loop()
     # _free_port() binds-then-closes to find a free port, then the real bind
     # happens below — a TOCTOU another process (or a concurrent xdist worker)
     # could win. serve_error surfaces that as the actual OSError on timeout
     # below, instead of only the generic "did not become ready" message.
     serve_error: BaseException | None = None
+    stopping = False
 
     def _serve_forever() -> None:
         nonlocal serve_error
+        asyncio.set_event_loop(loop)
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             loop.run_until_complete(
                 mcp.run_http_async(
                     host='127.0.0.1', port=port, show_banner=False, log_level='error',
                 )
             )
         except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
-            serve_error = exc
+            if not stopping:
+                serve_error = exc
+        finally:
+            loop.close()
 
     thread = threading.Thread(
         target=_serve_forever, name='status-authority-gate-http', daemon=True,
@@ -190,7 +202,12 @@ def http_server(
             f'handshake on 127.0.0.1:{port} within 10s{detail}'
         )
 
-    yield base_url, queue
+    try:
+        yield base_url, queue
+    finally:
+        stopping = True
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
 
 
 async def _resolve_over_http(
