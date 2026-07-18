@@ -52,6 +52,28 @@ def _reset_archival_failures() -> None:
     _ARCHIVAL_FAILURES = 0
 
 
+def _record_failure(src: Path, task_id: str, exc: OSError) -> None:
+    """Count and loudly (but non-fatally) log a single per-file archive failure.
+
+    Increments :data:`_ARCHIVAL_FAILURES` and emits one structured WARNING so a
+    systemic breakage (e.g. disk full → every file fails) is visible as a
+    climbing counter rather than failing silently (design-invariants
+    INV-2/INV-4).
+    """
+    global _ARCHIVAL_FAILURES
+    _ARCHIVAL_FAILURES += 1
+    logger.warning(
+        'transcript_archive: failed to archive %s: %s',
+        src,
+        exc,
+        extra={
+            'path': str(src),
+            'task_id': task_id,
+            'errno': getattr(exc, 'errno', None),
+        },
+    )
+
+
 def _archive_one(
     src: Path,
     projects_root: Path,
@@ -111,6 +133,13 @@ def archive_task_transcripts(
 
     count = 0
     for src in sources:
-        if _archive_one(src, projects_root, archive_root, task_id):
-            count += 1
+        # Best-effort: a per-file OSError (incl. gzip.BadGzipFile, which
+        # subclasses OSError) is logged + counted, never re-raised, so one bad
+        # file cannot lose its siblings and the whole function stays total —
+        # the property the producer relies on to call it inside a finally.
+        try:
+            if _archive_one(src, projects_root, archive_root, task_id):
+                count += 1
+        except OSError as exc:
+            _record_failure(src, task_id, exc)
     return count
