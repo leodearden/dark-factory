@@ -352,3 +352,200 @@ class TestEntrySerialization:
         assert restored.summary == entry.summary
         assert restored.summary_warnings == entry.summary_warnings
         assert restored.created_at == entry.created_at
+
+
+# ---------------------------------------------------------------------------
+# step-7: write-through persistence on every mutator — RED until step-8
+# ---------------------------------------------------------------------------
+
+
+class _WTFakeMemoryService:
+    """Minimal async stub sufficient to drive cite_entity/cite_edge/cite_memory."""
+
+    def __init__(self):
+        self.entity_nodes = [{'uuid': 'a1b2c3d4-e5f6-7890-abcd-ef1234567890', 'name': 'Foo'}]
+        self.edge_result = {'fact': 'fact text'}
+        self.memory_result = {'fingerprint': 'fp'}
+
+    async def get_entity(self, name, project_id):
+        return {'nodes': self.entity_nodes, 'edges': []}
+
+    async def get_edge(self, edge_uuid, project_id):
+        return self.edge_result
+
+    async def get_memory(self, memory_id, store, project_id):
+        return self.memory_result
+
+    async def count_memories_by_metadata(self, project_id, filters):
+        return 1
+
+
+class _WTFakeTaskInterceptor:
+    async def get_task(self, task_id, project_root, tag=None):
+        return {'data': {'title': 'Some Task'}, 'title': 'Some Task'}
+
+
+class TestWriteThrough:
+    """Every ReconReportState mutator write-throughs to the store immediately."""
+
+    def _make_state(self, tmp_path):
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state, store, t
+
+    def _row_for(self, store, run_id, stage):
+        rows = store.load_all()
+        matches = [r for r in rows if r['run_id'] == run_id and r['stage'] == stage]
+        assert len(matches) == 1, (
+            f'expected exactly one persisted row for {(run_id, stage)!r}, got {len(matches)}'
+        )
+        return matches[0]
+
+    def _entry_for(self, store, run_id, stage):
+        from fused_memory.server.recon_report import _deserialize_entry
+
+        return _deserialize_entry(self._row_for(store, run_id, stage)['entry_json'])
+
+    @pytest.mark.asyncio
+    async def test_full_lifecycle_write_through(self, tmp_path):
+        state, store, _t = self._make_state(tmp_path)
+        run_id = 'wt-run-1'
+        stage = 'memory_consolidator'
+
+        try:
+            # start_report
+            state.start_report(run_id=run_id, stage=stage, project_id='dark_factory')
+            row = self._row_for(store, run_id, stage)
+            assert row['is_active'] is True
+            assert row['project_id'] == 'dark_factory'
+            entry = self._entry_for(store, run_id, stage)
+            assert entry.run_id == run_id
+            assert entry.findings == []
+
+            # add_finding — real (task_id, flag_type) signature
+            result_real = state.add_finding(
+                run_id=run_id, severity='moderate', category='memory_stale',
+                description='real', suggested_action='act', actionable=True,
+                task_id='42', flag_type='orphaned_knowledge',
+            )
+            fid_real = result_real['finding_id']
+            entry = self._entry_for(store, run_id, stage)
+            assert {f.finding_id for f in entry.findings} == {fid_real}
+
+            # add_finding — null/null (description-hash dedup)
+            result_null = state.add_finding(
+                run_id=run_id, severity='low', category='other',
+                description='null null observation', suggested_action='note',
+                actionable=False,
+            )
+            fid_null = result_null['finding_id']
+            entry = self._entry_for(store, run_id, stage)
+            assert {f.finding_id for f in entry.findings} == {fid_real, fid_null}
+
+            # delete_finding — retract the null/null finding.  Done BEFORE
+            # complete() below: delete_finding is rejected once the owning
+            # entry is completed (report_already_completed guard), so this is
+            # the only point in a single-stage lifecycle where a genuine
+            # delete is possible.
+            delete_result = state.delete_finding(run_id, fid_null)
+            assert delete_result == {'status': 'deleted', 'finding_id': fid_null}
+            entry = self._entry_for(store, run_id, stage)
+            assert {f.finding_id for f in entry.findings} == {fid_real}
+
+            # set_stat
+            state.set_stat(run_id, 'scanned', 10)
+            entry = self._entry_for(store, run_id, stage)
+            assert entry.stats['scanned'] == 10
+
+            # inc_stat
+            state.inc_stat(run_id, 'scanned', 5)
+            entry = self._entry_for(store, run_id, stage)
+            assert entry.stats['scanned'] == 15
+
+            # cite_task
+            cite_task_result = await state.cite_task(run_id, fid_real, 'dark_factory', '42')
+            assert 'error' not in cite_task_result
+            entry = self._entry_for(store, run_id, stage)
+            cited_real = next(f for f in entry.findings if f.finding_id == fid_real)
+            assert cited_real.cited_tasks and cited_real.cited_tasks[0]['task_id'] == '42'
+
+            # cite_entity
+            cite_entity_result = await state.cite_entity(run_id, fid_real, 'foo')
+            assert 'error' not in cite_entity_result
+            entry = self._entry_for(store, run_id, stage)
+            cited_real = next(f for f in entry.findings if f.finding_id == fid_real)
+            assert cited_real.cited_entities
+
+            # cite_edge
+            cite_edge_result = await state.cite_edge(
+                run_id, fid_real, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+            )
+            assert 'error' not in cite_edge_result
+            entry = self._entry_for(store, run_id, stage)
+            cited_real = next(f for f in entry.findings if f.finding_id == fid_real)
+            assert cited_real.cited_edges
+
+            # cite_memory
+            cite_memory_result = await state.cite_memory(
+                run_id, fid_real, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890', 'mem0'
+            )
+            assert 'error' not in cite_memory_result
+            entry = self._entry_for(store, run_id, stage)
+            cited_real = next(f for f in entry.findings if f.finding_id == fid_real)
+            assert cited_real.cited_memories
+
+            # complete
+            complete_result = state.complete(run_id, 'summary text')
+            assert complete_result['flagged_count'] == 1
+            entry = self._entry_for(store, run_id, stage)
+            assert entry.completed_at is not None
+            assert entry.summary == 'summary text'
+        finally:
+            store.close()
+
+    @pytest.mark.asyncio
+    async def test_recon_lifecycle_filer_direct_sync_add_finding_persists(self, tmp_path):
+        """recon_lifecycle_filer.py calls ReconReportState.add_finding directly
+        (a sync call, not via an MCP tool wrapper) — confirm that path also
+        write-throughs, since it's one of the two non-MCP-wrapper synchronous
+        callers named in the design (the other is stages/base.py's start_report)."""
+        from fused_memory.middleware.live_task_write_guard import LiveTaskSnapshot, LifecycleResetFinding
+        from fused_memory.server.recon_lifecycle_filer import build_lifecycle_reset_filer
+
+        state, store, _t = self._make_state(tmp_path)
+        run_id = 'wt-filer-run'
+        stage = 'task_knowledge_sync'
+
+        try:
+            state.start_report(run_id=run_id, stage=stage, project_id='dark_factory')
+            file_finding = build_lifecycle_reset_filer(state)
+            finding = LifecycleResetFinding(
+                task_id='7',
+                project_id='dark_factory',
+                op='update_task',
+                before=LiveTaskSnapshot(
+                    status='in-progress', claimant_run_id='run-x/session-1/pid=1',
+                    heartbeat_at='2026-07-15T12:00:00+00:00',
+                ),
+                after=LiveTaskSnapshot(status='pending', claimant_run_id=None, heartbeat_at=None),
+                diverged_fields=('claimant_run_id', 'status'),
+            )
+            await file_finding(finding)
+
+            entry = self._entry_for(store, run_id, stage)
+            assert len(entry.findings) == 1
+            assert entry.findings[0].task_id == '7'
+        finally:
+            store.close()
