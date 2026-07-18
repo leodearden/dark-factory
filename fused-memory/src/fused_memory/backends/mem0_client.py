@@ -423,6 +423,37 @@ class Mem0Backend:
 
         return result
 
+    async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
+        """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.
+
+        Fetches a single Mem0 record straight from Qdrant's ``retrieve`` API by
+        its raw point-id (the Mem0 memory UUID) and returns the FULL raw payload
+        dict — bypassing both semantic ranking (``search``) and metadata-equality
+        filtering (``count_by_metadata`` / ``scroll_by_metadata``).
+
+        Unlike :meth:`get` (mem0 ``AsyncMemory.get``, which swallows a read
+        timeout into ``None``), a Qdrant read-timeout is PROPAGATED (raises
+        ``TimeoutError``), never swallowed — mirroring ``count_by_metadata`` /
+        ``scroll_by_metadata`` so a timed-out read is never mistaken for a
+        genuine not-found (no-silent-fail invariant). That timeout-distinguishing
+        behaviour is the whole reason this bypasses ``get``.
+
+        Returns the point's full raw payload dict, or ``None`` when the point is
+        absent (empty ``retrieve`` result).
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        records = await asyncio.wait_for(
+            client.retrieve(
+                collection_name=collection_name,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            ),
+            timeout=self._read_timeout,
+        )
+        return dict(records[0].payload or {}) if records else None
+
     async def close(self) -> None:
         """Close all cached AsyncMemory instances and release their connections."""
         import contextlib
