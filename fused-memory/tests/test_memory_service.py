@@ -8450,3 +8450,95 @@ class TestStoreFailureDiagnosticsHelper:
         mem0_diag = next(d for d in res.failure_diagnostics if d['store'] == 'mem0')
         assert mem0_diag['reason'] == 'exception'
         assert mem0_diag['error_type'] == 'RuntimeError'
+
+
+class TestGetMemoryById:
+    """MemoryService.get_memory_by_id: raw Mem0 point-id read (content + full payload).
+
+    Non-semantic, distinct from the fingerprint-only get_memory — delegates to
+    Mem0Backend.get_point_by_id and returns {'id', 'content', 'metadata'} (raw
+    payload) or None on a genuine miss, propagating TimeoutError.
+    """
+
+    @pytest.mark.asyncio
+    async def test_found_returns_id_content_metadata(self, service):
+        """A present point → {'id', 'content'(=payload['data']), 'metadata'(=raw payload)}
+        and get_point_by_id is called once with (memory_id, Scope(project_id=...))."""
+        uuid = '77a3f6bc-0000-0000-0000-000000000000'
+        payload = {'data': 'the content', 'category': 'observations_and_summaries', 'agent_id': 'x'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id=uuid)
+
+        assert result == {'id': uuid, 'content': 'the content', 'metadata': payload}
+        # metadata must be the exact raw payload (nothing stripped/hidden)
+        assert result['metadata'] is payload
+
+        service.mem0.get_point_by_id.assert_called_once()
+        call_args = service.mem0.get_point_by_id.call_args
+        assert call_args.args[0] == uuid, f'expected memory_id positional, got {call_args!r}'
+        scope = call_args.args[1]
+        assert isinstance(scope, Scope)
+        assert scope.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_content_fallback_to_memory_key(self, service):
+        """When the payload has no 'data' key, content falls back to 'memory'."""
+        payload = {'memory': 'm', 'category': 'observations_and_summaries'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+        assert result is not None
+        assert result['content'] == 'm', f'expected content from memory key, got {result!r}'
+        assert result['metadata'] == payload
+
+    @pytest.mark.asyncio
+    async def test_content_fallback_to_content_key(self, service):
+        """With neither 'data' nor 'memory', content falls back to the third and
+        last key in the canonical _MEM0_CONTENT_KEYS order ('content')."""
+        payload = {'content': 'c', 'category': 'observations_and_summaries'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+        assert result is not None
+        assert result['content'] == 'c', f'expected content from content key, got {result!r}'
+        assert result['metadata'] == payload
+
+    @pytest.mark.asyncio
+    async def test_no_recognized_content_key_returns_found_with_empty_content(self, service):
+        """A present point whose payload carries NONE of _MEM0_CONTENT_KEYS is still
+        a hit (found), with content=='' and the full raw payload as metadata — the
+        documented ('data'→'memory'→'content'→'') precedence's fall-through arm.
+
+        This is a found-but-no-content-string result, NOT a miss: a consumer must
+        not treat empty content as absence (that's what None / found:False is for).
+        """
+        payload = {'category': 'observations_and_summaries', 'agent_id': 'y'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+        assert result is not None, 'a present point with no content key is still a hit, not a miss'
+        assert result['content'] == '', f'expected empty content on fall-through, got {result!r}'
+        assert result['metadata'] == payload
+        assert result['metadata'] is payload
+
+    @pytest.mark.asyncio
+    async def test_not_found_returns_none(self, service):
+        """get_point_by_id → None (genuine miss) propagates as a None service result."""
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        result = await service.get_memory_by_id(project_id='dark_factory', memory_id='missing')
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates(self, service):
+        """A backend TimeoutError propagates (NOT swallowed into None) so the MCP
+        boundary can surface it as an error rather than a genuine not-found."""
+        service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant retrieve timed out'))
+
+        with pytest.raises(TimeoutError):
+            await service.get_memory_by_id(project_id='dark_factory', memory_id='u')

@@ -1,6 +1,7 @@
 """Unit tests for Mem0Backend — filter construction and search delegation."""
 
 import contextlib
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -228,6 +229,106 @@ class TestMem0BackendScrollByMetadata:
             'Expected a truncation WARNING when len(points)==limit; '
             f'got warning messages: {warning_msgs}'
         )
+
+
+class TestMem0BackendGetPointById:
+    """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.
+
+    Direct-to-Qdrant point-fetch (retrieve by id), non-semantic — mirrors the
+    scroll_by_metadata / count_by_metadata timeout-propagation contract, which is
+    exactly why it bypasses the timeout-swallowing Mem0Backend.get.
+    """
+
+    def _make_mock_point(self, point_id: str, payload: dict | None):
+        """Create a MagicMock that mimics a Qdrant Record returned by retrieve()."""
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        return point
+
+    @pytest.mark.asyncio
+    async def test_retrieves_raw_payload(self, backend):
+        """get_point_by_id returns the point's full raw payload dict and calls
+        client.retrieve once with the right collection/id and payload/vector flags."""
+        uuid = '77a3f6bc-0000-0000-0000-000000000000'
+        payload = {'data': 'txt', 'category': 'observations_and_summaries', 'agent_id': 'a'}
+        point = self._make_mock_point(uuid, payload)
+
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[point])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.get_point_by_id(uuid, Scope(project_id='dark_factory'))
+
+        assert result == payload, f'expected raw payload {payload!r}, got {result!r}'
+        assert mock_client.retrieve.await_count == 1
+        call_kwargs = mock_client.retrieve.call_args.kwargs
+        collection_prefix = backend.config.mem0.collection_prefix
+        assert call_kwargs.get('collection_name') == f'{collection_prefix}_dark_factory'
+        assert call_kwargs.get('ids') == [uuid]
+        assert call_kwargs.get('with_payload') is True
+        assert call_kwargs.get('with_vectors') is False
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_not_found(self, backend):
+        """An empty retrieve result -> None (genuine miss)."""
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.get_point_by_id(
+                '00000000-0000-0000-0000-000000000000',
+                Scope(project_id='dark_factory'),
+            )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        """On TimeoutError the exception propagates — it is NOT swallowed into None.
+
+        Mirrors scroll_by_metadata/count_by_metadata's propagate-by-default
+        contract (no try/except around asyncio.wait_for): a timed-out point-fetch
+        must never be indistinguishable from a genuine not-found (no-silent-fail
+        invariant), which is exactly why this bypasses the timeout-swallowing
+        Mem0Backend.get.
+        """
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.get_point_by_id(
+                '00000000-0000-0000-0000-000000000000',
+                Scope(project_id='dark_factory'),
+            )
+
+    @pytest.mark.asyncio
+    async def test_multiple_records_uses_first_and_warns(self, backend, caplog):
+        """A single-id retrieve returning >1 record is unexpected: use records[0]'s
+        payload and log a WARNING (defense-in-depth, mirroring scroll_by_metadata)."""
+        uuid = '77a3f6bc-0000-0000-0000-000000000000'
+        first_payload = {'data': 'first', 'category': 'observations_and_summaries'}
+        second_payload = {'data': 'second', 'category': 'observations_and_summaries'}
+        p1 = self._make_mock_point(uuid, first_payload)
+        p2 = self._make_mock_point(uuid, second_payload)
+
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[p1, p2])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.get_point_by_id(uuid, Scope(project_id='dark_factory'))
+
+        assert result == first_payload, f'expected the first record payload, got {result!r}'
+        assert any(
+            'retrieved 2 points for a single id' in rec.getMessage()
+            for rec in caplog.records
+        ), f'expected a >1-point WARNING, got {[r.getMessage() for r in caplog.records]!r}'
 
 
 class TestMem0BackendAddSystemRecord:

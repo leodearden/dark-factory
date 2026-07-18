@@ -71,6 +71,14 @@ _DEPENDENCY_FACT_RE = re.compile(r'\bdepends on\b', re.I)
 # dedup/no-op.
 _MEM0_ADD_INFER_PINNED_FALSE = True
 
+# Canonical order for extracting a memory's human-readable content string from a
+# raw Qdrant payload: mem0 stores the verbatim content under 'data', but older
+# / alternately-written points use 'memory' or 'content'. First non-empty string
+# wins. Kept package-internal here (a deliberate minor duplication of scripts/
+# clear_malformed_empty_memory.py:_CONTENT_KEYS and audit_duplicate_memories.py)
+# rather than importing from scripts/, so the service has no scripts/ dependency.
+_MEM0_CONTENT_KEYS = ('data', 'memory', 'content')
+
 
 def _is_dependency_fact(fact: str | None) -> bool:
     """Return True when *fact* expresses a dependency relationship.
@@ -3247,6 +3255,44 @@ class MemoryService:
         filters = dict(filters)
         _normalize_task_id_metadata(filters)
         return await self.mem0.scroll_by_metadata(scope, filters, limit)
+
+    async def get_memory_by_id(
+        self,
+        project_id: str,
+        memory_id: str,
+    ) -> dict | None:
+        """Raw Mem0 point-id read (content + full payload), non-semantic.
+
+        Fetches a single Mem0 record by its raw Qdrant point-id (the memory
+        UUID) via ``Mem0Backend.get_point_by_id`` — bypassing BOTH semantic
+        ranking (``search``) and metadata-equality filtering
+        (``count_memories_by_metadata`` / ``get_memories_by_metadata``). Distinct
+        from the fingerprint-only :meth:`get_memory` (which returns only
+        {category, agent_id, created_at} through the mem0 layer and raises on a
+        miss): this returns the full raw payload plus a ready-to-read content
+        string.
+
+        Returns ``{'id', 'content', 'metadata'}`` — where ``content`` is the
+        first non-empty string among the canonical ``_MEM0_CONTENT_KEYS``
+        (``data`` → ``memory`` → ``content``) and ``metadata`` is the FULL
+        unprocessed Qdrant payload — or ``None`` on a genuine not-found.
+
+        A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), NOT
+        collapsed into ``None`` — so the caller can distinguish "memory
+        genuinely absent" from "backend timed out" (no-silent-fail invariant);
+        surfaced at the MCP boundary as ``{'error', 'error_type': 'TimeoutError'}``.
+        """
+        scope = Scope(project_id=project_id)
+        payload = await self.mem0.get_point_by_id(memory_id, scope)
+        if payload is None:
+            return None
+        content = ''
+        for key in _MEM0_CONTENT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                content = value
+                break
+        return {'id': memory_id, 'content': content, 'metadata': payload}
 
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)
