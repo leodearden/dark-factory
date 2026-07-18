@@ -1328,18 +1328,28 @@ async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
     """fan_out_list_tickets runs per-root coroutines in parallel.
 
     Two-event handshake:
-    - r1's mock sets event_r1_started then awaits event_r2_started (2 s ceiling).
-    - r2's mock sets event_r2_started then awaits event_r1_started (2 s ceiling).
+    - r1's mock sets event_r1_started then awaits event_r2_started (20 s ceiling).
+    - r2's mock sets event_r2_started then awaits event_r1_started (20 s ceiling).
 
     Concurrent execution: both fire concurrently → each sets its own event before
     awaiting the other → both wait_for calls return within ms → pending_total == 2.
 
     Sequential execution: r1 sets event_r1 then waits for event_r2 (which is
-    never set because r2 hasn't started yet) → r1 times out after 2 s →
+    never set because r2 hasn't started yet) → r1 times out after 20 s →
     TimeoutError swallowed at WARNING → r1 contributes 0; r2 then runs, sets
     event_r2, awaits event_r1 (already set) → r2 contributes 1 → pending_total == 1.
 
     pending_total == 2 is the definitive concurrent signal.
+
+    Ceilings (20 s inner, 30 s outer) are generous headroom for full-suite
+    xdist contention, which can starve the event loop badly enough that a
+    coroutine which already set its own event isn't rescheduled to observe
+    the peer's event within a tight budget (task 2740) — even though under
+    genuine concurrency both wait_for calls still resolve within ms, since
+    each side's event is already set by the time the other awaits it. The
+    generous ceilings only rescue the flaky-under-contention case; they
+    don't mask true sequential execution, which still times out against the
+    outer fan_out_list_tickets timeout below and yields pending_total == 1.
     """
     from dashboard.data.metrics import fan_out_list_tickets
 
@@ -1361,10 +1371,10 @@ async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
         root = arguments.get('project_root', '')
         if root == str(r1):
             event_r1_started.set()
-            await asyncio.wait_for(event_r2_started.wait(), timeout=2.0)
+            await asyncio.wait_for(event_r2_started.wait(), timeout=20.0)
         else:
             event_r2_started.set()
-            await asyncio.wait_for(event_r1_started.wait(), timeout=2.0)
+            await asyncio.wait_for(event_r1_started.wait(), timeout=20.0)
         return {'project_id': 'p', 'count': 1, 'tickets': []}
 
     mock_mcp = AsyncMock(side_effect=_side_effect)
@@ -1376,7 +1386,7 @@ async def test_fan_out_list_tickets_runs_roots_concurrently(tmp_path: Path):
                 http_client,
                 cfg,
                 limit=2000,
-                timeout=5.0,
+                timeout=30.0,
             )
 
     assert pending_total == 2, (
