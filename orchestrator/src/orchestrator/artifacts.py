@@ -431,6 +431,152 @@ class TaskArtifacts:
         """Remove ``.task/false_premise.json`` if present."""
         self._clear_path('false_premise.json')
 
+    # ──────────────────────────────────────────────────────────────────
+    # Review-state persistence (review_state.json)
+    #
+    # A single reseed-surviving artifact holding (a) the tree-hash-keyed
+    # verdict cache — so a re-dispatch on an unchanged committed tree does
+    # not re-mint a fresh reviewer nit — and (b) the task-lifetime
+    # amendment/review counters, so ``max_amendment_rounds`` /
+    # ``max_review_cycles`` bound the WHOLE task lifetime, not each
+    # dispatch.  Fail-safe: a corrupt/absent file reads as defaults; the
+    # cache is an optimization/churn guard, never load-bearing.
+    # ──────────────────────────────────────────────────────────────────
+
+    def read_review_state(self) -> dict:
+        """Read ``review_state.json`` — the tree-hash verdict cache plus the
+        task-lifetime amendment/review counters.
+
+        Returns a fresh default state ``{'amendment_rounds_total': 0,
+        'review_cycles_total': 0, 'verdicts': {}}`` when the file is absent,
+        and — mirroring ``read_created_at``'s fail-safe (:264-279) — logs a
+        warning and returns those same defaults on a corrupt/unreadable or
+        malformed file rather than raising.  A present-but-partial file is
+        merged over the defaults so all canonical keys are always exposed.
+        """
+        default = {
+            'amendment_rounds_total': 0,
+            'review_cycles_total': 0,
+            'verdicts': {},
+        }
+        path = self._read_path('review_state.json')
+        if not path.exists():
+            return default
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt review_state.json at %s: %s', path, exc)
+            return default
+        if not isinstance(data, dict):
+            logger.warning(
+                'Malformed review_state.json at %s: not an object', path
+            )
+            return default
+        merged = {**default, **data}
+        if not isinstance(merged.get('verdicts'), dict):
+            merged['verdicts'] = {}
+        return merged
+
+    def record_review_verdict(
+        self,
+        tree_hash: str,
+        verdict: str,
+        suggestions_routed: bool,
+        reviewer_fingerprint: str | None = None,
+    ) -> None:
+        """Record a non-blocking ``verdict`` for a committed ``tree_hash``.
+
+        Read-modify-write of ``review_state.json`` that preserves the
+        lifetime counters and any other recorded verdicts.  Only PASS /
+        suggestions_only verdicts are ever recorded by the caller — a
+        cache hit therefore unconditionally short-circuits REVIEW to DONE.
+
+        ``reviewer_fingerprint`` (optional) captures the identity of the
+        review inputs — the active reviewer roster and their resolved
+        models — at the moment the verdict was minted.  The cache reader
+        (``workflow._execute_verify_review_loop``) only honours a hit when
+        this fingerprint still matches, so a reviewer-roster or per-role
+        model-config change forces a fresh review even on a byte-identical
+        committed tree (task 2749 amendment).  ``None`` is stored when the
+        caller could not compute a fingerprint; such a record can never
+        satisfy the reader's positive-match requirement, so it fails safe
+        to a full review rather than a stale skip.
+        """
+        state = self.read_review_state()
+        state['verdicts'][tree_hash] = {
+            'verdict': verdict,
+            'suggestions_routed': bool(suggestions_routed),
+            'reviewer_fingerprint': reviewer_fingerprint,
+            'ts': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'review_state.json', state)
+
+    def get_cached_verdict(self, tree_hash: str) -> dict | None:
+        """Return the recorded verdict record for ``tree_hash``, else ``None``."""
+        return self.read_review_state()['verdicts'].get(tree_hash)
+
+    def get_amendment_rounds_total(self) -> int:
+        """Return the persisted task-lifetime amendment-round count (0 default)."""
+        try:
+            return int(self.read_review_state().get('amendment_rounds_total', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def get_review_cycles_total(self) -> int:
+        """Return the persisted task-lifetime review-cycle count (0 default)."""
+        try:
+            return int(self.read_review_state().get('review_cycles_total', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_review_counters(
+        self,
+        *,
+        amendment_rounds_total: int | None = None,
+        review_cycles_total: int | None = None,
+    ) -> None:
+        """Persist the task-lifetime review counters (read-modify-write).
+
+        Updates only the provided keys, preserving the verdicts map and the
+        other counter, so ``max_amendment_rounds`` / ``max_review_cycles``
+        can bound the whole task lifetime rather than each dispatch.
+        """
+        state = self.read_review_state()
+        if amendment_rounds_total is not None:
+            state['amendment_rounds_total'] = int(amendment_rounds_total)
+        if review_cycles_total is not None:
+            state['review_cycles_total'] = int(review_cycles_total)
+        self._write_json(self.root / 'review_state.json', state)
+
+    def clear_review_counters(self) -> None:
+        """Reset the task-lifetime amendment/review counters to zero.
+
+        The operator/resume-path reset hook (task 2749 amendment).  The
+        lifetime counters intentionally survive re-dispatches so restart
+        churn / requeue / resume cannot re-grant a fresh
+        ``max_amendment_rounds`` / ``max_review_cycles`` allowance.  That
+        same persistence means a task that has EXHAUSTED its allowance and
+        escalated keeps the exhausted counters across a human-driven
+        re-pend: on the next blocking review the seeded local is already at
+        the cap, so the loop re-escalates WITHOUT attempting a replan.
+
+        Deliberately NOT auto-cleared on re-dispatch — the loop cannot tell
+        churn (must keep the counters) from a legitimate operator re-pend
+        (should reset them) without an out-of-band signal, so granting a
+        fresh allowance is an EXPLICIT operator action, never inferred.
+        When an operator resolves the review escalation and re-pends the
+        task to make replan progress, call this hook (e.g. from the
+        resume/re-pend path, or manually against the ``.task-meta/<name>/``
+        store) to grant a fresh lifetime allowance.  The verdict cache is
+        left intact — a genuine re-pend that changed the tree misses it
+        anyway, and an unchanged tree with an unchanged config legitimately
+        still skips.
+        """
+        state = self.read_review_state()
+        state['amendment_rounds_total'] = 0
+        state['review_cycles_total'] = 0
+        self._write_json(self.root / 'review_state.json', state)
+
     def _read_path(self, name: str) -> Path:
         """Resolve *name* under ``self.root``."""
         return self.root / name

@@ -1436,3 +1436,130 @@ class TestReadReviewsMergesLegacyAndNew:
 
         with pytest.raises(json.JSONDecodeError):
             ta.read_reviews()
+
+
+class TestReviewVerdictCache:
+    """Tests for the tree-hash-keyed verdict cache (review_state.json)."""
+
+    def test_fresh_root_returns_default_state(self, artifacts: TaskArtifacts):
+        assert artifacts.read_review_state() == {
+            'amendment_rounds_total': 0,
+            'review_cycles_total': 0,
+            'verdicts': {},
+        }
+
+    def test_record_and_get_cached_verdict(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', suggestions_routed=True
+        )
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['verdict'] == 'suggestions_only'
+        assert rec['suggestions_routed'] is True
+        assert isinstance(rec['ts'], str) and rec['ts']
+        # ts must be an ISO-8601 datetime string.
+        datetime.fromisoformat(rec['ts'])
+
+    def test_get_cached_verdict_absent_returns_none(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', suggestions_routed=True
+        )
+        assert artifacts.get_cached_verdict('other_tree') is None
+
+    def test_second_tree_hash_coexists(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
+        artifacts.record_review_verdict('tree_def', 'PASS', False)
+        rec_abc = artifacts.get_cached_verdict('tree_abc')
+        rec_def = artifacts.get_cached_verdict('tree_def')
+        assert rec_abc is not None and rec_abc['verdict'] == 'suggestions_only'
+        assert rec_def is not None and rec_def['verdict'] == 'PASS'
+
+    def test_same_tree_hash_overwrites_last_wins(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
+        artifacts.record_review_verdict('tree_abc', 'PASS', False)
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['verdict'] == 'PASS'
+        assert rec['suggestions_routed'] is False
+
+    def test_corrupt_review_state_is_fail_safe(self, artifacts: TaskArtifacts):
+        (artifacts.root / 'review_state.json').write_text('{not valid json')
+        assert artifacts.read_review_state() == {
+            'amendment_rounds_total': 0,
+            'review_cycles_total': 0,
+            'verdicts': {},
+        }
+        assert artifacts.get_cached_verdict('tree_abc') is None
+
+    def test_reviewer_fingerprint_round_trips(self, artifacts: TaskArtifacts):
+        # The optional fingerprint (task 2749 amendment) is stored verbatim.
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', True, reviewer_fingerprint='FP1'
+        )
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['reviewer_fingerprint'] == 'FP1'
+
+    def test_reviewer_fingerprint_defaults_none(self, artifacts: TaskArtifacts):
+        # Omitting the fingerprint stores an explicit None (never absent), so
+        # the reader's positive-match test is well-defined.
+        artifacts.record_review_verdict('tree_abc', 'PASS', False)
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['reviewer_fingerprint'] is None
+
+
+class TestReviewCounters:
+    """Tests for the persisted task-lifetime amendment/review counters."""
+
+    def test_counters_default_zero(self, artifacts: TaskArtifacts):
+        assert artifacts.get_amendment_rounds_total() == 0
+        assert artifacts.get_review_cycles_total() == 0
+
+    def test_partial_update_amendment_only(self, artifacts: TaskArtifacts):
+        artifacts.set_review_counters(amendment_rounds_total=2)
+        assert artifacts.get_amendment_rounds_total() == 2
+        # The other counter is untouched.
+        assert artifacts.get_review_cycles_total() == 0
+
+    def test_independent_fields_read_modify_write(self, artifacts: TaskArtifacts):
+        artifacts.set_review_counters(amendment_rounds_total=2)
+        artifacts.set_review_counters(review_cycles_total=1)
+        # Setting review_cycles must not clobber amendment_rounds.
+        assert artifacts.get_amendment_rounds_total() == 2
+        assert artifacts.get_review_cycles_total() == 1
+
+    def test_counters_and_verdicts_coexist(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
+        artifacts.set_review_counters(
+            amendment_rounds_total=3, review_cycles_total=2
+        )
+        # Neither write clobbers the other's keys.
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None and rec['verdict'] == 'suggestions_only'
+        assert artifacts.get_amendment_rounds_total() == 3
+        assert artifacts.get_review_cycles_total() == 2
+
+    def test_clear_review_counters_resets_both(self, artifacts: TaskArtifacts):
+        # The operator/resume-path reset hook (task 2749 amendment) zeroes
+        # both counters so a human re-pend can make fresh replan progress.
+        artifacts.set_review_counters(
+            amendment_rounds_total=3, review_cycles_total=2
+        )
+        artifacts.clear_review_counters()
+        assert artifacts.get_amendment_rounds_total() == 0
+        assert artifacts.get_review_cycles_total() == 0
+
+    def test_clear_review_counters_preserves_verdicts(
+        self, artifacts: TaskArtifacts
+    ):
+        # Clearing counters must NOT drop the verdict cache — an unchanged
+        # tree under an unchanged config legitimately still skips.
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', True, reviewer_fingerprint='FP1'
+        )
+        artifacts.set_review_counters(review_cycles_total=2)
+        artifacts.clear_review_counters()
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None and rec['verdict'] == 'suggestions_only'
+        assert rec['reviewer_fingerprint'] == 'FP1'
