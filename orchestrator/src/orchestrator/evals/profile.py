@@ -83,3 +83,15 @@ def resolve_eval_profile_update(base: OrchestratorConfig) -> dict[str, Any]:
         update[head] = submodel.model_copy(update=leaf_updates)
 
     return update
+
+
+def apply_eval_profile(base: OrchestratorConfig) -> OrchestratorConfig:
+    """Return *base* with EVAL_PROFILE's divergences applied, everything else inherited.
+
+    This is the profile-application unit the parity tripwire (Invariant P1,
+    Boundary test B1) measures: the changed-leaf set between
+    ``apply_eval_profile(base)`` and *base* must equal ``set(EVAL_PROFILE)``
+    exactly (see test_eval_profile.py). Every field not named in
+    EVAL_PROFILE is inherited from *base* verbatim — the D5 fix.
+    """
+    return base.model_copy(update=resolve_eval_profile_update(base))
