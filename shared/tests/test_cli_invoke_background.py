@@ -21,6 +21,9 @@ from pathlib import Path
 import pytest
 
 from shared.cli_invoke import (
+    AgentResult,
+    _parse_claude_output,
+    _SubprocessResult,
     detect_ended_awaiting_background,
     ended_awaiting_background_for_session,
 )
@@ -222,3 +225,78 @@ class TestEndedAwaitingBackgroundForSession:
         sid = 'sess-bg-empty'
         _write_transcript(tmp_path, sid, [])
         assert ended_awaiting_background_for_session(tmp_path, sid) is False
+
+
+# A clean success envelope: subtype='success', is_error absent, returncode 0 —
+# the exact shape a run that ended-awaiting-background produces (Reify 5164).
+_SUCCESS_ENVELOPE = json.dumps(
+    {
+        'result': 'done',
+        'subtype': 'success',
+        'cost_usd': 0.02,
+        'duration_ms': 681_000,
+        'num_turns': 19,
+        'session_id': 'sess-bg-downgrade',
+    }
+)
+
+
+class TestEndedAwaitingBackgroundField:
+    """The new boolean outcome flag mirrors schema_salvaged / schema_tool_denied:
+    it defaults False on both AgentResult and _SubprocessResult."""
+
+    def test_agent_result_defaults_false(self) -> None:
+        """AgentResult.ended_awaiting_background defaults to False."""
+        result = AgentResult(success=True, output='ok')
+        assert result.ended_awaiting_background is False
+
+    def test_subprocess_result_defaults_false(self) -> None:
+        """_SubprocessResult.ended_awaiting_background defaults to False."""
+        result = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=0)
+        assert result.ended_awaiting_background is False
+
+
+class TestParseClaudeOutputDowngrade:
+    """_parse_claude_output downgrades success→failure when the subprocess was
+    flagged ended_awaiting_background, and propagates the flag on every path."""
+
+    def test_success_envelope_flagged_is_downgraded(self) -> None:
+        """subtype=success + ended_awaiting_background=True → success False, flag True."""
+        sub = _SubprocessResult(
+            stdout=_SUCCESS_ENVELOPE,
+            stderr='',
+            returncode=0,
+            duration_ms=681_000,
+            ended_awaiting_background=True,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.success is False
+        assert agent.ended_awaiting_background is True
+
+    def test_success_envelope_unflagged_stays_success(self) -> None:
+        """subtype=success + ended_awaiting_background=False → success stays True, flag False."""
+        sub = _SubprocessResult(
+            stdout=_SUCCESS_ENVELOPE,
+            stderr='',
+            returncode=0,
+            duration_ms=681_000,
+            ended_awaiting_background=False,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.success is True
+        assert agent.ended_awaiting_background is False
+
+    def test_flag_propagated_on_empty_stdout_without_flipping_success(self) -> None:
+        """An already-failing empty-stdout result + flag=True → success stays
+        False and the flag is still propagated (downgrade is an idempotent no-op
+        on an already-failing result; no crash)."""
+        sub = _SubprocessResult(
+            stdout='',
+            stderr='boom',
+            returncode=1,
+            duration_ms=100,
+            ended_awaiting_background=True,
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.success is False
+        assert agent.ended_awaiting_background is True
