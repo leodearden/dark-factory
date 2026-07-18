@@ -117,15 +117,21 @@ def http_server(
     process (task 2741). Any task still pending at that point is cancelled
     and drained (``_drain_pending_tasks``) inside the serving thread before
     the loop closes, so cleanup runs inside a live task context instead of
-    at uncontrolled GC time.
+    at uncontrolled GC time. A ``stopping`` flag distinguishes that
+    deliberate, stop-induced ``RuntimeError`` from a genuine startup
+    failure, so ``serve_error`` below still reflects only real errors
+    (mirrors ``test_status_authority_gate.py``'s ``http_server`` fixture).
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
     queue = EscalationQueue(queue_dir)
     mcp = create_server(queue, startup_sweep=False)
     port = _free_port()
     loop = asyncio.new_event_loop()
+    serve_error: BaseException | None = None
+    stopping = False
 
     def _serve_forever() -> None:
+        nonlocal serve_error
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(
@@ -133,10 +139,13 @@ def http_server(
                     host='127.0.0.1', port=port, show_banner=False, log_level='error',
                 )
             )
-        except RuntimeError:
+        except RuntimeError as exc:
             # Expected when teardown stops the loop mid-serve ("Event loop
-            # stopped before Future completed").
-            pass
+            # stopped before Future completed") -- but only when *we*
+            # induced it; a RuntimeError raised before teardown began is a
+            # genuine startup failure and must be surfaced below.
+            if not stopping:
+                serve_error = exc
         finally:
             _drain_pending_tasks(loop)
             loop.close()
@@ -156,14 +165,16 @@ def http_server(
             break
         time.sleep(0.05)
     if not ready:
+        detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
         raise RuntimeError(
             f'escalation HTTP test server did not become ready on '
-            f'127.0.0.1:{port} within 10s'
+            f'127.0.0.1:{port} within 10s{detail}'
         )
 
     try:
         yield f'http://127.0.0.1:{port}', queue
     finally:
+        stopping = True
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5.0)
 
