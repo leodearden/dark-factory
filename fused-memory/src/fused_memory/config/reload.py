@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from fused_memory.config.schema import FusedMemoryConfig
 
@@ -98,3 +98,71 @@ def diff_config(
         restart_required=restart_required,
         unchanged=unchanged,
     )
+
+
+def _set_leaf(model: FusedMemoryConfig, path: str, value: Any) -> None:
+    """Write *value* to dotted *path* on *model*, bypassing per-write validation.
+
+    A one-component path (top-level field) is written via ``object.__setattr__``.
+    A two-component path (submodel leaf, e.g.
+    ``reconciliation.stale_run_recovery_seconds``) is written via plain
+    ``setattr`` on the EXISTING submodel object — mutating it in place to
+    preserve submodel identity (I3), so held references (e.g.
+    ``ReconciliationHarness.config``) observe the update. The single
+    authoritative check is the post-apply whole-config re-validation in
+    :func:`apply_reload`.
+    """
+    parts = path.split('.')
+    if len(parts) == 1:
+        object.__setattr__(model, parts[0], value)
+    else:
+        sub_name, leaf = parts
+        setattr(getattr(model, sub_name), leaf, value)
+
+
+def apply_reload(
+    live: FusedMemoryConfig,
+    fresh: FusedMemoryConfig,
+    allowlist: frozenset[str] = RELOADABLE_FIELDS,
+) -> dict[str, Any]:
+    """Diff *live* against *fresh* and apply every allowlisted differing leaf to
+    *live* in place.
+
+    Hybrid re-validation: leaf-copies bypass per-write validation (see
+    :func:`_set_leaf`), so after copying, the resulting *live* is re-validated as
+    a whole via ``FusedMemoryConfig.model_validate(live.model_dump())``. Two
+    individually-valid configs can still combine into an invalid hybrid (a field
+    bound like ``gt=0``, or a cross-field ``model_validator``) — if that happens,
+    every applied leaf is synchronously rolled back to its captured old value and
+    the reload is reported failed. Nothing is left mutated on failure.
+
+    Returns ``{reloaded, applied, restart_required, unchanged, error}``.
+    ``config_path`` is intentionally omitted here; the MCP tool injects it.
+    """
+    d = diff_config(live, fresh, allowlist)
+    applied: dict[str, dict[str, Any]] = {}
+    try:
+        for path, old_new in d.applied_candidates.items():
+            _set_leaf(live, path, old_new['new'])
+            applied[path] = old_new
+        FusedMemoryConfig.model_validate(live.model_dump())
+    except (ValidationError, ValueError) as exc:
+        # Roll back every leaf applied so far (order-independent: each write
+        # restores its own captured old value) so `live` is left exactly as it
+        # was before this call, even on a mid-loop raise.
+        for path, old_new in applied.items():
+            _set_leaf(live, path, old_new['old'])
+        return {
+            'reloaded': False,
+            'applied': {},
+            'restart_required': d.restart_required,
+            'unchanged': d.unchanged,
+            'error': f'hybrid-invariant: {exc}',
+        }
+    return {
+        'reloaded': True,
+        'applied': applied,
+        'restart_required': d.restart_required,
+        'unchanged': d.unchanged,
+        'error': None,
+    }
