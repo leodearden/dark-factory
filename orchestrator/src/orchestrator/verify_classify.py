@@ -258,7 +258,12 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
       shared-venv-mutation signatures, consulted ONLY here — see the
       "BEHAVIORAL NARROWING" note above ``_ENV_TRANSIENT_PATTERNS`` below for
       the resulting constraint: the caller must resolve a command to
-      ``ToolKind.PYTEST`` for env_transient auto-recovery to ever fire).
+      ``ToolKind.PYTEST`` for THIS shared-venv-mutation flavor of
+      env_transient auto-recovery to ever fire. Since task 2756,
+      ``FailureCategory.ENV_TRANSIENT`` also has a second, ToolKind-
+      independent producer — guard 3's ``_classify_environmental`` above,
+      via ``_VERIFY_ENV_BROKEN_RE`` — so env_transient auto-recovery overall
+      is NOT PYTEST-gated, only this particular pattern source is).
     - ``ToolKind.CARGO_TEST`` / ``ToolKind.CARGO_CLIPPY`` -> a structured
       NDJSON parse (``_parse_cargo_json``) is attempted FIRST (Invariant C2);
       when *output* isn't detected as cargo's ``--message-format json`` NDJSON
@@ -326,8 +331,9 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # for the same rc=5-stays-RED contract, which applies here identically).
 #
 # BEHAVIORAL NARROWING vs. the pre-δ tool-blind ladder (intentional, tracked
-# here rather than reverted): env_transient auto-recovery is now reachable
-# ONLY when the failing check's config command lexically resolves to
+# here rather than reverted): auto-recovery keyed on THIS pattern table (the
+# shared-venv-mutation signatures immediately below) is now reachable ONLY
+# when the failing check's config command lexically resolves to
 # ToolKind.PYTEST via `parse_config_command` (see verify.py's
 # `_tool_for_cmd`) — the tool-blind `_classify_failure` used to consult these
 # patterns unconditionally, for every check. A test command the parser
@@ -347,6 +353,17 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # active gap; if a wrapped/indirect test command shape is ever introduced,
 # either extend `parse_config_command` to see through the wrapper to PYTEST,
 # or revisit whether these patterns belong in the OPAQUE ladder too.
+#
+# SCOPE OF THE NARROWING (task 2756 update): the "ONLY … ToolKind.PYTEST"
+# constraint above binds THIS `_ENV_TRANSIENT_PATTERNS` source only, not
+# `FailureCategory.ENV_TRANSIENT` as a whole. Since task 2756,
+# `_classify_environmental`'s `_VERIFY_ENV_BROKEN_RE` check (above,
+# `classify_failure` guard 3) is a second, ToolKind-independent producer of
+# the same category — it runs tool-blind, before per-tool dispatch, so a
+# broken-`_merge-verify`-worktree failure trips `ENV_TRANSIENT` (and its
+# verify.py auto-recovery retry) regardless of which ToolKind the failing
+# check resolves to. verify.py's `_tool_for_cmd` NOTE echoes this same
+# now-narrower PYTEST-only claim; read it as scoped identically to this one.
 # ---------------------------------------------------------------------------
 
 # Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
