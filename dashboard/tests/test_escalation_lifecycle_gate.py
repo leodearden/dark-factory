@@ -21,6 +21,7 @@ root-pytest invocation and is deliberately NOT duplicated here.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -252,6 +253,37 @@ def _make_server(queue: EscalationQueue) -> Any:
     return create_server(queue, startup_sweep=False)
 
 
+def _live_archive_sync(base: Path) -> tuple[EscalationQueue, _LiveArchive]:
+    """Build the live boundary archive under *base* synchronously.
+
+    The builder awaits the async ``resolve_issue`` tool, but the FastAPI route
+    tests drive the SYNC starlette ``TestClient`` (whose lifespan portal runs
+    its own loop in a separate thread). Running the builder via ``asyncio.run``
+    in the main thread — which has no running loop in a sync test — keeps the
+    two off each other.
+    """
+    queue = EscalationQueue(base / 'data' / 'escalations')
+    server = _make_server(queue)
+    arch = asyncio.run(_build_live_boundary_archive(queue, server))
+    return queue, arch
+
+
+def _plain_terminal_archive(base: Path, *, source: str = 'gate-src-secondary') -> None:
+    """Write one plain resolved record (terminal, valid times, NO triaged_at) under *base*.
+
+    Used as the row-10 counter-example project: an archive with no
+    ``triaged_at`` record must yield NO ``triage_segments`` key (render-when-
+    present), never an error.
+    """
+    queue = EscalationQueue(base / 'data' / 'escalations')
+    queue.submit(Escalation(
+        id='esc-sec-1', task_id='sec', agent_role=source, severity='blocking',
+        category='cleanup_needed', summary='secondary, no triage',
+        timestamp=_iso(_BASE), status='pending', level=0,
+    ))
+    queue.resolve('esc-sec-1', 'closed', resolved_by='interactive')
+
+
 # ---------------------------------------------------------------------------
 # step-1 — TestAlphaChokepointRoundTrip: boundary rows 1–5 at the record level.
 # ---------------------------------------------------------------------------
@@ -427,3 +459,108 @@ class TestAggregateOverLiveArchive:
         for s in sources:
             assert flow_source_class_counts.get((s['source'], 'benign'), 0) == s['benign']
             assert flow_source_class_counts.get((s['source'], 'actionable'), 0) == s['actionable']
+
+
+# ---------------------------------------------------------------------------
+# step-5 — TestEndpointOverLiveArchive: rows 9 + 10 + row-6 through the real route.
+# ---------------------------------------------------------------------------
+
+
+class TestEndpointOverLiveArchive:
+    """Rows 6 + 9 + 10 through the REAL FastAPI route over the live archive.
+
+    Sync tests (like the existing route suite): the async builder runs via
+    :func:`_live_archive_sync`; the route is driven by the sync starlette
+    ``TestClient`` (``client`` conftest fixture). The route wraps the aggregator
+    payload under the ``ESCALATION_ANALYTICS`` key.
+    """
+
+    def test_row6_route_contract_and_origin_stamps(self, client, tmp_path: Path) -> None:
+        from dashboard.app import _analytics_cache_clear
+
+        _queue, arch = _live_archive_sync(tmp_path)
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        resp = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert 'ESCALATION_ANALYTICS' in body
+        analytics = body['ESCALATION_ANALYTICS']
+        assert set(analytics) == {'generated_at', 'parse_failures', 'regime_markers', 'per_project'}
+        assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
+        assert isinstance(analytics['regime_markers'], list)
+        assert len(analytics['per_project']) == 1
+        entry = analytics['per_project'][0]
+        assert entry['project'] == tmp_path.name
+
+        # Origin reflects the round-tripped stamps (same per-source truth the
+        # aggregator produced in step-3, now surfaced through the route/JSON layer).
+        expected = arch.expected_origin_by_source()
+        sources_by_name = {s['source']: s for s in entry['origin']['sources']}
+        assert set(sources_by_name) == set(expected)
+        for name, exp in expected.items():
+            s = sources_by_name[name]
+            assert s['benign'] == exp['benign'], f'{name} benign'
+            assert s['actionable'] == exp['actionable'], f'{name} actionable'
+            classified = exp['benign'] + exp['actionable']
+            expected_share = exp['stamped'] / classified if classified else 0.0
+            assert s['stamped_share'] == pytest.approx(expected_share), f'{name} stamped_share'
+
+    def test_row9_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch) -> None:
+        import dashboard.data.escalation_analytics as escalation_analytics_module
+        from dashboard.app import _analytics_cache_clear
+
+        _live_archive_sync(tmp_path)
+        client.app.state.config = _make_config(tmp_path)
+
+        # Pre-corruption baseline: parse_failures already >= 1 (the corrupt esc
+        # file in the live archive), regime_markers loads cleanly.
+        _analytics_cache_clear()
+        resp1 = client.get('/api/v2/dashboard/escalation-analytics')
+        assert resp1.status_code == 200
+        pre = resp1.json()['ESCALATION_ANALYTICS']['parse_failures']
+        assert pre >= 1
+
+        # Corrupt the regime-markers file the route loads → must degrade loudly,
+        # never 500: regime_markers empties and parse_failures strictly increases.
+        bad_markers = tmp_path / 'bad-regime-markers.yaml'
+        bad_markers.write_text('date: [unclosed')
+        monkeypatch.setattr(
+            escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
+        )
+        _analytics_cache_clear()
+        resp2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert resp2.status_code == 200
+        analytics2 = resp2.json()['ESCALATION_ANALYTICS']
+        assert analytics2['regime_markers'] == []
+        assert analytics2['parse_failures'] > pre
+
+    def test_row10_triage_segments_render_when_present(self, client, tmp_path: Path) -> None:
+        from dashboard.app import _analytics_cache_clear
+
+        # Primary: the live archive (row 1 carries a round-tripped triaged_at).
+        _live_archive_sync(tmp_path)
+        # Secondary: a plain archive with NO triaged_at record.
+        secondary = tmp_path / 'secondary'
+        _plain_terminal_archive(secondary)
+
+        client.app.state.config = _make_config(tmp_path, known_project_roots=[secondary])
+        _analytics_cache_clear()
+        resp = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert resp.status_code == 200
+        per_project = resp.json()['ESCALATION_ANALYTICS']['per_project']
+        by_project = {p['project']: p for p in per_project}
+        assert tmp_path.name in by_project and 'secondary' in by_project
+
+        # Primary carries a triaged terminal record → triage_segments present.
+        primary_lifespan = by_project[tmp_path.name]['lifespan']
+        assert 'triage_segments' in primary_lifespan
+        assert primary_lifespan['triage_segments']['count'] >= 1
+
+        # Secondary has no triaged_at record → the key is omitted entirely
+        # (render-when-present), and the endpoint still returns 200 for it.
+        assert 'triage_segments' not in by_project['secondary']['lifespan']
