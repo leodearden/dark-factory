@@ -23000,3 +23000,19 @@ class TestCoalesceTipRecency:
         assert result.in_flight is True, (
             f'entry.snapshot_tip=None must coalesce unchanged; got {result}'
         )
+
+
+def test_verify_and_advance_shim_removed() -> None:
+    """Contract: the _verify_and_advance compat shim is deleted from production.
+
+    Task 2180's user-observable signal — the test-only single-item drive path
+    no longer lives on SpeculativeMergeWorker.  Every direct-call test now
+    drives the _merge_queue_harness.drive_verify_and_advance helper instead, so
+    the production class must not carry the shim.
+    """
+    assert not hasattr(SpeculativeMergeWorker, '_verify_and_advance'), (
+        '_verify_and_advance compat shim must be deleted from '
+        'SpeculativeMergeWorker (task 2180): the direct-call tests now drive '
+        'drive_verify_and_advance from _merge_queue_harness, so the production '
+        'class must no longer carry the test-only shim.'
+    )
