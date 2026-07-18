@@ -53,7 +53,7 @@ def _stub_result():
         cost_usd=1.0,
         duration_ms=1000,
         turns=3,
-        session_id=None,
+        session_id='',
         timed_out=False,
     )
 
