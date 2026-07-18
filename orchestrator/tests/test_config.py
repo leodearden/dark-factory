@@ -290,6 +290,21 @@ class TestDefaults:
             'orchestrator_restart_min_interval_secs) and must NOT be in '
             'RELOADABLE_FIELDS'
         )
+        # task 2753: merge-phase grace bounds the self-redeploy hold (polite AND
+        # force-fire) while a pre-enqueue MERGE-phase workflow is still racing to
+        # the durable merge journal. Red-tier / restart-only like its siblings —
+        # captured at coordinator construction, so it must NOT be in
+        # RELOADABLE_FIELDS.
+        assert config.orchestrator_restart_merge_phase_grace_secs == 600.0
+        assert (
+            'orchestrator_restart_merge_phase_grace_secs' not in RELOADABLE_FIELDS
+        ), (
+            'orchestrator_restart_merge_phase_grace_secs requires a process '
+            'restart to take effect (matches its siblings '
+            'orchestrator_restart_force_fire_after_secs / '
+            'orchestrator_restart_min_interval_secs) and must NOT be in '
+            'RELOADABLE_FIELDS'
+        )
 
     def test_project_root_resolved_to_absolute(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
