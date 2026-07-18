@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -305,6 +306,122 @@ class TestRawCallRetry:
         # loggers produce something useful even when str(exc) is empty.
         assert 'ReadTimeout' in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
+
+
+class TestClientOpIdInjection:
+    """_raw_call injects a per-logical-call client_op_id for mutating task
+    tools so the transport-level retry loop is safe (task 2712).
+
+    The id is generated ONCE before the retry loop, so every transport retry
+    of the same logical call reuses the same key — a retried write dedupes
+    server-side instead of double-applying.
+    """
+
+    @pytest.mark.asyncio
+    async def test_injects_client_op_id_for_mutating_tool(self):
+        session = McpSession('http://localhost:8002')
+        ok = _make_response()
+        mock_client = AsyncMock()
+        mock_client.post.return_value = ok
+
+        with patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await session._raw_call(
+                'tools/call', {'name': 'update_task', 'arguments': {'id': '1'}},
+            )
+
+        posted = mock_client.post.call_args.kwargs['json']
+        op_id = posted['params']['arguments'].get('client_op_id')
+        assert isinstance(op_id, str) and op_id, (
+            'a mutating tool call must get a non-empty client_op_id injected'
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_client_op_id_across_transport_retries(self):
+        """The injected key is stable across all transport retries of one
+        logical call — generated once BEFORE the retry loop.
+
+        The payload dict is reused by reference across retries, so we snapshot
+        (deep-copy) the posted body at each post() to compare the key values
+        as they were actually sent, not their final in-place state.
+        """
+        session = McpSession('http://localhost:8002')
+        ok = _make_response()
+        posted_bodies: list[dict] = []
+
+        async def capture_post(*args, **kwargs):
+            posted_bodies.append(copy.deepcopy(kwargs['json']))
+            if len(posted_bodies) == 1:
+                raise httpx.ConnectError('x')
+            return ok
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = capture_post
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch(
+                'orchestrator.mcp_lifecycle.fm_retry_backoffs',
+                return_value=[0.0],
+            ),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await session._raw_call(
+                'tools/call', {'name': 'update_task', 'arguments': {'id': '1'}},
+            )
+
+        assert len(posted_bodies) == 2
+        op_ids = [
+            b['params']['arguments']['client_op_id'] for b in posted_bodies
+        ]
+        assert op_ids[0] and op_ids[0] == op_ids[1], (
+            'the same client_op_id must be posted on every transport retry'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_injection_for_read_tool(self):
+        session = McpSession('http://localhost:8002')
+        ok = _make_response()
+        mock_client = AsyncMock()
+        mock_client.post.return_value = ok
+
+        with patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await session._raw_call(
+                'tools/call', {'name': 'get_tasks', 'arguments': {}},
+            )
+
+        posted = mock_client.post.call_args.kwargs['json']
+        assert 'client_op_id' not in posted['params']['arguments'], (
+            'read tools must not get a client_op_id injected'
+        )
+
+    @pytest.mark.asyncio
+    async def test_preserves_caller_supplied_client_op_id(self):
+        session = McpSession('http://localhost:8002')
+        ok = _make_response()
+        mock_client = AsyncMock()
+        mock_client.post.return_value = ok
+
+        with patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await session._raw_call(
+                'tools/call',
+                {
+                    'name': 'update_task',
+                    'arguments': {'id': '1', 'client_op_id': 'caller-set'},
+                },
+            )
+
+        posted = mock_client.post.call_args.kwargs['json']
+        assert posted['params']['arguments']['client_op_id'] == 'caller-set', (
+            'a caller-supplied client_op_id must be preserved, not overwritten'
+        )
 
 
 class TestRawNotifyRetry:
