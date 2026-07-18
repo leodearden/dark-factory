@@ -264,8 +264,11 @@ path) is queued as task ε upstream of the ReconWritePolicy task (G3 resolution 
    is unnecessary because markers are short-lived (14-day GC) and self-repopulate each cycle — the
    ledger simply becomes authoritative going forward; residual Mem0 markers age out under the
    final DELETE pass. Deploy is a deterministic fused-memory restart capstone (task π) using
-   out-of-cgroup `systemctl --user restart fused-memory.service` (program decision #6 — **not**
-   `restart-fused-memory.sh --drain`, hung per task 2090).
+   out-of-cgroup `systemctl --user restart fused-memory.service` (program decision #6 — the
+   capstone restarts out-of-cgroup so it does not self-kill). The standalone
+   `restart-fused-memory.sh` is now cycle-aware (bare: defers while a full recon cycle is in
+   flight, restarts between cycles or after the 35-min cap; `--now` bypasses); its `--drain`
+   path now converges (task 2702, no longer the task-2090 hang).
 
 7. **`execution_class` is stored as a metadata field now; W3 types it later.** The field lives in
    the untyped `metadata` dict, validated by W5's guard. W3 registers it as a typed sub-model in
