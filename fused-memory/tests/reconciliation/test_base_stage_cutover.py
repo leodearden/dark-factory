@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -506,3 +507,91 @@ class TestStartReportErrorHandling:
         assert result.stats == {}
         assert result.llm_calls == 0
         assert result.tokens_used == 0
+
+
+class TestSessionCaptureLifecycle:
+    """BaseStage.run mints a CLI session, persists it (record_run_session) BEFORE
+    launching the stage subprocess, forwards session_id + a per-run TaskConfigDir
+    into run_stage_via_cli, and clears the session afterwards — even when the stage
+    subprocess raises (finally path) — per task 2744."""
+
+    def _make_stage_with_real_journal_dir(self, tmp_path):
+        """_StubStage whose journal has a real data_dir + AsyncMock session methods."""
+        stage = _make_stage(recon_report_state=None)
+        journal = MagicMock()
+        journal.data_dir = tmp_path
+        journal.record_run_session = AsyncMock()
+        journal.clear_run_session = AsyncMock()
+        stage.journal = journal
+        return stage, journal
+
+    @pytest.mark.asyncio
+    async def test_session_minted_persisted_and_forwarded(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+        from shared.config_dir import TaskConfigDir
+
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        watermark = Watermark(project_id='test_project')
+
+        call_log: list[str] = []
+        captured: dict = {}
+
+        async def _record(run_id, *, session_id, stage_cursor):
+            call_log.append('record')
+
+        async def _runner(**kwargs):
+            call_log.append('runner')
+            captured.update(kwargs)
+            return StageResult(report={}, success=True)
+
+        async def _clear(run_id):
+            call_log.append('clear')
+
+        journal.record_run_session.side_effect = _record
+        journal.clear_run_session.side_effect = _clear
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(side_effect=_runner),
+        ):
+            await stage.run([], watermark, [], run_id='run-sc1')
+
+        # (a) record_run_session BEFORE the runner; clear_run_session AFTER.
+        assert call_log == ['record', 'runner', 'clear'], (
+            f'expected mint-before-spawn / clear-after ordering, got {call_log!r}'
+        )
+
+        # record_run_session got (run_id, session_id=<uuid4>, stage_cursor=<stage>).
+        journal.record_run_session.assert_awaited_once()
+        rc = journal.record_run_session.await_args
+        assert rc.args[0] == 'run-sc1'
+        session_id = rc.kwargs['session_id']
+        assert uuid.UUID(session_id).version == 4, 'session_id must be a uuid4 string'
+        assert rc.kwargs['stage_cursor'] == StageId.memory_consolidator.value
+
+        # (b) the runner received the SAME session_id and a per-run TaskConfigDir
+        #     under <data_dir>/recon-config.
+        assert captured['session_id'] == session_id
+        cfg = captured['config_dir']
+        assert isinstance(cfg, TaskConfigDir)
+        assert cfg.path.parent == tmp_path / 'recon-config'
+        assert cfg.path.name == 'claude-config-run-sc1'
+
+        # (c) clear_run_session was awaited with the run_id.
+        journal.clear_run_session.assert_awaited_once_with('run-sc1')
+
+    @pytest.mark.asyncio
+    async def test_clear_runs_even_when_runner_raises(self, tmp_path):
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        watermark = Watermark(project_id='test_project')
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(side_effect=RuntimeError('subprocess boom')),
+        ):
+            with pytest.raises(RuntimeError):
+                await stage.run([], watermark, [], run_id='run-sc2')
+
+        # Mint-before-spawn happened, and clear ran in the finally despite the raise.
+        journal.record_run_session.assert_awaited_once()
+        journal.clear_run_session.assert_awaited_once_with('run-sc2')
