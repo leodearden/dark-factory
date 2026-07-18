@@ -48,6 +48,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
 })
 
 
+# Sentinel marking a leaf structurally present on only ONE side of a diff — a
+# nullable submodel field (e.g. ``taskmaster``/``usage_cap``) toggled between
+# None (yielded as one atomic ``('taskmaster', None)`` leaf) and populated
+# (yielded as ``('taskmaster.<sub>', ...)`` sub-leaves with NO bare
+# ``'taskmaster'`` key). Rendered as the JSON-serializable string ``'<absent>'``
+# in the disposition report so the response stays machine-checkable.
+_ABSENT = '<absent>'
+
+
 @dataclass
 class ConfigDiff:
     """Result of :func:`diff_config`: every differing leaf, bucketed by allowlist."""
@@ -88,13 +97,24 @@ def diff_config(
     (path in *allowlist*) or ``restart_required`` (otherwise); equal leaves are
     counted in ``unchanged``. Pure and synchronous — no I/O, no mutation of
     either argument.
+
+    Iterates the UNION of both sides' leaf keys, tolerant of structural
+    asymmetry: a nullable submodel field toggled between None and populated
+    across the reload yields a bare ``'taskmaster'`` leaf on one side and
+    ``'taskmaster.<sub>'`` leaves on the other. Such a one-sided leaf is a
+    genuine difference — bucketed (never ``KeyError``), with the absent side
+    rendered as the ``'<absent>'`` sentinel — so a nullable-submodel edit is
+    reported ``restart_required`` (neither the bare name nor its subfields are
+    allowlisted) instead of aborting the whole reload.
     """
+    live_leaves = dict(_iter_leaves(live))
     fresh_leaves = dict(_iter_leaves(fresh))
     applied_candidates: dict[str, dict[str, Any]] = {}
     restart_required: dict[str, dict[str, Any]] = {}
     unchanged = 0
-    for path, live_val in _iter_leaves(live):
-        fresh_val = fresh_leaves[path]
+    for path in live_leaves.keys() | fresh_leaves.keys():
+        live_val = live_leaves.get(path, _ABSENT)
+        fresh_val = fresh_leaves.get(path, _ABSENT)
         if live_val != fresh_val:
             entry = {'old': live_val, 'new': fresh_val}
             if path in allowlist:

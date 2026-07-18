@@ -101,6 +101,52 @@ class TestDiffConfig:
         assert d.restart_required['task_metadata.enforce'] == {'old': old, 'new': not old}
         assert 'task_metadata.enforce' not in d.applied_candidates
 
+    def test_nullable_submodel_toggle_none_to_populated(self):
+        """A nullable submodel field toggled None -> populated across a reload is
+        bucketed as restart_required, never a KeyError.
+
+        ``FusedMemoryConfig.taskmaster`` defaults to None (yielded as one atomic
+        ``('taskmaster', None)`` leaf); populating it yields ``taskmaster.<sub>``
+        sub-leaves and NO bare ``'taskmaster'`` key. Regression for the
+        structural-asymmetry KeyError (task 2718 review esc-2718-1).
+        """
+        from fused_memory.config.schema import TaskmasterConfig
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        assert live.taskmaster is None
+        object.__setattr__(fresh, 'taskmaster', TaskmasterConfig())
+
+        d = diff_config(live, fresh)  # must not raise
+
+        # The bare-name leaf (None on live, absent on fresh) is a difference.
+        assert 'taskmaster' in d.restart_required
+        assert d.restart_required['taskmaster']['old'] is None
+        assert d.restart_required['taskmaster']['new'] == '<absent>'
+        # Each populated sub-leaf (absent on live) is also a difference.
+        assert 'taskmaster.project_root' in d.restart_required
+        assert d.restart_required['taskmaster.project_root']['old'] == '<absent>'
+        assert d.applied_candidates == {}
+
+    def test_nullable_submodel_toggle_populated_to_none(self):
+        """The reverse toggle (populated -> None) is symmetrically tolerated —
+        removing a ``taskmaster:`` block from the YAML must not KeyError."""
+        from fused_memory.config.schema import TaskmasterConfig
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(live, 'taskmaster', TaskmasterConfig())
+        assert fresh.taskmaster is None
+
+        d = diff_config(live, fresh)  # must not raise
+
+        assert 'taskmaster' in d.restart_required
+        assert d.restart_required['taskmaster']['old'] == '<absent>'
+        assert d.restart_required['taskmaster']['new'] is None
+        assert 'taskmaster.project_root' in d.restart_required
+        assert d.restart_required['taskmaster.project_root']['new'] == '<absent>'
+        assert d.applied_candidates == {}
+
     def test_equal_leaves_tallied_unchanged(self):
         """Leaves equal between the two configs are counted in ``unchanged``."""
         live = FusedMemoryConfig()
