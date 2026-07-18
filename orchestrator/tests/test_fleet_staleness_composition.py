@@ -47,11 +47,11 @@ from orchestrator.harness import Harness
 from orchestrator.service_restart import StaleServiceRestartCoordinator
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-DF_CONFIG_PATH = REPO_ROOT / 'orchestrator' / 'config.yaml'
+DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 
 def _load_committed_orchestrator_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the COMMITTED orchestrator/config.yaml through the real pydantic model.
+    """Load the COMMITTED dark-factory-orchestrator.yaml through the real pydantic model.
 
     Mirrors ``test_orchestrator_restart_config_drift.py``'s round-trip pattern
     (γ): this drives the ACTUAL parsed ``orchestrator_restart_*`` values, not
@@ -59,11 +59,12 @@ def _load_committed_orchestrator_config(monkeypatch: pytest.MonkeyPatch) -> Orch
     reverted-to-default value (``OrchestratorConfig`` uses ``extra='ignore'``)
     exactly as it would in the γ drift test.
 
-    Note: the orchestrator/tests autouse ``_isolate_orch_config`` fixture
-    deletes ``ORCH_CONFIG_PATH`` and pins ``ORCH_PROJECT_ROOT`` to ``tmp_path``
-    for every test in this package; setting ``ORCH_CONFIG_PATH`` here (via the
-    same function-scoped ``monkeypatch``) runs after that autouse setup and
-    wins, so this always loads the committed file. The resulting
+    Note: the orchestrator/tests autouse ``_isolate_orch_config`` fixture pins
+    ``ORCH_CONFIG_PATH`` to the canonical ``dark-factory-orchestrator.yaml`` and
+    ``ORCH_PROJECT_ROOT`` to ``tmp_path`` for every test in this package;
+    setting ``ORCH_CONFIG_PATH`` here (via the same function-scoped
+    ``monkeypatch``) runs after that autouse setup and wins, so this always
+    loads the committed file (here the same canonical path). The resulting
     ``project_root`` on the returned object is still pinned to ``tmp_path`` by
     that same autouse fixture, which is irrelevant here — only the
     ``orchestrator_restart_*`` fields are read off this object and grafted

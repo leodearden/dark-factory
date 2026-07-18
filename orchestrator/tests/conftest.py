@@ -30,6 +30,13 @@ _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
+# Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
+# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
+# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
+# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
+# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
 # Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
@@ -181,16 +188,24 @@ def repo_root() -> Path | None:
 def _isolate_orch_config(monkeypatch, tmp_path):
     """Isolate OrchestratorConfig from the real project tree for every test.
 
-    ORCH_CONFIG_PATH is removed so tests don't inadvertently load the real
-    config via that env var.
+    ORCH_CONFIG_PATH is pinned to the canonical top-level
+    ``dark-factory-orchestrator.yaml`` (absolute path) so tests load the
+    operational config deterministically, independent of the process CWD.
 
-    project_root isolation (the load-bearing part): with ORCH_CONFIG_PATH unset,
-    the settings source (``settings_customise_sources``) falls back to the
-    *relative* ``Path('config.yaml')``.  Running ``cd orchestrator && pytest``
-    (exactly how the per-subproject test command invokes us) therefore loads the
-    tracked ``orchestrator/config.yaml``, whose ``project_root`` resolves to the
-    real repo root.  Any test that builds a bare ``OrchestratorConfig()`` and
-    drives ``acquire_next`` then writes
+    Config source (task 2719): previously this fixture *deleted*
+    ORCH_CONFIG_PATH and relied on ``settings_customise_sources`` falling back
+    to the *relative* ``Path('config.yaml')`` — which, under ``cd orchestrator
+    && pytest`` (how the per-subproject test command invokes us), resolved via
+    the ``orchestrator/config.yaml`` symlink to the operational config.  That
+    transitional symlink was retired, so we now pin the absolute canonical path
+    explicitly.  It is byte-identical to the removed symlink's target, so the
+    operational values every test relies on (e.g. ``lock_depth``,
+    ``merge_verify_breadth='full'``) are unchanged; the absolute path is also
+    CWD-independent, so the config no longer depends on running from
+    ``orchestrator/``.
+
+    project_root isolation (the other load-bearing part): any test that builds a
+    bare ``OrchestratorConfig()`` and drives ``acquire_next`` writes
     ``<repo>/data/orchestrator/scheduler_state.json`` (and the overrides SQLite
     DB) into the live tree — which the dashboard reads back as real scheduler
     state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
@@ -199,11 +214,14 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     Precedence keeps this safe: ``init_settings`` (explicit ``project_root=...``
     kwargs) still win over the env, and ``env_settings`` only overrides
     ``project_root`` — every other field still loads from config.yaml/defaults,
-    so tests that depend on config.yaml values (e.g. lock_depth) are unaffected.
+    so tests that depend on config values (e.g. lock_depth) are unaffected.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
-    env value agrees with the YAML they write.
+    env value agrees with the YAML they write.  The opt-in
+    ``code_default_config`` fixture runs after this autouse fixture and still
+    wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
+    default-asserting / scoped-behaviour tests.
     """
-    monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
 
 
