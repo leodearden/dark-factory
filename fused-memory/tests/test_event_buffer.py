@@ -56,6 +56,24 @@ async def test_push_and_stats(buf):
 
 
 @pytest.mark.asyncio
+async def test_push_is_idempotent_on_duplicate_id(buf):
+    """Pushing the same event (identical id) twice does not raise and leaves
+    exactly one row.
+
+    This is the precondition that makes at-least-once startup redelivery from
+    the EventJournal safe: recover() can re-enqueue an event that was already
+    committed to the buffer (drainer killed after push but before mark_processed),
+    and the re-push must be a harmless no-op rather than an IntegrityError that
+    would dead-letter a perfectly good event (task 2709).
+    """
+    event = _make_event()
+    await buf.push(event)
+    # Re-pushing the SAME event id must be a no-op, not an IntegrityError.
+    await buf.push(event)
+    assert await buf.count_buffered('test-project') == 1
+
+
+@pytest.mark.asyncio
 async def test_should_trigger_buffer_size(tmp_path):
     buf = EventBuffer(db_path=tmp_path / 'trigger.db', buffer_size_threshold=3, max_staleness_seconds=3600)
     await buf.initialize()

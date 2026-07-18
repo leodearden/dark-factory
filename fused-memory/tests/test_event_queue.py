@@ -20,6 +20,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
 
 
@@ -1275,3 +1276,280 @@ def test_iter_lines_reversed_max_line_bytes_overflow(tmp_path, caplog):
     # (c) No bytes lost — all 500 'X's appear across the yielded fragments.
     total_x = sum(line.count('X') for line in results)
     assert total_x == 500, f"expected 500 X's across yields, got {total_x}"
+
+
+# ── Durable-at-enqueue journal (task 2709) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enqueue_is_durable_before_drain(real_buffer, tmp_path):
+    """With journal_path set, enqueue() persists the event durably BEFORE the
+    drainer runs — the kill-9-between-enqueue-and-drain guarantee.
+    """
+    ej_path = tmp_path / 'ej.db'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+    )
+    try:
+        event = _make_event()
+        # NOTE: no q.start() — no drainer. The durable write must have already
+        # happened synchronously inside enqueue().
+        assert q.enqueue(event) is True
+        # The in-memory queue still holds it (dispatch cache over the durable row).
+        assert q._queue.qsize() == 1
+        # A FRESH EventJournal over the same path sees the durable row — proof
+        # the row survived independently of the (never-started) drainer.
+        journal = EventJournal(ej_path)
+        try:
+            recovered = journal.load_unprocessed()
+        finally:
+            journal.close()
+        assert [e.id for e in recovered] == [event.id]
+    finally:
+        if q._journal is not None:
+            q._journal.close()
+
+
+@pytest.mark.asyncio
+async def test_no_journal_path_creates_no_journal(real_buffer, tmp_path):
+    """Without journal_path (default None), no journal is created and enqueue
+    behaves exactly as today — regression guard for the sync/non-blocking WP-B
+    contract (no synchronous FULL commit is added to the hot path).
+    """
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+    )
+    assert q._journal is None
+    assert q.enqueue(_make_event()) is True
+    assert q._queue.qsize() == 1
+    # No journal db was created — the only *.db under tmp_path is the buffer's
+    # own file (from the real_buffer fixture), never a journal db.
+    assert {p.name for p in tmp_path.glob('*.db')} == {'buf.db'}
+
+
+@pytest.mark.asyncio
+async def test_drainer_marks_processed_on_commit(real_buffer, tmp_path):
+    """After the drainer commits an event to the buffer, its journal row is
+    removed — the in-memory queue is a pure dispatch cache over the durable row.
+    """
+    ej_path = tmp_path / 'ej.db'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        event = _make_event()
+        assert q.enqueue(event) is True
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        # Committed to the buffer.
+        stats = await real_buffer.get_buffer_stats('test-project')
+        assert stats['size'] == 1
+        # Journal row removed (drainer marked it processed after the push).
+        journal = EventJournal(ej_path)
+        try:
+            assert journal.load_unprocessed() == []
+        finally:
+            journal.close()
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_drainer_marks_processed_on_dead_letter(tmp_path):
+    """When the drainer dead-letters a non-retriable event, its journal row is
+    removed too — durability is handed off to the dead-letter JSONL file.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
+    ej_path = tmp_path / 'ej.db'
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        journal_path=ej_path,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        event = _make_event()
+        assert q.enqueue(event) is True
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        # Dead-lettered (non-retriable push error).
+        assert q.stats()['dead_letters'] == 1
+        lines = dl.read_text().strip().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])['reason'] == 'non_retriable'
+        # Journal row removed — durability handed off to the dead-letter file.
+        journal = EventJournal(ej_path)
+        try:
+            assert journal.load_unprocessed() == []
+        finally:
+            journal.close()
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
+    """Acceptance: an event durable in the journal but never committed to the
+    buffer (a hard kill between enqueue and drain) is present AND processed
+    after a restart that shares the same journal_path.
+    """
+    ej_path = tmp_path / 'ej.db'
+
+    # queue1: enqueue WITHOUT starting the drainer, so the event is durable in
+    # the journal but never reaches the buffer — simulating kill -9 between
+    # enqueue and drain. queue1's in-memory queue is then abandoned.
+    queue1 = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+    )
+    event = _make_event()
+    assert queue1.enqueue(event) is True
+    # Not in the buffer yet — no drainer ran.
+    assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 0
+    # Release queue1's journal fd (a real kill -9 frees it via OS cleanup); the
+    # INSERT was already committed at append, so the row survives.
+    if queue1._journal is not None:
+        queue1._journal.close()
+
+    # queue2: fresh EventQueue over the SAME buffer + journal_path. start()
+    # must recover() the unprocessed row and re-enqueue it for the drainer.
+    queue2 = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await queue2.start()
+    try:
+        await asyncio.wait_for(queue2._queue.join(), timeout=2.0)
+        # (1) present after restart.
+        assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 1
+        # (2) processed after restart — journal drained.
+        journal = EventJournal(ej_path)
+        try:
+            assert journal.load_unprocessed() == []
+        finally:
+            journal.close()
+    finally:
+        await queue2.close()
+
+
+# ── Dead-letter replay (task 2709) ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_reenqueues_and_clears(real_buffer, tmp_path):
+    """replay_dead_letters re-enqueues dead-lettered events (drainer commits
+    them), clears them from the file, and a second call finds nothing to replay.
+    """
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=dl,
+        journal_path=tmp_path / 'ej.db',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(3):
+            q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+        assert len(dl.read_text().strip().splitlines()) == 3
+
+        counts = q.replay_dead_letters()
+        assert counts == {'replayed': 3, 'failed': 0}
+        # Drainer commits the replayed events to the buffer.
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 3
+        # File no longer holds the replayed records.
+        assert (dl.read_text().strip() if dl.exists() else '') == ''
+        # Second call → nothing to replay (no re-replay).
+        assert q.replay_dead_letters() == {'replayed': 0, 'failed': 0}
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_filters_by_project_id(real_buffer, tmp_path):
+    """With project_id set, only matching records are replayed; non-matching
+    records remain in the dead-letter file."""
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=dl,
+        journal_path=tmp_path / 'ej.db',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        for _ in range(2):
+            q._write_dead_letter(_make_event(project_id='proj-a'), reason='non_retriable', attempts=1)
+        for _ in range(3):
+            q._write_dead_letter(_make_event(project_id='proj-b'), reason='non_retriable', attempts=1)
+
+        counts = q.replay_dead_letters(project_id='proj-a')
+        assert counts == {'replayed': 2, 'failed': 0}
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        assert (await real_buffer.get_buffer_stats('proj-a'))['size'] == 2
+        # Non-matching proj-b records are preserved in the file.
+        remaining = q.read_dead_letters()
+        assert len(remaining) == 3
+        assert all(r['event']['project_id'] == 'proj-b' for r in remaining)
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_preserves_unparseable(real_buffer, tmp_path):
+    """A malformed/unparseable dead-letter line counts toward `failed` and is
+    preserved (loud-over-silent — never silently dropped)."""
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=dl,
+        journal_path=tmp_path / 'ej.db',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        q._write_dead_letter(_make_event(), reason='non_retriable', attempts=1)
+        with dl.open('a', encoding='utf-8') as fh:
+            fh.write('{not valid json\n')
+
+        counts = q.replay_dead_letters()
+        assert counts == {'replayed': 1, 'failed': 1}
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        # The malformed line survives; the good record was replayed out.
+        assert dl.exists()
+        assert '{not valid json' in dl.read_text()
+    finally:
+        await q.close()

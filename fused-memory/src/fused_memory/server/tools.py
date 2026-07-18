@@ -2526,6 +2526,53 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def replay_event_dead_letters(
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Re-enqueue dead-lettered reconciliation events for another attempt.
+
+        The reconciliation ``event_queue`` dead-letters events (to a JSONL file)
+        when the drainer cannot commit them to the durable buffer. This tool
+        snapshots those dead-letter files, reconstructs each event, and re-enqueues
+        it through the normal enqueue path (so replayed events regain
+        durable-at-enqueue semantics). Records that fail to parse, and records
+        filtered out by ``project_id``, are written back to the dead-letter file —
+        replay never silently drops data.
+
+        This is the event-queue counterpart to ``replay_dead_letters`` (which
+        resets the durable *write* queue). It operates on the reconciliation
+        event dead-letter JSONL, not the SQLite write queue.
+
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling.
+
+        Args:
+            project_id: Scope to a specific project (optional — all if omitted)
+
+        Returns:
+            ``{'status': 'replayed', 'replayed': N, 'failed': M}`` — ``replayed``
+            events re-entered the queue; ``failed`` records could not be parsed
+            and were preserved in the dead-letter file.
+        """
+        if event_queue is None:
+            return {'error': 'Event queue not initialized', 'error_type': 'ConfigurationError'}
+        # replay_dead_letters does synchronous file I/O; offload to a thread so
+        # the event loop is not blocked on large dead-letter files.
+        counts = await asyncio.to_thread(
+            event_queue.replay_dead_letters,
+            project_id=project_id,
+        )
+        return {
+            'status': 'replayed',
+            'replayed': counts['replayed'],
+            'failed': counts['failed'],
+        }
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def get_dead_letters(
         project_id: str | None = None,
         limit: int = 100,

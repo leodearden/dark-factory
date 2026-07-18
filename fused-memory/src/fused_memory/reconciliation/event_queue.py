@@ -26,12 +26,14 @@ import os
 import random
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
+
+from fused_memory.reconciliation.event_journal import EventJournal
 
 if TYPE_CHECKING:
     from fused_memory.models.reconciliation import ReconciliationEvent
@@ -122,9 +124,17 @@ class EventQueue:
         overflow_warn_interval_seconds: float = 60.0,
         max_bytes: int | None = None,
         keep_rotations: int = 3,
+        journal_path: Path | str | None = None,
     ):
         self._buffer = event_buffer
         self._dead_letter_path = Path(dead_letter_path)
+        # Durable-at-enqueue write-ahead log. None (the default) keeps every
+        # existing journal_path-less caller/test byte-unchanged — critically the
+        # timing test test_enqueue_returns_immediately, which would regress if a
+        # synchronous FULL commit were added to enqueue unconditionally. main.py
+        # wires the real path (data_dir/'event_journal.db'); the None default is
+        # the off-switch.
+        self._journal = EventJournal(journal_path) if journal_path is not None else None
         self._queue: asyncio.Queue[ReconciliationEvent] = asyncio.Queue(maxsize=maxsize)
         self._retry_initial = retry_initial_seconds
         self._retry_max = retry_max_seconds
@@ -133,6 +143,11 @@ class EventQueue:
         self._max_bytes = max_bytes
         self._keep_rotations = keep_rotations
         self._drainer_task: asyncio.Task | None = None
+        # Event-loop reference captured at start(). Used only by
+        # replay_dead_letters to marshal enqueue() (which mutates the
+        # thread-unsafe asyncio.Queue) back onto the loop thread when replay is
+        # offloaded to an asyncio.to_thread worker. None until start() runs.
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
         # Stats surface for WP-C watchdog / WP-D policy.
         self._last_commit_ts: float | None = None
@@ -149,11 +164,19 @@ class EventQueue:
     # ── lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Spawn the background drainer coroutine."""
+        """Recover unprocessed journal rows, then spawn the background drainer."""
         if self._drainer_task is not None:
             raise RuntimeError('EventQueue already started')
+        # Capture the loop so replay_dead_letters can marshal enqueue() back to
+        # this thread when it is offloaded to an asyncio.to_thread worker.
+        self._loop = asyncio.get_running_loop()
         # Ensure dead-letter directory exists.
         self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-enqueue any events that were durable in the journal but never
+        # committed to the buffer (kill -9 between enqueue and drain) BEFORE the
+        # drainer starts, so recovery is complete the moment draining begins.
+        if self._journal is not None:
+            await self.recover()
         self._drainer_task = asyncio.create_task(
             self._drain_loop(), name='event-queue-drainer',
         )
@@ -161,6 +184,38 @@ class EventQueue:
             'EventQueue started (maxsize=%d, dead_letter=%s)',
             self._queue.maxsize, self._dead_letter_path,
         )
+
+    async def recover(self) -> int:
+        """Re-enqueue unprocessed journal rows onto the in-memory queue.
+
+        The durable-at-enqueue guarantee: rows surviving in the journal are
+        events that were persisted but never committed to the buffer nor
+        dead-lettered. Each is ``put_nowait``-ed back onto the in-memory queue
+        for the drainer to commit — WITHOUT re-appending (the durable row already
+        exists). Redelivery is at-least-once, so the drainer may re-push an
+        already-committed event; ``EventBuffer.push`` is idempotent (INSERT OR
+        IGNORE) so that is a harmless no-op. On overflow the event is
+        dead-lettered (``recover_overflow``) and its journal row marked processed.
+        Returns the number of events recovered.
+        """
+        if self._journal is None:
+            return 0
+        events = self._journal.load_unprocessed()
+        recovered = 0
+        for event in events:
+            try:
+                self._queue.put_nowait(event)
+                recovered += 1
+            except asyncio.QueueFull:
+                self._overflow_drops += 1
+                self._write_dead_letter(event, reason='recover_overflow', attempts=0)
+                self._journal.mark_processed(event.id)
+        if recovered:
+            logger.info(
+                'EventQueue.recover: re-enqueued %d unprocessed event(s) from journal',
+                recovered,
+            )
+        return recovered
 
     async def close(self) -> None:
         """Flush the queue within ``shutdown_flush_seconds`` then stop the drainer.
@@ -208,9 +263,19 @@ class EventQueue:
         if residue:
             for event in residue:
                 self._write_dead_letter(event, reason='shutdown_timeout', attempts=0)
+                # Durability handed off to the dead-letter file — drop the
+                # journal row so recover() doesn't redeliver it next startup.
+                if self._journal is not None:
+                    self._journal.mark_processed(event.id)
             logger.warning(
                 'EventQueue: dead-lettered %d events on shutdown', len(residue),
             )
+
+        # Close the durable journal last: every surviving in-flight event has
+        # now been either committed to the buffer (drainer marked it processed)
+        # or dead-lettered (marked processed just above).
+        if self._journal is not None:
+            self._journal.close()
 
     # ── test helper ───────────────────────────────────────────────────
 
@@ -235,14 +300,26 @@ class EventQueue:
         """
         if self._closed:
             # Shutting down — divert straight to dead-letter so nothing is lost.
+            # The journal may already be closed here, so do NOT touch it; the
+            # dead-letter file provides durability for post-close events.
             self._write_dead_letter(event, reason='post_close', attempts=0)
             return False
+        # Durable-at-enqueue: persist the event synchronously BEFORE the
+        # in-memory put, so a hard kill between here and the drainer's commit
+        # cannot silently drop it. The in-memory queue is a dispatch cache over
+        # this durable row; startup recover() re-enqueues survivors.
+        if self._journal is not None:
+            self._journal.append(event)
         try:
             self._queue.put_nowait(event)
             return True
         except asyncio.QueueFull:
             self._overflow_drops += 1
             self._write_dead_letter(event, reason='overflow_drop', attempts=0)
+            # Durability just handed off to the dead-letter file — drop the
+            # journal row so it isn't redelivered on the next recover().
+            if self._journal is not None:
+                self._journal.mark_processed(event.id)
             now = time.monotonic()
             if (now - self._last_overflow_warn_ts) >= self._overflow_warn_interval:
                 self._last_overflow_warn_ts = now
@@ -318,6 +395,12 @@ class EventQueue:
             attempts += 1
             try:
                 await self._buffer.push(event)
+                # Committed durably to the buffer — drop the journal row. The
+                # push-then-mark order is deliberate: a crash in between leaves
+                # the row for recover() to redeliver, and EventBuffer.push is
+                # idempotent (INSERT OR IGNORE) so the redelivery is a no-op.
+                if self._journal is not None:
+                    self._journal.mark_processed(event.id)
                 self._last_commit_ts = time.time()
                 self._events_committed += 1
                 if self._retry_in_flight > 0 and attempts > 1:
@@ -352,6 +435,10 @@ class EventQueue:
                     event.id, exc, exc_info=True,
                 )
                 self._write_dead_letter(event, reason='non_retriable', attempts=attempts)
+                # Durability handed off to the dead-letter file — drop the
+                # journal row so recover() doesn't redeliver it next startup.
+                if self._journal is not None:
+                    self._journal.mark_processed(event.id)
                 if self._retry_in_flight > 0 and attempts > 1:
                     self._retry_in_flight = max(0, self._retry_in_flight - 1)
                 self._recent_ops.append(
@@ -648,3 +735,155 @@ class EventQueue:
             return 0
 
         return count
+
+    # ── replay dead-letters ────────────────────────────────────────────
+
+    async def _enqueue_on_loop(self, event: ReconciliationEvent) -> bool:
+        """Coroutine wrapper around :meth:`enqueue`.
+
+        Lets :meth:`replay_dead_letters` marshal the (thread-unsafe)
+        ``asyncio.Queue`` mutation inside :meth:`enqueue` back onto the
+        event-loop thread via ``run_coroutine_threadsafe``. Always runs on the
+        loop thread.
+        """
+        return self.enqueue(event)
+
+    def _resolve_replay_enqueue(self) -> Callable[[ReconciliationEvent], object]:
+        """Return a callable that enqueues one event, safe for the CURRENT thread.
+
+        :meth:`enqueue` calls ``self._queue.put_nowait`` and ``asyncio.Queue`` is
+        NOT thread-safe: from a non-loop thread ``put_nowait`` would wake a
+        blocked getter via ``loop.call_soon`` (not ``call_soon_threadsafe``),
+        appending to the loop's ready-callback deque and touching Future
+        internals off-thread. :meth:`replay_dead_letters` runs either on the
+        event-loop thread (a direct call — e.g. from tests or another coroutine)
+        or in an ``asyncio.to_thread`` worker (the ``replay_event_dead_letters``
+        MCP tool offloads the blocking dead-letter file I/O). On the loop thread
+        we enqueue inline; off it we marshal each enqueue onto the loop via
+        ``run_coroutine_threadsafe`` and block the worker on the result, so every
+        ``asyncio.Queue`` mutation stays on the loop thread and replay stays
+        deterministic — counting and queue state are fully settled before the
+        method returns.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Off the event-loop thread (asyncio.to_thread worker): marshal.
+            loop = self._loop
+            if loop is None:
+                raise RuntimeError(
+                    'EventQueue.replay_dead_letters invoked off the event-loop '
+                    'thread before start() captured the loop — cannot marshal '
+                    'enqueue onto the loop safely'
+                ) from None
+
+            def _marshalled(event: ReconciliationEvent) -> object:
+                return asyncio.run_coroutine_threadsafe(
+                    self._enqueue_on_loop(event), loop,
+                ).result()
+
+            return _marshalled
+        # On the event-loop thread: put_nowait is safe inline.
+        return self.enqueue
+
+    def replay_dead_letters(self, *, project_id: str | None = None) -> dict[str, int]:
+        """Re-enqueue dead-lettered reconciliation events through :meth:`enqueue`.
+
+        For each existing dead-letter file (current + rotations) this atomically
+        snapshots it to a ``.replaying`` temp via ``os.replace`` — race-safe
+        against concurrent :meth:`_write_dead_letter` appends and self-guarding
+        against re-replay (a second call finds nothing left to snapshot). The
+        ``.replaying`` suffix is non-numeric, so :meth:`_purge_orphan_rotations`
+        and :meth:`_dead_letter_paths` ignore it. Each record is read
+        oldest-first; when ``project_id`` is None or matches, its event is
+        reconstructed and re-enqueued through the normal :meth:`enqueue` path (so
+        it regains durable-at-enqueue semantics and overflow safety). Records
+        that fail to parse/reconstruct (counted in ``failed``) and records
+        filtered out by ``project_id`` are written back to the current
+        dead-letter file — replay never silently drops data (loud-over-silent).
+        Snapshots are unlinked once fully processed.
+
+        Thread-safety: the blocking dead-letter file I/O (snapshot/read/parse/
+        leftover-writeback) runs on whatever thread calls this method — the MCP
+        ``replay_event_dead_letters`` tool offloads it to an
+        ``asyncio.to_thread`` worker. The re-enqueue itself mutates the
+        thread-unsafe in-memory ``asyncio.Queue`` (via :meth:`enqueue` →
+        ``put_nowait``), so it is always performed on the event-loop thread:
+        :meth:`_resolve_replay_enqueue` enqueues inline when already on the loop
+        thread, or marshals each enqueue onto the loop (blocking the worker on
+        the result) when called from a worker thread.
+
+        Note: ``project_id`` is NOT canonicalized (matches the dead-letter tool
+        convention). Returns ``{'replayed': N, 'failed': M}``.
+        """
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        # Resolve a thread-appropriate enqueue callable once (see
+        # _resolve_replay_enqueue): inline on the loop thread, marshalled onto
+        # the loop when this runs in an asyncio.to_thread worker.
+        enqueue = self._resolve_replay_enqueue()
+        replayed = 0
+        failed = 0
+        leftovers: list[str] = []
+        for path in self._dead_letter_paths():
+            if not path.exists():
+                continue
+            snapshot = Path(f'{path}.replaying')
+            try:
+                os.replace(path, snapshot)
+            except OSError as exc:
+                logger.warning(
+                    'EventQueue.replay_dead_letters: cannot snapshot %s: %s',
+                    path, exc,
+                )
+                continue
+            try:
+                content = snapshot.read_text(encoding='utf-8')
+            except OSError as exc:
+                # Leave the .replaying snapshot on disk so its records are not
+                # lost — an operator can recover them (loud-over-silent).
+                logger.error(
+                    'EventQueue.replay_dead_letters: cannot read snapshot %s: %s',
+                    snapshot, exc,
+                )
+                continue
+            for raw in content.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    event = ReconciliationEvent.model_validate(rec['event'])
+                except Exception as exc:
+                    logger.warning(
+                        'EventQueue.replay_dead_letters: unparseable record kept '
+                        'as leftover (from %s): %s', path, exc,
+                    )
+                    failed += 1
+                    leftovers.append(line)
+                    continue
+                if (
+                    project_id is not None
+                    and rec['event'].get('project_id') != project_id
+                ):
+                    leftovers.append(line)
+                    continue
+                # Normal enqueue path → re-journaled (durable-at-enqueue) and
+                # overflow-safe (an overflow re-dead-letters via _write_dead_letter).
+                # `enqueue` is the thread-appropriate callable (inline on the
+                # loop thread, marshalled onto the loop from a worker thread).
+                enqueue(event)
+                replayed += 1
+            snapshot.unlink(missing_ok=True)
+
+        if leftovers:
+            self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._dead_letter_path.open('a', encoding='utf-8') as fh:
+                for line in leftovers:
+                    fh.write(line + '\n')
+
+        logger.info(
+            'EventQueue.replay_dead_letters: replayed=%d failed=%d (project_id=%s)',
+            replayed, failed, project_id,
+        )
+        return {'replayed': replayed, 'failed': failed}

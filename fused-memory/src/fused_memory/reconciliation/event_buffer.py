@@ -228,12 +228,30 @@ class EventBuffer:
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
-        """Insert event into the shared buffer."""
+        """Insert event into the shared buffer.
+
+        Idempotent on the event id (UUID primary key): the conflict clause is
+        scoped to the primary key with ``ON CONFLICT(id) DO NOTHING`` so
+        re-pushing an already-committed event is a harmless no-op rather than an
+        IntegrityError. A duplicate only ever occurs on EventJournal-driven
+        startup recovery, which redelivers in-flight events at-least-once — the
+        drainer can be killed after this push commits but before it marks the
+        journal row processed, so recover() re-enqueues and re-pushes it (task
+        2709). Without the conflict clause the drainer would treat the duplicate
+        as a non-retriable error and dead-letter a perfectly good event.
+
+        Scoping to ``(id)`` rather than a bare ``INSERT OR IGNORE`` is
+        deliberate (loud-over-silent): only the intended duplicate-id case is
+        swallowed; any *other* constraint violation on this row — e.g. a
+        NOT NULL breach on project_id/event_type/event_source/timestamp — still
+        raises loudly instead of silently dropping the event.
+        """
         async with self._txn() as db:
             await db.execute(
                 """INSERT INTO event_buffer
                    (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')
+                   ON CONFLICT(id) DO NOTHING""",
                 (
                     event.id,
                     event.project_id,
