@@ -76,6 +76,7 @@ test against ``orchestrator.config.TranscriptArchiveConfig`` / ``RetentionConfig
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -189,3 +190,59 @@ def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
         mtime = max(file_mtimes) if file_mtimes else child.stat().st_mtime
         scanned.append((child, mtime))
     return scanned
+
+
+@dataclass
+class PruneOutcome:
+    """Result of a :func:`prune_task_dirs` sweep.
+
+    ``removed`` lists the task-dir paths successfully deleted; ``failed`` lists
+    those whose ``shutil.rmtree`` raised ``OSError`` (logged at WARNING and
+    counted, never re-raised). In a dry-run both stay empty. Pure value object.
+    """
+
+    removed: list[Path] = field(default_factory=list)
+    failed: list[Path] = field(default_factory=list)
+
+
+def prune_task_dirs(
+    prune_records: list[tuple[Path, str]],
+    *,
+    dry_run: bool,
+) -> PruneOutcome:
+    """Delete each pruned task dir, best-effort and LOUD (filesystem I/O).
+
+    Iterates ``(path, reason)`` records. In ``dry_run`` mode nothing is
+    deleted — each dir is logged with a stable ``would prune`` INFO line and
+    skipped. Otherwise each dir is removed via ``shutil.rmtree`` inside a
+    ``try/except OSError``: a success logs a LOUD per-removal INFO line and is
+    appended to ``removed``; an ``OSError`` is logged at WARNING (path / reason
+    / errno) and appended to ``failed`` while the sweep continues. The sweep
+    NEVER re-raises, so one wedged dir cannot stop its siblings from being
+    pruned. Every line carries the greppable ``gc_agent_transcripts:`` prefix.
+    """
+    outcome = PruneOutcome()
+    for path, reason in prune_records:
+        if dry_run:
+            logger.info(
+                '%s would prune task dir %s (reason=%s)', _LOG_PREFIX, path, reason
+            )
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as err:
+            logger.warning(
+                '%s failed to prune task dir %s (reason=%s, errno=%s): %s',
+                _LOG_PREFIX,
+                path,
+                reason,
+                err.errno,
+                err,
+            )
+            outcome.failed.append(path)
+        else:
+            logger.info(
+                '%s pruned task dir %s (reason=%s)', _LOG_PREFIX, path, reason
+            )
+            outcome.removed.append(path)
+    return outcome
