@@ -75,8 +75,12 @@ test against ``orchestrator.config.TranscriptArchiveConfig`` / ``RetentionConfig
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import shutil
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -271,3 +275,145 @@ def prune_task_dirs(
             )
             outcome.removed.append(path)
     return outcome
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI arg parser (unit-testable in isolation).
+
+    ``--root`` defaults to :func:`default_archive_root`; the caps default to the
+    drift-guarded α mirrors; ``--check`` is a dry-run flag; ``--now`` overrides
+    the age reference clock (epoch seconds) for deterministic/reproducible runs.
+    """
+    parser = argparse.ArgumentParser(
+        prog='gc_agent_transcripts.py',
+        description=(
+            'Retention GC sweep over the gzipped agent-transcript archive '
+            '(age/count cap, best-effort, LOUD).'
+        ),
+    )
+    parser.add_argument(
+        '--root',
+        default=str(default_archive_root()),
+        help='Archive root to sweep (default: %(default)s).',
+    )
+    parser.add_argument(
+        '--max-age-days',
+        type=int,
+        default=DEFAULT_MAX_AGE_DAYS,
+        help=(
+            'Prune task dirs older than this many days; a non-positive value '
+            'disables the age axis (default: %(default)s).'
+        ),
+    )
+    parser.add_argument(
+        '--max-task-dirs',
+        type=int,
+        default=DEFAULT_MAX_TASK_DIRS,
+        help=(
+            'Keep at most this many newest task dirs, pruning older ones; a '
+            'non-positive value disables the count axis (default: %(default)s).'
+        ),
+    )
+    parser.add_argument(
+        '--check',
+        action='store_true',
+        help=(
+            'Dry-run: scan + classify + log would-prune lines, delete nothing, '
+            'exit 0. Doubles as the delivered_check for a dependent task.'
+        ),
+    )
+    parser.add_argument(
+        '--now',
+        type=float,
+        default=time.time(),
+        help=(
+            'Age reference clock in epoch seconds (default: the current time). '
+            'Pin it for deterministic age-based pruning in tests.'
+        ),
+    )
+    return parser
+
+
+def build_gc_report(
+    root: Path,
+    scanned: list[tuple[Path, float]],
+    decision: GcDecision,
+    outcome: PruneOutcome,
+    caps: tuple[int, int],
+    now: float,
+    check: bool,
+) -> dict:
+    """Assemble the machine-readable JSON report (pure — no I/O).
+
+    ``removed`` is the count actually deleted (0 in a dry-run); ``pruned`` is
+    the count CLASSIFIED as prunable (non-zero even in a dry-run). ``failed``
+    carries the best-effort per-dir ``rmtree`` failures — the machine-readable
+    failure signal (INV-4 loud-over-silent) that a cron/watchdog wrapper reads
+    without alarming on the always-0 exit code.
+    """
+    max_age_days, max_task_dirs = caps
+    reason_counts: dict[str, int] = {}
+    for _path, reason in decision.prune:
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        'root': str(root),
+        'now': now,
+        'check': check,
+        'caps': {'max_age_days': max_age_days, 'max_task_dirs': max_task_dirs},
+        'scanned': len(scanned),
+        'kept': len(decision.keep),
+        'pruned': len(decision.prune),
+        'reason_counts': reason_counts,
+        'removed': len(outcome.removed),
+        'removed_paths': [str(p) for p in outcome.removed],
+        'failed': len(outcome.failed),
+        'failed_paths': [str(p) for p in outcome.failed],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the sweep: scan → classify → prune (or dry-run), report, exit 0.
+
+    Best-effort and never-raising by design — the JSON report on stdout and the
+    LOUD summary on stderr carry the signal (including any per-dir failures);
+    the process always exits 0 so a cron/watchdog hook does not alarm on routine
+    per-dir hiccups. ``--check`` never deletes.
+    """
+    logging.basicConfig(level=logging.INFO)
+    args = build_parser().parse_args(argv)
+
+    root = Path(args.root)
+    scanned = scan_task_dirs(root)
+    decision = select_prunable(
+        scanned, args.now, args.max_age_days, args.max_task_dirs
+    )
+    outcome = prune_task_dirs(decision.prune, dry_run=args.check)
+
+    report = build_gc_report(
+        root=root,
+        scanned=scanned,
+        decision=decision,
+        outcome=outcome,
+        caps=(args.max_age_days, args.max_task_dirs),
+        now=args.now,
+        check=args.check,
+    )
+    print(json.dumps(report))
+
+    logger.info(
+        '%s sweep complete — root=%s scanned=%d kept=%d pruned=%d removed=%d '
+        'failed=%d check=%s',
+        _LOG_PREFIX,
+        root,
+        report['scanned'],
+        report['kept'],
+        report['pruned'],
+        report['removed'],
+        report['failed'],
+        args.check,
+    )
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
