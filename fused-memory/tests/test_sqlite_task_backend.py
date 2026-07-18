@@ -1495,7 +1495,7 @@ def test_reserved_metadata_control_keys_names_append_and_metadata_mode():
     """`_RESERVED_METADATA_CONTROL_KEYS` names exactly the two update_task call-flags."""
     from fused_memory.backends.sqlite_task_backend import _RESERVED_METADATA_CONTROL_KEYS
 
-    assert _RESERVED_METADATA_CONTROL_KEYS == frozenset({'append', 'metadata_mode'})
+    assert frozenset({'append', 'metadata_mode'}) == _RESERVED_METADATA_CONTROL_KEYS
 
 
 def test_drop_reserved_control_keys_removes_append_and_metadata_mode():
