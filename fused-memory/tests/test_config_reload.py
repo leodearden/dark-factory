@@ -260,3 +260,30 @@ class TestReloadConfigTool:
         # Live config: green leaf mutated in place; red leaf NOT mutated.
         assert svc.config.reconciliation.stale_run_recovery_seconds == old_green + 1
         assert svc.config.task_metadata.enforce is False
+
+    @pytest.mark.asyncio
+    async def test_tool_fails_closed_on_invalid_config_reread(self, tmp_path, monkeypatch):
+        """A CONFIG_PATH that re-reads as invalid yields a fail-closed report with
+        the live config left completely untouched — never a half-applied reload."""
+        # Build a VALID live config first (the autouse fixture points CONFIG_PATH
+        # at a missing file → pure valid defaults), then capture the flagship leaf.
+        svc = AsyncMock()
+        svc.config = FusedMemoryConfig()
+        flagship_before = svc.config.reconciliation.stale_run_recovery_seconds
+
+        # Now point CONFIG_PATH at a yaml that RE-READS as invalid (gt=0 violated).
+        bad_yaml = tmp_path / 'bad.yaml'
+        bad_yaml.write_text(
+            yaml.safe_dump({'reconciliation': {'stale_run_recovery_seconds': 0}})
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(bad_yaml))
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is False
+        assert isinstance(result['error'], str) and result['error']
+        assert result['applied'] == {}
+        assert result['config_path'] == str(bad_yaml)
+        # Live config completely untouched — no apply on the load-failure path.
+        assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
