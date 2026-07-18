@@ -727,3 +727,91 @@ class EventQueue:
             return 0
 
         return count
+
+    # ── replay dead-letters ────────────────────────────────────────────
+
+    def replay_dead_letters(self, *, project_id: str | None = None) -> dict[str, int]:
+        """Re-enqueue dead-lettered reconciliation events through :meth:`enqueue`.
+
+        For each existing dead-letter file (current + rotations) this atomically
+        snapshots it to a ``.replaying`` temp via ``os.replace`` — race-safe
+        against concurrent :meth:`_write_dead_letter` appends and self-guarding
+        against re-replay (a second call finds nothing left to snapshot). The
+        ``.replaying`` suffix is non-numeric, so :meth:`_purge_orphan_rotations`
+        and :meth:`_dead_letter_paths` ignore it. Each record is read
+        oldest-first; when ``project_id`` is None or matches, its event is
+        reconstructed and re-enqueued through the normal :meth:`enqueue` path (so
+        it regains durable-at-enqueue semantics and overflow safety). Records
+        that fail to parse/reconstruct (counted in ``failed``) and records
+        filtered out by ``project_id`` are written back to the current
+        dead-letter file — replay never silently drops data (loud-over-silent).
+        Snapshots are unlinked once fully processed.
+
+        Note: ``project_id`` is NOT canonicalized (matches the dead-letter tool
+        convention). Returns ``{'replayed': N, 'failed': M}``.
+        """
+        from fused_memory.models.reconciliation import ReconciliationEvent
+
+        replayed = 0
+        failed = 0
+        leftovers: list[str] = []
+        for path in self._dead_letter_paths():
+            if not path.exists():
+                continue
+            snapshot = Path(f'{path}.replaying')
+            try:
+                os.replace(path, snapshot)
+            except OSError as exc:
+                logger.warning(
+                    'EventQueue.replay_dead_letters: cannot snapshot %s: %s',
+                    path, exc,
+                )
+                continue
+            try:
+                content = snapshot.read_text(encoding='utf-8')
+            except OSError as exc:
+                # Leave the .replaying snapshot on disk so its records are not
+                # lost — an operator can recover them (loud-over-silent).
+                logger.error(
+                    'EventQueue.replay_dead_letters: cannot read snapshot %s: %s',
+                    snapshot, exc,
+                )
+                continue
+            for raw in content.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    event = ReconciliationEvent.model_validate(rec['event'])
+                except Exception as exc:
+                    logger.warning(
+                        'EventQueue.replay_dead_letters: unparseable record kept '
+                        'as leftover (from %s): %s', path, exc,
+                    )
+                    failed += 1
+                    leftovers.append(line)
+                    continue
+                if (
+                    project_id is not None
+                    and rec['event'].get('project_id') != project_id
+                ):
+                    leftovers.append(line)
+                    continue
+                # Normal enqueue path → re-journaled (durable-at-enqueue) and
+                # overflow-safe (an overflow re-dead-letters via _write_dead_letter).
+                self.enqueue(event)
+                replayed += 1
+            snapshot.unlink(missing_ok=True)
+
+        if leftovers:
+            self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._dead_letter_path.open('a', encoding='utf-8') as fh:
+                for line in leftovers:
+                    fh.write(line + '\n')
+
+        logger.info(
+            'EventQueue.replay_dead_letters: replayed=%d failed=%d (project_id=%s)',
+            replayed, failed, project_id,
+        )
+        return {'replayed': replayed, 'failed': failed}
