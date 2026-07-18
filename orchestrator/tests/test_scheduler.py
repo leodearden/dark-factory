@@ -12137,6 +12137,132 @@ class TestStarvationWatchdog:
         callback.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_never_top_scored_low_task_e2e_rca_reproduction(self):
+        """End-to-end reify-5166 reproduction: a never-top-scored low task fires idle-only.
+
+        A single 'low'-priority task on module 'backend' is kept perpetually
+        eligible while a stream of FRESH 'high'-priority tasks on the DISJOINT
+        module 'frontend' dispatch first EVERY tick (TIER_BASE high=8000 always
+        outscores low's max of 2999).  Because 'low' is never the top-scored
+        candidate, the scored loop acquires+dispatches the high task and returns
+        BEFORE 'low' is ever reached: _skip_count['low'] stays 0 and the dual
+        skip+idle gate can NEVER trip — the exact structural blind spot from
+        reify-5166 (77h eligible, 547 higher-tier dispatches, zero skips).
+
+        Once continuous eligibility crosses idle_only_secs, the idle-only
+        backstop files exactly one STARVATION_WATCHDOG escalation for 'low'.
+        When contention finally clears, 'low' dispatches and self-resolves
+        (proving the existing resolve/GC state is reused after an idle-only fire).
+        """
+        scheduler, t = self._make_scheduler(
+            skip_threshold=3, idle_secs=100.0, idle_only_secs=200.0,
+        )
+        warn_cb = AsyncMock()
+        resolve_cb = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(
+            scheduler._callbacks,
+            on_starvation_warn=warn_cb,
+            on_starvation_resolve=resolve_cb,
+        )
+
+        low = {
+            'id': 'low',
+            'title': 'Low-priority never-top task',
+            'status': 'pending',
+            'priority': 'low',
+            'dependencies': [],
+            'metadata': {'files': ['backend/main.py']},
+        }
+
+        def high_task(n: int) -> dict:
+            return {
+                'id': f'high{n}',
+                'title': f'High task {n}',
+                'status': 'pending',
+                'priority': 'high',
+                'dependencies': [],
+                'metadata': {'files': ['frontend/main.py']},
+            }
+
+        # Contention phase: many ticks below idle_only_secs.  Each tick a fresh
+        # high task on 'frontend' dispatches first; 'low' is never reached.
+        for n in range(4):
+            scheduler.get_tasks = AsyncMock(return_value=[low, high_task(n)])
+            result = await scheduler.acquire_next()
+            assert result is not None and result.task_id == f'high{n}', (
+                f'Expected high{n} to dispatch first (top-scored); got {result!r}'
+            )
+            # 'low' is continuously eligible (anchored) but never top-scored.
+            assert 'low' in scheduler._starvation_first_seen, (
+                f'low must stay continuously eligible (anchored) at tick {n}'
+            )
+            assert scheduler._skip_count.get('low', 0) == 0, (
+                f'low must NEVER accrue skips (never top-scored); '
+                f'got {scheduler._skip_count!r} at tick {n}'
+            )
+            # Release the dispatched high so next tick's high acquires 'frontend'.
+            scheduler.lock_table.release(f'high{n}')
+            scheduler._dispatched.discard(f'high{n}')
+
+        # No escalation yet (elapsed 0 < idle_only_secs=200).
+        warn_cb.assert_not_called()
+
+        # Advance past idle_only_secs and tick once more (still contended).
+        t[0] = 250.0
+        scheduler.get_tasks = AsyncMock(return_value=[low, high_task(99)])
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'high99', (
+            f'high99 must still dispatch first this tick; got {result!r}'
+        )
+        # low still never reached: zero skips, never dispatched.
+        assert scheduler._skip_count.get('low', 0) == 0, (
+            f'low must still have zero skips; got {scheduler._skip_count!r}'
+        )
+
+        # Idle-only backstop fired EXACTLY once for 'low'.
+        warn_cb.assert_called_once()
+        call_args = warn_cb.call_args
+        args = call_args.args if call_args.args else ()
+        kwargs = call_args.kwargs if call_args.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == 'low', (
+            f'Expected watchdog to fire for low; got {task_id_arg!r}'
+        )
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
+            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
+        )
+        assert 'low' in scheduler._starvation_escalated, (
+            'low must be escalated after the idle-only fire'
+        )
+        scheduler.lock_table.release('high99')
+        scheduler._dispatched.discard('high99')
+
+        # Clear all higher-tier contention: only 'low' remains eligible.
+        scheduler.get_tasks = AsyncMock(return_value=[low])
+        result = await scheduler.acquire_next()
+        assert result is not None and result.task_id == 'low', (
+            f'low must finally dispatch once contention clears; got {result!r}'
+        )
+
+        # Self-resolve reuse works after an idle-only fire.
+        resolve_cb.assert_called_once()
+        r_args = resolve_cb.call_args.args
+        r_kwargs = resolve_cb.call_args.kwargs
+        r_task_id = r_args[0] if r_args else r_kwargs.get('task_id')
+        assert str(r_task_id) == 'low', (
+            f'Expected resolve callback for low; got {r_task_id!r}'
+        )
+        assert 'low' not in scheduler._starvation_escalated, (
+            '_starvation_escalated must clear on dispatch (self-resolve reuse)'
+        )
+        assert 'low' not in scheduler._starvation_first_seen, (
+            '_starvation_first_seen must clear on dispatch'
+        )
+        # warn must not have re-fired during the resolve tick.
+        warn_cb.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_disabled_no_callback(self):
         """(c) Disabled: starvation_watchdog.enabled=False → NOT called even when both thresholds crossed.
 
