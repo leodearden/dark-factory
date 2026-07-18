@@ -4800,6 +4800,18 @@ class TaskWorkflow:
                     await self._route_review_suggestions_to_curator(reviews)
                 else:
                     await self._write_suggestions_to_memory(reviews)
+                # Record the non-blocking verdict keyed by the committed tree
+                # hash (task 2749) so a future re-dispatch on byte-identical
+                # content skips the reviewer and its suggestion routing.  Only
+                # PASS / suggestions_only are cached — blocking verdicts are
+                # never recorded (a replan changes the tree anyway), so any
+                # cache hit is unconditionally safe→DONE.
+                if review_tree_hash and self.artifacts:
+                    self.artifacts.record_review_verdict(
+                        review_tree_hash,
+                        'suggestions_only' if reviews.suggestions else 'PASS',
+                        suggestions_routed=bool(reviews.suggestions),
+                    )
                 return WorkflowOutcome.DONE
 
             review_cycle += 1
