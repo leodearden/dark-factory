@@ -10,13 +10,17 @@ KEPT (strict >, not >=); max_age_days <= 0 disables the age axis.
 """
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 
 import gc_agent_transcripts as gct
 from gc_agent_transcripts import select_prunable
+
+LOG_PREFIX = "gc_agent_transcripts:"
 
 DAY = 86_400
 NOW = 1_000_000_000.0
@@ -217,3 +221,87 @@ def test_scan_existing_but_empty_root_returns_empty(tmp_path):
     root = tmp_path / "agent-transcripts"
     root.mkdir(parents=True)
     assert gct.scan_task_dirs(root) == []
+
+
+# ---------------------------------------------------------------------------
+# step-7: prune_task_dirs(prune_records, *, dry_run) — best-effort + LOUD
+# ---------------------------------------------------------------------------
+
+def _make_task_dirs(root: Path, records: list[tuple[str, str]]) -> list[tuple[Path, str]]:
+    """Materialise ``(name, reason)`` specs as populated task dirs under *root*;
+    return the ``(task_dir_path, reason)`` prune-record list."""
+    out: list[tuple[Path, str]] = []
+    for name, reason in records:
+        d = root / name
+        (d / "enc").mkdir(parents=True)
+        (d / "enc" / "x.jsonl.gz").write_bytes(b"x")
+        out.append((d, reason))
+    return out
+
+
+def test_prune_removes_dirs_and_logs_loud_per_removal(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="gc_agent_transcripts")
+    records = _make_task_dirs(tmp_path, [("100", "age"), ("200", "count")])
+
+    outcome = gct.prune_task_dirs(records, dry_run=False)
+
+    for d, _reason in records:
+        assert not d.exists()
+    assert set(outcome.removed) == {d for d, _ in records}
+    assert outcome.failed == []
+
+    info_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    for d, reason in records:
+        assert any(
+            LOG_PREFIX in m and str(d) in m and reason in m for m in info_msgs
+        ), f"missing LOUD removal line for {d} (reason={reason}); got {info_msgs}"
+
+
+def test_prune_dry_run_removes_nothing_but_logs_would_prune(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="gc_agent_transcripts")
+    records = _make_task_dirs(tmp_path, [("100", "age"), ("200", "count")])
+
+    outcome = gct.prune_task_dirs(records, dry_run=True)
+
+    for d, _reason in records:
+        assert d.exists()  # dry-run deletes nothing
+    assert outcome.removed == []
+    assert outcome.failed == []
+
+    msgs = [r.getMessage() for r in caplog.records]
+    for d, _reason in records:
+        assert any(
+            LOG_PREFIX in m and "would prune" in m and str(d) in m for m in msgs
+        ), f"missing 'would prune' line for {d}; got {msgs}"
+
+
+def test_prune_best_effort_on_rmtree_oserror(tmp_path, caplog, monkeypatch):
+    """A per-dir rmtree OSError is logged at WARNING + counted in `failed`, the
+    sweep never raises, and the sibling dirs are still removed."""
+    caplog.set_level(logging.INFO, logger="gc_agent_transcripts")
+    records = _make_task_dirs(
+        tmp_path, [("100", "age"), ("200", "count"), ("300", "age+count")]
+    )
+    fail_dir = records[1][0]  # the "200" dir
+
+    real_rmtree = shutil.rmtree
+
+    def fake_rmtree(path, *args, **kwargs):
+        if Path(path) == fail_dir:
+            raise OSError(28, "No space left on device")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", fake_rmtree)
+
+    outcome = gct.prune_task_dirs(records, dry_run=False)  # must not raise
+
+    assert fail_dir.exists()  # the failing dir survives
+    assert fail_dir in outcome.failed
+    assert set(outcome.removed) == {records[0][0], records[2][0]}
+    assert not records[0][0].exists()
+    assert not records[2][0].exists()
+
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        LOG_PREFIX in m and str(fail_dir) in m for m in warn_msgs
+    ), f"missing WARNING line for failed dir {fail_dir}; got {warn_msgs}"
