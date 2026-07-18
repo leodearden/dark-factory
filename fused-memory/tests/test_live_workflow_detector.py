@@ -48,6 +48,21 @@ def _worktree_porcelain_no_branch() -> str:
     )
 
 
+def _worktree_porcelain_prunable(branch: str, path: str = '/tmp/gone') -> str:
+    """Return `git worktree list --porcelain` output for a REAPED worktree.
+
+    Its directory was removed but git still carries a stale registration for
+    *branch*, marked `prunable` — reify#5245's shape.
+    """
+    return (
+        f'worktree {path}\n'
+        f'HEAD abc1234\n'
+        f'branch refs/heads/{branch}\n'
+        'prunable gitdir file points to non-existent location\n'
+        '\n'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -737,3 +752,102 @@ class TestBlockedNormalOrchestratorSuppression:
             )
 
         assert live is False
+
+
+# ---------------------------------------------------------------------------
+# reify#5245 hardening: reaped-worktree / bare-branch / stranded-orchestrator
+# false-positive (task 2767)
+# ---------------------------------------------------------------------------
+
+
+class TestPrunableWorktreeSignal:
+    """A worktree porcelain entry marked `prunable` (its directory was reaped) must
+    not count as worktree_registered — a reaped worktree is not a live workspace,
+    even though its branch line is still present in the porcelain stanza
+    (reify#5245's shape).
+    """
+
+    def _make_run(self, stdout: str, returncode: int = 0):
+        """Build a mock subprocess.CompletedProcess for worktree list."""
+        return subprocess.CompletedProcess(
+            args=['git', 'worktree', 'list', '--porcelain'],
+            returncode=returncode,
+            stdout=stdout,
+            stderr='',
+        )
+
+    def _make_log_run(self, stdout: str = '', returncode: int = 1):
+        """Build a mock subprocess.CompletedProcess for git log (branch absent by default)."""
+        return subprocess.CompletedProcess(
+            args=['git', 'log', '-1', '--format=%cI', _BRANCH],
+            returncode=returncode,
+            stdout=stdout,
+            stderr='',
+        )
+
+    def _make_revlist_run(self, stdout: str = '0', returncode: int = 0):
+        """Build a mock subprocess.CompletedProcess for the (forthcoming) rev-list call."""
+        return subprocess.CompletedProcess(
+            args=['git', 'rev-list', '--count', f'main..{_BRANCH}'],
+            returncode=returncode,
+            stdout=stdout,
+            stderr='',
+        )
+
+    def _run_side_effect(
+        self,
+        worktree_stdout: str,
+        log_stdout: str = '',
+        log_rc: int = 1,
+        revlist_stdout: str = '0',
+        revlist_rc: int = 0,
+    ):
+        """Return a function-style subprocess.run side_effect dispatching on args.
+
+        Matches the existing style in TestWorktreeSignal (NOT a list side_effect),
+        so an unanticipated extra call — e.g. the rev-list call landing in a later
+        step — degrades gracefully instead of raising StopIteration.
+        """
+        worktree_result = self._make_run(worktree_stdout)
+        log_result = self._make_log_run(log_stdout, log_rc)
+        revlist_result = self._make_revlist_run(revlist_stdout, revlist_rc)
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return worktree_result
+            if 'rev-list' in args:
+                return revlist_result
+            return log_result
+
+        return side_effect
+
+    def test_prunable_worktree_not_counted(self, tmp_path):
+        """A prunable (reaped) worktree entry does not count as worktree_registered,
+        even though its branch line is present in the same porcelain stanza.
+        """
+        side_effect = self._run_side_effect(
+            _worktree_porcelain_prunable(_BRANCH),
+            log_rc=1,
+            revlist_stdout='0',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.worktree_registered is False
+        assert result.is_live is False
+
+    def test_live_nonprunable_worktree_still_counts_even_when_bare(self, tmp_path):
+        """A LIVE (non-prunable) worktree stays a live signal even when the branch
+        itself is bare (zero own commits) — a just-started dispatch (branch created,
+        no commits yet) must stay live.
+        """
+        side_effect = self._run_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH),
+            log_rc=1,
+            revlist_stdout='0',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.worktree_registered is True
+        assert result.is_live is True
