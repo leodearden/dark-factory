@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
@@ -27,6 +27,11 @@ from orchestrator.verify_cmd import (
     parse_config_command,
     render,
     with_pytest_timeout,
+)
+from orchestrator.verify_runner import (
+    LocalRunner,
+    MergeVerifySpec,
+    UnscopedTypecheckSpec,
 )
 
 
@@ -601,3 +606,207 @@ class TestSuppressionStormStreak:
         )
 
         assert vm._merge_flake_suppression_streak == 0
+
+
+# --- LocalRunner.run_merge_verify integration (step-9/10) ---------------------
+
+_MERGE_VERIFY_SHA = 'abc123'
+
+
+def _merge_spec() -> MergeVerifySpec:
+    return MergeVerifySpec(
+        verify_commands=(),
+        unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+        task_files=None,
+        verify_env={},
+        cold_timeout_secs=60.0,
+    )
+
+
+def _clean_unscoped_gate() -> MagicMock:
+    """An unscoped-typecheck gate result that is not broken (falls through)."""
+    return MagicMock(
+        broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[],
+    )
+
+
+def _broken_unscoped_gate() -> MagicMock:
+    """A broken unscoped-typecheck gate (turns a passed scoped result red)."""
+    return MagicMock(
+        broken=True, timed_out=False, failing_subprojects=['orchestrator'],
+        timed_out_subprojects=[], detail='type error line 10',
+    )
+
+
+def _make_hook_runner(
+    tmp_path: Path,
+    *,
+    scoped_result: VerifyResult,
+    unscoped_gate: MagicMock | None = None,
+    event_store=None,
+    escalation_queue=None,
+) -> tuple[LocalRunner, AsyncMock, AsyncMock]:
+    """A LocalRunner whose scoped phase fails (so the α hook fires), with a
+    fake unscoped gate + optional event_store / escalation_queue threaded in.
+    """
+    run_scoped = AsyncMock(return_value=scoped_result)
+    run_unscoped = AsyncMock(
+        return_value=unscoped_gate if unscoped_gate is not None else _clean_unscoped_gate()
+    )
+    runner = LocalRunner(
+        merge_wt=tmp_path,
+        config=_make_config(tmp_path),
+        module_configs=[_orch_module_config()],
+        task_files=None,
+        run_scoped=run_scoped,
+        run_unscoped=run_unscoped,
+        task_id='2768',
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+    return runner, run_scoped, run_unscoped
+
+
+class TestLocalRunnerMergeFlakeSuppressionHook:
+    """LocalRunner.run_merge_verify wires apply_merge_flake_suppression into the
+    `not scoped.passed` branch (PRD task α, steps 9/10).
+
+    RED until step-10 adds event_store/escalation_queue to LocalRunner.__init__
+    and calls verify.apply_merge_flake_suppression on the scoped-fail branch
+    (resolved via the verify module so this monkeypatch takes effect).
+    """
+
+    # -- (a) suppression is NOT a bypass of the unscoped typecheck gate ----
+
+    def test_suppressed_result_proceeds_into_clean_unscoped_gate(self, tmp_path: Path) -> None:
+        """apply_* returns a PASSED (suppressed) result -> run_merge_verify runs
+        the unscoped gate and, when it is clean, returns the suppressed pass."""
+        from orchestrator import verify as verify_module
+
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(False),
+        )
+        suppressed = _result(True, category='merge_flake_suppressed')
+        apply = AsyncMock(return_value=suppressed)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        apply.assert_awaited_once()
+        run_unscoped.assert_awaited_once()  # suppression does NOT skip the gate
+        assert result.passed is True
+        assert result.category == 'merge_flake_suppressed'
+
+    def test_suppressed_result_still_gated_by_broken_unscoped(self, tmp_path: Path) -> None:
+        """Even after suppression, a BROKEN unscoped gate turns the merge red —
+        proving suppression is not a bypass of the unscoped typecheck gate."""
+        from orchestrator import verify as verify_module
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY
+
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(False), unscoped_gate=_broken_unscoped_gate(),
+        )
+        apply = AsyncMock(return_value=_result(True, category='merge_flake_suppressed'))
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        run_unscoped.assert_awaited_once()
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+
+    # -- (b) non-suppression is byte-identical to today's short-circuit ----
+
+    def test_non_suppression_returns_failing_and_skips_unscoped(self, tmp_path: Path) -> None:
+        """apply_* returns the ORIGINAL failing result -> run_merge_verify
+        returns it unchanged and does NOT call the unscoped gate."""
+        from orchestrator import verify as verify_module
+
+        failing = _result(False, category='test_failure')
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=failing,
+        )
+        apply = AsyncMock(side_effect=lambda fr, **kw: fr)  # non-confirmation: unchanged
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        apply.assert_awaited_once()
+        assert result is failing
+        assert result.passed is False
+        run_unscoped.assert_not_awaited()
+
+    # -- scoped PASS path is byte-identical (hook never fires) --------------
+
+    def test_scoped_pass_does_not_invoke_suppression_hook(self, tmp_path: Path) -> None:
+        """A passing scoped phase never reaches the α hook (byte-identical)."""
+        from orchestrator import verify as verify_module
+
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(True),
+        )
+        apply = AsyncMock(return_value=_result(True, category='merge_flake_suppressed'))
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        apply.assert_not_awaited()
+        run_unscoped.assert_awaited_once()
+        assert result.passed is True
+
+    # -- (c) event_store/escalation_queue thread into the hook call --------
+
+    def test_init_threads_event_store_and_escalation_queue_into_hook(self, tmp_path: Path) -> None:
+        """LocalRunner.__init__ accepts event_store=/escalation_queue= and passes
+        them (plus worktree/config/module_configs/merge_sha/task_id) to the hook."""
+        from orchestrator import verify as verify_module
+
+        es = _FakeEventStore()
+        eq = _FakeEscalationQueue()
+        failing = _result(False)
+        runner, _run_scoped, _run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=failing, event_store=es, escalation_queue=eq,
+        )
+        apply = AsyncMock(side_effect=lambda fr, **kw: fr)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        apply.assert_awaited_once()
+        # The failing scoped result is passed positionally as the first arg.
+        assert apply.call_args.args[0] is failing
+        kwargs = apply.call_args.kwargs
+        assert kwargs['event_store'] is es
+        assert kwargs['escalation_queue'] is eq
+        assert kwargs['worktree'] == tmp_path
+        assert kwargs['merge_sha'] == _MERGE_VERIFY_SHA
+        assert kwargs['task_id'] == '2768'
+        assert kwargs['module_configs'] == [_orch_module_config()]
+        assert 'config' in kwargs
+
+    def test_init_defaults_event_store_and_escalation_queue_to_none(self, tmp_path: Path) -> None:
+        """Omitting event_store/escalation_queue defaults both to None and
+        threads None into the hook (byte-identical CLI/test construction)."""
+        from orchestrator import verify as verify_module
+
+        failing = _result(False)
+        run_scoped = AsyncMock(return_value=failing)
+        run_unscoped = AsyncMock(return_value=_clean_unscoped_gate())
+        # Construct WITHOUT event_store/escalation_queue (default None).
+        runner = LocalRunner(
+            merge_wt=tmp_path,
+            config=_make_config(tmp_path),
+            module_configs=[_orch_module_config()],
+            task_files=None,
+            run_scoped=run_scoped,
+            run_unscoped=run_unscoped,
+            task_id='2768',
+        )
+        apply = AsyncMock(side_effect=lambda fr, **kw: fr)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        kwargs = apply.call_args.kwargs
+        assert kwargs['event_store'] is None
+        assert kwargs['escalation_queue'] is None
