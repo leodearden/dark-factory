@@ -11818,9 +11818,15 @@ class TestStarvationWatchdog:
         *,
         skip_threshold: int = 3,
         idle_secs: float = 100.0,
+        idle_only_secs: float = 259200.0,
         enabled: bool = True,
     ) -> tuple['Scheduler', list]:
-        """Build a Scheduler with watchdog config tuned small and a mutable clock."""
+        """Build a Scheduler with watchdog config tuned small and a mutable clock.
+
+        ``idle_only_secs`` defaults to 259200 (the schema default) so existing
+        dual-gate tests — whose fake clock never advances past a few hundred
+        seconds — are unaffected by the never-top-scored idle-only backstop.
+        """
         t: list[float] = [0.0]
 
         def fake_clock() -> float:
@@ -11832,6 +11838,7 @@ class TestStarvationWatchdog:
                 enabled=enabled,
                 skip_threshold=skip_threshold,
                 idle_secs=idle_secs,
+                idle_only_secs=idle_only_secs,
             ),
         )
         # Prevent fairness parks from installing before the watchdog threshold
@@ -12044,6 +12051,89 @@ class TestStarvationWatchdog:
         t[0] = 50.0
         await scheduler.acquire_next()
 
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idle_only_backstop_fires_with_zero_skips(self):
+        """Idle-only backstop fires for a never-top-scored task (skip_count stays 0).
+
+        Drives _apply_starvation_watchdog DIRECTLY (not acquire_next) so
+        _skip_count is never bumped — the faithful reify-5166 shape where a low
+        task can never outscore a medium/high candidate, is never the top-scored
+        candidate, and accrues ZERO skips.  With idle_secs=100, idle_only_secs=200:
+        - t=0: first call stamps first_seen; skip_count==0; no fire.
+        - t=250 (>= idle_only_secs, skip still 0): warn fires EXACTLY once with
+          task_id='starved' and 'STARVATION_WATCHDOG' in the summary; tid escalated.
+        - further calls do not re-fire (dedup).
+
+        RED under the current AND-only gate, which never fires with skip_count==0.
+        """
+        scheduler, t = self._make_scheduler(idle_secs=100.0, idle_only_secs=200.0)
+        callback = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
+
+        task = self._starved_task()
+
+        # t=0: stamp first_seen.  Direct call must never bump skip_count.
+        await scheduler._apply_starvation_watchdog([task])
+        assert scheduler._skip_count.get('starved', 0) == 0, (
+            f'Direct _apply_starvation_watchdog must never bump skip_count; '
+            f'got {scheduler._skip_count!r}'
+        )
+        callback.assert_not_called()
+
+        # Advance past idle_only_secs (200); skip_count is still 0 (never top).
+        t[0] = 250.0
+        await scheduler._apply_starvation_watchdog([task])
+
+        assert scheduler._skip_count.get('starved', 0) == 0, (
+            'skip_count must remain 0 across the idle-only fire (never top-scored)'
+        )
+        callback.assert_called_once()
+        call_args = callback.call_args
+        args = call_args.args if call_args.args else ()
+        kwargs = call_args.kwargs if call_args.kwargs else {}
+        task_id_arg = args[0] if args else kwargs.get('task_id')
+        assert str(task_id_arg) == 'starved', (
+            f'Expected task_id="starved"; got {task_id_arg!r}'
+        )
+        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
+        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
+            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
+        )
+        assert 'starved' in scheduler._starvation_escalated, (
+            '_starvation_escalated must contain task_id after the idle-only fire'
+        )
+
+        # Further calls must NOT re-fire (dedup / no re-arm spam).
+        for _ in range(3):
+            await scheduler._apply_starvation_watchdog([task])
+        callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_idle_only_does_not_fire_below_idle_only_secs(self):
+        """Guard: skip_count==0 and idle_secs <= elapsed < idle_only_secs → NOT fired.
+
+        Proves the idle-only backstop does not fire prematurely: crossing the
+        dual-gate's idle_secs component (100) is NOT sufficient without skips —
+        only crossing idle_only_secs (200) fires when skip_count==0.
+        """
+        scheduler, t = self._make_scheduler(idle_secs=100.0, idle_only_secs=200.0)
+        callback = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
+
+        task = self._starved_task()
+
+        # t=0: stamp first_seen.
+        await scheduler._apply_starvation_watchdog([task])
+
+        # t=150: >= idle_secs (100) but < idle_only_secs (200), skip_count==0.
+        t[0] = 150.0
+        await scheduler._apply_starvation_watchdog([task])
+
+        assert scheduler._skip_count.get('starved', 0) == 0, (
+            'Precondition: skip_count must be 0 (never top-scored)'
+        )
         callback.assert_not_called()
 
     @pytest.mark.asyncio
