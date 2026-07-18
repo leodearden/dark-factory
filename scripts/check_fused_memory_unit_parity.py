@@ -51,10 +51,26 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
 # non-comment directives.  Extend this list to guard additional safety flags.
+# Restart=on-failure / RestartSec=5 / TimeoutStartSec=300 / TimeoutStopSec=90
+# are host-invariant literal strings (already present verbatim in
+# scripts/fused-memory.service.template) — exact membership matching both
+# detects a divergent value (e.g. a wrong TimeoutStopSec) and lets --fix
+# append the correct line.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "Environment=MEM0_TELEMETRY=false",
     "WatchdogSec=120",
+    "Restart=on-failure",
+    "RestartSec=5",
+    "TimeoutStartSec=300",
+    "TimeoutStopSec=90",
 )
+
+# Directive PREFIXES that MUST be present (as the start of some non-comment
+# [Service] line) but whose full value is host-specific and therefore cannot
+# be exact-matched or synthesized by --fix. ExecStartPre= carries
+# host-specific paths (__REPO_ROOT__, /home/leo/bin) — only its presence can
+# be asserted.
+REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=",)
 
 # ---------------------------------------------------------------------------
 # Unit parser
@@ -99,6 +115,7 @@ def parse_unit_sections(text: str) -> dict[str, list[str]]:
 def find_drift(
     unit_text: str,
     required: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVES,
+    required_prefixes: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVE_PREFIXES,
 ) -> list[str]:
     """Return required directives NOT present as non-comment lines in [Service].
 
@@ -106,17 +123,31 @@ def find_drift(
     non-comment line inside the [Service] section — a commented-out copy or
     a line in another section is treated as missing.
 
+    A prefix in ``required_prefixes`` is considered absent if no non-comment
+    [Service] line starts with it — used for directives whose full value is
+    host-specific (e.g. ExecStartPre=) and therefore cannot be exact-matched.
+    Prefix misses are appended, in order, after the exact-match misses.
+
     Args:
         unit_text: The full text of the systemd unit file.
         required:  Ordered tuple of exact directive strings to check.
+        required_prefixes: Ordered tuple of directive prefixes whose mere
+            presence (not exact value) must be checked. Pass ``()`` to skip
+            prefix checking entirely (e.g. from fix_unit_text, which can only
+            ever synthesize exact directives).
 
     Returns:
-        List of missing directives in the same order as ``required`` (empty if
-        all are present).
+        List of missing directives/prefixes: exact misses (in ``required``
+        order) followed by prefix misses (in ``required_prefixes`` order).
+        Empty if everything required is present.
     """
     sections = parse_unit_sections(unit_text)
     service_lines = sections.get("Service", [])
-    return [d for d in required if d not in service_lines]
+    missing = [d for d in required if d not in service_lines]
+    missing.extend(
+        p for p in required_prefixes if not any(line.startswith(p) for line in service_lines)
+    )
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +166,10 @@ def fix_unit_text(
     - Appends each missing directive immediately after the last non-blank
       line of the [Service] section, before the next section header.
     - Never removes or reorders any existing line.
+    - Only ever synthesizes EXACT directives (required_prefixes=() is passed
+      to find_drift) — a prefix-checked directive like ExecStartPre= carries
+      a host-specific value that cannot be guessed, so a missing prefix is
+      surfaced by find_drift() for reporting but never appended here.
 
     Args:
         unit_text: The original unit file text.
@@ -143,7 +178,7 @@ def fix_unit_text(
     Returns:
         Updated text string (or the original if nothing was missing).
     """
-    missing = find_drift(unit_text, required)
+    missing = find_drift(unit_text, required, required_prefixes=())
     if not missing:
         return unit_text
 
@@ -267,10 +302,30 @@ def main(argv: Sequence[str]) -> int:
     )
 
     if args.fix:
+        # fix_unit_text only ever synthesizes EXACT directives — a host-specific
+        # prefix directive (e.g. ExecStartPre=, whose value carries __REPO_ROOT__
+        # / host paths) cannot be guessed. So the count of lines actually
+        # appended is the number of missing EXACT directives, NOT len(drift)
+        # (which also counts un-synthesizable prefix misses).
+        appended = find_drift(unit_text, required_prefixes=())
         fixed_text = fix_unit_text(unit_text)
         installed_path.write_text(fixed_text, encoding="utf-8")
-        print(f"[fixed] Appended {len(drift)} directive(s) to {installed_path}")
+        print(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
         daemon_reload()
+
+        # Re-check the written text with the default (prefix-aware) config. Any
+        # residual drift is an un-synthesizable prefix directive that --fix
+        # could not resolve; report it and exit 1 (drift) rather than falsely
+        # signalling parity with exit 0 — a follow-up plain verify would exit 1.
+        residual = find_drift(fixed_text)
+        if residual:
+            print(
+                f"[drift] {installed_path}: --fix cannot synthesize host-specific "
+                f"directive(s) (value carries host paths — add them by hand):\n"
+                + "".join(f"  - {d}\n" for d in residual),
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     print(

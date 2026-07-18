@@ -34,6 +34,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 # (port, systemd unit name) pairs to watch.  Port values match each
 # orchestrator's configured escalation.port (guarded by the drift test in
@@ -66,6 +68,26 @@ STARTUP_GRACE_SECS = 120
 # _enumerate_running_units excludes it explicitly so the exclusion does not
 # rely on systemd oneshot SUB-state semantics.
 WATCHDOG_UNIT_NAME = "orchestrator-watchdog.service"
+
+# fused-memory liveness (task 2713, ξ of the fm-restart survey). fused-memory
+# is the single shared MCP server all 7 orchestrators depend on — it is
+# deliberately NOT added to WATCHED/main()'s loop (both are pinned by
+# exact-equality drift tests). It needs a richer probe than a bare port
+# check: the in-process systemd watchdog thread pings WATCHDOG=1 from a
+# dedicated OS thread unconditionally (task 1731), so a wedged asyncio loop
+# still looks "healthy" to systemd forever — only an HTTP /health fetch can
+# catch that. See fused_memory_liveness_pass() / probe_health() below.
+FUSED_MEMORY_UNIT = "fused-memory.service"
+# Port value matches fused-memory/config/config.yaml's server.port (guarded
+# by the drift test in tests/scripts/test_orchestrator_watchdog.py).
+FUSED_MEMORY_PORT = 8002
+FUSED_MEMORY_HEALTH_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/health"
+# /health (fused_memory/server/tools.py:701) runs two sequential backing-store
+# probes (FalkorDB, Qdrant), each wrapped in asyncio.timeout(5), so a
+# degraded-but-alive server can take ~10s to return its 503. 15s clears that
+# ~10s worst case with margin, so only a genuinely wedged loop (no response
+# at all) times out here.
+FUSED_MEMORY_HEALTH_TIMEOUT_SECS = 15
 
 # Working directory shared by every orchestrator-*.service unit; the repo the
 # staleness pass diffs against.
@@ -240,6 +262,61 @@ def probe_port(port: int) -> bool:
             except ValueError:
                 continue
     return False
+
+
+def probe_health(
+    url: str = FUSED_MEMORY_HEALTH_URL, timeout: float = FUSED_MEMORY_HEALTH_TIMEOUT_SECS
+) -> bool:
+    """Return True iff *url* returns ANY HTTP response within *timeout* seconds.
+
+    Deliberately inverted fail-direction vs. probe_port(): probe_port defaults
+    to True (assume healthy) on a tooling failure so a flaky `ss` invocation
+    never triggers a restart. probe_health instead treats an HTTP response —
+    including an error status such as 503 (surfaced by urlopen as
+    urllib.error.HTTPError) — as the positive/alive signal, and returns False
+    only when NO response is received at all (connection-refused, DNS
+    failure, or a timeout).
+
+    This asymmetry is intentional: fused-memory's /health returns 503 when a
+    backing store (FalkorDB/Qdrant) is degraded, but a 503 still means the
+    asyncio event loop IS serving requests — restarting the process would not
+    fix a down store, would flap the single shared instance all 7
+    orchestrators depend on, and would cancel expensive in-flight
+    reconciliation work for nothing. The wedge this probe must actually catch
+    (task 1731: an OS thread pings systemd's WATCHDOG=1 unconditionally, so a
+    hung asyncio loop never trips systemd's own watchdog) manifests as no
+    HTTP response at all within the timeout — that is the only case that
+    should return False here.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        # The server responded (even with an error status) — the loop is
+        # alive. A degraded backing store is not something a restart fixes.
+        return True
+    except Exception as exc:  # noqa: BLE001 -- any other failure means no response
+        log(f"probe_health({url!r}) got no response ({type(exc).__name__}: {exc})")
+        return False
+
+
+def _fused_memory_liveness_verdict() -> str:
+    """Classify fused-memory.service liveness as 'port-down' / 'healthy' / 'wedged'.
+
+    Pure read-only (no restart, no logging) — the single source of truth for
+    fused-memory's liveness, consumed by both fused_memory_liveness_pass()
+    (which restarts on anything but 'healthy') and _print_fused_memory_liveness()
+    (the --report row).
+
+    The port probe runs first and short-circuits before the (up to 15s)
+    health fetch, so a fully-dead unit is classified quickly without waiting
+    on probe_health()'s timeout.
+    """
+    if not probe_port(FUSED_MEMORY_PORT):
+        return "port-down"
+    if probe_health():
+        return "healthy"
+    return "wedged"
 
 
 def restart_unit(unit: str) -> None:
@@ -570,6 +647,47 @@ def main() -> None:
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
 
+def fused_memory_liveness_pass() -> None:
+    """Probe fused-memory.service liveness; restart it if the verdict isn't 'healthy'.
+
+    Single-unit analogue of main()'s per-unit body, targeting FUSED_MEMORY_UNIT
+    only — fused-memory is deliberately NOT added to WATCHED (see the
+    module-level comment above FUSED_MEMORY_UNIT's definition), since both
+    WATCHED and main()'s loop are pinned by exact-equality drift tests. This
+    sibling pass reuses is_unit_enabled + STARTUP_GRACE_SECS gating verbatim
+    from main(), and _fused_memory_liveness_verdict() (B2) for the combined
+    port+/health verdict.
+
+    Both 'port-down' and 'wedged' trigger a restart via restart_unit() called
+    DIRECTLY — uncapped, with no fleet-deploy clock and no delegation to
+    restart-all-orchestrators.sh (I5: brokenness is not a scheduled deploy),
+    exactly like main()'s wedged-orchestrator revive path.
+
+    Wrapped in a single try/except Exception (mirroring main()'s per-unit
+    isolation) so a probe/verdict failure is logged and swallowed rather than
+    raising — a hiccup here must never crash the oneshot watchdog or prevent
+    staleness_pass() from running afterward.
+    """
+    try:
+        if not is_unit_enabled(FUSED_MEMORY_UNIT):
+            # Disabled (or unknown) — respect operator intent, skip silently.
+            return
+        elapsed = _unit_start_elapsed_secs(FUSED_MEMORY_UNIT)
+        if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+            log(
+                f"{FUSED_MEMORY_UNIT} started {elapsed:.0f}s ago; "
+                f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
+            )
+            return
+        verdict = _fused_memory_liveness_verdict()
+        if verdict != "healthy":
+            log(f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}'; restarting")
+            restart_unit(FUSED_MEMORY_UNIT)
+            log(f"{FUSED_MEMORY_UNIT} restart issued")
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
+
+
 def _delegate_fleet_restart() -> None:
     """Delegate a fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain.
 
@@ -837,22 +955,56 @@ def report() -> int:
     return 1 if any_stale else 0
 
 
+def _print_fused_memory_liveness() -> None:
+    """Print a single labelled fused-memory liveness row for ``--report``.
+
+    Strictly read-only, mirroring report()'s I7/I8 guarantee: computes the
+    verdict via _fused_memory_liveness_verdict() (port probe + /health fetch
+    only — no is_unit_enabled/STARTUP_GRACE_SECS gating, since report()
+    likewise shows every unit's raw verdict unconditionally) and prints it.
+    No systemctl mutation, no clock write, no restart.
+
+    Informational only: called from _cli's --report branch AFTER report()'s
+    own staleness table, and never affects report()'s staleness-only exit
+    code (see _cli's docstring below).
+
+    Wrapped in a try/except Exception mirroring fused_memory_liveness_pass()'s
+    per-unit isolation (B3): probe_port only catches FileNotFoundError/
+    TimeoutExpired, so an unusual subprocess failure (e.g. PermissionError)
+    could otherwise propagate out of the verdict chain and crash --report
+    after report() has already computed its exit code. An unexpected failure
+    here degrades to a logged 'unknown' row instead.
+    """
+    try:
+        verdict = _fused_memory_liveness_verdict()
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error printing {FUSED_MEMORY_UNIT} liveness row: {exc}")
+        verdict = "unknown"
+    print(f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): {verdict}")
+
+
 def _cli(argv: list[str] | None = None) -> int:
     """Dispatch the CLI: ``--report`` routes to the read-only doctor mode.
 
     With no ``argv`` argument, reads ``sys.argv[1:]``. If ``--report`` is
-    present, runs ONLY the read-only report() and returns its exit code
-    (0 = all fresh, 1 = at least one stale unit) — main() and
-    staleness_pass() are not invoked, so this path never mutates systemd
-    state (I7 at the CLI boundary). Otherwise runs the existing liveness
-    main() followed by staleness_pass() (the timer path) and returns 0.
-    Unknown flags are not treated as an error — they fall through to the
-    timer path.
+    present, runs the read-only report() followed by the read-only
+    _print_fused_memory_liveness() (B4) and returns report()'s OWN exit code
+    (0 = all fresh, 1 = at least one stale unit) — the fm row is
+    informational only and never alters this exit code. main(),
+    fused_memory_liveness_pass(), and staleness_pass() are not invoked under
+    --report, so this path never mutates systemd state (I7 at the CLI
+    boundary). Otherwise runs the existing liveness main(), then
+    fused_memory_liveness_pass() (B3), then staleness_pass() (the timer
+    path) and returns 0. Unknown flags are not treated as an error — they
+    fall through to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--report" in argv:
-        return report()
+        rc = report()
+        _print_fused_memory_liveness()
+        return rc
     main()
+    fused_memory_liveness_pass()
     staleness_pass()
     return 0
 

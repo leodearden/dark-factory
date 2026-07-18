@@ -101,6 +101,11 @@ Description=Clean Service
 Type=simple
 Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target
@@ -160,6 +165,94 @@ def test_find_drift_does_not_report_present_watchdog():
 
 
 # ---------------------------------------------------------------------------
+# find_drift tests: restart-relevant EXACT directives (A1)
+# ---------------------------------------------------------------------------
+
+_MISSING_RESTART_DIRECTIVES_UNIT = """\
+[Unit]
+Description=Drifted Service Missing Restart Directives
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+
+[Install]
+WantedBy=default.target
+"""
+
+# A fully-populated [Service] except an injected divergence: TimeoutStopSec=45
+# instead of the required TimeoutStopSec=90. Exact-match semantics mean a
+# *different* value for the same key still counts as the required directive
+# being absent.
+_DIVERGENT_TIMEOUT_STOP_SEC_UNIT = """\
+[Unit]
+Description=Installed Fused Memory (divergent TimeoutStopSec)
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def test_find_drift_detects_missing_restart_directives():
+    """find_drift flags all four restart-relevant directives when absent.
+
+    RED until REQUIRED_SERVICE_DIRECTIVES grows to include Restart=on-failure,
+    RestartSec=5, TimeoutStartSec=300, and TimeoutStopSec=90 — today it only
+    lists MEM0_TELEMETRY + WatchdogSec, so find_drift returns [] here.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_MISSING_RESTART_DIRECTIVES_UNIT)
+    assert "Restart=on-failure" in drift
+    assert "RestartSec=5" in drift
+    assert "TimeoutStartSec=300" in drift
+    assert "TimeoutStopSec=90" in drift
+
+
+def test_find_drift_detects_injected_timeout_stop_sec_divergence():
+    """A divergent TimeoutStopSec value (45 vs required 90) is flagged as missing.
+
+    Exact-match semantics: the required directive is the full string
+    'TimeoutStopSec=90', so a unit carrying a *different* value for the same
+    key still fails the check — the correct value is effectively absent.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_DIVERGENT_TIMEOUT_STOP_SEC_UNIT)
+    assert "TimeoutStopSec=90" in drift
+
+
+def test_parity_checker_subprocess_exit_1_on_divergent_timeout_stop_sec(
+    tmp_path: pathlib.Path,
+):
+    """The divergent-TimeoutStopSec unit yields exit code 1 through the real CLI.
+
+    Mirrors test_parity_checker_callable_as_subprocess's subprocess-boundary
+    pattern, but for the injected TimeoutStopSec divergence case (A1c).
+    """
+    divergent = _write_unit(tmp_path, _DIVERGENT_TIMEOUT_STOP_SEC_UNIT, name="divergent.service")
+    result = subprocess.run(
+        [sys.executable, str(CHECKER_PATH), "--installed", str(divergent)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, (
+        f"Expected exit 1 for divergent TimeoutStopSec unit; got {result.returncode}. "
+        f"stderr: {result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Template parity test  (step-5 / step-6)
 # ---------------------------------------------------------------------------
 
@@ -190,6 +283,7 @@ Description=Installed Fused Memory
 [Service]
 Type=notify
 WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/other
 
 [Install]
@@ -221,6 +315,69 @@ def test_fix_unit_text_is_idempotent():
     once = mod.fix_unit_text(_DRIFTED_WITH_HOST_SPECIFIC)
     twice = mod.fix_unit_text(once)
     assert once == twice
+
+
+# ---------------------------------------------------------------------------
+# find_drift / fix_unit_text tests: ExecStartPre presence (A2)
+# ---------------------------------------------------------------------------
+
+_ALL_EXACT_NO_EXECSTARTPRE_UNIT = """\
+[Unit]
+Description=All Exact Directives Present, No ExecStartPre
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def test_find_drift_flags_missing_execstartpre():
+    """find_drift flags 'ExecStartPre=' as missing when no [Service] line has that prefix.
+
+    RED until find_drift gains a required_prefixes parameter — today it only
+    checks REQUIRED_SERVICE_DIRECTIVES via exact membership, so a unit that
+    satisfies every exact directive but lacks any ExecStartPre= line is
+    (incorrectly) reported as fully clean.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_ALL_EXACT_NO_EXECSTARTPRE_UNIT)
+    assert "ExecStartPre=" in drift
+
+
+def test_find_drift_does_not_flag_present_execstartpre():
+    """find_drift does not flag 'ExecStartPre=' when a matching-prefix line is present."""
+    mod = _load_checker()
+    drift = mod.find_drift(_CLEAN_UNIT)
+    assert "ExecStartPre=" not in drift
+
+
+def test_fix_unit_text_never_synthesizes_bare_execstartpre():
+    """fix_unit_text appends the missing EXACT directives but never a bare 'ExecStartPre=' line.
+
+    A host-specific prefix value (e.g. carrying __REPO_ROOT__ or
+    /home/leo/bin paths) cannot be synthesized by --fix — only its presence
+    can be checked, never its correct value guessed. Exercised against a unit
+    missing BOTH ExecStartPre and the exact directives.
+    """
+    mod = _load_checker()
+    fixed = mod.fix_unit_text(_MISSING_MEM0_UNIT)
+    sections = mod.parse_unit_sections(fixed)
+    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+    assert "Restart=on-failure" in sections["Service"]
+    assert "RestartSec=5" in sections["Service"]
+    assert "TimeoutStartSec=300" in sections["Service"]
+    assert "TimeoutStopSec=90" in sections["Service"]
+    assert not any(line.startswith("ExecStartPre=") for line in sections["Service"]), (
+        "fix_unit_text must never synthesize an ExecStartPre= line (host-specific value)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +441,59 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytes
     monkeypatch.setattr(mod, "daemon_reload", _fake_reload)
     mod.main(["--installed", str(installed), "--fix"])
     assert len(reload_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# CLI --fix residual (un-synthesizable prefix) tests  (amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """main(--fix) returns 1 (not a false 0) when a host-specific prefix directive remains.
+
+    _MISSING_MEM0_UNIT lacks every exact directive AND any ExecStartPre= line.
+    --fix appends the exact directives but cannot synthesize the host-specific
+    ExecStartPre value, so parity is NOT reached. The CLI must report the
+    residual drift and exit 1 — matching what a follow-up plain verify would
+    return — instead of falsely signalling parity with exit 0.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
+    installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
+    rc = mod.main(["--installed", str(installed), "--fix"])
+    assert rc == 1
+    combined = "".join(capsys.readouterr())
+    assert "ExecStartPre=" in combined, (
+        "The residual, un-synthesizable directive must be named in the output."
+    )
+
+
+def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The '[fixed] Appended N' count reflects only the EXACT directives appended.
+
+    find_drift(_MISSING_MEM0_UNIT) returns the 5 missing exact directives PLUS
+    the ExecStartPre= prefix miss (6 total), but fix_unit_text only appends the
+    5 exact directives. The reported count must therefore be 5, never the
+    inflated len(drift)==6.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
+    full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
+    exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
+    assert len(full_drift) == len(exact_only) + 1  # exactly the ExecStartPre miss
+    installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
+    mod.main(["--installed", str(installed), "--fix"])
+    out = capsys.readouterr().out
+    assert f"Appended {len(exact_only)} directive" in out
+    assert f"Appended {len(full_drift)} directive" not in out
 
 
 # ---------------------------------------------------------------------------
