@@ -717,6 +717,16 @@ async def test_curator_combine_updates_target_and_returns_id(
     assert call.kwargs['title'] == 'Harden parser'
     assert call.kwargs['priority'] == 'high'
     assert 'line 42' in call.kwargs['details']  # specifics preserved verbatim
+    # Combine is a whole-blob overwrite — it must use the explicit
+    # metadata_mode='replace' co-signal, NOT a bare append=False (which the
+    # task-2180 metadata-wipe guard now rejects). Lock both: the co-signal is
+    # present, and no bare append=False is forwarded.
+    assert call.kwargs.get('metadata_mode') == 'replace', (
+        f"combine must pass metadata_mode='replace'; got {call.kwargs.get('metadata_mode')!r}"
+    )
+    assert call.kwargs.get('append') is not False, (
+        f'combine must not pass a bare append=False; got {call.kwargs.get("append")!r}'
+    )
     taskmaster.add_task.assert_not_called()
 
 
