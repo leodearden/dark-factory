@@ -167,24 +167,29 @@ def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]
 
 
 def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
-    """Read review JSON files from a worktree's .task/reviews/ directory.
+    """Read review data for a worktree, preferring the MCP verdict envelope.
+
+    Post-migration (task 2484) runs write the reviewer's verdict/issues
+    payload to ``.task/verdicts/reviewer*.json`` as a schema-versioned
+    envelope; pre-migration runs wrote it directly to
+    ``.task/reviews/*.json``. This prefers the verdict envelope when any
+    reviewer envelope is present, and falls back to the legacy reviews/
+    directory otherwise — a run is reviewed by one reviewer roster at one
+    point in time, so the two sources are never meaningfully mixed.
 
     Returns ``{reviewer_name: {verdict, issues, summary}}``.
-    Returns empty dict if the worktree or reviews dir doesn't exist.
+    Returns empty dict if the worktree has neither artifact source.
     """
-    reviews_dir = Path(worktree_path) / '.task' / 'reviews'
-    if not reviews_dir.is_dir():
-        return {}
+    artifacts = TaskArtifacts(Path(worktree_path))
 
-    reviews: dict[str, Any] = {}
-    for path in sorted(reviews_dir.glob('*.json')):
-        try:
-            data = json.loads(path.read_text())
-            name = data.get('reviewer', path.stem)
-            reviews[name] = data
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning('Failed to read review %s: %s', path, e)
-    return reviews
+    reviews = _read_reviewer_verdict_envelopes(artifacts)
+    if reviews:
+        return reviews
+
+    return {
+        data.get('reviewer', stem): data
+        for stem, data in artifacts.read_reviews().items()
+    }
 
 
 def _format_review_artifacts(reviews: dict[str, Any]) -> str:
