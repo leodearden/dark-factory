@@ -712,3 +712,111 @@ class TestHydrateReadback:
             assert cite_b['entity_uuid'] == entity_uuid
         finally:
             store_b.close()
+
+
+# ---------------------------------------------------------------------------
+# step-11: run-quiescence GC deletes a run's rows — RED until step-12 adds the
+# tick() delete_run hook
+# ---------------------------------------------------------------------------
+
+
+class TestStoreGC:
+    """tick() GCs a run's persisted rows at RUN QUIESCENCE (delete_run), not on
+    per-entry TTL eviction — a completed-then-evicted stage's findings stay
+    durable while a sibling stage of the same run is still live.
+    """
+
+    def _make_state(self, store, clock_holder):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: clock_holder[0],
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def _add(self, state, run_id, desc):
+        return state.add_finding(
+            run_id=run_id, severity='low', category='other',
+            description=desc, suggested_action='note', actionable=False,
+        )['finding_id']
+
+    def _run_ids_in_store(self, store):
+        return {r['run_id'] for r in store.load_all()}
+
+    def test_rows_gc_only_at_run_quiescence(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store, t)
+            run_r = 'gc-run-R'
+            run_live = 'gc-run-LIVE'
+            s1 = 'memory_consolidator'
+            s2 = 'task_knowledge_sync'
+
+            # run R, stage 1 — completed at t=0.
+            state.start_report(run_id=run_r, stage=s1, project_id='dark_factory')
+            self._add(state, run_r, 'R stage1')
+            state.complete(run_r, 'R s1 done')  # completed_at = 0
+
+            # run R, stage 2 — becomes active; completed LATER at t=100.
+            state.start_report(run_id=run_r, stage=s2, project_id='dark_factory')
+            self._add(state, run_r, 'R stage2')
+
+            # A DIFFERENT run that never completes → in-progress → immortal.
+            state.start_report(run_id=run_live, stage=s1, project_id='dark_factory')
+            self._add(state, run_live, 'LIVE stage1')
+
+            # Both runs' rows are persisted up front.
+            assert self._run_ids_in_store(store) == {run_r, run_live}
+
+            # Complete R's stage 2 at t=100 (still well within TTL).
+            t[0] = 100.0
+            state.complete(run_r, 'R s2 done')  # completed_at = 100
+
+            # --- Tick past ONLY stage 1's TTL: stage 2 survives, so run R is
+            #     NOT quiescent — its rows must remain durable. ---
+            t[0] = 301.0  # 301-0=301 > ttl(300) for s1; 301-100=201 < 300 for s2
+            evicted = state.tick()
+            assert evicted == 1  # only R/stage1 evicted from memory
+            assert (run_r, s2) in state._state  # sibling stage still live
+            assert run_r in self._run_ids_in_store(store)  # rows NOT GC'd yet
+            assert run_live in self._run_ids_in_store(store)
+
+            # --- Tick past stage 2's TTL as well: run R fully quiesces → its
+            #     rows are GC'd (delete_run), the still-live run is untouched. ---
+            t[0] = 401.0  # 401-100=301 > ttl(300) for s2
+            evicted = state.tick()
+            assert evicted == 1  # R/stage2 evicted
+            assert run_r not in self._run_ids_in_store(store)  # GC'd with the run
+            assert run_live in self._run_ids_in_store(store)  # different run untouched
+            # In-memory run-level indices for R released at quiescence.
+            assert run_r not in state._run_finding_index
+        finally:
+            store.close()
+
+    def test_tick_with_store_none_does_not_raise_and_evicts(self, tmp_path):
+        """tick()'s GC hook is a full no-op when store is None: eviction still
+        happens (byte-identical count) and nothing raises."""
+        t = [0.0]
+        state = self._make_state(None, t)
+        assert state._store is None
+        run_id = 'gc-none-run'
+        stage = 'memory_consolidator'
+
+        state.start_report(run_id=run_id, stage=stage, project_id='dark_factory')
+        self._add(state, run_id, 'finding')
+        state.complete(run_id, 'done')  # completed_at = 0
+
+        t[0] = 301.0
+        evicted = state.tick()  # must not raise
+        assert evicted == 1
+        assert (run_id, stage) not in state._state
+        assert run_id not in state._run_finding_index
