@@ -564,3 +564,72 @@ class TestEndpointOverLiveArchive:
         # Secondary has no triaged_at record → the key is omitted entirely
         # (render-when-present), and the endpoint still returns 200 for it.
         assert 'triage_segments' not in by_project['secondary']['lifespan']
+
+
+# ---------------------------------------------------------------------------
+# step-7 — TestFrontendPayloadContract: the γ↔frontend seam's final agreement.
+# ---------------------------------------------------------------------------
+
+
+class TestFrontendPayloadContract:
+    """Every leaf key the δ/ε/ζ components consume is present + typed over the live payload.
+
+    Pins the producer (γ) to its three consumers without a JS runtime: the
+    fields asserted here are exactly those read by the analytics tab (δ,
+    test_tab_escalation_analytics.py), the StatTile strip (ε,
+    test_tab_escalations.py), and the mini-Sankey flow diagram (ζ,
+    test_esc_flow_diagram.py). A subset (``<=``) check per object so a
+    render-when-present extra (e.g. ``triage_segments``, ``samples_downsampled``)
+    never trips the contract, while a DROPPED consumed key fails loudly.
+    """
+
+    def test_served_payload_exposes_every_consumed_key(self, client, tmp_path: Path) -> None:
+        from dashboard.app import _analytics_cache_clear
+
+        _live_archive_sync(tmp_path)
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        resp = client.get('/api/v2/dashboard/escalation-analytics')
+        assert resp.status_code == 200
+        analytics = resp.json()['ESCALATION_ANALYTICS']
+
+        # Top-level regime_markers[] (δ timeline overlay).
+        regime_markers = analytics['regime_markers']
+        assert isinstance(regime_markers, list) and regime_markers, (
+            'committed regime-markers seed should surface at least one marker'
+        )
+        for marker in regime_markers:
+            assert {'date', 'label', 'tasks'} <= set(marker)
+
+        entry = analytics['per_project'][0]
+
+        # origin — δ donut/sparkline + ε StatTile strip.
+        origin = entry['origin']
+        assert isinstance(origin['daily_by_source'], dict)
+        assert origin['sources']
+        for source in origin['sources']:
+            assert {
+                'source', 'filings', 'benign', 'actionable', 'stamped_share',
+                'benign_rate', 'predictably_benign', 'daily_spark',
+            } <= set(source)
+
+        # lifespan — δ percentiles + open-items table.
+        lifespan = entry['lifespan']
+        assert {
+            'percentiles_by_level', 'samples', 'open_items', 'l1_to_l2_promotion',
+        } <= set(lifespan)
+        assert lifespan['open_items'], 'row-4 pending record guarantees an open item'
+        for item in lifespan['open_items']:
+            assert {'id', 'task_id', 'level', 'age_secs', 'breach_6h'} <= set(item)
+
+        # workflow — δ throughput + ζ mini-Sankey flow cube.
+        workflow = entry['workflow']
+        assert {
+            'tier_weekly', 'action_mix', 'churn_daily', 'esc_per_done_daily', 'flow_daily',
+        } <= set(workflow)
+        assert workflow['esc_per_done_daily']
+        for row in workflow['esc_per_done_daily']:
+            assert {'date', 'filings', 'done', 'ratio'} <= set(row)
+        assert workflow['flow_daily']
+        for row in workflow['flow_daily']:
+            assert {'date', 'source', 'level', 'tier', 'class', 'n'} <= set(row)
