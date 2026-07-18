@@ -250,3 +250,79 @@ async def _build_live_boundary_archive(queue: EscalationQueue, server: Any) -> _
 def _make_server(queue: EscalationQueue) -> Any:
     """create_server harness with startup_sweep disabled for a controlled archive."""
     return create_server(queue, startup_sweep=False)
+
+
+# ---------------------------------------------------------------------------
+# step-1 — TestAlphaChokepointRoundTrip: boundary rows 1–5 at the record level.
+# ---------------------------------------------------------------------------
+
+
+class TestAlphaChokepointRoundTrip:
+    """Boundary rows 1–5 at the record level, over the live-chokepoint archive.
+
+    Every row is filed + resolved through α's REAL terminal-write path by
+    :func:`_build_live_boundary_archive`; here we reload each archived record
+    via ``queue.get()`` and pin its ``(resolution_class, effective_benign)``
+    against the PRD Seam-1 contract (per-path default, cascade inheritance,
+    proxy fallback, reject-before-mutate). A disagreement here is a real
+    α-seam regression — assertions must never be weakened to force green.
+    """
+
+    async def test_boundary_rows_1_through_5(self, tmp_path: Path) -> None:
+        queue = _live_queue(tmp_path)
+        server = _make_server(queue)
+        arch = await _build_live_boundary_archive(queue, server)
+
+        # --- Row 1: an explicit 'actionable' stamp survives the
+        #     server → queue.resolve round-trip and is read stamped. ---
+        r1 = queue.get(ID_ROW1)
+        assert r1 is not None and r1.status == 'resolved'
+        assert r1.resolution_class == 'actionable'
+        assert effective_benign(r1) == ('actionable', 'stamped')
+
+        # --- Row 3: no class passed → record stays unstamped; effective_benign's
+        #     read-time proxy infers 'actionable' from the resolved status. ---
+        r3 = queue.get(ID_ROW3)
+        assert r3 is not None and r3.status == 'resolved'
+        assert r3.resolution_class is None
+        assert effective_benign(r3) == ('actionable', 'inferred')
+
+        # --- Row 4: an unknown class is rejected BEFORE any mutation, at both
+        #     the server tool and the queue chokepoint (INV-1 reject-before-
+        #     mutate). We pin the rejection CONTRACT (typed code + unchanged
+        #     record + ValueError), NOT the exact legal-value set — that set
+        #     legitimately grows (e.g. 'moot-terminal-subject', task 2724). ---
+        assert {'benign', 'actionable'} <= RESOLUTION_CLASSES
+        assert 'meh' not in RESOLUTION_CLASSES
+        assert arch.row4_reject_result is not None
+        assert arch.row4_reject_result.get('code') == 'invalid_resolution_class'
+        r4 = queue.get(ID_ROW4)
+        assert r4 is not None and r4.status == 'pending'   # unchanged by the server reject
+        assert r4.resolution_class is None                 # never stamped
+        assert r4.resolved_at is None and r4.resolved_by is None
+        with pytest.raises(ValueError):
+            queue.resolve(ID_ROW4, 'still rejected', resolution_class='meh')
+        assert queue.get(ID_ROW4).status == 'pending'      # queue reject left it untouched too
+
+        # --- Row 2: resolving the L2 with class='benign' cascades the stamp to
+        #     every member L1 (stamped-inherited via resolved_by='l2-cascade:<id>'). ---
+        l2 = queue.get(ID_ROW2_L2)
+        assert l2 is not None and l2.status == 'resolved'
+        assert l2.resolution_class == 'benign'
+        assert effective_benign(l2) == ('benign', 'stamped')
+        for member_id in (ID_ROW2_M1, ID_ROW2_M2):
+            m = queue.get(member_id)
+            assert m is not None, f'cascade member {member_id} missing from archive'
+            assert m.status in ('resolved', 'dismissed')
+            assert m.resolution_class == 'benign'
+            assert effective_benign(m) == ('benign', 'stamped')
+            assert m.resolved_by == f'l2-cascade:{ID_ROW2_L2}'
+
+        # --- Row 5: age-out auto-dismiss → the reaper-sweep per-path benign
+        #     default is stamped (resolved_by='auto-dismissed'). ---
+        r5 = queue.get(ID_ROW5)
+        assert r5 is not None
+        assert r5.status == 'dismissed'
+        assert r5.resolved_by == 'auto-dismissed'
+        assert r5.resolution_class == 'benign'
+        assert effective_benign(r5) == ('benign', 'stamped')
