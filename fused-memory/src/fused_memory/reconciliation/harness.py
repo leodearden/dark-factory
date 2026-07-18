@@ -144,6 +144,18 @@ _RECON_DEDUP_CONFIG = (
 
 logger = logging.getLogger(__name__)
 
+# Task 2708 amendment (reviewer_comprehensive): bound the startup judge-recovery
+# fan-out. Normal operation leaves at most a handful of judge_pending markers
+# (the cycle-end→verdict-commit window is tiny), but a persistently-failing
+# judge never clears its marker — _run_judge's `except Exception` path logs and
+# returns WITHOUT reaching add_verdict's atomic clear — so markers accumulate
+# and would otherwise ALL re-fire concurrently on every restart: a
+# thundering-herd of LLM calls. Cap the per-restart spawn; the un-spawned
+# remainder self-heals on later restarts (its markers persist until a verdict
+# commits). Exceeding the cap is WARN-logged so a wedged judge is visible rather
+# than silently re-run each restart.
+_JUDGE_RECOVERY_MAX_SPAWN = 20
+
 # Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
 # The fingerprint is keyed on finding['category'] / affected_ids / description
 # (harness.py:_escalate), so keeping these fields constant — and putting all
@@ -2365,10 +2377,27 @@ class ReconciliationHarness:
         pending = await self.journal.get_pending_judge_runs()
         if not pending:
             return
-        logger.info(
-            f'Recovering {len(pending)} pending judge review(s) after restart'
-        )
-        for run_id, project_id in pending:
+        # Bound the fan-out (task 2708 amendment): get_pending_judge_runs is
+        # ordered oldest-marked first, so the oldest markers are re-fired first
+        # and any excess is deferred to a later restart. This caps the burst of
+        # concurrent judge LLM calls a wedged judge (markers never clear) would
+        # otherwise trigger on every restart.
+        total = len(pending)
+        to_spawn = pending[:_JUDGE_RECOVERY_MAX_SPAWN]
+        if total > _JUDGE_RECOVERY_MAX_SPAWN:
+            logger.warning(
+                f'{total} pending judge review(s) at startup exceeds the '
+                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-restart recovery cap — a judge may '
+                'be persistently failing (a judge_pending marker clears only on a '
+                f'committed verdict). Re-firing the {len(to_spawn)} oldest; the '
+                f'remaining {total - len(to_spawn)} will be recovered on '
+                'subsequent restarts.'
+            )
+        else:
+            logger.info(
+                f'Recovering {total} pending judge review(s) after restart'
+            )
+        for run_id, project_id in to_spawn:
             await self._spawn_judge(run_id, project_id)
 
     async def _run_judge(self, run_id: str) -> None:
