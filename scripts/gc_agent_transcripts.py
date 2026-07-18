@@ -161,3 +161,31 @@ def select_prunable(
             keep.append(path)
 
     return GcDecision(keep=keep, prune=prune)
+
+
+def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
+    """Scan the archive *root* into ``(task_dir, mtime)`` pairs (filesystem I/O).
+
+    Each immediate child DIR of *root* is one per-task archive dir. Its
+    reported mtime is the NEWEST descendant file mtime (recursive), which —
+    because α mirrors the source transcript mtime onto each ``.gz`` — measures
+    the task's most recent agent-session activity. A task dir holding no files
+    falls back to its own directory mtime. Stray non-directory entries directly
+    under *root* are skipped.
+
+    Returns ``[]`` when *root* is absent or is not a directory (so a missing or
+    empty archive is a clean no-op). Output is sorted by task-dir path for
+    deterministic ordering.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+
+    scanned: list[tuple[Path, float]] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        file_mtimes = [p.stat().st_mtime for p in child.rglob('*') if p.is_file()]
+        mtime = max(file_mtimes) if file_mtimes else child.stat().st_mtime
+        scanned.append((child, mtime))
+    return scanned
