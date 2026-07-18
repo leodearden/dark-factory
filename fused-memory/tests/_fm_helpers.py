@@ -701,6 +701,75 @@ async def poll_until(
         await asyncio.sleep(interval)
 
 
+async def collection_vector_size(
+    client: Any,
+    collection: str,
+    *,
+    timeout: float = 15.0,
+    interval: float = 0.05,
+) -> int:
+    """Read *collection*'s vector dimension, tolerating the transient-404 read race.
+
+    Under ``-n auto`` xdist load a collection created moments earlier can
+    transiently 404 (or the HTTP layer can raise ``ResponseHandlingException``)
+    before it is durably readable, so a single naive ``get_collection`` flakes.
+    This wraps the read in the shared :func:`poll_until` engine so the
+    transient window becomes a bounded retry: a 404 ``UnexpectedResponse`` or a
+    ``ResponseHandlingException`` maps to "keep polling", while any other
+    ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised immediately —
+    fail loud, no retry. A collection that never becomes readable surfaces as
+    the usual :func:`poll_until` ``AssertionError`` at the deadline.
+
+    Imports the qdrant symbols lazily inside the body, mirroring
+    :func:`_qdrant_available` / :func:`ensure_fresh_collection` (see their
+    docstrings) so importing this module never pulls in qdrant_client.
+
+    Args:
+        client: A ``qdrant_client.QdrantClient`` (or test double) exposing
+            ``get_collection``.
+        collection: The collection to read.
+        timeout: Seconds to keep retrying the transient-404 window before
+            raising. Defaults to 15s — generous enough to absorb host CPU
+            oversubscription while still catching a genuinely-missing collection.
+        interval: Seconds to sleep between probes. Defaults to 0.05s.
+
+    Returns:
+        The collection's single-vector dimensionality.
+
+    Raises:
+        AssertionError: the collection never became readable within *timeout*.
+        qdrant_client.http.exceptions.UnexpectedResponse: a non-404 server
+            error on the read (surfaced immediately, not retried).
+    """
+    from qdrant_client.http.exceptions import (
+        ResponseHandlingException,
+        UnexpectedResponse,
+    )
+    from qdrant_client.models import VectorParams
+
+    def _probe():
+        try:
+            return client.get_collection(collection)
+        except UnexpectedResponse as exc:
+            if getattr(exc, 'status_code', None) == 404:
+                return None  # transient: not yet durably visible — keep polling
+            raise  # genuine server error — fail loud, no retry
+        except ResponseHandlingException:
+            return None  # transient HTTP-layer hiccup — keep polling
+
+    info = await poll_until(
+        _probe,
+        timeout=timeout,
+        interval=interval,
+        message=f'collection {collection!r} not readable within {timeout}s',
+    )
+    vectors = info.config.params.vectors
+    assert isinstance(vectors, VectorParams), (
+        f'collection {collection!r} vectors config is not a single VectorParams: {vectors!r}'
+    )
+    return vectors.size
+
+
 # ---------------------------------------------------------------------------
 # Shared quota/rate-limit error builder (task 2448)
 # ---------------------------------------------------------------------------
