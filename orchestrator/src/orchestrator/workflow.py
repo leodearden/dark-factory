@@ -8616,7 +8616,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # which is what makes calling it here safe.
             ta = self.config.transcript_archive
             if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
-                archive_task_transcripts(
+                # Offload to a worker thread: archive_task_transcripts does
+                # blocking, CPU-bound work (glob + stream-gzip each transcript).
+                # This finally runs on the shared event loop for every role of
+                # every concurrent task, so a multi-MB transcript archived inline
+                # would stall all other in-flight tasks; to_thread keeps the loop
+                # free. Awaiting inside a finally is safe here — the helper never
+                # raises (best-effort), so the await can only surface a
+                # CancelledError from the loop tearing this task down, never an
+                # archival error that could mask the in-flight exception.
+                await asyncio.to_thread(
+                    archive_task_transcripts,
                     self._config_dir.path,
                     self.task_id,
                     self._last_invoke_session_id,
