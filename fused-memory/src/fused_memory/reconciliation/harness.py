@@ -2076,6 +2076,17 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_resume_interrupted_runs at startup failed: {e}')
 
+        # One-shot: re-fire the judge for any run whose verdict a restart dropped
+        # in the cycle-end→verdict-commit window (task 2708). The durable
+        # judge_pending marker (written before the fire-and-forget judge task) is
+        # the recovery cursor. Judge is already .initialize()d above (2029-2030);
+        # guarded (self.judge is not None) inside the method. Fail-safe wrapped like
+        # the sibling one-shot passes so a recovery hiccup never crashes the loop.
+        try:
+            await self._recover_pending_judge_reviews()
+        except Exception as e:
+            logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
+
         loop_count = 0
         try:
             while True:
@@ -2337,6 +2348,28 @@ class ReconciliationHarness:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self._judge_tasks.clear()
+
+    async def _recover_pending_judge_reviews(self) -> None:
+        """Re-fire the judge for every run left with a judge_pending marker (task 2708).
+
+        One-shot startup pass: a restart landing in the cycle-end→verdict-commit
+        window cancels the fire-and-forget judge before add_verdict's atomic
+        marker-clear, so the marker survives. Re-running the judge is safe — the
+        review is read-only over the run record, and the invariant 'marker present
+        ⟹ no committed verdict' (add_verdict clears atomically) means the re-run's
+        judge_verdicts INSERT never collides on the run_id PK. Routes through the
+        same _spawn_judge seam as fresh launches (idempotent re-mark + tracked task).
+        """
+        if self.judge is None:
+            return
+        pending = await self.journal.get_pending_judge_runs()
+        if not pending:
+            return
+        logger.info(
+            f'Recovering {len(pending)} pending judge review(s) after restart'
+        )
+        for run_id, project_id in pending:
+            await self._spawn_judge(run_id, project_id)
 
     async def _run_judge(self, run_id: str) -> None:
         """Fire-and-forget judge wrapper with error logging."""
