@@ -1811,6 +1811,85 @@ class TestDeliveredCheckGraceEscalation:
         assert len(self._held_events(scheduler)) == 2
 
     @pytest.mark.asyncio
+    async def test_escalation_survives_sha_advances_and_transient_absence(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """End-to-end regression (task 2743, reproduces the reported incident).
+
+        Drives the REAL per-tick phase order — ``_phase_stale_sweep`` then
+        ``_phase_delivered_check_gate`` — across ticks where ``main`` advances
+        EVERY tick and the still-pending gate-held dependent transiently drops
+        out of the active-only fetch on one tick (the merge/reconcile churn
+        that coincides with a main advance).
+
+        Pre-fix, tick3's ``_phase_stale_sweep`` GC'd the grace streak on that
+        transient absence, so it never reached ``grace_cycles`` and the
+        born-at-L2 ``dependency_capability`` escalation never fired (RED).
+        Post-fix the streak survives the one-tick disappearance — and the
+        intervening SHA advances, which never keyed it — so the escalation
+        fires exactly once at ``grace_cycles`` (GREEN).
+        """
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        monkeypatch.setattr(
+            'orchestrator.scheduler.run_delivered_check',
+            self._fake_runner({'cap-one': DeliveredCheckResult.FAILED}),
+        )
+        task = self._dependent()
+        dep = self._dep()
+        callback = scheduler._callbacks.on_delivered_check_block
+        assert callback is not None
+
+        async def _tick(*, present: bool, sha: str) -> None:
+            sha_box['value'] = sha
+            if present:
+                # The dependent is pending and gate-held — the real tick's
+                # _update_age_anchors stamps its pending-age anchor each tick
+                # it appears in the fetch; model that so tick3's absence
+                # exercises the stale_sweep absence-GC path under test.
+                scheduler._pending_anchor['10'] = 10.0
+                ctx = TickContext(
+                    tasks=[task],
+                    status_map={'20': 'done'},
+                    tasks_by_id={'20': dep, '10': task},
+                )
+            else:
+                # '10' transiently drops out of the active-only fetch: absent
+                # from ctx.tasks AND ctx.tasks_by_id, still tracked via the
+                # anchor stamped on the prior tick, and non-terminal.
+                ctx = TickContext(
+                    tasks=[],
+                    status_map={'20': 'done'},
+                    tasks_by_id={'20': dep},
+                )
+            await scheduler._phase_stale_sweep(ctx)
+            await scheduler._phase_delivered_check_gate(ctx)
+
+        await _tick(present=True, sha='sha1')   # FAIL -> streak 1
+        await _tick(present=True, sha='sha2')   # FAIL -> streak 2
+        callback.assert_not_called()
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 2
+
+        # Transient absence coinciding with a main advance: stale_sweep runs,
+        # the gate can't bump an absent task. The grace streak must FREEZE at
+        # 2 (survive), not reset to 0.
+        await _tick(present=False, sha='sha3')
+        assert scheduler._streak_delivered_fail.value(('10', '20')) == 2
+        callback.assert_not_called()
+
+        await _tick(present=True, sha='sha4')   # FAIL -> streak 3 -> ESCALATE
+
+        callback.assert_called_once()
+        call_args, call_kwargs = callback.call_args
+        assert call_args[0] == '10'
+        assert call_kwargs['category'] == 'dependency_capability'
+        assert 'DEP_CAPABILITY_NOT_DELIVERED' in call_kwargs['summary']
+
+    @pytest.mark.asyncio
     async def test_streak_resets_on_pass(self, scheduler: Scheduler, monkeypatch):
         sha_box = {'value': 'sha1'}
 
