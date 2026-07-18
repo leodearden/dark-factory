@@ -773,6 +773,58 @@ class ReconReportState:
             )
             self._run_cited_task_index.setdefault(run_id, {}).update(cited_task_slice)
 
+    def start_persistence(self) -> None:
+        """Open the shadow store and hydrate in-memory state — call ONCE at boot.
+
+        A full no-op when ``self._store is None`` (persistence disabled — fresh
+        in-process runs stay byte-identical).  Otherwise opens the persistent
+        SQLite connection and replays any persisted rows into memory via
+        :meth:`hydrate_from_store`, so a mid-stage restart resumes with the
+        findings earlier stages already filed.
+
+        Deliberately NOT called by the socket-free
+        ``_build_recon_report_components`` factory (which only constructs the
+        store) — mirroring the reaper-not-started-at-build invariant, only
+        ``run_server`` opens it, right before :meth:`start_reaper`.  Paired with
+        :meth:`stop_persistence` at shutdown.
+
+        Best-effort, matching the loud-but-non-fatal posture of every other
+        persistence touchpoint (:meth:`_persist_run`, :meth:`hydrate_from_store`,
+        :meth:`tick`'s GC hook): a failure to open/hydrate the shadow store is
+        logged loudly (WARNING, structured) and then DEGRADES to no persistence
+        (``self._store`` is dropped to ``None``) rather than crashing server
+        boot or spamming a per-write warning from a half-open store.  The
+        server keeps running with an in-memory-only report state — exactly the
+        byte-identical no-store path — instead of dying because the shadow
+        store hiccuped.
+        """
+        if self._store is None:
+            return
+        try:
+            self._store.open()
+            self.hydrate_from_store()
+        except Exception:
+            logger.warning(
+                'recon_report: failed to open/hydrate persistence store %r; '
+                'continuing WITHOUT write-through persistence',
+                getattr(self._store, 'db_path', None),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                self._store.close()
+            self._store = None
+
+    def stop_persistence(self) -> None:
+        """Close the shadow store — call at shutdown.
+
+        A no-op when ``self._store is None`` (persistence disabled or already
+        degraded).  :meth:`ReconReportStore.close` is itself idempotent, so
+        repeated calls are safe.
+        """
+        if self._store is None:
+            return
+        self._store.close()
+
     # ------------------------------------------------------------------
     # Tool implementations
     # ------------------------------------------------------------------

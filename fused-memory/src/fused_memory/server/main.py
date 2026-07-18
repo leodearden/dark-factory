@@ -1072,6 +1072,12 @@ async def run_server():
             # NOTIFY_SOCKET unset.
             _start_watchdog_thread()
 
+            # Open + hydrate the write-through shadow store (task 2716) BEFORE
+            # the reaper starts, so a mid-stage restart resumes with prior
+            # findings. No-op when persistence is disabled (store=None); a
+            # store-open failure degrades to no-persistence loudly rather than
+            # crashing boot (see ReconReportState.start_persistence).
+            recon_report_state.start_persistence()
             await recon_report_state.start_reaper()
             logger.info(
                 '  Recon Report Endpoint: http://%s:%d/mcp/',
@@ -1120,6 +1126,11 @@ async def run_server():
         if recon_report_state is not None:
             with contextlib.suppress(BaseException):
                 await recon_report_state.stop_reaper()
+            # Close the write-through shadow store (task 2716). No-op when
+            # persistence is disabled; idempotent. Suppressed like stop_reaper
+            # so a close hiccup can't mask the original shutdown cause.
+            with contextlib.suppress(BaseException):
+                recon_report_state.stop_persistence()
         # Symmetrically tear down both servers so that a failure in either
         # (e.g. recon_server port-already-bound) doesn't leave the primary
         # server serving while the rest of the app shuts down.
@@ -1645,12 +1656,26 @@ def _build_recon_report_components(
     import uvicorn
 
     from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+    from fused_memory.server.recon_report_store import ReconReportStore
 
     ttl = config.reconciliation.recon_report_state_ttl_seconds
+    # Recon-report SQLite write-through persistence (task 2716): attach a durable
+    # shadow store only when reconciliation is enabled AND persistence is opted
+    # in (recon_report_persist_enabled, default True). The store is CONSTRUCTED
+    # here but NOT opened — run_server()'s state.start_persistence() opens and
+    # hydrates it, mirroring the reaper-not-started-at-build invariant so this
+    # factory stays socket-free and test-friendly. store=None (either flag off)
+    # keeps fresh in-process runs byte-identical — persistence is a total no-op.
+    recon_report_store = None
+    if config.reconciliation.enabled and config.reconciliation.recon_report_persist_enabled:
+        recon_report_store = ReconReportStore(
+            Path(config.reconciliation.data_dir) / 'recon_report_state.db'
+        )
     state = ReconReportState(
         ttl_seconds=ttl,
         memory_service=memory_service,
         task_interceptor=task_interceptor,
+        store=recon_report_store,
     )
     if known_projects is not None:
         state.known_projects = known_projects
