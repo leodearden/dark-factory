@@ -478,6 +478,42 @@ class TestBranchPreMergeVerifyGreen:
         assert _branch_pre_merge_verify_green(store, '2381') is None
 
 
+class TestBranchPreMergeVerifyGreenCrossRun:
+    """The durable cross-restart regression the verify checkpoint (task 2752)
+    creates: the verify checkpoint SUPPRESSES the current-run workflow_verify
+    re-emit at an unchanged branch tip, so on the exact cross-restart fast-path
+    this feature targets, the branch's only workflow_verify(passed=True) green
+    lives under a PRIOR run_id. I5's branch-green fact MUST still see it — else
+    a genuine INTEGRATION_SKEW silently degrades to INDETERMINATE after a fleet
+    redeploy. So _branch_pre_merge_verify_green must read the durable cross-run
+    history (fetch_events_by_type_all_runs), not the run-scoped current run."""
+
+    def test_prior_run_green_is_visible_cross_run(self, tmp_path: Path):
+        from orchestrator.merge_disposition import _branch_pre_merge_verify_green
+
+        db_path = tmp_path / 'runs.db'
+        # A green recorded under a PRIOR orchestrator run (before a restart).
+        store_prior = EventStore(db_path, run_id='run-prior')
+        store_prior.emit(
+            EventType.workflow_verify,
+            task_id='2381',
+            data={
+                'passed': True,
+                'tip_sha': 'tipA',
+                'base_sha': 'b',
+                'branch': 'task/2381',
+            },
+        )
+
+        # A fresh run (post-restart) on the SAME db under a DIFFERENT run_id.
+        store_now = EventStore(db_path, run_id='run-now')
+        # Precondition: the green is genuinely under a different run_id, so the
+        # run-scoped reader (the old backing read) cannot see it at all.
+        assert store_now.fetch_events_by_type(EventType.workflow_verify) == []
+        # ...but the durable cross-run branch-green fact MUST still see it.
+        assert _branch_pre_merge_verify_green(store_now, '2381') is True
+
+
 # ---------------------------------------------------------------------------
 # step-11/13/15/17 — end-to-end classify_merge_failure_disposition
 # ---------------------------------------------------------------------------
@@ -546,6 +582,61 @@ class TestClassifyIntegrationSkew:
         assert subprocess.run(
             ['git', 'status', '--porcelain'], cwd=repo, capture_output=True, text=True,
         ).stdout == ''
+
+
+class TestClassifyIntegrationSkewCrossRun:
+    """End-to-end cross-restart INTEGRATION_SKEW: the branch's only
+    workflow_verify green lives under a PRIOR run_id (the task-2752 verify
+    checkpoint suppressed the current-run re-emit at an unchanged branch tip).
+    With an implicated landing on main, classify MUST still yield
+    INTEGRATION_SKEW after a fleet redeploy — not degrade to INDETERMINATE for
+    want of a current-run green (that would lose the skew-specific handling for
+    a branch that really was verified green)."""
+
+    def test_prior_run_green_plus_implicated_landing_yields_integration_skew(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            SkewEvidence,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing_sha = _commit_file(repo, 'src/x.py', 'v2', 'edit x on main (landing)')
+
+        db_path = tmp_path / 'runs.db'
+        # The green is emitted ONLY under the PRIOR run.
+        store_prior = EventStore(db_path, run_id='run-prior')
+        store_prior.emit(
+            EventType.workflow_verify,
+            task_id='2381',
+            data={
+                'passed': True,
+                'tip_sha': 'tipA',
+                'base_sha': 'b',
+                'branch': 'task/2381',
+            },
+        )
+        # classify runs in a fresh post-restart run with NO green of its own.
+        store_now = EventStore(db_path, run_id='run-now')
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=_XPY_FAILURE,
+            branch='task/2381',
+            merge_base_sha=merge_base_sha,
+            main_sha=landing_sha,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store_now,
+        ))
+
+        assert disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert isinstance(evidence, SkewEvidence)
 
 
 class TestClassifyBranchBug:
