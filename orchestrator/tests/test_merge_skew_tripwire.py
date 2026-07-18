@@ -15,6 +15,7 @@ test_merge_queue_lifecycle_registry.py / test_merge_queue_request_liveness.py.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -139,6 +140,35 @@ exit 0
             tmp_path, [str(script)], ['src/a.py'],
         )
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_hanging_script_times_out_and_returns_false(
+        self, tmp_path: Path,
+    ) -> None:
+        """A script that hangs past timeout_secs must not block the caller
+        for the full hang duration — asyncio.wait_for bounds the wait and
+        the fail-open contract returns False (not load-bearing), satisfying
+        I6 (never block/delay the merge-landed hot path) even for a
+        misbehaving operator-supplied oracle."""
+        from orchestrator.merge_skew_tripwire import _run_load_bearing_oracle
+
+        script = self._write_oracle_script(tmp_path, """\
+#!/usr/bin/env bash
+sleep 5
+exit 0
+""")
+
+        start = time.monotonic()
+        result = await _run_load_bearing_oracle(
+            tmp_path, ['bash', str(script)], ['src/a.py'], timeout_secs=0.2,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 4.0, (
+            f'expected the {0.2}s timeout to bound the wait well under the '
+            f'script\'s 5s sleep; took {elapsed:.2f}s'
+        )
 
 
 class TestComputeTripwireOverlap:
@@ -357,9 +387,9 @@ class TestEmitTripwire:
             f'update_task must be called for the overlapping task only; got {call.args[0]!r}'
         )
         note = call.args[1]
-        assert 'merge_skew_tripwire' in note
-        assert note['merge_skew_tripwire']['landing_sha'] == landing_sha
-        assert note['merge_skew_tripwire']['overlap_files'] == ['src/a.py']
+        assert 'x_merge_skew_tripwire' in note
+        assert note['x_merge_skew_tripwire']['landing_sha'] == landing_sha
+        assert note['x_merge_skew_tripwire']['overlap_files'] == ['src/a.py']
         assert call.kwargs.get('metadata_mode') == 'merge'
 
     async def test_empty_or_none_oracle_cmd_never_consults_downstream(
@@ -526,4 +556,50 @@ class TestEmitTripwire:
             inflight=[('101', 'task/101')],
             get_branch_diff=get_branch_diff,
             update_task=update_task,
+        )
+
+    async def test_oracle_timeout_secs_forwarded_bounds_a_hanging_oracle(
+        self, tmp_path: Path,
+    ) -> None:
+        """oracle_timeout_secs must reach _run_load_bearing_oracle: a hanging
+        oracle script bounded by a short oracle_timeout_secs fails open
+        (no escalation) and returns promptly, rather than blocking for the
+        script's full hang duration (I6)."""
+        from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
+
+        script = tmp_path / 'hanging_oracle.sh'
+        script.write_text("""\
+#!/usr/bin/env bash
+sleep 5
+exit 0
+""")
+        script.chmod(0o755)
+        fake_eq = _FakeEscalationQueue()
+        update_task = AsyncMock(return_value=True)
+
+        async def get_branch_diff(branch: str) -> list[str] | None:
+            return ['src/a.py']
+
+        start = time.monotonic()
+        await emit_pipeline_landing_tripwire(
+            project_root=tmp_path,
+            oracle_cmd=['bash', str(script)],
+            escalation_queue=fake_eq,
+            landing_sha='a1' * 20,
+            landing_task_id='999',
+            landing_changed_files=['src/a.py'],
+            inflight=[('101', 'task/101')],
+            get_branch_diff=get_branch_diff,
+            update_task=update_task,
+            oracle_timeout_secs=0.2,
+        )
+        elapsed = time.monotonic() - start
+
+        assert fake_eq.submitted == [], (
+            'a timed-out oracle must fail open — no escalation'
+        )
+        update_task.assert_not_awaited()
+        assert elapsed < 4.0, (
+            f'expected oracle_timeout_secs=0.2 to bound the wait well under '
+            f"the script's 5s sleep; took {elapsed:.2f}s"
         )

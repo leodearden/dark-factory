@@ -1568,6 +1568,20 @@ class GitConfig(BaseModel):
             '(default) disables the tripwire entirely — logged no-op.'
         ),
     )
+    load_bearing_oracle_timeout_secs: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            'Wall-clock timeout (seconds) bounding the load_bearing_oracle_cmd '
+            'subprocess (task 2382, merge-skew pipeline-landing tripwire). The '
+            'oracle runs synchronously in the merge-landed hot path (invariant '
+            'I6: the tripwire must never block/delay the advance), so a hung '
+            'or slow operator-supplied script is bounded via asyncio.wait_for '
+            'rather than running unbounded; exceeding this is treated as a '
+            'fail-open not-load-bearing result (logged WARNING, no '
+            'escalation). Mirrors delivered_checks.check_timeout_secs.'
+        ),
+    )
 
 
 class ChronicFlakeConfig(BaseModel):

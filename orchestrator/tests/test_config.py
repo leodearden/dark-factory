@@ -209,6 +209,33 @@ class TestDefaults:
         config2 = OrchestratorConfig(git=GitConfig(load_bearing_oracle_cmd=cmd))
         assert config2.git.load_bearing_oracle_cmd == cmd
 
+    def test_load_bearing_oracle_timeout_secs_defaults_60(self):
+        """GitConfig.load_bearing_oracle_timeout_secs defaults to 60.0 —
+        bounds the load-bearing oracle subprocess (task 2382) so a hung
+        operator-supplied script can never block the merge-landed hot path
+        indefinitely (invariant I6)."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig()
+        assert cfg.load_bearing_oracle_timeout_secs == 60.0
+
+    def test_load_bearing_oracle_timeout_secs_round_trips_override(self):
+        """An explicit override round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig(load_bearing_oracle_timeout_secs=15.0)
+        assert cfg.load_bearing_oracle_timeout_secs == 15.0
+
+    def test_load_bearing_oracle_timeout_secs_rejects_non_positive(self):
+        """Must be > 0 — a zero or negative timeout is nonsensical (mirrors
+        DeliveredChecksConfig.check_timeout_secs' gt=0 constraint)."""
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError):
+            GitConfig(load_bearing_oracle_timeout_secs=0)
+        with pytest.raises(ValidationError):
+            GitConfig(load_bearing_oracle_timeout_secs=-5.0)
+
     def test_fused_memory_defaults(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)

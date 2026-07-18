@@ -6898,10 +6898,15 @@ Output JSON matching the schema. Every task must appear in the output.
         .emit_pipeline_landing_tripwire``: reads the per-project
         ``config.git.load_bearing_oracle_cmd`` knob (``None`` disables the
         tripwire — logged no-op), enumerates in-flight tasks (excluding the
-        just-landed *task_id*) as ``(task_id, branch)`` pairs assuming the
-        ``task/{id}`` branch-naming convention, and injects the real
+        just-landed *task_id*) as ``(task_id, branch)`` pairs using the
+        project's configured ``config.git.branch_prefix`` (NOT a hardcoded
+        ``task/`` literal — a project that customizes ``branch_prefix`` must
+        still resolve real branch refs here, or every in-flight task is
+        silently skipped), and injects the real
         ``git_ops.get_branch_changed_files`` / ``scheduler.update_task``
-        callables.
+        callables. The configured ``config.git.load_bearing_oracle_timeout_secs``
+        bounds the oracle subprocess so a hung operator-supplied script
+        cannot block this hot path indefinitely (I6).
 
         Called from ``_note_merge_all`` inside its own try/except, after the
         landing diff has already been fetched (``prefetched_diff`` reused,
@@ -6920,8 +6925,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 return
 
             tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+            branch_prefix = self.config.git.branch_prefix
             inflight = [
-                (str(t['id']), f"task/{t['id']}")
+                (str(t['id']), f"{branch_prefix}{t['id']}")
                 for t in tasks
                 if str(t.get('id')) != str(task_id)
             ]
@@ -6942,6 +6948,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 inflight=inflight,
                 get_branch_diff=get_branch_diff,
                 update_task=self.scheduler.update_task,
+                oracle_timeout_secs=self.config.git.load_bearing_oracle_timeout_secs,
             )
         except Exception:
             logger.warning(

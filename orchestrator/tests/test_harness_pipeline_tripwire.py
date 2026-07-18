@@ -133,6 +133,45 @@ class TestMaybePipelineLandingTripwire:
             f'update_task must be called for the overlapping task only; got {call.args[0]!r}'
         )
 
+    async def test_uses_configured_branch_prefix_not_hardcoded_task_slash(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """A project that customizes config.git.branch_prefix must still
+        resolve real in-flight branch refs — the adapter must NOT hardcode
+        the ``task/`` literal, or every in-flight task silently fails to
+        diff (get_branch_changed_files errors -> None -> skipped -> no
+        escalation, with no diagnostic)."""
+        script = _write_oracle_script(tmp_path, exit_code=0)  # load-bearing
+        harness.config.git.load_bearing_oracle_cmd = ['bash', str(script)]
+        harness.config.git.branch_prefix = 'feature/'
+
+        harness.scheduler.get_tasks = AsyncMock(return_value=[
+            {'id': '999', 'status': 'in-progress'},  # the just-landed task
+            {'id': '101', 'status': 'in-progress'},  # overlapping
+        ])
+
+        async def get_branch_changed_files(ref: str):
+            if ref == 'feature/101':
+                return (['src/a.py'], None)
+            raise AssertionError(
+                f'expected the configured feature/ prefix, got ref {ref!r}'
+            )
+
+        harness.git_ops.get_branch_changed_files = AsyncMock(
+            side_effect=get_branch_changed_files,
+        )
+
+        await harness._maybe_pipeline_landing_tripwire(
+            '999', 'base-sha', 'e' * 40, ['src/a.py'],
+        )
+
+        fake_eq: _FakeEscalationQueue = harness._escalation_queue  # type: ignore[assignment]
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation using the configured branch '
+            f'prefix; got {fake_eq.submitted!r}'
+        )
+        harness.scheduler.update_task.assert_awaited_once()  # type: ignore[attr-defined]
+
     async def test_oracle_cmd_none_short_circuits_before_get_tasks(
         self, harness: Harness,
     ) -> None:
