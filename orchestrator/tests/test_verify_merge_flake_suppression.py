@@ -16,14 +16,74 @@ monkeypatched so no real subprocess runs).
 
 from __future__ import annotations
 
-import dataclasses
+import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.verify import VerifyResult
 from orchestrator.verify_cmd import (
     ToolKind,
     parse_config_command,
     render,
     with_pytest_timeout,
 )
+
+
+def _make_config(tmp_path: Path) -> OrchestratorConfig:
+    """A real minimal OrchestratorConfig (never a bare MagicMock — the
+    check_bare_magicmock_config lint gate). run_verification is fully
+    monkeypatched in these tests, so only project_root/git are load-bearing.
+    """
+    return OrchestratorConfig(
+        project_root=tmp_path,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+
+
+def _materialize(worktree: Path, *relpaths: str) -> None:
+    """Create empty files at *relpaths* under *worktree* so the node-id ->
+    subproject existence mapping (`(worktree / prefix / file).exists()` etc.)
+    runs against real files without a real git checkout.
+    """
+    for rel in relpaths:
+        p = worktree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('def test_x():\n    pass\n')
+
+
+# A merge-role subproject whose pytest command mirrors dark_factory's real
+# per-subproject test_command shape (uv run --project X --directory X pytest ...).
+_ORCH_TEST_CMD = (
+    'uv run --project orchestrator --directory orchestrator '
+    'pytest tests/ --tb=short -q'
+)
+
+
+def _orch_module_config() -> ModuleConfig:
+    return ModuleConfig(
+        prefix='orchestrator',
+        test_command=_ORCH_TEST_CMD,
+        lint_command='uv run --project orchestrator ruff check src/',
+        type_check_command='uv run --project orchestrator pyright src/',
+    )
+
+
+def _result(passed: bool, *, category: str = '') -> VerifyResult:
+    return VerifyResult(
+        passed=passed,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='ok' if passed else 'fail',
+        category=category or ('' if passed else 'test_failure'),
+    )
 
 
 class TestWithPytestTimeout:
@@ -148,6 +208,171 @@ class TestWithPytestTimeoutStr:
         assert '--timeout 300' in composed
 
 
-# Sanity: the module imports even before verify.py gains the new symbols would
-# fail — dataclasses is imported here for later steps' VerifyResult construction.
-_ = dataclasses
+# --- Node-id fixtures for the confirm gate ------------------------------------
+
+# B1: a real FAILED node-id plus an xdist `node down`-preceding node-id, both
+# owned by orchestrator/tests/test_x.py so they group into one isolated re-run.
+_B1_FAILED_ID = 'orchestrator/tests/test_x.py::test_y'
+_B1_CRASH_ID = 'orchestrator/tests/test_x.py::test_z'
+_B1_TEST_OUTPUT = (
+    f'FAILED {_B1_FAILED_ID}\n'
+    f'{_B1_CRASH_ID}\n'
+    '[gw3] node down: Not properly terminated\n'
+)
+
+# B3: a bare whole-file collection ERROR (no ::nodeid) — _extract_failing_test_ids
+# yields the file target, which re-errors at collection on the isolated re-run.
+_B3_TEST_OUTPUT = 'ERROR orchestrator/tests/test_x.py\n'
+
+
+class TestConfirmMergeVerifyFlakeSuppressible:
+    """confirm_merge_verify_flake_suppressible(config, failing_result, *,
+    worktree, module_configs) -> list[str] | None — the PURE gate (PRD task α).
+
+    SAME-TREE (re-runs in the given merge worktree, no fresh probe worktree),
+    single-shot per node-id group, returns the suppressed node-ids on a
+    confirmed flake or None (fail-closed to red) otherwise. NEVER raises.
+    """
+
+    def _run(self, config, failing_result, worktree, module_configs):
+        from orchestrator.verify import confirm_merge_verify_flake_suppressible
+
+        return asyncio.run(
+            confirm_merge_verify_flake_suppressible(
+                config, failing_result, worktree=worktree, module_configs=module_configs,
+            )
+        )
+
+    # -- B1: suppress a confirmed flake -----------------------------------
+
+    def test_b1_suppresses_when_isolated_rerun_passes(self, tmp_path: Path) -> None:
+        """FAILED + node-down node-ids both pass on isolated re-run -> returns
+        the extracted node-id list, and the isolated ModuleConfig carries the
+        serial + generous-timeout recovery command with null lint/type."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
+            type_output='', summary='fail', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rv):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result == [_B1_FAILED_ID, _B1_CRASH_ID], result
+
+        rv.assert_awaited()
+        # The isolated re-run's ModuleConfig: serial + generous timeout, null gates.
+        called_mc = rv.call_args.args[2]
+        assert '-p no:xdist' in called_mc.test_command, called_mc.test_command
+        assert '--timeout 300' in called_mc.test_command, called_mc.test_command
+        assert _B1_FAILED_ID in called_mc.test_command, called_mc.test_command
+        assert called_mc.lint_command is None
+        assert called_mc.type_check_command is None
+        # Merge-role, single-shot, cold-timeout semantics.
+        assert rv.call_args.kwargs['is_merge_verify'] is True
+        assert rv.call_args.kwargs['max_retries'] == 0
+        assert rv.call_args.kwargs['role'] == 'merge'
+
+    # -- B2: never mask a still-real red ----------------------------------
+
+    def test_b2_no_suppress_when_isolated_rerun_still_fails(self, tmp_path: Path) -> None:
+        """The isolated re-run still FAILS -> None (merge stays red)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
+            type_output='', summary='fail', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(False))
+        with patch.object(verify_module, 'run_verification', rv):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result is None
+        rv.assert_awaited()
+
+    # -- B3: whole-file collection error re-errors -> not suppressed ------
+
+    def test_b3_collection_error_not_suppressed(self, tmp_path: Path) -> None:
+        """A bare `ERROR file.py` collection error yields a whole-file target;
+        the isolated re-run re-errors (not passed) -> None."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output=_B3_TEST_OUTPUT, lint_output='',
+            type_output='', summary='collection error', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(False))
+        with patch.object(verify_module, 'run_verification', rv):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result is None
+
+    # -- fail-closed: no recoverable node-id, no re-run at all -------------
+
+    def test_no_node_id_returns_none_without_rerun(self, tmp_path: Path) -> None:
+        """Opaque/lint/type failure output (no pytest node-id) -> None WITHOUT
+        calling run_verification (cheap early-out, fail-closed to red)."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output='',
+            lint_output='src/foo.py:12:5: F401 unused import',
+            type_output='', summary='lint_failure', category='lint_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rv):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result is None
+        rv.assert_not_awaited()
+
+    # -- fail-closed: node-id maps to no subproject -----------------------
+
+    def test_unmapped_node_id_returns_none(self, tmp_path: Path) -> None:
+        """A node-id whose file exists under no given subproject -> None.
+        (No file materialized on disk -> the existence mapping fails.)"""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output='FAILED some/other/tests/test_q.py::test_z\n',
+            lint_output='', type_output='', summary='fail', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rv):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result is None
+
+    # -- fail-closed: infra-sentinel re-run is never trusted --------------
+
+    def test_infra_transient_rerun_category_returns_none(self, tmp_path: Path) -> None:
+        """An isolated re-run whose category is in INFRA_TRANSIENT_CATEGORIES
+        is never trusted as confirmation, even paired with passed=True -> None."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        failing = VerifyResult(
+            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
+            type_output='', summary='fail', category='test_failure',
+        )
+
+        rv = AsyncMock(return_value=_result(True, category='pytest_internalerror'))
+        with patch.object(verify_module, 'run_verification', rv):
+            result = self._run(config, failing, tmp_path, [_orch_module_config()])
+
+        assert result is None
