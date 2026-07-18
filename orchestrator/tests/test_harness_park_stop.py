@@ -815,12 +815,15 @@ class TestHarnessCostCeiling:
     # Step 1 — config fields
     # ------------------------------------------------------------------
 
-    def test_config_defaults(self, monkeypatch, tmp_path: Path) -> None:
+    @pytest.mark.usefixtures("code_default_config")
+    def test_config_defaults(self, tmp_path: Path) -> None:
         """OrchestratorConfig exposes the two ceiling fields with correct defaults."""
-        # Isolate cwd so YamlSettingsSource's cwd-relative Path('config.yaml')
-        # fallback doesn't pick up orchestrator/config.yaml when tests run from
-        # that directory (mirrors the TestDefaults idiom in tests/test_config.py).
-        monkeypatch.chdir(tmp_path)
+        # code_default_config pins ORCH_CONFIG_PATH at a guaranteed-absent file so
+        # OrchestratorConfig loads ONLY defaults.yaml. Without it the autouse
+        # _isolate_orch_config fixture pins the operational
+        # dark-factory-orchestrator.yaml (watcher ceiling 150.0), which would
+        # override these code defaults (task 2719: the orchestrator/config.yaml
+        # symlink whose cwd-relative fallback this test used to rely on was retired).
         config = OrchestratorConfig(project_root=tmp_path)
         assert config.watcher_daily_cost_ceiling_usd == 50.0, (
             f'Expected 50.0; got {config.watcher_daily_cost_ceiling_usd!r}'
