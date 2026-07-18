@@ -143,6 +143,7 @@ __all__ = [
     'classify_agent_failure',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
+    'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'is_timed_out_with_progress',
@@ -430,6 +431,25 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
             elif name in _BACKGROUND_REAP_TOOLS:
                 last_reap_idx = pos
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
+
+
+def ended_awaiting_background_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> bool:
+    """Return True when *session_id*'s on-disk transcript ended its turn with a
+    still-pending backgrounded Bash command.
+
+    Mirrors ``count_transcript_turns``' shape: delegate to
+    ``read_transcript_records``; if it returns None (transcript not located or a
+    catastrophic read error) return False (fail-safe — an unreadable transcript
+    must never downgrade a success on ambiguous data); otherwise apply the pure
+    ``detect_ended_awaiting_background`` detector.  Never raises.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return False
+    return detect_ended_awaiting_background(records)
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
