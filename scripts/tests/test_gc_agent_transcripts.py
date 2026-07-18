@@ -226,6 +226,86 @@ def test_scan_existing_but_empty_root_returns_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# amend (review): scan_task_dirs must be best-effort + never-raise under a
+# stat() failure mid-scan. The archive is written CONCURRENTLY by the α
+# producer hook, so a descendant .gz / task dir can vanish or become
+# unstattable between the rglob walk and the stat() call (a classic TOCTOU
+# race). The module docstring loudly promises "never-raise / always exit 0";
+# an unguarded stat() OSError would propagate scan_task_dirs -> main ->
+# traceback -> exit 1 before any pruning even starts, breaking that contract
+# (unlike prune_task_dirs, which is already tested for OSError resilience).
+#
+# PermissionError/EACCES stands in for the whole OSError class the guard must
+# survive: a bare FileNotFoundError/ENOENT is swallowed by Path.is_file() /
+# Path.is_dir() (which ignore ENOENT and return False) BEFORE the guarded
+# stat runs, so it cannot exercise — or crash — this code path at all.
+# ---------------------------------------------------------------------------
+
+def test_scan_survives_stat_failure_on_descendant_file(tmp_path, caplog, monkeypatch):
+    """A descendant .gz that becomes unstattable mid-scan is skipped LOUDLY;
+    the remaining readable files still set the dir's age and sibling task dirs
+    are still scanned — the sweep never raises."""
+    caplog.set_level(logging.WARNING, logger="gc_agent_transcripts")
+    root = tmp_path / "agent-transcripts"
+    good = root / "100" / "enc" / "good.jsonl.gz"
+    vanished = root / "100" / "enc" / "vanished.jsonl.gz"
+    _touch(good, NOW - 20 * DAY)
+    _touch(vanished, NOW - 1 * DAY)  # the newest file — but it fails to stat
+    _touch(root / "200" / "enc" / "sib.jsonl.gz", NOW - 8 * DAY)
+
+    real_stat = Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        if self == vanished:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+    result = dict(gct.scan_task_dirs(root))  # must NOT raise
+
+    # Sibling dir unaffected; the failing dir is still reported off its one
+    # readable file (the unstattable newest file is skipped, not fatal).
+    assert set(result.keys()) == {root / "100", root / "200"}
+    assert result[root / "100"] == pytest.approx(NOW - 20 * DAY, abs=1)
+    assert result[root / "200"] == pytest.approx(NOW - 8 * DAY, abs=1)
+
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        LOG_PREFIX in m and str(vanished) in m for m in warn_msgs
+    ), f"missing LOUD WARNING for the unstattable descendant; got {warn_msgs}"
+
+
+def test_scan_survives_stat_failure_on_task_dir(tmp_path, caplog, monkeypatch):
+    """A task dir that becomes unstattable mid-scan is skipped LOUDLY and the
+    sibling dirs are still scanned — the sweep never raises."""
+    caplog.set_level(logging.WARNING, logger="gc_agent_transcripts")
+    root = tmp_path / "agent-transcripts"
+    bad = root / "100"
+    bad.mkdir(parents=True)
+    _touch(root / "200" / "enc" / "sib.jsonl.gz", NOW - 8 * DAY)
+
+    real_stat = Path.stat
+
+    def fake_stat(self, *args, **kwargs):
+        if self == bad:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+    result = dict(gct.scan_task_dirs(root))  # must NOT raise
+
+    assert set(result.keys()) == {root / "200"}  # the unstattable dir dropped
+    assert result[root / "200"] == pytest.approx(NOW - 8 * DAY, abs=1)
+
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        LOG_PREFIX in m and str(bad) in m for m in warn_msgs
+    ), f"missing LOUD WARNING for the unstattable task dir; got {warn_msgs}"
+
+
+# ---------------------------------------------------------------------------
 # step-7: prune_task_dirs(prune_records, *, dry_run) — best-effort + LOUD
 # ---------------------------------------------------------------------------
 

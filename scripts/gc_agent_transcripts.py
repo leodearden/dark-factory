@@ -193,6 +193,27 @@ def select_prunable(
     return GcDecision(keep=keep, prune=prune)
 
 
+def _warn_stat_skip(kind: str, path: Path, err: OSError) -> None:
+    """LOUD, greppable WARNING for a ``stat`` that failed mid-scan (best-effort).
+
+    The archive is written CONCURRENTLY by the α producer hook, so a path can
+    vanish (or briefly become unreadable) between the directory walk and the
+    ``stat`` call — a classic TOCTOU race. :func:`scan_task_dirs` skips the
+    offending *path* and keeps sweeping rather than aborting, mirroring
+    :func:`prune_task_dirs`' per-dir ``OSError`` posture and the module's
+    never-raise / always-exit-0 contract. Every line carries the greppable
+    ``gc_agent_transcripts:`` prefix.
+    """
+    logger.warning(
+        '%s failed to stat %s %s (errno=%s): %s — skipping',
+        _LOG_PREFIX,
+        kind,
+        path,
+        err.errno,
+        err,
+    )
+
+
 def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
     """Scan the archive *root* into ``(task_dir, mtime)`` pairs (filesystem I/O).
 
@@ -206,6 +227,13 @@ def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
     Returns ``[]`` when *root* is absent or is not a directory (so a missing or
     empty archive is a clean no-op). Output is sorted by task-dir path for
     deterministic ordering.
+
+    Best-effort + never-raise: because the archive is written concurrently by
+    the α producer hook, any per-entry ``stat`` may fail with an ``OSError``
+    (a file/dir that vanishes or becomes unreadable between the walk and the
+    ``stat`` — a TOCTOU race). Every such failure is skipped LOUDLY (see
+    :func:`_warn_stat_skip`) and the sweep continues, so one torn-down path
+    can never abort the scan or violate the module's always-exit-0 contract.
     """
     root = Path(root)
     if not root.is_dir():
@@ -213,10 +241,36 @@ def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
 
     scanned: list[tuple[Path, float]] = []
     for child in sorted(root.iterdir()):
-        if not child.is_dir():
+        try:
+            if not child.is_dir():
+                continue
+        except OSError as err:
+            # The child vanished / became unstattable between iterdir and here.
+            _warn_stat_skip('archive entry', child, err)
             continue
-        file_mtimes = [p.stat().st_mtime for p in child.rglob('*') if p.is_file()]
-        mtime = max(file_mtimes) if file_mtimes else child.stat().st_mtime
+
+        # Newest descendant FILE mtime, guarding EVERY per-file stat: a .gz can
+        # vanish (or briefly become unreadable) between the rglob walk and the
+        # stat call. A failed file is skipped LOUDLY; the remaining readable
+        # files still set the dir's age.
+        file_mtimes: list[float] = []
+        for descendant in child.rglob('*'):
+            try:
+                if descendant.is_file():
+                    file_mtimes.append(descendant.stat().st_mtime)
+            except OSError as err:
+                _warn_stat_skip('archive file', descendant, err)
+
+        if file_mtimes:
+            mtime = max(file_mtimes)
+        else:
+            # No readable files — fall back to the dir's own mtime, guarding
+            # that stat too (the dir itself may have just vanished).
+            try:
+                mtime = child.stat().st_mtime
+            except OSError as err:
+                _warn_stat_skip('task dir', child, err)
+                continue
         scanned.append((child, mtime))
     return scanned
 
