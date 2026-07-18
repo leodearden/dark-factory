@@ -5769,6 +5769,36 @@ class GitOps:
         )
         return sha.strip()
 
+    async def get_head_tree_hash(self, worktree: Path) -> str | None:
+        """Return HEAD's committed tree hash in *worktree*, or ``None``.
+
+        Fail-safe (mirrors ``get_main_sha``'s shape but NEVER raises): the
+        committed tree hash keys the review verdict cache, an optimization/
+        churn guard that must degrade to always-review rather than crash the
+        workflow loop.  Returns the stripped ``git rev-parse HEAD^{tree}``
+        output on success; on any non-zero exit code, empty output, or
+        subprocess error (e.g. a vanished/non-git worktree), logs a warning
+        and returns ``None``.
+        """
+        try:
+            rc, stdout, stderr = await _run(
+                ['git', 'rev-parse', 'HEAD^{tree}'],
+                cwd=worktree,
+            )
+        except Exception as exc:
+            logger.warning(
+                'get_head_tree_hash: git failed in %s: %s', worktree, exc
+            )
+            return None
+        tree_hash = stdout.strip()
+        if rc == 0 and tree_hash:
+            return tree_hash
+        logger.warning(
+            'get_head_tree_hash: unexpected rc=%s in %s: %s',
+            rc, worktree, stderr.strip(),
+        )
+        return None
+
     async def resolve_branch_sha(self, branch_name: str) -> str | None:
         """Resolve a branch name to its 40-char commit SHA via ``git rev-parse --verify``.
 
