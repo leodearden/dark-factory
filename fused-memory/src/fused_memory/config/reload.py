@@ -48,12 +48,16 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
 })
 
 
-# Sentinel marking a leaf structurally present on only ONE side of a diff — a
-# nullable submodel field (e.g. ``taskmaster``/``usage_cap``) toggled between
-# None (yielded as one atomic ``('taskmaster', None)`` leaf) and populated
-# (yielded as ``('taskmaster.<sub>', ...)`` sub-leaves with NO bare
-# ``'taskmaster'`` key). Rendered as the JSON-serializable string ``'<absent>'``
-# in the disposition report so the response stays machine-checkable.
+# Defensive sentinel for a leaf structurally present on only ONE side of a diff.
+# With annotation-based ``_iter_leaves`` (which compares nullable submodels
+# whole), two same-class ``FusedMemoryConfig`` instances always yield identical
+# leaf-path sets, so this is not reached in normal operation. It is retained as
+# belt-and-suspenders: were ``_iter_leaves`` ever to regress to value-based
+# descent (reintroducing the ``taskmaster``/``usage_cap`` None<->populated
+# asymmetry), ``diff_config`` would degrade to bucketing the one-sided leaf as
+# ``restart_required`` — rendered as the JSON-serializable string ``'<absent>'``
+# so the report stays machine-checkable — rather than raising the KeyError of
+# task 2718 review esc-2718-1.
 _ABSENT = '<absent>'
 
 
@@ -69,17 +73,38 @@ class ConfigDiff:
 def _iter_leaves(model: BaseModel):
     """Yield ``(dotted_path, value)`` for every leaf field of *model*.
 
-    Descends exactly one level into BaseModel-valued fields (e.g.
-    ``reconciliation``, ``task_metadata``); dict/list/set/None-valued fields are
-    yielded whole as atomic leaves compared by equality. Values are read via
-    ``__dict__`` (not ``getattr``) so a ``Field(deprecated=True)`` leaf does not
-    fire a DeprecationWarning on every diff sweep — ``__dict__`` holds the same
-    validated value pydantic already stored, so this only bypasses the
-    deprecated-access warning wrapper, not validation.
+    Descends exactly one level into a submodel field ONLY when its DECLARED
+    annotation is a bare, non-Optional ``BaseModel`` subclass (e.g.
+    ``reconciliation``, ``task_metadata``). The descent decision is driven by the
+    annotation, NOT the runtime value — so an Optional/nullable submodel field
+    (declared ``X | None``, e.g. ``taskmaster: TaskmasterConfig | None`` and
+    ``usage_cap: UsageCapConfig | None``) is ALWAYS compared WHOLE as one atomic
+    leaf, whether it is currently None or populated. Scalars, containers, and
+    ``Optional[BaseModel]`` fields are all yielded whole.
+
+    Anchoring descent to the annotation keeps ``_iter_leaves(live)`` and
+    ``_iter_leaves(fresh)`` structurally identical regardless of an optional
+    submodel's nullability state: a None<->populated toggle yields exactly ONE
+    whole-object leaf on both sides, never a bare ``name`` on one side and
+    descended ``name.<sub>`` sub-leaves on the other. That symmetry is what makes
+    such a toggle diff to a single ``restart_required`` entry instead of the
+    KeyError / half-missing-sub-path scatter of task 2718 review esc-2718-1.
+
+    Values are read via ``__dict__`` (not ``getattr``) so a
+    ``Field(deprecated=True)`` leaf does not fire a DeprecationWarning on every
+    diff sweep — ``__dict__`` holds the same validated value pydantic already
+    stored, so this only bypasses the deprecated-access warning wrapper, not
+    validation.
     """
-    for name in type(model).model_fields:
+    fields = type(model).model_fields
+    for name in fields:
         value = model.__dict__[name]
-        if isinstance(value, BaseModel):
+        annotation = fields[name].annotation
+        # Descend only into a REQUIRED (bare, non-Optional) submodel. An
+        # ``X | None`` field has annotation ``Optional[X]`` — a typing Union, not
+        # a ``type`` — so it fails this guard and is yielded whole. That is the
+        # fix for the nullable-submodel leaf-path-set divergence (esc-2718-1).
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             for sub in type(value).model_fields:
                 yield f'{name}.{sub}', value.__dict__[sub]
         else:
@@ -98,14 +123,14 @@ def diff_config(
     counted in ``unchanged``. Pure and synchronous — no I/O, no mutation of
     either argument.
 
-    Iterates the UNION of both sides' leaf keys, tolerant of structural
-    asymmetry: a nullable submodel field toggled between None and populated
-    across the reload yields a bare ``'taskmaster'`` leaf on one side and
-    ``'taskmaster.<sub>'`` leaves on the other. Such a one-sided leaf is a
-    genuine difference — bucketed (never ``KeyError``), with the absent side
-    rendered as the ``'<absent>'`` sentinel — so a nullable-submodel edit is
-    reported ``restart_required`` (neither the bare name nor its subfields are
-    allowlisted) instead of aborting the whole reload.
+    Iterates the UNION of both sides' leaf keys as defense-in-depth. In normal
+    operation ``_iter_leaves`` (annotation-driven) yields identical leaf-path
+    sets for two same-class configs — including for a nullable submodel toggled
+    None<->populated, which is compared WHOLE and so lands as a SINGLE
+    ``restart_required`` entry (neither the bare name nor its subfields are
+    allowlisted). The union + ``_ABSENT`` fallback merely guarantees any residual
+    one-sided leaf is still bucketed (never a ``KeyError``) if that symmetry were
+    ever broken — see task 2718 review esc-2718-1.
     """
     live_leaves = dict(_iter_leaves(live))
     fresh_leaves = dict(_iter_leaves(fresh))
