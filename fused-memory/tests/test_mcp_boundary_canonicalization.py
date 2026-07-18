@@ -244,7 +244,7 @@ def _resolve_mock_attr(mock_service, dotted_path: str):
 
 # (tool_name, extra kwargs supplying the tool's mandatory no-default args other
 # than project_id, dotted mock_service attr path the tool ultimately calls).
-# Covers all 19 in-scope memory tools: the 5 gated writes, 7 reads (including
+# Covers all 20 in-scope memory tools: the 5 gated writes, 8 reads (including
 # get_queue_stats), and 7 ungated mutators.
 _ALL_MEMORY_TOOL_SWEEP_CASES = [
     # Gated writes
@@ -257,6 +257,7 @@ _ALL_MEMORY_TOOL_SWEEP_CASES = [
     ('search', {'query': 'q'}, 'search'),
     ('count_memories_by_metadata', {'filters': {}}, 'count_memories_by_metadata'),
     ('get_memories_by_metadata', {'filters': {}}, 'get_memories_by_metadata'),
+    ('get_memory_by_id', {'memory_id': 'm1'}, 'get_memory_by_id'),
     ('get_entity', {'name': 'e'}, 'get_entity'),
     ('get_entity_by_uuid', {'entity_uuid': 'u1'}, 'get_entity_by_uuid'),
     ('get_episodes', {}, 'get_episodes'),
@@ -271,8 +272,8 @@ _ALL_MEMORY_TOOL_SWEEP_CASES = [
     ('replay_to_graphiti', {}, 'replay_from_store'),
 ]
 
-assert len(_ALL_MEMORY_TOOL_SWEEP_CASES) == 19, (
-    'Sweep must cover exactly the 19 in-scope memory tools (PRD seam S3) — '
+assert len(_ALL_MEMORY_TOOL_SWEEP_CASES) == 20, (
+    'Sweep must cover exactly the 20 in-scope memory tools (PRD seam S3) — '
     'update this table if the in-scope tool count ever changes.'
 )
 
@@ -284,7 +285,7 @@ class TestCompletenessSweepAllMemoryTools:
     Guards the tools not individually B1/B2-tested above, and any tool added
     in the future — canonicalization is the first project_id operation in
     every prologue, ahead of any tool-specific required-arg check, so a
-    path-shaped project_id must short-circuit uniformly across all 19.
+    path-shaped project_id must short-circuit uniformly across all 20.
     """
 
     @pytest.mark.asyncio
