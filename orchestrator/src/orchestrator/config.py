@@ -3680,6 +3680,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'delivered_checks.enabled',
         'delivered_checks.grace_cycles',
         'delivered_checks.check_timeout_secs',
+        # Escalation-revalidation terminal-subject category allowlist (task
+        # 2724) — green-tier hot-reloadable via mcp__escalation__reload_config.
+        # A frozenset[str] leaf: _iter_leaves yields it as an atomic set-valued
+        # leaf compared by equality, so widening/narrowing the allowlist reloads
+        # cleanly (order-independent, no spurious diffs) with no new reload code.
+        'escalation_revalidation_allowlist',
     },
 )
 
