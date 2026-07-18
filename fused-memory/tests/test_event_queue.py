@@ -1401,3 +1401,55 @@ async def test_drainer_marks_processed_on_dead_letter(tmp_path):
             journal.close()
     finally:
         await q.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_after_kill9(real_buffer, tmp_path):
+    """Acceptance: an event durable in the journal but never committed to the
+    buffer (a hard kill between enqueue and drain) is present AND processed
+    after a restart that shares the same journal_path.
+    """
+    ej_path = tmp_path / 'ej.db'
+
+    # queue1: enqueue WITHOUT starting the drainer, so the event is durable in
+    # the journal but never reaches the buffer — simulating kill -9 between
+    # enqueue and drain. queue1's in-memory queue is then abandoned.
+    queue1 = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+    )
+    event = _make_event()
+    assert queue1.enqueue(event) is True
+    # Not in the buffer yet — no drainer ran.
+    assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 0
+    # Release queue1's journal fd (a real kill -9 frees it via OS cleanup); the
+    # INSERT was already committed at append, so the row survives.
+    if queue1._journal is not None:
+        queue1._journal.close()
+
+    # queue2: fresh EventQueue over the SAME buffer + journal_path. start()
+    # must recover() the unprocessed row and re-enqueue it for the drainer.
+    queue2 = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await queue2.start()
+    try:
+        await asyncio.wait_for(queue2._queue.join(), timeout=2.0)
+        # (1) present after restart.
+        assert (await real_buffer.get_buffer_stats('test-project'))['size'] == 1
+        # (2) processed after restart — journal drained.
+        journal = EventJournal(ej_path)
+        try:
+            assert journal.load_unprocessed() == []
+        finally:
+            journal.close()
+    finally:
+        await queue2.close()
