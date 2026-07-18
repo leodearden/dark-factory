@@ -13,8 +13,12 @@ not prose.
 from __future__ import annotations
 
 import types
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 from fused_memory.config.reload import (
     RELOADABLE_FIELDS,
@@ -27,6 +31,21 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
 )
+from fused_memory.server.tools import create_mcp_server
+
+
+def _edit_yaml(path: Path, dotted_leaf: str, value: Any) -> None:
+    """Rewrite one dotted leaf on the YAML file at *path*, preserving the rest.
+
+    Ported from escalation/tests/test_reload_config_integration.py._edit_yaml.
+    """
+    data = yaml.safe_load(path.read_text()) or {}
+    node = data
+    parts = dotted_leaf.split('.')
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    node[parts[-1]] = value
+    path.write_text(yaml.safe_dump(data))
 
 
 @pytest.fixture(autouse=True)
@@ -202,3 +221,42 @@ class TestBehaviorChangesWithoutRestart:
 
         assert 'reconciliation.procedural_knowledge_near_dup_threshold' in report['applied']
         assert resolve_near_dup_threshold(memory_service) == new_val
+
+
+class TestReloadConfigTool:
+    """The reload_config MCP tool re-reads the process's own CONFIG_PATH and
+    returns the machine-checked disposition report, mutating only green leaves."""
+
+    @pytest.mark.asyncio
+    async def test_tool_applies_green_leaf_and_flags_red_leaf(self, tmp_path, monkeypatch):
+        config_yaml = tmp_path / 'config.yaml'
+        # Baseline on-disk config: an explicit green leaf; red leaf left default.
+        config_yaml.write_text(
+            yaml.safe_dump({'reconciliation': {'stale_run_recovery_seconds': 1800}})
+        )
+        monkeypatch.setenv('CONFIG_PATH', str(config_yaml))
+
+        svc = AsyncMock()
+        svc.config = FusedMemoryConfig()
+        old_green = svc.config.reconciliation.stale_run_recovery_seconds
+        assert svc.config.task_metadata.enforce is False  # baseline red leaf
+
+        # Edit one green (allowlisted) + one red (restart-only) leaf on disk.
+        _edit_yaml(config_yaml, 'reconciliation.stale_run_recovery_seconds', old_green + 1)
+        _edit_yaml(config_yaml, 'task_metadata.enforce', True)
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is True
+        assert result['config_path'] == str(config_yaml)
+        assert result['applied'] == {
+            'reconciliation.stale_run_recovery_seconds': {'old': old_green, 'new': old_green + 1}
+        }
+        assert result['restart_required'] == {
+            'task_metadata.enforce': {'old': False, 'new': True}
+        }
+        assert result['error'] is None
+        # Live config: green leaf mutated in place; red leaf NOT mutated.
+        assert svc.config.reconciliation.stale_run_recovery_seconds == old_green + 1
+        assert svc.config.task_metadata.enforce is False
