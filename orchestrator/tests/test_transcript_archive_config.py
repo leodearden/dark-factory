@@ -11,6 +11,7 @@ from __future__ import annotations
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
+    TranscriptArchiveConfig,
     apply_reload,
 )
 
@@ -43,7 +44,9 @@ class TestTranscriptArchiveReloadable:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
-        fresh = OrchestratorConfig(transcript_archive={'enabled': False})
+        fresh = OrchestratorConfig(
+            transcript_archive=TranscriptArchiveConfig(enabled=False)
+        )
         report = apply_reload(live, fresh)
         assert report['reloaded'] is True
         assert 'transcript_archive.enabled' in report['applied']

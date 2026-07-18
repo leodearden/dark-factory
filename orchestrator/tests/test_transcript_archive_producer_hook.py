@@ -16,11 +16,11 @@ from __future__ import annotations
 import asyncio
 import gzip
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
-
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
@@ -81,7 +81,7 @@ def task_assignment() -> TaskAssignment:
 
 
 def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         project_root=git_repo,
         max_concurrent_tasks=1,
         git=GitConfig(
@@ -127,6 +127,7 @@ class TestProducerHook:
 
         def _side_effect(**kwargs):
             # The session id _invoke generated is forwarded as session_id=.
+            assert config_dir is not None
             sid = kwargs['session_id']
             p = config_dir.path / 'projects' / ENC / f'{sid}.jsonl'
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +180,7 @@ class TestProducerHook:
         ):
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
+        assert workflow._config_dir is not None
         mock_helper.assert_called_once_with(
             workflow._config_dir.path,
             workflow.task_id,

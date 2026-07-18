@@ -8,8 +8,6 @@ import logging
 import os
 from pathlib import Path
 
-import pytest
-
 from shared import transcript_archive as transcript_archive_module
 from shared.transcript_archive import archive_task_transcripts
 
