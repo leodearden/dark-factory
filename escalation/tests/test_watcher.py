@@ -6,6 +6,7 @@ import contextlib
 import itertools
 import json
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -783,6 +784,14 @@ class TestTimeout:
         interloper counts — which is the executable proof that the
         ``constant_stub=True`` equality is a meaningful, falsifiable claim
         about the fix, not an artifact of the stub shape.
+
+        The ``constant_stub=False`` arm is itself susceptible to the exact
+        flake it documents (it installs the same process-global,
+        position-sensitive patch a real interloper could partially drain),
+        so it only runs single-worker — see the ``PYTEST_XDIST_WORKER``
+        guard below. The ``constant_stub=True`` GREEN assertion is
+        interloper-immune by construction and always runs, including under
+        xdist.
         """
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
@@ -852,8 +861,20 @@ class TestTimeout:
         # task-2702 "expected 4500, got 5000" flake directly. This is what
         # makes the equality assertion above a meaningful, falsifiable
         # claim rather than a tautology of a constant return_value.
-        assert _run(0, constant_stub=False) == 4500
-        assert _run(3, constant_stub=False) == 5000
+        #
+        # This reproduction installs the very process-global,
+        # position-sensitive time.monotonic() patch responsible for the
+        # original flake (see this test's docstring above), so a
+        # real xdist/execnet background thread calling time.monotonic()
+        # during this window could drain a leading value and shift these
+        # results — the identical self-inflicted risk the constant stub
+        # above was built to remove. Restrict it to single-worker runs,
+        # where no other thread can interlope, so the falsifiability
+        # demonstration stays deterministic instead of reintroducing the
+        # flake it exists to document.
+        if not os.environ.get('PYTEST_XDIST_WORKER'):
+            assert _run(0, constant_stub=False) == 4500
+            assert _run(3, constant_stub=False) == 5000
 
 
 class TestLevelFilter:
