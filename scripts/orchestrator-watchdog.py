@@ -1351,19 +1351,31 @@ def _print_fused_memory_liveness() -> None:
 
 
 def _cli(argv: list[str] | None = None) -> int:
-    """Dispatch the CLI: ``--report`` routes to the read-only doctor mode.
+    """Dispatch the CLI: ``--stamp-fm-deploy-clock`` / ``--report`` / timer path.
 
-    With no ``argv`` argument, reads ``sys.argv[1:]``. If ``--report`` is
-    present, runs the read-only report() followed by the read-only
-    _print_fused_memory_liveness() (B4) and returns report()'s OWN exit code
-    (0 = all fresh, 1 = at least one stale unit) — the fm row is
+    With no ``argv`` argument, reads ``sys.argv[1:]``.
+
+    ``--stamp-fm-deploy-clock`` (checked first) stamps fused-memory's own deploy
+    clock and returns 0, running none of the liveness/staleness/report passes —
+    it is the subcommand _delegate_fm_restart chains after a verified
+    restart-fused-memory.sh exit-0 (task 2714).
+
+    If ``--report`` is present, runs the read-only report() followed by the
+    read-only _print_fused_memory_liveness() (B4) and returns report()'s OWN
+    exit code (0 = all fresh, 1 = at least one stale unit) — the fm row is
     informational only and never alters this exit code. main(),
-    fused_memory_liveness_pass(), and staleness_pass() are not invoked under
-    --report, so this path never mutates systemd state (I7 at the CLI
-    boundary). Otherwise runs the existing liveness main(), then
-    fused_memory_liveness_pass() (B3), then staleness_pass() (the timer
-    path) and returns 0. Unknown flags are not treated as an error — they
-    fall through to the timer path.
+    fused_memory_liveness_pass(), staleness_pass(), and
+    fused_memory_staleness_pass() are NOT invoked under --report, so this path
+    never mutates systemd state (I7 at the CLI boundary): the fm staleness
+    backstop runs on the timer path only.
+
+    Otherwise runs the timer path: the liveness passes first (main() =
+    orchestrator liveness, then fused_memory_liveness_pass() = fm liveness),
+    then the scheduled clock-gated deploys (staleness_pass() = orchestrator
+    fleet, then fused_memory_staleness_pass() = fm backstop, task 2714), and
+    returns 0 — grouping immediate brokenness-revives ahead of scheduled
+    deploys (I5). Unknown flags are not treated as an error — they fall through
+    to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--stamp-fm-deploy-clock" in argv:
@@ -1380,6 +1392,7 @@ def _cli(argv: list[str] | None = None) -> int:
     main()
     fused_memory_liveness_pass()
     staleness_pass()
+    fused_memory_staleness_pass()
     return 0
 
 
