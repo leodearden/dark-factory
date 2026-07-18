@@ -1502,6 +1502,70 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def get_memory_by_id(
+        project_id: str,
+        memory_id: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Direct Mem0/Qdrant point-id lookup (raw content + metadata), non-semantic.
+
+        Fetches a single Mem0 memory by its raw Qdrant point-id (the memory
+        UUID) and returns its raw content plus full payload — bypassing BOTH
+        semantic ranking (``search``) AND metadata-equality filtering
+        (``count_memories_by_metadata`` / ``get_memories_by_metadata``). Use it
+        when you already hold a memory id and need to read that exact record,
+        e.g. a confirmed-to-exist memory that semantic search fails to surface
+        across many worded queries.
+
+        **Mem0/Qdrant-only scope:** looks up only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries,
+        preferences_and_norms, procedural_knowledge). It does NOT query Graphiti —
+        for graph nodes use ``get_entity`` / ``get_entity_by_uuid``.
+
+        **No-silent-fail contract (load-bearing):** a GENUINE not-found returns
+        ``{'found': False, ...}`` — a normal result, like
+        ``get_memories_by_metadata``'s empty list — NOT an error dict. Only a real
+        backend failure (Qdrant read-timeout / error) returns
+        ``{'error', 'error_type'}`` (with ``found`` ABSENT, via
+        ``@mcp_tool_errors``). This lets a consumer tell "memory genuinely
+        absent/already-folded" apart from "backend timed out" — the exact
+        distinction semantic search's silent low-similarity drop could not make.
+
+        This tool is intentionally read-only and is NOT included in any
+        DISALLOW_* list, so it is auto-allowed in Stage 1 (memory_consolidator)
+        and Stage 3's read-only integrity-check mode.
+
+        Args:
+            project_id: Project scope (required)
+            memory_id: Raw Mem0/Qdrant point-id (memory UUID) to look up
+
+        Returns:
+            ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
+            on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
+            False, 'memory_id', 'project_id'}`` on a genuine miss; or ``{'error',
+            'error_type'}`` on a backend failure.
+        """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        record = await memory_service.get_memory_by_id(
+            project_id=project_id,
+            memory_id=memory_id,
+        )
+        if record is None:
+            return {'found': False, 'memory_id': memory_id, 'project_id': project_id}
+        return {
+            'found': True,
+            'memory_id': memory_id,
+            'project_id': project_id,
+            'content': record['content'],
+            'metadata': record['metadata'],
+        }
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def get_entity(
         name: str,
         project_id: str,
