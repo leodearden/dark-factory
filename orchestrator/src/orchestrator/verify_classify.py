@@ -125,6 +125,19 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 _LOCK_TOKEN_RE = re.compile(r'\b(?:flock|lock|slot|semaphore)\b', re.IGNORECASE)
 _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 
+# task 2748: deterministic-diagnostic veto for the SEMAPHORE_TIMEOUT arm. A
+# genuine flock/semaphore slot-acquisition timeout is emitted by the
+# concurrency-limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE
+# the wrapped tool ever runs, so its output CANNOT also contain a compiler/
+# lint diagnostic. `_LOCK_TOKEN_RE`/`_TIMEOUT_TOKEN_RE` are independent
+# whole-output searches, so a deterministic `cargo clippy` diagnostic that
+# quotes lock/slot/semaphore source and mentions "timed out" in a note
+# satisfies both and is misclassified SEMAPHORE_TIMEOUT. The clippy
+# lint-namespace token `clippy::` is present in every denied-lint note (e.g.
+# `-D clippy::await-holding-lock`) and therefore PROVES the wrapped command
+# ran — reused as the veto marker rather than inventing a new one.
+_CLIPPY_LINT_MARKER_RE = re.compile(r'clippy::')
+
 
 def _classify_environmental(output: str) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT.
@@ -135,13 +148,28 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     per-tool table is the right home for them. Returns ``None`` (the caller
     proceeds to per-tool dispatch) when neither condition is grounded in
     *output*.
+
+    SEMAPHORE_TIMEOUT deterministic-diagnostic veto (task 2748): a genuine
+    slot/lock-acquisition timeout is raised by the concurrency-limiter
+    wrapper BEFORE the wrapped tool runs, so its output can never carry a
+    Rust compiler/clippy diagnostic. When *output* carries the clippy
+    lint-namespace token (``clippy::``), the lock/slot/semaphore + timeout
+    tokens are incidental to a deterministic lint failure, so this returns
+    ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
+    dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
+    markers are specific enough (and checked first) that a compile/lint
+    failure caused by a genuinely full disk must stay DISK_FULL.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
         return FailureCategory.DISK_FULL
-    if _LOCK_TOKEN_RE.search(output) and _TIMEOUT_TOKEN_RE.search(output):
+    if (
+        _LOCK_TOKEN_RE.search(output)
+        and _TIMEOUT_TOKEN_RE.search(output)
+        and not _CLIPPY_LINT_MARKER_RE.search(output)
+    ):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
