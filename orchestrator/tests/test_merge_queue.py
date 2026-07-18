@@ -27,6 +27,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec
 from _serial_merge_worker import MergeWorker
 
@@ -7028,7 +7029,7 @@ class TestWipHaltSpeculativeMergeWorker:
                 patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
                 pytest.raises(RuntimeError, match='cleanup boom'),
             ):
-                await worker._verify_and_advance(item)
+                await drive_verify_and_advance(worker, item)
 
             # PRIMARY discriminator: queue must NOT be halted when cleanup raised
             # before the wip_halted outcome could reach the workflow.
@@ -9695,7 +9696,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
                 side_effect=_capture_reverify,
             ),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert not advanced, 'Expected False (gate blocked the merge)'
         # RED: 'keep_worktrees' not in captured_kw because call site omits it.
@@ -9870,7 +9871,7 @@ class TestMergedBranchTipCarryThroughRebuild:
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
@@ -9965,7 +9966,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             # No spy on _check_post_merge_equivalence: real impl runs so the
             # drifted-HEAD false-positive (RED state) is observable end-to-end.
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         # RED: without PRIMARY fix, merged_tip=None → gate reads drifted HEAD
         #      (DIVERGENT) → 'blocked'.
@@ -10075,7 +10076,7 @@ class TestMergedBranchTipCarryThroughRebuild:
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
@@ -10202,7 +10203,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             ),
             patch('orchestrator.merge_queue.dataclasses.replace', side_effect=_spy_replace),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
@@ -10305,7 +10306,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             ),
             patch('orchestrator.merge_queue.dataclasses.replace', side_effect=_spy_replace),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
@@ -12742,7 +12743,7 @@ class TestSpeculationRaceRetry:
             'orchestrator.merge_queue.run_scoped_verification',
             _mock_verify_pass(),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced is True
         outcome = req.result.result()
@@ -13041,7 +13042,7 @@ class TestSpeculationRaceRetry:
         main commits land on the protected branch.  skip_verify must be False unconditionally
         on this path regardless of req.pre_rebased.
 
-        Behavioural check: _verify_and_advance(item) must invoke run_scoped_verification
+        Behavioural check: drive_verify_and_advance(worker, item) must invoke run_scoped_verification
         (i.e., must NOT skip the verify step).
         """
         branch = 'race-retry-skip-verify'
@@ -13086,7 +13087,7 @@ class TestSpeculationRaceRetry:
         # (verification is never skipped).
         mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
         with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced is True
         assert mock_verify.called, (
@@ -13171,7 +13172,7 @@ class TestRemergeAlwaysVerifies:
         # Behavioural check: _verify_and_advance must invoke run_scoped_verification.
         mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
         with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced is True
         assert mock_verify.called, (
@@ -16303,7 +16304,7 @@ class TestSpeculativeMergeWorkerGate:
 
     Each test builds a SpeculativeItem via worker._remerge(req, None),
     simulates intervening main movement by committing directly in
-    project_root, then drives worker._verify_and_advance(item) and asserts
+    project_root, then drives drive_verify_and_advance(worker, item) and asserts
     the expected outcome and run_scoped_verification call count.
 
     Scenarios
@@ -16405,7 +16406,7 @@ class TestSpeculativeMergeWorkerGate:
             'orchestrator.merge_queue.run_scoped_verification',
             side_effect=_verify_side_effect,
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert not advanced, (
             '(a) Gate-on-red: expected _verify_and_advance to return False'
@@ -16465,7 +16466,7 @@ class TestSpeculativeMergeWorkerGate:
             'orchestrator.merge_queue.run_scoped_verification',
             side_effect=_verify_side_effect,
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, '(b) Overlap+green: expected True (done)'
         outcome = req.result.result()
@@ -16526,7 +16527,7 @@ class TestSpeculativeMergeWorkerGate:
             'orchestrator.merge_queue.run_scoped_verification',
             side_effect=_verify_side_effect,
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, '(c) Disjoint: expected True (done)'
         outcome = req.result.result()
@@ -16568,7 +16569,7 @@ class TestSpeculativeMergeWorkerGate:
             'orchestrator.merge_queue.run_scoped_verification',
             side_effect=_verify_side_effect,
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced, '(d) No-movement: expected True (done)'
         outcome = req.result.result()
@@ -18029,7 +18030,7 @@ class TestSMWGenerationChain:
             patch('orchestrator.merge_queue._run_post_merge_verify', AsyncMock(return_value=None)),
             patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced is True
         finalize_mock.assert_awaited_once()
@@ -19338,7 +19339,7 @@ class TestSoftCancelMidVerify:
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
         ):
-            await worker._verify_and_advance(item)
+            await drive_verify_and_advance(worker, item)
 
         # (a) The abandoned INFO log must appear.
         assert 'abandoned by waiter' in caplog.text, (
@@ -19425,7 +19426,7 @@ class TestSoftCancelMidVerify:
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
         ):
-            task = asyncio.create_task(worker._verify_and_advance(item))
+            task = asyncio.create_task(drive_verify_and_advance(worker, item))
             # Wait until the blocking verify has started.
             await asyncio.wait_for(verify_started.wait(), timeout=5)
 
@@ -19589,7 +19590,7 @@ class TestSoftCancelMidVerify:
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
         ):
-            result = await worker._verify_and_advance(item)
+            result = await drive_verify_and_advance(worker, item)
 
         assert result is False
         assert 'abandoned by waiter' in caplog.text, (
@@ -19656,7 +19657,7 @@ class TestSoftCancelMidVerify:
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
         ):
-            result = await worker._verify_and_advance(item)
+            result = await drive_verify_and_advance(worker, item)
 
         assert result is False
         assert 'abandoned by waiter' in caplog.text, (
@@ -20428,7 +20429,7 @@ class TestOperatorHalt:
             ),
             caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
         ):
-            task = asyncio.create_task(worker._verify_and_advance(item))
+            task = asyncio.create_task(drive_verify_and_advance(worker, item))
             await asyncio.wait_for(verify_started.wait(), timeout=5)
 
             # Operator halt while the verify is in flight.
@@ -20517,7 +20518,7 @@ class TestOperatorHalt:
             'orchestrator.merge_queue.run_scoped_verification',
             side_effect=_blocking_verify,
         ):
-            task = asyncio.create_task(worker._verify_and_advance(item))
+            task = asyncio.create_task(drive_verify_and_advance(worker, item))
             await asyncio.wait_for(verify_started.wait(), timeout=5)
 
             # Automatic WIP halt while the verify is in flight.
