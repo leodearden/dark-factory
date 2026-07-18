@@ -12,6 +12,8 @@ not prose.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from fused_memory.config.reload import (
@@ -21,6 +23,10 @@ from fused_memory.config.reload import (
     diff_config,
 )
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.server.near_duplicate_guard import (
+    resolve_near_dup_guard_enabled,
+    resolve_near_dup_threshold,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -154,3 +160,45 @@ class TestApplyReload:
         assert report['error'].startswith('hybrid-invariant')
         # Flagship leaf restored — live untouched after rollback.
         assert live.reconciliation.stale_run_recovery_seconds == old_green
+
+
+class TestBehaviorChangesWithoutRestart:
+    """The user-observable signal: a live consumer's behavior changes after an
+    in-place apply_reload, with no reconstruction — proven on the real near-dup
+    guard resolvers that read ``memory_service.config.reconciliation.*`` live."""
+
+    def test_guard_enabled_flip_observed_by_live_resolver(self):
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        # Baseline: default True, and the live resolver agrees.
+        assert (
+            memory_service.config.reconciliation.procedural_knowledge_near_dup_guard_enabled
+            is True
+        )
+        assert resolve_near_dup_guard_enabled(memory_service) is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.reconciliation, 'procedural_knowledge_near_dup_guard_enabled', False
+        )
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'reconciliation.procedural_knowledge_near_dup_guard_enabled' in report['applied']
+        # The live resolver observes the in-place mutation without a restart.
+        assert resolve_near_dup_guard_enabled(memory_service) is False
+
+    def test_threshold_flip_observed_by_live_resolver(self):
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        old = memory_service.config.reconciliation.procedural_knowledge_near_dup_threshold
+        assert resolve_near_dup_threshold(memory_service) == old
+
+        new_val = 0.5 if old != 0.5 else 0.7
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.reconciliation, 'procedural_knowledge_near_dup_threshold', new_val
+        )
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'reconciliation.procedural_knowledge_near_dup_threshold' in report['applied']
+        assert resolve_near_dup_threshold(memory_service) == new_val
