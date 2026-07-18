@@ -679,3 +679,30 @@ async def test_record_idempotent_result_never_raises(journal):
     journal._db = None
     # Should not raise
     await journal.record_idempotent_result('op-y', 'update_task', {'ok': True})
+
+
+@pytest.mark.asyncio
+async def test_prune_idempotent_ops_ages_out_old_rows(journal):
+    """prune deletes rows older than the window; preserves recent rows."""
+    # Recent row (created_at = now) stays; backdated row is aged out.
+    await journal.record_idempotent_result('recent', 'update_task', {'ok': True})
+    await journal.record_idempotent_result('old', 'update_task', {'ok': True})
+    await journal._db.execute(
+        'UPDATE idempotent_ops SET created_at = ? WHERE client_op_id = ?',
+        ('2000-01-01T00:00:00+00:00', 'old'),
+    )
+    await journal._db.commit()
+
+    deleted = await journal.prune_idempotent_ops(older_than_days=7)
+    assert deleted == 1  # only the backdated row
+
+    assert await journal.get_idempotent_result('old') is None
+    assert await journal.get_idempotent_result('recent') == {'ok': True}
+
+
+@pytest.mark.asyncio
+async def test_prune_idempotent_ops_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    journal._db = None
+    assert await journal.prune_idempotent_ops() == 0

@@ -355,6 +355,41 @@ class WriteJournal:
                 f'Failed to record idempotent_ops for {client_op_id}: {e}'
             )
 
+    async def prune_idempotent_ops(self, *, older_than_days: float = 7.0) -> int:
+        """Age out old ``idempotent_ops`` rows past a retention window.
+
+        One row accrues per mutating task write (update_task / set_task_status /
+        add_dependency / remove_dependency), so — like ``mem0_intents`` — this
+        table grows without bound if never swept. A client idempotency key only
+        needs to outlive the ambiguous-transport-failure retry window it guards
+        (seconds to minutes; a higher-level retry at most hours), so an
+        aggressive TTL is safe: rows whose ``created_at`` is older than
+        ``older_than_days`` are deleted and the count returned. Intended to run
+        at startup alongside ``prune_mem0_intents``.
+
+        Fire-and-forget — logs loudly on failure but never raises, so a prune
+        hiccup cannot crash startup (mirrors ``prune_mem0_intents``).
+        """
+        try:
+            cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+            deleted = 0
+            async with self._txn() as db:
+                cursor = await db.execute(
+                    'DELETE FROM idempotent_ops WHERE created_at < ?',
+                    (cutoff,),
+                )
+                deleted = max(cursor.rowcount, 0)
+            if deleted:
+                logger.info(
+                    'Pruned %d idempotent_ops rows older than %s days',
+                    deleted,
+                    older_than_days,
+                )
+            return deleted
+        except Exception as e:
+            logger.error(f'Failed to prune idempotent_ops: {e}')
+            return 0
+
     # ------------------------------------------------------------------
     # mem0_intents: write-ahead intent journal for the dual-store add path
     # (task 2710 / survey finding D3)

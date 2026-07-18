@@ -541,6 +541,16 @@ async def run_server():
     if _mem0_pruned:
         logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
 
+    # Bounded retention: age out old idempotent_ops so the client-idempotency
+    # key table does not grow without bound (one row accrues per mutating task
+    # write). An idempotency key only needs to outlive the transport-retry
+    # window it guards, so the default TTL is aggressive. Fire-and-forget.
+    _idempotent_pruned = await write_journal.prune_idempotent_ops()
+    if _idempotent_pruned:
+        logger.info(
+            f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
+        )
+
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
     task_interceptor = None
