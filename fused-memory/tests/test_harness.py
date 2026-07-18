@@ -12238,3 +12238,75 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     harness.buffer.mark_drained_run_id.assert_awaited_once_with(
         'test-project', [e.id for e in pre_drained], run_b.id,
     )
+
+
+class TestPerRunConfigDirGC:
+    """The harness GCs each run's per-run recon CLI config dir at every terminal
+    transition (task 2744): run_full_cycle (success AND failure) and
+    _recover_one_run all call gc_run_config_dir(journal.data_dir, run_id).
+    Patching the module-level symbol with a spy sidesteps the generated-run_id /
+    real-dir problem — we assert the call, not the filesystem effect."""
+
+    @pytest.mark.asyncio
+    async def test_gc_after_successful_full_cycle(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.gc_run_config_dir',
+        ) as gc_spy:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        gc_spy.assert_any_call(journal.data_dir, run.id)
+
+    @pytest.mark.asyncio
+    async def test_gc_after_failed_full_cycle(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage exploded'))
+
+        with patch(
+            'fused_memory.reconciliation.harness.gc_run_config_dir',
+        ) as gc_spy:
+            with pytest.raises(RuntimeError, match='stage exploded'):
+                await harness.run_full_cycle('test-project', 'test-trigger')
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        gc_spy.assert_any_call(journal.data_dir, recent[0].id)
+
+    @pytest.mark.asyncio
+    async def test_gc_after_recover_one_run(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        # Isolate the GC assertion from the full recovery mechanics.
+        harness._replay_deferred_writes = AsyncMock()
+
+        run = ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='orphan',
+            started_at=datetime.now(UTC),
+            status=RunStatus.running,
+            instance_id='dead-predecessor',
+        )
+        await journal.start_run(run)
+
+        with patch(
+            'fused_memory.reconciliation.harness.gc_run_config_dir',
+        ) as gc_spy:
+            await harness._recover_one_run(run, lock_holder=None, lock_age=None)
+
+        gc_spy.assert_any_call(journal.data_dir, run.id)
