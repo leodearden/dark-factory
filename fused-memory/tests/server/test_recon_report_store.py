@@ -150,6 +150,64 @@ class TestReconReportStore:
         finally:
             store.close()
 
+    def test_upsert_many_writes_all_rows_in_one_batch(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.open()
+        try:
+            store.upsert_many([
+                {
+                    'run_id': 'r1', 'stage': 'memory_consolidator',
+                    'project_id': 'dark_factory', 'is_active': False,
+                    'entry_json': '{"v": 1}', 'updated_at': 1.0,
+                },
+                {
+                    'run_id': 'r1', 'stage': 'task_knowledge_sync',
+                    'project_id': 'dark_factory', 'is_active': True,
+                    'entry_json': '{"v": 2}', 'updated_at': 2.0,
+                },
+            ])
+            rows = {r['stage']: r for r in store.load_all()}
+            assert set(rows) == {'memory_consolidator', 'task_knowledge_sync'}
+            assert rows['memory_consolidator']['entry_json'] == '{"v": 1}'
+            assert rows['memory_consolidator']['is_active'] is False
+            assert rows['task_knowledge_sync']['entry_json'] == '{"v": 2}'
+            assert rows['task_knowledge_sync']['is_active'] is True
+        finally:
+            store.close()
+
+    def test_upsert_many_conflict_replaces_existing_row(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.open()
+        try:
+            store.upsert_entry(
+                run_id='r1', stage='memory_consolidator', project_id='dark_factory',
+                is_active=False, entry_json='{"v": 1}', updated_at=1.0,
+            )
+            # Same (run_id, stage) via the batch path must REPLACE, not duplicate.
+            store.upsert_many([
+                {
+                    'run_id': 'r1', 'stage': 'memory_consolidator',
+                    'project_id': 'dark_factory', 'is_active': True,
+                    'entry_json': '{"v": 2}', 'updated_at': 5.0,
+                },
+            ])
+            rows = store.load_all()
+            assert len(rows) == 1
+            assert rows[0]['entry_json'] == '{"v": 2}'
+            assert rows[0]['is_active'] is True
+            assert rows[0]['updated_at'] == 5.0
+        finally:
+            store.close()
+
+    def test_upsert_many_empty_is_noop(self, tmp_path):
+        store = self._make_store(tmp_path)
+        store.open()
+        try:
+            store.upsert_many([])  # must not raise, opens no transaction
+            assert store.load_all() == []
+        finally:
+            store.close()
+
     def test_delete_run_removes_all_of_that_runs_rows(self, tmp_path):
         store = self._make_store(tmp_path)
         store.open()
@@ -862,6 +920,9 @@ class _TripwireStore:
 
     def upsert_entry(self, **kwargs):
         raise _StoreTouched('upsert_entry')
+
+    def upsert_many(self, *args, **kwargs):
+        raise _StoreTouched('upsert_many')
 
     def delete_run(self, run_id):
         raise _StoreTouched('delete_run')

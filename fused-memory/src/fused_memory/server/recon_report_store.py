@@ -54,6 +54,20 @@ CREATE INDEX IF NOT EXISTS idx_rrs_run
     ON recon_report_state (run_id);
 """
 
+# INSERT-or-replace for one ``(run_id, stage)`` row.  Single-sourced here so the
+# ON CONFLICT clause lives in exactly one place; shared by ``upsert_entry`` (one
+# row) and ``upsert_many`` (a whole run's rows in one transaction).
+_UPSERT_SQL = (
+    'INSERT INTO recon_report_state '
+    '(run_id, stage, project_id, is_active, entry_json, updated_at) '
+    'VALUES (?, ?, ?, ?, ?, ?) '
+    'ON CONFLICT(run_id, stage) DO UPDATE SET '
+    'project_id = excluded.project_id, '
+    'is_active = excluded.is_active, '
+    'entry_json = excluded.entry_json, '
+    'updated_at = excluded.updated_at'
+)
+
 
 class ReconReportStore:
     """Persistent-connection sync SQLite writer for recon_report_state rows."""
@@ -106,20 +120,52 @@ class ReconReportStore:
         entry_json: str,
         updated_at: float,
     ) -> None:
-        """Insert or replace the row for ``(run_id, stage)``."""
+        """Insert or replace the row for ``(run_id, stage)`` (one commit)."""
         conn = self._require_conn()
         conn.execute(
-            'INSERT INTO recon_report_state '
-            '(run_id, stage, project_id, is_active, entry_json, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?) '
-            'ON CONFLICT(run_id, stage) DO UPDATE SET '
-            'project_id = excluded.project_id, '
-            'is_active = excluded.is_active, '
-            'entry_json = excluded.entry_json, '
-            'updated_at = excluded.updated_at',
+            _UPSERT_SQL,
             (run_id, stage, project_id, int(is_active), entry_json, updated_at),
         )
         conn.commit()
+
+    def upsert_many(self, rows: list[dict[str, Any]]) -> None:
+        """Insert-or-replace many rows in a SINGLE transaction — one ``commit``
+        (one fsync under ``synchronous=FULL``) for the whole batch.
+
+        ``ReconReportState._persist_run`` rewrites ALL of a run's entries (up to
+        the handful of recon stages) after every mutation; routing them through
+        one ``executemany`` + one ``commit`` here collapses what would otherwise
+        be one fsync per entry per mutation into one fsync per mutation — the
+        commit-batching win called out in review.  Each ``row`` is a mapping
+        with the same keys ``load_all`` returns (``run_id``, ``stage``,
+        ``project_id``, ``is_active``, ``entry_json``, ``updated_at``).
+
+        An empty batch is a no-op (no transaction opened).  On failure the
+        pending transaction is rolled back before re-raising, so a half-applied
+        batch never lingers on the persistent connection; the caller
+        (``_persist_run``) logs the failure loudly and continues, since the
+        shadow store is best-effort and must not abort a recon stage.
+        """
+        if not rows:
+            return
+        conn = self._require_conn()
+        params = [
+            (
+                row['run_id'],
+                row['stage'],
+                row['project_id'],
+                int(row['is_active']),
+                row['entry_json'],
+                row['updated_at'],
+            )
+            for row in rows
+        ]
+        try:
+            conn.executemany(_UPSERT_SQL, params)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def delete_run(self, run_id: str) -> None:
         """Delete every row belonging to ``run_id`` (GC at run quiescence)."""

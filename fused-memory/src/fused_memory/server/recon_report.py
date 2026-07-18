@@ -649,16 +649,30 @@ class ReconReportState:
         ``self._active.get(run_id) == stage``, so an active-stage transition
         self-corrects on the very next persist.
 
+        All of the run's serialized rows are written through in ONE
+        ``store.upsert_many`` transaction — a single commit / fsync per
+        mutation rather than one per entry (review: performance).
+
         Best-effort: a store failure is logged loudly (WARNING, structured)
         but never raised — a shadow-store hiccup must not abort a recon stage
-        (mirrors ``start_report``'s existing degradation posture).
+        (mirrors ``start_report``'s existing degradation posture).  Per-entry
+        serialization is likewise resilient: an entry that fails to serialize
+        is skipped-and-logged, and the rest of the run still persists.
         """
         if self._store is None:
             return
         active_stage = self._active.get(run_id)
+        updated_at = self._clock()
+        rows: list[dict[str, Any]] = []
         for (rid, stage), entry in self._state.items():
             if rid != run_id:
                 continue
+            # Serialize each entry independently so a single un-serializable
+            # entry is skipped-and-logged without dropping the rest of the run.
+            # This loop touches ONLY in-memory state (never the store), so the
+            # single store write is the batched upsert_many below — one
+            # transaction / one fsync for the whole run (review: performance),
+            # instead of a commit per entry.
             try:
                 finding_ids = {f.finding_id for f in entry.findings}
                 sig_anchor_slice = {
@@ -676,21 +690,37 @@ class ReconReportState:
                     sig_anchor_slice=sig_anchor_slice,
                     cited_task_slice=cited_task_slice,
                 )
-                self._store.upsert_entry(
-                    run_id=rid,
-                    stage=stage,
-                    project_id=entry.project_id,
-                    is_active=(active_stage == stage),
-                    entry_json=entry_json,
-                    updated_at=self._clock(),
-                )
             except Exception:
                 logger.warning(
-                    'recon_report: failed to persist run_id=%r stage=%r to store',
+                    'recon_report: failed to serialize run_id=%r stage=%r for '
+                    'persistence; skipping this entry',
                     rid,
                     stage,
                     exc_info=True,
                 )
+                continue
+            rows.append(
+                {
+                    'run_id': rid,
+                    'stage': stage,
+                    'project_id': entry.project_id,
+                    'is_active': (active_stage == stage),
+                    'entry_json': entry_json,
+                    'updated_at': updated_at,
+                }
+            )
+        if not rows:
+            return
+        try:
+            self._store.upsert_many(rows)
+        except Exception:
+            logger.warning(
+                'recon_report: failed to persist run_id=%r (%d entr%s) to store',
+                run_id,
+                len(rows),
+                'y' if len(rows) == 1 else 'ies',
+                exc_info=True,
+            )
 
     def hydrate_from_store(self) -> None:
         """Rebuild in-memory state from the persisted store — run ONCE at boot.
@@ -725,6 +755,30 @@ class ReconReportState:
         simply starts with empty in-memory state, exactly as if the persisted
         rows were absent; a single undeserializable row is skipped (logged)
         without discarding the rest.
+
+        Durable-leak tradeoff (in-progress rows).  Only entries whose
+        ``completed_at`` is set are TTL-evictable; an IN-PROGRESS entry
+        (``completed_at is None``) is immortal by design (PRD §9.4), so its
+        run never quiesces and :meth:`ReconReportStore.delete_run` (the only GC
+        path) never fires for it.  With persistence this immortality becomes
+        DURABLE: an abandoned/crashed run that files a stage but never reaches
+        :meth:`complete` leaves its rows in ``recon_report_state.db``
+        permanently, and this method resurrects them into memory on EVERY
+        subsequent boot — an unbounded on-disk growth path the pure in-memory
+        version bounded at process lifetime.  This mirrors the existing
+        in-memory immortal-in-progress semantics (not a new regression, just a
+        longer-lived one), and is a bounded practical risk because a completed
+        run's rows DO self-GC at quiescence and only genuinely abandoned runs
+        accumulate.  A bounded durable backstop (drop hydrated in-progress rows
+        older than N) is deliberately NOT added here: every persisted timestamp
+        (``created_at`` / ``completed_at`` / the row's ``updated_at``) is a
+        MONOTONIC event-loop clock value, not wall-clock, and is not comparable
+        across a restart (a fresh event loop restarts the clock near 0), so a
+        reliable age-based sweep would require adding a wall-clock column — a
+        store/serialization FORMAT change out of scope for this task (task 2716;
+        the σ resume work owns interrupted-run adoption).  Operators reclaim
+        space by deleting the abandoned run's rows (or the whole DB, which a
+        fresh boot recreates empty).
         """
         if self._store is None:
             return
