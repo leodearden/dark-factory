@@ -10,9 +10,11 @@ KEPT (strict >, not >=); max_age_days <= 0 disables the age axis.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -326,3 +328,132 @@ def test_default_constants_match_orchestrator_config():
     assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
     assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
     assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 5000
+
+
+# ---------------------------------------------------------------------------
+# step-11: CLI end-to-end via subprocess — build_parser() / main()
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).parent.parent / "gc_agent_transcripts.py"
+
+
+def _run_cli(*args):
+    """Drive the GC CLI as a real subprocess (inherits the parent env / PATH).
+
+    stdout carries the machine-readable JSON report; stderr carries the LOUD
+    human log lines (basicConfig logs to stderr), so ``json.loads(stdout)`` sees
+    pure JSON.
+    """
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _make_cli_archive(root: Path, specs: list[tuple[str, float]]) -> None:
+    """Build ``<root>/<name>/enc/session.jsonl.gz`` for each ``(name, mtime)``,
+    stamping the ``.gz`` mtime via ``os.utime`` so ``scan_task_dirs`` reads it
+    as that task dir's retention age."""
+    root.mkdir(parents=True, exist_ok=True)
+    for name, mtime in specs:
+        gz = root / name / "enc" / "session.jsonl.gz"
+        gz.parent.mkdir(parents=True)
+        gz.write_bytes(b"x")
+        os.utime(gz, (mtime, mtime))
+
+
+# 5 fresh dirs (all within the age cap), distinct mtimes: "100" newest ...
+# "104" oldest. Newest-first order is 100, 101, 102, 103, 104.
+def _five_fresh_specs() -> list[tuple[str, float]]:
+    return [(str(100 + i), NOW - i * DAY) for i in range(5)]
+
+
+def test_cli_count_cap_prunes_oldest_over_cap(tmp_path):
+    """(a) A low --max-task-dirs over an N>cap archive removes the oldest
+    (N-cap) dirs from disk, prints a LOUD log to stderr, exits 0, and emits a
+    JSON report with removed>0."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "0",  # disable the age axis — isolate the count cap
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    # cap=2 keeps the 2 newest (100, 101); prunes the 3 oldest (102, 103, 104).
+    assert (root / "100").exists()
+    assert (root / "101").exists()
+    for name in ("102", "103", "104"):
+        assert not (root / name).exists(), f"{name} should have been pruned"
+
+    report = json.loads(result.stdout)
+    assert report["removed"] == 3
+    assert report["check"] is False
+    # LOUD: the greppable prefix reaches stderr; real-run, not a dry-run.
+    assert LOG_PREFIX in result.stderr
+    assert "would prune" not in result.stderr
+
+
+def test_cli_default_caps_keep_everything(tmp_path):
+    """(b) With the default (large) caps, nothing is removed and exit is 0."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli("--root", str(root), "--now", str(NOW))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for i in range(5):
+        assert (root / str(100 + i)).exists()
+    report = json.loads(result.stdout)
+    assert report["removed"] == 0
+
+
+def test_cli_check_is_dry_run(tmp_path):
+    """(c) --check over the same over-cap archive exits 0, deletes NOTHING,
+    logs 'would prune', and reports check=true / removed=0."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "0",
+        "--check",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for i in range(5):
+        assert (root / str(100 + i)).exists()  # dry-run deletes nothing
+    report = json.loads(result.stdout)
+    assert report["check"] is True
+    assert report["removed"] == 0
+    assert "would prune" in result.stderr
+
+
+def test_cli_empty_root_is_noop(tmp_path):
+    """(d) An existing-but-empty archive root is a no-op, exit 0."""
+    root = tmp_path / "agent-transcripts"
+    root.mkdir(parents=True)
+
+    result = _run_cli("--root", str(root), "--now", str(NOW))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["removed"] == 0
+
+
+def test_cli_absent_root_is_noop(tmp_path):
+    """(e) An ABSENT archive root is a no-op, exit 0."""
+    root = tmp_path / "does-not-exist"
+
+    result = _run_cli("--root", str(root), "--now", str(NOW))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["removed"] == 0
