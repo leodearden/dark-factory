@@ -4709,6 +4709,44 @@ class TaskWorkflow:
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
+            # Tree-hash verdict cache (task 2749): if a non-blocking verdict
+            # is already recorded for HEAD's committed tree hash — from a
+            # prior dispatch that reviewed byte-identical content — skip the
+            # reviewer and ALL suggestion routing.  Suggestions were routed
+            # when the verdict was first recorded; re-routing on every
+            # re-dispatch is exactly the nit-loop churn this eliminates.
+            # Blocking verdicts are never cached, so any hit is safe→DONE.
+            # Fail-safe: a None tree hash (git error) or a cache miss falls
+            # through to a normal review.  ``review_tree_hash`` stays in
+            # scope for verdict recording on the DONE path below.
+            review_tree_hash: str | None = None
+            if self.worktree and self.artifacts:
+                try:
+                    review_tree_hash = await self.git_ops.get_head_tree_hash(
+                        self.worktree
+                    )
+                    if review_tree_hash:
+                        cached = self.artifacts.get_cached_verdict(
+                            review_tree_hash
+                        )
+                        if cached is not None:
+                            logger.info(
+                                'Task %s: REVIEW skipped — cached %s verdict '
+                                'for tree %s',
+                                self.task_id, cached.get('verdict'),
+                                review_tree_hash,
+                            )
+                            return WorkflowOutcome.DONE
+                except Exception as exc:
+                    # Fail-safe (never load-bearing): a tree-hash or cache
+                    # lookup error degrades to a normal review — never skips,
+                    # never crashes the loop.  Logged loud, not silent.
+                    logger.warning(
+                        'Task %s: verdict-cache lookup failed, falling back '
+                        'to a full review: %s',
+                        self.task_id, exc,
+                    )
+                    review_tree_hash = None
             reviews = await self._review()
             if reviews.reviewer_errors:
                 names = ', '.join(reviews.reviewer_errors)
