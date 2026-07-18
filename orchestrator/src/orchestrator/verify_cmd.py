@@ -642,6 +642,34 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     return replace(cmd, base_flags=(*cmd.base_flags, '--junitxml', junit_path))
 
 
+def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
+    """Return *cmd* with a ``--timeout <secs>`` per-test timeout appended to ``base_flags``.
+
+    PRD task α (cpu-load-robust-verify-prd.md): structured field edit, never a
+    regex, copying ``with_junitxml``'s structure exactly. A no-op (returns
+    *cmd* unchanged) unless ``cmd.tool is ToolKind.PYTEST and cmd.raw is
+    None`` — covers OPAQUE and every other tool (P1), and, like
+    ``with_junitxml`` (and deliberately UNLIKE
+    ``apply_pytest_numprocesses``/``serial_pytest``), also covers a
+    raw-retained pytest chain (``cmd.raw is not None``): there is no
+    regex-rewrite branch here, so a recognised-but-unstructurable
+    ``&&``-chained pytest command is left byte-identical rather than
+    rewritten.
+
+    The α confirm gate injects this AFTER ``serial_pytest``'s
+    ``-p no:xdist -o addopts=`` recovery form: the pyproject per-test
+    ``timeout=60`` default lives in ``[tool.pytest.ini_options]``, NOT in
+    ``addopts``, so ``-o addopts=`` does not clear it. Without a GENEROUS
+    explicit override the isolated confirm re-run could itself starve into a
+    false non-suppression (never masking a real red is a hard constraint, but
+    masking a genuine flake as a real red just because the confirm run was
+    also starved defeats the gate's purpose).
+    """
+    if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
+        return cmd
+    return replace(cmd, base_flags=(*cmd.base_flags, '--timeout', str(secs)))
+
+
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:
     """Return *cmd* with a cpu-governed-exec wrapper appended to ``wrappers``.
 

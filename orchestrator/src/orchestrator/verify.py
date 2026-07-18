@@ -51,6 +51,7 @@ from orchestrator.verify_cmd import (
     serial_pytest,
     strip_cwd,
     with_junitxml,
+    with_pytest_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -1090,6 +1091,32 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
         return None
     parsed = parse_config_command(cmd)
     rewritten = serial_pytest(parsed)
+    if rewritten is parsed:
+        return cmd
+    return render(rewritten)
+
+
+def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
+    """Inject a ``--timeout <secs>`` per-test timeout into every structured
+    ``pytest`` invocation in *cmd*, via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``with_pytest_timeout`` -> ``render`` (mirrors ``_serial_pytest_str``):
+    appends ``--timeout <secs>`` to a structured PYTEST command's ``base_flags``.
+    Returns *cmd* unchanged when it is ``None`` or does not parse into a
+    structured PYTEST command (an OPAQUE / raw-retained chain / non-pytest
+    command — covers the same no-op surface as ``with_pytest_timeout``, P1).
+
+    The α confirm gate composes this OUTSIDE ``_serial_pytest_str`` — the
+    generous explicit ``--timeout`` is required because the serial recovery's
+    ``-o addopts=`` clears pyproject ``addopts`` but NOT the
+    ``[tool.pytest.ini_options] timeout=60`` default, which would otherwise
+    starve the isolated confirm run into a false non-suppression.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = with_pytest_timeout(parsed, secs)
     if rewritten is parsed:
         return cmd
     return render(rewritten)
