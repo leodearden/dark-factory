@@ -1389,6 +1389,57 @@ async def test_restore_drained_scoped_to_run_id_does_not_clobber_other_runs(buf)
 
 
 @pytest.mark.asyncio
+async def test_get_drained_events_reads_run_scoped_without_restoring(buf):
+    """get_drained_events(project, run_id) is a read-only accessor: it returns
+    exactly the run's drained events, leaves their status 'drained' (does NOT
+    restore them to 'buffered'), and ignores rows drained by a different run.
+
+    Used by the resume path (task σ) to feed FRESH later stages their inputs
+    without un-draining events (restoring would double-process them)."""
+    events_r1 = [_make_event() for _ in range(3)]
+    for e in events_r1:
+        await buf.push(e)
+    r1_ids = {e.id for e in events_r1}
+    await buf.drain('test-project', run_id='R1')
+
+    # A second run's events, drained under a different run_id.
+    events_r2 = [_make_event() for _ in range(2)]
+    for e in events_r2:
+        await buf.push(e)
+    r2_ids = {e.id for e in events_r2}
+    await buf.drain('test-project', run_id='R2')
+
+    # Reads exactly R1's drained events, as ReconciliationEvent objects,
+    # ordered by timestamp — ignoring R2's rows entirely.
+    got = await buf.get_drained_events('test-project', 'R1')
+    assert {e.id for e in got} == r1_ids
+    assert all(isinstance(e, ReconciliationEvent) for e in got)
+    got_ids = [e.id for e in got]
+    assert not (set(got_ids) & r2_ids), 'must ignore rows drained by another run'
+
+    # Read-only: the events stay 'drained' (NOT restored), and a repeat read is
+    # idempotent — nothing surfaced as 'buffered'.
+    assert (await buf.get_buffer_stats('test-project'))['size'] == 0, (
+        'get_drained_events must not restore events to buffered'
+    )
+    assert await buf.peek_buffered('test-project', 100) == []
+    again = await buf.get_drained_events('test-project', 'R1')
+    assert {e.id for e in again} == r1_ids
+
+    db = buf._require_db()
+    async with db.execute(
+        "SELECT status FROM event_buffer WHERE id IN ({})".format(
+            ','.join('?' for _ in r1_ids)
+        ),
+        list(r1_ids),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert all(row['status'] == 'drained' for row in rows), (
+        "R1's events must remain 'drained' after a read-only get_drained_events"
+    )
+
+
+@pytest.mark.asyncio
 async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     """mark_drained_run_id lets an already-drained (NULL-attributed) row be
     retroactively attributed to the run about to process it — used by the
