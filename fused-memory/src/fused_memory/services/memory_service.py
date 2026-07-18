@@ -2281,6 +2281,137 @@ class MemoryService:
             message=msg,
         )
 
+    # ------------------------------------------------------------------
+    # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
+    # ------------------------------------------------------------------
+
+    async def recover_mem0_intents(self) -> dict[str, int]:
+        """Reconcile every crash-mid-write mem0 intent still ``pending``.
+
+        A ``pending`` intent means the process died between the write-ahead
+        intent (committed before the mem0 await) and its terminal stamp.
+        Classify each by the existing per-call mem0 ``backend_op`` keyed on
+        ``write_op_id`` — reusing durable evidence rather than a second
+        bookkeeping channel:
+
+        - a SUCCESS mem0 backend_op → the write provably landed (only the
+          completion stamp was lost) → mark ``completed``; NOT an orphan, no
+          re-issue.
+        - only FAILED mem0 backend_op(s) → ``add()`` provably raised so mem0
+          did not persist → safe to re-issue (0 prior writes + 1 = 1):
+          rebuild ``Scope`` + metadata and call ``mem0.add``; ``completed`` on
+          success, ``dead`` on error.
+        - NO mem0 backend_op → outcome UNKNOWN (killed before/inside the
+          await) → dead-letter with a structured reason. ``mem0.add`` pins
+          ``infer=False`` and is non-idempotent, so a blind re-issue risks a
+          duplicate twin; the goal is that a partial write is never SILENT,
+          not automatic healing. Manual replay remains available.
+
+        Every outcome is a durable row (readable via ``get_mem0_intents``)
+        plus a loud log line. Idempotent — no pending intents ⇒ zeroed
+        summary — so it is safe to run on every startup.
+        """
+        summary = {'scanned': 0, 'reconciled': 0, 'reissued': 0, 'dead_lettered': 0}
+        if self._write_journal is None:
+            return summary
+
+        pending = await self._write_journal.get_incomplete_mem0_intents()
+        for intent in pending:
+            summary['scanned'] += 1
+            intent_id = intent['id']
+            write_op_id = intent['write_op_id']
+            payload_digest = intent.get('payload_digest')
+
+            beops = await self._write_journal.get_backend_ops_for_write_op(
+                write_op_id
+            )
+            mem0_beops = [b for b in beops if b.get('backend') == 'mem0']
+            any_success = any(b.get('success') for b in mem0_beops)
+
+            if any_success:
+                # Write landed; only the completion stamp was lost.
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id,
+                    'completed',
+                    reason='reconciled: mem0 backend_op confirms write landed',
+                )
+                summary['reconciled'] += 1
+                logger.info(
+                    'recover_mem0_intents: intent %s reconciled completed — '
+                    'mem0 backend_op confirms write landed (write_op_id=%s)',
+                    intent_id,
+                    write_op_id,
+                )
+            elif mem0_beops:
+                # Only failed backend_op(s) → add() raised → safe to re-issue.
+                try:
+                    scope = Scope(
+                        project_id=intent.get('project_id') or 'main',
+                        agent_id=intent.get('agent_id'),
+                        session_id=intent.get('session_id'),
+                    )
+                    metadata = json.loads(intent.get('metadata') or '{}')
+                    await self.mem0.add(
+                        content=intent.get('content') or '',
+                        scope=scope,
+                        metadata=metadata,
+                    )
+                    await self._write_journal.resolve_mem0_intent(
+                        intent_id,
+                        'completed',
+                        reason='reconciled: re-issued after failed-only mem0 backend_op',
+                    )
+                    summary['reissued'] += 1
+                    logger.warning(
+                        'recover_mem0_intents: intent %s re-issued and completed — '
+                        'prior mem0 add failed (write_op_id=%s)',
+                        intent_id,
+                        write_op_id,
+                    )
+                except Exception as e:
+                    reason = (
+                        f're-issue failed: {type(e).__name__}: {e} '
+                        f'(write_op_id={write_op_id}, payload_digest={payload_digest})'
+                    )
+                    await self._write_journal.resolve_mem0_intent(
+                        intent_id, 'dead', reason=reason
+                    )
+                    summary['dead_lettered'] += 1
+                    logger.error(
+                        'recover_mem0_intents: intent %s dead-lettered — re-issue '
+                        'raised: %s',
+                        intent_id,
+                        e,
+                    )
+            else:
+                # No backend_op → UNKNOWN outcome → dead-letter (never silent).
+                reason = (
+                    'dead-lettered: no mem0 backend_op for '
+                    f'write_op_id={write_op_id} — outcome UNKNOWN (killed '
+                    'before/inside the mem0 await). '
+                    f'payload_digest={payload_digest} '
+                    f'project_id={intent.get("project_id")} '
+                    f'agent_id={intent.get("agent_id")} '
+                    f'session_id={intent.get("session_id")}. '
+                    'Not auto-re-issued: infer=False add is non-idempotent and '
+                    'would risk a duplicate twin; manual replay available.'
+                )
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, 'dead', reason=reason
+                )
+                summary['dead_lettered'] += 1
+                logger.warning(
+                    'recover_mem0_intents: intent %s dead-lettered — no mem0 '
+                    'backend_op, outcome UNKNOWN (write_op_id=%s, payload_digest=%s)',
+                    intent_id,
+                    write_op_id,
+                    payload_digest,
+                )
+
+        if summary['scanned']:
+            logger.info('recover_mem0_intents complete: %s', summary)
+        return summary
+
     async def add_system_record(
         self,
         content: str,

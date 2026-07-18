@@ -219,10 +219,12 @@ class TestRecoverMem0Intents:
         summary = await svc.recover_mem0_intents()
 
         # Re-issued exactly once with the reconstructed content / Scope / metadata.
+        # Scope canonicalizes project_id (dashes -> underscores), exactly as the
+        # original add_memory write did, so the re-issue is faithful to it.
         svc.mem0.add.assert_called_once()
         call_kwargs = svc.mem0.add.call_args.kwargs
         assert call_kwargs['content'] == 'reissue me faithfully'
-        assert call_kwargs['scope'].project_id == 'proj-x'
+        assert call_kwargs['scope'].project_id == 'proj_x'
         assert call_kwargs['scope'].agent_id == 'agent-a'
         assert call_kwargs['scope'].session_id == 'sess-1'
         assert call_kwargs['metadata'] == meta
