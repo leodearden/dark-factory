@@ -68,6 +68,73 @@ def test_health_post_not_allowed(health_app):
 
 
 # ------------------------------------------------------------------
+# recon_busy: additive machine-readable in-flight-cycle field (task 2703 δ)
+# ------------------------------------------------------------------
+
+
+class _StubHarness:
+    """Minimal stand-in exposing the recon_busy_snapshot() contract the
+    /health endpoint consumes (the real one is ReconciliationHarness)."""
+
+    def __init__(self, snapshot):
+        self._snapshot = snapshot
+
+    def recon_busy_snapshot(self):
+        return self._snapshot
+
+
+_CANNED_RECON_BUSY = [
+    {
+        'project_id': 'dark_factory',
+        'run_id': 'run-xyz',
+        'stage': 'stage1_memory_consolidation',
+        'started_at': '2026-07-18T06:00:00+00:00',
+    }
+]
+
+
+def _health_app_with_harness(snapshot):
+    """Build a /health app whose create_mcp_server got a stub harness whose
+    recon_busy_snapshot() returns *snapshot*."""
+    server = create_mcp_server(
+        _make_mock_service(), reconciliation_harness=_StubHarness(snapshot)
+    )
+    return server.streamable_http_app()
+
+
+def test_health_includes_recon_busy_key(health_app):
+    """GET /health body always carries a recon_busy key."""
+    client = TestClient(health_app)
+    body = client.get('/health').json()
+    assert 'recon_busy' in body
+
+
+def test_health_recon_busy_empty_when_no_harness(health_app):
+    """With create_mcp_server called without a harness (the default
+    fixture), recon_busy is an empty list — no phantom in-flight cycles."""
+    client = TestClient(health_app)
+    body = client.get('/health').json()
+    assert body['recon_busy'] == []
+
+
+def test_health_recon_busy_reflects_harness_snapshot():
+    """recon_busy mirrors the harness's recon_busy_snapshot() verbatim."""
+    client = TestClient(_health_app_with_harness(_CANNED_RECON_BUSY))
+    body = client.get('/health').json()
+    assert body['recon_busy'] == _CANNED_RECON_BUSY
+
+
+def test_health_recon_busy_does_not_change_ok_status():
+    """recon_busy is purely additive: a non-empty in-flight list on an
+    otherwise-healthy server does NOT flip status/HTTP code (stays ok/200)."""
+    resp = TestClient(_health_app_with_harness(_CANNED_RECON_BUSY)).get('/health')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['status'] == 'ok'
+    assert body['recon_busy'] == _CANNED_RECON_BUSY
+
+
+# ------------------------------------------------------------------
 # ServerConfig stateless_http / json_response defaults and propagation
 # ------------------------------------------------------------------
 
