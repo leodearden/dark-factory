@@ -201,6 +201,22 @@ def _first_timestamp_date(path: Path) -> date | None:
     return session_date
 
 
+def resolve_agent_transcript_roots(
+    project_root: Path | str, roots: Sequence[str]
+) -> list[Path]:
+    """Resolve ``legibility.yaml``'s ``agent_transcript_roots`` against *project_root*.
+
+    Each relative root (e.g. ``data/orchestrator/agent-transcripts``) is
+    joined onto *project_root* so archive mining is independent of whatever
+    CWD the trickle/census process happens to inherit; an already-absolute
+    root is returned unchanged (``Path`` division returns the right operand
+    verbatim when it is absolute). An empty *roots* yields ``[]`` — the
+    byte-parity baseline in which :func:`enumerate_sessions` reads only the
+    ``~/.claude/projects`` tree.
+    """
+    return [Path(project_root) / r for r in roots]
+
+
 def enumerate_sessions(
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
