@@ -577,3 +577,83 @@ class TestLatestMergeFinalized:
         assert row['request_id'] == 'mr-req', (
             f'Expected request_id-matched row, got {row["request_id"]!r}'
         )
+
+
+class TestFetchEventsByTypeAllRuns:
+    """``fetch_events_by_type_all_runs`` is the restart-durable (run-agnostic)
+    counterpart to ``fetch_events_by_type`` (task 2752).
+
+    The durable verified-green checkpoint must read a ``workflow_verify`` row
+    emitted in a PRIOR orchestrator run (a run whose ``run_id`` differs from
+    the current one), which the run-scoped ``fetch_events_by_type`` cannot
+    see.  The optional ``task_id=`` filter bounds the cross-run result set to
+    a single task's handful of rows.
+    """
+
+    def test_reads_across_runs_where_run_scoped_reader_sees_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """A green emitted under run-A is visible to a run-B reader via
+        ``fetch_events_by_type_all_runs`` but NOT via ``fetch_events_by_type``."""
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, run_id='run-A')
+        store_a.emit(
+            EventType.workflow_verify,
+            task_id='42',
+            data={'passed': True, 'tip_sha': 'tipA', 'base_sha': 'b'},
+        )
+        store_a.emit(
+            EventType.workflow_verify,
+            task_id='99',
+            data={'passed': True, 'tip_sha': 'tip99', 'base_sha': 'b'},
+        )
+
+        # A fresh run on the SAME db — the cross-restart scenario.
+        store_b = EventStore(db_path, run_id='run-B')
+
+        all_runs = store_b.fetch_events_by_type_all_runs(EventType.workflow_verify)
+        assert len(all_runs) == 2, all_runs
+        assert {row['task_id'] for row in all_runs} == {'42', '99'}
+        assert all(row['run_id'] == 'run-A' for row in all_runs)
+
+        # The run-scoped reader on run-B sees no prior-run rows.
+        assert store_b.fetch_events_by_type(EventType.workflow_verify) == []
+
+    def test_task_id_filter_returns_only_that_tasks_rows_with_parsed_data(
+        self, tmp_path: Path
+    ) -> None:
+        """The optional ``task_id=`` filter narrows to one task; ``data`` is a dict."""
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, run_id='run-A')
+        store_a.emit(
+            EventType.workflow_verify,
+            task_id='42',
+            data={'passed': True, 'tip_sha': 'tipA', 'base_sha': 'b'},
+        )
+        store_a.emit(EventType.workflow_verify, task_id='99', data={'passed': True})
+
+        store_b = EventStore(db_path, run_id='run-B')
+        rows = store_b.fetch_events_by_type_all_runs(
+            EventType.workflow_verify, task_id='42'
+        )
+        assert len(rows) == 1, rows
+        assert rows[0]['task_id'] == '42'
+        assert rows[0]['data'] == {'passed': True, 'tip_sha': 'tipA', 'base_sha': 'b'}
+        assert isinstance(rows[0]['data'], dict)
+
+    def test_empty_store_and_task_miss_return_empty_list(
+        self, tmp_path: Path
+    ) -> None:
+        """No matching rows (empty store, or a task_id with no rows) → []."""
+        db_path = tmp_path / 'runs.db'
+        store = EventStore(db_path, run_id='run-A')
+        assert store.fetch_events_by_type_all_runs(EventType.workflow_verify) == []
+
+        store.emit(
+            EventType.workflow_verify,
+            task_id='42',
+            data={'passed': True, 'tip_sha': 'tipA'},
+        )
+        assert store.fetch_events_by_type_all_runs(
+            EventType.workflow_verify, task_id='does-not-exist'
+        ) == []

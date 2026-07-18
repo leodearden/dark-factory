@@ -105,6 +105,7 @@ from orchestrator.verify_categories import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     FailureCategory,
 )
+from orchestrator.verify_checkpoint import green_checkpoint_at_tip
 from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     BlockDisposition,
     CancellationScope,
@@ -1003,6 +1004,19 @@ class TaskWorkflow:
         self._merge_recovery_basis: str | None = None
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
+        # Durable verified-green checkpoint state (task 2752).
+        # _verify_checkpoint_hit: set True for the current loop iteration when
+        # the VERIFY-phase checkpoint fires (a durable prior-run workflow_verify
+        # green exists at the current branch tip) and _verify_debugfix_loop is
+        # SKIPPED.  Read in _enter_phase to SUPPRESS the VERIFY->REVIEW
+        # workflow_verify re-emit — verify did not run this cycle, so
+        # re-asserting a green would be dishonest (the honest signal is
+        # phase_skipped(verify)).  Reset to False at the top of each loop pass.
+        # _verify_green_tip_sha: the branch tip captured right after a PASSING
+        # _verify_debugfix_loop and before _enter_phase(REVIEW); recorded in the
+        # workflow_verify payload as the durable checkpoint key for the next run.
+        self._verify_checkpoint_hit: bool = False
+        self._verify_green_tip_sha: str | None = None
         # Set by _verify_debugfix_loop when a failure is classified as inherited
         # from main (preexisting break).  Read at the call site (run()) to route
         # _mark_blocked with dedupe_fingerprint instead of the generic reason.
@@ -1863,12 +1877,40 @@ class TaskWorkflow:
             # tradeoff (merge_disposition.py's any-prior-green keying is out
             # of this task's module scope to change); pinned by
             # test_merge_skew_end_to_end.py::TestReviewBounceStaleGreenTradeoff.
-            if prev is WorkflowState.VERIFY and new_state is WorkflowState.REVIEW:
+            #
+            # Task 2752: 'tip_sha' (the branch tip captured right after the
+            # passing verify) is the DURABLE cross-restart checkpoint key —
+            # verify_checkpoint.green_checkpoint_at_tip matches on it to skip a
+            # redundant re-verify at an unchanged tip in a later run.  The
+            # `not self._verify_checkpoint_hit` gate SUPPRESSES this emit when
+            # the checkpoint already fired this cycle: verify did NOT run, so
+            # re-asserting workflow_verify(passed=True) would claim a verify
+            # that never happened (the honest signal on a skip is
+            # phase_skipped(verify), emitted in _execute_verify_review_loop).
+            #
+            # Consumer impact of this suppression (task 2752, step-10): on the
+            # cross-restart fast-path the branch's only workflow_verify green
+            # then lives under a PRIOR run_id, which WOULD have blinded the
+            # run-scoped I5 reader and degraded a genuine INTEGRATION_SKEW to
+            # INDETERMINATE.  So merge_disposition._branch_pre_merge_verify_green
+            # was switched to the cross-run fetch_events_by_type_all_runs reader
+            # (task 2752, step-10): it now sees the durable prior-run green, so
+            # no INTEGRATION_SKEW classification is lost.  The remaining
+            # run-scoped consumer, merge_completion.merge_completion_eligible,
+            # still degrades to the documented task-2633 human-/unblock restart
+            # gap and is intentionally left unchanged.  (Both read only
+            # data['passed'], so the added tip_sha key itself affects neither.)
+            if (
+                prev is WorkflowState.VERIFY
+                and new_state is WorkflowState.REVIEW
+                and not self._verify_checkpoint_hit
+            ):
                 self.event_store.emit(
                     EventType.workflow_verify,
                     task_id=self.task_id,
                     data={
                         'passed': True,
+                        'tip_sha': self._verify_green_tip_sha,
                         'base_sha': self._base_commit,
                         'branch': f'{self.config.git.branch_prefix}{self.task_id}',
                     },
@@ -4759,37 +4801,99 @@ class TaskWorkflow:
                 return await self._mark_blocked('Execution iterations exhausted')
 
             # VERIFY + DEBUGFIX loop
+            #
+            # Durable verified-green checkpoint (task 2752): reset fresh each
+            # loop pass.  If a durable prior-run workflow_verify green exists at
+            # the CURRENT branch tip, SKIP the whole (expensive) verify/debugfix
+            # loop — the branch was already verified green at this exact tip, and
+            # a rebase (the only base-mover) would rewrite commits → a new tip,
+            # so an unchanged tip means an unchanged tree.  The honest signal on
+            # a skip is phase_skipped(verify); the VERIFY→REVIEW workflow_verify
+            # re-emit is suppressed in _enter_phase (gated on
+            # _verify_checkpoint_hit) so we never assert a verify that did not
+            # run this cycle.  Fail-closed on every axis: no event store, a
+            # checkpoint miss, a RAISING _get_head_commit (caught below →
+            # tip=None → miss), an empty tip, or a green_checkpoint_at_tip read
+            # error all fall through to the normal verify path
+            # (green_checkpoint_at_tip never raises, and the tip fetch is
+            # wrapped in try/except so a spawn failure cannot crash the loop).
+            # Task 2749's tree-hash verdict cache then skips REVIEW below,
+            # composing into the fast-path to merge.
+            self._verify_checkpoint_hit = False
             self._enter_phase(WorkflowState.VERIFY)
-            verify_outcome = await self._verify_debugfix_loop()
-            if verify_outcome == WorkflowOutcome.ESCALATED:
-                return WorkflowOutcome.ESCALATED
-            if verify_outcome == WorkflowOutcome.BLOCKED:
-                # Infra hold takes priority: route to infra_issue with
-                # escalate_to_human so the open L1 keeps this branch OUT of
-                # pending/footprint-dispatch until the infra clears.
-                # Must be checked BEFORE _inherited_break_info to prevent the
-                # generic 'Verification attempts exhausted' task_failure block
-                # from clobbering the infra_issue category.
-                if self._infra_hold_info is not None:
-                    info = self._infra_hold_info
-                    return await self._mark_blocked(
-                        info['reason'],
-                        detail=info.get('detail', ''),
-                        category='infra_issue',
-                        escalate_to_human=True,
-                        block_status='infra-hold',
+            if self.event_store is not None:
+                try:
+                    tip = await self._get_head_commit()
+                except Exception:
+                    # A raising _get_head_commit (git not on PATH →
+                    # FileNotFoundError, a None worktree, a transient spawn
+                    # failure) must NOT crash the loop: degrade to the normal
+                    # verify path (tip=None → green_checkpoint_at_tip miss →
+                    # _verify_debugfix_loop runs).  This is exactly the
+                    # fail-safe the comment above promises for a
+                    # _get_head_commit error.
+                    logger.warning(
+                        'Task %s: VERIFY checkpoint tip fetch failed; running '
+                        'the normal verify (fail-safe) (task 2752)',
+                        self.task_id, exc_info=True,
                     )
-                if self._inherited_break_info is not None:
-                    info = self._inherited_break_info
-                    return await self._mark_blocked(
-                        info['reason'],
-                        detail=info['detail'],
-                        category=info['category'],
-                        dedupe_fingerprint=info['fingerprint'],
-                        suggested_action='await_preexisting_main_hotfix',
+                    tip = None
+                if green_checkpoint_at_tip(
+                    self.event_store, EventType.workflow_verify, self.task_id, tip,
+                ):
+                    self._verify_checkpoint_hit = True
+                    self.event_store.emit(
+                        EventType.phase_skipped,
+                        task_id=self.task_id,
+                        phase='verify',
+                        data={'reason': 'durable_verified_green', 'tip_sha': tip},
                     )
-                detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
-                return await self._mark_blocked('Verification attempts exhausted', detail=detail)
+                    logger.info(
+                        'Task %s: VERIFY skipped — durable verified-green '
+                        'checkpoint at tip %s (task 2752)',
+                        self.task_id, tip,
+                    )
+            if not self._verify_checkpoint_hit:
+                verify_outcome = await self._verify_debugfix_loop()
+                if verify_outcome == WorkflowOutcome.ESCALATED:
+                    return WorkflowOutcome.ESCALATED
+                if verify_outcome == WorkflowOutcome.BLOCKED:
+                    # Infra hold takes priority: route to infra_issue with
+                    # escalate_to_human so the open L1 keeps this branch OUT of
+                    # pending/footprint-dispatch until the infra clears.
+                    # Must be checked BEFORE _inherited_break_info to prevent the
+                    # generic 'Verification attempts exhausted' task_failure block
+                    # from clobbering the infra_issue category.
+                    if self._infra_hold_info is not None:
+                        info = self._infra_hold_info
+                        return await self._mark_blocked(
+                            info['reason'],
+                            detail=info.get('detail', ''),
+                            category='infra_issue',
+                            escalate_to_human=True,
+                            block_status='infra-hold',
+                        )
+                    if self._inherited_break_info is not None:
+                        info = self._inherited_break_info
+                        return await self._mark_blocked(
+                            info['reason'],
+                            detail=info['detail'],
+                            category=info['category'],
+                            dedupe_fingerprint=info['fingerprint'],
+                            suggested_action='await_preexisting_main_hotfix',
+                        )
+                    detail = self._last_verify_result.failure_report() if self._last_verify_result else ''
+                    return await self._mark_blocked('Verification attempts exhausted', detail=detail)
+                # Passing fall-through (_verify_debugfix_loop returns DONE):
+                # capture the verified branch tip so the subsequent
+                # _enter_phase(REVIEW) records it in the workflow_verify payload
+                # as the durable checkpoint key for the next run (task 2752).
+                # Normalize an empty tip (a failed `git rev-parse` returns '' —
+                # see _get_head_commit) to None so we never record '' as a
+                # green key: a later run that also read '' must MISS the
+                # checkpoint (green_checkpoint_at_tip fails closed on an empty
+                # tip), not match '' == '' and falsely skip verify.
+                self._verify_green_tip_sha = (await self._get_head_commit()) or None
 
             # REVIEW
             self._enter_phase(WorkflowState.REVIEW)
