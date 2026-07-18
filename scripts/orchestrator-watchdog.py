@@ -31,8 +31,10 @@ scripts/orchestrator-watchdog.timer).
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -167,6 +169,47 @@ try:
     DRAIN_FRESH_WINDOW_SECS = int(os.environ["ORCH_DRAIN_FRESH_WINDOW_SECS"])
 except (KeyError, ValueError):
     DRAIN_FRESH_WINDOW_SECS = 120
+
+# --- fused-memory staleness backstop (task 2714, ο of the fm-restart survey) ---
+# fused-memory needs the SAME staleness backstop the orchestrator fleet has
+# (staleness_pass below): a merged fm change otherwise sits undeployed until a
+# human/PRD files a deploy task (survey finding A2). fused_memory_staleness_pass()
+# is a single-unit mirror of staleness_pass() over FUSED_MEMORY_UNIT; the
+# constants below are fm siblings of WATCHED_PATHS / FLEET_DEPLOY_CLOCK_PATH /
+# ORCH_RESTART_MIN_INTERVAL_SECS, kept deliberately independent so fm's redeploy
+# cadence never couples to the orchestrator fleet's.
+
+# Paths whose newest commit defines "fresh" for the fm staleness pass. Includes
+# shared/src/ because fused-memory imports shared.* (e.g. shared.task_metadata),
+# so a shared change can alter fm's behavior and must count toward fm staleness.
+FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
+
+# fused-memory's OWN deploy-clock file — a DIFFERENT file than the orchestrator
+# fleet clock (FLEET_DEPLOY_CLOCK_PATH), so an orchestrator fleet redeploy never
+# resets fm's min-interval window and vice-versa. Unlike
+# restart-all-orchestrators.sh (which stamps the fleet clock itself),
+# restart-fused-memory.sh does NOT write this file — the watchdog does, via the
+# `--stamp-fm-deploy-clock` subcommand chained after a verified restart (see
+# _delegate_fm_restart / _stamp_fm_deploy_clock below). Env-overridable so tests
+# can point it at a tmp file without touching real data/.
+FM_DEPLOY_CLOCK_PATH = os.environ.get(
+    "FM_DEPLOY_CLOCK",
+    os.path.join(REPO_DIR, "data", "fused-memory", "last_redeploy_fused_memory.json"),
+)
+
+# Minimum wall-clock seconds between successive fm redeploys — fm's own
+# independent cap, mirroring ORCH_RESTART_MIN_INTERVAL_SECS's 8h default and its
+# env-with-try/except-fallback pattern (a typo'd env var must not crash the
+# oneshot watchdog). 0 disables the cap entirely.
+try:
+    FM_RESTART_MIN_INTERVAL_SECS = int(os.environ["FM_RESTART_MIN_INTERVAL_SECS"])
+except (KeyError, ValueError):
+    FM_RESTART_MIN_INTERVAL_SECS = 28800
+
+# Fixed transient unit name for the detached fm staleness redeploy — the natural
+# overlap guard (a second tick fails to re-register the same unit name while a
+# redeploy is still running), sibling of orch-fleet-staleness-redeploy.service.
+FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
 
 
 def log(msg: str) -> None:
@@ -523,6 +566,63 @@ def _unit_start_epoch(unit: str) -> int | None:
         return None
 
 
+def _unit_active_enter_epoch(unit: str) -> int | None:
+    """Return *unit*'s realtime ActiveEnterTimestamp epoch (Unix seconds), or None.
+
+    fm sibling of _unit_start_epoch, structurally identical but querying
+    ``ActiveEnterTimestamp`` instead of ``ExecMainStartTimestamp``.
+    fused_memory_staleness_pass() (task 2714) uses this field per the task's
+    explicit choice: ActiveEnterTimestamp marks when a Type=notify service
+    signalled readiness (= "when did this version start serving"), which is
+    the semantically-correct staleness anchor for fused-memory and is exactly
+    the field restart-all-orchestrators.sh's own freshness verify reads.
+
+    Queries ``systemctl --user show --timestamp=unix`` which yields a clean,
+    timezone-independent ``@<epoch>`` value directly comparable to git's
+    ``%ct`` committer epoch. Returns None if the unit has never activated (the
+    ``@0`` sentinel), the value cannot be parsed, or any subprocess/OS error
+    occurs — callers must treat None as "staleness cannot be determined for
+    this unit" (skip, don't guess).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--timestamp=unix",
+                "-p",
+                "ActiveEnterTimestamp",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            val = line.split("=", 1)[1].strip()
+            if val.startswith("@"):
+                val = val[1:]
+            try:
+                epoch = int(val)
+            except ValueError:
+                return None
+            if epoch == 0:
+                return None  # unit has never activated (no readiness signal recorded)
+            return epoch
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_unit_active_enter_epoch({unit!r}): swallowed {exc!r}; "
+            "returning None (staleness undeterminable this tick)"
+        )
+        return None
+
+
 def _newest_watched_commit_epoch() -> int | None:
     """Return the newest committer epoch touching WATCHED_PATHS on HEAD, or None.
 
@@ -569,6 +669,55 @@ def _newest_watched_commit_epoch() -> int | None:
         logger.warning(
             f"_newest_watched_commit_epoch: swallowed {exc!r}; "
             "returning None (staleness undeterminable this tick)"
+        )
+        return None
+
+
+def _newest_fm_watched_commit_epoch() -> int | None:
+    """Return the newest committer epoch touching FM_WATCHED_PATHS on HEAD, or None.
+
+    fm sibling of _newest_watched_commit_epoch, identical body but diffing
+    FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) instead of WATCHED_PATHS.
+    fused_memory_staleness_pass() (task 2714) compares this against
+    fused-memory.service's ActiveEnterTimestamp to detect a merged-but-
+    undeployed fm change.
+
+    Returns None if no commit touches the fm-watched paths (git exits 0 with
+    EMPTY stdout — must be treated as undeterminable, not epoch 0, or
+    fused-memory would look infinitely stale), on a non-zero exit, on
+    unparseable stdout, or on any subprocess/OS error. Callers must treat None
+    as "staleness cannot be determined this tick".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                REPO_DIR,
+                "log",
+                "-1",
+                "--format=%ct",
+                "HEAD",
+                "--",
+                *FM_WATCHED_PATHS,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        stdout = result.stdout.strip()
+        if not stdout:
+            return None
+        try:
+            return int(stdout)
+        except ValueError:
+            return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_newest_fm_watched_commit_epoch: swallowed {exc!r}; "
+            "returning None (fm staleness undeterminable this tick)"
         )
         return None
 
@@ -620,6 +769,97 @@ def _within_fleet_deploy_min_interval() -> bool:
     if last is None:
         return False
     return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
+
+
+def _read_last_fm_deploy_epoch() -> float | None:
+    """Return the last verified fm-deploy epoch from FM_DEPLOY_CLOCK_PATH, or None.
+
+    fm sibling of _read_last_fleet_deploy_epoch: reads the same ``{ts, iso}``
+    JSON schema _stamp_fm_deploy_clock writes (which itself mirrors
+    restart-all-orchestrators.sh's stamp_fleet_deploy_clock), so ``float(ts)``
+    reads it identically.
+
+    Fail-open: returns None (never raises) when the file is missing (no fm
+    deploy has ever verified fresh, or a fresh checkout with no data/ yet), or
+    when it is corrupt, unreadable, or missing its ``ts`` key. Callers must
+    treat None as "the min-interval cap does not apply" (fail toward running
+    the backstop, not toward silence).
+    """
+    try:
+        with open(FM_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        return float(raw["ts"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log(
+            f"ignoring unreadable/corrupt fm-deploy clock at "
+            f"{FM_DEPLOY_CLOCK_PATH}: {exc!r}"
+        )
+        return None
+
+
+def _within_fm_deploy_min_interval() -> bool:
+    """Return True iff we are still inside fm's own deploy min-interval window.
+
+    fm sibling of _within_fleet_deploy_min_interval, reading fm's OWN clock
+    (FM_DEPLOY_CLOCK_PATH) and honoring fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS)
+    — independent of the orchestrator fleet clock. FM_RESTART_MIN_INTERVAL_SECS<=0
+    disables the cap outright (the clock is not even read). A missing/unreadable
+    clock (_read_last_fm_deploy_epoch returns None) is treated as "outside the
+    window" — fail toward letting the backstop run, not toward silencing it
+    indefinitely.
+    """
+    if FM_RESTART_MIN_INTERVAL_SECS <= 0:
+        return False
+    last = _read_last_fm_deploy_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < FM_RESTART_MIN_INTERVAL_SECS
+
+
+def _stamp_fm_deploy_clock() -> None:
+    """Atomically stamp FM_DEPLOY_CLOCK_PATH with the current ``{ts, iso}`` time.
+
+    Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock
+    (mkdir -p, mktemp a sibling, write, atomic rename). Needed because
+    restart-fused-memory.sh — unlike restart-all-orchestrators.sh — does NOT
+    stamp its own clock; the watchdog owns fm's clock. Called ONLY from the
+    ``--stamp-fm-deploy-clock`` CLI subcommand, which _delegate_fm_restart
+    chains after restart-fused-memory.sh's verified exit-0 (``&&``), so the fm
+    clock advances only after a genuinely-verified restart (I2: a failed fm
+    restart can never silence the backstop).
+
+    Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
+    (the temp file, if created, is unlinked) rather than raised — a stamp
+    failure must not crash the detached unit. The backstop still self-heals via
+    ActiveEnterTimestamp next tick, so the clock is only a secondary flap-guard.
+    """
+    tmp_path: str | None = None
+    try:
+        clock_dir = os.path.dirname(FM_DEPLOY_CLOCK_PATH)
+        os.makedirs(clock_dir, exist_ok=True)
+        now = time.time()
+        payload = json.dumps(
+            {
+                "ts": int(now),
+                "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+            }
+        )
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".last_redeploy_fused_memory.", dir=clock_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload + "\n")
+        os.replace(tmp_path, FM_DEPLOY_CLOCK_PATH)
+        tmp_path = None  # renamed away — nothing to clean up
+    except Exception as exc:  # noqa: BLE001
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        log(f"_stamp_fm_deploy_clock: failed to stamp {FM_DEPLOY_CLOCK_PATH}: {exc!r}")
 
 
 def main() -> None:
@@ -738,6 +978,80 @@ def _delegate_fleet_restart() -> None:
         log(f"_delegate_fleet_restart: systemd-run registration failed: {exc!r}")
 
 
+def _delegate_fm_restart() -> None:
+    """Delegate a fused-memory staleness redeploy to restart-fused-memory.sh (task 2714).
+
+    fm sibling of _delegate_fleet_restart: fires a detached, named transient
+    unit via ``systemd-run --user`` so the defer-if-busy restart and the
+    exit-0-gated clock stamp run identically whether triggered by this backstop
+    or (later) any other caller.
+
+    - ``--unit=fm-staleness-redeploy.service`` (FM_STALENESS_REDEPLOY_UNIT) is a
+      FIXED transient unit name — the natural overlap guard. A second tick while
+      a redeploy is still running fails to re-register the same unit name and
+      no-ops, so this stateless oneshot needs no cross-tick bookkeeping.
+    - ``--collect`` removes the transient unit once it exits so a LATER tick can
+      re-register the same name.
+    - ``--no-block`` detaches: this call returns as soon as the transient unit
+      is *registered*, without waiting for restart-fused-memory.sh to finish.
+      Essential because restart-fused-memory.sh's default defer-if-busy path can
+      hold up to RECON_GATE_TIMEOUT (35 min) while a full recon cycle runs — the
+      60s oneshot watchdog must never block on that (task 2703 δ).
+    - ``--setenv=FM_DEPLOY_CLOCK=<path>`` forwards the reader's RESOLVED clock
+      path into the detached unit. ``systemd-run --user`` runs the transient
+      unit under the systemd user *manager's* environment, NOT this watchdog
+      process's — so without this, the chained ``--stamp-fm-deploy-clock`` would
+      recompute FM_DEPLOY_CLOCK_PATH from the session env and default it,
+      silently diverging from the path the reader
+      (_within_fm_deploy_min_interval, in THIS process) consults whenever
+      FM_DEPLOY_CLOCK is overridden. Pinning the stamp to FM_DEPLOY_CLOCK_PATH
+      keeps writer==reader in all cases (a no-op at the default path;
+      load-bearing under an operator/test override).
+
+    KEY divergence from _delegate_fleet_restart (task ο design decision):
+    restart-fused-memory.sh is invoked in its DEFAULT defer-if-busy mode (NO
+    --now / --drain), and — because it does NOT stamp its own clock (unlike
+    restart-all-orchestrators.sh) — the command chains ``&& <self>
+    --stamp-fm-deploy-clock`` inside the SAME detached ``bash -c`` payload. The
+    ``&&`` short-circuit means the fm clock is stamped ONLY on the restart
+    script's verified exit-0, and the whole thing stays non-blocking (the stamp
+    runs inside the detached unit, not inline in the watchdog).
+
+    Fail-soft: a missing systemd-run binary, a timeout, or any other
+    registration error is logged and swallowed, never raised — a registration
+    hiccup must not crash the oneshot watchdog. The NEXT tick's
+    fused_memory_staleness_pass will simply try again (stateless — I6).
+    """
+    restart_script = os.path.join(REPO_DIR, "scripts", "restart-fused-memory.sh")
+    stamp_cmd = (
+        f"{shlex.quote(sys.executable)} "
+        f"{shlex.quote(os.path.abspath(__file__))} --stamp-fm-deploy-clock"
+    )
+    try:
+        subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--collect",
+                "--no-block",
+                # Pin the detached stamp to the SAME clock file the reader
+                # consults — systemd-run --user does not propagate this
+                # process's env, so the chained --stamp-fm-deploy-clock would
+                # otherwise default the path (see docstring). No-op at the
+                # default path; load-bearing under a FM_DEPLOY_CLOCK override.
+                f"--setenv=FM_DEPLOY_CLOCK={FM_DEPLOY_CLOCK_PATH}",
+                f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
+                "/bin/bash",
+                "-c",
+                f"{shlex.quote(restart_script)} && {stamp_cmd}",
+            ],
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"_delegate_fm_restart: systemd-run registration failed: {exc!r}")
+
+
 def staleness_pass() -> None:
     """Restart any running orchestrator unit stale w.r.t. the newest watched commit.
 
@@ -828,6 +1142,75 @@ def staleness_pass() -> None:
     if stale_found:
         log("delegating fleet-wide staleness redeploy to restart-all-orchestrators.sh --drain")
         _delegate_fleet_restart()
+
+
+def fused_memory_staleness_pass() -> None:
+    """Restart fused-memory.service if it is stale w.r.t. the newest fm commit.
+
+    Single-unit mirror of staleness_pass() targeting FUSED_MEMORY_UNIT — closes
+    survey finding A2 (no staleness signal drives fused-memory redeploys, so a
+    merged fm change sits undeployed until a human/PRD files a deploy task).
+    fused-memory has an on-merge event-driven StaleServiceRestartCoordinator
+    (survey finding A7) that can starve under load; this watchdog pass is the
+    BACKSTOP for it, exactly as staleness_pass() backstops the orchestrator
+    fleet's coordinator.
+
+    Gate order (mirrors staleness_pass): (1) fm-deploy min-interval clock cap
+    FIRST (fm's OWN clock, throttled skip-log); (2) newest fm-watched commit,
+    None -> no-op; (3) commit-grace head-start reusing STALENESS_GRACE_SECS so
+    the polite fm coordinator gets its head start before the backstop acts;
+    (4) enabled / startup-grace / ActiveEnterTimestamp-vs-commit -> delegate
+    once via _delegate_fm_restart().
+
+    Stateless (I6): staleness is recomputed from live systemd + git each tick,
+    so a successful restart (from this pass or the fm coordinator) advances
+    ActiveEnterTimestamp past the commit and the unit reads fresh on the very
+    next call — no stored state, no flap loop.
+
+    Wrapped in a single try/except Exception around the per-unit probes
+    (mirroring fused_memory_liveness_pass()'s isolation) so a probe hiccup is
+    logged and swallowed rather than crashing the oneshot watchdog. Uses
+    _delegate_fm_restart() (detached defer-if-busy chokepoint), never
+    restart_unit() directly — liveness stays the only uncapped, non-clock-gated
+    revive path (I5: brokenness is not a scheduled deploy).
+    """
+    if _within_fm_deploy_min_interval():
+        # Bucket on wall-clock time (no extra clock read beyond the gate's) —
+        # see SKIP_LOG_INTERVAL_SECS. The gate check still runs every tick;
+        # only the log emission is throttled.
+        if time.time() % SKIP_LOG_INTERVAL_SECS < 120:
+            log(
+                "skip: within fm-deploy min-interval "
+                f"({FM_RESTART_MIN_INTERVAL_SECS}s) since last deploy"
+            )
+        return
+
+    commit_epoch = _newest_fm_watched_commit_epoch()
+    if commit_epoch is None:
+        return  # undeterminable — fall safe, no restart this tick
+    if time.time() - commit_epoch < STALENESS_GRACE_SECS:
+        # Give the polite event-driven fm coordinator its head start.
+        return
+
+    try:
+        if not is_unit_enabled(FUSED_MEMORY_UNIT):
+            # Disabled (or unknown) — respect operator intent, skip silently.
+            return
+        elapsed = _unit_start_elapsed_secs(FUSED_MEMORY_UNIT)
+        if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+            # None => grace does not apply, proceed (mirrors main()).
+            return
+        active = _unit_active_enter_epoch(FUSED_MEMORY_UNIT)
+        if active is None:
+            return  # undeterminable — skip, don't guess
+        if active < commit_epoch:
+            log(
+                f"WARNING: {FUSED_MEMORY_UNIT} activated at {active} before the newest "
+                f"fm-watched commit ({commit_epoch}); delegating fused-memory staleness redeploy"
+            )
+            _delegate_fm_restart()
+    except Exception as exc:  # noqa: BLE001
+        log(f"fm staleness probe error for {FUSED_MEMORY_UNIT}: {exc}")
 
 
 def _format_epoch(epoch: int | None) -> str:
@@ -955,14 +1338,68 @@ def report() -> int:
     return 1 if any_stale else 0
 
 
-def _print_fused_memory_liveness() -> None:
-    """Print a single labelled fused-memory liveness row for ``--report``.
+def _fused_memory_recon_busy_verdict() -> str:
+    """Classify fused-memory's in-flight reconciliation state for ``--report``.
 
-    Strictly read-only, mirroring report()'s I7/I8 guarantee: computes the
-    verdict via _fused_memory_liveness_verdict() (port probe + /health fetch
-    only — no is_unit_enabled/STARTUP_GRACE_SECS gating, since report()
-    likewise shows every unit's raw verdict unconditionally) and prints it.
-    No systemctl mutation, no clock write, no restart.
+    Reuses scripts/recon_busy_check.py's parse_health()/classify() (task 2703
+    δ) via a lazy import — the SAME busy/idle/unreachable gate
+    restart-fused-memory.sh's default defer-if-busy path consumes — so this
+    ``--report`` column predicts the restart script's recon gate exactly
+    rather than risking a reimplementation drifting from it. Mirrors
+    _classify_unit_heartbeat's lazy-reuse-of-a-sibling-script pattern.
+
+    Fetches FUSED_MEMORY_HEALTH_URL's body and runs it through
+    parse_health()+classify():
+      - 'busy'        — a full reconciliation cycle is in flight
+      - 'idle'        — no cycle running (recon_busy empty/absent)
+      - 'unreachable' — the endpoint answered with a blank/unparseable body
+      - 'unknown'     — the fetch/import itself failed (fail-soft, logged)
+
+    Read-only: no restart, no clock write, no mutating call. Any exception
+    (recon_busy_check missing/unimportable, the /health fetch failing, or
+    anything else) is swallowed and degrades this single column to 'unknown'
+    rather than breaking ``--report``.
+
+    Inserts this module's own directory onto sys.path (guarded — a no-op if
+    already present, e.g. via tests/scripts/conftest.py under test) so
+    ``import recon_busy_check`` resolves regardless of how this script was
+    invoked.
+    """
+    try:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import recon_busy_check  # noqa: PLC0415
+
+        with urllib.request.urlopen(
+            FUSED_MEMORY_HEALTH_URL, timeout=FUSED_MEMORY_HEALTH_TIMEOUT_SECS
+        ) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        return recon_busy_check.classify(recon_busy_check.parse_health(body))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_fused_memory_recon_busy_verdict: swallowed {exc!r}; returning 'unknown'"
+        )
+        return "unknown"
+
+
+def _print_fused_memory_liveness() -> None:
+    """Print a single labelled fused-memory row for ``--report``.
+
+    Strictly read-only, mirroring report()'s I7/I8 guarantee. Three fields,
+    all read-only:
+      - liveness verdict via _fused_memory_liveness_verdict() (port probe +
+        /health fetch only — no is_unit_enabled/STARTUP_GRACE_SECS gating,
+        since report() likewise shows every unit's raw verdict
+        unconditionally);
+      - DEPLOY-AGE from fused-memory's OWN deploy clock
+        (_read_last_fm_deploy_epoch), rendered hours-to-one-decimal exactly
+        like report()'s DEPLOY-AGE column, or 'unknown' when the fm clock has
+        never been stamped / is unreadable (fail-open);
+      - recon-busy via _fused_memory_recon_busy_verdict() (fail-soft
+        'unknown').
+    No systemctl mutation, no clock write, no restart — the DEPLOY-AGE read
+    and the recon-busy /health fetch are both read-only.
 
     Informational only: called from _cli's --report branch AFTER report()'s
     own staleness table, and never affects report()'s staleness-only exit
@@ -973,32 +1410,62 @@ def _print_fused_memory_liveness() -> None:
     TimeoutExpired, so an unusual subprocess failure (e.g. PermissionError)
     could otherwise propagate out of the verdict chain and crash --report
     after report() has already computed its exit code. An unexpected failure
-    here degrades to a logged 'unknown' row instead.
+    here degrades to a logged 'unknown' liveness verdict instead; DEPLOY-AGE
+    (fail-open None) and recon-busy (fail-soft 'unknown') never raise.
     """
     try:
         verdict = _fused_memory_liveness_verdict()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error printing {FUSED_MEMORY_UNIT} liveness row: {exc}")
         verdict = "unknown"
-    print(f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): {verdict}")
+    deploy_epoch = _read_last_fm_deploy_epoch()
+    deploy_age_str = (
+        f"{(time.time() - deploy_epoch) / 3600:.1f}h"
+        if deploy_epoch is not None
+        else "unknown"
+    )
+    recon_busy = _fused_memory_recon_busy_verdict()
+    print(
+        f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): "
+        f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy}"
+    )
 
 
 def _cli(argv: list[str] | None = None) -> int:
-    """Dispatch the CLI: ``--report`` routes to the read-only doctor mode.
+    """Dispatch the CLI: ``--stamp-fm-deploy-clock`` / ``--report`` / timer path.
 
-    With no ``argv`` argument, reads ``sys.argv[1:]``. If ``--report`` is
-    present, runs the read-only report() followed by the read-only
-    _print_fused_memory_liveness() (B4) and returns report()'s OWN exit code
-    (0 = all fresh, 1 = at least one stale unit) — the fm row is
+    With no ``argv`` argument, reads ``sys.argv[1:]``.
+
+    ``--stamp-fm-deploy-clock`` (checked first) stamps fused-memory's own deploy
+    clock and returns 0, running none of the liveness/staleness/report passes —
+    it is the subcommand _delegate_fm_restart chains after a verified
+    restart-fused-memory.sh exit-0 (task 2714).
+
+    If ``--report`` is present, runs the read-only report() followed by the
+    read-only _print_fused_memory_liveness() (B4) and returns report()'s OWN
+    exit code (0 = all fresh, 1 = at least one stale unit) — the fm row is
     informational only and never alters this exit code. main(),
-    fused_memory_liveness_pass(), and staleness_pass() are not invoked under
-    --report, so this path never mutates systemd state (I7 at the CLI
-    boundary). Otherwise runs the existing liveness main(), then
-    fused_memory_liveness_pass() (B3), then staleness_pass() (the timer
-    path) and returns 0. Unknown flags are not treated as an error — they
-    fall through to the timer path.
+    fused_memory_liveness_pass(), staleness_pass(), and
+    fused_memory_staleness_pass() are NOT invoked under --report, so this path
+    never mutates systemd state (I7 at the CLI boundary): the fm staleness
+    backstop runs on the timer path only.
+
+    Otherwise runs the timer path: the liveness passes first (main() =
+    orchestrator liveness, then fused_memory_liveness_pass() = fm liveness),
+    then the scheduled clock-gated deploys (staleness_pass() = orchestrator
+    fleet, then fused_memory_staleness_pass() = fm backstop, task 2714), and
+    returns 0 — grouping immediate brokenness-revives ahead of scheduled
+    deploys (I5). Unknown flags are not treated as an error — they fall through
+    to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
+    if "--stamp-fm-deploy-clock" in argv:
+        # Checked FIRST (before --report): this subcommand does exactly one
+        # thing — stamp fm's deploy clock — and is chained after a verified
+        # restart-fused-memory.sh exit-0 inside the detached _delegate_fm_restart
+        # unit. It runs none of the liveness/staleness/report passes.
+        _stamp_fm_deploy_clock()
+        return 0
     if "--report" in argv:
         rc = report()
         _print_fused_memory_liveness()
@@ -1006,6 +1473,7 @@ def _cli(argv: list[str] | None = None) -> int:
     main()
     fused_memory_liveness_pass()
     staleness_pass()
+    fused_memory_staleness_pass()
     return 0
 
 

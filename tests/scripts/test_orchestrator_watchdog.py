@@ -2985,7 +2985,8 @@ def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPat
 
 
 def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_cli([]) runs main(), fused_memory_liveness_pass(), then staleness_pass(), never report()."""
+    """_cli([]) runs main(), fused_memory_liveness_pass(), staleness_pass(), then
+    fused_memory_staleness_pass() (the fm staleness backstop, task 2714), never report()."""
     wdog = _load_watchdog()
     calls: list[str] = []
 
@@ -2995,12 +2996,18 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
         wdog, "fused_memory_liveness_pass", lambda: calls.append("fused_memory_liveness_pass")
     )
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
+    )
 
     wdog._cli([])
 
-    assert calls == ["main", "fused_memory_liveness_pass", "staleness_pass"], (
-        f"Expected main then fused_memory_liveness_pass then staleness_pass, got {calls}"
-    )
+    assert calls == [
+        "main",
+        "fused_memory_liveness_pass",
+        "staleness_pass",
+        "fused_memory_staleness_pass",
+    ], f"Expected liveness passes then both staleness passes (fm last), got {calls}"
 
 
 def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3014,11 +3021,36 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
         wdog, "fused_memory_liveness_pass", lambda: calls.append("fused_memory_liveness_pass")
     )
     monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+    monkeypatch.setattr(
+        wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
+    )
 
     # Must not raise
     wdog._cli(["--bogus"])
 
-    assert calls == ["main", "fused_memory_liveness_pass", "staleness_pass"]
+    assert calls == [
+        "main",
+        "fused_memory_liveness_pass",
+        "staleness_pass",
+        "fused_memory_staleness_pass",
+    ]
+
+
+def test_cli_report_does_not_run_fm_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--report must NOT invoke fused_memory_staleness_pass() (I7 at the CLI
+    boundary): the fm staleness backstop runs on the timer path only, never in
+    the read-only doctor mode."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "report", lambda: 0)
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
+    monkeypatch.setattr(
+        wdog,
+        "fused_memory_staleness_pass",
+        lambda: pytest.fail("fused_memory_staleness_pass() must not run under --report"),
+    )
+
+    assert wdog._cli(["--report"]) == 0
 
 
 def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4161,6 +4193,11 @@ def test_print_fused_memory_liveness_row(
         # shells out to `systemd-cat` via subprocess.run — no-op it so
         # fake_run only ever sees the `ss` probe call it's built to handle.
         monkeypatch.setattr(wdog, "log", lambda _m: None)
+        # The enriched row (step 16) also reads the fm deploy clock and the
+        # recon-busy verdict; stub both so this liveness-focused test neither
+        # hits a real socket for recon-busy nor depends on a real clock file.
+        monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+        monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
 
         wdog._print_fused_memory_liveness()
 
@@ -4196,6 +4233,10 @@ def test_print_fused_memory_liveness_row_survives_verdict_exception(
     monkeypatch.setattr(
         wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
     )
+    # The enriched row also reads the fm clock and recon-busy verdict; stub
+    # both so this fail-soft test stays hermetic (no real socket / clock file).
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
     logged: list[str] = []
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
@@ -4222,6 +4263,10 @@ def test_cli_report_includes_fused_memory_row(
 
     monkeypatch.setattr(wdog, "report", lambda: 0)
     monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    # Stub the enriched-row helpers (step 16) so this test neither hits a real
+    # socket for the recon-busy verdict nor depends on a real clock file.
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
 
     exit_code = wdog._cli(["--report"])
 
@@ -4229,4 +4274,1122 @@ def test_cli_report_includes_fused_memory_row(
     assert "fused-memory.service" in captured.out
     assert "healthy" in captured.out
     assert exit_code == 0, "report()'s staleness-only exit code must be unaffected by the fm row"
+
+
+# ---------------------------------------------------------------------------
+# Enriched --report fused-memory row: DEPLOY-AGE + recon-busy (steps 15/16)
+#
+# _fused_memory_recon_busy_verdict() lazily reuses scripts/recon_busy_check.py
+# — the SAME busy/idle/unreachable gate restart-fused-memory.sh's defer-if-busy
+# path consumes — so this column predicts the restart gate exactly; it degrades
+# to 'unknown' on any fetch/import failure. _print_fused_memory_liveness() is
+# enriched with a DEPLOY-AGE field (fm-clock age in hours) and a recon-busy
+# field, staying strictly read-only (no mutation, no clock write).
+# ---------------------------------------------------------------------------
+
+
+class _FakeHealthBodyResponse:
+    """urlopen stand-in whose .read() returns a fixed /health body as bytes.
+
+    Distinct from _FakeHealthResponse (which only models a status code for the
+    liveness probe): _fused_memory_recon_busy_verdict() reads the response
+    BODY and runs it through recon_busy_check.parse_health()/classify().
+    """
+
+    def __init__(self, body: str) -> None:
+        self._body = body.encode("utf-8")
+
+    def __enter__(self) -> "_FakeHealthBodyResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _run_recon_busy_verdict_with_body(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, body: str
+) -> str:
+    """Drive _fused_memory_recon_busy_verdict() with a faked /health *body*
+    flowing through the REAL lazy-imported recon_busy_check.classify()."""
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        return _FakeHealthBodyResponse(body)
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    return wdog._fused_memory_recon_busy_verdict()
+
+
+def test_fused_memory_recon_busy_verdict_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-empty recon_busy list classifies as 'busy' (a full cycle is in flight)."""
+    wdog = _load_watchdog()
+    body = json.dumps(
+        {"status": "ok", "recon_busy": [{"project_id": "dark_factory", "run_id": "r1"}]}
+    )
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, body) == "busy"
+
+
+def test_fused_memory_recon_busy_verdict_idle_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty recon_busy list classifies as 'idle'."""
+    wdog = _load_watchdog()
+    body = json.dumps({"status": "ok", "recon_busy": []})
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, body) == "idle"
+
+
+def test_fused_memory_recon_busy_verdict_idle_absent_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent recon_busy field classifies as 'idle'."""
+    wdog = _load_watchdog()
+    body = json.dumps({"status": "ok"})
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, body) == "idle"
+
+
+def test_fused_memory_recon_busy_verdict_unreachable_on_blank_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank/whitespace body (unreachable/degraded endpoint) → 'unreachable'.
+
+    The fetch SUCCEEDS but returns an unparseable body — recon_busy_check.
+    parse_health() returns None and classify() maps that to 'unreachable'.
+    This is the case distinct from an outright fetch exception (→ 'unknown').
+    """
+    wdog = _load_watchdog()
+    assert _run_recon_busy_verdict_with_body(wdog, monkeypatch, "   ") == "unreachable"
+
+
+def test_fused_memory_recon_busy_verdict_unknown_on_fetch_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any fetch/import exception degrades to 'unknown' (fail-soft) and is logged."""
+    wdog = _load_watchdog()
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        wdog.logger, "warning", lambda m, *a, **k: warnings.append(str(m))
+    )
+
+    assert wdog._fused_memory_recon_busy_verdict() == "unknown"
+    assert warnings, "the swallowed fetch exception must be logged"
+
+
+def test_print_fused_memory_liveness_row_includes_deploy_age(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The enriched fm row renders DEPLOY-AGE as fm-clock age in hours (one decimal).
+
+    Mirrors report()'s DEPLOY-AGE column: (now - fm-clock epoch) / 3600 to one
+    decimal place, sourced from _read_last_fm_deploy_epoch (fm's OWN clock).
+    """
+    wdog = _load_watchdog()
+    now = 2_000_000_000.0
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: now - 3 * 3600)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "DEPLOY-AGE" in out, f"expected DEPLOY-AGE label in fm row: {out!r}"
+    assert "3.0h" in out, f"expected DEPLOY-AGE ~3.0h in fm row: {out!r}"
+
+
+def test_print_fused_memory_liveness_row_deploy_age_unknown_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """DEPLOY-AGE renders 'unknown' when the fm deploy clock is absent (fail-open).
+
+    Mirrors _read_last_fm_deploy_epoch's fail-open contract (None when the fm
+    clock file has never been stamped / is unreadable).
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "DEPLOY-AGE" in out
+    assert "unknown" in out, f"expected DEPLOY-AGE 'unknown' in fm row: {out!r}"
+
+
+def test_print_fused_memory_liveness_row_includes_recon_busy(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The enriched fm row carries a labelled recon-busy field from the verdict."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "healthy")
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "busy")
+
+    wdog._print_fused_memory_liveness()
+
+    out = capsys.readouterr().out
+    assert "recon-busy: busy" in out, (
+        f"expected labelled recon-busy field carrying the verdict in fm row: {out!r}"
+    )
+
+
+def test_print_fused_memory_liveness_row_enriched_stays_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+) -> None:
+    """I8 guard extended to the enriched fm row: no mutating systemctl call and
+    no write to FM_DEPLOY_CLOCK_PATH.
+
+    Drives the REAL _fused_memory_liveness_verdict() -> probe_port()/
+    probe_health() chain (faking `ss` + urlopen) so the zero-mutating-calls
+    assertion is meaningful, stubs the recon-busy verdict to avoid a second
+    socket, points the fm deploy clock at an absent tmp file, and asserts the
+    read-only row never creates it.
+    """
+    wdog = _load_watchdog()
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
+        return subprocess.CompletedProcess(cmd, 0, stdout=_SS_LISTEN_8002, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        wdog.urllib.request, "urlopen", lambda *a, **k: _FakeHealthResponse(200)
+    )
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+
+    clock = tmp_path / "last_redeploy_fused_memory.json"
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock))
+
+    wdog._print_fused_memory_liveness()
+
+    captured = capsys.readouterr()
+    assert "fused-memory.service" in captured.out
+    _assert_zero_mutating_calls(recorded_calls)
+    assert not clock.exists(), (
+        "the read-only fm row must never write the fm deploy clock file"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part C: fused-memory staleness — constants (step 1)
+#
+# fm-staleness siblings of the orchestrator staleness constants. These pin the
+# new FM_* constants that fused_memory_staleness_pass() and its clock/delegate
+# helpers consume: the watched-paths list, fm's OWN deploy-clock file + env
+# override, the min-interval knob (env-with-fallback like
+# ORCH_RESTART_MIN_INTERVAL_SECS), and the fixed transient redeploy unit name.
+# ---------------------------------------------------------------------------
+
+
+def test_fm_watched_paths_constant() -> None:
+    """FM_WATCHED_PATHS is exactly [fused-memory/src/, shared/src/].
+
+    fused-memory imports shared.* (e.g. shared.task_metadata), so a change to
+    shared/src/ can alter fm's behavior and must count toward fm staleness —
+    hence both prefixes are watched.
+    """
+    wdog = _load_watchdog()
+    assert wdog.FM_WATCHED_PATHS == ["fused-memory/src/", "shared/src/"]
+
+
+def test_fm_deploy_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_DEPLOY_CLOCK_PATH defaults to fm's OWN clock file under REPO_DIR."""
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_DEPLOY_CLOCK_PATH == os.path.join(
+        wdog.REPO_DIR, "data", "fused-memory", "last_redeploy_fused_memory.json"
+    )
+
+
+def test_fm_deploy_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_DEPLOY_CLOCK_PATH honors the FM_DEPLOY_CLOCK env override.
+
+    _load_watchdog() re-execs the module, so an env var set before the call is
+    picked up at (re)import time — mirrors FLEET_DEPLOY_CLOCK_PATH's
+    ORCH_FLEET_DEPLOY_CLOCK override.
+    """
+    monkeypatch.setenv("FM_DEPLOY_CLOCK", "/tmp/custom_fm_clock.json")
+    wdog = _load_watchdog()
+    assert wdog.FM_DEPLOY_CLOCK_PATH == "/tmp/custom_fm_clock.json"
+
+
+def test_fm_deploy_clock_path_separate_from_fleet_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fm's deploy clock must be a DIFFERENT file than the orchestrator fleet clock.
+
+    fused-memory and the orchestrator fleet are independent deploy targets
+    whose redeploy cadences must not couple — an orchestrator fleet redeploy
+    must not reset fm's min-interval window and vice-versa.
+    """
+    monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
+    monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_DEPLOY_CLOCK_PATH != wdog.FLEET_DEPLOY_CLOCK_PATH
+
+
+def test_fm_restart_min_interval_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_RESTART_MIN_INTERVAL_SECS defaults to 28800 (8h) with no env override.
+
+    Mirrors ORCH_RESTART_MIN_INTERVAL_SECS's 8h backstop cadence, but as fm's
+    OWN independent knob.
+    """
+    monkeypatch.delenv("FM_RESTART_MIN_INTERVAL_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.FM_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_fm_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FM_RESTART_MIN_INTERVAL_SECS honors a valid env override."""
+    monkeypatch.setenv("FM_RESTART_MIN_INTERVAL_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.FM_RESTART_MIN_INTERVAL_SECS == 60
+
+
+def test_fm_restart_min_interval_secs_malformed_env_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed FM_RESTART_MIN_INTERVAL_SECS env value falls back to 28800.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos,
+    mirroring ORCH_RESTART_MIN_INTERVAL_SECS's malformed-env test.
+    """
+    monkeypatch.setenv("FM_RESTART_MIN_INTERVAL_SECS", "not-an-int")
+    wdog = _load_watchdog()
+    assert wdog.FM_RESTART_MIN_INTERVAL_SECS == 28800
+
+
+def test_fm_staleness_redeploy_unit_constant() -> None:
+    """FM_STALENESS_REDEPLOY_UNIT is the fixed transient redeploy unit name."""
+    wdog = _load_watchdog()
+    assert wdog.FM_STALENESS_REDEPLOY_UNIT == "fm-staleness-redeploy.service"
+
+
+# ---------------------------------------------------------------------------
+# Part C: _unit_active_enter_epoch() (step 3)
+#
+# fm sibling of _unit_start_epoch: structurally identical, but queries
+# ActiveEnterTimestamp (when the unit signalled readiness — the field
+# restart-all-orchestrators.sh's own freshness verify reads) instead of
+# ExecMainStartTimestamp. fused_memory_staleness_pass() compares this against
+# the newest fm-watched commit.
+# ---------------------------------------------------------------------------
+
+
+def _make_active_enter_epoch_result(value: str, rc: int = 0) -> subprocess.CompletedProcess:
+    """Build a fake `systemctl show --timestamp=unix -p ActiveEnterTimestamp` result."""
+    stdout = f"ActiveEnterTimestamp={value}\n"
+    return subprocess.CompletedProcess(["systemctl"], rc, stdout=stdout, stderr="")
+
+
+def test_unit_active_enter_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch parses the '@<epoch>' realtime value to an int.
+
+    Also pins the field choice: the argv must request ActiveEnterTimestamp and
+    must NOT request ExecMainStartTimestamp (the sibling helper's field).
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return _make_active_enter_epoch_result("@1782996274")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._unit_active_enter_epoch("fused-memory.service")
+
+    assert result == 1782996274
+    assert isinstance(result, int)
+    assert len(calls) == 1, f"Expected exactly one systemctl call, got {calls}"
+    argv = calls[0]
+    assert "--timestamp=unix" in argv
+    assert any("ActiveEnterTimestamp" in tok for tok in argv), (
+        f"argv must request ActiveEnterTimestamp: {argv}"
+    )
+    assert not any("ExecMainStartTimestamp" in tok for tok in argv), (
+        f"argv must NOT request ExecMainStartTimestamp (that is _unit_start_epoch's field): {argv}"
+    )
+
+
+def test_unit_active_enter_epoch_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("@1782996274", rc=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_empty_value_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None when the property value is empty."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None for the '@0' sentinel (never activated)."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("@0")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_unparseable_value_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_unit_active_enter_epoch returns None when the value is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("@notanint")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_missing_binary_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_unit_active_enter_epoch returns None when systemctl binary is not found."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None when the systemctl call times out."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+# ---------------------------------------------------------------------------
+# Part C: _newest_fm_watched_commit_epoch() (step 5)
+#
+# fm sibling of _newest_watched_commit_epoch: identical body but diffs
+# FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) rather than WATCHED_PATHS.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
+
+
+def test_newest_fm_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_newest_fm_watched_commit_epoch parses git's %ct output to an int.
+
+    Also pins that the argv diffs the fm-watched paths (both fused-memory/src/
+    and shared/src/) rather than the orchestrator WATCHED_PATHS.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="1783013906\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._newest_fm_watched_commit_epoch()
+
+    assert result == 1783013906
+    assert isinstance(result, int)
+    assert len(calls) == 1, f"Expected exactly one git call, got {calls}"
+    argv = calls[0]
+    assert argv[0] == "git"
+    assert argv[1] == "-C"
+    assert argv[2] == _EXPECTED_REPO_DIR
+    assert argv[3:7] == ["log", "-1", "--format=%ct", "HEAD"]
+    assert "--" in argv, f"argv must separate revision from pathspec with '--': {argv}"
+    watched_args = argv[argv.index("--") + 1 :]
+    for path in _EXPECTED_FM_WATCHED_PATHS:
+        assert path in watched_args, f"Expected fm-watched path {path!r} in argv {argv}"
+
+
+def test_newest_fm_watched_commit_epoch_empty_stdout_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None on empty stdout (rc 0).
+
+    `git log -1 --format=%ct HEAD -- <paths>` exits 0 with empty stdout when no
+    commit touches the paths — this must be treated as undeterminable, NOT
+    epoch 0 (which would make fused-memory look infinitely stale).
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_fm_watched_commit_epoch() is None
+
+
+def test_newest_fm_watched_commit_epoch_nonzero_rc_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None when git exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(
+            cmd, 128, stdout="", stderr="fatal: not a git repository"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_fm_watched_commit_epoch() is None
+
+
+def test_newest_fm_watched_commit_epoch_unparseable_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None when stdout is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="not-an-epoch\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_fm_watched_commit_epoch() is None
+
+
+def test_newest_fm_watched_commit_epoch_broad_error_returns_none_and_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_fm_watched_commit_epoch returns None (and warns) on a broad subprocess error."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise RuntimeError("boom: git subprocess exploded")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+
+    assert wdog._newest_fm_watched_commit_epoch() is None
+    assert any("WARNING" in m for m in logged), (
+        f"a swallowed subprocess error must emit a WARNING via logger.warning: {logged}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part C: fm deploy-clock trio + --stamp-fm-deploy-clock CLI (step 7)
+#
+# fm's OWN deploy clock (data/fused-memory/last_redeploy_fused_memory.json):
+# _read_last_fm_deploy_epoch() (fail-open {ts,iso} reader), _stamp_fm_deploy_clock()
+# (atomic write, unlike restart-all-orchestrators.sh, restart-fused-memory.sh
+# does NOT self-stamp), _within_fm_deploy_min_interval() (the gate predicate),
+# and the `--stamp-fm-deploy-clock` CLI subcommand the detached restart chains
+# on its verified exit-0.
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_and_read_fm_deploy_clock_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_stamp_fm_deploy_clock writes a {ts,iso} body (creating the parent dir)
+    that _read_last_fm_deploy_epoch reads back as float(ts)."""
+    wdog = _load_watchdog()
+    # Parent dir does NOT exist yet — the stamp must create it (makedirs).
+    clock_file = tmp_path / "data" / "fused-memory" / "last_redeploy_fused_memory.json"
+    assert not clock_file.parent.exists()
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+    monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.5)
+
+    wdog._stamp_fm_deploy_clock()
+
+    assert clock_file.exists(), "stamp must create the clock file and its parent dir"
+    body = json.loads(clock_file.read_text())
+    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
+    assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
+    assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
+
+
+def test_read_last_fm_deploy_epoch_missing_file_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fm_deploy_epoch returns None when the clock file is absent."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "absent.json"))
+    assert wdog._read_last_fm_deploy_epoch() is None
+
+
+def test_read_last_fm_deploy_epoch_corrupt_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """_read_last_fm_deploy_epoch returns None (fail-open) on a partial/corrupt file."""
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "corrupt.json"
+    clock_file.write_text('{"ts": 178300')  # truncated / partially written
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+    assert wdog._read_last_fm_deploy_epoch() is None
+
+
+def test_within_fm_deploy_min_interval_true_when_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is True when now - last < FM_RESTART_MIN_INTERVAL_SECS."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)  # 100s ago
+
+    assert wdog._within_fm_deploy_min_interval() is True
+
+
+def test_within_fm_deploy_min_interval_false_when_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is False once FM_RESTART_MIN_INTERVAL_SECS has elapsed."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1.0)
+
+    assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_within_fm_deploy_min_interval_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is False when FM_RESTART_MIN_INTERVAL_SECS<=0.
+
+    0 disables the cap entirely — the clock file must not even be read.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fm_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the cap is disabled"),
+    )
+
+    assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_within_fm_deploy_min_interval_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_within_fm_deploy_min_interval is False when the clock is unreadable/absent.
+
+    A never-deployed fm (or an unreadable clock) must not block the backstop
+    indefinitely — fail toward running the backstop, not toward silence.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+
+    assert wdog._within_fm_deploy_min_interval() is False
+
+
+def test_cli_stamp_fm_deploy_clock_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli(["--stamp-fm-deploy-clock"]) stamps exactly once, returns 0, and runs
+    NONE of the liveness/staleness/report paths.
+
+    This is the subcommand the detached _delegate_fm_restart chains after a
+    verified restart (`restart-fused-memory.sh && <self> --stamp-fm-deploy-clock`),
+    so it must do exactly one thing: stamp the fm clock.
+    """
+    wdog = _load_watchdog()
+    stamped: list[None] = []
+
+    monkeypatch.setattr(
+        wdog, "_stamp_fm_deploy_clock", lambda: stamped.append(None), raising=False
+    )
+    monkeypatch.setattr(wdog, "main", lambda: pytest.fail("main() must not run under --stamp"))
+    monkeypatch.setattr(
+        wdog,
+        "fused_memory_liveness_pass",
+        lambda: pytest.fail("fused_memory_liveness_pass() must not run under --stamp"),
+    )
+    monkeypatch.setattr(
+        wdog, "staleness_pass", lambda: pytest.fail("staleness_pass() must not run under --stamp")
+    )
+    monkeypatch.setattr(
+        wdog,
+        "fused_memory_staleness_pass",
+        lambda: pytest.fail("fused_memory_staleness_pass() must not run under --stamp"),
+        raising=False,
+    )
+    monkeypatch.setattr(wdog, "report", lambda: pytest.fail("report() must not run under --stamp"))
+
+    exit_code = wdog._cli(["--stamp-fm-deploy-clock"])
+
+    assert exit_code == 0
+    assert stamped == [None], f"Expected exactly one stamp call, got {stamped}"
+
+
+# ---------------------------------------------------------------------------
+# Part C: _delegate_fm_restart() (step 9)
+#
+# fm sibling of _delegate_fleet_restart: detached systemd-run with a fixed
+# transient unit name (overlap guard) + fail-soft registration. Diverges from
+# the orchestrator path in TWO ways: (1) it invokes restart-fused-memory.sh in
+# its DEFAULT defer-if-busy mode (no --now/--drain), and (2) it chains
+# `&& <self> --stamp-fm-deploy-clock` so the fm clock is stamped only on the
+# restart script's verified exit-0 (restart-fused-memory.sh, unlike
+# restart-all-orchestrators.sh, does not self-stamp).
+# ---------------------------------------------------------------------------
+
+
+def test_delegate_fm_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fm_restart fires a detached, named systemd-run that runs
+    restart-fused-memory.sh (default defer-if-busy mode) and chains the stamp
+    on its verified exit-0."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog._delegate_fm_restart()
+
+    assert len(calls) == 1, f"Expected exactly one subprocess.run call, got {calls}"
+    argv = calls[0]
+    assert argv[:2] == ["systemd-run", "--user"], f"argv must start with systemd-run --user: {argv}"
+    assert "--collect" in argv, f"argv must include --collect: {argv}"
+    assert "--no-block" in argv, f"argv must include --no-block (detached): {argv}"
+    assert "--unit=fm-staleness-redeploy.service" in argv, (
+        f"argv must fire the fixed transient unit name (the overlap guard): {argv}"
+    )
+
+    # systemd-run --user does NOT propagate this process's env into the detached
+    # unit, so the chained --stamp-fm-deploy-clock must be pinned to the reader's
+    # resolved clock path via --setenv or it would default a divergent path.
+    assert f"--setenv=FM_DEPLOY_CLOCK={wdog.FM_DEPLOY_CLOCK_PATH}" in argv, (
+        "argv must forward the reader's resolved FM_DEPLOY_CLOCK_PATH via "
+        f"--setenv so the detached stamp writes the same file the reader reads: {argv}"
+    )
+
+    # The bash -c payload chains restart-fused-memory.sh && <self> --stamp.
+    payload = next(
+        (a for a in argv if "restart-fused-memory.sh" in a), None
+    )
+    assert payload is not None, f"argv must carry a restart-fused-memory.sh payload: {argv}"
+    assert "&&" in payload, (
+        f"payload must chain the stamp with `&&` so it runs only on exit-0: {payload!r}"
+    )
+    assert "--stamp-fm-deploy-clock" in payload, (
+        f"payload must chain the fm-clock stamp subcommand: {payload!r}"
+    )
+    assert "--now" not in payload, (
+        f"payload must NOT pass --now (uses the default defer-if-busy path): {payload!r}"
+    )
+    assert "--drain" not in payload, (
+        f"payload must NOT pass --drain (that is the orchestrator path): {payload!r}"
+    )
+
+    # The referenced restart script must actually exist on disk.
+    assert (REPO_ROOT / "scripts" / "restart-fused-memory.sh").exists(), (
+        "scripts/restart-fused-memory.sh must exist on disk (task 2703 δ dependency)"
+    )
+
+
+def test_delegate_fm_restart_forwards_clock_override_via_setenv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FM_DEPLOY_CLOCK override is forwarded into the detached unit via --setenv.
+
+    systemd-run --user runs the transient unit under the systemd user manager's
+    environment, not the watchdog process's — so without an explicit --setenv the
+    chained --stamp-fm-deploy-clock would recompute FM_DEPLOY_CLOCK_PATH from the
+    session env and default it, diverging from the overridden path the in-process
+    reader (_within_fm_deploy_min_interval) consults. Forwarding keeps
+    writer==reader so the min-interval cap actually engages under an override.
+    """
+    monkeypatch.setenv("FM_DEPLOY_CLOCK", "/tmp/custom_fm_clock.json")
+    wdog = _load_watchdog()
+    # Sanity: the reader resolved the override at import.
+    assert wdog.FM_DEPLOY_CLOCK_PATH == "/tmp/custom_fm_clock.json"
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog._delegate_fm_restart()
+
+    assert len(calls) == 1, f"Expected exactly one subprocess.run call, got {calls}"
+    argv = calls[0]
+    # The forwarded --setenv value must equal the reader's resolved override —
+    # writer (detached stamp) and reader consult the identical file.
+    assert "--setenv=FM_DEPLOY_CLOCK=/tmp/custom_fm_clock.json" in argv, (
+        f"argv must forward the FM_DEPLOY_CLOCK override into the detached unit: {argv}"
+    )
+    assert f"--setenv=FM_DEPLOY_CLOCK={wdog.FM_DEPLOY_CLOCK_PATH}" in argv, (
+        "the forwarded --setenv value must track the reader's FM_DEPLOY_CLOCK_PATH"
+    )
+
+
+def test_delegate_fm_restart_swallows_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fm_restart must not raise if the systemd-run call times out."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    # Must not raise
+    wdog._delegate_fm_restart()
+
+    assert len(log_messages) >= 1, "a systemd-run timeout must be logged"
+
+
+def test_delegate_fm_restart_swallows_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fm_restart must not raise if systemd-run is not on PATH."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemd-run")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    # Must not raise
+    wdog._delegate_fm_restart()
+
+    assert len(log_messages) >= 1, "a missing systemd-run binary must be logged"
+
+
+# ---------------------------------------------------------------------------
+# Part C: fused_memory_staleness_pass() (step 11)
+#
+# Single-unit mirror of staleness_pass() over FUSED_MEMORY_UNIT: min-interval
+# gate (fm clock) -> commit epoch -> commit-grace head-start -> enabled /
+# startup-grace / ActiveEnterTimestamp-vs-commit -> delegate once. Every helper
+# is stubbed directly (the α-style unit level); the fm-deploy min-interval gate
+# is neutralized to False except where it is the subject under test.
+# ---------------------------------------------------------------------------
+
+
+def test_fused_memory_staleness_pass_core_stale_delegates_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 1: an enabled, past-startup-grace fused-memory.service whose
+    ActiveEnterTimestamp predates the newest fm-watched commit delegates a
+    fused-memory restart exactly once and logs a WARNING naming the unit."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+    log_messages: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch - 100)  # stale
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert len(delegated) == 1, f"Expected exactly one fm restart delegation, got {len(delegated)}"
+    assert any(("WARNING" in m and wdog.FUSED_MEMORY_UNIT in m) for m in log_messages), (
+        f"Expected a WARNING log naming {wdog.FUSED_MEMORY_UNIT}: {log_messages}"
+    )
+
+
+def test_fused_memory_staleness_pass_fresh_does_not_delegate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 2: ActiveEnterTimestamp >= commit (fm already running the newest
+    code) → no delegation."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch + 100)  # fresh
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A fresh unit must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_within_min_interval_logs_inside_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 3a: within fm's min-interval → early return (no commit read, no
+    delegate) and a throttled skip-log line emitted at a bucket boundary."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(wdog.time, "time", lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0)
+    monkeypatch.setattr(
+        wdog,
+        "_newest_fm_watched_commit_epoch",
+        lambda: pytest.fail("must not read commit when the fm-deploy gate is closed"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("must not delegate when the fm-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert any(
+        "skip" in m and str(wdog.FM_RESTART_MIN_INTERVAL_SECS) in m for m in log_messages
+    ), f"Expected a skip log naming the fm-deploy min-interval: {log_messages}"
+
+
+def test_fused_memory_staleness_pass_within_min_interval_suppresses_log_outside_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 3b: within fm's min-interval but outside the log bucket → still
+    returns early, but emits NO skip line (rate-limit throttle)."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: True)
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_fm_watched_commit_epoch",
+        lambda: pytest.fail("must not read commit when the fm-deploy gate is closed"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert log_messages == [], f"Expected no skip log outside the bucket: {log_messages}"
+
+
+def test_fused_memory_staleness_pass_commit_grace_suppresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 4: a commit younger than STALENESS_GRACE_SECS gives the fm
+    event-driven coordinator its head start — no delegation."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - 300  # younger than STALENESS_GRACE_SECS=1800
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(
+        wdog,
+        "_unit_active_enter_epoch",
+        lambda _u: pytest.fail("must not probe activation inside the commit-grace window"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A young commit must suppress delegation; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_noop_when_commit_epoch_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 5: an undeterminable commit epoch is a complete no-op (no
+    enabled/active probe, no delegate)."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: None)
+    monkeypatch.setattr(
+        wdog,
+        "is_unit_enabled",
+        lambda _u: pytest.fail("must not probe enabled when commit epoch is None"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("must not delegate when commit epoch is None"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+
+def test_fused_memory_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case 6: a disabled fused-memory.service (operator intent) → no
+    activation probe, no delegate."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
+    monkeypatch.setattr(
+        wdog,
+        "_unit_active_enter_epoch",
+        lambda _u: pytest.fail("must not probe activation for a disabled unit"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A disabled unit must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_skips_startup_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 7: a just-restarted fm within STARTUP_GRACE_SECS → no delegate
+    (avoid an indefinite restart loop before the new version converges)."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)  # < 120s grace
+    monkeypatch.setattr(
+        wdog,
+        "_unit_active_enter_epoch",
+        lambda _u: pytest.fail("must not probe activation inside the startup-grace window"),
+    )
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A unit within startup grace must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_active_none_does_not_delegate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 8: an undeterminable ActiveEnterTimestamp (None) → no delegate
+    (don't guess staleness)."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: None)  # undeterminable
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert delegated == [], f"A None ActiveEnterTimestamp must not delegate; got {delegated}"
+
+
+def test_fused_memory_staleness_pass_isolates_probe_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 9: an exception raised inside the probe chain is caught (no raise),
+    mirroring fused_memory_liveness_pass()'s single-unit try/except isolation."""
+    wdog = _load_watchdog()
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    def _boom(_u: str) -> bool:
+        raise RuntimeError("systemctl exploded")
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", _boom)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    # Must not raise
+    wdog.fused_memory_staleness_pass()
+
+
+def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case 10 (I6): a first pass with ActiveEnterTimestamp<commit delegates
+    once; after the restart advances ActiveEnterTimestamp past the commit, the
+    next pass no-ops — stateless self-heal, no stored flap state."""
+    wdog = _load_watchdog()
+    delegated: list[None] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+    active = {"epoch": commit_epoch - 100}  # starts stale
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_unit_active_enter_epoch", lambda _u: active["epoch"])
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+    assert len(delegated) == 1, f"first pass must delegate once; got {len(delegated)}"
+
+    # Restart refreshed the unit — ActiveEnterTimestamp now past the commit.
+    delegated.clear()
+    active["epoch"] = commit_epoch + 50
+    wdog.fused_memory_staleness_pass()
+    assert delegated == [], f"a refreshed unit must self-clear; got {len(delegated)} delegation(s)"
 
