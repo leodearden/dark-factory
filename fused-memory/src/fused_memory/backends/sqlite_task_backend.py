@@ -2653,6 +2653,15 @@ class SqliteTaskBackend:
 
             new_metadata: str | None = None
             if metadata is not None:
+                # Strip reserved update_task call-flag key names (append,
+                # metadata_mode) from the INCOMING payload before merging —
+                # a caller that conflates the call-flag with a metadata field
+                # (task 2682) must not have the literal key persisted.
+                # Fail-safe passthrough for corrupt/non-dict payloads leaves
+                # _merge_metadata's own guards below as the source of truth.
+                metadata = _strip_reserved_control_keys(
+                    metadata, project_root=project_root, tag=tag, task_id=tid,
+                )
                 # Behavior note: on merge/additive, _merge_metadata RAISES
                 # TaskmasterError if the stored blob is corrupt — preventing a
                 # silent clobber.  The _txn wrapper rolls back, leaving the
