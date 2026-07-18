@@ -248,6 +248,14 @@ class AgentResult:
       cli_invoke deny-list no longer permits the schema tool), NOT a flaky
       candidate.  ``success`` stays False (NOT salvaged); callers should raise a
       loud, un-suppressed escalation so the deny-list gets fixed.
+    - ``ended_awaiting_background``: True when the run ended its turn while a
+      backgrounded Bash command was still pending (launched via
+      ``run_in_background`` and never subsequently polled/killed).  The headless
+      one-shot ``claude --print`` session exits subtype=success and silently
+      abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
+      downgrades ``success`` to False when this is set on an otherwise-successful
+      run, so existing non-success handling retries/resumes.  Stamped by
+      ``_run_subprocess`` via ``ended_awaiting_background_for_session``.
     - ``proc_tree``: human-readable snapshot of the subprocess process group
       captured by ``snapshot_process_group(pgid)`` at the top of the
       ``TimeoutError`` handler in ``_run_subprocess`` — i.e. while the wedged
@@ -274,6 +282,7 @@ class AgentResult:
     timed_out: bool = False
     schema_salvaged: bool = False
     schema_tool_denied: bool = False
+    ended_awaiting_background: bool = False
     api_error_status: int | None = None
     proc_tree: str = ''
     transcript_turns: int | None = None
@@ -732,6 +741,11 @@ class _SubprocessResult:
     timed_out: bool = False
     proc_tree: str = ''
     transcript_turns: int | None = None
+    ended_awaiting_background: bool = False
+    """True when the normal-exit transcript ended its turn with a still-pending
+    backgrounded Bash command; carried into AgentResult and used by
+    _parse_claude_output to downgrade success→failure.  Never set on the
+    timeout path (a timed-out run is already non-success)."""
 
 
 async def invoke_claude_agent(
@@ -1631,6 +1645,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             duration_ms=result.duration_ms,
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
+            ended_awaiting_background=result.ended_awaiting_background,
         )
 
     try:
@@ -1644,6 +1659,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             timed_out=result.timed_out,
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
+            ended_awaiting_background=result.ended_awaiting_background,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -1676,6 +1692,17 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     # usage cap hit).  Trust is_error as an authoritative override.
     is_error = data.get('is_error', False)
     is_success = (subtype == 'success' or result.returncode == 0) and not is_error
+
+    # Ended-awaiting-background downgrade (task 2761): the run exited
+    # subtype=success but its transcript tail launched a backgrounded Bash
+    # command that was never polled/killed — the headless one-shot session
+    # abandoned still-pending work (Reify-5164 RCA).  Flip an otherwise-success
+    # verdict to failure so existing non-success handling retries/resumes rather
+    # than proceeding on a half-done tree.  Guarded on ``is_success`` so it is an
+    # idempotent no-op on an already-failing result (the flag still propagates
+    # below for classification).
+    if result.ended_awaiting_background and is_success:
+        is_success = False
 
     # Schema salvage: when the CLI reports is_error=True but the schema tool
     # already produced a valid structured payload (common with error_max_turns
@@ -1719,6 +1746,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         timed_out=result.timed_out,
         schema_salvaged=schema_salvaged,
         schema_tool_denied=schema_tool_denied,
+        ended_awaiting_background=result.ended_awaiting_background,
         api_error_status=api_error_status,
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
@@ -2158,9 +2186,22 @@ async def _run_subprocess(
     else:
         logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}')
 
+    # Detect the ended-awaiting-background footgun on the normal-exit path
+    # (task 2761): a run that exited subtype=success but whose transcript tail
+    # launched a still-pending backgrounded Bash command silently abandoned the
+    # work.  Symmetric to the timeout path's transcript re-read above; fail-safe
+    # to False when the transcript can't be located.  _parse_claude_output owns
+    # the actual success→failure downgrade.
+    ended_awaiting_background = (
+        ended_awaiting_background_for_session(config_dir, session_id)
+        if (config_dir and session_id)
+        else False
+    )
+
     return _SubprocessResult(
         stdout=stdout.decode(),
         stderr=stderr_text,
         returncode=proc.returncode if proc.returncode is not None else 1,
         duration_ms=duration_ms,
+        ended_awaiting_background=ended_awaiting_background,
     )
