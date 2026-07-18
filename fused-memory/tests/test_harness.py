@@ -1095,6 +1095,65 @@ class TestStage1CycleSummaryHarnessBackstop:
 
         harness.journal.update_run_stage_reports.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_stage1_completed_but_ledger_write_failed_triggers_recovery_backstop(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Task 2734 / arm 2: Stage 1 can COMPLETE and return a real report
+        while its own in-stage ledger upsert still failed transiently — the
+        report carries the explicit failure signal
+        (stats['stage1_cycle_summary_ledger_written'] == 0) but task 2440's
+        arm 1 never fires for this case, because the report IS present
+        (arm 1 only fires when Stage 1 recorded no report at all). This
+        reproduces the actual defect task 2734 was filed to close: a Stage 1
+        ledger row silently missing from a run that otherwise completed
+        successfully end-to-end (current_stage_name has already moved to
+        integrity_check by the time the finally block runs, so arm 1's gate
+        no-ops)."""
+        import json
+
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 0},
+            llm_calls=6,
+            tokens_used=600,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary', flag_type='memory_consolidator', run_id=run.id,
+        )
+        assert record is not None, (
+            'arm 2 must recover the ledger row that a transient in-stage '
+            'write failure otherwise leaves permanently absent'
+        )
+
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 6, (
+            'the recovered row must reuse the REAL Stage 1 report (honest '
+            'llm_calls/tokens), not a zeroed arm-1-style synthesis'
+        )
+        assert payload['stats'].get('stage1_cycle_summary_write_recovered_backstop') is True
+        assert 'stage1_cycle_summary_degraded_backstop' not in payload['stats'], (
+            'arm 2 must never stamp the arm-1 degraded marker — the two arms '
+            'self-identify with distinct markers'
+        )
+
 
 class TestStage1CycleSummaryRemediationBackstop:
     """_run_remediation_pass's finally block guarantees a Stage 1 cycle_summary
