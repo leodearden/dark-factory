@@ -19,6 +19,7 @@ Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
 from collections.abc import Iterator, Sequence
@@ -80,12 +81,27 @@ def is_member(cwd: str, cwd_prefixes: Sequence[str]) -> bool:
 def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     """Yield parsed dict records from a JSONL file, skipping blank/malformed lines.
 
+    Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
+    (the archived fleet-transcript format written by
+    ``shared.transcript_archive``) is opened via ``gzip.open(..., 'rt')``,
+    while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
+    for byte-parity. Either way the strip/skip-blank/``json.loads``/
+    dict-check body is identical, so :func:`_session_cwd_and_date` and its
+    callers (incl. ``sampling._score_and_find_first_turn``) become gz-aware
+    with no further change.
+
     Mirrors ``digest.load_transcript``'s graceful-degrade contract: a
     transcript is written fire-and-forget and can have a truncated or
     corrupt trailing line, which must not abort the whole read. Raises
-    ``OSError`` if *path* cannot be opened at all (caller's concern).
+    ``OSError`` if *path* cannot be opened or decompressed at all —
+    ``gzip.BadGzipFile`` (a corrupt ``.gz``) is an ``OSError`` subclass, so
+    the caller's existing ``except OSError`` degrade path already covers it.
     """
-    with open(path, encoding='utf-8') as f:
+    if str(path).endswith('.gz'):
+        f = gzip.open(path, 'rt', encoding='utf-8')
+    else:
+        f = open(path, encoding='utf-8')
+    with f:
         for line in f:
             line = line.strip()
             if not line:
