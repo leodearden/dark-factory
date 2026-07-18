@@ -5267,9 +5267,16 @@ class Scheduler:
         ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
         into a hand loop — unioning in tasks that left the candidate pool
         for a non-terminal, non-eligible status (starvation-only sweep
-        set). Always continues.
+        set). The two delivered-check streaks (``delivered_fail`` /
+        ``delivered_hold``) are NARROWED via ``overrides`` to sweep ONLY on
+        genuinely-terminal dependents (``terminal_ids``), NOT on transient
+        active-fetch absence — so a still-pending gate-held dependent's
+        grace/hold streak survives a one-tick disappearance around a main
+        advance and can still reach ``grace_cycles`` and fire the born-at-L2
+        escalation (task 2743). Always continues.
         """
         stale_ids: set[str] = set()
+        terminal_ids: set[str] = set()
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
@@ -5277,7 +5284,10 @@ class Scheduler:
             | set(self._pending_anchor)
         )
         for tid_str in all_tracked:
-            if ctx.status_map.get(tid_str) in TERMINAL_STATUSES or tid_str not in ctx.tasks_by_id:
+            is_terminal = ctx.status_map.get(tid_str) in TERMINAL_STATUSES
+            if is_terminal:
+                terminal_ids.add(tid_str)
+            if is_terminal or tid_str not in ctx.tasks_by_id:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
@@ -5288,8 +5298,16 @@ class Scheduler:
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE
         }
+        # The delivered-check streaks are GC'd ONLY on genuinely-terminal
+        # dependents (terminal_ids ⊆ stale_ids), never on transient
+        # active-fetch absence — so a still-pending gate-held dependent's
+        # grace/hold streak survives a one-tick disappearance around a main
+        # advance and can still reach grace_cycles (task 2743). Every other
+        # counter keeps the base terminal-or-absent stale_ids sweep.
         await self._streak_registry.gc(
-            stale_ids, extra={'starvation': starvation_non_eligible}
+            stale_ids,
+            extra={'starvation': starvation_non_eligible},
+            overrides={'delivered_fail': terminal_ids, 'delivered_hold': terminal_ids},
         )
         ctx.stale_ids = stale_ids
         return _CONTINUE
