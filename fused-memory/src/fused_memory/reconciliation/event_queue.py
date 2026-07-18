@@ -775,7 +775,7 @@ class EventQueue:
                     'EventQueue.replay_dead_letters invoked off the event-loop '
                     'thread before start() captured the loop — cannot marshal '
                     'enqueue onto the loop safely'
-                )
+                ) from None
 
             def _marshalled(event: ReconciliationEvent) -> object:
                 return asyncio.run_coroutine_threadsafe(
