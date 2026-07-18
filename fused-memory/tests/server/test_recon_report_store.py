@@ -549,3 +549,166 @@ class TestWriteThrough:
             assert entry.findings[0].task_id == '7'
         finally:
             store.close()
+
+
+# ---------------------------------------------------------------------------
+# step-9: hydrate_from_store readback after a simulated restart — RED until
+# step-10 adds ReconReportState.hydrate_from_store
+# ---------------------------------------------------------------------------
+
+
+class TestHydrateReadback:
+    """A FRESH ReconReportState opened on the SAME store rebuilds its in-memory
+    state (entries, active-stage pointer, and all four run-level dedup indices)
+    from the persisted rows — the ρ observable signal that a mid-run restart
+    does not lose previously-filed findings.
+    """
+
+    def _make_state(self, store):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    @pytest.mark.asyncio
+    async def test_hydrate_rebuilds_state_after_restart(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        run_id = 'hy-run-1'
+        s1 = 'memory_consolidator'
+        s2 = 'task_knowledge_sync'
+        null_desc = 'stage1 informational observation'
+        entity_uuid = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+
+        # ---- Phase 1: state A files across TWO live stages of one run ----
+        store_a = ReconReportStore(db)
+        store_a.open()
+        try:
+            state_a = self._make_state(store_a)
+
+            # Stage 1 (memory_consolidator)
+            state_a.start_report(run_id=run_id, stage=s1, project_id='dark_factory')
+            fid_real = state_a.add_finding(
+                run_id=run_id, severity='moderate', category='memory_stale',
+                description='stage1 real finding', suggested_action='act',
+                actionable=True, task_id='42', flag_type='orphaned_knowledge',
+            )['finding_id']
+            fid_s1_null = state_a.add_finding(
+                run_id=run_id, severity='low', category='other',
+                description=null_desc, suggested_action='note', actionable=False,
+            )['finding_id']
+            # Citations on the real stage-1 finding (cite_entity + cite_task).
+            assert 'error' not in await state_a.cite_entity(run_id, fid_real, 'Foo')
+            assert 'error' not in await state_a.cite_task(run_id, fid_real, 'dark_factory', '42')
+            state_a.complete(run_id, 'stage1 summary')
+
+            # Stage 2 (task_knowledge_sync) — becomes the ACTIVE stage.
+            state_a.start_report(run_id=run_id, stage=s2, project_id='dark_factory')
+            state_a.add_finding(
+                run_id=run_id, severity='high', category='systemic_pattern',
+                description='stage2 finding', suggested_action='fix',
+                actionable=True, task_id='99', flag_type='systemic',
+            )
+            # Null-task finding + cite_task → registers a project-scoped cited-task
+            # fold anchor in _run_cited_task_index (a run-level index that must be
+            # rebuilt on hydrate).
+            fid_s2_anchor = state_a.add_finding(
+                run_id=run_id, severity='low', category='other',
+                description='stage2 anchor observation', suggested_action='note',
+            )['finding_id']
+            assert 'error' not in await state_a.cite_task(
+                run_id, fid_s2_anchor, 'dark_factory', '77'
+            )
+            # In-run cross-stage duplicate of stage-1's (42, orphaned_knowledge).
+            dup_a = state_a.add_finding(
+                run_id=run_id, severity='moderate', category='memory_stale',
+                description='stage2 restatement', suggested_action='act',
+                actionable=True, task_id='42', flag_type='orphaned_knowledge',
+            )
+            assert dup_a.get('error') == 'duplicate_finding'
+            assert dup_a['existing_finding_id'] == fid_real
+
+            # Snapshot state A's readback for a byte-for-byte comparison later.
+            report_a_s1 = state_a.get_assembled_report(run_id, s1)
+            report_a_s2 = state_a.get_assembled_report(run_id, s2)
+            findings_a = {
+                f['finding_id']: f for f in state_a.get_findings_for_run(run_id)
+            }
+        finally:
+            store_a.close()
+
+        # ---- Phase 2: simulate restart — FRESH state B, SAME store ----
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b)
+            state_b.hydrate_from_store()
+
+            # (1) Readback identical to state A (findings, citation lists, stats).
+            assert state_b.get_assembled_report(run_id, s1) == report_a_s1
+            assert state_b.get_assembled_report(run_id, s2) == report_a_s2
+            findings_b = {
+                f['finding_id']: f for f in state_b.get_findings_for_run(run_id)
+            }
+            assert set(findings_b) == set(findings_a)
+            for fid, fa in findings_a.items():
+                fb = findings_b[fid]
+                assert fb['description'] == fa['description']
+                assert fb['cited_entities'] == fa['cited_entities']
+                assert fb['cited_tasks'] == fa['cited_tasks']
+                assert fb['cited_edges'] == fa['cited_edges']
+                assert fb['cited_memories'] == fa['cited_memories']
+
+            # (2) _active restored — active_run_for_stage resolves the LIVE stage
+            #     (stage 2), and NOT the completed earlier stage.
+            assert state_b.active_run_for_stage(s2, 'dark_factory') == run_id
+            assert state_b.active_run_for_stage(s1, 'dark_factory') is None
+
+            # (3) Signature dedup index (_run_sig_index) rebuilt: a follow-up
+            #     add_finding duplicating a hydrated (task_id, flag_type) returns
+            #     duplicate_finding carrying the ORIGINAL finding_id.
+            dup_b = state_b.add_finding(
+                run_id=run_id, severity='moderate', category='memory_stale',
+                description='post-restart restatement', suggested_action='act',
+                actionable=True, task_id='42', flag_type='orphaned_knowledge',
+            )
+            assert dup_b.get('error') == 'duplicate_finding'
+            assert dup_b['existing_finding_id'] == fid_real
+
+            # (3b) Description-hash dedup index (_run_desc_index) rebuilt across
+            #      stages: a null/null finding repeating stage-1's description
+            #      folds onto the original stage-1 finding.
+            dup_desc = state_b.add_finding(
+                run_id=run_id, severity='low', category='other',
+                description=null_desc, suggested_action='note', actionable=False,
+            )
+            assert dup_desc.get('error') == 'duplicate_finding'
+            assert dup_desc['existing_finding_id'] == fid_s1_null
+
+            # (3c) Cited-task fold anchor index (_run_cited_task_index) rebuilt:
+            #      a new null-task finding citing the hydrated anchor's task
+            #      folds onto the original anchor finding.
+            fid_new_anchor = state_b.add_finding(
+                run_id=run_id, severity='low', category='other',
+                description='post-restart anchor restatement',
+                suggested_action='note',
+            )['finding_id']
+            fold_res = await state_b.cite_task(run_id, fid_new_anchor, 'dark_factory', '77')
+            assert fold_res.get('error') == 'duplicate_finding'
+            assert fold_res['existing_finding_id'] == fid_s2_anchor
+
+            # (4) cite_entity on a hydrated STAGE-1 finding_id resolves via the
+            #     rebuilt cross-stage _run_finding_index (while stage 2 is active).
+            cite_b = await state_b.cite_entity(run_id, fid_real, 'Foo')
+            assert 'error' not in cite_b
+            assert cite_b['entity_uuid'] == entity_uuid
+        finally:
+            store_b.close()
