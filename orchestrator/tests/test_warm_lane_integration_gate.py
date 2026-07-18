@@ -309,7 +309,7 @@ async def _run_synthetic_hard_cancel_slot(
     # is skipped without needing to stub anything on the mocked scheduler.
     harness.scheduler.is_deterministic = MagicMock(return_value=False)
 
-    with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+    with patch('orchestrator.harness.build_workflow') as MockWorkflow:
         mock_wf = MagicMock()
         mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
         MockWorkflow.return_value = mock_wf

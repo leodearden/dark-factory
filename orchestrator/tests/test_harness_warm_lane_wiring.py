@@ -584,7 +584,7 @@ class TestHardCancelLaneRelease:
         # ── Patch TaskWorkflow to simulate a hard-cancel ────────────────────
         # workflow.run() raises CancelledError, exactly as hard_cancel_workflow()
         # produces when the soft-cancel is ignored past the poll limit.
-        with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
+        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
             mock_wf = MagicMock()
             mock_wf.run = AsyncMock(side_effect=asyncio.CancelledError())
             MockWorkflow.return_value = mock_wf
