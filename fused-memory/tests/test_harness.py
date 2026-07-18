@@ -6082,6 +6082,106 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
     assert 'stale' in call_order[1:]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'scenario',
+    [
+        'stale_freshness',
+        'attempt_cap_reached',
+        'stage_already_resumed',
+        'transcript_missing',
+    ],
+)
+async def test_resume_interrupted_runs_falls_back_when_unresumable(
+    journal, event_buffer, mock_memory_service, scenario,
+):
+    """task σ (s18 guard rails): each guard rail must route an interrupted
+    own-dead-predecessor run to the failed+restore fallback
+    (``_recover_one_run(disposition='failed')``) instead of ``--resume``:
+
+      (a) ``stale_freshness`` — ``completed_at`` older than
+          ``resume_freshness_window_seconds``,
+      (b) ``attempt_cap_reached`` — ``stage_reports['_resume'].count`` already
+          ``>= resume_max_attempts_per_run``,
+      (c) ``stage_already_resumed`` — ``stage_reports['_resume'].last_stage``
+          equals ``run.stage_cursor`` (one-resume-per-stage),
+      (d) ``transcript_missing`` — ``read_transcript_records`` returns None.
+
+    In every case: the run ends ``failed``, its events are restored, the
+    per-run config dir is GC'd, and ``run_full_cycle(resume_run=...)`` is
+    NEVER invoked. A single fallback stays below the storm threshold so no
+    escalation fires.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    project_id = 'test-project'
+    # Guard-rail thresholds are the injected policy defaults (not accuracy claims).
+    assert harness.config.resume_freshness_window_seconds == 3600
+    assert harness.config.resume_max_attempts_per_run == 2
+
+    completed_at = None
+    resume_meta = None
+    transcript_return: list | None = [{'sessionId': 'S'}]
+    if scenario == 'stale_freshness':
+        completed_at = datetime.now(UTC) - timedelta(seconds=7200)
+    elif scenario == 'attempt_cap_reached':
+        resume_meta = {'count': 2, 'last_stage': 'memory_consolidator'}
+    elif scenario == 'stage_already_resumed':
+        resume_meta = {'count': 1, 'last_stage': 'task_knowledge_sync'}
+    elif scenario == 'transcript_missing':
+        transcript_return = None
+
+    run = await _setup_interrupted_dead_predecessor_run(
+        journal, event_buffer,
+        completed_at=completed_at,
+        resume_meta=resume_meta,
+    )
+
+    # run_full_cycle must NOT be invoked on ANY fallback — the whole point of a
+    # guard rail is to avoid spinning up a resume cycle for an unresumable run.
+    harness.run_full_cycle = AsyncMock()
+
+    # Spy restore_drained to prove the failed+restore path ran (events go back to
+    # 'buffered' so a fresh cycle can reprocess them).
+    restore_spy = AsyncMock(side_effect=event_buffer.restore_drained)
+    event_buffer.restore_drained = restore_spy
+
+    with patch(
+        'fused_memory.reconciliation.harness.read_transcript_records',
+        return_value=transcript_return, create=True,
+    ), patch(
+        'fused_memory.reconciliation.harness.gc_run_config_dir',
+    ) as gc_mock:
+        await harness._resume_interrupted_runs()
+
+    # Fell back — never resumed.
+    harness.run_full_cycle.assert_not_awaited()
+
+    after = await journal.get_run(run.id)
+    assert after is not None
+    assert after.status == RunStatus.failed, (
+        f'{scenario}: an unresumable run must fall back to failed, '
+        f'got {after.status}'
+    )
+    err = after.stage_reports.get('_error')
+    assert isinstance(err, dict)
+    assert err.get('error_type') == 'InterruptedRunUnresumable', (
+        f'{scenario}: fallback must error-stamp InterruptedRunUnresumable, '
+        f'got {err.get("error_type")!r}'
+    )
+
+    # Events restored (fallback path) and the per-run config dir GC'd.
+    restore_spy.assert_awaited()
+    gc_mock.assert_called_once_with(journal.data_dir, run.id)
+
+    # The dead predecessor's lock was released by the recovery body (never
+    # adopted by this instance on the fallback path).
+    assert await event_buffer.get_lock_holder_instance_id(project_id) is None
+
+    # One fallback is below resume_failure_storm_threshold (6) — no escalation.
+    harness._escalate.assert_not_called()
+
+
 # ── Tests for AllAccountsCappedException deferral in run_full_cycle ────
 
 
