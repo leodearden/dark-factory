@@ -510,6 +510,40 @@ def pydantic_spec(model: type[BaseModel]) -> type:
     )
 
 
+def stamp_stock_routing_config(cfg, *, rules=None):
+    """Stamp real (non-MagicMock) stock ``routing.*`` values onto a mock config.
+
+    Every out-of-band dispatch site (steward main + inner triage,
+    deep_reviewer, module_tagger, unblock_auto) now resolves its route through
+    ``orchestrator.routing.resolve_route`` (task η, plans/adaptive-model-
+    routing-prd.md).  ``resolve_route`` does real membership/dict ops
+    (``candidate not in config.routing.allowed_models``,
+    ``config.routing.per_model_daily_ceiling_usd.get(...)``,
+    ``for rule in config.routing.rules``) that a bare-MagicMock ``cfg.routing``
+    child attribute cannot satisfy — ``pydantic_spec`` only constrains
+    ``cfg``'s own top-level attribute names, so ``cfg.routing`` itself is an
+    unconstrained MagicMock unless configured here.  Mirrors
+    ``test_workflow_routing_decision._make_workflow``'s ``cfg.routing.*`` block
+    (the ``_invoke`` routing tests) so every out-of-band site fixture resolves
+    through the same stock config shape.
+
+    ``allowed_models``/``ladder`` are the task-beta defaults
+    (``haiku``/``sonnet``/``opus``); ``per_model_daily_ceiling_usd`` is ``{}``
+    (stock — no ceilings, so no surprise ``cost_store`` read fires); and
+    ``rules`` defaults to ``[]`` (empty — no shipped default rule matches any
+    of the five out-of-band roles, so each resolves at the config/role_default
+    layer, byte-equivalent to pre-η).  Pass ``rules=`` to install a policy-rule
+    list for rule-matching tests.
+
+    Returns *cfg* for call-site chaining.
+    """
+    cfg.routing.allowed_models = ['haiku', 'sonnet', 'opus']
+    cfg.routing.ladder = ['haiku', 'sonnet', 'opus']
+    cfg.routing.per_model_daily_ceiling_usd = {}
+    cfg.routing.rules = list(rules) if rules else []
+    return cfg
+
+
 _GATE_PROPERTY_DEFAULTS: dict[str, object] = {
     # Known-good values for every UsageGate @property.
     # This dict is the *single* fix-point for property defaults: update here when
