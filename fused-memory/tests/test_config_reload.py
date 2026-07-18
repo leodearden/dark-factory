@@ -101,52 +101,6 @@ class TestDiffConfig:
         assert d.restart_required['task_metadata.enforce'] == {'old': old, 'new': not old}
         assert 'task_metadata.enforce' not in d.applied_candidates
 
-    def test_nullable_submodel_toggle_none_to_populated(self):
-        """A nullable submodel field toggled None -> populated across a reload is
-        bucketed as restart_required, never a KeyError.
-
-        ``FusedMemoryConfig.taskmaster`` defaults to None (yielded as one atomic
-        ``('taskmaster', None)`` leaf); populating it yields ``taskmaster.<sub>``
-        sub-leaves and NO bare ``'taskmaster'`` key. Regression for the
-        structural-asymmetry KeyError (task 2718 review esc-2718-1).
-        """
-        from fused_memory.config.schema import TaskmasterConfig
-
-        live = FusedMemoryConfig()
-        fresh = FusedMemoryConfig()
-        assert live.taskmaster is None
-        object.__setattr__(fresh, 'taskmaster', TaskmasterConfig())
-
-        d = diff_config(live, fresh)  # must not raise
-
-        # The bare-name leaf (None on live, absent on fresh) is a difference.
-        assert 'taskmaster' in d.restart_required
-        assert d.restart_required['taskmaster']['old'] is None
-        assert d.restart_required['taskmaster']['new'] == '<absent>'
-        # Each populated sub-leaf (absent on live) is also a difference.
-        assert 'taskmaster.project_root' in d.restart_required
-        assert d.restart_required['taskmaster.project_root']['old'] == '<absent>'
-        assert d.applied_candidates == {}
-
-    def test_nullable_submodel_toggle_populated_to_none(self):
-        """The reverse toggle (populated -> None) is symmetrically tolerated —
-        removing a ``taskmaster:`` block from the YAML must not KeyError."""
-        from fused_memory.config.schema import TaskmasterConfig
-
-        live = FusedMemoryConfig()
-        fresh = FusedMemoryConfig()
-        object.__setattr__(live, 'taskmaster', TaskmasterConfig())
-        assert fresh.taskmaster is None
-
-        d = diff_config(live, fresh)  # must not raise
-
-        assert 'taskmaster' in d.restart_required
-        assert d.restart_required['taskmaster']['old'] == '<absent>'
-        assert d.restart_required['taskmaster']['new'] is None
-        assert 'taskmaster.project_root' in d.restart_required
-        assert d.restart_required['taskmaster.project_root']['new'] == '<absent>'
-        assert d.applied_candidates == {}
-
     def test_equal_leaves_tallied_unchanged(self):
         """Leaves equal between the two configs are counted in ``unchanged``."""
         live = FusedMemoryConfig()
@@ -158,6 +112,64 @@ class TestDiffConfig:
         assert d.applied_candidates == {}
         assert d.restart_required == {}
         assert d.unchanged > 0
+
+
+class TestDiffConfigOptionalSubmodels:
+    """diff_config / apply_reload tolerate an OPTIONAL submodel field toggling
+    between None and populated across a reload — the structural-asymmetry the
+    reviewer flagged (task 2718 review esc-2718-1).
+
+    ``taskmaster: TaskmasterConfig | None`` (default None) and
+    ``usage_cap: UsageCapConfig | None`` (default a populated submodel) are the
+    two nullable submodels on FusedMemoryConfig. Because ``_iter_leaves`` decides
+    descent from the DECLARED annotation (descend only into a bare, non-Optional
+    BaseModel), a nullable submodel is always compared WHOLE — so ``_iter_leaves``
+    yields identical leaf-path sets for live and fresh regardless of nullability
+    state, and a None<->populated toggle produces exactly ONE whole-object
+    restart_required entry rather than a KeyError or a scatter of half-missing
+    ``name.<sub>`` sub-paths.
+    """
+
+    def test_opposite_toggles_bucket_whole_without_crash(self):
+        from fused_memory.config.schema import TaskmasterConfig
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        assert live.taskmaster is None  # default
+        old_usage_cap = live.usage_cap
+        assert old_usage_cap is not None  # default-populated submodel
+
+        # Toggle BOTH optional submodels in OPPOSITE directions in one diff, so a
+        # leaf-path-set divergence is forced from both sides at once.
+        new_tm = TaskmasterConfig()
+        object.__setattr__(fresh, 'taskmaster', new_tm)  # None -> populated
+        object.__setattr__(fresh, 'usage_cap', None)  # populated -> None
+
+        # (a) NO-CRASH: the structural asymmetry no longer raises KeyError.
+        d = diff_config(live, fresh)
+
+        # (b) BOTH bucketed under restart_required as WHOLE atomic leaves.
+        assert d.restart_required['taskmaster'] == {'old': None, 'new': new_tm}
+        assert d.restart_required['usage_cap'] == {'old': old_usage_cap, 'new': None}
+        # (c) Neither optional-submodel path is an applied candidate (restart-only).
+        assert 'taskmaster' not in d.applied_candidates
+        assert 'usage_cap' not in d.applied_candidates
+        # (d) NO descended optional sub-paths leak as keys — compared whole.
+        all_keys = set(d.restart_required) | set(d.applied_candidates)
+        assert not any(
+            k.startswith('taskmaster.') or k.startswith('usage_cap.') for k in all_keys
+        ), f'optional submodel sub-paths leaked: {sorted(all_keys)}'
+
+        # (e) END-TO-END: apply_reload reports both under restart_required, applies
+        # nothing (neither is allowlisted), and leaves ``live`` untouched.
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['applied'] == {}
+        assert report['error'] is None
+        assert 'taskmaster' in report['restart_required']
+        assert 'usage_cap' in report['restart_required']
+        assert live.taskmaster is None
+        assert live.usage_cap is old_usage_cap
 
 
 class TestApplyReload:
