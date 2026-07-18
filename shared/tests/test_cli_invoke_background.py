@@ -1,0 +1,165 @@
+"""Tests for the background-task abandonment detector + downgrade (task 2761).
+
+Layer 2 of the headless ``--print`` background-task footgun fix: detect when an
+otherwise-successful ``claude --print`` run ended its turn while a backgrounded
+Bash command was still pending (launched via ``Bash run_in_background=true``,
+never subsequently polled with ``BashOutput`` or killed with
+``KillShell``/``KillBash``), and downgrade ``success``→failure so existing
+non-success handling retries/resumes instead of proceeding on a half-done tree.
+
+RCA: Reify 5164's amender ended its turn (681s, 19 turns, subtype=success,
+timed_out=false) "to wait for the completion notification" while a 2700s
+backgrounded OCCT test was still pending — the CLI treated the conversation as
+complete and exited success, silently abandoning the work mid-task.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from shared.cli_invoke import detect_ended_awaiting_background
+
+
+# ── Fixture builders ────────────────────────────────────────────────────────
+# Hand-authored assistant/user record dicts mirroring the on-disk transcript
+# JSONL shape: an assistant record carries content blocks either nested under
+# ``record['message']['content']`` (the real CLI shape) or flat under
+# ``record['content']`` (the shape used by the existing read_transcript_records
+# tests).  tool_use blocks carry ``name`` + ``input``.
+
+
+def _assistant(blocks: list, *, nested: bool = True) -> dict:
+    """An assistant transcript record wrapping *blocks*.
+
+    ``nested=True`` → record['message']['content'] (real CLI shape).
+    ``nested=False`` → flat record['content'].
+    """
+    if nested:
+        return {'type': 'assistant', 'message': {'role': 'assistant', 'content': blocks}}
+    return {'type': 'assistant', 'content': blocks}
+
+
+def _bash_launch(*, background: bool = True, command: str = 'sleep 9999') -> dict:
+    return {
+        'type': 'tool_use',
+        'name': 'Bash',
+        'input': {'command': command, 'run_in_background': background},
+    }
+
+
+def _bash_output(shell_id: str = 'sh-1') -> dict:
+    return {'type': 'tool_use', 'name': 'BashOutput', 'input': {'bash_id': shell_id}}
+
+
+def _kill_shell(shell_id: str = 'sh-1', *, name: str = 'KillShell') -> dict:
+    return {'type': 'tool_use', 'name': name, 'input': {'shell_id': shell_id}}
+
+
+def _text(text: str = 'thinking') -> dict:
+    return {'type': 'text', 'text': text}
+
+
+class TestDetectEndedAwaitingBackground:
+    """The pure detector fires (True) iff the session's final
+    background-management action was a launch never followed by a poll/kill —
+    i.e. index(last background launch) > index(last reap)."""
+
+    def test_empty_list_is_false(self) -> None:
+        """No records → no launch → False (fail-safe)."""
+        assert detect_ended_awaiting_background([]) is False
+
+    def test_no_background_launch_is_false(self) -> None:
+        """A foreground Bash (run_in_background falsy/absent) is not a launch → False."""
+        records = [
+            _assistant([_text('run the tests')]),
+            _assistant([_bash_launch(background=False, command='pytest -q')]),
+            _assistant([{'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_single_abandoned_launch_is_true(self) -> None:
+        """A single background launch with nothing after it → True (the RCA)."""
+        records = [
+            _assistant([_text('kick off the long build')]),
+            _assistant([_bash_launch(command='./occt-test.sh')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_launch_then_bashoutput_is_false(self) -> None:
+        """Launch later polled by BashOutput → engaged → False."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_bash_output()]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_launch_then_killshell_is_false(self) -> None:
+        """Launch later killed by KillShell → engaged → False."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_kill_shell()]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_launch_then_killbash_is_false(self) -> None:
+        """KillBash is also a reap (older CLI tool name) → False."""
+        records = [
+            _assistant([_bash_launch()]),
+            _assistant([_kill_shell(name='KillBash')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_second_launch_with_reap_before_it_is_true(self) -> None:
+        """Two launches; the reap sits BEFORE the second launch, which is never
+        reaped → last launch after last reap → True."""
+        records = [
+            _assistant([_bash_launch(command='job-a')]),
+            _assistant([_kill_shell()]),
+            _assistant([_bash_launch(command='job-b')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_launch_reaped_then_second_launch_abandoned_is_true(self) -> None:
+        """launch → BashOutput (reaps first) → a SECOND launch left abandoned → True."""
+        records = [
+            _assistant([_bash_launch(command='job-a')]),
+            _assistant([_bash_output()]),
+            _assistant([_bash_launch(command='job-b')]),
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_tolerant_to_mixed_nesting_and_malformed_blocks(self) -> None:
+        """Nested + flat records, plus malformed/missing blocks interleaved →
+        no exception, correct verdict (True — the launch is the last action)."""
+        records = [
+            {'type': 'assistant', 'message': {'role': 'assistant'}},  # message w/o content
+            {'type': 'assistant', 'content': None},  # content not a list
+            _assistant([_text('planning')], nested=False),  # flat text
+            {'type': 'user', 'content': [{'type': 'tool_result', 'content': 'x'}]},
+            _assistant(['not-a-dict-block', 42, {'type': 'text'}], nested=False),  # junk blocks
+            _assistant([{'type': 'tool_use', 'name': 'Bash'}]),  # Bash tool_use w/o input
+            _assistant([_bash_launch(command='./occt-test.sh')], nested=True),  # the launch
+        ]
+        assert detect_ended_awaiting_background(records) is True
+
+    def test_malformed_records_only_is_false(self) -> None:
+        """None / non-dict records and empty blocks never raise → False."""
+        records = [
+            None,  # type: ignore[list-item]
+            'garbage',  # type: ignore[list-item]
+            {'type': 'assistant'},  # no content at all
+            {'no_type': True, 'content': []},
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    def test_reap_after_launch_across_nesting_styles_is_false(self) -> None:
+        """A launch (nested) later reaped by a BashOutput authored in the flat
+        shape → still recognised as a reap → False."""
+        records = [
+            _assistant([_bash_launch()], nested=True),
+            _assistant([_bash_output()], nested=False),
+        ]
+        assert detect_ended_awaiting_background(records) is False
