@@ -39,6 +39,7 @@ from fused_memory.models.scope import (
 )
 from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
@@ -1272,6 +1273,15 @@ class ReconciliationHarness:
         await self.journal.update_run_stage_reports(run.id, run.stage_reports)
         await self.journal.complete_run(run.id, disposition)
 
+        # Task 2744: sweep the config dir a dead predecessor process may have left
+        # behind for this run. Defensive — never mask the recovery outcome.
+        try:
+            gc_run_config_dir(self.journal.data_dir, run.id)
+        except Exception as gc_err:  # noqa: BLE001
+            logger.warning(
+                'gc_run_config_dir failed for recovered run %s: %r', run.id, gc_err
+            )
+
         # include_unattributed=True additionally sweeps drained_by_run_id IS
         # NULL rows in this project: events drained by a pre-task-2711
         # process (before drains stamped run attribution) would otherwise
@@ -2238,6 +2248,15 @@ class ReconciliationHarness:
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                # Task 2744: GC this run's per-run recon CLI config dir on every
+                # exit path (success/failure/cancel). Defensive — a filesystem
+                # hiccup must never mask the run's real terminal outcome.
+                try:
+                    gc_run_config_dir(self.journal.data_dir, run_id)
+                except Exception as gc_err:  # noqa: BLE001
+                    logger.warning(
+                        'gc_run_config_dir failed for run %s: %r', run_id, gc_err
+                    )
 
     async def _ensure_stage1_cycle_summary(
         self,
@@ -3434,6 +3453,15 @@ class ReconciliationHarness:
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            # Task 2744: GC this remediation run's per-run recon CLI config dir on
+            # every exit path. Defensive — never mask the run's terminal outcome.
+            try:
+                gc_run_config_dir(self.journal.data_dir, run_id)
+            except Exception as gc_err:  # noqa: BLE001
+                logger.warning(
+                    'gc_run_config_dir failed for remediation run %s: %r',
+                    run_id, gc_err,
+                )
 
 
 # ── Backlog iteration ──────────────────────────────────────────────────
