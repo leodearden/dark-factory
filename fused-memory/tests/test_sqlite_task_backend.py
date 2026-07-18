@@ -1476,6 +1476,134 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
     }
 
 
+# ── reserved control-flag key stripping (task 2735) ───────────────────
+#
+# The Stage-2 recon LLM conflated update_task's CALL-FLAGS (`append`,
+# `metadata_mode`) with actual metadata fields, calling
+# update_task(metadata={..., "append": True}, append=True). `_merge_metadata`
+# faithfully persists every key in the incoming payload, so the literal
+# `append` key leaked into the stored blob (task 2682). These tests cover
+# the defensive strip helpers that remove reserved control-flag key names
+# from the INCOMING metadata payload before the merge runs.
+#
+# Symbols under test do not exist yet — imported inside each test function
+# (mirroring test_sqlite_task_backend_has_no_add_subtask_method below) so
+# RED is localized to these tests rather than failing module collection.
+
+
+def test_reserved_metadata_control_keys_names_append_and_metadata_mode():
+    """`_RESERVED_METADATA_CONTROL_KEYS` names at least the two update_task call-flags.
+
+    Membership, not exact-equality: the behavioral tests below already
+    exercise 'append' and 'metadata_mode' end-to-end, so this only guards
+    against accidentally dropping one of them from the set. Pinning the
+    whole frozenset would force an edit here every time a legitimate third
+    reserved key is added, without adding failure-mode coverage.
+    """
+    from fused_memory.backends.sqlite_task_backend import _RESERVED_METADATA_CONTROL_KEYS
+
+    assert {'append', 'metadata_mode'} <= _RESERVED_METADATA_CONTROL_KEYS
+
+
+def test_drop_reserved_control_keys_removes_append_and_metadata_mode():
+    """(a) Reserved keys are dropped; sibling keys survive; dropped-set reported."""
+    from fused_memory.backends.sqlite_task_backend import _drop_reserved_control_keys
+
+    incoming = {
+        'append': True,
+        'metadata_mode': 'additive',
+        'source': 'x',
+        'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+    }
+    cleaned, dropped = _drop_reserved_control_keys(incoming)
+    assert cleaned == {
+        'source': 'x',
+        'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+    }
+    assert dropped == {'append', 'metadata_mode'}
+
+
+def test_drop_reserved_control_keys_no_op_when_absent():
+    """(b) A dict without reserved keys is returned unchanged with an empty dropped-set."""
+    from fused_memory.backends.sqlite_task_backend import _drop_reserved_control_keys
+
+    incoming = {'source': 'x', 'memory_hints': {'entities': ['A'], 'queries': ['q1']}}
+    cleaned, dropped = _drop_reserved_control_keys(incoming)
+    assert cleaned == incoming
+    assert dropped == set()
+
+
+def test_strip_reserved_control_keys_strips_from_json_object_string():
+    """(c) String wrapper strips reserved keys from a JSON-object string and re-serializes."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    incoming = json.dumps({'append': True, 'metadata_mode': 'merge', 'source': 'x'})
+    result = _strip_reserved_control_keys(incoming)
+    assert json.loads(result) == {'source': 'x'}
+
+
+def test_strip_reserved_control_keys_no_op_returns_equivalent_when_absent():
+    """(c) No reserved keys present: the (re-serialized) payload is unchanged in content."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    incoming = json.dumps({'source': 'x'})
+    result = _strip_reserved_control_keys(incoming)
+    assert json.loads(result) == {'source': 'x'}
+
+
+def test_strip_reserved_control_keys_passthrough_on_corrupt_json():
+    """(d) Fail-safe: a corrupt/non-JSON string is returned UNCHANGED (identity-preserving),
+    matching _merge_metadata's corrupt-incoming last-write-wins fallback."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    incoming = 'NOT_JSON'
+    assert _strip_reserved_control_keys(incoming) is incoming
+
+
+@pytest.mark.parametrize('incoming', ['[1,2]', '"s"'])
+def test_strip_reserved_control_keys_passthrough_on_non_dict_json(incoming):
+    """(d) Fail-safe: valid-but-non-dict JSON is returned UNCHANGED, matching
+    _merge_metadata's non-dict-incoming fallback (returns incoming verbatim)."""
+    from fused_memory.backends.sqlite_task_backend import _strip_reserved_control_keys
+
+    assert _strip_reserved_control_keys(incoming) is incoming
+
+
+@pytest.mark.asyncio
+async def test_update_task_never_persists_reserved_control_keys(backend, project_root):
+    """End-to-end regression (task 2735): a payload that conflates update_task's
+    call-flags with metadata fields must never have those keys persisted, while
+    the legit write (memory_hints union, sibling keys) still lands.
+
+    Reproduces the Stage-2 recon LLM's call shape:
+    update_task(metadata={..., "append": True, "metadata_mode": "additive"},
+    append=True) — the exact write that leaked into task 2682.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='hinted',
+        metadata=json.dumps({
+            'source': 'x',
+            'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({
+            'memory_hints': {'entities': ['B'], 'queries': ['q2']},
+            'append': True,
+            'metadata_mode': 'additive',
+        }),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    metadata = task['metadata']
+    assert 'append' not in metadata
+    assert 'metadata_mode' not in metadata
+    assert metadata['source'] == 'x'
+    assert metadata['memory_hints'] == {'entities': ['A', 'B'], 'queries': ['q1', 'q2']}
+
+
 @pytest.mark.asyncio
 async def test_sqlite_task_backend_has_no_add_subtask_method():
     """SqliteTaskBackend must NOT have an add_subtask method after DF-D (task 1543).

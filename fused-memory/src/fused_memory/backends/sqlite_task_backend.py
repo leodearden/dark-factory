@@ -2653,6 +2653,15 @@ class SqliteTaskBackend:
 
             new_metadata: str | None = None
             if metadata is not None:
+                # Strip reserved update_task call-flag key names (append,
+                # metadata_mode) from the INCOMING payload before merging —
+                # a caller that conflates the call-flag with a metadata field
+                # (task 2682) must not have the literal key persisted.
+                # Fail-safe passthrough for corrupt/non-dict payloads leaves
+                # _merge_metadata's own guards below as the source of truth.
+                metadata = _strip_reserved_control_keys(
+                    metadata, project_root=project_root, tag=tag, task_id=tid,
+                )
                 # Behavior note: on merge/additive, _merge_metadata RAISES
                 # TaskmasterError if the stored blob is corrupt — preventing a
                 # silent clobber.  The _txn wrapper rolls back, leaving the
@@ -3328,3 +3337,62 @@ def _merge_metadata(
         # Pathologically deep metadata; fall back to last-write-wins.
         return incoming
     return json.dumps(merged)
+
+
+# ── reserved control-flag key stripping (task 2735) ────────────────────
+#
+# ``append`` and ``metadata_mode`` are update_task CALL-FLAGS consumed by
+# _resolve_metadata_mode above — not metadata fields. A caller that
+# conflates the two (e.g. update_task(metadata={..., "append": True},
+# append=True), as the Stage-2 recon LLM did — task 2682) must not have the
+# literal key persisted: _merge_metadata treats every key in the incoming
+# payload as data, so an unstripped "append"/"metadata_mode" key would be
+# faithfully written into the stored blob.
+
+_RESERVED_METADATA_CONTROL_KEYS: frozenset[str] = frozenset({'append', 'metadata_mode'})
+
+
+def _drop_reserved_control_keys(meta: dict) -> tuple[dict, set[str]]:
+    """Remove update_task call-flag key names from a metadata payload.
+
+    Returns ``meta`` unchanged (same object) with an empty dropped-set when
+    no reserved key is present. Otherwise returns a shallow copy with the
+    reserved keys removed, plus the set of keys that were dropped.
+    """
+    dropped = {k for k in meta if k in _RESERVED_METADATA_CONTROL_KEYS}
+    if not dropped:
+        return meta, set()
+    cleaned = {k: v for k, v in meta.items() if k not in _RESERVED_METADATA_CONTROL_KEYS}
+    return cleaned, dropped
+
+
+def _strip_reserved_control_keys(
+    incoming: str,
+    *,
+    project_root: str | None = None,
+    tag: str | None = None,
+    task_id: int | None = None,
+) -> str:
+    """String wrapper around :func:`_drop_reserved_control_keys`.
+
+    Fail-safe passthrough: a corrupt/non-JSON ``incoming`` string, or valid
+    JSON that is not an object, is returned UNCHANGED — preserving
+    :func:`_merge_metadata`'s own corrupt-incoming last-write-wins and
+    non-dict-incoming fallback behavior. This wrapper never raises.
+    """
+    try:
+        parsed = json.loads(incoming)
+    except (TypeError, ValueError):
+        return incoming
+    if not isinstance(parsed, dict):
+        return incoming
+    cleaned, dropped = _drop_reserved_control_keys(parsed)
+    if not dropped:
+        return incoming
+    logger.warning(
+        'update_task: stripped reserved control-flag key(s) %s from metadata '
+        'payload for task %s (tag=%s project_root=%s) — call-flags are not '
+        'metadata keys',
+        sorted(dropped), task_id, tag, project_root,
+    )
+    return json.dumps(cleaned)
