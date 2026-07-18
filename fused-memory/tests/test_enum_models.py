@@ -191,7 +191,14 @@ class TestRunStatus:
     def test_values(self):
         from fused_memory.models.reconciliation import RunStatus
 
-        expected = {'running', 'completed', 'failed', 'rolled_back', 'circuit_breaker'}
+        expected = {
+            'running',
+            'completed',
+            'failed',
+            'rolled_back',
+            'circuit_breaker',
+            'interrupted',
+        }
         assert {e.value for e in RunStatus} == expected
 
     def test_string_equality(self):

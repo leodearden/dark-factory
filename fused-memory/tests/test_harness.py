@@ -2192,7 +2192,7 @@ async def test_run_full_cycle_cancelled_marks_interrupted_and_keeps_events(
     # Events stay drained (resumed work must not be double-processed).
     restore_spy.assert_not_awaited()
     # Transcript kept for --resume — config dir NOT gc'd.
-    gc_mock.assert_not_called()
+    assert gc_mock.call_count == 0
 
     runs = await journal.get_recent_runs('test-project', limit=5)
     assert len(runs) >= 1
@@ -6179,7 +6179,7 @@ async def test_resume_interrupted_runs_falls_back_when_unresumable(
     assert await event_buffer.get_lock_holder_instance_id(project_id) is None
 
     # One fallback is below resume_failure_storm_threshold (6) — no escalation.
-    harness._escalate.assert_not_called()
+    assert harness._escalate.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -6246,8 +6246,8 @@ async def test_resume_interrupted_runs_honours_opt_out_on_resuming_side(
 
     # A deliberate opt-out is NOT a resume failure: the storm counter is not
     # consulted and no escalation fires.
-    harness._record_resume_failure.assert_not_called()
-    harness._escalate.assert_not_called()
+    assert harness._record_resume_failure.call_count == 0
+    assert harness._escalate.call_count == 0
 
 
 def test_resume_failure_storm_escalates_once_per_window(
