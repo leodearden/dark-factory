@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from escalation.models import BORN_AT_L2_SEVERITIES, RESOLUTION_CLASSES, Escalation, TrainState
+from escalation.models import (
+    BORN_AT_L2_SEVERITIES,
+    RESOLUTION_CLASSES,
+    Escalation,
+    EvidenceEntry,
+    TrainState,
+)
 
 
 class TestBornAtL2Severities:
@@ -702,4 +708,135 @@ class TestEscalationTriageFields:
         )
         assert restored.updated_at is None, (
             f"Expected updated_at=None for legacy JSON, got {restored.updated_at!r}"
+        )
+
+
+class TestEscalationEvidence:
+    """Escalation dataclass has an `evidence` field (task 2558 — structured raw-observation entries).
+
+    Mirrors the zero-migration round-trip pattern of TestEscalationTrainState /
+    TestEscalationResolutionAction.  Each entry is a plain dict
+    {observation, measured_at, ref} — stored/returned verbatim, no shape
+    validation.  The values are plain dict literals (annotated
+    `list[EvidenceEntry]` only to satisfy the invariant-`list` type check;
+    EvidenceEntry is a plain dict at runtime), so this reads identically pre-
+    and post-implementation.
+    """
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='orchestrator',
+            severity='critical',
+            category='infra_issue',
+            summary='test escalation for evidence',
+        )
+
+    # --- (a) default is [] ---
+
+    def test_evidence_default_is_empty_list(self):
+        """Escalation constructed without evidence has evidence == []."""
+        esc = self._make_base_esc()
+        assert esc.evidence == []
+
+    # --- (b) default_factory independence (no shared mutable default) ---
+
+    def test_evidence_default_not_shared_between_instances(self):
+        """Two escalations do not share the same default evidence list object."""
+        esc1 = self._make_base_esc()
+        esc2 = self._make_base_esc()
+        assert esc1.evidence is not esc2.evidence
+        esc1.evidence.append({'observation': 'x', 'measured_at': 'y', 'ref': 'z'})
+        assert esc2.evidence == []
+
+    # --- (c) round-trip to_dict / from_dict ---
+
+    def test_evidence_round_trip_via_to_dict_from_dict(self):
+        """evidence list is preserved through to_dict() / from_dict()."""
+        ev: list[EvidenceEntry] = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
+        esc = Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='orchestrator',
+            severity='critical',
+            category='infra_issue',
+            summary='test evidence round-trip',
+            evidence=ev,
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.evidence == ev
+
+    # --- (c) round-trip to_json / from_json ---
+
+    def test_evidence_round_trip_via_to_json_from_json(self):
+        """evidence list is preserved through to_json() / from_json()."""
+        ev: list[EvidenceEntry] = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
+        esc = Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='orchestrator',
+            severity='critical',
+            category='infra_issue',
+            summary='test evidence json round-trip',
+            evidence=ev,
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.evidence == ev
+
+    # --- (d) appears in serialised JSON ---
+
+    def test_evidence_appears_in_to_json_output(self):
+        """evidence is serialised (not silently dropped) when set."""
+        ev: list[EvidenceEntry] = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
+        esc = Escalation(
+            id='esc-task-400-0001',
+            task_id='400',
+            agent_role='orchestrator',
+            severity='critical',
+            category='infra_issue',
+            summary='test evidence in json',
+            evidence=ev,
+        )
+        d = json.loads(esc.to_json())
+        assert 'evidence' in d
+        assert d['evidence'] == ev
+
+    # --- (e) legacy JSON backward compat ---
+
+    def test_from_dict_legacy_json_omits_evidence(self):
+        """from_json() on JSON without evidence key returns evidence == [] (backward compat, zero migration)."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without evidence',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            # NOTE: evidence is intentionally absent
+        }
+        old_json = json.dumps(old_dict)
+        restored = Escalation.from_json(old_json)
+        assert restored.evidence == [], (
+            f"Expected evidence=[] for legacy JSON, got {restored.evidence!r}"
         )

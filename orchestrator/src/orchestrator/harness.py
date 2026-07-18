@@ -8769,6 +8769,7 @@ task, include it with an empty "files" list rather than omitting it.
         without self-healing; confirmed-real (``True``) files it exactly as
         before.
         """
+        from orchestrator import critical_gate  # noqa: PLC0415
         from orchestrator import verify as verify_mod  # noqa: PLC0415
 
         main_sha: str = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
@@ -8826,9 +8827,36 @@ task, include it with an empty "files" list rather than omitting it.
         # A confirmed flake (False) is deliberately NOT self-healed: that
         # requires a genuine full-verify PASS (see vr.passed branch above),
         # and an isolated subset re-run is weaker evidence than that.
-        if not await verify_mod.confirm_main_tip_failure_is_real(
+        subset_confirmed = await verify_mod.confirm_main_tip_failure_is_real(
             self.config, self.git_ops, vr, main_sha=swept_sha
-        ):
+        )
+
+        # Current-tip re-confirmation arm (task 2558), COMPOSED with 2370's
+        # subset re-run above — NOT a second full sweep.  The full verify +
+        # subset re-run take minutes, during which main can advance past the
+        # observed bad SHA; filing then would recommend a destructive
+        # intervention against a SHA that is no longer the tip — the survey
+        # §1.7 "last-green rewind named a commit that also failed / evidence
+        # since mutated" precedent.  So re-resolve the current tip cheaply and
+        # require it still equal swept_sha.  Filing requires BOTH the subset
+        # confirm AND the tip being unchanged.  The default-on
+        # main_tip_sweep_rerun_confirm_enabled kill-switch toggles ONLY this
+        # tip arm; disabled forces tip_unchanged=True (byte-identical post-2370).
+        if self.config.main_tip_sweep_rerun_confirm_enabled:
+            current_sha = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
+            tip_unchanged = bool(current_sha) and current_sha == swept_sha
+        else:
+            tip_unchanged = True
+        rerun_confirmed = subset_confirmed and tip_unchanged
+        if not critical_gate.critical_filing_gate(rerun_confirmed=rerun_confirmed):
+            # Not corroborated on the current tip: either the subset re-run
+            # flaked (2370) OR main advanced past the observed bad SHA (2558).
+            # Suppress — a stale/transient red must not fire a destructive alarm.
+            logger.info(
+                'Main-tip integrity sweep: failure at %s unconfirmed on current tip '
+                '(subset_confirmed=%s tip_unchanged=%s) — not filing (stale/transient)',
+                swept_sha[:12], subset_confirmed, tip_unchanged,
+            )
             return
 
         summary = f'Main-tip integrity sweep failed at {swept_sha[:12]}: {vr.category}'[:200]

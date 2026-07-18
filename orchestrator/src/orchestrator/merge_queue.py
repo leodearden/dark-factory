@@ -27,6 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
@@ -6789,6 +6790,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         otherwise.  The streak is persistent until ``_record_runner_recovered``
         clears it, so consecutive calls beyond the threshold continue returning
         ``True`` (the alarm helper's ``has_open_l1`` dedup prevents re-submitting).
+
+        The consecutive-streak decision delegates to the shared
+        ``critical_gate.critical_filing_gate`` helper (task 2558): passing an int
+        ``threshold`` reproduces the original ``streak >= threshold`` predicate
+        exactly, so behavior is unchanged.
         """
         if host in self._runner_unavailable:
             entry = self._runner_unavailable[host]
@@ -6800,7 +6806,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 first_unavailable_at=now,
                 reason=reason,
             )
-        return self._runner_unavailable[host].streak >= self._unreachable_escalate_after_n
+        return critical_filing_gate(
+            streak=self._runner_unavailable[host].streak,
+            threshold=self._unreachable_escalate_after_n,
+        )
 
     def _record_runner_recovered(self, host: str) -> None:
         """Clear the unavailability tracker entry for *host* (idempotent).

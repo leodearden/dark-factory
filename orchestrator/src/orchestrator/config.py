@@ -2786,6 +2786,19 @@ class OrchestratorConfig(BaseSettings):
     # main_tip_sweep_enabled's operator kill-switch convention.
     escalation_revalidation_enabled: bool = Field(default=True)
 
+    # Current-tip re-confirmation gate for the main-tip sweep's CRITICAL/L1
+    # filer (task 2558).  A single red-main observation is never sufficient to
+    # file a destructive-intervention alarm: before submitting, _run_main_tip_sweep
+    # requires BOTH task 2370's confirm_main_tip_failure_is_real subset re-run
+    # AND that the current main tip is STILL the observed bad SHA (re-resolved
+    # via git_ops.get_main_sha() == swept_sha).  This closes the "evidence since
+    # mutated" gap (main advancing past the observed SHA during the minutes-long
+    # verify), the survey §1.7 "last-green rewind named a commit that also
+    # failed" precedent.  Default-on, mirrors main_tip_sweep_enabled's operator
+    # kill-switch convention; set to False to restore legacy single-observation
+    # filing (tip arm disabled — byte-identical post-2370 behavior).
+    main_tip_sweep_rerun_confirm_enabled: bool = Field(default=True)
+
     # Category allowlist narrowing the terminal-subject auto-close (task 2724).
     # The subject-terminal Source-C close (criterion a above) used to fire for
     # ANY category — a status-only heuristic that silently dropped still-required

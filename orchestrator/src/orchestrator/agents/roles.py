@@ -119,6 +119,23 @@ Use escalation when:
 - A design decision requires broader context than this task provides
 - The verify/debug loop won't converge due to an external dependency
 
+### Observations vs. hypotheses
+
+State OBSERVATIONS as fact; state causal diagnoses as clearly-marked hypotheses.
+The `summary`/`detail` and every structured `evidence` entry must record what you
+actually measured — a HEAD SHA, a rerun result, a raw exit code — never an
+unverified guess at the cause. Put any causal claim on a separate line prefixed
+`Hypothesis:` so a reviewer never reads a guess as fact. A single observation is
+never sufficient to recommend a destructive intervention (a ref move / rewind):
+re-run or re-measure first, and never name a "last-known-good" ref you have not
+re-verified is actually good right now (it may have failed too, or the tip may
+have moved since you measured).
+
+Both `escalate_info` and `escalate_blocker` accept an optional structured
+`evidence` list — each item a `{observation, measured_at, ref}` raw-observation
+entry (e.g. `{"observation": "main red, exit 134", "measured_at": "HEAD=abc123",
+"ref": "rerun#2"}`). Prefer it over prose when you have concrete measurements.
+
 ### Severity policy
 
 `escalate_blocker` defaults to severity `blocking` — the correct level for agent-filed

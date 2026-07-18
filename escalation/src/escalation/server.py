@@ -9,7 +9,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -27,6 +27,7 @@ from escalation.models import (
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
     Escalation,
+    EvidenceEntry,
 )
 from escalation.queue import EscalationQueue
 
@@ -456,6 +457,7 @@ def create_server(
         suggested_action: str = '',
         worktree: str | None = None,
         workflow_state: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
@@ -475,6 +477,16 @@ def create_server(
 
         *terminal_state_is_the_bug* — set True when the escalation is expected even
         if the target task is already terminal (bypasses the auto-resolve chokepoint).
+
+        *evidence* — optional list of structured raw-OBSERVATION entries, each a
+        ``{observation, measured_at, ref}`` dict (e.g. the HEAD SHA at measurement,
+        a ref listing, a rerun result, a raw exit code).  Stored and returned
+        verbatim (no shape validation).  State OBSERVATIONS as fact — in
+        ``summary``, ``detail`` and each ``evidence.observation`` record only what
+        was measured, never an unverified cause.  Put any causal diagnosis on a
+        clearly-marked hypothesis line (prefix ``Hypothesis:``), never asserted as
+        fact.  A single observation is not sufficient to recommend a destructive
+        intervention (a ref move / rewind) — re-run or re-measure first.
 
         Response shape:
         - Queued (task alive):    ``{id, status}``  where status='queued'
@@ -501,6 +513,7 @@ def create_server(
             suggested_action=suggested_action,
             worktree=worktree,
             workflow_state=workflow_state,
+            evidence=cast(list[EvidenceEntry], evidence or []),
         )
         # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
@@ -517,6 +530,7 @@ def create_server(
         suggested_action: str = '',
         worktree: str | None = None,
         workflow_state: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, commit any in-progress work,
@@ -539,6 +553,16 @@ def create_server(
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
+
+        *evidence* — optional list of structured raw-OBSERVATION entries, each a
+        ``{observation, measured_at, ref}`` dict (e.g. the HEAD SHA at measurement,
+        a ref listing, a rerun result, a raw exit code).  Stored and returned
+        verbatim (no shape validation).  State OBSERVATIONS as fact — in
+        ``summary``, ``detail`` and each ``evidence.observation`` record only what
+        was measured, never an unverified cause.  Put any causal diagnosis on a
+        clearly-marked hypothesis line (prefix ``Hypothesis:``), never asserted as
+        fact.  A single observation is not sufficient to recommend a destructive
+        intervention (a ref move / rewind) — re-run or re-measure first.
 
         Response shape always includes ``action='terminate_cleanly'`` plus:
         - Queued:        ``{id, status, action}``  where status='queued'
@@ -565,6 +589,7 @@ def create_server(
             suggested_action=suggested_action,
             worktree=worktree,
             workflow_state=workflow_state,
+            evidence=cast(list[EvidenceEntry], evidence or []),
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
         return {**result, 'action': 'terminate_cleanly'}
