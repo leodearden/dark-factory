@@ -141,7 +141,7 @@ class TestClaimantClearedOnEveryOutcome:
         harness = _make_harness(config, scheduler)
 
         monkeypatch.setattr(
-            harness_module, 'TaskWorkflow', _make_stub_workflow_class(outcome),
+            harness_module, 'build_workflow', _make_stub_workflow_class(outcome),
         )
 
         task_id = f'claimant-clear-{outcome.value}'
@@ -176,7 +176,7 @@ class TestClaimantClearIsBestEffort:
         harness = _make_harness(config, scheduler)
 
         monkeypatch.setattr(
-            harness_module, 'TaskWorkflow',
+            harness_module, 'build_workflow',
             _make_stub_workflow_class(WorkflowOutcome.DONE),
         )
 
