@@ -456,6 +456,7 @@ def create_server(
         suggested_action: str = '',
         worktree: str | None = None,
         workflow_state: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
     ) -> dict[str, Any]:
         """Report a non-blocking observation. The agent continues working after this call.
@@ -501,6 +502,7 @@ def create_server(
             suggested_action=suggested_action,
             worktree=worktree,
             workflow_state=workflow_state,
+            evidence=evidence or [],
         )
         # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
@@ -517,6 +519,7 @@ def create_server(
         suggested_action: str = '',
         worktree: str | None = None,
         workflow_state: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
         terminal_state_is_the_bug: bool = False,
     ) -> dict[str, Any]:
         """Report a blocking problem. After calling this, commit any in-progress work,
@@ -565,6 +568,7 @@ def create_server(
             suggested_action=suggested_action,
             worktree=worktree,
             workflow_state=workflow_state,
+            evidence=evidence or [],
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
         return {**result, 'action': 'terminate_cleanly'}
