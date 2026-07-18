@@ -21,8 +21,27 @@ eval behavior.
 
 from __future__ import annotations
 
+import pytest
+
+from orchestrator import config
 from orchestrator.config import OrchestratorConfig
-from orchestrator.evals.profile import EVAL_PROFILE, resolve_eval_profile_update
+from orchestrator.evals.profile import (
+    EVAL_PROFILE,
+    apply_eval_profile,
+    resolve_eval_profile_update,
+)
+
+
+def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str]:
+    """Return the set of dotted leaf paths where *a* and *b* differ.
+
+    Reuses ``config._iter_leaves`` (the same one-level-nested dotted-path
+    enumerator ``diff_config`` uses), so its output (e.g.
+    ``'unblock_auto.enabled'``) matches ``EVAL_PROFILE`` keys 1:1.
+    """
+    a_leaves = dict(config._iter_leaves(a))
+    b_leaves = dict(config._iter_leaves(b))
+    return {path for path, a_val in a_leaves.items() if a_val != b_leaves[path]}
 
 
 def test_eval_profile_documented_keys():
@@ -68,3 +87,48 @@ def test_resolve_eval_profile_update_maps_dotted_to_submodel_copy(tmp_path):
     # UnblockAutoConfig() replacing it wholesale.
     assert resolved_unblock_auto.budget_usd == base.unblock_auto.budget_usd
     assert resolved_unblock_auto.model == base.unblock_auto.model
+
+
+@pytest.mark.usefixtures('code_default_config')
+def test_apply_eval_profile_parity(tmp_path):
+    """The changed-leaf set between apply_eval_profile(base) and base equals EVAL_PROFILE exactly.
+
+    Invariant P1 / Boundary test B1 — the D5 root-cause guard. Exactness holds
+    by identity: model_copy(update=X) changes exactly X's leaves and every
+    profile leaf flips True -> False, so the diff is precisely the 5
+    documented EVAL_PROFILE keys — never more (an undocumented leak) or fewer
+    (a no-op profile entry).
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+
+    # Loud premise guard: every EVAL_PROFILE path must read True on a fresh
+    # code-default base, or flipping it to False below wouldn't actually
+    # change anything and the parity assertion would pass vacuously.
+    for path in EVAL_PROFILE:
+        assert config._get_leaf(base, path) is True, (
+            f'premise violated: {path!r} is not True on a fresh code-default '
+            f'OrchestratorConfig — the parity assertion below would be vacuous'
+        )
+
+    resolved = apply_eval_profile(base)
+
+    assert _changed_leaf_paths(resolved, base) == set(EVAL_PROFILE)
+
+
+def test_parity_tripwire_trips_on_undocumented_divergence(tmp_path):
+    """A synthetic non-profile divergence trips the tripwire — the RED signal B1 guards.
+
+    Proves the tripwire is actually sensitive to a leaked production field:
+    hand-inject a change to a field EVAL_PROFILE never touches
+    (``max_amendment_rounds``) and confirm the changed-leaf set no longer
+    equals ``set(EVAL_PROFILE)`` — with the offending field named in the diff.
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+    leaked = apply_eval_profile(base).model_copy(
+        update={'max_amendment_rounds': base.max_amendment_rounds + 1},
+    )
+
+    changed = _changed_leaf_paths(leaked, base)
+
+    assert changed != set(EVAL_PROFILE)
+    assert 'max_amendment_rounds' in changed
