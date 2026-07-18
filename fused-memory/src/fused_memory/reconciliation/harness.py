@@ -1939,6 +1939,21 @@ class ReconciliationHarness:
         full cycle). Consumed by the /health endpoint's additive
         ``recon_busy`` field (task 2703 δ) so a cycle-aware restart can defer
         while a cycle is running — machine-readable, no journal scraping.
+
+        Scope — the stage pipeline only (decision, task 2703 δ): an entry is
+        live only for the duration of the ``with self._active_runs.track(...)``
+        block in ``run_full_cycle``, i.e. the three-stage pipeline
+        (memory_consolidator → task_knowledge_sync → integrity_check) plus the
+        inline remediation pass. It is deliberately NOT held for the
+        fire-and-forget judge task (``asyncio.create_task(self._run_judge(...))``),
+        which outlives the cycle: stage reports are already durably persisted
+        (``update_run_stage_reports``) BEFORE the judge fires, so the judge only
+        appends an advisory verdict. A restart firing in the narrow window after
+        ``run_full_cycle`` returns may therefore cancel an in-flight judge — an
+        accepted trade-off, since the expensive, interruption-sensitive work a
+        cycle-aware restart must protect is the stage pipeline, not the judge.
+        The inline remediation pass runs inside the same ``track(...)`` block, so
+        it reuses the parent cycle's entry rather than opening its own.
         """
         return self._active_runs.snapshot()
 
@@ -2092,7 +2107,12 @@ class ReconciliationHarness:
                 # stage report, so this runs after update_run_stage_reports above.
                 await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
 
-                # Async judge review
+                # Async judge review. Fire-and-forget: it outlives this cycle and
+                # is intentionally NOT tracked by _active_runs / recon_busy (which
+                # scopes to the stage pipeline only — see recon_busy_snapshot).
+                # Stage reports are already persisted above, so a cycle-aware
+                # restart cancelling an in-flight judge here is an accepted
+                # trade-off (task 2703 δ).
                 if self.judge:
                     asyncio.create_task(self._run_judge(run_id))
 
