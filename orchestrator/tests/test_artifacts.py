@@ -1487,3 +1487,35 @@ class TestReviewVerdictCache:
             'verdicts': {},
         }
         assert artifacts.get_cached_verdict('tree_abc') is None
+
+
+class TestReviewCounters:
+    """Tests for the persisted task-lifetime amendment/review counters."""
+
+    def test_counters_default_zero(self, artifacts: TaskArtifacts):
+        assert artifacts.get_amendment_rounds_total() == 0
+        assert artifacts.get_review_cycles_total() == 0
+
+    def test_partial_update_amendment_only(self, artifacts: TaskArtifacts):
+        artifacts.set_review_counters(amendment_rounds_total=2)
+        assert artifacts.get_amendment_rounds_total() == 2
+        # The other counter is untouched.
+        assert artifacts.get_review_cycles_total() == 0
+
+    def test_independent_fields_read_modify_write(self, artifacts: TaskArtifacts):
+        artifacts.set_review_counters(amendment_rounds_total=2)
+        artifacts.set_review_counters(review_cycles_total=1)
+        # Setting review_cycles must not clobber amendment_rounds.
+        assert artifacts.get_amendment_rounds_total() == 2
+        assert artifacts.get_review_cycles_total() == 1
+
+    def test_counters_and_verdicts_coexist(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
+        artifacts.set_review_counters(
+            amendment_rounds_total=3, review_cycles_total=2
+        )
+        # Neither write clobbers the other's keys.
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None and rec['verdict'] == 'suggestions_only'
+        assert artifacts.get_amendment_rounds_total() == 3
+        assert artifacts.get_review_cycles_total() == 2
