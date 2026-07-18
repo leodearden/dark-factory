@@ -692,15 +692,20 @@ async def test_run_full_cycle_persists_judge_pending_marker_and_tracks_task(
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2])
 
-    # Truthy judge stub + no-op _run_judge that does NOT clear the marker, so the
-    # persisted judge_pending marker survives for the assertion below.
+    # Truthy judge stub + a _run_judge that blocks (and never clears the marker),
+    # so BOTH the persisted judge_pending marker AND the tracked task remain
+    # observable when we assert — a no-op judge would complete and self-discard
+    # from _judge_tasks (via its done-callback) before the assertion runs.
     harness.judge = MagicMock()
-    harness._run_judge = AsyncMock()
+    never_set = asyncio.Event()
+
+    async def _blocking_judge(_run_id):
+        await never_set.wait()
+
+    harness._run_judge = _blocking_judge
 
     run = await harness.run_full_cycle('test-project', 'buffer_size:2')
 
-    # Assert task-tracking BEFORE any further await so the done-callback discard
-    # cannot empty the set between the cycle returning and this check.
     assert harness._judge_tasks, '_spawn_judge must track the judge task in _judge_tasks'
 
     pending = await journal.get_pending_judge_runs()
@@ -708,6 +713,9 @@ async def test_run_full_cycle_persists_judge_pending_marker_and_tracks_task(
         'run_full_cycle must persist a judge_pending marker via _spawn_judge'
     )
 
+    # Cleanup: cancel the blocked judge task(s) and drain.
+    for t in list(harness._judge_tasks):
+        t.cancel()
     await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
 
 
