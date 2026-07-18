@@ -68,29 +68,33 @@ def _submit_aged(
 class TestOrphanL0Reaper:
     """Harness._reap_orphan_l0_escalations promotes aged orphan L0s to L1."""
 
-    def test_no_queue_is_noop(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_no_queue_is_noop(self, harness: Harness):
         harness._escalation_queue = None
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
 
-    def test_empty_queue(self, harness: Harness):
-        assert harness._reap_orphan_l0_escalations() == 0
+    @pytest.mark.asyncio
+    async def test_empty_queue(self, harness: Harness):
+        assert await harness._reap_orphan_l0_escalations() == 0
 
-    def test_young_l0_not_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_young_l0_not_promoted(self, harness: Harness):
         assert harness._escalation_queue is not None
         _submit_aged(harness._escalation_queue, 'review-abc', seconds_ago=10.0)
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
         pending = harness._escalation_queue.get_pending()
         assert len(pending) == 1
         assert pending[0].level == 0
 
-    def test_aged_orphan_l0_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_aged_orphan_l0_promoted(self, harness: Harness):
         assert harness._escalation_queue is not None
         original = _submit_aged(
             harness._escalation_queue, 'review-abc', seconds_ago=300.0,
             worktree='/home/leo/src/dark-factory/.worktrees/review-abc',
         )
 
-        count = harness._reap_orphan_l0_escalations()
+        count = await harness._reap_orphan_l0_escalations()
         assert count == 1
 
         all_escs = [
@@ -118,7 +122,8 @@ class TestOrphanL0Reaper:
         assert l1.worktree is None
         assert 'branch=task/review-abc' in (l1.detail or '')
 
-    def test_aged_orphan_l0_with_open_l1_dismissed_not_promoted(
+    @pytest.mark.asyncio
+    async def test_aged_orphan_l0_with_open_l1_dismissed_not_promoted(
         self, harness: Harness,
     ):
         """B2: an aged orphan L0 for a task that already has an open L1 is
@@ -138,7 +143,7 @@ class TestOrphanL0Reaper:
             harness._escalation_queue, 'task-99', seconds_ago=300.0, level=0,
         )
 
-        count = harness._reap_orphan_l0_escalations()
+        count = await harness._reap_orphan_l0_escalations()
         assert count == 0  # nothing promoted
 
         # The orphan L0 was dismissed by the reaper...
@@ -155,33 +160,36 @@ class TestOrphanL0Reaper:
         l1s = [e for e in all_escs if e and e.level == 1]
         assert len(l1s) == 1
 
-    def test_active_workflow_l0_not_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_active_workflow_l0_not_promoted(self, harness: Harness):
         """An L0 for a task_id with an active workflow is left alone."""
         assert harness._escalation_queue is not None
         import asyncio
         _submit_aged(harness._escalation_queue, 'task-42', seconds_ago=300.0)
         harness._escalation_events['task-42'] = asyncio.Event()
 
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
 
-    def test_l1_not_touched(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
         _submit_aged(
             harness._escalation_queue, 'review-abc', seconds_ago=300.0, level=1,
         )
-        assert harness._reap_orphan_l0_escalations() == 0
+        assert await harness._reap_orphan_l0_escalations() == 0
         pending = harness._escalation_queue.get_pending()
         assert len(pending) == 1
         assert pending[0].level == 1
 
-    def test_multiple_orphans_all_promoted(self, harness: Harness):
+    @pytest.mark.asyncio
+    async def test_multiple_orphans_all_promoted(self, harness: Harness):
         assert harness._escalation_queue is not None
         _submit_aged(harness._escalation_queue, 'review-a', seconds_ago=300.0)
         _submit_aged(harness._escalation_queue, 'review-b', seconds_ago=300.0)
         _submit_aged(harness._escalation_queue, 'review-c', seconds_ago=10.0)  # young
 
-        assert harness._reap_orphan_l0_escalations() == 2
+        assert await harness._reap_orphan_l0_escalations() == 2
 
         pending = harness._escalation_queue.get_pending()
         l1s = [e for e in pending if e.level == 1]

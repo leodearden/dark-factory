@@ -1368,12 +1368,15 @@ class Harness:
         self._lifecycle = registry
 
     async def _run_orphan_l0_reaper_pass(self) -> None:
-        """Async ``pass_fn`` wrapper for the (synchronous) orphan-L0 pass.
+        """Async ``pass_fn`` wrapper for the orphan-L0 pass.
 
-        ``_reap_orphan_l0_escalations`` is sync; ``BackgroundService``
-        requires an ``Awaitable[None]`` pass_fn (task 2241, W10-η).
+        ``_reap_orphan_l0_escalations`` is itself async (task 2725 — it
+        needs to ``await scheduler.get_task`` to check for a
+        terminal+merged subject task on the done-step-commit orphan
+        class); ``BackgroundService`` requires an ``Awaitable[None]``
+        pass_fn (task 2241, W10-η).
         """
-        self._reap_orphan_l0_escalations()
+        await self._reap_orphan_l0_escalations()
 
     async def _run_terminal_status_watcher_pass(self) -> None:
         """Async ``pass_fn`` wrapper discarding the terminal-scan cancelled count.
@@ -7942,13 +7945,18 @@ task, include it with an empty "files" list rather than omitting it.
             self._escalation_task = None
             logger.info('Escalation server stopped')
 
-    def _reap_orphan_l0_escalations(self) -> int:
+    async def _reap_orphan_l0_escalations(self) -> int:
         """Single pass: promote any overdue orphan L0 to L1.  Returns count.
 
         Extracted from the loop so tests can drive it deterministically.
         An escalation is an orphan when its ``task_id`` is not in
         ``_escalation_events`` (no running workflow) and it is older than
         ``orphan_l0_timeout_secs``.
+
+        Async (task 2725): the done-step-commit orphan class needs to
+        ``await self.scheduler.get_task(...)`` to check whether its
+        subject task is terminal+merged (rebase-superseded false
+        positive) before promoting.
         """
         if self._escalation_queue is None:
             return 0
