@@ -733,11 +733,15 @@ async def reap_leaked_ticket_workers() -> int:
     also close the still-fixture-owned ticket store out from under its own
     teardown).
 
-    Best-effort and bounded: never raises, and is a cheap no-op for the
-    (vast majority of) tests that leak no worker. The suppressed-exception
-    set deliberately excludes bare ``BaseException`` so a ``CancelledError``
-    targeting the reaper's own task (as opposed to the worker task it is
-    draining) still propagates instead of being silently swallowed.
+    Best-effort and bounded, and a cheap no-op for the (vast majority of)
+    tests that leak no worker. Only the ``asyncio.wait_for`` timeout is
+    suppressed (``asyncio.TimeoutError``): the drained worker's own
+    exceptions are already captured as results by ``return_exceptions=True``
+    in the ``gather``, so nothing else needs catching. A genuine bug inside
+    the reaper itself — or a ``CancelledError`` targeting the reaper's own
+    task rather than the worker task it is draining — is deliberately left
+    to propagate instead of being masked by a broad ``Exception`` /
+    ``BaseException`` suppress (loud-over-silent-degradation).
 
     Returns:
         The number of orphaned worker tasks actually cancelled and drained
@@ -753,7 +757,7 @@ async def reap_leaked_ticket_workers() -> int:
         if not getattr(coro, '__qualname__', '').endswith('TaskInterceptor._curator_worker'):
             continue
         task.cancel()
-        with contextlib.suppress(asyncio.TimeoutError, Exception):
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), timeout=10.0,
             )
