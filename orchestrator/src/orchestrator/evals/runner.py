@@ -571,8 +571,9 @@ class _StubMcpSession:
         """Dispatch an in-memory MCP tool call and return a JSON-RPC envelope.
 
         Supported tools: ``set_task_status``, ``get_task``, ``get_tasks``,
-        ``get_statuses``, ``update_task``, ``set_task_claimant``.  Unknown tool
-        names raise ``NotImplementedError``.
+        ``get_statuses``, ``update_task``, ``set_task_claimant``,
+        ``get_external_statuses``.  Unknown tool names raise
+        ``NotImplementedError``.
 
         .. note::
             Terminal-state enforcement is intentionally **not** simulated.
@@ -613,6 +614,17 @@ class _StubMcpSession:
             # NOT recorded here, mirroring the real tool which never touches it.
             task_id = arguments['id']
             return self._envelope(json.dumps({'id': task_id}))
+        if name == 'get_external_statuses':
+            # Cross-project dep resolver (Scheduler.get_external_statuses parses
+            # the response via parse_tool_result(result, None, dict) — the
+            # whole-inner-dict contract). Return a FLAT {dep: status} dict (no
+            # 'statuses' wrapper) keying EVERY requested dep so no missing-key
+            # ExternalResolverError; empty deps → {}. Eval runs are single-task
+            # with no cross-project deps, so this is inert in practice but
+            # contract-complete (non-blocking 'done') if ever exercised.
+            deps = arguments.get('deps', [])
+            mapping = {d: 'done' for d in deps}
+            return self._envelope(json.dumps(mapping))
         raise NotImplementedError(
             f'_StubMcpSession: unknown tool {name!r} — add a branch if this tool is needed'
         )
