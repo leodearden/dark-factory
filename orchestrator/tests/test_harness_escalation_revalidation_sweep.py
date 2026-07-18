@@ -563,6 +563,7 @@ class TestCloseSupersededMainSweepEscalations:
         assert resolution and isinstance(resolution, str)
         assert kwargs.get('dismiss') is True
         assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
+        assert kwargs.get('resolution_class') == 'benign'
         h.event_store.emit.assert_called_once()  # type: ignore[attr-defined]
         emit_args, _emit_kwargs = h.event_store.emit.call_args  # type: ignore[attr-defined]
         assert emit_args[0] == EventType.escalation_resolved
@@ -586,6 +587,7 @@ class TestCloseSupersededMainSweepEscalations:
         _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
         assert kwargs.get('dismiss') is True
         assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
+        assert kwargs.get('resolution_class') == 'benign'
 
     @pytest.mark.asyncio
     async def test_not_yet_superseded_leaves_open(self) -> None:

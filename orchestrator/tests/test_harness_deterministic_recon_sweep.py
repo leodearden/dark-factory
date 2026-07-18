@@ -547,6 +547,7 @@ class TestRevalidateOpenDeterministicEscalation:
         resolution = args[1] if len(args) > 1 else kwargs.get('resolution')
         assert resolution and isinstance(resolution, str)
         assert kwargs.get('resolved_by') == 'harness-deterministic-recon-sweep'
+        assert kwargs.get('resolution_class') == 'benign'
 
     @pytest.mark.asyncio
     async def test_does_not_resolve_when_unconfirmed(self) -> None:
@@ -603,6 +604,8 @@ class TestRevalidateOpenDeterministicEscalation:
         await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
 
         h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert kwargs.get('resolution_class') == 'benign'
 
 
 # ---------------------------------------------------------------------------
