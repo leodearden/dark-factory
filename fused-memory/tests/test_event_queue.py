@@ -1327,6 +1327,6 @@ async def test_no_journal_path_creates_no_journal(real_buffer, tmp_path):
     assert q._journal is None
     assert q.enqueue(_make_event()) is True
     assert q._queue.qsize() == 1
-    # No journal db file was created anywhere under tmp_path.
-    assert not (tmp_path / 'ej.db').exists()
-    assert list(tmp_path.glob('*.db')) == []
+    # No journal db was created — the only *.db under tmp_path is the buffer's
+    # own file (from the real_buffer fixture), never a journal db.
+    assert {p.name for p in tmp_path.glob('*.db')} == {'buf.db'}

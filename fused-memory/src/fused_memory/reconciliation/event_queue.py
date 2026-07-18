@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 
 import aiosqlite
 
+from fused_memory.reconciliation.event_journal import EventJournal
+
 if TYPE_CHECKING:
     from fused_memory.models.reconciliation import ReconciliationEvent
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -122,9 +124,17 @@ class EventQueue:
         overflow_warn_interval_seconds: float = 60.0,
         max_bytes: int | None = None,
         keep_rotations: int = 3,
+        journal_path: Path | str | None = None,
     ):
         self._buffer = event_buffer
         self._dead_letter_path = Path(dead_letter_path)
+        # Durable-at-enqueue write-ahead log. None (the default) keeps every
+        # existing journal_path-less caller/test byte-unchanged — critically the
+        # timing test test_enqueue_returns_immediately, which would regress if a
+        # synchronous FULL commit were added to enqueue unconditionally. main.py
+        # wires the real path (data_dir/'event_journal.db'); the None default is
+        # the off-switch.
+        self._journal = EventJournal(journal_path) if journal_path is not None else None
         self._queue: asyncio.Queue[ReconciliationEvent] = asyncio.Queue(maxsize=maxsize)
         self._retry_initial = retry_initial_seconds
         self._retry_max = retry_max_seconds
@@ -208,9 +218,19 @@ class EventQueue:
         if residue:
             for event in residue:
                 self._write_dead_letter(event, reason='shutdown_timeout', attempts=0)
+                # Durability handed off to the dead-letter file — drop the
+                # journal row so recover() doesn't redeliver it next startup.
+                if self._journal is not None:
+                    self._journal.mark_processed(event.id)
             logger.warning(
                 'EventQueue: dead-lettered %d events on shutdown', len(residue),
             )
+
+        # Close the durable journal last: every surviving in-flight event has
+        # now been either committed to the buffer (drainer marked it processed)
+        # or dead-lettered (marked processed just above).
+        if self._journal is not None:
+            self._journal.close()
 
     # ── test helper ───────────────────────────────────────────────────
 
@@ -235,14 +255,26 @@ class EventQueue:
         """
         if self._closed:
             # Shutting down — divert straight to dead-letter so nothing is lost.
+            # The journal may already be closed here, so do NOT touch it; the
+            # dead-letter file provides durability for post-close events.
             self._write_dead_letter(event, reason='post_close', attempts=0)
             return False
+        # Durable-at-enqueue: persist the event synchronously BEFORE the
+        # in-memory put, so a hard kill between here and the drainer's commit
+        # cannot silently drop it. The in-memory queue is a dispatch cache over
+        # this durable row; startup recover() re-enqueues survivors.
+        if self._journal is not None:
+            self._journal.append(event)
         try:
             self._queue.put_nowait(event)
             return True
         except asyncio.QueueFull:
             self._overflow_drops += 1
             self._write_dead_letter(event, reason='overflow_drop', attempts=0)
+            # Durability just handed off to the dead-letter file — drop the
+            # journal row so it isn't redelivered on the next recover().
+            if self._journal is not None:
+                self._journal.mark_processed(event.id)
             now = time.monotonic()
             if (now - self._last_overflow_warn_ts) >= self._overflow_warn_interval:
                 self._last_overflow_warn_ts = now
