@@ -637,6 +637,84 @@ class TestReconciliationConfigStormKnobs:
             ReconciliationConfig(dead_owner_suppression_storm_window_seconds=-1.0)
 
 
+class TestReconciliationConfigResumeKnobs:
+    """Tests for the interrupted-run resume knobs (task 2717 / PRD σ, rec 13).
+
+    Five new fields on ReconciliationConfig gate the startup adopt-and-resume
+    pass:
+      - resume_after_restart (bool, default True)
+      - resume_freshness_window_seconds (int, gt=0, default 3600)
+      - resume_max_attempts_per_run (int, gt=0, default 2)
+      - resume_failure_storm_threshold (int, gt=0, default 6)
+      - resume_failure_storm_window_seconds (float, gt=0, default 3600.0)
+    """
+
+    # --- defaults ---
+
+    def test_default_resume_after_restart_is_true(self):
+        assert ReconciliationConfig().resume_after_restart is True
+
+    def test_default_resume_freshness_window_is_3600(self):
+        assert ReconciliationConfig().resume_freshness_window_seconds == 3600
+
+    def test_default_resume_max_attempts_is_2(self):
+        assert ReconciliationConfig().resume_max_attempts_per_run == 2
+
+    def test_default_resume_failure_storm_threshold_is_positive(self):
+        cfg = ReconciliationConfig()
+        assert cfg.resume_failure_storm_threshold == 6
+        assert cfg.resume_failure_storm_threshold > 0
+
+    def test_default_resume_failure_storm_window_is_positive(self):
+        cfg = ReconciliationConfig()
+        assert cfg.resume_failure_storm_window_seconds == 3600.0
+        assert cfg.resume_failure_storm_window_seconds > 0
+
+    # --- override accepted ---
+
+    def test_resume_after_restart_override_accepted(self):
+        cfg = ReconciliationConfig(resume_after_restart=False)
+        assert cfg.resume_after_restart is False
+
+    def test_resume_freshness_window_override_accepted(self):
+        cfg = ReconciliationConfig(resume_freshness_window_seconds=7200)
+        assert cfg.resume_freshness_window_seconds == 7200
+
+    def test_resume_max_attempts_override_accepted(self):
+        cfg = ReconciliationConfig(resume_max_attempts_per_run=1)
+        assert cfg.resume_max_attempts_per_run == 1
+
+    # --- gt=0 bound: resume_freshness_window_seconds ---
+
+    def test_resume_freshness_window_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(resume_freshness_window_seconds=0)
+
+    def test_resume_freshness_window_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(resume_freshness_window_seconds=-1)
+
+    # --- gt=0 bound: resume_max_attempts_per_run ---
+
+    def test_resume_max_attempts_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(resume_max_attempts_per_run=0)
+
+    def test_resume_max_attempts_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(resume_max_attempts_per_run=-1)
+
+    # --- gt=0 bounds: storm knobs ---
+
+    def test_resume_failure_storm_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(resume_failure_storm_threshold=0)
+
+    def test_resume_failure_storm_window_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(resume_failure_storm_window_seconds=0)
+
+
 class TestConfigYamlBacklogHardLimitOverrides:
     """Deployment test: config.yaml must carry the reify override (task 1764).
 

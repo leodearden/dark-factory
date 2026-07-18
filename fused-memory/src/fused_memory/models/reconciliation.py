@@ -126,6 +126,12 @@ class RunStatus(StrEnum):
     failed = 'failed'
     rolled_back = 'rolled_back'
     circuit_breaker = 'circuit_breaker'
+    # A run whose in-flight stage was cancelled by a restart while
+    # config.resume_after_restart was set. Unlike 'failed', an interrupted run
+    # keeps its drained events and per-run transcript so the startup
+    # adopt-and-resume pass (task σ) can --resume the SAME run_id at its
+    # stage_cursor rather than re-running from stage 1.
+    interrupted = 'interrupted'
 
 
 class ReconciliationRun(BaseModel):

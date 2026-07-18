@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
 from shared.safe_io import load_json_or_warn
 
@@ -123,8 +125,19 @@ class BaseStage:
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
+        resume_session_id: str | None = None,
     ) -> StageReport:
-        """Execute this stage via Claude CLI with MCP tools."""
+        """Execute this stage via Claude CLI with MCP tools.
+
+        ``resume_session_id`` (task 2717 σ) is set only by the startup
+        adopt-and-resume pass, to ``--resume`` an in-flight session that a
+        restart interrupted mid-stage. When set AND its transcript is still on
+        disk in this run's per-run config dir (record_run_session's snapshot is
+        best-effort — see its docstring warning), the stage subprocess resumes
+        that session and is handed a purpose-written recovery prompt; otherwise
+        --resume is dropped and the stage runs fresh. Defaults to None — every
+        non-resume caller keeps today's fresh-launch behaviour.
+        """
         require_project_id(self.project_id)
         require_run_id(run_id)
 
@@ -233,10 +246,44 @@ class BaseStage:
         await self.journal.record_run_session(
             run_id, session_id=session_id, stage_cursor=self.stage_id.value
         )
+
+        # Task σ resume seam: when the startup adopt-and-resume pass supplies the
+        # in-flight session id, --resume it IFF its transcript is still on disk in
+        # this run's per-run config dir (config_dir is keyed on run_id, so it is
+        # the SAME dir across the interrupt). record_run_session's snapshot is
+        # best-effort — it can go stale after an internal cap retry — so validate
+        # the transcript before trusting it to --resume. On a valid transcript,
+        # deliver a purpose-written recovery prompt (resume_delivers_prompt=True)
+        # that ALSO embeds the full stage payload, so a resume failure falls back
+        # to a fully-contexted fresh invocation via invoke_with_cap_retry's
+        # original_prompt. On a missing/empty transcript, drop --resume and run
+        # the stage fresh.
+        effective_payload = payload
+        effective_resume_session_id: str | None = None
+        resume_delivers_prompt = False
+        if resume_session_id:
+            transcript = read_transcript_records(config_dir.path, resume_session_id)
+            if transcript:
+                effective_resume_session_id = resume_session_id
+                resume_delivers_prompt = True
+                effective_payload = self._build_recovery_prompt(run_id, payload)
+            else:
+                logger.warning(
+                    'Stage %s run_id=%s: resume_session_id=%s has no transcript in '
+                    '%s — dropping --resume, running the stage fresh',
+                    self.stage_id.value, run_id, resume_session_id, config_dir.path,
+                )
+
+        # Clear the session snapshot on a normal stage exit (and on non-cancel
+        # errors) but PRESERVE it on asyncio.CancelledError: a restart cancelling
+        # the in-flight stage must leave (session_id, stage_cursor) on the run row
+        # so the startup adopt-and-resume pass (task σ) can --resume this run.
+        # A non-cancel exception still clears (the run is failing, not resuming).
+        cancelled = False
         try:
             stage_result = await run_stage_via_cli(
                 system_prompt=self.get_system_prompt(),
-                payload=payload,
+                payload=effective_payload,
                 disallowed_tools=disallowed,
                 config=self.config,
                 mcp_config=mcp_config,
@@ -246,9 +293,15 @@ class BaseStage:
                 output_schema=effective_output_schema,
                 session_id=session_id,
                 config_dir=config_dir,
+                resume_session_id=effective_resume_session_id,
+                resume_delivers_prompt=resume_delivers_prompt,
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            await self.journal.clear_run_session(run_id)
+            if not cancelled:
+                await self.journal.clear_run_session(run_id)
 
         completed = datetime.now(UTC)
 
@@ -315,6 +368,36 @@ class BaseStage:
             )
 
         return stage_report
+
+    def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
+        """Build the continuation prompt delivered to a ``--resume``d stage (task σ).
+
+        Unlike the generic CRASH_RECOVERY placeholder ('continue where you left
+        off'), this is purpose-written for reconciliation: it frames the interrupt
+        as a fused-memory restart, notes the MCP reset, and — critically — points
+        the agent at the write journal (``causation_id={run_id}``) so it can see
+        which writes it already applied this run before repeating them. The full
+        original stage payload is appended verbatim so the same string doubles as
+        the fresh-fallback prompt (invoke_with_cap_retry keeps ``prompt`` as
+        ``original_prompt`` when a resume fails and it restarts fresh).
+        """
+        return (
+            '## Reconciliation run RESUMED after a restart\n\n'
+            f'This reconciliation stage (run_id={run_id}, stage={self.stage_id.value}) '
+            'was INTERRUPTED by a fused-memory restart mid-run and has now been '
+            'resumed via --resume. Your MCP tool connections were reset by the '
+            'restart, so re-establish any state you need before continuing.\n\n'
+            '**Some of the writes you made before the interrupt may ALREADY have '
+            'been applied.** Every fused-memory write in this run was recorded in '
+            f'the write_journal under causation_id={run_id}. Before repeating any '
+            'write, check what you already recorded this run (the write_journal '
+            f'entries with causation_id={run_id}, and the current memory/task '
+            'state they produced) so you do not duplicate work already committed. '
+            'Then continue exactly where you left off and finish the stage.\n\n'
+            '--- Original stage task (unchanged; also used verbatim if this stage '
+            'has to restart fresh) ---\n\n'
+            f'{stage_payload}'
+        )
 
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.

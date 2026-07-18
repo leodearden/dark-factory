@@ -1792,6 +1792,7 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
+        resume_session_id: str | None = None,
     ) -> StageReport:
         """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
         apply the same-run Stage 1 human_operator_required dedup post-processor.
@@ -1824,7 +1825,10 @@ class TaskKnowledgeSync(BaseStage):
         # to the post-flight guard's flag_deleted_records join.
         self._stage2_combined_flags = []
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
-        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+        report = await super().run(
+            events, watermark, prior_reports, run_id, model=model,
+            resume_session_id=resume_session_id,
+        )
 
         # --- missing-run_id marker stat (task 1257) ---
         # Explicit zero is required so downstream consumers never need
@@ -2696,6 +2700,7 @@ class IntegrityCheck(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
+        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
@@ -2715,7 +2720,10 @@ class IntegrityCheck(BaseStage):
 
         Mirrors MemoryConsolidator.run() override structure (Stage 1).
         """
-        report = await super().run(events, watermark, prior_reports, run_id, model=model)
+        report = await super().run(
+            events, watermark, prior_reports, run_id, model=model,
+            resume_session_id=resume_session_id,
+        )
 
         # Layer 3 (finding-side) gate for blocked-snapshot false positives.
         # Mirrors the filter_stale_count_snapshot_corrections idiom in

@@ -729,6 +729,23 @@ class ReconciliationJournal:
             rows = await cursor.fetchall()
         return [_row_to_run(row) for row in rows]
 
+    async def get_interrupted_runs(self) -> list[ReconciliationRun]:
+        """Return every run marked 'interrupted', with no age filter.
+
+        Mirrors ``get_running_runs`` but filters the restart-interrupt status
+        (see ``RunStatus.interrupted``). Consumed by the startup
+        adopt-and-resume pass (task σ / ``_resume_interrupted_runs``): a run left
+        ``interrupted`` by a dead predecessor still carries its session_id /
+        stage_cursor snapshot and its drained events, so the pass can --resume
+        the same run_id rather than re-run it from scratch.
+        """
+        db = self._require_db()
+        async with db.execute(
+            "SELECT * FROM runs WHERE status = 'interrupted'"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_row_to_run(row) for row in rows]
+
     # ── Chunk boundaries ─────────────────────────────────────────────
 
     async def record_chunk_boundary(

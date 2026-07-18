@@ -678,6 +678,68 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Interrupted-run resume knobs (task 2717 / PRD σ, rec 13). Gate the
+    # startup adopt-and-resume pass (_resume_interrupted_runs): a fused-memory
+    # restart mid-stage marks the run 'interrupted' (keeping its drained events
+    # and per-run transcript), and the next startup --resume's the SAME run_id
+    # at its stage_cursor. On ANY doubt the pass falls back to today's
+    # failed+restore recovery path.
+    resume_after_restart: bool = Field(
+        default=True,
+        description=(
+            'Master switch for interrupted-run resume. When True, run_full_cycle '
+            "marks a restart-cancelled run 'interrupted' (no restore_drained, "
+            'transcript preserved) and the startup pass adopts and --resume\'s it. '
+            'Set False to opt a deploy out of resume when it changes recon prompts '
+            'or tooling — a resumed session finishes under the OLD system prompt by '
+            'construction (--resume skips the system prompt), so a prompt/tool '
+            'change must not be resumed into. When False, a cancelled cycle keeps '
+            "today's failed + restore_drained + GC behaviour verbatim."
+        ),
+    )
+    resume_freshness_window_seconds: int = Field(
+        default=3600,
+        gt=0,
+        description=(
+            'Max age (seconds) of an interrupted run — measured from its '
+            'completed_at (the interrupt instant stamped by complete_run) — that '
+            'the startup pass will still --resume. Beyond this window the run is '
+            "treated as too stale to resume and falls back to today's "
+            'failed+restore path. Default 3600s.'
+        ),
+    )
+    resume_max_attempts_per_run: int = Field(
+        default=2,
+        gt=0,
+        description=(
+            'Per-run cap on resume attempts (tracked in '
+            "stage_reports['_resume'].count). Once a run has been resumed this "
+            'many times it falls back to failed+restore instead of resuming again, '
+            'bounding a resume→re-interrupt→resume loop. Default 2.'
+        ),
+    )
+    resume_failure_storm_threshold: int = Field(
+        default=6,
+        gt=0,
+        description=(
+            'Number of unresumable/failed resume attempts within '
+            'resume_failure_storm_window_seconds that triggers a single loud '
+            'recon_resume_failure_storm escalation. Mirrors '
+            'dead_owner_suppression_storm_threshold. Default 6 per 3600s.'
+        ),
+    )
+    resume_failure_storm_window_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Rolling time window (seconds) for counting resume failures. A single '
+            'recon_resume_failure_storm alarm fires per window when the count '
+            'crosses resume_failure_storm_threshold; also doubles as the '
+            'per-window rate limit. Mirrors '
+            'dead_owner_suppression_storm_window_seconds. Default 3600.0.'
+        ),
+    )
+
     # Tiered models
     sonnet_model: str = Field(default='sonnet')
     opus_model: str = Field(default='opus')
