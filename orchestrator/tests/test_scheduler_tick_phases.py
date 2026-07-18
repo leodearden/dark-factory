@@ -121,7 +121,7 @@ class TestHygienePhases:
         # A non-delivered streak for the same dependent — must STILL be GC'd.
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10.0
+        scheduler._pending_anchor['10'] = 10
 
         ctx = TickContext(
             tasks=[],
@@ -148,7 +148,7 @@ class TestHygienePhases:
         GC'd — the protection is narrowed to non-terminal transient absence,
         not a blanket exemption (task 2743)."""
         scheduler._streak_delivered_fail.counts[('11', '21')] = 2
-        scheduler._pending_anchor['11'] = 11.0
+        scheduler._pending_anchor['11'] = 11
 
         ctx = TickContext(
             tasks=[],

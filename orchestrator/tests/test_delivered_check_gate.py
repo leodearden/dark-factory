@@ -1851,7 +1851,7 @@ class TestDeliveredCheckGraceEscalation:
                 # _update_age_anchors stamps its pending-age anchor each tick
                 # it appears in the fetch; model that so tick3's absence
                 # exercises the stale_sweep absence-GC path under test.
-                scheduler._pending_anchor['10'] = 10.0
+                scheduler._pending_anchor['10'] = 10
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'20': 'done'},
