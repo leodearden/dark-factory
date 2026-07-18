@@ -195,6 +195,7 @@ async def test_identical_infer_false_writes_all_land_distinct(
         await backend.close()
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), reason='real embedder needs OPENAI_API_KEY')
 @pytest.mark.asyncio
 async def test_identical_writes_land_with_real_openai_embeddings(
@@ -209,6 +210,12 @@ async def test_identical_writes_land_with_real_openai_embeddings(
     survey's '~0.92 cosine similarity dedup' observation: even the
     strongest realistic near-duplicate signal never triggers a drop,
     because the infer=False path never consults embeddings for dedup.
+
+    Opt-in via `-m integration` (task 2736): this test makes a genuine
+    OpenAI network call, so it is deselected from the default suite by
+    fused-memory/pyproject.toml's `-m 'not integration'` addopts. The
+    skipif above is retained as a belt-and-braces guard for the
+    addopts-cleared recovery/flaky-rerun path (verify_cmd.serial_pytest).
     """
     backend = await _build_recon_backend(mock_config, recon_scope, monkeypatch, real_embedder=True)
     try:
