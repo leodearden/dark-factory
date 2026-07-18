@@ -78,6 +78,9 @@ class TestWorkflowVerifyProducerEmit:
         store = EventStore(tmp_path / 'runs.db', run_id='run-test')
         wf = _make_workflow(event_store=store)
         wf._base_commit = 'deadbeef'
+        # task 2752: the verified branch tip captured just before REVIEW entry
+        # is recorded in the workflow_verify payload as the durable checkpoint key.
+        wf._verify_green_tip_sha = 'cafef00d'
         wf.state = WorkflowState.VERIFY
 
         wf._enter_phase(WorkflowState.REVIEW)
@@ -87,9 +90,28 @@ class TestWorkflowVerifyProducerEmit:
         assert rows[0]['task_id'] == wf.task_id
         assert rows[0]['data'] == {
             'passed': True,
+            'tip_sha': 'cafef00d',
             'base_sha': 'deadbeef',
             'branch': f'{wf.config.git.branch_prefix}{wf.task_id}',
         }
+
+    def test_verify_checkpoint_hit_suppresses_workflow_verify_emit(self, tmp_path: Path):
+        """task 2752: when the durable verified-green checkpoint fired this
+        cycle (``_verify_checkpoint_hit`` True), verify did NOT actually run, so
+        the VERIFY→REVIEW edge must NOT re-emit ``workflow_verify`` — re-emitting
+        would assert a verify that never happened (honesty / no-silent-fail-soft)
+        and violate the task's "no new workflow_verify on the fast-path" signal.
+        The honest observability signal on a skip is ``phase_skipped(verify)``."""
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        wf = _make_workflow(event_store=store)
+        wf._base_commit = 'deadbeef'
+        wf._verify_green_tip_sha = 'cafef00d'
+        wf._verify_checkpoint_hit = True
+        wf.state = WorkflowState.VERIFY
+
+        wf._enter_phase(WorkflowState.REVIEW)
+
+        assert store.fetch_events_by_type(EventType.workflow_verify) == []
 
     def test_execute_to_verify_emits_no_workflow_verify_row(self, tmp_path: Path):
         """A non-VERIFY→REVIEW edge (EXECUTE→VERIFY) must not emit."""
