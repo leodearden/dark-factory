@@ -74,6 +74,25 @@ unaffected either way, since it already ORs in ``worktree_registered``/
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
+**Reaped worktrees and bare branches (task 2767, reify#5245).** A worktree
+entry in ``git worktree list --porcelain`` marked ``prunable`` (its directory
+was removed/reaped, but the registration itself was not yet pruned) does NOT
+count toward ``worktree_registered`` — only a LIVE (non-prunable) worktree
+does. Likewise, a branch with zero commits of its own beyond ``base_branch``
+(checked via ``git rev-list --count <base_branch>..<branch>``; "bare" — e.g.
+a branch whose reflog holds only a "Created from main" entry) has its tip
+timestamp stripped from ``recent_commit``, since that timestamp is just the
+base-branch commit, not evidence of task work. When BOTH hold — the branch is
+bare AND no live worktree is registered AND there is no recent commit —
+:func:`_orchestrator_signal_ineligible`'s rule 4 additionally drops the
+project-wide ``orchestrator_live`` signal, **regardless of status or
+task_kind** (unlike rules 1-3): this is the exact reify#5245 shape, where a
+task with no live work of its own kept showing worktree+orchestrator signals
+solely because a *different*, genuinely live task shared the same project-wide
+orchestrator lock. Both gates are fail-safe TOWARD live: a missing branch, a
+subprocess error, or an unparseable ``rev-list`` count never marks a worktree
+prunable or a branch bare — only positive evidence does.
+
 Branch convention: ``task/<task_id>`` (matches the orchestrator's worktree naming).
 Injectable ``now`` for deterministic tests.
 """
@@ -248,10 +267,14 @@ def detect_live_workflow(
     # project-wide lock is not evidence of liveness for a task that will never
     # be dispatched (or, for blocked deterministic tasks, never acquires a
     # worktree/branch of its own; or, for blocked normal tasks with no
-    # per-task git evidence, task 2409).  worktree_registered/recent_commit
-    # (already computed above) are threaded through so rule 3 can require
-    # their absence.
-    if _orchestrator_signal_ineligible(status, task_kind, worktree_registered, recent_commit):
+    # per-task git evidence, task 2409; or, status-agnostically, for a task
+    # whose branch is provably bare with its worktree reaped, task 2767).  The
+    # FINAL worktree_registered/recent_commit (post-prunable/post-bare, already
+    # computed above) and branch_bare are threaded through so rules 3 and 4 can
+    # evaluate the same evidence the caller sees.
+    if _orchestrator_signal_ineligible(
+        status, task_kind, worktree_registered, recent_commit, branch_bare
+    ):
         orchestrator_live = False
     else:
         orchestrator_live = (
@@ -295,12 +318,13 @@ def _orchestrator_signal_ineligible(
     task_kind: str | None,
     worktree_registered: bool = False,
     recent_commit: bool = False,
+    branch_bare: bool = False,
 ) -> bool:
     """Return True when the project-wide ``orchestrator_live`` signal must be
-    forced False for this *status*/*task_kind* (/*worktree_registered*/
-    *recent_commit*) combination.
+    forced False for this *status*/*task_kind*/*worktree_registered*/
+    *recent_commit*/*branch_bare* combination.
 
-    Three independent rules are centralized here:
+    Four independent rules are centralized here:
 
     1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
        (``deferred``, ``done``, ``cancelled``) — statuses that are never
@@ -321,6 +345,25 @@ def _orchestrator_signal_ineligible(
        concern), so this rule only suppresses the bare case, leaving
        ``is_live`` (which already ORs in ``worktree_registered``/
        ``recent_commit``) unaffected whenever real per-task evidence exists.
+    4. ``branch_bare and not worktree_registered and not recent_commit`` — the
+       task's branch is provably bare (zero commits beyond ``base_branch``)
+       AND no LIVE worktree is registered (a registered-but-prunable entry
+       does not count — see ``worktree_registered``'s meaning) AND there is
+       no recent commit, i.e. POSITIVE evidence the branch has no work and
+       its worktree was reaped, so a running project orchestrator is
+       demonstrably not on THIS task (task 2767, reify#5245). Deliberately
+       **status/task_kind-agnostic** — unlike rules 1-3, this rule is
+       evaluated regardless of ``status``/``task_kind`` (including for
+       ``pending``/``in-progress``/``review``/``merge-deferred``, and
+       independent of rules 2/3's blocked-only scoping), because
+       ``recon_write_policy`` Gate 2 calls the detector without ``task_kind``
+       and with whatever status the task currently holds — a status-gated
+       rule would not fire there. Not a race risk: an absent branch yields an
+       unknown (not ``0``) commit count (see
+       :func:`_branch_own_commit_count`), so a not-yet-dispatched task is
+       unaffected; a just-started dispatch keeps a LIVE (non-prunable)
+       worktree, so ``worktree_registered`` is True and this rule stays
+       inert.
 
     ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
     wholesale: a normal blocked task (``task_kind`` absent or not
@@ -328,19 +371,21 @@ def _orchestrator_signal_ineligible(
     the project-wide orchestrator lock remains real per-task evidence for it
     *when there is other evidence to corroborate it*. Hence the compound
     (status AND task_kind [AND NOT git-evidence]) conditions for rules 2 and 3,
-    rather than an unconditional status addition.
+    rather than an unconditional status addition. Rule 4 is the sole exception
+    to the "scoped by status" pattern, by design (see above).
     """
     if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
         return True
-    if status != 'blocked':
-        return False
-    if task_kind == DETERMINISTIC_TASK_KIND:
-        return True
-    return (
-        task_kind in (None, NORMAL_TASK_KIND)
-        and not worktree_registered
-        and not recent_commit
-    )
+    if status == 'blocked':
+        if task_kind == DETERMINISTIC_TASK_KIND:
+            return True
+        if (
+            task_kind in (None, NORMAL_TASK_KIND)
+            and not worktree_registered
+            and not recent_commit
+        ):
+            return True
+    return branch_bare and not worktree_registered and not recent_commit
 
 
 def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
