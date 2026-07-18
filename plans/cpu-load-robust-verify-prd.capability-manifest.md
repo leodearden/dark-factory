@@ -14,6 +14,8 @@ informational for this batch; the sidecar is hand-stamped at decompose (per deco
 | Serial isolated re-run command builder | grep:`verify_cmd.py` `def serial_pytest`; `verify.py:1063` `_serial_pytest_str` | PASS wired |
 | main-sweep isolated-rerun-suppress precedent to mirror (INV-5 reuse) | grep:`verify.py:5201` `run_main_tip_sweep` retry-on-flake + `_extract_failing_test_ids` confirm gate | PASS wired |
 | Merge-role verify result handler to hook | grep:`verify.py` `run_scoped_verification` + `role='merge'` branch (`verify.py:981` main-probe, merge fan-out `verify.py:4557-4623`) | PASS wired |
+| Gap is real: existing bare-crash retry is gated OUT of merge path | grep:`verify.py:3822` `not is_merge_verify` guard on `_is_bare_xdist_worker_crash` reclassify (tasks 2365/2619, task-path only) | PASS wired (gap confirmed) |
+| α resolves inline (return verdict), never raises on merge path | grep:`verify.py:3800` comment "merge_queue.py has no VerifyInfraError handler"; main-sweep return-a-category precedent | PASS wired |
 | Structured `merge_flake_suppressed` fact emittable (INV-2) | grep:`event_store.py` `EventType` (existing event bus); observation/hypothesis split precedent | PASS wired |
 | Storm-streak escalation on the fail-soft path (INV-4) | built by α; consecutive-streak precedent `merge_liveness.py`; boundary test **B4** | PASS (bound as B4) |
 | Never suppress a genuine failure (rejection) | built by α; boundary tests **B2** (re-run still fails → red) + **B3** (collection ERROR → red) | PASS (bound as B2/B3) |

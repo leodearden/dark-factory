@@ -17,7 +17,9 @@ tasks:
       expect: present
   - name: merge-role-isolated-rerun-suppress-wired
     binding: capability→producer (delivered by α) — merge-role verify gains the
-      main-sweep confirm-gate; suppresses load-induced reds
+      main-sweep confirm-gate (return a verdict inline, NOT raise VerifyInfraError
+      which verify.py:3800/3822 gates out of the merge path); genuine gap vs the
+      task-path bare-crash retry (2365/2619); suppresses load-induced reds
     verdict: PASS
     delivered_check:
       kind: manual

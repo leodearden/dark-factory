@@ -46,6 +46,19 @@ Established this session by code + durable verify-logs (see the RCA memory):
   windows in specific tests (104 sleep-using test files repo-wide;
   ~18 `assert elapsed < N`).
 
+**Existing partial coverage (verified — α must not duplicate):** the *task*
+path already has a bounded whole-suite auto-retry for a **bare** xdist worker
+crash (`_is_bare_xdist_worker_crash` → `VerifyInfraError` →
+`_run_scoped_verification_with_infra_retry`; tasks 2365 + 2619). Two gaps remain
+that α closes: (1) that reclassification is **explicitly gated `not
+is_merge_verify`** (`verify.py:3822`) — the merge path is deliberately excluded
+because "merge_queue.py has no VerifyInfraError handler and an uncaught raise
+there would stall the merge queue" (`verify.py:3800`), so the **merge gate gets
+no auto-retry at all** today; and (2) the discriminator fires **only for a bare
+crash with no co-occurring `FAILED` marker**, so a starvation timeout that
+surfaces as `FAILED <nodeid>` (or a Qdrant `ReadTimeout` / timing-assert flake)
+is never retried — exactly what blocked task 2700.
+
 Premises are true and backed by existing mechanisms — none assert an impossible
 number. The α flake-vs-real classification reuses the premise main-sweep
 already relies on (a node-id that passes in isolation was load-induced).
@@ -62,11 +75,17 @@ calls).
   on a failing merge verify, extract the failing node-ids
   (`_extract_failing_test_ids` — already handles FAILED / ERROR / xdist
   `node down` surfaces), re-run just those **serially** (`-p no:xdist`, the
-  `serial_pytest` recovery form) once; if they all pass, the failure was
+  `serial_pytest` recovery form) once with a generous per-test timeout (so the
+  confirm run cannot itself starve); if they all pass, the failure was
   load-induced → **suppress and let the merge proceed**; if any still fails, the
-  merge stays red. This is the single highest-leverage lever against the churn
-  spiral — it makes a correct task immune to a starvation flake without touching
-  parallelism.
+  merge stays red. **Critically, α resolves to a pass/fail verdict inline — it
+  does NOT raise `VerifyInfraError`** (that is the task-path mechanism which
+  `verify.py:3800-3822` documents would stall the merge queue). This mirrors
+  `run_main_tip_sweep`'s return-a-category pattern, which is why it is safe on
+  the merge path where the bare-crash reclassification deliberately isn't. Single
+  highest-leverage lever against the churn spiral — makes a correct task immune to
+  a starvation flake without touching parallelism, and covers the co-occurring-
+  `FAILED` case that 2365/2619's bare-crash discriminator does not.
 - **β — Raise the merge-path per-test wall-clock timeout to 300s.** Append
   `--timeout=300` to the per-module merge `test_command`s (mirroring the
   fallback command's existing convention), so a starved-but-correct worker has
@@ -105,6 +124,10 @@ not a copy.
   recovery form — `verify_cmd.py:545`, `verify.py:1063`. ✔
 - main-sweep isolated-rerun-suppress precedent (`run_main_tip_sweep`,
   retry-on-flake) — `verify.py:5201-5330`. ✔
+- Existing task-path bare-crash retry (`_is_bare_xdist_worker_crash` →
+  `VerifyInfraError`) is gated **out** of the merge path (`not is_merge_verify`,
+  `verify.py:3822`) and covers **only** bare crashes — confirming α's gap is
+  real, not a duplicate of tasks 2365/2619. ✔
 - Merge verify runs per-module `pytest tests/ -q` with the **60s** pyproject
   default (no `--timeout`) — `orchestrator/orchestrator.yaml:5` et al. ✔
 - `@pytest.mark.integration` marker declared — `fused-memory/pyproject.toml`
@@ -221,16 +244,27 @@ Behaviour:
    (covers FAILED / ERROR / `node down`). If none extractable (opaque / whole
    collection error) → **do not suppress** (fail closed to red).
 2. Re-run exactly those node-ids once, serially (`serial_pytest` form,
-   `-p no:xdist -o addopts=''`), in the same merge worktree.
-3. All pass → suppress: merge proceeds; emit `merge_flake_suppressed`
-   (node-ids, sha, measured_at); bump the suppression-streak counter.
-4. Any fail / re-run errors → merge stays red (existing behaviour); streak
-   counter untouched by a non-suppressing outcome.
+   `-p no:xdist -o addopts=''`), with a generous per-test timeout (≥300s so the
+   confirm run cannot itself starve → no false non-suppression), in the same
+   merge worktree/SHA.
+3. All pass → suppress: **return a passed verdict** (do NOT raise
+   `VerifyInfraError` — the merge path has no handler, `verify.py:3800`); merge
+   proceeds; emit `merge_flake_suppressed` (node-ids, sha, measured_at); bump the
+   suppression-streak counter.
+4. Any fail / re-run errors / confirm-run times out → merge stays red (existing
+   behaviour); streak counter untouched by a non-suppressing outcome. A genuine
+   hang re-hangs in isolation → not suppressed (correct).
 5. Streak ≥ threshold within window → escalation (loud), streak cleared.
+
+Distinction from tasks 2365/2619: those raise `VerifyInfraError` for a **bare**
+crash on the **task** path only (`not is_merge_verify`, `verify.py:3822`). α is
+the **merge**-path analog and covers the **co-occurring-`FAILED`** case, via a
+return-a-verdict (not raise) resolution — the only shape safe on the merge path.
 
 Invariants: INV-2 (structured fact at suppression), INV-3 (same-tree
 corroboration), INV-4 (streak escalation on the fail-soft path), INV-5 (reuse
-`_extract_failing_test_ids` + `serial_pytest`, no duplication).
+`_extract_failing_test_ids` + `serial_pytest` + main-sweep confirm pattern, no
+duplication).
 
 ## Appendix B — α boundary-test sketch (B+H observable signal)
 
