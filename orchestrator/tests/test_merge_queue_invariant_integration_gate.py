@@ -71,7 +71,7 @@ Fake/instrumented runners only — no real ssh/build/merge-to-main:
       B) direct _verifier_loop() with a trailing None sentinel via
          worker._verifier_queue (row 4 DROPPED chokepoint).
       C) direct _run_inflight_verify(item, lease) / _finalize_inflight(entry)
-         / _verify_and_advance(item) compat shim (rows 2, 3, 4, 8).
+         / drive_verify_and_advance(worker, item) harness (rows 2, 3, 4, 8).
 
 Pattern precedent: test_merge_queue_two_layer_integration.py (λ=1895) — the
 fixtures/builders/harness factory below are ported/adapted from there; the
@@ -91,6 +91,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from escalation.queue import EscalationQueue
 
@@ -799,8 +800,8 @@ class TestScenario234VerifierLifecycleFaults:
     Style C: direct _run_inflight_verify(item, lease) [+ _finalize_inflight
     for the release-half assertions], driven against REAL merged items
     (``_make_merged_item``) rather than the full worker.run() loop — these
-    rows test the verify/finalize halves of ``_verify_and_advance`` in
-    isolation, per the task's documented style-C driving convention.
+    rows test the verify/finalize halves of the ``drive_verify_and_advance``
+    harness in isolation, per the task's documented style-C driving convention.
     """
 
     async def test_runner_unavailable_quarantines_and_redispatches(
@@ -871,7 +872,7 @@ class TestScenario234VerifierLifecycleFaults:
             'orchestrator.merge_queue.run_scoped_verification',
             AsyncMock(return_value=_mock_verify_result(True)),
         ):
-            landed = await worker._verify_and_advance(redispatched)
+            landed = await drive_verify_and_advance(worker, redispatched)
         assert landed is True
         assert req.result.done() and req.result.result().status == 'done', (
             f'Expected the re-dispatched item to eventually land "done", got '
@@ -952,7 +953,7 @@ class TestScenario234VerifierLifecycleFaults:
             'orchestrator.merge_queue.run_scoped_verification',
             AsyncMock(return_value=_mock_verify_result(True)),
         ):
-            landed = await worker._verify_and_advance(item)
+            landed = await drive_verify_and_advance(worker, item)
         assert landed is True
         assert req.result.done() and req.result.result().status == 'done', (
             f'Expected re-verify after unhalt to land "done", got '
@@ -1250,7 +1251,7 @@ class TestScenario8CasRetryTipCarry:
     None — no phantom POST_MERGE_EQUIVALENCE_FAILED 'blocked' on
     byte-identical work (task-1928 regression pin; ε=1890 I3).
 
-    Driven directly via worker._verify_and_advance(item) (style C). Models
+    Driven directly via drive_verify_and_advance(worker, item) (style C). Models
     test_merge_queue.py's TestMergedBranchTipCarryThroughRebuild — reuses its
     test-(C) mocked-``advance_main`` technique (a simple branch + a fully
     mocked CAS loop, no real overlap/rebase needed) but targets the
@@ -1341,7 +1342,7 @@ class TestScenario8CasRetryTipCarry:
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
-            advanced = await worker._verify_and_advance(item)
+            advanced = await drive_verify_and_advance(worker, item)
 
         assert advanced is True, 'Expected True (main advanced)'
         outcome = req.result.result()
