@@ -37,6 +37,14 @@ Invariants (see the task-2381 plan / merge-skew-attribution-prd.md):
        workflow_verify), so absent-green -> INDETERMINATE is byte-identical
        to today's behaviour. Task 2381 α owns this member + reader; task
        2383 β emits the event at the workflow VERIFY-pass site.
+       The workflow_verify read is run-AGNOSTIC (durable across restarts,
+       via EventStore.fetch_events_by_type_all_runs): task 2752's verify
+       checkpoint SUPPRESSES the current-run re-emit at an unchanged branch
+       tip, so the branch's only green may live under a prior run_id — a
+       run-scoped read would then miss it and lose the INTEGRATION_SKEW
+       classification after a fleet redeploy. Reading across runs keeps the
+       durable prior-run green visible (any-prior-green semantics unchanged;
+       result set bounded by the task_id filter).
 
 This module is intentionally self-contained (task 2381 α scope): it defines
 the classifier, its data types, and private helpers only. Wiring into the
@@ -224,7 +232,8 @@ def _branch_pre_merge_verify_green(
     task_id: str | None,
 ) -> bool | None:
     """Read the branch's OWN pre-merge verify verdict (the I5 green fact) from
-    ``EventType.workflow_verify`` event-store history, keyed by ``task_id``.
+    ``EventType.workflow_verify`` event-store history, keyed by ``task_id``,
+    reading run-agnostically across ALL runs (durable across restarts).
 
     Returns:
         ``True``  — at least one workflow_verify row for this task_id has a
@@ -237,6 +246,19 @@ def _branch_pre_merge_verify_green(
                     / ``task_id`` is None, or any read error (fail-safe: never
                     raises).
 
+    Cross-run durability (task 2752): the read is via
+    ``EventStore.fetch_events_by_type_all_runs(..., task_id=task_id)`` — the
+    run-agnostic reader — NOT the run-scoped ``fetch_events_by_type``. This is
+    load-bearing: task 2752's verify checkpoint SUPPRESSES the current-run
+    workflow_verify re-emit at an unchanged branch tip, so on the cross-restart
+    fast-path the branch's only ``workflow_verify(passed=True)`` green lives
+    under a PRIOR run_id. A run-scoped read would find no row -> return None ->
+    degrade a genuine INTEGRATION_SKEW to INDETERMINATE after a fleet redeploy.
+    The any-prior-green, tip-agnostic semantics are unchanged (a single-run
+    store is still fully visible to the all-runs reader); visibility is merely
+    extended across runs, and the result set stays bounded by the task_id SQL
+    filter.
+
     Source note (I5, task-2381 design amendment): the green fact is the
     workflow VERIFY phase's branch-vs-merge-base verdict, NOT the merge
     worker's post-rebase ``EventType.merge_verify`` (a *passing* merge_verify
@@ -247,11 +269,12 @@ def _branch_pre_merge_verify_green(
     if event_store is None or task_id is None:
         return None
     try:
-        rows = event_store.fetch_events_by_type(EventType.workflow_verify)
-        matched = [row for row in rows if row.get('task_id') == task_id]
-        if not matched:
+        rows = event_store.fetch_events_by_type_all_runs(
+            EventType.workflow_verify, task_id=task_id,
+        )
+        if not rows:
             return None
-        return any(bool((row.get('data') or {}).get('passed')) for row in matched)
+        return any(bool((row.get('data') or {}).get('passed')) for row in rows)
     except Exception:
         logger.warning(
             '_branch_pre_merge_verify_green: event-store read failed for '

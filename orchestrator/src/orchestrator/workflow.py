@@ -1886,12 +1886,20 @@ class TaskWorkflow:
             # the checkpoint already fired this cycle: verify did NOT run, so
             # re-asserting workflow_verify(passed=True) would claim a verify
             # that never happened (the honest signal on a skip is
-            # phase_skipped(verify), emitted in _execute_verify_review_loop);
-            # the prior-run durable row is what the checkpoint relies on, so
-            # nothing is lost by not re-emitting.  Backward-compat: I5
-            # (merge_disposition._branch_pre_merge_verify_green) and
-            # merge_completion_eligible read only data['passed'], so adding
-            # tip_sha does not affect them.
+            # phase_skipped(verify), emitted in _execute_verify_review_loop).
+            #
+            # Consumer impact of this suppression (task 2752, step-10): on the
+            # cross-restart fast-path the branch's only workflow_verify green
+            # then lives under a PRIOR run_id, which WOULD have blinded the
+            # run-scoped I5 reader and degraded a genuine INTEGRATION_SKEW to
+            # INDETERMINATE.  So merge_disposition._branch_pre_merge_verify_green
+            # was switched to the cross-run fetch_events_by_type_all_runs reader
+            # (task 2752, step-10): it now sees the durable prior-run green, so
+            # no INTEGRATION_SKEW classification is lost.  The remaining
+            # run-scoped consumer, merge_completion.merge_completion_eligible,
+            # still degrades to the documented task-2633 human-/unblock restart
+            # gap and is intentionally left unchanged.  (Both read only
+            # data['passed'], so the added tip_sha key itself affects neither.)
             if (
                 prev is WorkflowState.VERIFY
                 and new_state is WorkflowState.REVIEW
