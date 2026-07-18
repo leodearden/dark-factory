@@ -20,7 +20,10 @@ from pathlib import Path
 
 import pytest
 
-from shared.cli_invoke import detect_ended_awaiting_background
+from shared.cli_invoke import (
+    detect_ended_awaiting_background,
+    ended_awaiting_background_for_session,
+)
 
 
 # ── Fixture builders ────────────────────────────────────────────────────────
@@ -60,6 +63,17 @@ def _kill_shell(shell_id: str = 'sh-1', *, name: str = 'KillShell') -> dict:
 
 def _text(text: str = 'thinking') -> dict:
     return {'type': 'text', 'text': text}
+
+
+def _write_transcript(base: Path, session_id: str, records: list) -> Path:
+    """Write *records* as a JSONL transcript under
+    base/projects/<slug>/<session_id>.jsonl — mirrors the fixture style of the
+    existing read_transcript_records / count_transcript_turns tests."""
+    slug_dir = base / 'projects' / 'myproject'
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    transcript = slug_dir / f'{session_id}.jsonl'
+    transcript.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+    return transcript
 
 
 class TestDetectEndedAwaitingBackground:
@@ -163,3 +177,48 @@ class TestDetectEndedAwaitingBackground:
             _assistant([_bash_output()], nested=False),
         ]
         assert detect_ended_awaiting_background(records) is False
+
+
+class TestEndedAwaitingBackgroundForSession:
+    """File-reading seam: mirrors count_transcript_turns' shape — delegate to
+    read_transcript_records, then the pure detector, mapping None (unresolvable
+    / missing transcript) → False (fail-safe)."""
+
+    def test_missing_transcript_is_false(self, tmp_path: Path) -> None:
+        """No matching transcript file → read_transcript_records None → False."""
+        (tmp_path / 'projects' / 'myproject').mkdir(parents=True, exist_ok=True)
+        assert (
+            ended_awaiting_background_for_session(tmp_path, 'no-such-session') is False
+        )
+
+    def test_abandoned_launch_transcript_is_true(self, tmp_path: Path) -> None:
+        """A transcript whose tail launched but never reaped a background task → True."""
+        sid = 'sess-bg-abandoned'
+        _write_transcript(
+            tmp_path,
+            sid,
+            [
+                _assistant([_text('start the long build')]),
+                _assistant([_bash_launch(command='./occt-test.sh')]),
+            ],
+        )
+        assert ended_awaiting_background_for_session(tmp_path, sid) is True
+
+    def test_polled_launch_transcript_is_false(self, tmp_path: Path) -> None:
+        """A transcript where the launch is later polled by BashOutput → False."""
+        sid = 'sess-bg-polled'
+        _write_transcript(
+            tmp_path,
+            sid,
+            [
+                _assistant([_bash_launch()]),
+                _assistant([_bash_output()]),
+            ],
+        )
+        assert ended_awaiting_background_for_session(tmp_path, sid) is False
+
+    def test_empty_transcript_is_false(self, tmp_path: Path) -> None:
+        """A located-but-empty transcript → records [] → False (never raises)."""
+        sid = 'sess-bg-empty'
+        _write_transcript(tmp_path, sid, [])
+        assert ended_awaiting_background_for_session(tmp_path, sid) is False
