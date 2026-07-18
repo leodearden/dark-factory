@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -111,6 +112,7 @@ async def test_worker_processes_create_decision(
     """
     # Arrange: curator mock that returns a 'create' decision
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(
         return_value=CuratorDecision(action='create')
     )
@@ -334,6 +336,7 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
     taskmaster.get_tasks = AsyncMock(return_value={'tasks': [existing_task]})
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock()  # should NOT be called
     mock_curator.note_created = MagicMock()
     mock_curator.record_task = AsyncMock()
@@ -461,6 +464,7 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
     interceptor_with_store._journal = capturing_journal
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(
         return_value=CuratorDecision(action='create')
     )
@@ -512,7 +516,7 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
 
 @pytest.mark.asyncio
 async def test_worker_created_path_emits_journal_event(
-    interceptor_with_store, ticket_store, taskmaster, event_buffer,
+    interceptor_with_store, ticket_store, taskmaster, event_buffer, caplog,
 ):
     """Regression-pin: on create success, exactly one EventType.task_created
     event is journalled with the task_id in its payload.
@@ -530,6 +534,7 @@ async def test_worker_created_path_emits_journal_event(
     interceptor_with_store._journal = capturing_journal
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(
         return_value=CuratorDecision(action='create')
     )
@@ -539,6 +544,8 @@ async def test_worker_created_path_emits_journal_event(
     with patch.object(
         type(interceptor_with_store), '_get_curator',
         new=AsyncMock(return_value=mock_curator),
+    ), caplog.at_level(
+        logging.ERROR, logger='fused_memory.middleware.task_interceptor',
     ):
         result = await interceptor_with_store.submit_task(
             project_root='/project',
@@ -566,6 +573,21 @@ async def test_worker_created_path_emits_journal_event(
     )
     assert payload.get('operation') == 'add_task', (
         f'task_created event payload must have operation=add_task: {payload}'
+    )
+
+    # The curator mock must fully cover every awaited curator method
+    # _prepare_ticket calls: an incomplete mock (prepare_candidate left as
+    # a non-awaitable MagicMock) makes _prepare_ticket swallow a TypeError
+    # and log it here. That swallowed error is the deterministic,
+    # order-independent signal for the incomplete-mock regression this
+    # test exists to pin.
+    prepare_candidate_errors = [
+        r for r in caplog.records if 'prepare_candidate failed' in r.getMessage()
+    ]
+    assert not prepare_candidate_errors, (
+        f'curator.prepare_candidate must be awaitable and must not raise; '
+        f'got swallowed ERROR records: '
+        f'{[r.getMessage() for r in prepare_candidate_errors]}'
     )
 
 
@@ -600,6 +622,7 @@ async def test_worker_note_created_and_record_task_run_under_write_lock(
         lock_held_at_record.append(lock.locked() if lock else False)
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(
         return_value=CuratorDecision(action='create')
     )
@@ -680,6 +703,7 @@ async def test_resolve_ticket_wakes_on_worker_completion(
     that ticket wakes the caller promptly (well under the 5s timeout).
     """
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
     mock_curator.note_created = MagicMock()
     mock_curator.record_task = AsyncMock()
@@ -835,6 +859,7 @@ async def test_close_drains_worker_and_closes_store(
         return CuratorDecision(action='create')
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = blocking_curate
     mock_curator.note_created = MagicMock()
     mock_curator.record_task = AsyncMock()
@@ -896,6 +921,7 @@ async def test_worker_post_create_failure_still_resolves_as_created(
     interceptor_with_store._journal = capturing_journal
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
     mock_curator.note_created = MagicMock(side_effect=RuntimeError('embed broke'))
     mock_curator.record_task = AsyncMock()
@@ -973,6 +999,7 @@ async def test_worker_record_task_failure_still_resolves_as_created(
     interceptor_with_store._journal = capturing_journal
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(return_value=CuratorDecision(action='create'))
     mock_curator.note_created = MagicMock()
     mock_curator.record_task = AsyncMock(side_effect=RuntimeError('record broke'))
@@ -1058,6 +1085,7 @@ async def test_per_project_ticket_queues_do_not_serialise(
         return CuratorDecision(action='create')
 
     mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
     mock_curator.curate = AsyncMock(side_effect=curate_side_effect)
     mock_curator.note_created = MagicMock()
     mock_curator.record_task = AsyncMock()
