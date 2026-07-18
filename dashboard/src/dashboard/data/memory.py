@@ -26,8 +26,18 @@ MCP_HEADERS = {
 # Twin of orchestrator.mcp_lifecycle._MUTATING_TASK_TOOLS (task 2712): mutating
 # task tools get a client-supplied idempotency key so a retried write dedupes
 # server-side instead of double-applying. Inert today (the dashboard issues
-# only reads) but keeps the two McpSession twins aligned and write-safe by
-# construction if the dashboard ever gains a mutating call.
+# only reads) but keeps the two McpSession twins aligned.
+#
+# CAVEAT (not yet write-safe by construction on this path): unlike the
+# orchestrator twin, this _raw_call has NO transport retry loop, so the
+# injection generates a FRESH key per invocation. The orchestrator's
+# inject-once-before-the-retry-loop invariant — the property that makes
+# transport retries reuse one key and dedupe — does NOT hold here. If the
+# dashboard ever gains a mutating call that a higher layer retries by
+# re-invoking _raw_call, that caller must thread one stable client_op_id
+# across attempts (or a retry loop must be added here); a fresh per-attempt
+# uuid4 would NOT trigger server-side dedup. Safe today only because reads
+# never dedup and a caller-supplied key is preserved.
 _MUTATING_TASK_TOOLS = frozenset({
     'update_task',
     'set_task_status',
