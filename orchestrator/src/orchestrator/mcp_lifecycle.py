@@ -435,6 +435,25 @@ JCODEMUNCH_ENV: dict[str, str] = {'JCODEMUNCH_NO_VERSION_HINT': '1'}
 # orchestrator.fm_retry.fm_retry_backoffs() (task 2706) so this loop spans
 # fm's own restart window instead of a too-small, independently-guessed
 # budget — see orchestrator/src/orchestrator/fm_retry.py.
+#
+# Scope of the ~120s fm-restart window (deliberate — task 2706 review
+# amendment): McpSession is a generic Streamable-HTTP transport, so the
+# window is applied to every session this class drives rather than gated
+# per-URL. That is intentional AND, in the orchestrator, effectively
+# fm-scoped in practice: the module-level singleton (McpLifecycle.start()
+# below) is McpSession(self.config.url) with config.url == fused-memory, and
+# mcp_call() reuses that singleton for ALL calls regardless of its url arg
+# (the McpSession(url) one-shot fallback fires only pre-singleton). So the
+# widened budget lands on fused-memory traffic, not sprayed across arbitrary
+# MCP servers. Accepted trade-off: a persistently-hung endpoint now blocks a
+# single call for up to ~attempts*per_attempt_timeout + sum(backoffs)
+# (minutes) versus the old ~7s. No outer cadence assumption is violated by
+# that stall — the scheduler drives dispatch as a sequential poll loop
+# (acquire_next() then asyncio.sleep(idle_poll_secs), harness.py), so a slow
+# call serializes the next poll rather than racing a fixed-interval tick
+# deadline; and multi-attempt durations already exceeded any single
+# per-attempt timeout under the old budget too. Per-URL gating is deferred
+# as a larger transport-layer refactor outside this task's scope.
 _RETRYABLE_STATUS = frozenset({502, 503, 504})
 
 # Exceptions treated as transient for retry purposes.
@@ -532,6 +551,9 @@ class McpSession:
         if params is not None:
             payload['params'] = params
 
+        # Shared fm-restart retry window, applied to this generic transport by
+        # design (fm-scoped in practice) — see the "Scope of the ~120s
+        # fm-restart window" note by _RETRYABLE_STATUS above.
         backoffs = fm_retry_backoffs()
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
@@ -605,6 +627,9 @@ class McpSession:
         if params is not None:
             payload['params'] = params
 
+        # Shared fm-restart retry window, applied to this generic transport by
+        # design (fm-scoped in practice) — see the "Scope of the ~120s
+        # fm-restart window" note by _RETRYABLE_STATUS above.
         backoffs = fm_retry_backoffs()
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
