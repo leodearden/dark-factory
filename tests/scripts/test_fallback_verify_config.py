@@ -36,9 +36,26 @@ import yaml
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
+# Task 2769: the 7 per-module merge-verify orchestrator.yaml files, each
+# carrying its own subproject-scoped test_command (distinct from the
+# repo-root FALLBACK fleet chain in dark-factory-orchestrator.yaml above).
+PER_MODULE_CONFIG_PATHS = [
+    REPO_ROOT / "shared" / "orchestrator.yaml",
+    REPO_ROOT / "escalation" / "orchestrator.yaml",
+    REPO_ROOT / "orchestrator" / "orchestrator.yaml",
+    REPO_ROOT / "fused-memory" / "orchestrator.yaml",
+    REPO_ROOT / "dashboard" / "orchestrator.yaml",
+    REPO_ROOT / "sampler" / "orchestrator.yaml",
+    REPO_ROOT / "scripts" / "orchestrator.yaml",
+]
+
 
 def _fleet_test_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["test_command"]
+
+
+def _module_test_command(config_path: pathlib.Path) -> str:
+    return yaml.safe_load(config_path.read_text(encoding="utf-8"))["test_command"]
 
 
 def _pytest_segments(cmd: str) -> list[str]:
@@ -184,3 +201,46 @@ def test_fallback_verify_raises_per_test_timeout() -> None:
             f"sets --timeout={timeout_value}, which does not raise the ceiling "
             "above the flaky 60s pyproject default (task 2361)"
         )
+
+
+def test_per_module_merge_verify_raises_per_test_timeout() -> None:
+    """Every per-module merge test_command must carry --timeout>=300.
+
+    Task 2769 (PRD plans/cpu-load-robust-verify-prd.md, task beta): unlike
+    the repo-root FALLBACK fleet chain checked above (which already sets
+    --timeout=300), the 7 per-module merge-verify orchestrator.yaml files
+    (shared, escalation, orchestrator, fused-memory, dashboard, sampler,
+    scripts) carried no --timeout override at all, so they silently
+    inherited the flaky 60s pyproject.toml default. Under host CPU
+    oversubscription a starved-but-correct xdist worker can cross that 60s
+    wall-clock ceiling; pytest-timeout's thread method then os._exit()s the
+    worker, and --max-worker-restart=0 degrades that into a false "node
+    down" failure on whatever test happens to be running. Raising the
+    per-test timeout to 300s (mirroring the fallback chain's own
+    convention) removes the trigger for all but genuinely-hung tests. This
+    guard fails CI if any per-module test_command's pytest segment omits
+    --timeout, or sets it below 300, so a future edit can't silently
+    regress back to the 60s default.
+    """
+    for config_path in PER_MODULE_CONFIG_PATHS:
+        cmd = _module_test_command(config_path)
+        segments = _pytest_segments(cmd)
+        assert segments, (
+            f"{config_path} test_command (per-module merge verify) has no "
+            f"pytest segments to check (task 2769); got: {cmd!r}"
+        )
+        for seg in segments:
+            match = re.search(r"--timeout[=\s](\d+)", seg)
+            assert match, (
+                f"pytest segment {seg!r} in {config_path} test_command "
+                "(per-module merge verify) has no --timeout override (task "
+                "2769) — the flaky 60s pyproject default is left in place, "
+                "so xdist worker starvation under host oversubscription can "
+                "still manufacture a false 'node down' failure"
+            )
+            timeout_value = int(match.group(1))
+            assert timeout_value >= 300, (
+                f"pytest segment {seg!r} in {config_path} test_command sets "
+                f"--timeout={timeout_value}, which is below the 300s floor "
+                "(task 2769) mirroring the FALLBACK chain's own convention"
+            )
