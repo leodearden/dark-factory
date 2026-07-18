@@ -21,7 +21,11 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from orchestrator.agents.roles import MANDATED_STAGING_COMMAND
+from orchestrator.agents.roles import MANDATED_STAGING_COMMAND, ROLES
+
+# The 5 roles whose system_prompt carries a "## CRITICAL: Git Staging Rules"
+# section mandating a staging command -- see roles.py.
+_STAGING_RULES_ROLES = ('implementer', 'debugger', 'merger', 'steward', 'simple_task')
 
 
 def _init_repo_with_gitignored_task_dir(repo: Path) -> None:
@@ -101,3 +105,28 @@ def test_legacy_exclusion_form_exits_one_root_cause(tmp_path: Path) -> None:
         'expected the legacy `:!.task` form to reproduce the exit-1 root cause; got '
         f'returncode={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}'
     )
+
+
+def test_no_role_system_prompt_mandates_the_legacy_exclusion_form() -> None:
+    """No role's system_prompt may mandate the exit-1-prone `:!.task` form.
+
+    Mirrors test_roles_operator_tools.py's convention: iterate ROLES and
+    assert an invariant across every role.system_prompt in one place.
+    """
+    offenders = sorted(name for name, role in ROLES.items() if ':!.task' in role.system_prompt)
+    assert offenders == [], (
+        f'role(s) still mandate the exit-1-prone `:!.task` staging form: {offenders}'
+    )
+
+
+def test_staging_rules_roles_mandate_the_canonical_constant() -> None:
+    """Every staging-rules role's system_prompt cites MANDATED_STAGING_COMMAND.
+
+    Confirms the canonical command is present (not merely absent the legacy
+    form) and ties the constant to the prompts, so the two can't drift apart.
+    """
+    missing = sorted(
+        name for name in _STAGING_RULES_ROLES
+        if MANDATED_STAGING_COMMAND not in ROLES[name].system_prompt
+    )
+    assert missing == [], f'role(s) missing MANDATED_STAGING_COMMAND in system_prompt: {missing}'
