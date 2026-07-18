@@ -9,7 +9,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -27,6 +27,7 @@ from escalation.models import (
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
     Escalation,
+    EvidenceEntry,
 )
 from escalation.queue import EscalationQueue
 
@@ -512,7 +513,7 @@ def create_server(
             suggested_action=suggested_action,
             worktree=worktree,
             workflow_state=workflow_state,
-            evidence=evidence or [],
+            evidence=cast(list[EvidenceEntry], evidence or []),
         )
         # Returns {id, status} or resolved record.
         # No 'action' key — that is only on the blocker path.
@@ -588,7 +589,7 @@ def create_server(
             suggested_action=suggested_action,
             worktree=worktree,
             workflow_state=workflow_state,
-            evidence=evidence or [],
+            evidence=cast(list[EvidenceEntry], evidence or []),
         )
         result = await _chokepoint_or_submit(esc, terminal_state_is_the_bug)
         return {**result, 'action': 'terminate_cleanly'}

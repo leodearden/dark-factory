@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from escalation.models import BORN_AT_L2_SEVERITIES, RESOLUTION_CLASSES, Escalation, TrainState
+from escalation.models import (
+    BORN_AT_L2_SEVERITIES,
+    RESOLUTION_CLASSES,
+    Escalation,
+    EvidenceEntry,
+    TrainState,
+)
 
 
 class TestBornAtL2Severities:
@@ -711,9 +717,10 @@ class TestEscalationEvidence:
     Mirrors the zero-migration round-trip pattern of TestEscalationTrainState /
     TestEscalationResolutionAction.  Each entry is a plain dict
     {observation, measured_at, ref} — stored/returned verbatim, no shape
-    validation.  Uses plain dict literals (not the EvidenceEntry TypedDict,
-    which is a plain dict at runtime) so this reads identically pre- and
-    post-implementation.
+    validation.  The values are plain dict literals (annotated
+    `list[EvidenceEntry]` only to satisfy the invariant-`list` type check;
+    EvidenceEntry is a plain dict at runtime), so this reads identically pre-
+    and post-implementation.
     """
 
     def _make_base_esc(self) -> Escalation:
@@ -747,7 +754,7 @@ class TestEscalationEvidence:
 
     def test_evidence_round_trip_via_to_dict_from_dict(self):
         """evidence list is preserved through to_dict() / from_dict()."""
-        ev = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
+        ev: list[EvidenceEntry] = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
         esc = Escalation(
             id='esc-task-400-0001',
             task_id='400',
@@ -764,7 +771,7 @@ class TestEscalationEvidence:
 
     def test_evidence_round_trip_via_to_json_from_json(self):
         """evidence list is preserved through to_json() / from_json()."""
-        ev = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
+        ev: list[EvidenceEntry] = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
         esc = Escalation(
             id='esc-task-400-0001',
             task_id='400',
@@ -781,7 +788,7 @@ class TestEscalationEvidence:
 
     def test_evidence_appears_in_to_json_output(self):
         """evidence is serialised (not silently dropped) when set."""
-        ev = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
+        ev: list[EvidenceEntry] = [{'observation': 'main red at abc123', 'measured_at': '2026-07-14T00:00:00+00:00', 'ref': 'HEAD=abc123'}]
         esc = Escalation(
             id='esc-task-400-0001',
             task_id='400',
