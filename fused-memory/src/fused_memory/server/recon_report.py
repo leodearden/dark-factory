@@ -692,6 +692,87 @@ class ReconReportState:
                     exc_info=True,
                 )
 
+    def hydrate_from_store(self) -> None:
+        """Rebuild in-memory state from the persisted store — run ONCE at boot.
+
+        A full no-op when ``self._store is None`` (the byte-identical no-store
+        path) or when the store is empty (a fresh boot).  Otherwise, for every
+        persisted row it restores ``_state[(run_id, stage)]`` and ``_active``
+        (the row flagged ``is_active`` is the run's live stage), then rebuilds
+        all four run-level dedup indices by UNIONING each entry's persisted
+        per-entry mirrors and fold-anchor slices:
+
+        * ``_run_finding_index`` — ``{finding_id -> owning entry}`` for every
+          finding in every entry.
+        * ``_run_sig_index`` — each entry's ``_signature_to_finding`` PLUS its
+          persisted derived-signature slice (the ``cite_task`` entity-scoped
+          fold anchors owned by this entry's findings but absent from its own
+          ``_signature_to_finding``).
+        * ``_run_desc_index`` — each entry's ``_deschash_to_finding``.
+        * ``_run_cited_task_index`` — each entry's persisted cited-task slice
+          (the ``cite_task`` project-scoped fold anchors).
+
+        The union is faithful by construction — each sig / desc-hash /
+        cited-task key maps to exactly one finding_id owned by exactly one
+        entry — so no re-derivation of ``cite_task`` fold-eligibility is
+        needed (see :func:`_serialize_entry`).  This gives σ a correct dedup
+        substrate for continued filing against a run whose earlier stages were
+        filed before the restart.
+
+        Best-effort, mirroring :meth:`_persist_run`: a store read failure is
+        logged loudly (WARNING, structured) but never raised — a hydrate
+        hiccup must not abort server boot.  On a total read failure the process
+        simply starts with empty in-memory state, exactly as if the persisted
+        rows were absent; a single undeserializable row is skipped (logged)
+        without discarding the rest.
+        """
+        if self._store is None:
+            return
+        try:
+            rows = self._store.load_all()
+        except Exception:
+            logger.warning(
+                'recon_report: failed to load persisted state on hydrate; '
+                'starting with empty in-memory state',
+                exc_info=True,
+            )
+            return
+        for row in rows:
+            run_id = row['run_id']
+            stage = row['stage']
+            entry_json = row['entry_json']
+            try:
+                entry = _deserialize_entry(entry_json)
+                sig_anchor_slice, cited_task_slice = _deserialize_fold_anchor_slices(
+                    entry_json
+                )
+            except Exception:
+                logger.warning(
+                    'recon_report: failed to deserialize persisted row '
+                    'run_id=%r stage=%r on hydrate; skipping',
+                    run_id,
+                    stage,
+                    exc_info=True,
+                )
+                continue
+            self._state[(run_id, stage)] = entry
+            if row['is_active']:
+                self._active[run_id] = stage
+            # Rebuild the four run-level dedup indices by unioning this entry's
+            # persisted per-entry mirrors / fold-anchor slices.  Keys never
+            # collide across a run's entries (each sig/desc/cited-task key is
+            # owned by exactly one entry), so plain dict.update is a safe union.
+            finding_index = self._run_finding_index.setdefault(run_id, {})
+            for f in entry.findings:
+                finding_index[f.finding_id] = entry
+            sig_index = self._run_sig_index.setdefault(run_id, {})
+            sig_index.update(entry._signature_to_finding)
+            sig_index.update(sig_anchor_slice)
+            self._run_desc_index.setdefault(run_id, {}).update(
+                entry._deschash_to_finding
+            )
+            self._run_cited_task_index.setdefault(run_id, {}).update(cited_task_slice)
+
     # ------------------------------------------------------------------
     # Tool implementations
     # ------------------------------------------------------------------
