@@ -29,12 +29,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from starlette.testclient import TestClient  # noqa: F401  (route tests use the `client` conftest fixture)
-
 from escalation.classify import effective_benign
 from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+from starlette.testclient import (
+    TestClient,  # noqa: F401  (route tests use the `client` conftest fixture)
+)
 
 from dashboard.config import DashboardConfig
 from dashboard.data.escalation_analytics import (
@@ -334,7 +335,8 @@ class TestAlphaChokepointRoundTrip:
         assert r4.resolved_at is None and r4.resolved_by is None
         with pytest.raises(ValueError):
             queue.resolve(ID_ROW4, 'still rejected', resolution_class='meh')
-        assert queue.get(ID_ROW4).status == 'pending'      # queue reject left it untouched too
+        r4_after = queue.get(ID_ROW4)
+        assert r4_after is not None and r4_after.status == 'pending'  # queue reject left it untouched too
 
         # --- Row 2: resolving the L2 with class='benign' cascades the stamp to
         #     every member L1 (stamped-inherited via resolved_by='l2-cascade:<id>'). ---
