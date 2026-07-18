@@ -255,7 +255,10 @@ class AgentResult:
       abandons the pending work (Reify-5164 RCA).  ``_parse_claude_output``
       downgrades ``success`` to False when this is set on an otherwise-successful
       run, so existing non-success handling retries/resumes.  Stamped by
-      ``_run_subprocess`` via ``ended_awaiting_background_for_session``.
+      ``_run_subprocess`` on the normal-exit path from the parsed transcript
+      records (via ``detect_ended_awaiting_background``; the
+      ``ended_awaiting_background_for_session`` seam is the equivalent
+      standalone helper).
     - ``proc_tree``: human-readable snapshot of the subprocess process group
       captured by ``snapshot_process_group(pgid)`` at the top of the
       ``TimeoutError`` handler in ``_run_subprocess`` — i.e. while the wedged
@@ -287,8 +290,10 @@ class AgentResult:
     proc_tree: str = ''
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
-    when the transcript was not read (non-timeout paths) or could not be located.
-    Stamped only on the SIGTERM/SIGKILL timeout path via count_transcript_turns."""
+    when the transcript could not be read or located.  Stamped on the
+    SIGTERM/SIGKILL timeout path (via count_transcript_turns) AND on the
+    normal-exit path (task 2761 — derived from the same records read for the
+    ended_awaiting_background check, at no extra I/O)."""
 
 
 def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -2203,22 +2208,40 @@ async def _run_subprocess(
     else:
         logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}')
 
-    # Detect the ended-awaiting-background footgun on the normal-exit path
-    # (task 2761): a run that exited subtype=success but whose transcript tail
-    # launched a still-pending backgrounded Bash command silently abandoned the
-    # work.  Symmetric to the timeout path's transcript re-read above; fail-safe
-    # to False when the transcript can't be located.  _parse_claude_output owns
-    # the actual success→failure downgrade.
-    ended_awaiting_background = (
-        ended_awaiting_background_for_session(config_dir, session_id)
+    # Re-read the on-disk transcript ONCE on the normal-exit path and derive
+    # BOTH signals from the same parsed records — no double file I/O (task 2761
+    # amendment):
+    #   • transcript_turns — the assistant-turn count surfaced in
+    #     classify_agent_failure's diagnostic_detail.  Previously stamped only on
+    #     the timeout path, so a normal-exit ENDED_AWAITING_BACKGROUND
+    #     classification lost the turn-count signal (carried None); deriving it
+    #     from the records we already parse here restores it at zero extra I/O.
+    #   • ended_awaiting_background — a run that exited subtype=success but whose
+    #     transcript tail launched a still-pending backgrounded Bash command
+    #     silently abandoned the work.  Symmetric to the timeout path's
+    #     transcript re-read above; _parse_claude_output owns the actual
+    #     success→failure downgrade.
+    # Both fail safe when the transcript can't be located (records None →
+    # transcript_turns None, ended_awaiting_background False).
+    transcript_records = (
+        read_transcript_records(config_dir, session_id)
         if (config_dir and session_id)
-        else False
+        else None
     )
+    if transcript_records is None:
+        transcript_turns = None
+        ended_awaiting_background = False
+    else:
+        transcript_turns = sum(
+            1 for r in transcript_records if r.get('type') == 'assistant'
+        )
+        ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
 
     return _SubprocessResult(
         stdout=stdout.decode(),
         stderr=stderr_text,
         returncode=proc.returncode if proc.returncode is not None else 1,
         duration_ms=duration_ms,
+        transcript_turns=transcript_turns,
         ended_awaiting_background=ended_awaiting_background,
     )
