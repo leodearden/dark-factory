@@ -12,6 +12,10 @@ L2 cluster fields (default-empty; L0/L1 are unaffected):
   members:    list of member L1 escalation ids forming this cluster
   root_cause: exact-string dedup key for pending-L2 lookup
   options:    proposed resolution options (e.g. ['A: rollback', 'B: fix forward'])
+
+Structured-evidence field (default-empty; task 2558):
+  evidence:   list of EvidenceEntry {observation, measured_at, ref} raw
+              OBSERVATIONS backing the escalation (not causal diagnoses)
 """
 
 from __future__ import annotations
@@ -34,6 +38,26 @@ class TrainState(TypedDict):
     order: int            # this task's position in the train (0-based)
     parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
     failing_member: str   # this task's id (the one that triggered BLOCKED)
+
+
+class EvidenceEntry(TypedDict):
+    """A single structured raw-OBSERVATION backing an escalation (task 2558).
+
+    Each entry records what was measured, when, and against which ref — NOT a
+    causal diagnosis.  Filers put observations here (and in summary/detail) and
+    keep any causal claim on a clearly-marked `Hypothesis:` line, so a reviewer
+    never reads an unverified guess as fact (survey §1.7 precedent: a
+    "last-green" rewind recommendation named a commit that ALSO failed).
+
+    Shape mirrors the TrainState TypedDict.  TypedDict at runtime is a plain
+    dict; existing from_dict / to_dict / asdict() paths are unaffected —
+    round-trip fidelity is unchanged.  The server stores and returns it
+    verbatim (no shape validation), so partial evidence is accepted.
+    """
+
+    observation: str   # what was measured, e.g. "main red at abc123 (exit 134)"
+    measured_at: str   # when/where measured, e.g. "HEAD=abc123 @ 2026-07-14T00:00:00+00:00"
+    ref: str           # ref/context this was measured against, e.g. "rerun#2" or "HEAD=abc123"
 
 
 # Severities that cause an escalation to be created directly at L2,
@@ -90,6 +114,14 @@ class Escalation:
     members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
     root_cause: str = ''  # root-cause hypothesis; exact-string dedup key for pending-L2 lookup
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
+    # Structured raw-OBSERVATION entries backing this escalation (task 2558).
+    # Each is a {observation, measured_at, ref} dict recording a measurement
+    # (HEAD SHA, rerun result, raw exit code) — never a causal diagnosis.
+    # Empty default keeps existing free-form escalations bit-identical on disk;
+    # legacy JSON without the key deserialises to [] via the from_dict
+    # __dataclass_fields__ filter — zero migration, same pattern as members /
+    # train_state above.  Stored/returned verbatim (no shape validation).
+    evidence: list[EvidenceEntry] = field(default_factory=list)
     # PRD § 9.8 — per-train context for park-prefix derail L2 escalations.
     # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
     # via the from_dict __dataclass_fields__ filter — no migration required.
