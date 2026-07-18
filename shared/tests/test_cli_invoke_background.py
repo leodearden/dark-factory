@@ -180,6 +180,33 @@ class TestDetectEndedAwaitingBackground:
         ]
         assert detect_ended_awaiting_background(records) is False
 
+    def test_poll_once_still_running_then_end_is_false_documented_gap(self) -> None:
+        """DOCUMENTED, ACCEPTED false negative (design tradeoff, not a bug): an
+        agent that launches a background task, polls it ONCE with BashOutput
+        while it is still running, then ends its turn "to wait for the
+        completion notification" → the poll is the last background action (reap
+        after launch) → False.
+
+        This is arguably the *primary* Reify-5164 abandonment shape — the amender
+        described ending its turn to wait for completion, and a single natural
+        poll before ending lands exactly here. The detector cannot distinguish
+        "polled, saw it FINISHED, moved on" (a genuine clear) from "polled, saw
+        it STILL RUNNING, ended anyway" (this abandonment) without parsing
+        free-form BashOutput result text, which is deliberately avoided (fragile
+        across CLI versions). It errs toward False because a success→failure
+        downgrade must never re-run a possibly-complete task. Pinned here so this
+        coverage boundary is explicit and reviewed, not only prose-documented in
+        the detector's docstring. (Cf. test_launch_then_bashoutput_is_false,
+        which pins the same verdict for the FINISHED-then-moved-on shape.)
+        """
+        records = [
+            _assistant([_text('kick off the long OCCT test')]),
+            _assistant([_bash_launch(command='./occt-test.sh')]),
+            _assistant([_bash_output()]),  # polled once — still running
+            _assistant([_text('I will wait for the background test to finish')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
 
 class TestEndedAwaitingBackgroundForSession:
     """File-reading seam: mirrors count_transcript_turns' shape — delegate to
