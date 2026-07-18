@@ -18,6 +18,7 @@ import httpx
 from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.fm_retry import fm_retry_backoffs
 
 logger = logging.getLogger(__name__)
 
@@ -428,10 +429,32 @@ JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
 JCODEMUNCH_ENV: dict[str, str] = {'JCODEMUNCH_NO_VERSION_HINT': '1'}
 
 # ---------------------------------------------------------------------------
-# Retry settings for transient MCP failures (e.g. server restarting)
+# Retry settings for transient MCP failures (e.g. server restarting).
+#
+# The attempt count and backoff schedule come from the shared
+# orchestrator.fm_retry.fm_retry_backoffs() (task 2706) so this loop spans
+# fm's own restart window instead of a too-small, independently-guessed
+# budget — see orchestrator/src/orchestrator/fm_retry.py.
+#
+# Scope of the ~120s fm-restart window (deliberate — task 2706 review
+# amendment): McpSession is a generic Streamable-HTTP transport, so the
+# window is applied to every session this class drives rather than gated
+# per-URL. That is intentional AND, in the orchestrator, effectively
+# fm-scoped in practice: the module-level singleton (McpLifecycle.start()
+# below) is McpSession(self.config.url) with config.url == fused-memory, and
+# mcp_call() reuses that singleton for ALL calls regardless of its url arg
+# (the McpSession(url) one-shot fallback fires only pre-singleton). So the
+# widened budget lands on fused-memory traffic, not sprayed across arbitrary
+# MCP servers. Accepted trade-off: a persistently-hung endpoint now blocks a
+# single call for up to ~attempts*per_attempt_timeout + sum(backoffs)
+# (minutes) versus the old ~7s. No outer cadence assumption is violated by
+# that stall — the scheduler drives dispatch as a sequential poll loop
+# (acquire_next() then asyncio.sleep(idle_poll_secs), harness.py), so a slow
+# call serializes the next poll rather than racing a fixed-interval tick
+# deadline; and multi-attempt durations already exceeded any single
+# per-attempt timeout under the old budget too. Per-URL gating is deferred
+# as a larger transport-layer refactor outside this task's scope.
 _RETRYABLE_STATUS = frozenset({502, 503, 504})
-_MCP_MAX_RETRIES = 3
-_MCP_BACKOFF_BASE = 1.0  # seconds; exponential: 1s, 2s, 4s
 
 # Exceptions treated as transient for retry purposes.
 #
@@ -528,8 +551,13 @@ class McpSession:
         if params is not None:
             payload['params'] = params
 
+        # Shared fm-restart retry window, applied to this generic transport by
+        # design (fm-scoped in practice) — see the "Scope of the ~120s
+        # fm-restart window" note by _RETRYABLE_STATUS above.
+        backoffs = fm_retry_backoffs()
+        attempts = len(backoffs) + 1
         last_exc: Exception | None = None
-        for attempt in range(_MCP_MAX_RETRIES):
+        for attempt in range(attempts):
             headers = dict(MCP_HEADERS)
             if self._session_id:
                 headers['Mcp-Session-Id'] = self._session_id
@@ -545,14 +573,15 @@ class McpSession:
                     if resp.status_code in _RETRYABLE_STATUS:
                         logger.warning(
                             'MCP %s returned %d (attempt %d/%d)',
-                            method, resp.status_code, attempt + 1, _MCP_MAX_RETRIES,
+                            method, resp.status_code, attempt + 1, attempts,
                         )
                         self._session_id = None
                         self._initialized = False
                         last_exc = httpx.HTTPStatusError(
                             f'{resp.status_code}', request=resp.request, response=resp,
                         )
-                        await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
+                        if attempt < len(backoffs):
+                            await asyncio.sleep(backoffs[attempt])
                         continue
 
                     resp.raise_for_status()
@@ -567,19 +596,20 @@ class McpSession:
             except _RETRYABLE_EXCEPTIONS as exc:
                 logger.warning(
                     'MCP %s transient error (attempt %d/%d): %s: %s',
-                    method, attempt + 1, _MCP_MAX_RETRIES,
+                    method, attempt + 1, attempts,
                     type(exc).__name__, exc,
                 )
                 self._session_id = None
                 self._initialized = False
                 last_exc = exc
-                await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
+                if attempt < len(backoffs):
+                    await asyncio.sleep(backoffs[attempt])
 
         # Wrap exhausted retries so downstream log lines carry real context
         # even when str(last_exc) is empty (httpx.ReadTimeout has no message).
         if last_exc is not None:
             raise RuntimeError(
-                f'MCP {method} failed after {_MCP_MAX_RETRIES} attempts: '
+                f'MCP {method} failed after {attempts} attempts: '
                 f'{type(last_exc).__name__}: {last_exc}'
             ) from last_exc
         raise RuntimeError('_raw_call exhausted retries')
@@ -597,8 +627,13 @@ class McpSession:
         if params is not None:
             payload['params'] = params
 
+        # Shared fm-restart retry window, applied to this generic transport by
+        # design (fm-scoped in practice) — see the "Scope of the ~120s
+        # fm-restart window" note by _RETRYABLE_STATUS above.
+        backoffs = fm_retry_backoffs()
+        attempts = len(backoffs) + 1
         last_exc: Exception | None = None
-        for attempt in range(_MCP_MAX_RETRIES):
+        for attempt in range(attempts):
             headers = dict(MCP_HEADERS)
             if self._session_id:
                 headers['Mcp-Session-Id'] = self._session_id
@@ -621,17 +656,18 @@ class McpSession:
             except _RETRYABLE_EXCEPTIONS as exc:
                 logger.warning(
                     'MCP notify %s transient error (attempt %d/%d): %s: %s',
-                    method, attempt + 1, _MCP_MAX_RETRIES,
+                    method, attempt + 1, attempts,
                     type(exc).__name__, exc,
                 )
                 self._session_id = None
                 self._initialized = False
                 last_exc = exc
-                await asyncio.sleep(_MCP_BACKOFF_BASE * (2 ** attempt))
+                if attempt < len(backoffs):
+                    await asyncio.sleep(backoffs[attempt])
 
         if last_exc is not None:
             raise RuntimeError(
-                f'MCP notify {method} failed after {_MCP_MAX_RETRIES} attempts: '
+                f'MCP notify {method} failed after {attempts} attempts: '
                 f'{type(last_exc).__name__}: {last_exc}'
             ) from last_exc
         raise RuntimeError('_raw_notify exhausted retries')
