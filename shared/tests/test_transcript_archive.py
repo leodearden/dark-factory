@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import gzip
+import logging
 import os
 from pathlib import Path
 
@@ -153,3 +155,46 @@ class TestIdempotencyAndResume:
 
         assert archive_task_transcripts(config_dir, task_id, sid, archive_root=root) == 1
         assert _gunzip(dest) == grown
+
+
+class TestBestEffortLoud:
+    """E7: a per-file failure is caught, counted, and logged; never raises."""
+
+    def test_partial_failure_counted_logged_not_raised(self, tmp_path, caplog):
+        config_dir = tmp_path / 'claude-config-42'
+        root = tmp_path / 'archive'
+        task_id = '42'
+
+        good = config_dir / 'projects' / ENC / 'sess-good.jsonl'
+        bad = config_dir / 'projects' / ENC / 'sess-bad.jsonl'
+        good_bytes = b'{"ok":1}\n'
+        _write(good, good_bytes)
+        _write(bad, b'{"bad":1}\n')
+
+        # Induce a per-file write failure: pre-create a DIRECTORY at the bad
+        # file's dest .gz path so gzip.open(dest, 'wb') raises IsADirectoryError.
+        bad_dest = root / task_id / ENC / 'sess-bad.jsonl.gz'
+        bad_dest.mkdir(parents=True)
+        # Ensure the idempotency check does NOT skip it (dir mtime != src mtime).
+        os.utime(bad_dest, (0, 0))
+
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            count = archive_task_transcripts(config_dir, task_id, None, archive_root=root)
+
+        # Partial success — the good file archived, the bad one did not.
+        assert count == 1
+        good_dest = root / task_id / ENC / 'sess-good.jsonl.gz'
+        assert _gunzip(good_dest) == good_bytes
+
+        # Failure counted (loud-over-silent).
+        assert transcript_archive_module._archival_failures() == 1
+
+        # Exactly one structured WARNING carrying path, task_id, errno.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        rec = warnings[0]
+        assert rec.task_id == task_id
+        assert str(bad) in rec.path
+        assert rec.errno == errno.EISDIR
