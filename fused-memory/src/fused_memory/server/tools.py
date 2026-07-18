@@ -3175,6 +3175,7 @@ def create_mcp_server(
         claimant_run_id: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
+        client_op_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -3242,6 +3243,9 @@ def create_mcp_server(
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Threaded into the transition-legality gate so it can
                 classify an actor (task 2175/rho1b).
+            client_op_id: Optional client-supplied idempotency key (task 2712).
+                A retry with the same key applies once and returns the recorded
+                outcome. Omit for today's behavior.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -3269,6 +3273,7 @@ def create_mcp_server(
             done_provenance=done_provenance,
             reopen_reason=reopen_reason,
             agent_id=agent_id,
+            client_op_id=client_op_id,
             **claimant_kwargs,
         )
 
@@ -3847,6 +3852,7 @@ def create_mcp_server(
         status: str | None = None,
         dependencies: list[str] | None = None,
         agent_id: str | None = None,
+        client_op_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
@@ -3897,6 +3903,9 @@ def create_mcp_server(
                 (task C1), surfaced through the interceptor as a rejection
                 dict (task C2), so there is no transition to forward it to
                 on the interceptor.
+            client_op_id: Optional client-supplied idempotency key (task 2712).
+                A retry with the same key applies once and returns the recorded
+                outcome. Omit for today's behavior.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -3932,6 +3941,7 @@ def create_mcp_server(
             status=status,
             dependencies=dependencies,
             agent_id=agent_id,
+            client_op_id=client_op_id,
         )
 
     @mcp.tool()
@@ -4000,6 +4010,7 @@ def create_mcp_server(
         depends_on: str,
         project_root: str,
         tag: str | None = None,
+        client_op_id: str | None = None,
     ) -> dict[str, Any]:
         """Add a dependency between tasks.
 
@@ -4027,6 +4038,9 @@ def create_mcp_server(
                 (``"project_id:task_id"``).
             project_root: Absolute path to project root
             tag: Tag context (optional)
+            client_op_id: Optional client-supplied idempotency key (task 2712).
+                A retry with the same key applies once and returns the recorded
+                outcome. Omit for today's behavior.
         """
         if err := _reject_if_ticket_id('id', id):
             return err
@@ -4041,6 +4055,7 @@ def create_mcp_server(
             depends_on=depends_on,
             project_root=project_root,
             tag=tag,
+            client_op_id=client_op_id,
         )
 
     @mcp.tool()
@@ -4050,6 +4065,7 @@ def create_mcp_server(
         depends_on: str,
         project_root: str,
         tag: str | None = None,
+        client_op_id: str | None = None,
     ) -> dict[str, Any]:
         """Remove a dependency from a task.
 
@@ -4069,6 +4085,9 @@ def create_mcp_server(
                 (``"project_id:task_id"``).
             project_root: Absolute path to project root
             tag: Tag context (optional)
+            client_op_id: Optional client-supplied idempotency key (task 2712).
+                A retry with the same key applies once and returns the recorded
+                outcome. Omit for today's behavior.
         """
         if err := _reject_if_ticket_id('id', id):
             return err
@@ -4083,6 +4102,7 @@ def create_mcp_server(
             depends_on=depends_on,
             project_root=project_root,
             tag=tag,
+            client_op_id=client_op_id,
         )
 
     # ------------------------------------------------------------------

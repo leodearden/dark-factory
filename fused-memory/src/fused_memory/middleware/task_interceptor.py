@@ -496,6 +496,48 @@ class TaskInterceptor:
         """
         self._write_journal = journal
 
+    async def _idempotency_replay(self, client_op_id: str | None) -> dict | None:
+        """Return a previously-recorded outcome for ``client_op_id`` (task 2712).
+
+        No-op returning ``None`` when the caller supplied no key or no journal
+        is wired — so tests/callers without a journal keep behavior
+        byte-identical (mirrors ``_journal_around``'s no-journal gating). A
+        ``None`` result means "not a replay — proceed with the write".
+        """
+        if not client_op_id or self._write_journal is None:
+            return None
+        return await self._write_journal.get_idempotent_result(client_op_id)
+
+    async def _idempotency_record(
+        self, client_op_id: str | None, operation: str, result: Any
+    ) -> None:
+        """Record a mutating write's outcome under ``client_op_id`` (task 2712).
+
+        No-op unless a key was supplied, a journal is wired, AND the result is
+        a ``dict`` (a gate rejection may return a non-dict / the write may not
+        have produced a replayable outcome). ``record_idempotent_result`` is
+        first-write-wins, so a rare concurrent double records once.
+
+        Only SUCCESSFUL outcomes are pinned. A failure dict — ``success`` is
+        explicitly ``False`` or a truthy ``error`` — is deliberately NOT
+        recorded, so a transiently-failed write (e.g. a backend hiccup whose
+        HTTP response was then lost) is RE-ATTEMPTED on the retry rather than
+        replaying a stale failure. This mirrors the gate-rejection rule (a
+        never-applied op is not pinned) and the double-apply protection is
+        unaffected: a failed write applied nothing to protect.
+        """
+        if (
+            not client_op_id
+            or self._write_journal is None
+            or not isinstance(result, dict)
+            or result.get('success') is False
+            or result.get('error')
+        ):
+            return
+        await self._write_journal.record_idempotent_result(
+            client_op_id, operation, result
+        )
+
     def set_lifecycle_reset_filer(self, filer: FileFindingFn) -> None:
         """Wire the async lifecycle-reset finding filer (task 2624).
 
@@ -734,6 +776,7 @@ class TaskInterceptor:
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
+        client_op_id: str | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -755,7 +798,15 @@ class TaskInterceptor:
         forwarded per-id through the CSV loop so a comma-separated call is
         classified identically to a single-id call; every existing internal
         caller omits it and is unaffected (``None`` -> HUMAN, safe-open).
+
+        ``client_op_id`` is an optional client idempotency key (task 2712): on a
+        retry with a recorded key the replay below returns the prior outcome
+        (whole-call, covering both the CSV and single-id branches) and skips the
+        transition. It is NOT threaded into ``_apply_status_transition`` — dedup
+        is a public-method concern only. Absent a key behavior is unchanged.
         """
+        if (hit := await self._idempotency_replay(client_op_id)) is not None:
+            return hit
         if err := await self._backlog_gate(project_root):
             return err
         await self._ensure_taskmaster()
@@ -780,9 +831,11 @@ class TaskInterceptor:
                 isinstance(r.get('result'), dict) and r['result'].get('error') is None
                 for r in results
             )
-            return {'success': all_ok, 'results': results}
+            csv_result = {'success': all_ok, 'results': results}
+            await self._idempotency_record(client_op_id, 'set_task_status', csv_result)
+            return csv_result
 
-        return await self._apply_status_transition(
+        result = await self._apply_status_transition(
             task_id=task_id,
             status=status,
             project_root=project_root,
@@ -793,6 +846,8 @@ class TaskInterceptor:
             heartbeat_at=heartbeat_at,
             agent_id=agent_id,
         )
+        await self._idempotency_record(client_op_id, 'set_task_status', result)
+        return result
 
     async def _apply_status_transition(
         self,
@@ -3711,6 +3766,7 @@ class TaskInterceptor:
         project_root: str,
         *,
         agent_id: str | None = None,
+        client_op_id: str | None = None,
         **kwargs: Any,
     ) -> dict:
         """Write task metadata through all interceptor gates.
@@ -3744,7 +3800,15 @@ class TaskInterceptor:
         ``metadata_mode`` and ``append`` pass through unchanged via ``**kwargs`` to
         the backend, which single-sources mode resolution via
         :func:`~fused_memory.backends.sqlite_task_backend._resolve_metadata_mode`.
+
+        ``client_op_id`` is an optional client-supplied idempotency key (task
+        2712). Declared explicitly (like ``agent_id``) so it is never swept into
+        ``**kwargs`` → the backend. On a retry with a recorded key, the replay
+        below returns the prior outcome and skips the write, event, and re-embed
+        entirely. Absent a key (or a journal) behavior is byte-identical.
         """
+        if (hit := await self._idempotency_replay(client_op_id)) is not None:
+            return hit
         if err := _reject_directory_locks_in_update_metadata(
             task_id,
             kwargs.get('metadata'),
@@ -3896,6 +3960,7 @@ class TaskInterceptor:
                         task_id,
                         exc_info=True,
                     )
+        await self._idempotency_record(client_op_id, 'update_task', result)
         return result
 
     async def remove_tasks(self, ids: list[str], project_root: str, tag: str | None = None) -> dict:
@@ -3960,6 +4025,8 @@ class TaskInterceptor:
         depends_on: str,
         project_root: str,
         tag: str | None = None,
+        *,
+        client_op_id: str | None = None,
     ) -> dict:
         """Add a dependency for a task.
 
@@ -3975,7 +4042,13 @@ class TaskInterceptor:
         The interceptor does not inspect or transform ``depends_on``; routing is
         handled entirely by the backend.  The journal and ``task_modified`` event
         are emitted regardless of which branch the backend takes.
+
+        ``client_op_id`` is an optional client idempotency key (task 2712): a
+        retry with a recorded key replays the prior outcome and skips the write
+        + event. Absent a key behavior is unchanged.
         """
+        if (hit := await self._idempotency_replay(client_op_id)) is not None:
+            return hit
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
@@ -4001,6 +4074,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'add_dependency'},
         )
         await self._journal(event)
+        await self._idempotency_record(client_op_id, 'add_dependency', result)
         return result
 
     async def remove_dependency(
@@ -4009,6 +4083,8 @@ class TaskInterceptor:
         depends_on: str,
         project_root: str,
         tag: str | None = None,
+        *,
+        client_op_id: str | None = None,
     ) -> dict:
         """Remove a dependency from a task.
 
@@ -4024,7 +4100,13 @@ class TaskInterceptor:
         The interceptor does not inspect or transform ``depends_on``; routing is
         handled entirely by the backend.  The journal and ``task_modified`` event
         are emitted regardless of which branch the backend takes.
+
+        ``client_op_id`` is an optional client idempotency key (task 2712): a
+        retry with a recorded key replays the prior outcome and skips the write
+        + event. Absent a key behavior is unchanged.
         """
+        if (hit := await self._idempotency_replay(client_op_id)) is not None:
+            return hit
         if err := await self._backlog_gate(project_root):
             return err
         tm = await self._ensure_taskmaster()
@@ -4050,6 +4132,7 @@ class TaskInterceptor:
             {'task_id': task_id, 'depends_on': depends_on, 'operation': 'remove_dependency'},
         )
         await self._journal(event)
+        await self._idempotency_record(client_op_id, 'remove_dependency', result)
         return result
 
     # ── Pure reads (direct pass-through) ───────────────────────────────

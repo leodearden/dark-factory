@@ -631,3 +631,78 @@ async def test_prune_mem0_intents_never_raises(journal):
     await journal.close()
     journal._db = None
     assert await journal.prune_mem0_intents() == 0
+
+
+# ------------------------------------------------------------------
+# idempotent_ops: client-supplied idempotency keys (task 2712)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_and_get_idempotent_result_roundtrip(journal):
+    """record_idempotent_result then get_idempotent_result returns the exact dict."""
+    result = {'success': True, 'x': 1}
+    await journal.record_idempotent_result('op-1', 'update_task', result)
+    got = await journal.get_idempotent_result('op-1')
+    assert got == {'success': True, 'x': 1}
+
+
+@pytest.mark.asyncio
+async def test_get_idempotent_result_miss_returns_none(journal):
+    """A never-recorded client_op_id resolves to None (no hit)."""
+    assert await journal.get_idempotent_result('never-seen') is None
+
+
+@pytest.mark.asyncio
+async def test_record_idempotent_result_first_write_wins(journal):
+    """Re-recording the same client_op_id keeps the FIRST result (INSERT OR IGNORE)."""
+    await journal.record_idempotent_result('op-dup', 'update_task', {'v': 'first'})
+    # A second record with the SAME key but a DIFFERENT result must not raise
+    # and must not overwrite the first-recorded outcome.
+    await journal.record_idempotent_result('op-dup', 'update_task', {'v': 'second'})
+    got = await journal.get_idempotent_result('op-dup')
+    assert got == {'v': 'first'}
+
+
+@pytest.mark.asyncio
+async def test_get_idempotent_result_never_raises(journal):
+    """A read hiccup fails open (None), never raises — journal never-block style."""
+    await journal.close()
+    journal._db = None
+    assert await journal.get_idempotent_result('op-x') is None
+
+
+@pytest.mark.asyncio
+async def test_record_idempotent_result_never_raises(journal):
+    """A record hiccup is swallowed, not propagated."""
+    await journal.close()
+    journal._db = None
+    # Should not raise
+    await journal.record_idempotent_result('op-y', 'update_task', {'ok': True})
+
+
+@pytest.mark.asyncio
+async def test_prune_idempotent_ops_ages_out_old_rows(journal):
+    """prune deletes rows older than the window; preserves recent rows."""
+    # Recent row (created_at = now) stays; backdated row is aged out.
+    await journal.record_idempotent_result('recent', 'update_task', {'ok': True})
+    await journal.record_idempotent_result('old', 'update_task', {'ok': True})
+    await journal._db.execute(
+        'UPDATE idempotent_ops SET created_at = ? WHERE client_op_id = ?',
+        ('2000-01-01T00:00:00+00:00', 'old'),
+    )
+    await journal._db.commit()
+
+    deleted = await journal.prune_idempotent_ops(older_than_days=7)
+    assert deleted == 1  # only the backdated row
+
+    assert await journal.get_idempotent_result('old') is None
+    assert await journal.get_idempotent_result('recent') == {'ok': True}
+
+
+@pytest.mark.asyncio
+async def test_prune_idempotent_ops_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    journal._db = None
+    assert await journal.prune_idempotent_ops() == 0

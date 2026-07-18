@@ -73,6 +73,18 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
+
+-- idempotent_ops: client-supplied idempotency keys for mutating task writes
+-- (task 2712). client_op_id PRIMARY KEY IS the required unique index, so a
+-- retry with the same key records once (INSERT OR IGNORE, first-write-wins)
+-- and replays the recorded outcome. CREATE TABLE IF NOT EXISTS runs on every
+-- initialize(), so existing DBs gain the table with no ALTER migration.
+CREATE TABLE IF NOT EXISTS idempotent_ops (
+    client_op_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    result TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -287,6 +299,96 @@ class WriteJournal:
             (write_op_id,),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # idempotent_ops: client-supplied idempotency keys for mutating task
+    # writes (task 2712 / survey finding D5)
+    # ------------------------------------------------------------------
+
+    async def get_idempotent_result(self, client_op_id: str) -> dict | None:
+        """Replay a previously-recorded result for ``client_op_id``.
+
+        Returns the recorded outcome dict on a hit, or ``None`` on a miss.
+        Fails OPEN: any read error logs a warning and returns ``None`` (so a
+        rare DB hiccup lets the write proceed rather than wedging it) — the
+        journal's never-block discipline.
+        """
+        try:
+            db = self._require_db()
+            async with db.execute(
+                'SELECT result FROM idempotent_ops WHERE client_op_id = ?',
+                (client_op_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            return json.loads(row[0])
+        except Exception as e:
+            logger.warning(f'Failed to read idempotent_ops for {client_op_id}: {e}')
+            return None
+
+    async def record_idempotent_result(
+        self, client_op_id: str, operation: str, result: dict
+    ) -> None:
+        """Record the outcome of a mutating write under ``client_op_id``.
+
+        ``INSERT OR IGNORE`` on the ``client_op_id`` PRIMARY KEY makes the
+        first write win: a duplicate key (a rare concurrent double) is a no-op,
+        never a corruption or an overwrite. Fire-and-forget — logs on failure
+        but never raises (mirrors ``log_write_op``).
+        """
+        try:
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT OR IGNORE INTO idempotent_ops
+                       (client_op_id, operation, result, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        client_op_id,
+                        operation,
+                        json.dumps(result, default=str),
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+        except Exception as e:
+            logger.warning(
+                f'Failed to record idempotent_ops for {client_op_id}: {e}'
+            )
+
+    async def prune_idempotent_ops(self, *, older_than_days: float = 7.0) -> int:
+        """Age out old ``idempotent_ops`` rows past a retention window.
+
+        One row accrues per mutating task write (update_task / set_task_status /
+        add_dependency / remove_dependency), so — like ``mem0_intents`` — this
+        table grows without bound if never swept. A client idempotency key only
+        needs to outlive the ambiguous-transport-failure retry window it guards
+        (seconds to minutes; a higher-level retry at most hours), so an
+        aggressive TTL is safe: rows whose ``created_at`` is older than
+        ``older_than_days`` are deleted and the count returned. Intended to run
+        at startup alongside ``prune_mem0_intents``.
+
+        Fire-and-forget — logs loudly on failure but never raises, so a prune
+        hiccup cannot crash startup (mirrors ``prune_mem0_intents``).
+        """
+        try:
+            cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+            deleted = 0
+            async with self._txn() as db:
+                cursor = await db.execute(
+                    'DELETE FROM idempotent_ops WHERE created_at < ?',
+                    (cutoff,),
+                )
+                deleted = max(cursor.rowcount, 0)
+            if deleted:
+                logger.info(
+                    'Pruned %d idempotent_ops rows older than %s days',
+                    deleted,
+                    older_than_days,
+                )
+            return deleted
+        except Exception as e:
+            logger.error(f'Failed to prune idempotent_ops: {e}')
+            return 0
 
     # ------------------------------------------------------------------
     # mem0_intents: write-ahead intent journal for the dual-store add path
