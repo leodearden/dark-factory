@@ -163,9 +163,11 @@ async def _migrate_one_project(
         task_id = str(task.get('id', ''))
 
         # Build a full new metadata dict (None-deletion via merge doesn't
-        # work — append=True keeps existing keys; append=False replaces the
-        # whole blob, so we copy the existing metadata, mutate, and write
-        # the complete result.)
+        # work — a merge/append=True keeps existing keys). We copy the existing
+        # metadata, mutate, and write the COMPLETE result under the explicit
+        # metadata_mode='replace' co-signal — a bare append=False is now
+        # rejected by the task-2180 metadata-wipe guard in
+        # _resolve_metadata_mode.
         # Strip done_provenance — update_task rejects metadata writes that
         # carry it (set_task_status is the only sanctioned writer); we
         # already skip done/cancelled, but be defensive about orphan stamps.
@@ -190,7 +192,7 @@ async def _migrate_one_project(
                     'id': task_id,
                     'project_root': project_root,
                     'metadata': json.dumps(new_meta),
-                    'append': False,
+                    'metadata_mode': 'replace',
                 })
                 print(
                     f'  [{project_root}] task={task_id} action={action}',

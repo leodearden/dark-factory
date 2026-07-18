@@ -5209,8 +5209,9 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         ('replace',  None,  'replace'),
         # (b) metadata_mode=None + append=True -> 'additive'
         (None, True,  'additive'),
-        # (c) metadata_mode=None + append=False -> 'replace'
-        (None, False, 'replace'),
+        # NOTE: (None, False) is intentionally ABSENT — a bare append=False
+        # with no explicit metadata_mode now RAISES (task 2180 metadata-wipe
+        # guard); see test_resolve_metadata_mode_bare_append_false_raises.
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
         # (f) explicit metadata_mode wins over conflicting append (distinct combos)
@@ -5235,6 +5236,43 @@ def test_resolve_metadata_mode_invalid_raises():
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
         f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
     )
+
+
+def test_resolve_metadata_mode_bare_append_false_raises():
+    """A bare append=False (no explicit metadata_mode, metadata present) is
+    REJECTED — the task-2180 metadata-wipe guard. It must raise
+    TaskmasterError(TASKMASTER_TOOL_ERROR) rather than silently resolve to the
+    old destructive 'replace' default that wiped a live task's whole blob."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode(None, False)  # metadata_present defaults True
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    msg = exc.value.message
+    assert "metadata_mode='replace'" in msg, (
+        f"message must instruct the metadata_mode='replace' co-signal; got: {msg!r}"
+    )
+    # NB: intentionally do NOT assert on the '2180' incident number. That tag is
+    # cosmetic prose, not part of the actionable contract — the load-bearing
+    # requirement is that the message points the caller at the metadata_mode=
+    # 'replace' escape hatch (asserted above). Incident traceability lives in the
+    # source error message and the _resolve_metadata_mode docstring, not here, so
+    # a future reword that keeps the guidance but drops the tag won't break this.
+
+
+def test_resolve_metadata_mode_append_false_cosignal_replace():
+    """An explicit metadata_mode='replace' co-signal alongside append=False is
+    honored (still resolves to 'replace') — the sanctioned way to confirm a
+    whole-blob overwrite. Explicit metadata_mode wins unconditionally."""
+    assert _resolve_metadata_mode('replace', False) == 'replace'
+
+
+def test_resolve_metadata_mode_append_false_no_metadata_ok():
+    """append=False with metadata_present=False (a details-only write, no
+    metadata) is NOT rejected — the guard is scoped to metadata-present writes
+    so the details/prompt-append path is unaffected. Returns 'replace' (unused
+    by the caller since no metadata is written)."""
+    assert _resolve_metadata_mode(None, False, metadata_present=False) == 'replace'
 
 
 # ── _merge_metadata mode= API (step-3 RED / step-4 GREEN) ───────────────────
@@ -5393,8 +5431,37 @@ async def test_update_task_legacy_append_true_additive(backend, project_root):
 
 
 @pytest.mark.asyncio
-async def test_update_task_legacy_append_false_replace(backend, project_root):
-    """Legacy append=False -> replace overwrite (shim end-to-end)."""
+async def test_update_task_bare_append_false_rejected_preserves_blob(backend, project_root):
+    """A bare append=False metadata write (no metadata_mode) is REJECTED and
+    the stored blob is left intact — the task-2180 metadata-wipe guard,
+    end-to-end through the backend. The raise fires before the DB txn, so the
+    original metadata is never touched (no wipe, and the rejected write's
+    ``files`` key never lands)."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'keep2'}),
+    )
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'files': ['f.py']}),
+            append=False,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('_causation_id') == 'keep', f'original blob wiped: {meta}'
+    assert meta.get('extra') == 'keep2', f'original blob wiped: {meta}'
+    assert 'files' not in meta, f'rejected write must not land: {meta}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_mode_replace_replaces(backend, project_root):
+    """The explicit metadata_mode='replace' co-signal still performs a
+    whole-blob overwrite (the sanctioned destructive path — how a caller
+    confirms a deliberate replace after the bare-append=False rejection)."""
     await backend.add_task(
         project_root=project_root, title='t',
         metadata=json.dumps({'_causation_id': 'keep', 'extra': 'gone'}),
@@ -5402,12 +5469,30 @@ async def test_update_task_legacy_append_false_replace(backend, project_root):
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'files': ['f.py']}),
-        append=False,
+        metadata_mode='replace',
     )
     task = await backend.get_task('1', project_root=project_root)
     meta = task['metadata']
-    assert 'extra' not in meta, f'legacy append=False should replace: {meta}'
+    assert 'extra' not in meta, f"metadata_mode='replace' should overwrite: {meta}"
     assert meta['files'] == ['f.py']
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_only_append_false_ok(backend, project_root):
+    """A details-only append=False write (NO metadata) is NOT rejected — the
+    guard is scoped to metadata-present writes so the details-replace path is
+    unaffected. append=False replaces details wholesale."""
+    await backend.add_task(
+        project_root=project_root, title='t', details='old',
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        details='new', append=False,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['details'] == 'new', (
+        f'details-only append=False should replace: {task["details"]!r}'
+    )
 
 
 @pytest.mark.asyncio

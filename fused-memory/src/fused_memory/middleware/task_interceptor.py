@@ -1872,7 +1872,12 @@ class TaskInterceptor:
                     task_id=decision.target_id,
                     project_root=project_root,
                     metadata=combine_metadata,
-                    append=False,
+                    # Whole-blob overwrite via the explicit replace co-signal —
+                    # NOT a bare append=False (rejected by the task-2180
+                    # metadata-wipe guard in _resolve_metadata_mode). Behaviour-
+                    # preserving: metadata still resolves to 'replace', and the
+                    # details path stays replace since append is now None (falsy).
+                    metadata_mode='replace',
                     title=rt.title,
                     description=rt.description,
                     details=details_with_files,

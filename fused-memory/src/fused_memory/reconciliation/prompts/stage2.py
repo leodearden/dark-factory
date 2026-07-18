@@ -424,6 +424,18 @@ MAY also contain pre-existing entries that were preserved through the union merg
 the returned hints are missing any newly-attached entry, skip the \
 `tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
+The `append=True` additive union above is ONLY for the ATTACH case (adding new hints \
+to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
+`memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
+dict shape — you must NOT use `append=False`: a bare `append=False` whole-blob metadata \
+overwrite is now REJECTED (the task-2180 metadata-wipe incident, where it silently wiped \
+a live in-progress task's `substrate_confirmed`/`files`/`branch_base_sha`/`prd_path`/`routing`). \
+Instead do a read-modify-write under the explicit replace co-signal: call \
+`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` to read the FULL \
+current metadata, convert and merge the reshaped hints into it locally, then write the \
+COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
+key while replacing only the legacy hint shape.
+
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.

@@ -2595,11 +2595,18 @@ class SqliteTaskBackend:
         # ``details`` is passed it feeds the details path (replace, or append
         # when ``append=True``). ``metadata`` retains the merge-or-replace
         # semantics keyed off ``append``.
-        # Validate metadata_mode unconditionally — a bad value should always
-        # raise immediately, even if no metadata is supplied in this call.
-        # Resolution is stored so the metadata block can reuse it without a
-        # second call (and to keep the single call-site clear).
-        resolved_mode = _resolve_metadata_mode(metadata_mode, append)
+        # Validate the metadata_mode VALUE unconditionally — a bad value should
+        # always raise immediately, even if no metadata is supplied in this
+        # call. But scope the bare-append=False rejection (the task-2180
+        # metadata-wipe guard inside _resolve_metadata_mode) to metadata-present
+        # writes via metadata_present: ``append`` ALSO independently drives the
+        # details/prompt-append path below, so a details-only
+        # update_task(details=..., append=False) with no metadata must NOT be
+        # rejected. Resolution is stored so the metadata block can reuse it
+        # without a second call (and to keep the single call-site clear).
+        resolved_mode = _resolve_metadata_mode(
+            metadata_mode, append, metadata_present=metadata is not None,
+        )
 
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -3197,16 +3204,31 @@ _METADATA_MODES: frozenset[str] = frozenset({'merge', 'additive', 'replace'})
 def _resolve_metadata_mode(
     metadata_mode: str | None,
     append: bool | None,
+    *,
+    metadata_present: bool = True,
 ) -> str:
     """Resolve the effective metadata merge mode from the two input signals.
 
     Precedence (high → low):
     1. ``metadata_mode`` — explicit tri-state wins unconditionally.
-    2. ``append`` legacy shim — True → 'additive', False → 'replace'.
+    2. ``append`` legacy shim — True → 'additive'. A bare ``append=False``
+       (no explicit ``metadata_mode``) is **rejected** when
+       ``metadata_present`` is True: it used to resolve to a silent
+       whole-blob 'replace' that wiped a live in-progress task's metadata
+       (the task-2180 metadata-wipe incident, 2026-07-18). Callers who
+       genuinely want a destructive overwrite must pass the explicit
+       ``metadata_mode='replace'`` co-signal (honored via rule 1 above);
+       callers who want a safe merge pass ``metadata_mode='merge'`` or
+       ``append=True``. When ``metadata_present`` is False (a details/
+       prompt-only write with no metadata) the rejection is inert and
+       'replace' is returned unused — ``append`` still independently drives
+       the details-append path in the backend.
     3. Default — 'merge' (shallow last-write-wins) when both are None.
 
     Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) for an
-    unrecognised ``metadata_mode`` value (loud over silent).
+    unrecognised ``metadata_mode`` value AND for a bare ``append=False``
+    metadata write (both loud over silent). ``metadata_present`` defaults to
+    True (fail-safe strict) so any future 2-arg caller gets the guard.
     """
     if metadata_mode is not None:
         if metadata_mode not in _METADATA_MODES:
@@ -3216,8 +3238,25 @@ def _resolve_metadata_mode(
                 f"must be one of {sorted(_METADATA_MODES)}.",
             )
         return metadata_mode
-    if append is not None:
-        return 'additive' if append else 'replace'
+    if append is True:
+        return 'additive'
+    if append is False:
+        # Bare append=False (no explicit metadata_mode): the old destructive
+        # 'replace' default wiped a live task's whole metadata blob. Reject
+        # loudly and make the caller state intent explicitly.
+        if metadata_present:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                "Refusing a bare append=False metadata write: with no explicit "
+                "metadata_mode this used to silently REPLACE the whole metadata "
+                "blob, wiping a live in-progress task's metadata "
+                "(substrate_confirmed/files/branch_base_sha/prd_path/routing) — "
+                "the task-2180 metadata-wipe incident (2026-07-18). State intent "
+                "explicitly: pass metadata_mode='replace' to CONFIRM a whole-blob "
+                "overwrite, or metadata_mode='merge' (or append=True) to merge "
+                "into the existing blob.",
+            )
+        return 'replace'
     return 'merge'
 
 
