@@ -1154,6 +1154,162 @@ class TestStage1CycleSummaryHarnessBackstop:
             'self-identify with distinct markers'
         )
 
+    @pytest.mark.asyncio
+    async def test_remediation_stage1_completed_write_failed_does_not_fire_backstop(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Guards arm 2's run.run_type != RunType.remediation condition: a
+        remediation pass's Stage 1 intentionally writes no cycle_summary (its
+        run() early-returns before the write, task 2652), so even a report
+        explicitly carrying the write-failed stat (0) must not trigger arm
+        2's re-attempt — that would fabricate a spurious Stage 1 summary
+        every remediation pass."""
+        from fused_memory.models.reconciliation import StageId
+        from fused_memory.reconciliation.harness import TierConfig
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 0},
+            llm_calls=6,
+            tokens_used=600,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await harness._run_remediation_pass(
+                'test-project',
+                'parent-run-id',
+                [_make_s3_findings()[0]],
+                TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+                scope=_scope('test-project', '/tmp/test-project'),
+            )
+
+        mock_write.assert_not_called()
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent and recent[0].run_type == 'remediation', (
+            'expected the remediation run to be persisted by the journal'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unwired_ledger_completed_write_failed_does_not_fire(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Guards arm 2's getattr(self.memory, 'recon_ledger', None) is not
+        None condition: an intentionally recon_ledger_enabled=False
+        deployment (see write_cycle_summary's docstring) always stamps the
+        write-failed stat (0), since there is no ledger to upsert into — arm
+        2 must not re-fire (and WARNING) every cycle for that expected,
+        permanent state."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 0},
+            llm_calls=6,
+            tokens_used=600,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_stat_one_does_not_fire_arm2(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Guards arm 2's _stage1_ledger_write_missing(s1_report) condition
+        at its exact success boundary:
+        stats['stage1_cycle_summary_ledger_written'] == 1 (the in-stage
+        write succeeded) must never be treated as a failure needing
+        recovery. Complements test_happy_path_does_not_invoke_backstop_write
+        (which pins the same stat value from the 'no redundant write'
+        angle); this test pins it explicitly from arm 2's own
+        success-boundary angle so the guard survives independently of that
+        other test's intent."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage1_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'stage1_cycle_summary_ledger_written': 1},
+            llm_calls=3,
+            tokens_used=300,
+        )
+        harness.stages[0].run = AsyncMock(return_value=stage1_report)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_stat_stage1_report_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Guards arm 2's no-fire-on-absent-stat behavior: a Stage 1 report
+        with no stage1_cycle_summary_ledger_written key at all (the shape
+        every stubbed-Stage-1 test in this file uses via _mock_stage_run)
+        must not be treated as a write failure — only the explicit 0 value
+        is a failure signal (see _stage1_ledger_write_missing's docstring on
+        '== 0, never != 1'). Keeps every existing stubbed-Stage-1 test in
+        this file green."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage1_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_called()
+
 
 class TestStage1CycleSummaryRemediationBackstop:
     """_run_remediation_pass's finally block guarantees a Stage 1 cycle_summary
