@@ -2594,6 +2594,25 @@ class OrchestratorConfig(BaseSettings):
     # main_tip_sweep_enabled's operator kill-switch convention.
     escalation_revalidation_enabled: bool = Field(default=True)
 
+    # Category allowlist narrowing the terminal-subject auto-close (task 2724).
+    # The subject-terminal Source-C close (criterion a above) used to fire for
+    # ANY category — a status-only heuristic that silently dropped still-required
+    # escalations whose real work lives OUTSIDE the task record.  This allowlist
+    # restricts the auto-close to categories where a done/cancelled subject truly
+    # MOOTS the ask: task_failure and stranded_blocked are reliably about THIS
+    # task.  infra_issue is deliberately EXCLUDED (its remediation can outlive the
+    # task record; accepted tradeoff — a couple of historically-correct closes
+    # return to the human queue).  A non-allowlisted category on a terminal
+    # subject stays pending for a human.  Green-tier hot-reloadable (see its leaf
+    # name in RELOADABLE_FIELDS) so the allowlist can be widened/narrowed live via
+    # mcp__escalation__reload_config without a restart.  frozenset gives
+    # order-independent equality (no spurious reload diffs) and a safe immutable
+    # default.  Distinct from escalation_revalidation_enabled (the kill switch —
+    # left unchanged).
+    escalation_revalidation_allowlist: frozenset[str] = Field(
+        default=frozenset({'task_failure', 'stranded_blocked'})
+    )
+
     # Warm-lane auto-GC cadence loop (task 1926).
     # Periodic unconditional invocation of scripts/warm-lane-gc.sh reclaim to
     # bound FREE _lane-*/_spec-* target/ re-accretion.  gc.sh only resets FREE
