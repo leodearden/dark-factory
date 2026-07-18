@@ -4325,3 +4325,119 @@ def test_fm_staleness_redeploy_unit_constant() -> None:
     wdog = _load_watchdog()
     assert wdog.FM_STALENESS_REDEPLOY_UNIT == "fm-staleness-redeploy.service"
 
+
+# ---------------------------------------------------------------------------
+# Part C: _unit_active_enter_epoch() (step 3)
+#
+# fm sibling of _unit_start_epoch: structurally identical, but queries
+# ActiveEnterTimestamp (when the unit signalled readiness — the field
+# restart-all-orchestrators.sh's own freshness verify reads) instead of
+# ExecMainStartTimestamp. fused_memory_staleness_pass() compares this against
+# the newest fm-watched commit.
+# ---------------------------------------------------------------------------
+
+
+def _make_active_enter_epoch_result(value: str, rc: int = 0) -> subprocess.CompletedProcess:
+    """Build a fake `systemctl show --timestamp=unix -p ActiveEnterTimestamp` result."""
+    stdout = f"ActiveEnterTimestamp={value}\n"
+    return subprocess.CompletedProcess(["systemctl"], rc, stdout=stdout, stderr="")
+
+
+def test_unit_active_enter_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch parses the '@<epoch>' realtime value to an int.
+
+    Also pins the field choice: the argv must request ActiveEnterTimestamp and
+    must NOT request ExecMainStartTimestamp (the sibling helper's field).
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return _make_active_enter_epoch_result("@1782996274")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._unit_active_enter_epoch("fused-memory.service")
+
+    assert result == 1782996274
+    assert isinstance(result, int)
+    assert len(calls) == 1, f"Expected exactly one systemctl call, got {calls}"
+    argv = calls[0]
+    assert "--timestamp=unix" in argv
+    assert any("ActiveEnterTimestamp" in tok for tok in argv), (
+        f"argv must request ActiveEnterTimestamp: {argv}"
+    )
+    assert not any("ExecMainStartTimestamp" in tok for tok in argv), (
+        f"argv must NOT request ExecMainStartTimestamp (that is _unit_start_epoch's field): {argv}"
+    )
+
+
+def test_unit_active_enter_epoch_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("@1782996274", rc=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_empty_value_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None when the property value is empty."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None for the '@0' sentinel (never activated)."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("@0")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_unparseable_value_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_unit_active_enter_epoch returns None when the value is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_active_enter_epoch_result("@notanint")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_missing_binary_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_unit_active_enter_epoch returns None when systemctl binary is not found."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
+
+def test_unit_active_enter_epoch_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_active_enter_epoch returns None when the systemctl call times out."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_active_enter_epoch("some.service") is None
+
