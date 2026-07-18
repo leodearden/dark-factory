@@ -49,6 +49,10 @@ FUSED_MEMORY_DIR = TESTS_DIR.parent
 FUSED_MEMORY_PYPROJECT = FUSED_MEMORY_DIR / 'pyproject.toml'
 
 REAL_TEST_MODULE = TESTS_DIR / 'test_recon_dedup_premise.py'
+# Must stay in sync with the function names in test_recon_dedup_premise.py --
+# a rename there without a matching rename here turns this guard into a
+# silent no-op (the collect-only output just won't contain the old name
+# either way) rather than an obvious reference error.
 REAL_EMBEDDER_TEST_NAME = 'test_identical_writes_land_with_real_openai_embeddings'
 HERMETIC_SIBLING_TEST_NAME = 'test_identical_infer_false_writes_all_land_distinct'
 
@@ -91,6 +95,11 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
     addopts to keep collection serial without disabling the xdist plugin
     outright (`-p no:xdist` would conflict with the surviving `-n auto` and
     make pytest exit with "unrecognized arguments: -n").
+
+    The probe file lives under fused-memory/tests/, so pytest also loads
+    fused-memory/tests/conftest.py to collect it -- the same GraphitiBackend
+    / config-schema imports that earned the real-module test below a 90s
+    subprocess timeout over the file's default 60s test budget.
     """
     test_file = probe_dir / 'test_probe.py'
     test_file.write_text(_PROBE_SRC)
@@ -111,12 +120,13 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
         ],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=90,
         cwd=str(FUSED_MEMORY_DIR),
     )
     return result.stdout + result.stderr
 
 
+@pytest.mark.timeout(120)
 class TestIntegrationMarkerDeselection:
     def test_integration_marked_tests_deselected_by_default(self, probe_dir: Path) -> None:
         """Without a -m override: not collected by default, and marker is registered."""
