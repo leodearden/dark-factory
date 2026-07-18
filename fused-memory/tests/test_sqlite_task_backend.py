@@ -5209,8 +5209,9 @@ async def test_malformed_metadata_warn_dedup_shared_across_read_and_write(
         ('replace',  None,  'replace'),
         # (b) metadata_mode=None + append=True -> 'additive'
         (None, True,  'additive'),
-        # (c) metadata_mode=None + append=False -> 'replace'
-        (None, False, 'replace'),
+        # NOTE: (None, False) is intentionally ABSENT — a bare append=False
+        # with no explicit metadata_mode now RAISES (task 2180 metadata-wipe
+        # guard); see test_resolve_metadata_mode_bare_append_false_raises.
         # (d) metadata_mode=None + append=None -> 'merge' (new default)
         (None, None,  'merge'),
         # (f) explicit metadata_mode wins over conflicting append (distinct combos)
@@ -5235,6 +5236,40 @@ def test_resolve_metadata_mode_invalid_raises():
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
         f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
     )
+
+
+def test_resolve_metadata_mode_bare_append_false_raises():
+    """A bare append=False (no explicit metadata_mode, metadata present) is
+    REJECTED — the task-2180 metadata-wipe guard. It must raise
+    TaskmasterError(TASKMASTER_TOOL_ERROR) rather than silently resolve to the
+    old destructive 'replace' default that wiped a live task's whole blob."""
+    with pytest.raises(TaskmasterError) as exc:
+        _resolve_metadata_mode(None, False)  # metadata_present defaults True
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    msg = exc.value.message
+    assert "metadata_mode='replace'" in msg, (
+        f"message must instruct the metadata_mode='replace' co-signal; got: {msg!r}"
+    )
+    assert '2180' in msg, (
+        f'message must reference the task-2180 incident; got: {msg!r}'
+    )
+
+
+def test_resolve_metadata_mode_append_false_cosignal_replace():
+    """An explicit metadata_mode='replace' co-signal alongside append=False is
+    honored (still resolves to 'replace') — the sanctioned way to confirm a
+    whole-blob overwrite. Explicit metadata_mode wins unconditionally."""
+    assert _resolve_metadata_mode('replace', False) == 'replace'
+
+
+def test_resolve_metadata_mode_append_false_no_metadata_ok():
+    """append=False with metadata_present=False (a details-only write, no
+    metadata) is NOT rejected — the guard is scoped to metadata-present writes
+    so the details/prompt-append path is unaffected. Returns 'replace' (unused
+    by the caller since no metadata is written)."""
+    assert _resolve_metadata_mode(None, False, metadata_present=False) == 'replace'
 
 
 # ── _merge_metadata mode= API (step-3 RED / step-4 GREEN) ───────────────────
