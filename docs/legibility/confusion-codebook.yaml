@@ -448,3 +448,16 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: 'tool_error: 10 across retry loops: mcp__fused-memory__get_task ×3 (turns 46, 50), mcp__recon-report__set_stat ×7 (turns 26, 29, 36, 37, 54); multiple "The operation timed out" failures spanning reads (count_memories_by_metadata turns 35, 42; get_task turns 46, 50) and writes (add_memory turn 25; set_stat turns 26, 29, 36, 37, 54); session interrupted by usage limit at turn 74'
+- id: cand-20260717-1
+  title: Cross-reference validation gap in memory consolidation
+  cause: Task descriptions and Graphiti episodes can cite conflicting identifiers (escalation IDs, task IDs) for the same event. The memory consolidator detects the inconsistency but cannot auto-resolve it, requiring manual lookup against authoritative external state (escalation service) to determine ground truth.
+  area: fused-memory consistency, recon consolidation
+  first_seen: '2026-07-17'
+  disposition: pending
+  sightings:
+  - date: '2026-07-17'
+    project: dark_factory
+    session: 80913a75-a9de-43b4-bde0-1cf30ad71809
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: Task 2719 description cites 'esc-2698-9' as the deferral-recording escalation, while Graphiti episode de985921-2f36-43cc-8165-30f5398ad5a3 (written same timestamp, describing identical event) cites 'esc-2698-10'. Suggested action requires external escalation-service lookup to adjudicate which ID is authoritative.
