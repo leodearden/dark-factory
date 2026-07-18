@@ -100,26 +100,23 @@ async def cleanup_eval_worktree(
         logger.warning(f'Failed to cleanup worktree {worktree_path}: {e}')
 
 
-async def get_diff(worktree_path: Path) -> str:
-    """Get the full diff of changes in a worktree vs its base commit.
+async def get_diff(worktree_path: Path, base_commit: str) -> str:
+    """Get the full committed diff of an eval worktree vs its base commit.
 
-    Reads base_commit from .task/metadata.json (set at worktree creation).
-    Falls back to uncommitted diff if metadata not available.
+    ``base_commit`` is the authoritative ``task['pre_task_commit']`` carried
+    on the task record — the same base ``metrics._git_diff_stats`` uses. The
+    diff is ``git diff {base_commit}..HEAD`` (two-dot range), i.e. the full
+    change committed on the ``evals/<id>`` branch.
+
+    This intentionally does NOT read ``<worktree>/.task/metadata.json`` and
+    has no uncommitted (``git diff HEAD``) fallback: production TaskWorkflow
+    moved its metadata to the sibling ``.task-meta/<name>/`` under W11 / task
+    2258, so the old metadata read silently found nothing and the fallback
+    graded empty committed diffs (D1). Threading the base is the fix.
     """
-    import json as _json
-
-    metadata_file = worktree_path / '.task' / 'metadata.json'
-    if metadata_file.exists():
-        try:
-            meta = _json.loads(metadata_file.read_text())
-            base = meta.get('base_commit')
-            if base:
-                return await _run(
-                    ['git', 'diff', f'{base}..HEAD'], cwd=worktree_path,
-                )
-        except Exception:
-            pass
-    return await _run(['git', 'diff', 'HEAD'], cwd=worktree_path)
+    return await _run(
+        ['git', 'diff', f'{base_commit}..HEAD'], cwd=worktree_path,
+    )
 
 
 async def get_diff_between_commits(
