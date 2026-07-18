@@ -697,6 +697,13 @@ async def run_server():
             dead_letter_path=(
                 Path(config.reconciliation.data_dir) / 'event_dead_letter.jsonl'
             ),
+            # Durable-at-enqueue write-ahead log (task 2709): persists each event
+            # synchronously at enqueue so a hard kill between enqueue and drain
+            # cannot drop it; start() replays unprocessed rows. The constructor
+            # default is None (off) — this is the single production enable-site.
+            journal_path=(
+                Path(config.reconciliation.data_dir) / 'event_journal.db'
+            ),
             maxsize=config.reconciliation.event_queue_capacity,
             retry_initial_seconds=config.reconciliation.event_queue_retry_initial_seconds,
             retry_max_seconds=config.reconciliation.event_queue_retry_max_seconds,
