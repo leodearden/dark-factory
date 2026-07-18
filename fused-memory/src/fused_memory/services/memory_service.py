@@ -2297,10 +2297,18 @@ class MemoryService:
         - a SUCCESS mem0 backend_op → the write provably landed (only the
           completion stamp was lost) → mark ``completed``; NOT an orphan, no
           re-issue.
-        - only FAILED mem0 backend_op(s) → ``add()`` provably raised so mem0
-          did not persist → safe to re-issue (0 prior writes + 1 = 1):
-          rebuild ``Scope`` + metadata and call ``mem0.add``; ``completed`` on
-          success, ``dead`` on error.
+        - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
+          (clean, pre-persist) failure mem0 did not land, so re-issue is safe
+          (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
+          ``mem0.add``; ``completed`` on success, ``dead`` on error.
+          RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
+          AFTER mem0 committed but at/near the response (e.g. a read-timeout
+          on an otherwise-successful add) ALSO records a FAILED backend_op
+          while the write actually landed — re-issuing then mints a duplicate
+          twin, since the pinned ``infer=False`` add is non-idempotent. We
+          accept this narrow post-send-failure risk to heal the far more
+          common clean-failure case; the fully UNKNOWN no-beop case below is
+          the one we refuse to auto-re-issue.
         - NO mem0 backend_op → outcome UNKNOWN (killed before/inside the
           await) → dead-letter with a structured reason. ``mem0.add`` pins
           ``infer=False`` and is non-idempotent, so a blind re-issue risks a
@@ -2343,7 +2351,10 @@ class MemoryService:
                     write_op_id,
                 )
             elif mem0_beops:
-                # Only failed backend_op(s) → add() raised → safe to re-issue.
+                # Only failed backend_op(s) → add() raised → re-issue. Heals the
+                # common pre-persist failure; see the RESIDUAL DUPLICATE RISK
+                # note in this method's docstring for the narrow
+                # post-commit-failure case where this can mint a duplicate twin.
                 try:
                     scope = Scope(
                         project_id=intent.get('project_id') or 'main',
