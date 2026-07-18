@@ -477,6 +477,16 @@ def create_server(
         *terminal_state_is_the_bug* — set True when the escalation is expected even
         if the target task is already terminal (bypasses the auto-resolve chokepoint).
 
+        *evidence* — optional list of structured raw-OBSERVATION entries, each a
+        ``{observation, measured_at, ref}`` dict (e.g. the HEAD SHA at measurement,
+        a ref listing, a rerun result, a raw exit code).  Stored and returned
+        verbatim (no shape validation).  State OBSERVATIONS as fact — in
+        ``summary``, ``detail`` and each ``evidence.observation`` record only what
+        was measured, never an unverified cause.  Put any causal diagnosis on a
+        clearly-marked hypothesis line (prefix ``Hypothesis:``), never asserted as
+        fact.  A single observation is not sufficient to recommend a destructive
+        intervention (a ref move / rewind) — re-run or re-measure first.
+
         Response shape:
         - Queued (task alive):    ``{id, status}``  where status='queued'
         - Deduped (folded):       ``{id, status, parent_id, child_id}``
@@ -542,6 +552,16 @@ def create_server(
         *terminal_state_is_the_bug* — set True when the task being blocked is
         expected to be terminal (bypasses the auto-resolve chokepoint and submits
         normally).  action='terminate_cleanly' is still returned.
+
+        *evidence* — optional list of structured raw-OBSERVATION entries, each a
+        ``{observation, measured_at, ref}`` dict (e.g. the HEAD SHA at measurement,
+        a ref listing, a rerun result, a raw exit code).  Stored and returned
+        verbatim (no shape validation).  State OBSERVATIONS as fact — in
+        ``summary``, ``detail`` and each ``evidence.observation`` record only what
+        was measured, never an unverified cause.  Put any causal diagnosis on a
+        clearly-marked hypothesis line (prefix ``Hypothesis:``), never asserted as
+        fact.  A single observation is not sufficient to recommend a destructive
+        intervention (a ref move / rewind) — re-run or re-measure first.
 
         Response shape always includes ``action='terminate_cleanly'`` plus:
         - Queued:        ``{id, status, action}``  where status='queued'
