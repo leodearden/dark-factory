@@ -6,6 +6,7 @@ import contextlib
 import itertools
 import json
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -574,22 +575,23 @@ class TestTimeout:
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
 
-        # Fixed monotonic sequence: start=0.0 sets deadline=2.0; loop check=0.0
-        # so remaining_ms = max(0, int((2.0 - 0.0)*1000)) = 2000 -> read(timeout=2000)
-        # read returns [] -> exit 124 (empty events with deadline set)
-        # Non-exhausting (task 2361): the tail repeats so deadline/remaining_ms
-        # stay stable (this test's read(timeout=2000) assertion holds) even if
-        # the loop were to poll more than the minimal happy path under host
-        # load, instead of raising StopIteration on an unplanned extra call.
-        monotonic_values = itertools.chain([0.0], itertools.repeat(0.0))
-
+        # Constant monotonic clock (task 2722): time.monotonic() always
+        # returns 0.0, regardless of caller or call count. deadline =
+        # 0.0 + 2 = 2.0; each loop check computes remaining_ms =
+        # max(0, int((2.0 - 0.0)*1000)) = 2000 -> read(timeout=2000).
+        # read returns [] -> exit 124 (empty events with deadline set).
+        # A constant return_value (vs. a position-sensitive itertools
+        # side_effect iterator) can't be partially drained by another
+        # caller of the patched, process-global time.monotonic() — e.g.
+        # an xdist/execnet background thread — which is what caused the
+        # task-2702 flake in the two sibling tests below.
         with (
             patch('escalation.watcher.INotify') as MockINotify,
             patch('escalation.watcher.sys.argv', [
                 'watcher', '--queue-dir', str(queue_dir), '--timeout', '2',
             ]),
             patch('escalation.watcher._initial_scan', return_value=None),
-            patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+            patch('escalation.watcher.time.monotonic', return_value=0.0),
         ):
             mock_inotify = MockINotify.return_value
             # read returns empty list -> no events -> timeout path
@@ -646,21 +648,23 @@ class TestTimeout:
         mock_event = MagicMock()
         mock_event.name = f'{blocking_escalation.id}.json'
 
-        # monotonic sequence: first call sets deadline = 0.0 + 5.0 = 5.0;
-        # second call in the loop -> remaining_ms = int((5.0 - 0.5) * 1000) = 4500
-        # Non-exhausting (task 2361): the tail repeats so deadline/remaining_ms
-        # stay stable (this test's read(timeout=4500) assertion holds) even if
-        # the loop were to poll more than the minimal happy path under host
-        # load, instead of raising StopIteration on an unplanned extra call.
-        monotonic_values = itertools.chain([0.0], itertools.repeat(0.5))
-
+        # Constant monotonic clock (task 2722): time.monotonic() always
+        # returns 1000.0, regardless of caller or call count, so elapsed
+        # time between the deadline-call and any later loop-call is
+        # always 0. deadline = 1000.0 + 5 = 1005.0; remaining_ms =
+        # int((1005.0 - 1000.0) * 1000) = 5000 -> read(timeout=5000).
+        # A constant return_value (vs. a position-sensitive itertools
+        # side_effect iterator) can't be shifted by another caller of the
+        # patched, process-global time.monotonic() — e.g. an
+        # xdist/execnet background thread — which is what caused the
+        # task-2702 "expected 4500, got 5000" flake.
         with (
             patch('escalation.watcher.INotify') as MockINotify,
             patch('escalation.watcher.sys.argv', [
                 'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
             ]),
             patch('escalation.watcher._initial_scan', return_value=None),
-            patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+            patch('escalation.watcher.time.monotonic', return_value=1000.0),
         ):
             mock_inotify = MockINotify.return_value
             # read returns a matching event on the first call
@@ -679,27 +683,28 @@ class TestTimeout:
         data = json.loads(captured.out)
         assert data['id'] == blocking_escalation.id
 
-        # read was called with a positive timeout (not None)
-        assert mock_inotify.read.call_args.kwargs['timeout'] == 4500
+        # read was called with the constant-clock-derived timeout
+        assert mock_inotify.read.call_args.kwargs['timeout'] == 5000
 
     def test_timeout_matching_event_after_nonmatching_survives_extra_polls(
         self, tmp_path, blocking_escalation: Escalation, capsys
     ):
         """A non-matching event forces a 2nd loop iteration; the mock must not raise.
 
-        Regression guard for the esc-2286-class flake (task 2361): the sibling
-        tests above use a finite ``iter([0.0, 0.5])`` monotonic side_effect
-        sized to the happy path — exactly 2 calls (one to set the deadline,
-        one per loop iteration). Here the loop re-iterates once (a
-        non-matching event makes the inner ``for`` ``continue``, and the
-        ``while True`` polls again), which is a 3rd monotonic call; under the
-        sibling tests' finite-iterator idiom that 3rd call would raise
-        StopIteration under slow wall-clock. This test uses the non-exhausting
-        ``itertools.chain([prefix], itertools.repeat(tail))`` idiom (the fix
-        applied to the sibling tests in task 2361 step 4) and is the
-        executable proof that both the watcher's multi-iteration emit path
-        and the hardened mock pattern survive more polls than the minimal
-        happy path.
+        Regression guard for the esc-2286-class flake (task 2361) and the
+        task-2702 interloper flake (task 2722). A finite monotonic
+        ``side_effect`` sized to the happy path (one deadline-call, one
+        loop-call) raises StopIteration on this test's 3rd monotonic call
+        (the non-matching event forces a 2nd loop iteration). Task 2361
+        fixed that by making the stub non-exhausting
+        (``itertools.chain([prefix], itertools.repeat(tail))``); task 2722
+        replaced that with a constant ``return_value`` stub, which is both
+        non-exhausting AND immune to being partially drained, in any order,
+        by another caller of the patched, process-global
+        ``time.monotonic()`` — e.g. an xdist/execnet background thread.
+        This test is the executable proof that both the watcher's
+        multi-iteration emit path and the hardened mock pattern survive
+        more polls than the minimal happy path.
         """
         queue_dir = tmp_path / 'queue'
         queue_dir.mkdir()
@@ -714,18 +719,17 @@ class TestTimeout:
         matching = MagicMock()
         matching.name = f'{blocking_escalation.id}.json'
 
-        # Non-exhausting: call 1 -> 0.0 sets deadline=5.0; every later call ->
-        # 0.5 -> remaining_ms = int((5.0 - 0.5) * 1000) = 4500, stable no
-        # matter how many extra polls the loop takes.
-        monotonic_values = itertools.chain([0.0], itertools.repeat(0.5))
-
+        # Constant monotonic clock (task 2722): every call (deadline-call
+        # and every loop-call, however many extra polls) returns 1000.0.
+        # deadline = 1000.0 + 5 = 1005.0; remaining_ms = int((1005.0 -
+        # 1000.0) * 1000) = 5000, stable regardless of call count/order.
         with (
             patch('escalation.watcher.INotify') as MockINotify,
             patch('escalation.watcher.sys.argv', [
                 'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
             ]),
             patch('escalation.watcher._initial_scan', return_value=None),
-            patch('escalation.watcher.time.monotonic', side_effect=monotonic_values),
+            patch('escalation.watcher.time.monotonic', return_value=1000.0),
         ):
             mock_inotify = MockINotify.return_value
             # 1st read -> non-matching event (loop re-iterates); 2nd -> match.
@@ -746,8 +750,131 @@ class TestTimeout:
 
         # read was called exactly twice (nonmatching poll, then matching poll)
         assert mock_inotify.read.call_count == 2
-        # last read used a positive timeout recomputed from the stable tail value
-        assert mock_inotify.read.call_args.kwargs['timeout'] == 4500
+        # last read used the timeout recomputed from the constant clock
+        assert mock_inotify.read.call_args.kwargs['timeout'] == 5000
+
+    def test_timeout_read_ms_unaffected_by_interloping_monotonic(
+        self, tmp_path, blocking_escalation: Escalation, capsys
+    ):
+        """Regression guard for the task-2702 "expected 4500, got 5000" flake.
+
+        Root cause: ``patch('escalation.watcher.time.monotonic', ...)``
+        patches the PROCESS-GLOBAL ``time`` module singleton (watcher.py
+        does a plain ``import time``), so under pytest-xdist an
+        execnet/pytest background thread calling ``time.monotonic()``
+        inside the patched window is served from the exact same shared,
+        position-sensitive ``itertools.chain([0.0], itertools.repeat(0.5))``
+        iterator the watcher itself consumes. Each interloping call shifts
+        which value the watcher's own calls receive: with 0 interlopers the
+        watcher's deadline-call gets 0.0 (deadline=5.0) and its loop-call
+        gets 0.5 (remaining=int((5.0-0.5)*1000)=4500); with 3 interlopers
+        those three leading values are drained first, so the watcher's
+        deadline-call gets 0.5 (deadline=5.5) and its loop-call gets 0.5
+        again (remaining=int((5.5-0.5)*1000)=5000) — exactly the observed
+        "expected 4500, got 5000" flake.
+
+        ``_run`` is parametrized on which monotonic stub to install so this
+        test can CONTRAST the two idioms instead of only asserting on the
+        fixed one in isolation: a bare ``_run(0) == _run(3)`` against a stub
+        that is *always* a constant ``return_value`` is tautological (it
+        cannot fail no matter what the watcher's arithmetic does, since
+        constant-in implies constant-out by construction). The
+        ``constant_stub=False`` arm reproduces the OLD, order-sensitive
+        idiom live — hardcoding the exact 4500-vs-5000 split across
+        interloper counts — which is the executable proof that the
+        ``constant_stub=True`` equality is a meaningful, falsifiable claim
+        about the fix, not an artifact of the stub shape.
+
+        The ``constant_stub=False`` arm is itself susceptible to the exact
+        flake it documents (it installs the same process-global,
+        position-sensitive patch a real interloper could partially drain),
+        so it only runs single-worker — see the ``PYTEST_XDIST_WORKER``
+        guard below. The ``constant_stub=True`` GREEN assertion is
+        interloper-immune by construction and always runs, including under
+        xdist.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+
+        # Pre-create the escalation file so the event loop can read it.
+        esc_path = queue_dir / f'{blocking_escalation.id}.json'
+        esc_path.write_text(blocking_escalation.to_json())
+
+        mock_event = MagicMock()
+        mock_event.name = f'{blocking_escalation.id}.json'
+
+        def _run(n_interlopers, *, constant_stub):
+            # constant_stub=True: the task-2722 fix — a single value
+            # regardless of caller or call count, so an interloping
+            # time.monotonic() call can't shift what the watcher observes.
+            # constant_stub=False: the OLD idiom task 2722 replaced — a
+            # position-sensitive iterator that a prefix-consuming
+            # interloper (e.g. an xdist/execnet background thread) can
+            # partially drain, shifting the values the watcher receives.
+            monotonic_patch = (
+                patch('escalation.watcher.time.monotonic', return_value=1000.0)
+                if constant_stub
+                else patch(
+                    'escalation.watcher.time.monotonic',
+                    side_effect=itertools.chain([0.0], itertools.repeat(0.5)),
+                )
+            )
+            with (
+                patch('escalation.watcher.INotify') as MockINotify,
+                patch('escalation.watcher.sys.argv', [
+                    'watcher', '--queue-dir', str(queue_dir), '--timeout', '5',
+                ]),
+                patch('escalation.watcher._initial_scan', return_value=None),
+                monotonic_patch,
+            ):
+                mock_inotify = MockINotify.return_value
+                mock_inotify.read.return_value = [mock_event]
+
+                # Simulate n interloping time.monotonic() calls landing in
+                # the patched window BEFORE the watcher runs — e.g. an
+                # xdist/execnet background thread. patch() replaces the
+                # .monotonic attribute on the actual process-global `time`
+                # module object (watcher.py does a plain `import time`), so
+                # this call site and the watcher's internal calls draw from
+                # the exact same shared stub.
+                import escalation.watcher
+
+                for _ in range(n_interlopers):
+                    escalation.watcher.time.monotonic()
+
+                from escalation.watcher import main
+
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+
+                assert exc_info.value.code == 0
+
+            capsys.readouterr()  # drain stdout between runs
+            return mock_inotify.read.call_args.kwargs['timeout']
+
+        # GREEN (task 2722): the fixed constant stub's read timeout does
+        # not depend on how many interlopers ran first.
+        assert _run(0, constant_stub=True) == _run(3, constant_stub=True) == 5000
+
+        # Contrast: the OLD position-sensitive stub IS order-sensitive
+        # under the identical interloper simulation, reproducing the
+        # task-2702 "expected 4500, got 5000" flake directly. This is what
+        # makes the equality assertion above a meaningful, falsifiable
+        # claim rather than a tautology of a constant return_value.
+        #
+        # This reproduction installs the very process-global,
+        # position-sensitive time.monotonic() patch responsible for the
+        # original flake (see this test's docstring above), so a
+        # real xdist/execnet background thread calling time.monotonic()
+        # during this window could drain a leading value and shift these
+        # results — the identical self-inflicted risk the constant stub
+        # above was built to remove. Restrict it to single-worker runs,
+        # where no other thread can interlope, so the falsifiability
+        # demonstration stays deterministic instead of reintroducing the
+        # flake it exists to document.
+        if not os.environ.get('PYTEST_XDIST_WORKER'):
+            assert _run(0, constant_stub=False) == 4500
+            assert _run(3, constant_stub=False) == 5000
 
 
 class TestLevelFilter:
