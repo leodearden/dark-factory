@@ -228,10 +228,20 @@ class EventBuffer:
     # ── Push ───────────────────────────────────────────────────────────
 
     async def push(self, event: ReconciliationEvent) -> None:
-        """Insert event into the shared buffer."""
+        """Insert event into the shared buffer.
+
+        Idempotent on the event id (UUID primary key): ``INSERT OR IGNORE`` so
+        re-pushing an already-committed event is a harmless no-op rather than an
+        IntegrityError. A duplicate only ever occurs on EventJournal-driven
+        startup recovery, which redelivers in-flight events at-least-once — the
+        drainer can be killed after this push commits but before it marks the
+        journal row processed, so recover() re-enqueues and re-pushes it (task
+        2709). Without OR IGNORE the drainer would treat the duplicate as a
+        non-retriable error and dead-letter a perfectly good event.
+        """
         async with self._txn() as db:
             await db.execute(
-                """INSERT INTO event_buffer
+                """INSERT OR IGNORE INTO event_buffer
                    (id, project_id, event_type, event_source, agent_id, timestamp, payload, status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, 'buffered')""",
                 (
