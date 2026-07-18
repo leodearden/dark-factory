@@ -520,6 +520,59 @@ def _is_done_step_commit_orphan(esc: 'Escalation') -> bool:
     )
 
 
+# The "merged family" of done_provenance.kind values that positively confirm
+# a done task's content actually landed on main (task 2725). Deliberately
+# EXCLUDES:
+#   'found_on_main'                 — the class this reaper's skip must NOT
+#                                      mask (a done task whose content did
+#                                      not land); it already has its own
+#                                      dedicated landing guards (PRD
+#                                      5dd39a4c42, batch 2674-2683), so this
+#                                      reaper is not that safety net.
+#   'dispatch-gate-already-on-main' — not in the Leo-ratified list; left out
+#                                      to avoid scope creep.
+#   commitless kinds (e.g. 'operational-verified', 'deterministic-deploy',
+#   'deterministic-deploy-scheduled', 'deterministic-milestone') — these
+#   never had a step commit to orphan in the first place.
+# Used only by _is_terminal_merged to gate the orphan-L0 reaper's
+# done-step-commit dismiss branch.
+_MERGED_DONE_PROVENANCE_KINDS: frozenset[str] = frozenset({
+    'merged',
+    'dispatch-gate-marker-found',
+    'dispatch-gate-content-equivalent',
+})
+
+
+def _is_terminal_merged(task: dict | None) -> bool:
+    """Return True iff *task* is a done task whose content is confirmed merged.
+
+    Task 2725: used by the orphan-L0 reaper to recognise a
+    rebase-superseded done-step-commit orphan as benign — the step's
+    recorded commit SHA is a pre-rebase intermediate no longer reachable
+    from main, but its content landed on main under a new SHA via the
+    merge. True iff ``task['status'] == 'done'`` AND
+    ``task['metadata']['done_provenance']`` is a dict whose ``kind`` is in
+    :data:`_MERGED_DONE_PROVENANCE_KINDS`.
+
+    Fail-safe: a ``None`` *task* (``get_task`` failure or absence), a
+    missing/non-dict ``metadata``, and a missing/non-dict
+    ``done_provenance`` are all treated as non-matching rather than
+    raising — the caller promotes (surfaces) instead of silently
+    dismissing whenever terminal+merged cannot be positively confirmed.
+    """
+    if task is None:
+        return False
+    if task.get('status') != 'done':
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    provenance = metadata.get('done_provenance')
+    if not isinstance(provenance, dict):
+        return False
+    return provenance.get('kind') in _MERGED_DONE_PROVENANCE_KINDS
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
