@@ -533,6 +533,7 @@ class AgentFailureKind(enum.StrEnum):
     """Classification of an AgentResult.  SUCCESS is the non-failure case."""
 
     SUCCESS = 'success'
+    ENDED_AWAITING_BACKGROUND = 'ended_awaiting_background'
     MAX_TURNS = 'max_turns'
     EMPTY_OUTPUT = 'empty_output'
     API_ERROR = 'api_error'
@@ -565,28 +566,35 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
 
     1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
        (mirrors ``result.success``) → ``SUCCESS``.
-    2. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
+    2. ``result.ended_awaiting_background`` → ``ENDED_AWAITING_BACKGROUND``
+       (the run ended its turn while a backgrounded Bash command was still
+       pending; ``_parse_claude_output`` already downgraded ``success`` to
+       False, so this sits immediately below the OK check — it can never
+       shadow a genuine success — and above the timeout rule, which it cannot
+       shadow either since the two flags are mutually exclusive by
+       construction: the timeout path never sets this flag).
+    3. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
        PRODUCTIVE kill — ``transcript_turns > 0`` — from a no-progress wedge;
        see ``is_timed_out_with_progress``/reify-4827).
-    3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
+    4. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
-    4. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
+    5. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
        no cross-account retry; placed ABOVE the ``api_error_status`` rule
        below because a 404 also sets ``api_error_status`` and would
        otherwise be mis-tagged as transient ``API_ERROR``).
-    5. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
+    6. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
        ``API_ERROR`` (includes status code in the summary; transient — worth
        retrying against another account). ``AuthFailed`` ({401, 403}) is a
        strict subset of "api_error_status is not None", so the ``OR`` never
        changes the verdict — it keeps this rule visibly tied to the
        InvocationOutcome contract without narrowing API_ERROR away from
        429/5xx, which InvocationOutcome does not model.
-    6. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+    7. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
-    7. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+    8. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    8. otherwise → ``UNKNOWN``.
+    9. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -618,6 +626,15 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         return AgentFailureClass(
             kind=AgentFailureKind.SUCCESS,
             summary='agent succeeded',
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.ended_awaiting_background:
+        return AgentFailureClass(
+            kind=AgentFailureKind.ENDED_AWAITING_BACKGROUND,
+            summary=(
+                'agent ended its turn awaiting a still-pending backgrounded '
+                'task (work abandoned mid-turn)'
+            ),
             diagnostic_detail=diagnostic_detail,
         )
     if result.timed_out:
