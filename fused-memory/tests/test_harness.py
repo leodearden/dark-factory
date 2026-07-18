@@ -1802,10 +1802,18 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     This test confirms that after a timeout:
     - The journal run has status 'failed' (not 'running')
     - The buffer events were restored (buffer size == original event count)
+
+    task σ: the failed + restore-drained path is now gated behind
+    ``resume_after_restart=False`` (the True default routes a mid-cycle cancel
+    to the resumable ``interrupted`` path instead — see
+    ``test_run_full_cycle_cancelled_marks_interrupted_and_keeps_events``). This
+    test targets the legacy failed+restore semantics specifically, so it opts
+    out of resume explicitly.
     """
     import asyncio
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
 
     # Make first stage sleep forever (simulating a long-running stage)
     async def slow_stage_run(

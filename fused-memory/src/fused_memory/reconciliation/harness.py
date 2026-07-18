@@ -2022,6 +2022,7 @@ class ReconciliationHarness:
         tier: TierConfig | None = None,
         events: list[ReconciliationEvent] | None = None,
         assembled_payload: AssembledPayload | None = None,
+        resume_run: ReconciliationRun | None = None,
     ) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project.
 
@@ -2033,6 +2034,17 @@ class ReconciliationHarness:
             assembled_payload: Optional token-budgeted payload from ContextAssembler.
                     When provided, Stage 1 uses this instead of generic
                     time-windowed episode/memory fetches.
+            resume_run: Task σ adopt-and-resume seam.  When set, the cycle reuses
+                    this interrupted run wholesale instead of starting a fresh one:
+                    it keeps ``resume_run.id`` (no ``start_run``), does NOT drain
+                    (the caller MUST supply the run's already-drained ``events`` so
+                    a resumed cycle never double-processes them), skips any stage
+                    whose real ``StageReport`` is already in
+                    ``resume_run.stage_reports`` (its work landed before the
+                    interrupt), and ``--resume``s ONLY the stage matching
+                    ``resume_run.stage_cursor`` by threading
+                    ``resume_run.session_id`` into it.  The remaining stages run
+                    fresh, and the completion/judge/remediation tail is unchanged.
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
@@ -2040,26 +2052,46 @@ class ReconciliationHarness:
         project_root = scope.project_root
 
         tier = tier or TierConfig()
-        run_id = str(uuid4())
         watermark = await self.journal.get_watermark(project_id)
-        if events is None:
-            events = await self.buffer.drain(project_id, run_id=run_id)
-        else:
-            await self.buffer.mark_drained_run_id(
-                project_id, [e.id for e in events], run_id
-            )
 
-        run = ReconciliationRun(
-            id=run_id,
-            project_id=project_id,
-            run_type=RunType.full,
-            trigger_reason=trigger_reason,
-            started_at=datetime.now(UTC),
-            events_processed=len(events),
-            status=RunStatus.running,
-            instance_id=self.buffer.instance_id,
-        )
-        await self.journal.start_run(run)
+        if resume_run is not None:
+            # Task σ adopt-and-resume: reuse the interrupted run wholesale — no
+            # fresh run row, no re-drain. The startup pass supplies the run's
+            # already-drained events via `events`; re-draining or re-attributing
+            # them would double-process on resume, so both are skipped here.
+            if events is None:
+                raise ValueError(
+                    'run_full_cycle(resume_run=...) requires caller-supplied '
+                    "events (the interrupted run's already-drained events); "
+                    'draining fresh would lose the in-flight batch'
+                )
+            run = resume_run
+            run_id = run.id
+            # The row is 'interrupted' on disk; mark it running in-memory so the
+            # active-run tracker/logs reflect reality and the finally's GC gate
+            # (skip iff status == interrupted) permits the transcript sweep once
+            # this resumed cycle completes.
+            run.status = RunStatus.running
+        else:
+            run_id = str(uuid4())
+            if events is None:
+                events = await self.buffer.drain(project_id, run_id=run_id)
+            else:
+                await self.buffer.mark_drained_run_id(
+                    project_id, [e.id for e in events], run_id
+                )
+
+            run = ReconciliationRun(
+                id=run_id,
+                project_id=project_id,
+                run_type=RunType.full,
+                trigger_reason=trigger_reason,
+                started_at=datetime.now(UTC),
+                events_processed=len(events),
+                status=RunStatus.running,
+                instance_id=self.buffer.instance_id,
+            )
+            await self.journal.start_run(run)
 
         logger.info(
             'reconciliation.run_started',
@@ -2070,6 +2102,7 @@ class ReconciliationHarness:
                 'trigger_reason': trigger_reason,
                 'events_to_process': len(events),
                 'model': tier.model,
+                'resumed': resume_run is not None,
             },
         )
 
@@ -2104,7 +2137,20 @@ class ReconciliationHarness:
             try:
                 reports = []
                 for stage in stages:
-                    current_stage_name = stage.stage_id.value
+                    stage_key = stage.stage_id.value
+
+                    # Task σ resume: a stage whose real StageReport is already
+                    # persisted on the resumed run completed BEFORE the interrupt
+                    # — skip its subprocess entirely, but thread its persisted
+                    # report into `reports` so later stages still receive it as
+                    # prior context (exactly as a freshly-run stage would).
+                    if resume_run is not None:
+                        prior = run.stage_reports.get(stage_key)
+                        if isinstance(prior, StageReport):
+                            reports.append(prior)
+                            continue
+
+                    current_stage_name = stage_key
                     _active.stage(current_stage_name)
 
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
@@ -2128,11 +2174,30 @@ class ReconciliationHarness:
                     if isinstance(stage, IntegrityCheck):
                         stage.filtered_task_tree = filtered_task_tree
 
-                    report = await stage.run(
-                        events, watermark, reports, run_id, model=tier.model,
+                    # Task σ resume: --resume ONLY the stage the interrupt caught
+                    # mid-flight (stage_cursor), and only when a session was
+                    # actually captured for it. Pass the kwarg solely on that
+                    # path so every non-resume call site keeps today's signature.
+                    resume_session_id = (
+                        run.session_id
+                        if (
+                            resume_run is not None
+                            and stage_key == run.stage_cursor
+                            and run.session_id
+                        )
+                        else None
                     )
+                    if resume_session_id is not None:
+                        report = await stage.run(
+                            events, watermark, reports, run_id,
+                            model=tier.model, resume_session_id=resume_session_id,
+                        )
+                    else:
+                        report = await stage.run(
+                            events, watermark, reports, run_id, model=tier.model,
+                        )
                     reports.append(report)
-                    run.stage_reports[stage.stage_id.value] = report
+                    run.stage_reports[stage_key] = report
 
                 # Update watermark
                 watermark.last_full_run_id = run_id
