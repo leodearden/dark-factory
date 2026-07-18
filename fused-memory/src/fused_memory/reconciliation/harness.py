@@ -37,6 +37,7 @@ from fused_memory.models.scope import (
     ProjectScope,
     build_known_projects_map,
 )
+from fused_memory.reconciliation.active_runs import ActiveRunRegistry
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -479,6 +480,13 @@ class ReconciliationHarness:
         # with _draining, otherwise the next drain will silently fail to re-emit
         # the 'Harness fully drained' marker.
         self._drain_complete_logged: bool = False
+
+        # In-flight full-cycle registry — source of the machine-readable
+        # `recon_busy` signal on /health (task 2703 δ). Updated only inside
+        # run_full_cycle via `with self._active_runs.track(...)`, so an entry
+        # clears on every exit path (return / Exception / the CancelledError a
+        # drain or timeout raises mid-stage), never leaking a phantom-busy run.
+        self._active_runs = ActiveRunRegistry()
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
@@ -1923,6 +1931,17 @@ class ReconciliationHarness:
         except Exception:
             logger.error(f'Judge task failed for run {run_id}', exc_info=True)
 
+    def recon_busy_snapshot(self) -> list[dict]:
+        """Return the reconciliation full cycles currently in flight.
+
+        Synchronous, pure, never raises: a list of
+        ``{project_id, run_id, stage, started_at}`` dicts (one per in-flight
+        full cycle). Consumed by the /health endpoint's additive
+        ``recon_busy`` field (task 2703 δ) so a cycle-aware restart can defer
+        while a cycle is running — machine-readable, no journal scraping.
+        """
+        return self._active_runs.snapshot()
+
     async def run_full_cycle(
         self,
         project_id: str,
@@ -2006,157 +2025,161 @@ class ReconciliationHarness:
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages(scope)
-        try:
-            reports = []
-            for stage in stages:
-                current_stage_name = stage.stage_id.value
+        with self._active_runs.track(
+            run_id, project_id, run.started_at.isoformat()
+        ) as _active:
+            try:
+                reports = []
+                for stage in stages:
+                    current_stage_name = stage.stage_id.value
+                    _active.stage(current_stage_name)
 
-                # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
-                if isinstance(stage, MemoryConsolidator):
-                    self._configure_consolidator(
-                        stage, tier,
-                        prior_s3_findings=prior_s3_findings,
-                        cycle_fence_time=cycle_start_time,
-                        assembled_payload=assembled_payload,
-                        filtered_task_tree=filtered_task_tree,
-                        task_count_verification=task_count_verification,
-                        graphiti_queue_health=graphiti_queue_health,
-                        status_correction_reconciliation=status_correction_reconciliation,
+                    # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
+                    if isinstance(stage, MemoryConsolidator):
+                        self._configure_consolidator(
+                            stage, tier,
+                            prior_s3_findings=prior_s3_findings,
+                            cycle_fence_time=cycle_start_time,
+                            assembled_payload=assembled_payload,
+                            filtered_task_tree=filtered_task_tree,
+                            task_count_verification=task_count_verification,
+                            graphiti_queue_health=graphiti_queue_health,
+                            status_correction_reconciliation=status_correction_reconciliation,
+                        )
+
+                    # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
+                    if isinstance(stage, TaskKnowledgeSync):
+                        self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
+
+                    # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
+                    if isinstance(stage, IntegrityCheck):
+                        stage.filtered_task_tree = filtered_task_tree
+
+                    report = await stage.run(
+                        events, watermark, reports, run_id, model=tier.model,
                     )
+                    reports.append(report)
+                    run.stage_reports[stage.stage_id.value] = report
 
-                # Wire harness-fetched task tree into Stage 2 via symmetric helper (ref: task 455)
-                if isinstance(stage, TaskKnowledgeSync):
-                    self._configure_task_sync(stage, filtered_task_tree=filtered_task_tree)
+                # Update watermark
+                watermark.last_full_run_id = run_id
+                watermark.last_full_run_completed = datetime.now(UTC)
+                watermark.last_episode_timestamp = datetime.now(UTC)
+                watermark.last_memory_timestamp = datetime.now(UTC)
+                watermark.last_task_change_timestamp = datetime.now(UTC)
+                await self.journal.update_watermark(watermark)
 
-                # Wire harness-fetched task tree into Stage 3 for task-dump spot-check (task 1661)
-                if isinstance(stage, IntegrityCheck):
-                    stage.filtered_task_tree = filtered_task_tree
+                run.completed_at = datetime.now(UTC)
+                run.status = RunStatus.completed
+                await self.journal.complete_run(run_id, 'completed')
 
-                report = await stage.run(
-                    events, watermark, reports, run_id, model=tier.model,
+                # Cross-check self-reported stats against write-journal ops BEFORE the
+                # judge reads them. Stage agents sometimes over-report successful
+                # writes when Mem0 silently dedups; the verifier overwrites those
+                # counts with observed truth and keeps the originals under _reported.
+                await verify_and_rewrite_stats(
+                    run_id, run.stage_reports, self.journal.write_journal,
                 )
-                reports.append(report)
-                run.stage_reports[stage.stage_id.value] = report
 
-            # Update watermark
-            watermark.last_full_run_id = run_id
-            watermark.last_full_run_completed = datetime.now(UTC)
-            watermark.last_episode_timestamp = datetime.now(UTC)
-            watermark.last_memory_timestamp = datetime.now(UTC)
-            watermark.last_task_change_timestamp = datetime.now(UTC)
-            await self.journal.update_watermark(watermark)
+                # Persist stage reports before judge — the judge reads from the DB,
+                # so reports must be committed before firing the async task.
+                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
-            run.completed_at = datetime.now(UTC)
-            run.status = RunStatus.completed
-            await self.journal.complete_run(run_id, 'completed')
+                # Task 2278: structural cadence guard for the Stage-2 task_count_snapshot
+                # write — escalates once a confirmed miss has recurred for
+                # TASK_COUNT_SNAPSHOT_MISS_THRESHOLD consecutive full cycles.  Full-cycle
+                # path only (not evaluated from _maybe_remediate); reads the just-persisted
+                # stage report, so this runs after update_run_stage_reports above.
+                await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
 
-            # Cross-check self-reported stats against write-journal ops BEFORE the
-            # judge reads them. Stage agents sometimes over-report successful
-            # writes when Mem0 silently dedups; the verifier overwrites those
-            # counts with observed truth and keeps the originals under _reported.
-            await verify_and_rewrite_stats(
-                run_id, run.stage_reports, self.journal.write_journal,
-            )
+                # Async judge review
+                if self.judge:
+                    asyncio.create_task(self._run_judge(run_id))
 
-            # Persist stage reports before judge — the judge reads from the DB,
-            # so reports must be committed before firing the async task.
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                # Remediation pass: thread scope resolved above (task 1163) and pass
+                # pre-fetched tree to avoid a redundant fetch (ref: task 478).
+                await self._maybe_remediate(project_id, run_id, run, tier,
+                                            scope=scope,
+                                            filtered_task_tree=filtered_task_tree)
 
-            # Task 2278: structural cadence guard for the Stage-2 task_count_snapshot
-            # write — escalates once a confirmed miss has recurred for
-            # TASK_COUNT_SNAPSHOT_MISS_THRESHOLD consecutive full cycles.  Full-cycle
-            # path only (not evaluated from _maybe_remediate); reads the just-persisted
-            # stage report, so this runs after update_run_stage_reports above.
-            await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
+                logger.info(
+                    'reconciliation.run_completed',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': project_id,
+                        'status': 'completed',
+                    },
+                )
+                return run
 
-            # Async judge review
-            if self.judge:
-                asyncio.create_task(self._run_judge(run_id))
-
-            # Remediation pass: thread scope resolved above (task 1163) and pass
-            # pre-fetched tree to avoid a redundant fetch (ref: task 478).
-            await self._maybe_remediate(project_id, run_id, run, tier,
-                                        scope=scope,
-                                        filtered_task_tree=filtered_task_tree)
-
-            logger.info(
-                'reconciliation.run_completed',
-                extra={
-                    'run_id': run_id,
-                    'project_id': project_id,
-                    'status': 'completed',
-                },
-            )
-            return run
-
-        except asyncio.CancelledError:
-            # asyncio.wait_for cancels via CancelledError, which is NOT a subclass of
-            # Exception in Python 3.8+.  Without this handler the journal run is left
-            # stuck in 'running'.  Mark it failed, restore events, then re-raise so
-            # asyncio cancellation semantics are preserved.
-            #
-            # Two defences against cleanup being interrupted:
-            # 1. asyncio.shield() — runs the cleanup coroutine in its own Task so a
-            #    second cancellation (e.g. server shutdown) cannot abort the DB write.
-            # 2. Independent try/except BaseException per cleanup step — each step
-            #    runs regardless of the other's outcome, and CancelledError is still
-            #    re-raised to the caller.
-            run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': 'CancelledError',
-                'error_message': 'Run cancelled (timeout or external cancellation)',
-                'failed_stage': current_stage_name,
-                'traceback': '',
-            }
-            try:
-                await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
-            except BaseException as cleanup_err:
-                logger.error(f'complete_run failed after cancellation: {cleanup_err}')
-            try:
-                await asyncio.shield(self.buffer.restore_drained(project_id))
-            except BaseException as cleanup_err:
-                logger.error(f'restore_drained failed after cancellation: {cleanup_err}')
-            logger.error(
-                f'Reconciliation run {run_id} cancelled for {project_id} '
-                f'(stage: {current_stage_name})'
-            )
-            raise
-        except AllAccountsCappedException as e:
-            run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': 'AllAccountsCappedException',
-                'error_message': str(e),
-                'failed_stage': current_stage_name,
-                'deferred': True,
-            }
-            await self.journal.complete_run(run_id, 'failed')
-            await self.buffer.restore_drained(project_id)
-            logger.warning(
-                f'Reconciliation deferred: all accounts capped during stage '
-                f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
-            )
-            return run
-        except Exception as e:
-            run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': type(e).__name__,
-                'error_message': str(e),
-                'failed_stage': current_stage_name,
-                'traceback': traceback.format_exc(),
-            }
-            await self.journal.complete_run(run_id, 'failed')
-            await self.buffer.restore_drained(project_id)
-            logger.error(f'Reconciliation failed: {e}')
-            self._escalate(
-                'recon_failure', run_id,
-                f'Stage {current_stage_name} failed: {e}',
-            )
-            raise
-        finally:
-            await self._ensure_stage1_cycle_summary(
-                run, run_id, project_id, current_stage_name, cycle_start_time,
-            )
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            except asyncio.CancelledError:
+                # asyncio.wait_for cancels via CancelledError, which is NOT a subclass of
+                # Exception in Python 3.8+.  Without this handler the journal run is left
+                # stuck in 'running'.  Mark it failed, restore events, then re-raise so
+                # asyncio cancellation semantics are preserved.
+                #
+                # Two defences against cleanup being interrupted:
+                # 1. asyncio.shield() — runs the cleanup coroutine in its own Task so a
+                #    second cancellation (e.g. server shutdown) cannot abort the DB write.
+                # 2. Independent try/except BaseException per cleanup step — each step
+                #    runs regardless of the other's outcome, and CancelledError is still
+                #    re-raised to the caller.
+                run.status = RunStatus.failed
+                run.stage_reports['_error'] = {
+                    'error_type': 'CancelledError',
+                    'error_message': 'Run cancelled (timeout or external cancellation)',
+                    'failed_stage': current_stage_name,
+                    'traceback': '',
+                }
+                try:
+                    await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
+                except BaseException as cleanup_err:
+                    logger.error(f'complete_run failed after cancellation: {cleanup_err}')
+                try:
+                    await asyncio.shield(self.buffer.restore_drained(project_id))
+                except BaseException as cleanup_err:
+                    logger.error(f'restore_drained failed after cancellation: {cleanup_err}')
+                logger.error(
+                    f'Reconciliation run {run_id} cancelled for {project_id} '
+                    f'(stage: {current_stage_name})'
+                )
+                raise
+            except AllAccountsCappedException as e:
+                run.status = RunStatus.failed
+                run.stage_reports['_error'] = {
+                    'error_type': 'AllAccountsCappedException',
+                    'error_message': str(e),
+                    'failed_stage': current_stage_name,
+                    'deferred': True,
+                }
+                await self.journal.complete_run(run_id, 'failed')
+                await self.buffer.restore_drained(project_id)
+                logger.warning(
+                    f'Reconciliation deferred: all accounts capped during stage '
+                    f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
+                )
+                return run
+            except Exception as e:
+                run.status = RunStatus.failed
+                run.stage_reports['_error'] = {
+                    'error_type': type(e).__name__,
+                    'error_message': str(e),
+                    'failed_stage': current_stage_name,
+                    'traceback': traceback.format_exc(),
+                }
+                await self.journal.complete_run(run_id, 'failed')
+                await self.buffer.restore_drained(project_id)
+                logger.error(f'Reconciliation failed: {e}')
+                self._escalate(
+                    'recon_failure', run_id,
+                    f'Stage {current_stage_name} failed: {e}',
+                )
+                raise
+            finally:
+                await self._ensure_stage1_cycle_summary(
+                    run, run_id, project_id, current_stage_name, cycle_start_time,
+                )
+                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
     async def _ensure_stage1_cycle_summary(
         self,
