@@ -4693,3 +4693,97 @@ def test_cli_stamp_fm_deploy_clock_subcommand(monkeypatch: pytest.MonkeyPatch) -
     assert exit_code == 0
     assert stamped == [None], f"Expected exactly one stamp call, got {stamped}"
 
+
+# ---------------------------------------------------------------------------
+# Part C: _delegate_fm_restart() (step 9)
+#
+# fm sibling of _delegate_fleet_restart: detached systemd-run with a fixed
+# transient unit name (overlap guard) + fail-soft registration. Diverges from
+# the orchestrator path in TWO ways: (1) it invokes restart-fused-memory.sh in
+# its DEFAULT defer-if-busy mode (no --now/--drain), and (2) it chains
+# `&& <self> --stamp-fm-deploy-clock` so the fm clock is stamped only on the
+# restart script's verified exit-0 (restart-fused-memory.sh, unlike
+# restart-all-orchestrators.sh, does not self-stamp).
+# ---------------------------------------------------------------------------
+
+
+def test_delegate_fm_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fm_restart fires a detached, named systemd-run that runs
+    restart-fused-memory.sh (default defer-if-busy mode) and chains the stamp
+    on its verified exit-0."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog._delegate_fm_restart()
+
+    assert len(calls) == 1, f"Expected exactly one subprocess.run call, got {calls}"
+    argv = calls[0]
+    assert argv[:2] == ["systemd-run", "--user"], f"argv must start with systemd-run --user: {argv}"
+    assert "--collect" in argv, f"argv must include --collect: {argv}"
+    assert "--no-block" in argv, f"argv must include --no-block (detached): {argv}"
+    assert "--unit=fm-staleness-redeploy.service" in argv, (
+        f"argv must fire the fixed transient unit name (the overlap guard): {argv}"
+    )
+
+    # The bash -c payload chains restart-fused-memory.sh && <self> --stamp.
+    payload = next(
+        (a for a in argv if "restart-fused-memory.sh" in a), None
+    )
+    assert payload is not None, f"argv must carry a restart-fused-memory.sh payload: {argv}"
+    assert "&&" in payload, (
+        f"payload must chain the stamp with `&&` so it runs only on exit-0: {payload!r}"
+    )
+    assert "--stamp-fm-deploy-clock" in payload, (
+        f"payload must chain the fm-clock stamp subcommand: {payload!r}"
+    )
+    assert "--now" not in payload, (
+        f"payload must NOT pass --now (uses the default defer-if-busy path): {payload!r}"
+    )
+    assert "--drain" not in payload, (
+        f"payload must NOT pass --drain (that is the orchestrator path): {payload!r}"
+    )
+
+    # The referenced restart script must actually exist on disk.
+    assert (REPO_ROOT / "scripts" / "restart-fused-memory.sh").exists(), (
+        "scripts/restart-fused-memory.sh must exist on disk (task 2703 δ dependency)"
+    )
+
+
+def test_delegate_fm_restart_swallows_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fm_restart must not raise if the systemd-run call times out."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    # Must not raise
+    wdog._delegate_fm_restart()
+
+    assert len(log_messages) >= 1, "a systemd-run timeout must be logged"
+
+
+def test_delegate_fm_restart_swallows_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_delegate_fm_restart must not raise if systemd-run is not on PATH."""
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemd-run")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    # Must not raise
+    wdog._delegate_fm_restart()
+
+    assert len(log_messages) >= 1, "a missing systemd-run binary must be logged"
+
