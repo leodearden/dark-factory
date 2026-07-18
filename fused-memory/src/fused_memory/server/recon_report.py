@@ -1890,6 +1890,21 @@ class ReconReportState:
                     self._run_finding_index.pop(rid, None)
                     self._run_desc_index.pop(rid, None)
                     self._run_cited_task_index.pop(rid, None)
+                    # GC the run's persisted rows at quiescence (task 2716) —
+                    # "rows are GC'd with their run".  Best-effort: a shadow-store
+                    # hiccup must not abort the reaper sweep or the in-memory
+                    # eviction just performed (mirrors _persist_run's
+                    # loud-but-non-fatal posture).  No-op when store is None.
+                    if self._store is not None:
+                        try:
+                            self._store.delete_run(rid)
+                        except Exception:
+                            logger.warning(
+                                'recon_report: failed to GC persisted rows for '
+                                'run_id=%r at quiescence',
+                                rid,
+                                exc_info=True,
+                            )
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)
