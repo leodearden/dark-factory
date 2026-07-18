@@ -17,7 +17,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
+
+if TYPE_CHECKING:
+    from orchestrator.event_store import EventStore
 
 from shared.proc_group import terminate_process_group
 from shared.verify_admission import acquire_task_slot, nice_prefix
@@ -5797,3 +5800,108 @@ async def confirm_merge_verify_flake_suppressible(
             exc_info=True,
         )
         return None
+
+
+def _merge_flake_suppressed_pass(
+    failing_result: VerifyResult, node_ids: list[str],
+) -> VerifyResult:
+    """Turn a confirmed-flake *failing_result* into a PASSED VerifyResult.
+
+    Reuses ``dataclasses.replace`` so the original log paths / plan / duration
+    are preserved (the durable evidence of the suppressed red survives),
+    flipping only ``passed``/``timed_out``/``category``/``summary``. The
+    ``merge_flake_suppressed`` category lets the merge proceed into the unscoped
+    typecheck gate (``LocalRunner.run_merge_verify`` falls through on a passed
+    scoped result) while staying greppable in logs/archives.
+    """
+    joined = ', '.join(node_ids)
+    return replace(
+        failing_result,
+        passed=True,
+        timed_out=False,
+        category='merge_flake_suppressed',
+        summary=f'merge-verify flake suppressed (isolated re-run passed): {joined}',
+    )
+
+
+def _emit_merge_flake_suppressed(
+    event_store: 'EventStore | None',
+    task_id: str | None,
+    merge_sha: str,
+    node_ids: list[str],
+) -> None:
+    """Emit the INV-2 structured suppression fact. None-safe (skips on None).
+
+    ``EventType`` is imported lazily to avoid any import-order coupling on this
+    central module (event_store.py has no reverse dependency on verify.py, but
+    the lazy import keeps it that way by construction).
+    """
+    if event_store is None:
+        return
+    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
+
+    event_store.emit(
+        EventType.merge_flake_suppressed,
+        task_id=task_id,
+        data={
+            'node_ids': node_ids,
+            'merge_sha': merge_sha,
+            'measured_at': datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+#: Module-global consecutive-suppression counter (INV-4 storm detector).
+#: Bumped ONLY on a suppression; reset to 0 when the storm escalation fires
+#: (see ``_bump_suppression_streak_and_maybe_escalate``, step-8). A count-window
+#: detector; time-windowing is a sanctioned PRD §9 follow-up.
+_merge_flake_suppression_streak = 0
+
+
+def _bump_suppression_streak_and_maybe_escalate(
+    escalation_queue: Any, task_id: str | None, merge_sha: str,
+) -> None:
+    """Bump the suppression streak on a suppression (INV-4).
+
+    NOTE (step-6): the born-at-L2 storm escalation + counter reset are added in
+    step-8; today this only advances the counter so the orchestration wiring is
+    exercised end-to-end.
+    """
+    global _merge_flake_suppression_streak
+    _merge_flake_suppression_streak += 1
+
+
+async def apply_merge_flake_suppression(
+    failing_result: VerifyResult,
+    *,
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    module_configs: list[ModuleConfig],
+    merge_sha: str,
+    event_store: 'EventStore | None' = None,
+    escalation_queue: Any = None,
+    task_id: str | None = None,
+    _confirm=confirm_merge_verify_flake_suppressible,
+) -> VerifyResult:
+    """Merge-verify result handler: suppress a confirmed CPU-starvation flake.
+
+    THE hook ``LocalRunner.run_merge_verify`` calls on its ``not scoped.passed``
+    branch (PRD task α). Runs the pure gate *_confirm*; on a confirmed flake it
+    emits the INV-2 fact, bumps the INV-4 storm streak, and returns a PASSED
+    VerifyResult (category ``merge_flake_suppressed``) so the merge proceeds
+    into the unscoped typecheck gate. On a non-confirmation it returns
+    *failing_result* UNCHANGED (merge stays red; no fact, streak untouched).
+
+    Never raises: the pure gate is itself fail-closed and non-raising, and the
+    fact/streak side-effects are None-safe — an uncaught raise here would stall
+    the merge queue (merge_queue.py has no VerifyInfraError handler). *_confirm*
+    is injectable for testing.
+    """
+    ids = await _confirm(
+        config, failing_result, worktree=worktree, module_configs=module_configs,
+    )
+    if not ids:
+        return failing_result
+    _emit_merge_flake_suppressed(event_store, task_id, merge_sha, ids)
+    _bump_suppression_streak_and_maybe_escalate(escalation_queue, task_id, merge_sha)
+    return _merge_flake_suppressed_pass(failing_result, ids)
