@@ -55,6 +55,16 @@ def test_config_defaults_escalation_revalidation() -> None:
     assert config.escalation_revalidation_enabled is True
 
 
+def test_config_defaults_escalation_revalidation_allowlist() -> None:
+    """OrchestratorConfig exposes escalation_revalidation_allowlist (task 2724),
+    a frozenset defaulting to the two categories where a terminal subject task
+    truly moots the escalation — task_failure and stranded_blocked. infra_issue
+    is deliberately excluded (its real work can outlive the task record)."""
+    config = OrchestratorConfig()
+    assert config.escalation_revalidation_allowlist == frozenset({'task_failure', 'stranded_blocked'})
+    assert isinstance(config.escalation_revalidation_allowlist, frozenset)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
