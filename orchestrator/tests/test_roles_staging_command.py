@@ -120,13 +120,23 @@ def test_no_role_system_prompt_mandates_the_legacy_exclusion_form() -> None:
 
 
 def test_staging_rules_roles_mandate_the_canonical_constant() -> None:
-    """Every staging-rules role's system_prompt cites MANDATED_STAGING_COMMAND.
+    """Every staging-rules role's system_prompt cites MANDATED_STAGING_COMMAND
+    as its own standalone line -- not merely as a prefix of some other command.
 
-    Confirms the canonical command is present (not merely absent the legacy
-    form) and ties the constant to the prompts, so the two can't drift apart.
+    A bare `MANDATED_STAGING_COMMAND in system_prompt` substring check would
+    also pass for the retired `git add -- . ':!.task'` form, since that form
+    contains `git add -- .` as a leading substring -- it would not actually
+    catch a role that regressed to mandating only the legacy form. Checking
+    for an exact, standalone (whitespace-stripped) line gives this test real
+    discriminating power on its own, independent of
+    test_no_role_system_prompt_mandates_the_legacy_exclusion_form.
     """
     missing = sorted(
         name for name in _STAGING_RULES_ROLES
-        if MANDATED_STAGING_COMMAND not in ROLES[name].system_prompt
+        if MANDATED_STAGING_COMMAND not in {
+            line.strip() for line in ROLES[name].system_prompt.splitlines()
+        }
     )
-    assert missing == [], f'role(s) missing MANDATED_STAGING_COMMAND in system_prompt: {missing}'
+    assert missing == [], (
+        f'role(s) missing MANDATED_STAGING_COMMAND as a standalone line in system_prompt: {missing}'
+    )
