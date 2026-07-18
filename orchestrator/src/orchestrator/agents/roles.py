@@ -218,6 +218,27 @@ Use when you need context not in your briefing:
 - When you need context about prior decisions
 """
 
+# The canonical staging command that every role's "## CRITICAL: Git Staging
+# Rules" section (implementer, debugger, merger, steward, simple_task) must
+# cite verbatim as a standalone line. `.task/` is gitignored at the repo
+# root, so a plain `git add -- .` already excludes it -- no `:!.task`
+# exclusion pathspec is needed. A prior form, `git add -- . ':!.task'`,
+# named the gitignored `.task` path directly in a pathspec, which trips
+# git's "paths are ignored by one of your .gitignore files" advice AND
+# exits 1 (staging itself still succeeded -- only the exit code/advice was
+# spurious). Task 2745.
+#
+# NOTE: the role prompts below are plain string literals, not f-strings
+# built from this constant -- some prompts are long and contain literal
+# `{`/`}` characters that f-string interpolation could silently mangle, so
+# each prompt hardcodes this same command instead of interpolating it.
+# This constant is therefore a *test anchor*, not a shared template: it is
+# the value test_roles_staging_command.py checks every staging-rules
+# prompt against. If this command ever changes, update it here AND in
+# every affected role's system_prompt -- the regression test only catches
+# drift after the fact, it does not prevent it structurally.
+MANDATED_STAGING_COMMAND = 'git add -- .'
+
 
 ARCHITECT = AgentRole(
     name='architect',
@@ -354,24 +375,26 @@ Task metadata (plan.json, iterations.jsonl, etc.) now lives in the sibling
 `<worktree_base>/.task-meta/<worktree-name>/` directory, OUTSIDE this
 worktree — `git add -A`/`git clean`/`git checkout` here cannot reach it.
 `.task/` inside the worktree is retained for the compat window and for the
-Claude config dir, and must still NEVER be committed. When staging changes,
-ALWAYS exclude it:
+Claude config dir, and must still NEVER be committed. It is gitignored at
+the repo root, so an ordinary staging command already excludes it — no
+exclusion pathspec is needed:
 
 ```bash
-# CORRECT — stage by specific files or with exclusion:
+# CORRECT — stage by specific files, or stage everything at once:
 git add src/module/file.py tests/test_file.py
-git add -- . ':!.task'
+git add -- .
 
-# WRONG — these will stage .task/ files:
-# git add .
-# git add -A
-# git add .task/plan.json
+# WRONG — force-adds .task/ past the gitignore (never do this):
+# git add -f .task/plan.json
 ```
+
+As a backstop, a pre-commit hook silently strips any `.task/` path that
+still ends up staged — but that is defense-in-depth, not the only guard.
 
 The workflow for each step is:
 1. Write code (implementation or tests)
 2. Run tests to verify
-3. Stage and commit ONLY the code: `git add -- . ':!.task'`
+3. Stage and commit ONLY the code: `git add -- .`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
 
 ## Scope Boundary
@@ -424,18 +447,20 @@ You will be given:
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
 the compat window and for the Claude config dir, and must still NEVER be
-committed. When staging changes, ALWAYS exclude it:
+committed. It is gitignored at the repo root, so an ordinary staging command
+already excludes it — no exclusion pathspec is needed:
 
 ```bash
 # CORRECT:
 git add src/module/file.py tests/test_file.py
-git add -- . ':!.task'
+git add -- .
 
-# WRONG — these will stage .task/ files:
-# git add .
-# git add -A
-# git add .task/plan.json
+# WRONG — force-adds .task/ past the gitignore (never do this):
+# git add -f .task/plan.json
 ```
+
+As a backstop, a pre-commit hook silently strips any `.task/` path that
+still ends up staged.
 
 ## Scope Boundary
 
@@ -663,11 +688,13 @@ dropped file contributes that the kept side lacks.
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed. When staging changes,
-ALWAYS exclude it:
+the compat window and must still NEVER be committed — it is gitignored at the
+repo root (so an ordinary staging command already excludes it), and a
+pre-commit hook backstops this by stripping any `.task/` path that still gets
+staged. Never force-add it (`git add -f .task/...`):
 
 ```bash
-git add -- . ':!.task'
+git add -- .
 ```
 
 ## Important
@@ -935,11 +962,13 @@ wording differs.
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed. When staging changes,
-ALWAYS exclude it:
+the compat window and must still NEVER be committed — it is gitignored at the
+repo root (so an ordinary staging command already excludes it), and a
+pre-commit hook backstops this by stripping any `.task/` path that still gets
+staged. Never force-add it (`git add -f .task/...`):
 
 ```bash
-git add -- . ':!.task'
+git add -- .
 ```
 
 ## Session Continuity
@@ -1236,16 +1265,18 @@ dispatch.
 
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed.
+the compat window and must still NEVER be committed — it is gitignored at the
+repo root, so an ordinary staging command already excludes it (a pre-commit
+hook also backstops this by stripping any `.task/` path that still gets
+staged).
 
 ```bash
 # CORRECT:
 git add path/to/file.py
-git add -- . ':!.task'
+git add -- .
 
-# WRONG:
-# git add .
-# git add -A
+# WRONG — force-adds .task/ past the gitignore (never do this):
+# git add -f .task/plan.json
 ```
 
 ## Scope Boundary
