@@ -143,13 +143,25 @@ DAG: μ depends on λ (linear spine) ✓.
 | Capability | Evidence | Verdict |
 |---|---|---|
 | `QueuedBranch` type + parse() | `producer:μ` upstream | PASS |
-| `canonical_queued_branch_name` to delete | `grep:orchestrator/src/orchestrator/git_ops.py:737` wired | PASS |
+| `canonical_queued_branch_name` — **RELOCATED, RETAIN** (not deletable) | `grep:shared/src/shared/branch_names.py:15 (definition — load-bearing shared primitive)`; `grep:orchestrator/src/orchestrator/git_ops.py:58 (orchestrator-internal re-export — THIS is what ν deletes)` wired | PASS |
 | try-both `resolve_queued_branch_ref` to delete | `grep:orchestrator/src/orchestrator/git_ops.py:3968` wired | PASS |
 | journal strip/re-add pair to delete | `grep:orchestrator/src/orchestrator/merge_queue_store.py:117,:304` wired | PASS |
 | ~8 inline `f'{branch_prefix}{...}'` sites | `grep:orchestrator/src/orchestrator/git_ops.py:1246,:1307,:1770,:2649,:3378` wired | PASS |
 | **G6 premise: pyright enforces the invariant at drift sites** | `MergeRequest.branch: QueuedBranch` makes a bare-str assignment a type error — pyright is the existing merge-verify substrate (unscoped pyright runs today) | PASS |
 
 DAG: ν depends on μ (upstream) ✓ no inversion.
+
+> **Reconciled 2026-07-18 (esc-2178-3).** Since this manifest was verified (2026-07-06), a sibling
+> legibility-dedup task **relocated** `canonical_queued_branch_name` from `git_ops.py:737-753` to
+> `shared/src/shared/branch_names.py:15`, where it is now a load-bearing shared primitive consumed by
+> `escalation/server.py` at four raw-MCP-input sites (`:1166`, `:1263`, `:1784`, `:2076`). Because
+> `escalation` cannot import `orchestrator`, the primitive **cannot be deleted** and `QueuedBranch.parse`
+> continues to delegate to it (`merge_types.py:706`). ν's deletion deliverable therefore narrows to
+> canonical's **orchestrator-internal** dead uses only — the `git_ops.py:58` re-export and the duplicated
+> `test_git_ops.py::TestCanonicalQueuedBranchName` unit tests (now covered by `shared/tests/test_branch_names.py`) —
+> plus the try-both / journal strip-re-add / inline-construction sites above (unaffected by the relocation).
+> `escalation/server.py` stays **out of scope**. The user-observable signal is unchanged (met within the
+> orchestrator merge-queue subsystem). The old `git_ops.py:737` anchor is stale — see the RETAIN row above.
 
 ## ξ — Migrate _verify_and_advance tests to public surface + delete shim
 
