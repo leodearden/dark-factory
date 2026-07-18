@@ -65,6 +65,7 @@ class TestReconReportStore:
         store.open()
         try:
             conn = store._conn
+            assert conn is not None
             cur = conn.execute("PRAGMA table_info(recon_report_state)")
             cols = {row[1]: row for row in cur.fetchall()}
             assert set(cols) >= {
@@ -80,7 +81,9 @@ class TestReconReportStore:
         store = self._make_store(tmp_path)
         store.open()
         try:
-            row = store._conn.execute('PRAGMA journal_mode').fetchone()
+            conn = store._conn
+            assert conn is not None
+            row = conn.execute('PRAGMA journal_mode').fetchone()
             assert row[0] == 'wal'
         finally:
             store.close()
@@ -521,7 +524,10 @@ class TestWriteThrough:
         (a sync call, not via an MCP tool wrapper) — confirm that path also
         write-throughs, since it's one of the two non-MCP-wrapper synchronous
         callers named in the design (the other is stages/base.py's start_report)."""
-        from fused_memory.middleware.live_task_write_guard import LiveTaskSnapshot, LifecycleResetFinding
+        from fused_memory.middleware.live_task_write_guard import (
+            LifecycleResetFinding,
+            LiveTaskSnapshot,
+        )
         from fused_memory.server.recon_lifecycle_filer import build_lifecycle_reset_filer
 
         state, store, _t = self._make_state(tmp_path)
