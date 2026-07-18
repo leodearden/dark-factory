@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from orchestrator.evals import snapshots
-from orchestrator.evals.snapshots import create_eval_worktree
+from orchestrator.evals.snapshots import create_eval_worktree, get_diff
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -127,6 +128,54 @@ class TestCreateEvalWorktreeHeadAssertion:
             assert (worktree_path / 'SETUP_RAN').exists(), (
                 'setup_commands should have run after the HEAD assertion passed'
             )
+        finally:
+            subprocess.run(
+                ['git', 'worktree', 'remove', '--force', str(worktree_path)],
+                cwd=str(repo),
+                capture_output=True,
+            )
+
+
+class TestGetDiff:
+    """get_diff must diff the COMMITTED eval branch against the threaded base."""
+
+    def test_get_diff_returns_committed_diff_vs_base(
+        self, tmp_repo: tuple[Path, str, str]
+    ) -> None:
+        """A committed change on the eval branch shows up in the diff.
+
+        Reproduces D1: the landed change is a COMMIT (not a working-tree
+        edit), and a misleading ``<worktree>/.task/metadata.json`` points
+        ``base_commit`` at HEAD. The old metadata-read + uncommitted-only
+        fallback returned '' for this shape; threading the authoritative
+        ``base_commit`` (here ``first``) yields the full committed diff.
+        """
+        repo, first, _second = tmp_repo
+
+        worktree_path, _ = asyncio.run(
+            create_eval_worktree(repo, 'gd_task', first)
+        )
+        try:
+            # Land the change as a COMMIT on the detached eval branch, so it
+            # is NOT visible to `git diff HEAD` (the old uncommitted fallback).
+            (worktree_path / 'LANDED.py').write_text('X = "committed_marker"\n')
+            _git(['add', 'LANDED.py'], cwd=worktree_path)
+            _git(['commit', '-q', '-m', 'landed change'], cwd=worktree_path)
+
+            # Misleading metadata.json: if get_diff still read it, base==HEAD
+            # would make `git diff HEAD..HEAD` empty and mask the change.
+            head = _git(['rev-parse', 'HEAD'], cwd=worktree_path)
+            task_dir = worktree_path / '.task'
+            task_dir.mkdir(parents=True, exist_ok=True)
+            (task_dir / 'metadata.json').write_text(
+                json.dumps({'base_commit': head})
+            )
+
+            diff = asyncio.run(get_diff(worktree_path, first))
+
+            assert diff, 'expected a non-empty committed diff vs base'
+            assert 'LANDED.py' in diff
+            assert 'committed_marker' in diff
         finally:
             subprocess.run(
                 ['git', 'worktree', 'remove', '--force', str(worktree_path)],
