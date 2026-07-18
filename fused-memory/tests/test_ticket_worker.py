@@ -2752,3 +2752,54 @@ async def test_reap_leaked_ticket_workers_noop_when_nothing_leaked():
     from _fm_helpers import reap_leaked_ticket_workers
 
     assert await reap_leaked_ticket_workers() == 0
+
+
+@pytest.mark.asyncio
+async def test_reap_leaked_ticket_workers_does_not_count_timed_out_worker():
+    """A worker that fails to unwind within the drain bound is
+    cancel()-requested but NOT counted.
+
+    Pins the counting nuance documented on reap_leaked_ticket_workers: the
+    returned tally reflects workers actually drained to completion
+    (task.done() confirmed post-drain), not merely the workers it asked to
+    cancel. asyncio.wait_for is patched to simulate the bounded drain
+    blowing its deadline, so the test stays fast and deterministic instead
+    of waiting out the real 10s bound (and never risks hanging on a worker
+    that ignores cancellation).
+    """
+    from _fm_helpers import reap_leaked_ticket_workers
+
+    started = asyncio.Event()
+
+    # Local shim whose coroutine __qualname__ ends with
+    # 'TaskInterceptor._curator_worker', so the reaper's qualname filter
+    # matches it exactly like a real leaked worker.
+    class TaskInterceptor:
+        async def _curator_worker(self):
+            started.set()
+            await asyncio.sleep(3600)
+
+    worker = asyncio.ensure_future(TaskInterceptor()._curator_worker())
+    await started.wait()  # worker is live and blocked on sleep
+
+    async def _simulate_timeout(_awaitable, timeout):
+        # Model the bounded drain exceeding its deadline without waiting the
+        # real 10s and without yielding to the loop — so the reaper's
+        # cancel() is in flight but not yet processed when it re-checks
+        # task.done().
+        raise asyncio.TimeoutError
+
+    with patch('asyncio.wait_for', _simulate_timeout):
+        reaped = await reap_leaked_ticket_workers()
+
+    # The reaper issued cancel() (cancel-requested)...
+    assert worker.cancelling() > 0, 'reaper must have requested worker cancellation'
+    # ...but the worker had not finished unwinding when the drain "timed
+    # out", so it is deliberately NOT counted.
+    assert not worker.done(), 'worker should still be pending after a timed-out drain'
+    assert reaped == 0, f'a timed-out worker must not be counted, got {reaped}'
+
+    # Clean up the still-pending worker so it does not leak into teardown.
+    worker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker
