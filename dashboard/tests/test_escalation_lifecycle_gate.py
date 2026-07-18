@@ -326,3 +326,104 @@ class TestAlphaChokepointRoundTrip:
         assert r5.resolved_by == 'auto-dismissed'
         assert r5.resolution_class == 'benign'
         assert effective_benign(r5) == ('benign', 'stamped')
+
+
+# ---------------------------------------------------------------------------
+# step-3 — TestAggregateOverLiveArchive: rows 6 + 11 (real aggregator).
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateOverLiveArchive:
+    """Rows 6 + 11: the REAL aggregator over the live round-tripped archive.
+
+    The α↔γ seam — γ reads the records α wrote through its production
+    chokepoints (not hand-written golden dicts) via the SAME
+    ``effective_benign``/``classify_resolver_tier`` predicates, so a
+    disagreement in record shape or classification surfaces here.
+    """
+
+    async def test_row6_origin_and_parse_failures(self, tmp_path: Path) -> None:
+        queue = _live_queue(tmp_path)
+        server = _make_server(queue)
+        arch = await _build_live_boundary_archive(queue, server)
+
+        esc_dir = _make_config(tmp_path).escalations_dir
+        entry, pf = _aggregate_project(tmp_path.name, esc_dir, tmp_path / 'runs.db', now=_now())
+
+        # INV-4: the one corrupt esc-999-1.json is counted, never silently dropped.
+        assert pf == 1
+
+        # Per-source origin benign/actionable/stamped == the round-tripped truth
+        # (cascade members + age-out record → benign & stamped; the unstamped
+        # resume → actionable & inferred; the rejected row-4 record → pending,
+        # unclassified). effective_benign is the shared predicate (INV-5).
+        expected = arch.expected_origin_by_source()
+        sources_by_name = {s['source']: s for s in entry['origin']['sources']}
+        assert set(sources_by_name) == set(expected)
+        for name, exp in expected.items():
+            s = sources_by_name[name]
+            assert s['benign'] == exp['benign'], f'{name} benign'
+            assert s['actionable'] == exp['actionable'], f'{name} actionable'
+            # No 'moot-terminal-subject' records in this archive, so the
+            # classified count is exactly benign+actionable; derive the expected
+            # stamped_share from the stamped truth.
+            classified = exp['benign'] + exp['actionable']
+            expected_share = exp['stamped'] / classified if classified else 0.0
+            assert s['stamped_share'] == pytest.approx(expected_share), f'{name} stamped_share'
+
+        # build_escalation_analytics wraps the same archive: parse_failures
+        # surfaces the corrupt file (+0 for the committed regime-markers file),
+        # and generated_at is a non-empty iso string.
+        payload = build_escalation_analytics(
+            [(tmp_path.name, esc_dir, tmp_path / 'runs.db')], now=_now(),
+        )
+        assert payload['parse_failures'] >= 1
+        assert isinstance(payload['generated_at'], str) and payload['generated_at']
+
+    async def test_row11_flow_cube_reconciles_over_live_archive(self, tmp_path: Path) -> None:
+        queue = _live_queue(tmp_path)
+        server = _make_server(queue)
+        arch = await _build_live_boundary_archive(queue, server)
+
+        esc_dir = _make_config(tmp_path).escalations_dir
+        entry, _pf = _aggregate_project(tmp_path.name, esc_dir, tmp_path / 'runs.db', now=_now())
+
+        samples = entry['lifespan']['samples']
+        flow_daily = entry['workflow']['flow_daily']
+        tier_weekly = entry['workflow']['tier_weekly']
+        sources = entry['origin']['sources']
+
+        # sum(flow_daily.n) == len(samples) == terminal-with-valid-times count.
+        # Holds exactly because queue.resolve always stamps resolved_at, and the
+        # flow cube and samples share one population (both gate on parseable
+        # timestamp AND resolved_at).
+        expected_terminal = len(arch.terminal())
+        total_flow_n = sum(row['n'] for row in flow_daily)
+        assert total_flow_n == len(samples) == expected_terminal
+
+        # Per-date marginals match exactly (both keyed by date(resolved_at)) →
+        # the identity survives summing over ANY date sub-window.
+        sample_date_counts = Counter(row[0] for row in samples)
+        flow_date_counts: Counter = Counter()
+        for row in flow_daily:
+            flow_date_counts[row['date']] += row['n']
+        assert sample_date_counts == flow_date_counts
+
+        # Per-tier == tier_weekly totals == samples-by-tier (same population/derivation).
+        sample_tier_counts = Counter(row[1] for row in samples)
+        flow_tier_counts: Counter = Counter()
+        for row in flow_daily:
+            flow_tier_counts[row['tier']] += row['n']
+        tier_weekly_totals: Counter = Counter()
+        for week_bucket in tier_weekly.values():
+            for tier, n in week_bucket.items():
+                tier_weekly_totals[tier] += n
+        assert flow_tier_counts == tier_weekly_totals == sample_tier_counts
+
+        # Per-(source, class) == sources[] benign/actionable.
+        flow_source_class_counts: Counter = Counter()
+        for row in flow_daily:
+            flow_source_class_counts[(row['source'], row['class'])] += row['n']
+        for s in sources:
+            assert flow_source_class_counts.get((s['source'], 'benign'), 0) == s['benign']
+            assert flow_source_class_counts.get((s['source'], 'actionable'), 0) == s['actionable']
