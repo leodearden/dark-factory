@@ -378,12 +378,24 @@ class ReconciliationJournal:
     async def record_run_session(
         self, run_id: str, *, session_id: str, stage_cursor: str
     ) -> None:
-        """Snapshot the in-flight stage subprocess's CLI session onto the run row.
+        """Snapshot the in-flight stage's minted CLI session onto the run row.
 
         Called by ``BaseStage.run`` right before it launches a stage subprocess
         (mint-before-spawn). ``attempt`` auto-increments atomically in SQL so the
-        run row carries a monotonic count of stage-subprocess launches with no
-        read-modify-write race. Task σ's resume gate consumes this snapshot.
+        run row carries a monotonic count of stage invocations with no
+        read-modify-write race.
+
+        Best-effort snapshot — may be STALE after an internal cap retry: the
+        persisted ``session_id`` is the value ``BaseStage.run`` *minted* before
+        the launch, but ``invoke_with_cap_retry`` regenerates its own session id
+        internally on a cap retry (shared/src/shared/cli_invoke.py), so after
+        such a retry the CLI's live session differs from the value stored here.
+        Note too that ``attempt`` counts ``BaseStage.run`` stage invocations, not
+        the underlying subprocess spawns — a cap retry spawns again without
+        bumping ``attempt``. Task σ's resume gate therefore must treat this
+        snapshot as best-effort: validate that the transcript for the persisted
+        session actually exists before trusting it to ``--resume`` rather than
+        resuming the persisted id blindly.
         """
         async with self._txn() as db:
             await db.execute(

@@ -1275,6 +1275,16 @@ class ReconciliationHarness:
 
         # Task 2744: sweep the config dir a dead predecessor process may have left
         # behind for this run. Defensive — never mask the recovery outcome.
+        #
+        # TODO(task σ / session-resume): this GC is UNCONDITIONAL because
+        # ``disposition`` is always 'failed' today — a non-resumable terminal
+        # status — so the per-run config dir (which holds the CLI transcript a
+        # ``--resume`` would need) is always safe to delete here. When σ teaches
+        # this seam to complete a run with a *resumable* disposition (see the
+        # ``disposition`` docstring above), it MUST gate this GC on the
+        # disposition and skip it for resumable ones, or the transcript
+        # session-resume depends on is destroyed and resume has nothing to
+        # resume from.
         try:
             gc_run_config_dir(self.journal.data_dir, run.id)
         except Exception as gc_err:  # noqa: BLE001
