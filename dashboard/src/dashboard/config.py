@@ -98,6 +98,13 @@ def _discover_escalation_urls(roots: list[Path]) -> dict[str, str]:
     URL at all — no config found under any spelling, or a config found with
     no ``escalation.port`` — logs a WARNING naming the root, rather than
     degrading silently.
+
+    The per-root WARNINGs (both the legacy-fallback nudge and this no-URL
+    one) are an intentional, persistent migration nudge — not transient
+    errors. Discovery runs once per process at startup (via
+    ``DashboardConfig.__post_init__`` / ``from_env``), never per request, so
+    a legitimately non-orchestrator or still-legacy root re-emits its WARNING
+    only once per process lifetime — a bounded reminder, not log spam.
     """
     out: dict[str, str] = {}
     for root in roots:

@@ -68,6 +68,51 @@ class TestCanonicalConfigPreferred:
         assert records[0].levelno == logging.WARNING
         assert 'myproj' in records[0].getMessage()
 
+    @pytest.mark.parametrize(
+        ('earlier_raw', 'expect_parse_warning'),
+        [
+            (yaml.safe_dump({'escalation': {'host': '127.0.0.1'}}), False),
+            ('escalation: [unclosed', True),
+        ],
+        ids=['portless-earlier', 'unparseable-earlier'],
+    )
+    def test_legacy_fallthrough_past_bad_earlier_spelling(
+        self, tmp_path, caplog, earlier_raw, expect_parse_warning
+    ):
+        """A no-URL earlier legacy spelling does not halt the fallback loop.
+
+        With the canonical config absent, ``_discover_root_escalation_url``
+        iterates ``_LEGACY_CONFIG_NAMES`` in order. A portless or unparseable
+        config at an EARLIER spelling (``orchestrator.yaml``) must not stop
+        iteration nor be treated as authoritative — resolution continues to a
+        LATER legacy spelling (``orchestrator/config.yaml``) that carries a
+        valid port, still emitting the 'please migrate' nudge naming the
+        project. Guards against a regression that stopped after the first
+        legacy candidate returned None.
+        """
+        root = tmp_path / 'myproj'
+        # Earlier spelling (first in _LEGACY_CONFIG_NAMES): yields no URL.
+        earlier = root / 'orchestrator.yaml'
+        earlier.parent.mkdir(parents=True, exist_ok=True)
+        earlier.write_text(earlier_raw)
+        # Later spelling (last in _LEGACY_CONFIG_NAMES): valid port.
+        _write_yaml(root / 'orchestrator/config.yaml', {'escalation': {'port': 9202}})
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        # Resolved via the LATER legacy spelling, not the bad earlier one.
+        assert result == {'myproj': 'http://127.0.0.1:9202/mcp'}
+        messages = [r.getMessage() for r in caplog.records if r.name == _LOGGER_NAME]
+        migrate_msgs = [m for m in messages if 'please migrate' in m]
+        assert len(migrate_msgs) == 1
+        assert 'myproj' in migrate_msgs[0]
+        assert str(root / 'orchestrator/config.yaml') in migrate_msgs[0]
+        # Unparseable earlier config additionally logs one parse-failure warning.
+        assert sum('Failed to read' in m for m in messages) == (1 if expect_parse_warning else 0)
+        # The root DID resolve — no no-URL warning fired.
+        assert not any('No escalation URL discovered' in m for m in messages)
+
 
 class TestNoUrlWarnsNamingRoot:
     """Scope 2: a root that yields no escalation URL at all warns, naming the root."""
