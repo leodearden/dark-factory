@@ -2041,9 +2041,8 @@ class Harness:
                 # meaningless for them — exclude them in every mode, including
                 # a force-retag.
                 continue
-            if not force:
-                if metadata.get('files') or metadata.get('files_tagged_at'):
-                    continue
+            if not force and (metadata.get('files') or metadata.get('files_tagged_at')):
+                continue
             untagged.append(t)
 
         if not untagged:
