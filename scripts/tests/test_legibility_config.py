@@ -236,3 +236,12 @@ class TestShippedDarkFactoryConfig:
         assert cfg.models.census_miner
         assert cfg.models.census_verify
         assert cfg.models.census_synthesis
+
+    def test_shipped_config_agent_transcript_roots_set_live(self):
+        # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):
+        # the shipped config ships the fleet archive root SET (live), not empty,
+        # so the archived fleet-transcript corpus is enumerated with no operator
+        # flip. Relative to project_root; git-ignored; produced by task α's
+        # shared.transcript_archive.
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.agent_transcript_roots == ['data/orchestrator/agent-transcripts']
