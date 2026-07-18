@@ -1330,3 +1330,74 @@ async def test_no_journal_path_creates_no_journal(real_buffer, tmp_path):
     # No journal db was created — the only *.db under tmp_path is the buffer's
     # own file (from the real_buffer fixture), never a journal db.
     assert {p.name for p in tmp_path.glob('*.db')} == {'buf.db'}
+
+
+@pytest.mark.asyncio
+async def test_drainer_marks_processed_on_commit(real_buffer, tmp_path):
+    """After the drainer commits an event to the buffer, its journal row is
+    removed — the in-memory queue is a pure dispatch cache over the durable row.
+    """
+    ej_path = tmp_path / 'ej.db'
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        journal_path=ej_path,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        event = _make_event()
+        assert q.enqueue(event) is True
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        # Committed to the buffer.
+        stats = await real_buffer.get_buffer_stats('test-project')
+        assert stats['size'] == 1
+        # Journal row removed (drainer marked it processed after the push).
+        journal = EventJournal(ej_path)
+        try:
+            assert journal.load_unprocessed() == []
+        finally:
+            journal.close()
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_drainer_marks_processed_on_dead_letter(tmp_path):
+    """When the drainer dead-letters a non-retriable event, its journal row is
+    removed too — durability is handed off to the dead-letter JSONL file.
+    """
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
+    ej_path = tmp_path / 'ej.db'
+    dl = tmp_path / 'dl.jsonl'
+    q = EventQueue(
+        buf,
+        dead_letter_path=dl,
+        journal_path=ej_path,
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=2.0,
+    )
+    await q.start()
+    try:
+        event = _make_event()
+        assert q.enqueue(event) is True
+        await asyncio.wait_for(q._queue.join(), timeout=2.0)
+        # Dead-lettered (non-retriable push error).
+        assert q.stats()['dead_letters'] == 1
+        lines = dl.read_text().strip().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])['reason'] == 'non_retriable'
+        # Journal row removed — durability handed off to the dead-letter file.
+        journal = EventJournal(ej_path)
+        try:
+            assert journal.load_unprocessed() == []
+        finally:
+            journal.close()
+    finally:
+        await q.close()
