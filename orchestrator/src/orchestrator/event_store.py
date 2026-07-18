@@ -513,3 +513,62 @@ class EventStore:
         except Exception:
             logger.warning('event_store.fetch_events_by_type failed', exc_info=True)
             return []
+
+    def fetch_events_by_type_all_runs(
+        self, event_type: str | EventType, *, task_id: str | None = None,
+    ) -> list[dict]:
+        """Return all events of *event_type* across ALL runs, ordered by id.
+
+        The restart-durable (run-agnostic) counterpart to
+        ``fetch_events_by_type``: it drops the ``run_id`` scoping so a row
+        emitted in a PRIOR orchestrator run (e.g. before a fleet redeploy) is
+        still visible.  This is what the durable verified-green checkpoint
+        (task 2752) relies on — the run-scoped ``fetch_events_by_type`` cannot
+        see a prior run's ``workflow_verify`` green.
+
+        When *task_id* is given, an additional ``task_id = ?`` predicate bounds
+        the result set to that one task's rows (a handful, not the whole
+        cross-run history).  The ``data`` column of every returned row is
+        parsed from JSON back to a dict.  Returns an empty list when no rows
+        match.  Errors are logged and return [] (read path is fire-safe).
+        """
+        try:
+            type_str = event_type.value if isinstance(event_type, EventType) else str(event_type)
+            sql = (
+                'SELECT id, timestamp, run_id, task_id, event_type, phase, role, '
+                '       data, cost_usd, duration_ms '
+                'FROM events '
+                'WHERE event_type = ?'
+            )
+            params: list = [type_str]
+            if task_id is not None:
+                sql += ' AND task_id = ?'
+                params.append(task_id)
+            sql += ' ORDER BY id'
+            conn = self._connect()
+            try:
+                rows = conn.execute(sql, tuple(params)).fetchall()
+            finally:
+                conn.close()
+            result = []
+            for row in rows:
+                (row_id, timestamp, run_id, row_task_id, evt_type, phase,
+                 role, raw_data, cost_usd, duration_ms) = row
+                result.append({
+                    'id': row_id,
+                    'timestamp': timestamp,
+                    'run_id': run_id,
+                    'task_id': row_task_id,
+                    'event_type': evt_type,
+                    'phase': phase,
+                    'role': role,
+                    'data': json.loads(raw_data) if raw_data else {},
+                    'cost_usd': cost_usd,
+                    'duration_ms': duration_ms,
+                })
+            return result
+        except Exception:
+            logger.warning(
+                'event_store.fetch_events_by_type_all_runs failed', exc_info=True
+            )
+            return []
