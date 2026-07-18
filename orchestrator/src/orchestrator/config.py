@@ -2705,6 +2705,28 @@ class OrchestratorConfig(BaseSettings):
             '75-min default.'
         ),
     )
+    # Merge-phase grace for the orchestrator's own coordinator (task 2753):
+    # max seconds the self-redeploy (polite AND force-fire) is deferred to let
+    # a pre-enqueue MERGE-phase workflow (Phase-1 rebase + scoped re-verify)
+    # reach the durable merge journal (merge_queued). Post-enqueue merges
+    # already survive restart via that journal, so the grace protects ONLY the
+    # pre-enqueue window and releases the moment it reaches the queue. On the
+    # force-fire path it bounds the hold to force_fire_after_secs + this — an
+    # absolute owed-age ceiling that fires within a provable time even under
+    # rolling saturation. 0 disables the grace entirely (byte-identical prior
+    # behaviour). Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only,
+    # matching its siblings orchestrator_restart_force_fire_after_secs /
+    # orchestrator_restart_min_interval_secs (captured at coordinator
+    # construction).
+    orchestrator_restart_merge_phase_grace_secs: float = Field(
+        default=600.0,
+        description=(
+            'Max seconds an orchestrator self-redeploy (polite AND force-fire) '
+            'is deferred to let a pre-enqueue MERGE-phase workflow reach the '
+            'durable merge journal; bounds the force-fire hold to '
+            'force_fire_after_secs + this. 0 disables. 10-min default.'
+        ),
+    )
 
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
