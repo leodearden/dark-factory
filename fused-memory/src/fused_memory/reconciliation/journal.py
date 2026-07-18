@@ -573,9 +573,10 @@ class ReconciliationJournal:
             # the verdict and clearing the marker in one transaction guarantees
             # the invariant 'marker present ⟹ no committed verdict', so a
             # startup re-run never collides with the run_id PK on judge_verdicts.
-            await db.execute(
-                'DELETE FROM judge_pending WHERE run_id = ?', (verdict.run_id,)
-            )
+            # Routed through the shared _delete_judge_pending helper so this
+            # atomic clear and the standalone clear_judge_pending can't drift
+            # (task 2708 amendment, reviewer_comprehensive).
+            await self._delete_judge_pending(db, verdict.run_id)
 
     async def get_recent_verdicts(
         self, project_id: str, limit: int = 10, since: datetime | None = None,
@@ -632,12 +633,26 @@ class ReconciliationJournal:
                 (run_id, project_id, datetime.now(UTC).isoformat()),
             )
 
+    @staticmethod
+    async def _delete_judge_pending(db: aiosqlite.Connection, run_id: str) -> None:
+        """Single definition of the judge_pending marker DELETE (task 2708 amendment).
+
+        Takes an already-open connection so it runs inside the caller's
+        transaction: ``add_verdict`` calls it inside the verdict-INSERT ``_txn``
+        (atomic marker-clear), and ``clear_judge_pending`` inside its own
+        ``_txn`` (standalone clear). Sharing one DELETE statement keeps the SQL
+        and keying from drifting between the two paths.
+        """
+        await db.execute('DELETE FROM judge_pending WHERE run_id = ?', (run_id,))
+
     async def clear_judge_pending(self, run_id: str) -> None:
-        """Remove the pending-judge marker for ``run_id`` (no-op if absent)."""
+        """Remove the pending-judge marker for ``run_id`` (no-op if absent).
+
+        Standalone clear (own transaction); shares the single DELETE definition
+        with ``add_verdict``'s atomic clear via ``_delete_judge_pending``.
+        """
         async with self._txn() as db:
-            await db.execute(
-                'DELETE FROM judge_pending WHERE run_id = ?', (run_id,)
-            )
+            await self._delete_judge_pending(db, run_id)
 
     async def get_pending_judge_runs(self) -> list[tuple[str, str]]:
         """Return every run still owed a judge review as (run_id, project_id).
