@@ -105,6 +105,28 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and await every task still pending on *loop* before it closes
+    (mirrors test_capability_guard_http.py's ``_drain_pending_tasks``).
+
+    Mirrors ``asyncio.run()``'s own internal shutdown sequence
+    (``_cancel_all_tasks``). Without this, a task still suspended
+    mid-``await`` when the loop is stopped -- the server's own root task
+    (``run_http_async``), or an internal one it spawns (e.g.
+    sse_starlette's ``_shutdown_watcher``) -- is only unwound later at
+    uncontrolled garbage-collection time, outside of any running task
+    context, which crashes anyio's shielded lifespan cleanup with an
+    unraisable ``TypeError``/``NoEventLoopError`` instead of shutting down
+    cleanly (task 2741).
+    """
+    pending = asyncio.all_tasks(loop)
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
 async def _mcp_handshake_ready(base_url: str) -> bool:
     """True iff a real MCP client completes initialize+ping against
     ``{base_url}/mcp/``.
@@ -147,7 +169,11 @@ def http_server(
     unblocks ``run_until_complete`` in the serving thread, which is then
     joined (bounded to 5s). A ``stopping`` flag distinguishes that
     deliberate, stop-induced ``RuntimeError`` from a genuine startup
-    failure, so ``serve_error`` below still reflects only real errors.
+    failure, so ``serve_error`` below still reflects only real errors. Any
+    task still pending at that point is cancelled and drained
+    (``_drain_pending_tasks``) inside the serving thread before the loop
+    closes, so cleanup runs inside a live task context instead of at
+    uncontrolled GC time.
     """
     queue_dir = tmp_path_factory.mktemp('status_authority_gate_http')
     queue = EscalationQueue(queue_dir)
@@ -174,6 +200,7 @@ def http_server(
             if not stopping:
                 serve_error = exc
         finally:
+            _drain_pending_tasks(loop)
             loop.close()
 
     thread = threading.Thread(
@@ -278,7 +305,7 @@ def test_http_server_fixture_stops_serving_thread_on_teardown(
     already serving this module's other tests under the same thread name.
     """
     before = set(threading.enumerate())
-    gen = http_server.__wrapped__(tmp_path_factory)
+    gen = http_server.__wrapped__(tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
     try:
         base_url, queue = next(gen)
         new = [

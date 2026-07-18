@@ -67,6 +67,27 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and await every task still pending on *loop* before it closes.
+
+    Mirrors ``asyncio.run()``'s own internal shutdown sequence
+    (``_cancel_all_tasks``). Without this, a task still suspended
+    mid-``await`` when the loop is stopped -- the server's own root task
+    (``run_http_async``), or an internal one it spawns (e.g.
+    sse_starlette's ``_shutdown_watcher``) -- is only unwound later at
+    uncontrolled garbage-collection time, outside of any running task
+    context, which crashes anyio's shielded lifespan cleanup with an
+    unraisable ``TypeError``/``NoEventLoopError`` instead of shutting down
+    cleanly (task 2741).
+    """
+    pending = asyncio.all_tasks(loop)
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
@@ -93,7 +114,10 @@ def http_server(
     (bounded to 5s) before this fixture finishes tearing down. This
     prevents the daemon thread's event loop from outliving the test and
     acting as a background ``time.monotonic()`` caller for the rest of the
-    process (task 2741).
+    process (task 2741). Any task still pending at that point is cancelled
+    and drained (``_drain_pending_tasks``) inside the serving thread before
+    the loop closes, so cleanup runs inside a live task context instead of
+    at uncontrolled GC time.
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
     queue = EscalationQueue(queue_dir)
@@ -114,6 +138,7 @@ def http_server(
             # stopped before Future completed").
             pass
         finally:
+            _drain_pending_tasks(loop)
             loop.close()
 
     thread = threading.Thread(
@@ -293,7 +318,7 @@ class TestHarnessSanity:
         thread name.
         """
         before = set(threading.enumerate())
-        gen = http_server.__wrapped__(tmp_path_factory)
+        gen = http_server.__wrapped__(tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
         try:
             base_url, queue = next(gen)
             new = [
