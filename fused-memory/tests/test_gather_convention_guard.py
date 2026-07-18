@@ -116,6 +116,13 @@ DRAIN_ALLOWLIST: dict[tuple[str, str], tuple[int, str]] = {
         'Graceful-shutdown drain of per-project reconciliation loop tasks '
         'in the run_loop finally block.'
     ),
+    ('fused_memory/reconciliation/harness.py', '_drain_judge_tasks'): (
+        1,
+        'Graceful-shutdown drain of in-flight judge-review tasks (task 2708); '
+        'a cancelled judge mid-review is an expected drain outcome whose '
+        'uncleared judge_pending marker drives startup re-run, so the drain '
+        'must run to completion rather than propagate the cancellation.'
+    ),
     ('fused_memory/server/main.py', 'run_server'): (
         1,
         'Documented CancelledError-collection drain of the primary/recon '
