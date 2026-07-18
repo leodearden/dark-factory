@@ -39,6 +39,7 @@ from shared.cost_store import CostStore
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
+from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator import chronic_flake
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -8606,6 +8607,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         finally:
             if self.artifacts is not None:
                 self.artifacts.clear_agent_session()
+            # Producer hook (task 2742, agent-transcript-archival-prd α): gzip
+            # this just-finished session's transcripts to a durable archive root
+            # OUTSIDE the worktree (project_root / config.root), so they survive
+            # worktree teardown. _last_invoke_session_id is set before the try,
+            # so it is present even when this finally runs during exception
+            # propagation; archive_task_transcripts never raises (best-effort),
+            # which is what makes calling it here safe.
+            ta = self.config.transcript_archive
+            if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
+                archive_task_transcripts(
+                    self._config_dir.path,
+                    self.task_id,
+                    self._last_invoke_session_id,
+                    archive_root=self.config.project_root / ta.root,
+                )
         completed_at = datetime.now(UTC).isoformat()
 
         # Record the last successfully-completed role (updated only on success,
