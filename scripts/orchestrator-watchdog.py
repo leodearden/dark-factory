@@ -31,8 +31,10 @@ scripts/orchestrator-watchdog.timer).
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -167,6 +169,47 @@ try:
     DRAIN_FRESH_WINDOW_SECS = int(os.environ["ORCH_DRAIN_FRESH_WINDOW_SECS"])
 except (KeyError, ValueError):
     DRAIN_FRESH_WINDOW_SECS = 120
+
+# --- fused-memory staleness backstop (task 2714, ο of the fm-restart survey) ---
+# fused-memory needs the SAME staleness backstop the orchestrator fleet has
+# (staleness_pass below): a merged fm change otherwise sits undeployed until a
+# human/PRD files a deploy task (survey finding A2). fused_memory_staleness_pass()
+# is a single-unit mirror of staleness_pass() over FUSED_MEMORY_UNIT; the
+# constants below are fm siblings of WATCHED_PATHS / FLEET_DEPLOY_CLOCK_PATH /
+# ORCH_RESTART_MIN_INTERVAL_SECS, kept deliberately independent so fm's redeploy
+# cadence never couples to the orchestrator fleet's.
+
+# Paths whose newest commit defines "fresh" for the fm staleness pass. Includes
+# shared/src/ because fused-memory imports shared.* (e.g. shared.task_metadata),
+# so a shared change can alter fm's behavior and must count toward fm staleness.
+FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
+
+# fused-memory's OWN deploy-clock file — a DIFFERENT file than the orchestrator
+# fleet clock (FLEET_DEPLOY_CLOCK_PATH), so an orchestrator fleet redeploy never
+# resets fm's min-interval window and vice-versa. Unlike
+# restart-all-orchestrators.sh (which stamps the fleet clock itself),
+# restart-fused-memory.sh does NOT write this file — the watchdog does, via the
+# `--stamp-fm-deploy-clock` subcommand chained after a verified restart (see
+# _delegate_fm_restart / _stamp_fm_deploy_clock below). Env-overridable so tests
+# can point it at a tmp file without touching real data/.
+FM_DEPLOY_CLOCK_PATH = os.environ.get(
+    "FM_DEPLOY_CLOCK",
+    os.path.join(REPO_DIR, "data", "fused-memory", "last_redeploy_fused_memory.json"),
+)
+
+# Minimum wall-clock seconds between successive fm redeploys — fm's own
+# independent cap, mirroring ORCH_RESTART_MIN_INTERVAL_SECS's 8h default and its
+# env-with-try/except-fallback pattern (a typo'd env var must not crash the
+# oneshot watchdog). 0 disables the cap entirely.
+try:
+    FM_RESTART_MIN_INTERVAL_SECS = int(os.environ["FM_RESTART_MIN_INTERVAL_SECS"])
+except (KeyError, ValueError):
+    FM_RESTART_MIN_INTERVAL_SECS = 28800
+
+# Fixed transient unit name for the detached fm staleness redeploy — the natural
+# overlap guard (a second tick fails to re-register the same unit name while a
+# redeploy is still running), sibling of orch-fleet-staleness-redeploy.service.
+FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
 
 
 def log(msg: str) -> None:
