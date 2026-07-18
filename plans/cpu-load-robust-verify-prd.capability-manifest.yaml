@@ -1,0 +1,143 @@
+prd: plans/cpu-load-robust-verify-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: null   # stamped at commit_planning
+  title: Merge-gate single flake-retry (isolated-rerun-suppress for role=merge)
+  capabilities:
+  - name: failing-nodeids-extractable-incl-node-down
+    binding: capability→substrate (wired) — reuses verify.py:544 _extract_failing_test_ids
+      (INV-5); covers FAILED/ERROR/node-down surfaces
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _extract_failing_test_ids
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: present
+  - name: merge-role-isolated-rerun-suppress-wired
+    binding: capability→producer (delivered by α) — merge-role verify gains the
+      main-sweep confirm-gate; suppresses load-induced reds
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the suppress path is a behaviour asserted by boundary tests B1-B3, not a grep
+  - name: structured-merge-flake-suppressed-fact
+    binding: rejection-mechanism / observability (INV-2) — built by α; emits node-ids
+      + sha + measured_at at suppression
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: structured-fact emission is a test property (B1), not mechanically greppable
+  - name: storm-streak-escalation-on-chronic-suppression
+    binding: storm-escape (INV-4) — built by α; per-window suppression counter →
+      escalation; mirrors merge_liveness streak gate
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: streak→escalation is a test property (B4), not a grep
+  - name: never-suppress-genuine-failure
+    binding: rejection-mechanism — built by α; isolated re-run still-failing or
+      collection ERROR → merge stays red
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fail-closed-to-red is asserted by boundary tests B2/B3
+- label: β
+  task_id: null
+  title: Raise merge-path per-test wall-clock timeout to 300s
+  capabilities:
+  - name: per-module-merge-commands-carry-timeout-300
+    binding: capability→producer (delivered by β) — appends --timeout=300 to every
+      per-module merge test_command; guard test asserts the floor
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: timeout=300
+      paths:
+      - orchestrator/orchestrator.yaml
+      - fused-memory/orchestrator.yaml
+      expect: present
+  - name: timeout-floor-guard-test
+    binding: rejection-mechanism — built by β; a per-module segment omitting
+      --timeout>=300 fails the guard (mirrors fallback guard)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: guard-test property, asserted by the new test, not a static grep
+- label: γ
+  task_id: null
+  title: orchestrator + scripts test-hardening (timeout opt-ups / poll / load-scale / numeric mock)
+  capabilities:
+  - name: coalesce-gate-timeout-optup-and-widened-waitfor
+    binding: capability→producer (delivered by γ) — @pytest.mark.timeout(300) on the
+      4 scenario classes + widened internal wait_for bounds
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mark.timeout
+      paths:
+      - orchestrator/tests/test_coalesce_integration_gate.py
+      expect: present
+  - name: window-close-budgets-load-scaled
+    binding: capability→substrate (wired) — reuses _load_scaled_grace for the fixed
+      5/11/15s budgets
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _load_scaled_grace
+      paths:
+      - tests/scripts/test_spawn_claude.py
+      expect: present
+  - name: claimant-heartbeat-interval-numeric-in-mock-config
+    binding: rejection-mechanism — built by γ; mock_orch_config sets a real float so
+      asyncio.sleep(MagicMock) TypeError can't recur
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant_heartbeat_interval_secs
+      paths:
+      - orchestrator/tests/conftest.py
+      expect: present
+  - name: test-cli-cancel-timeout-widened
+    binding: capability→producer (delivered by γ) — test_verify_merge_cancel_end_to_end
+      timeout 90→120 (adopt the fefd541832 residual)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a one-line marker-arg change; asserted by the test passing
+- label: δ
+  task_id: null
+  title: fused-memory test-hardening (poll / signal-then-cancel / Qdrant integration-mark + idempotent create)
+  capabilities:
+  - name: ticket-worker-poll-not-fixed-sleep
+    binding: capability→producer (delivered by δ) — replaces asyncio.sleep(0.5)
+      readiness window with a bounded condition-poll
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: sleep→poll is a test-body change asserted by the test passing deterministically
+  - name: harness-timeout-marks-failed-deterministic-cancel
+    binding: rejection-mechanism — built by δ; signal-then-cancel Event replaces
+      wait_for(0.1) setup-window race
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: deterministic cancel is a test property, not a grep
+  - name: qdrant-compat-tests-integration-marked
+    binding: capability→producer (delivered by δ) — @pytest.mark.integration so
+      -m 'not integration' excludes them from merge-verify; idempotent create
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mark.integration
+      paths:
+      - fused-memory/tests/test_mem0_qdrant_integration.py
+      expect: present
+  - name: qdrant-coverage-lane-gap-flagged
+    binding: storm-escape (INV-4) — no -m integration lane exists; PRD §9 records the
+      lapse loudly rather than silently dropping compat coverage
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: flagged in PRD §9 Open questions; a lane is a follow-up, not in this batch
