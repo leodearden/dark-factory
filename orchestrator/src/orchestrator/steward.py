@@ -762,7 +762,15 @@ class TaskSteward:
         decision = await resolve_and_record_route(
             role_name='triage',
             role_defaults=RoleDefaults(
-                TRIAGE.default_model, 'high',
+                TRIAGE.default_model,
+                # Layer-4 effort base kept == EffortConfig.triage's default
+                # ('medium') — the value config-layer-3 always supplies today.
+                # AgentRole has no default_effort field, so effort is the one
+                # RoleDefaults field not sourced from the TRIAGE role object;
+                # matching the config default means a future EffortConfig field
+                # removal degrades to the same effort rather than silently
+                # jumping to a mismatched base.
+                'medium',
                 TRIAGE.default_budget, TRIAGE.default_max_turns,
             ),
             config=self.config,
