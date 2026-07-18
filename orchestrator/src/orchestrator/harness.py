@@ -8777,6 +8777,7 @@ task, include it with an empty "files" list rather than omitting it.
                     self._escalation_queue.resolve(
                         esc.id, resolution, dismiss=True,
                         resolved_by=_MAIN_TIP_SWEEP_SELFHEAL_ROLE,
+                        resolution_class='benign',
                     )
                     if self.event_store:
                         self.event_store.emit(
@@ -8979,6 +8980,7 @@ task, include it with an empty "files" list rather than omitting it.
         )
         self._escalation_queue.resolve(
             esc.id, resolution, resolved_by='harness-deterministic-recon-sweep',
+            resolution_class='benign',
         )
         logger.info(
             'Deterministic-recon-sweep: re-validated escalation %s for task %s '

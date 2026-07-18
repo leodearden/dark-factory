@@ -199,6 +199,8 @@ The three classes, and the evidence each requires you to **quote verbatim in `re
 | **`self_cleared_infra`** | `category == "infra_issue"` | A quoted live-probe `key=value` liveness token, e.g. `curator paused=false`, `ActiveState=active`, `MainPID=1234` |
 | **`stale_task_scoped`** | any category/role (subject to the denylist above) | A live `get_task` status citation showing the subject task went terminal or moved on — `status=done`, `status=cancelled`, `re-scoped`, or `re-dispatched` |
 
+**Stamp `resolution_class="benign"` on every one of these three closes.** They are allowlisted precisely *because* they are predictably benign — a superseded sweep, a self-cleared infra probe, or a stale/terminal task-scoped record is a confirmed **no-action** close (the escalation's stated condition already resolved itself; nothing was fixed or decided). Passing the class explicitly keeps the archived record's provenance **stamped, not inferred** by the origin analytics panel — see [Classify the resolution](#classify-the-resolution-resolution_class).
+
 Example call, closing a superseded main-sweep escalation:
 
 ```python
@@ -210,6 +212,7 @@ mcp__escalation__resolve_issue(
     "and verifies clean — swept SHA abc123def456 is-ancestor of the "
     "current clean tip."
   ),
+  resolution_class="benign",
 )
 ```
 
@@ -310,6 +313,15 @@ The `<min(3600, remaining)>` clamp sizes the final wait exactly to the remaining
 
 ## Per-Category Routing Table
 
+### Classify the resolution (`resolution_class`)
+
+Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `close_only` — MUST carry a `resolution_class`, so the archived record's provenance is **stamped, not inferred** by the origin analytics panel's benign-rate metric. Classification is triage output, not an afterthought; decide it as you decide the disposition. Two values:
+
+- **`actionable`** — a real action or decision accompanied the close: a `resume`/re-pend (scope expanded, dependency added, agent continued, strand re-dispatched), a requeue/restart, a dependency added, or a fix filed. The escalation led to a state change.
+- **`benign`** — a confirmed **no-action** close: the stated condition was stale, superseded, already-cleared, or a duplicate, and nothing real changed beyond closing the record. This covers the [L2 rubber-stamp carve-out](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) closes and the [`stranded_blocked`](#stranded_blocked) predicate-stale close.
+
+The class describes the **escalation's usefulness**, not your effort — a `resume` you performed in one call is still `actionable`; a stale record you spent effort verifying is still `benign`. `promote_to_l2` takes **no** `resolution_class` (promotion does not resolve — member L1s stay pending; the class is stamped only when the resulting L2 is finally resolved). When genuinely unsure, prefer `actionable` (it never suppresses a record from the human-review benign-rate metric).
+
 ### Autonomous dispatch categories (handle and resolve)
 
 These categories require only admin-level MCP operations. Dispatch them directly, then resolve.
@@ -329,7 +341,8 @@ Agent discovered it needs modules beyond its assigned scope.
      escalation_id="...",
      resolution="Scope expanded to include [modules]; resuming — task re-pends (blocked→pending) and the scheduler re-dispatches with the updated module locks.",
      action='resume',
-     resolved_by="escalation-watcher-auto"
+     resolved_by="escalation-watcher-auto",
+     resolution_class="actionable"
    )
    ```
 3. Add to digest: `DISPATCHED: scope_violation — <task_id> — scope expanded to [modules]`
@@ -349,7 +362,8 @@ Agent found it depends on work that isn't done yet.
      escalation_id="...",
      resolution="Added dependency on task <dep_id>; resuming — task re-pends (blocked→pending) and the scheduler holds it until <dep_id> is done.",
      action='resume',
-     resolved_by="escalation-watcher-auto"
+     resolved_by="escalation-watcher-auto",
+     resolution_class="actionable"
    )
    ```
    Add to digest: `DISPATCHED: dependency_discovered — <task_id> → depends on <dep_id>`
@@ -379,7 +393,8 @@ Technical debt or cleanup discovered during development.
      escalation_id="...",
      resolution="Cleanup queued. Agent may continue — cleanup tracked in digest for follow-up.",
      action='resume',
-     resolved_by="escalation-watcher-auto"
+     resolved_by="escalation-watcher-auto",
+     resolution_class="actionable"
    )
    ```
 2. Add to digest: `DISPATCHED: cleanup_needed — <task_id> — <summary>`
@@ -414,7 +429,8 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
      escalation_id="...",
      resolution="Stranded blocked task re-pended.",
      action='resume',
-     resolved_by="escalation-watcher-auto"
+     resolved_by="escalation-watcher-auto",
+     resolution_class="actionable"
    )
    ```
    Add to digest: `DISPATCHED: stranded_blocked — <task_id> — re-pended via resume`
@@ -425,7 +441,8 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
      escalation_id="...",
      resolution="Predicate stale — task no longer blocked or sibling escalation active; closing without change.",
      action='close_only',
-     resolved_by="escalation-watcher-auto"
+     resolved_by="escalation-watcher-auto",
+     resolution_class="benign"
    )
    ```
    Add to digest: `DISPATCHED: stranded_blocked — <task_id> — predicate stale, closed (close_only)`
@@ -625,9 +642,9 @@ Exit reason: <"escalation limit reached" | "time limit reached">
 Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not available)">
 
 ### Dispatched (autonomous)
-- DISPATCHED: scope_violation — task-42 — scope expanded to [orchestrator/src/orchestrator/harness.py]
-- DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up
-- DISPATCHED: dependency_discovered — task-77 → depends on task-55
+- DISPATCHED: scope_violation — task-42 — scope expanded to [orchestrator/src/orchestrator/harness.py] [actionable]
+- DISPATCHED: cleanup_needed — task-99 — dead code in scheduler.py flagged for follow-up [actionable]
+- DISPATCHED: dependency_discovered — task-77 → depends on task-55 [actionable]
 
 ### Promoted to L2 (L2-promotion mode only)
 - PROMOTED (L2 esc-42-7): task_failure — task-12 — verify exhausted after 3 attempts
@@ -637,8 +654,8 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - PROMOTED (L2 esc-42-10): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 
 ### Auto-closed L2 (narrow carve-out)
-- AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip
-- AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false
+- AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
+- AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false [benign]
 
 ### Pending (human review required — LEGACY mode only)
 - PENDING (human): task_failure — task-12 — verify exhausted after 3 attempts
@@ -650,5 +667,7 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 ### Skipped
 - review_suggestions: 3 escalations skipped (curator owned)
 ```
+
+The trailing `[actionable]` / `[benign]` tag on each `DISPATCHED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
 
 Maintain a running in-context summary as you handle each escalation. Emit the final digest only once, as your last output before returning.
