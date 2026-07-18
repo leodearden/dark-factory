@@ -159,11 +159,16 @@ class EventQueue:
     # ── lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Spawn the background drainer coroutine."""
+        """Recover unprocessed journal rows, then spawn the background drainer."""
         if self._drainer_task is not None:
             raise RuntimeError('EventQueue already started')
         # Ensure dead-letter directory exists.
         self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-enqueue any events that were durable in the journal but never
+        # committed to the buffer (kill -9 between enqueue and drain) BEFORE the
+        # drainer starts, so recovery is complete the moment draining begins.
+        if self._journal is not None:
+            await self.recover()
         self._drainer_task = asyncio.create_task(
             self._drain_loop(), name='event-queue-drainer',
         )
@@ -171,6 +176,38 @@ class EventQueue:
             'EventQueue started (maxsize=%d, dead_letter=%s)',
             self._queue.maxsize, self._dead_letter_path,
         )
+
+    async def recover(self) -> int:
+        """Re-enqueue unprocessed journal rows onto the in-memory queue.
+
+        The durable-at-enqueue guarantee: rows surviving in the journal are
+        events that were persisted but never committed to the buffer nor
+        dead-lettered. Each is ``put_nowait``-ed back onto the in-memory queue
+        for the drainer to commit — WITHOUT re-appending (the durable row already
+        exists). Redelivery is at-least-once, so the drainer may re-push an
+        already-committed event; ``EventBuffer.push`` is idempotent (INSERT OR
+        IGNORE) so that is a harmless no-op. On overflow the event is
+        dead-lettered (``recover_overflow``) and its journal row marked processed.
+        Returns the number of events recovered.
+        """
+        if self._journal is None:
+            return 0
+        events = self._journal.load_unprocessed()
+        recovered = 0
+        for event in events:
+            try:
+                self._queue.put_nowait(event)
+                recovered += 1
+            except asyncio.QueueFull:
+                self._overflow_drops += 1
+                self._write_dead_letter(event, reason='recover_overflow', attempts=0)
+                self._journal.mark_processed(event.id)
+        if recovered:
+            logger.info(
+                'EventQueue.recover: re-enqueued %d unprocessed event(s) from journal',
+                recovered,
+            )
+        return recovered
 
     async def close(self) -> None:
         """Flush the queue within ``shutdown_flush_seconds`` then stop the drainer.
