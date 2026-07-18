@@ -24,7 +24,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _orch_helpers import (
+    pydantic_spec,
+    skip_role_config_layer,
+    stamp_stock_routing_config,
+)
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 
@@ -419,3 +423,202 @@ class TestReviewCheckpointEventStoreAttribute:
         # (config, mcp, usage_gate) positional signature is unchanged.
         cp = ReviewCheckpoint(_review_config(), mcp, None)
         assert cp.event_store is None
+
+
+# ---------------------------------------------------------------------------
+# unblock_auto (steps 9-10)
+# ---------------------------------------------------------------------------
+
+
+def _unblock_config():
+    """Mock config for the autonomous dry-run unblock site.
+
+    ``unblock_auto``'s model/effort/budget/turns live on the top-level
+    ``config.unblock_auto`` block, NOT on the role-keyed ``config.models`` /
+    ``budgets`` / ``max_turns`` / ``effort`` sub-models (which have no
+    ``unblock_auto`` field) — so ``resolve_route``'s layer-3 config read is
+    SKIPPED and the ``RoleDefaults(ua_cfg.*)`` base (layer-4) stands.
+    ``skip_role_config_layer`` reproduces that production shape (empty-spec
+    sub-models → ``hasattr(cfg.models,'unblock_auto')`` False, ``getattr(
+    cfg.backends,'unblock_auto','claude')`` → 'claude'), so the site resolves
+    at ``source_layer='role_default'`` — byte-equivalent to pre-η.
+    """
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.unblock_auto.enabled = True
+    cfg.unblock_auto.model = 'sonnet'
+    cfg.unblock_auto.effort = 'high'
+    cfg.unblock_auto.budget_usd = 5.0
+    cfg.unblock_auto.max_turns = 50
+    cfg.unblock_auto.backend = 'claude'
+    cfg.unblock_auto.timeout_seconds = 600.0
+    cfg.unblock_auto.b3_proposal_keep_last = 5
+    cfg.timeouts.working_idle_secs = 1800.0
+    cfg.invocation_timeout = 7200.0
+    skip_role_config_layer(cfg)
+    stamp_stock_routing_config(cfg)
+    return cfg
+
+
+async def _run_unblock(*, config, scheduler, worktree: Path,
+                       event_store=None, cost_store=None, task_id='55'):
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+    await run_dry_run_unblock(
+        task_id=task_id,
+        worktree=str(worktree),
+        reason='verify exhausted',
+        detail='',
+        scheduler=scheduler,
+        mcp=mcp,
+        config=config,
+        event_store=event_store,
+        cost_store=cost_store,
+    )
+
+
+def _routing_mirror_calls(scheduler) -> list:
+    """The ``scheduler.update_task`` calls that mirror ``metadata.routing``
+    (positional ``(task_id, {'routing': …})`` + ``metadata_mode='merge'``) —
+    distinct from the dry-run proposal persist (``append=True``) and the
+    keep-last trim (positional metadata, no mode)."""
+    return [
+        c for c in scheduler.update_task.call_args_list
+        if c.kwargs.get('metadata_mode') == 'merge'
+        and len(c.args) > 1
+        and isinstance(c.args[1], dict)
+        and 'routing' in c.args[1]
+    ]
+
+
+@pytest.mark.asyncio
+class TestUnblockAutoAdoptsResolveRoute:
+    """The autonomous dry-run unblock hook (`run_dry_run_unblock`) resolves its
+    route through the shared helper.
+
+    unblock_auto is genuinely per-task (has task_id + scheduler + event_store),
+    so it best-effort fetches the task's metadata via ``scheduler.get_task``
+    (fail-safe → {}) to honor ``model_overrides['unblock_auto']``/tier, emits a
+    routing_decision event, and mirrors ``metadata.routing`` via
+    ``scheduler.update_task(metadata_mode='merge')``. Backend stays the site's
+    own ``ua_cfg.backend`` read (resolver-external).
+    """
+
+    async def test_decision_feeds_invoke_and_keeps_backend(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        scheduler = MagicMock()
+        scheduler.get_task = AsyncMock(return_value={'metadata': {'dispatch_count': 1}})
+        scheduler.update_task = AsyncMock()
+        fake = _fake_decision(model='sonnet', effort='low', budget_usd=4.2, max_turns=33)
+
+        with (
+            patch('orchestrator.dry_run_unblock.resolve_and_record_route',
+                  new=AsyncMock(return_value=fake)) as mock_helper,
+            patch('orchestrator.dry_run_unblock.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_stub_result())) as mock_iwcr,
+        ):
+            await _run_unblock(config=_unblock_config(), scheduler=scheduler, worktree=wt)
+
+        mock_helper.assert_awaited_once()
+        hk = mock_helper.call_args.kwargs
+        assert hk['role_name'] == 'unblock_auto'
+        assert hk['task_id'] == '55'
+        # Best-effort fetched task metadata flows into resolution (override/tier).
+        assert hk['task_metadata'] == {'dispatch_count': 1}
+        # Per-task → scheduler passed so the helper can mirror metadata.routing.
+        assert hk['scheduler'] is scheduler
+
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['model'] == 'sonnet'
+        assert kwargs['effort'] == 'low'
+        assert kwargs['max_budget_usd'] == 4.2
+        assert kwargs['max_turns'] == 33
+        # backend stays the site's own ua_cfg.backend read (resolver-external).
+        assert kwargs['backend'] == 'claude'
+
+    async def test_emits_routing_decision_and_mirrors_stock(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        rec = _RecordingEventStore()
+        scheduler = MagicMock()
+        scheduler.get_task = AsyncMock(return_value={'metadata': {}})
+        scheduler.update_task = AsyncMock()
+
+        with patch('orchestrator.dry_run_unblock.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
+            await _run_unblock(config=_unblock_config(), scheduler=scheduler,
+                               event_store=rec, worktree=wt)
+
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        data = entries[0]['data']
+        assert data['role'] == 'unblock_auto'
+        # No config.models.unblock_auto field → layer-3 skipped → RoleDefaults
+        # (ua_cfg.*) base stands: role_default layer, byte-equivalent to pre-η.
+        assert data['source_layer'] == 'role_default'
+        assert data['model'] == 'sonnet'
+        assert entries[0]['task_id'] == '55'
+
+        # Byte-equivalence: the resolved invoke values equal ua_cfg.*.
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['model'] == 'sonnet'
+        assert kwargs['effort'] == 'high'
+        assert kwargs['max_budget_usd'] == 5.0
+        assert kwargs['max_turns'] == 50
+        assert kwargs['backend'] == 'claude'
+
+        # Per-task → metadata.routing mirrored via scheduler merge.
+        assert len(_routing_mirror_calls(scheduler)) == 1
+
+    async def test_model_override_wins_boundary_test_9(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        rec = _RecordingEventStore()
+        scheduler = MagicMock()
+        scheduler.get_task = AsyncMock(return_value={
+            'metadata': {'model_overrides': {'unblock_auto': 'haiku'}},
+        })
+        scheduler.update_task = AsyncMock()
+
+        with patch('orchestrator.dry_run_unblock.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
+            await _run_unblock(config=_unblock_config(), scheduler=scheduler,
+                               event_store=rec, worktree=wt)
+
+        # The best-effort task fetch surfaces the override → invoke runs haiku.
+        assert mock_iwcr.call_args.kwargs['model'] == 'haiku'
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['source_layer'] == 'metadata_override'
+        assert entries[0]['data']['model'] == 'haiku'
+
+    async def test_scheduler_get_task_raising_degrades_to_stock(
+        self, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        rec = _RecordingEventStore()
+        scheduler = MagicMock()
+        scheduler.get_task = AsyncMock(side_effect=RuntimeError('scheduler hiccup'))
+        scheduler.update_task = AsyncMock()
+
+        # A scheduler.get_task that raises must degrade to empty metadata
+        # (byte-equivalent stock resolution) without raising out of the
+        # fire-and-forget investigation.
+        with patch('orchestrator.dry_run_unblock.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_stub_result())) as mock_iwcr:
+            await _run_unblock(config=_unblock_config(), scheduler=scheduler,
+                               event_store=rec, worktree=wt)
+
+        assert mock_iwcr.call_args.kwargs['model'] == 'sonnet'
+        entries = _routing_entries(rec)
+        assert len(entries) == 1
+        assert entries[0]['data']['source_layer'] == 'role_default'

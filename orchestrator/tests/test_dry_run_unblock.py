@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
-from _orch_helpers import pydantic_spec
+from _orch_helpers import (
+    pydantic_spec,
+    skip_role_config_layer,
+    stamp_stock_routing_config,
+)
 from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
@@ -115,6 +119,16 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
     # dry_run_unblock's _one_attempt invoke_with_cap_retry call.
     cfg.timeouts.working_idle_secs = working_idle_secs
     cfg.invocation_timeout = invocation_timeout
+    # task η (step-9/10): run_dry_run_unblock now resolves its route through
+    # orchestrator.routing.resolve_route (via resolve_and_record_route), which
+    # does real membership/dict ops on config.routing.* — stamp the stock
+    # routing block so those ops run against real values, not a bare MagicMock.
+    # skip_role_config_layer makes the resolver's layer-3 config read skip the
+    # 'unblock_auto' role (its model/effort/budget/turns live on the top-level
+    # config.unblock_auto block, not on the role-keyed sub-models), so the
+    # RoleDefaults(ua_cfg.*) base stands — byte-equivalent to pre-η.
+    skip_role_config_layer(cfg)
+    stamp_stock_routing_config(cfg)
     return cfg
 
 
@@ -436,12 +450,21 @@ class TestEventTagging:
                 event_store=event_store,
             )
 
-        event_store.emit.assert_called_once()
-        emit_call = event_store.emit.call_args
-
-        # First positional arg must be EventType.invocation_end
+        # task η (step-9/10): run_dry_run_unblock now ALSO emits a
+        # routing_decision event (via resolve_and_record_route) at route
+        # resolution time, so emit() is called more than once. The
+        # invocation_end tagging this test pins is unchanged — filter by
+        # EventType rather than asserting a single emit.
         from orchestrator.event_store import EventType
-        assert emit_call.args[0] == EventType.invocation_end
+        invocation_end_calls = [
+            c for c in event_store.emit.call_args_list
+            if c.args and c.args[0] == EventType.invocation_end
+        ]
+        assert len(invocation_end_calls) == 1, (
+            'expected exactly one invocation_end emit; got '
+            f'{[c.args[0] for c in event_store.emit.call_args_list if c.args]}'
+        )
+        emit_call = invocation_end_calls[0]
 
         # Keyword args that operators filter on to find dry-run emissions
         assert emit_call.kwargs.get('phase') == 'blocked'

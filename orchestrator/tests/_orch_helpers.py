@@ -544,6 +544,42 @@ def stamp_stock_routing_config(cfg, *, rules=None):
     return cfg
 
 
+def skip_role_config_layer(cfg):
+    """Make a role WITHOUT a leaf on the role-keyed config sub-models
+    faithfully SKIP ``resolve_route``'s layer-3 config read.
+
+    ``resolve_route`` reads the static per-role config layer via
+    ``hasattr(config.models, key)`` / ``getattr(config.models, key)`` (and the
+    same on ``budgets``/``max_turns``/``effort``), and gates model validation
+    on ``getattr(config.backends, key, 'claude') == 'claude'``.  For a role
+    whose settings live on a *top-level* config block rather than these
+    role-keyed sub-models — the canonical case is ``unblock_auto`` (its
+    model/effort/budget/turns live on ``config.unblock_auto``, and
+    ``ModelsConfig``/``BudgetsConfig``/``TurnsConfig``/``EffortConfig``/
+    ``BackendsConfig`` have NO ``unblock_auto`` field) — production skips
+    layer-3 entirely so the ``RoleDefaults`` (layer-4) base stands
+    (``source_layer='role_default'``, byte-equivalent to pre-η).
+
+    A bare ``MagicMock`` sub-model child instead auto-vivifies a truthy
+    ``unblock_auto`` leaf on every access, so ``hasattr`` is True and the
+    resolver would treat that MagicMock as a real per-role model/budget/turns/
+    effort override — corrupting the resolved decision.  Replacing each
+    sub-model with an empty-spec ``MagicMock`` makes ``hasattr(cfg.models,
+    'unblock_auto')`` False (layer-3 skipped) and ``getattr(cfg.backends,
+    'unblock_auto', 'claude')`` return the ``'claude'`` default
+    (claude_backend=True), reproducing the real ``OrchestratorConfig`` shape.
+
+    Call AFTER any per-role leaf assignment (it overwrites the sub-models
+    wholesale).  Returns *cfg* for call-site chaining.
+    """
+    cfg.models = MagicMock(spec_set=[])
+    cfg.budgets = MagicMock(spec_set=[])
+    cfg.max_turns = MagicMock(spec_set=[])
+    cfg.effort = MagicMock(spec_set=[])
+    cfg.backends = MagicMock(spec_set=[])
+    return cfg
+
+
 _GATE_PROPERTY_DEFAULTS: dict[str, object] = {
     # Known-good values for every UsageGate @property.
     # This dict is the *single* fix-point for property defaults: update here when
