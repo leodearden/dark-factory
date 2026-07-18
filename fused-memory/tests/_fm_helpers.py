@@ -579,6 +579,61 @@ def qdrant_skipif(reason: str = 'Qdrant not reachable'):
     return pytest.mark.skipif(not _qdrant_available(), reason=reason)
 
 
+def ensure_fresh_collection(
+    client: Any,
+    collection_name: str,
+    *,
+    size: int,
+    distance: Any = None,
+) -> None:
+    """Idempotently (re)create *collection_name* as an empty size-*size* collection.
+
+    Replaces the fragile ``delete_collection(suppressed) + create_collection``
+    pair each integration fixture rolled by hand. Under ``-n auto`` xdist load,
+    a prior run's teardown can be swallowed (or a concurrent worker can win the
+    create race), leaving a stale collection behind that ``collection_exists()``
+    may still report absent — so a naive create then 409-conflicts and fails the
+    next run. This helper self-heals that case: if the create raises a 409
+    ``UnexpectedResponse`` it deletes the stale collection and creates once more.
+    Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
+    loud, no retry.
+
+    Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
+    the body, mirroring ``_qdrant_available``'s convention (see its docstring):
+    conftest.py imports this module every test session, so a module-scope
+    qdrant import would pull qdrant_client into every session and break tests
+    that monkeypatch ``qdrant_client.QdrantClient``.
+
+    Args:
+        client: A ``qdrant_client.QdrantClient`` (or test double) exposing
+            ``collection_exists`` / ``delete_collection`` / ``create_collection``.
+        collection_name: The collection to (re)create.
+        size: Vector dimensionality for the new collection.
+        distance: Optional ``qdrant_client.models.Distance``; defaults to
+            ``Distance.COSINE`` when None.
+    """
+    from qdrant_client.http.exceptions import UnexpectedResponse
+    from qdrant_client.models import Distance, VectorParams
+
+    vectors_config = VectorParams(size=size, distance=distance or Distance.COSINE)
+
+    if client.collection_exists(collection_name):
+        client.delete_collection(collection_name)
+    try:
+        client.create_collection(
+            collection_name=collection_name, vectors_config=vectors_config,
+        )
+    except UnexpectedResponse as exc:
+        if getattr(exc, 'status_code', None) != 409:
+            raise
+        # Stale collection survived a swallowed teardown / lost create race:
+        # delete it and create once more rather than propagating the conflict.
+        client.delete_collection(collection_name)
+        client.create_collection(
+            collection_name=collection_name, vectors_config=vectors_config,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
