@@ -156,12 +156,25 @@ class StreakRegistry:
         stale_ids: Iterable[Any],
         *,
         extra: dict[str, Iterable[Any]] | None = None,
+        overrides: dict[str, Iterable[Any]] | None = None,
     ) -> None:
         """Sweep every registered counter, dropping stale (+ extra) ids.
 
         Each counter's sweep set is ``stale_ids``, unioned with
         ``extra[name]`` when the counter's registered name is a key in
         ``extra`` (e.g. the starvation counter's non-eligible-status ids).
+
+        ``overrides`` is the sibling REPLACE/NARROW knob to ``extra``'s
+        UNION: when a counter's registered name is a key in ``overrides``,
+        its sweep set is ``set(overrides[name])`` — ignoring both the base
+        ``stale_ids`` and any ``extra`` union for that counter. An empty
+        override therefore sweeps nothing for that counter (it hits the
+        ``if not sweep_ids: continue`` short-circuit below). ``overrides``
+        takes precedence over ``extra`` for the same name, and only ever
+        narrows the caller-supplied override set — it never widens beyond
+        it. ``overrides=None`` (the default) is byte-identical to the prior
+        base-stale/extra-only behaviour.
+
         For a counter registered with ``on_gc``, the callback is awaited
         once for every key in ``counter.escalated`` whose ``key_fn``-
         extracted task-id falls in that counter's sweep set — BEFORE the
@@ -171,8 +184,14 @@ class StreakRegistry:
         """
         base_stale = stale_ids if isinstance(stale_ids, (set, frozenset)) else set(stale_ids)
         extra = extra or {}
+        overrides = overrides or {}
         for name, (counter, on_gc) in self._counters.items():
-            sweep_ids = base_stale | set(extra[name]) if name in extra else base_stale
+            if name in overrides:
+                sweep_ids = set(overrides[name])
+            elif name in extra:
+                sweep_ids = base_stale | set(extra[name])
+            else:
+                sweep_ids = base_stale
             if not sweep_ids:
                 continue
             if on_gc is not None:

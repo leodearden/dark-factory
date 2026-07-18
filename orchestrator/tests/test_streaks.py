@@ -341,6 +341,71 @@ class TestStreakRegistry:
         assert other.value('escalated-task') == 1
 
     @pytest.mark.asyncio
+    async def test_overrides_replaces_base_sweep_set_for_the_named_counter_only(self) -> None:
+        """``overrides`` REPLACES (narrows) a named counter's sweep set —
+        contrast ``extra`` which UNIONS. The overridden counter ignores the
+        base ``stale_ids`` entirely; every other counter uses it unchanged.
+        """
+        registry = StreakRegistry()
+        counter_a = StreakCounter(threshold=3)
+        counter_b = StreakCounter(threshold=3)
+        registry.register('a', counter_a)
+        registry.register('b', counter_b)
+        counter_a.bump('task-1')
+        counter_a.bump('task-2')
+        counter_b.bump('task-1')
+        counter_b.bump('task-2')
+
+        # 'a' uses the base stale_ids ({task-1, task-2}) → both swept.
+        # 'b' is overridden to {task-2} → ONLY task-2 swept; its task-1 entry
+        # SURVIVES because overrides REPLACES the base set (does not union).
+        await registry.gc({'task-1', 'task-2'}, overrides={'b': {'task-2'}})
+
+        assert counter_a.value('task-1') == 0
+        assert counter_a.value('task-2') == 0
+        assert counter_b.value('task-1') == 1  # narrowed out of 'b's sweep
+        assert counter_b.value('task-2') == 0
+
+    @pytest.mark.asyncio
+    async def test_overrides_empty_set_sweeps_nothing_for_the_named_counter(self) -> None:
+        """An empty override REPLACES the base set with the empty set — the
+        named counter is never swept — while other counters still use the
+        base stale_ids.
+        """
+        registry = StreakRegistry()
+        counter_a = StreakCounter(threshold=3)
+        counter_b = StreakCounter(threshold=3)
+        registry.register('a', counter_a)
+        registry.register('b', counter_b)
+        counter_a.bump('task-1')
+        counter_b.bump('task-1')
+
+        await registry.gc({'task-1'}, overrides={'b': set()})
+
+        assert counter_a.value('task-1') == 0
+        assert counter_b.value('task-1') == 1  # empty override → survives
+
+    @pytest.mark.asyncio
+    async def test_overrides_none_is_byte_identical_to_prior_behaviour(self) -> None:
+        """Omitting ``overrides`` (or passing None) reproduces the pre-existing
+        base-stale-only sweep for every registered counter.
+        """
+        registry = StreakRegistry()
+        counter_a = StreakCounter(threshold=3)
+        counter_b = StreakCounter(threshold=3)
+        registry.register('a', counter_a)
+        registry.register('b', counter_b)
+        counter_a.bump('task-1')
+        counter_a.bump('task-2')
+        counter_b.bump('task-1')
+
+        await registry.gc({'task-1'})
+
+        assert counter_a.value('task-1') == 0
+        assert counter_a.value('task-2') == 1
+        assert counter_b.value('task-1') == 0
+
+    @pytest.mark.asyncio
     async def test_on_gc_awaited_once_per_cleared_key_present_in_escalated(self) -> None:
         registry = StreakRegistry()
         starvation = StreakCounter(threshold=3)
