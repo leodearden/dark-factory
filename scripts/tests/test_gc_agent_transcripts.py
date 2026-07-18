@@ -305,3 +305,24 @@ def test_prune_best_effort_on_rmtree_oserror(tmp_path, caplog, monkeypatch):
     assert any(
         LOG_PREFIX in m and str(fail_dir) in m for m in warn_msgs
     ), f"missing WARNING line for failed dir {fail_dir}; got {warn_msgs}"
+
+
+# ---------------------------------------------------------------------------
+# step-9: drift guard — the stdlib mirror must equal α's canonical config
+# ---------------------------------------------------------------------------
+
+def test_default_constants_match_orchestrator_config():
+    """DRIFT GUARD: the GC is stdlib-only and mirrors α's retention config as
+    module constants instead of importing OrchestratorConfig. Those constants
+    must never silently diverge from the canonical
+    orchestrator.config.{TranscriptArchiveConfig,RetentionConfig} defaults — a
+    divergence here would prune against the wrong root/caps. Value equality
+    (not docstring/introspection), mirroring
+    test_drain_check.test_default_fleet_dir_matches_orchestrator_fleet_heartbeat.
+    """
+    from orchestrator.config import RetentionConfig, TranscriptArchiveConfig
+
+    assert gct.ARCHIVE_ROOT_RELATIVE == TranscriptArchiveConfig().root
+    assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
+    assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
+    assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 5000
