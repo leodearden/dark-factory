@@ -1436,3 +1436,54 @@ class TestReadReviewsMergesLegacyAndNew:
 
         with pytest.raises(json.JSONDecodeError):
             ta.read_reviews()
+
+
+class TestReviewVerdictCache:
+    """Tests for the tree-hash-keyed verdict cache (review_state.json)."""
+
+    def test_fresh_root_returns_default_state(self, artifacts: TaskArtifacts):
+        assert artifacts.read_review_state() == {
+            'amendment_rounds_total': 0,
+            'review_cycles_total': 0,
+            'verdicts': {},
+        }
+
+    def test_record_and_get_cached_verdict(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', suggestions_routed=True
+        )
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec is not None
+        assert rec['verdict'] == 'suggestions_only'
+        assert rec['suggestions_routed'] is True
+        assert isinstance(rec['ts'], str) and rec['ts']
+        # ts must be an ISO-8601 datetime string.
+        datetime.fromisoformat(rec['ts'])
+
+    def test_get_cached_verdict_absent_returns_none(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict(
+            'tree_abc', 'suggestions_only', suggestions_routed=True
+        )
+        assert artifacts.get_cached_verdict('other_tree') is None
+
+    def test_second_tree_hash_coexists(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
+        artifacts.record_review_verdict('tree_def', 'PASS', False)
+        assert artifacts.get_cached_verdict('tree_abc')['verdict'] == 'suggestions_only'
+        assert artifacts.get_cached_verdict('tree_def')['verdict'] == 'PASS'
+
+    def test_same_tree_hash_overwrites_last_wins(self, artifacts: TaskArtifacts):
+        artifacts.record_review_verdict('tree_abc', 'suggestions_only', True)
+        artifacts.record_review_verdict('tree_abc', 'PASS', False)
+        rec = artifacts.get_cached_verdict('tree_abc')
+        assert rec['verdict'] == 'PASS'
+        assert rec['suggestions_routed'] is False
+
+    def test_corrupt_review_state_is_fail_safe(self, artifacts: TaskArtifacts):
+        (artifacts.root / 'review_state.json').write_text('{not valid json')
+        assert artifacts.read_review_state() == {
+            'amendment_rounds_total': 0,
+            'review_cycles_total': 0,
+            'verdicts': {},
+        }
+        assert artifacts.get_cached_verdict('tree_abc') is None
