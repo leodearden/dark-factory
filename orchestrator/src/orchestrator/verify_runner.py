@@ -557,7 +557,7 @@ class LocalRunner:
         run_unscoped: Callable[..., Awaitable[Any]],
         task_id: str | None = None,
         archive_root: Path | None = None,
-        event_store: 'EventStore | None' = None,
+        event_store: EventStore | None = None,
         escalation_queue: Any = None,
     ) -> None:
         """Initialise LocalRunner.
