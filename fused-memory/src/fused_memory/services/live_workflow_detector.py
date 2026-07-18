@@ -130,7 +130,11 @@ class WorkflowLiveness:
 
     Attributes:
         is_live: True when any of the three signals indicates an active workflow.
-        worktree_registered: True when a git worktree is registered for ``branch``.
+        worktree_registered: True when a LIVE (non-prunable) git worktree is
+            registered for ``branch``. A worktree entry marked ``prunable`` in
+            ``git worktree list --porcelain`` (its directory has been removed
+            or reaped, but the registration itself has not yet been pruned)
+            does NOT count — a reaped worktree is not a live workspace.
         recent_commit: True when the tip of ``branch`` is newer than the threshold.
         orchestrator_live: True when the project-level orchestrator lock is live.
         branch: The branch name inspected (e.g. ``task/4321``).
@@ -205,7 +209,8 @@ def detect_live_workflow(
     branch = f'{branch_prefix}{task_id}'
     root = str(project_root)
 
-    worktree_registered = _check_worktree_registered(root, branch)
+    worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+    worktree_registered = worktree_present and not worktree_prunable
     last_commit_at, recent_commit = _check_recent_commit(
         root, branch, now=now, max_commit_age_hours=max_commit_age_hours
     )
@@ -313,11 +318,19 @@ def _orchestrator_signal_ineligible(
     )
 
 
-def _check_worktree_registered(project_root: str, branch: str) -> bool:
-    """Return True iff a git worktree is registered for *branch*.
+def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
+    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
 
-    Parses ``git -C <root> worktree list --porcelain`` output.  Any subprocess
-    error or unexpected output silently returns False (fail-safe).
+    Parses ``git -C <root> worktree list --porcelain`` output into
+    blank-line-delimited stanzas (one per registered worktree). ``registered``
+    is True iff some stanza contains a line equal to ``branch refs/heads/<branch>``;
+    ``prunable`` is True iff that SAME stanza also contains a line starting with
+    ``prunable`` — git's marker for a worktree whose directory has been removed
+    or reaped, but whose registration has not yet been pruned (reify#5245's
+    shape: a stale worktree entry survives after the directory itself is gone).
+
+    Any subprocess error or unexpected output silently returns ``(False, False)``
+    (fail-safe).
     """
     try:
         result = subprocess.run(
@@ -328,17 +341,22 @@ def _check_worktree_registered(project_root: str, branch: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug('live_workflow_detector: worktree list failed: %s', exc)
-        return False
+        return False, False
 
     if result.returncode != 0:
         logger.debug(
             'live_workflow_detector: worktree list returned %d: %s',
             result.returncode, result.stderr.strip(),
         )
-        return False
+        return False, False
 
     target = f'branch refs/heads/{branch}'
-    return any(line.strip() == target for line in result.stdout.splitlines())
+    for stanza in result.stdout.split('\n\n'):
+        lines = [line.strip() for line in stanza.splitlines()]
+        if target in lines:
+            prunable = any(line.startswith('prunable') for line in lines)
+            return True, prunable
+    return False, False
 
 
 def _check_recent_commit(
