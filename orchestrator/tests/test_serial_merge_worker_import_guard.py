@@ -52,9 +52,8 @@ def _serial_worker_importers(source: str) -> list[int]:
         if isinstance(node, ast.Import):
             if any(alias.name == _SERIAL_WORKER_MODULE for alias in node.names):
                 linenos.append(node.lineno)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module == _SERIAL_WORKER_MODULE and node.level == 0:
-                linenos.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom) and node.module == _SERIAL_WORKER_MODULE and node.level == 0:
+            linenos.append(node.lineno)
     return linenos
 
 
