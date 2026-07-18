@@ -263,6 +263,11 @@ class TestOrphanL0Reaper:
         assert refreshed is not None
         assert refreshed.status == 'dismissed'
         assert refreshed.resolved_by == 'harness-orphan-reaper'
+        # Positively distinguish this benign rebase-superseded dismiss path
+        # from the has_open_l1 dismiss branch and the promotion path, both
+        # of which also use resolved_by='harness-orphan-reaper'.
+        assert refreshed.resolution is not None
+        assert 'rebase-superseded' in refreshed.resolution
 
         # No new L1 was created for this orphan.
         all_escs = [
@@ -373,6 +378,11 @@ class TestOrphanL0Reaper:
         assert refreshed is not None
         assert refreshed.status == 'dismissed'
         assert refreshed.resolved_by == 'harness-orphan-reaper'
+        # Positively distinguish this benign rebase-superseded dismiss path
+        # from the has_open_l1 dismiss branch and the promotion path, both
+        # of which also use resolved_by='harness-orphan-reaper'.
+        assert refreshed.resolution is not None
+        assert 'rebase-superseded' in refreshed.resolution
 
         all_escs = [
             harness._escalation_queue.get(p.stem)
