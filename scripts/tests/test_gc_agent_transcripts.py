@@ -10,8 +10,12 @@ KEPT (strict >, not >=); max_age_days <= 0 disables the age axis.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
+
+import gc_agent_transcripts as gct
 from gc_agent_transcripts import select_prunable
 
 DAY = 86_400
@@ -160,3 +164,56 @@ def test_union_age_and_count_reasons():
     assert decision.prune_paths == {young_c, old_d}
     assert decision.reasons[young_c] == "count"
     assert decision.reasons[old_d] == "age+count"
+
+
+# ---------------------------------------------------------------------------
+# step-5: scan_task_dirs(root) against a real filesystem archive
+# ---------------------------------------------------------------------------
+
+def _touch(path: Path, mtime: float) -> None:
+    """Create *path* (and parents) as a small file with the given mtime."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x")
+    os.utime(path, (mtime, mtime))
+
+
+def test_scan_reports_newest_descendant_mtime_per_task_dir(tmp_path):
+    root = tmp_path / "agent-transcripts"
+    # task dir "100": a single main-session .gz.
+    _touch(root / "100" / "enc" / "sid1.jsonl.gz", NOW - 10 * DAY)
+    # task dir "200": two files at different mtimes -> newest wins.
+    _touch(root / "200" / "enc" / "sid2.jsonl.gz", NOW - 50 * DAY)
+    _touch(root / "200" / "enc" / "sid3.jsonl.gz", NOW - 5 * DAY)
+    # task dir "300": nested subagent transcript only.
+    _touch(root / "300" / "enc" / "sid4" / "subagents" / "agent-1.jsonl.gz", NOW - 3 * DAY)
+    # a stray non-directory file directly under root -> ignored.
+    _touch(root / "loose.jsonl.gz", NOW)
+
+    result = dict(gct.scan_task_dirs(root))
+
+    assert set(result.keys()) == {root / "100", root / "200", root / "300"}
+    assert result[root / "100"] == pytest.approx(NOW - 10 * DAY, abs=1)
+    assert result[root / "200"] == pytest.approx(NOW - 5 * DAY, abs=1)  # max of the two
+    assert result[root / "300"] == pytest.approx(NOW - 3 * DAY, abs=1)
+
+
+def test_scan_empty_task_dir_falls_back_to_own_mtime(tmp_path):
+    root = tmp_path / "agent-transcripts"
+    empty = root / "999"
+    empty.mkdir(parents=True)
+    os.utime(empty, (NOW - 7 * DAY, NOW - 7 * DAY))
+
+    result = dict(gct.scan_task_dirs(root))
+
+    assert set(result.keys()) == {empty}
+    assert result[empty] == pytest.approx(NOW - 7 * DAY, abs=1)
+
+
+def test_scan_missing_root_returns_empty(tmp_path):
+    assert gct.scan_task_dirs(tmp_path / "does-not-exist") == []
+
+
+def test_scan_existing_but_empty_root_returns_empty(tmp_path):
+    root = tmp_path / "agent-transcripts"
+    root.mkdir(parents=True)
+    assert gct.scan_task_dirs(root) == []
