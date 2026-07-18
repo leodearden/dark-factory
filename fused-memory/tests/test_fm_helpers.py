@@ -754,3 +754,98 @@ class TestEnsureFreshCollection:
 
         client.delete_collection.assert_not_called()
         assert client.create_collection.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared collection_vector_size() helper (task 2773, item 4)
+# ---------------------------------------------------------------------------
+# Race-safe read of a collection's vector dimension: under `-n auto` load a
+# just-created collection's get_collection() can transiently 404 (or the HTTP
+# layer can raise ResponseHandlingException) before it is durably visible, so
+# a single naive read flakes. The helper wraps the read in poll_until so the
+# transient window is a bounded retry, while a non-404 error (e.g. a genuine
+# 500) is re-raised immediately — fail loud. No real Qdrant is used here: the
+# client is a MagicMock and get_collection is scripted. Following
+# TestPollUntil's discipline, cases assert only on call counts and raises,
+# never on elapsed wall-clock, so the suite stays load-independent.
+
+class TestCollectionVectorSize:
+    """Unit tests for async collection_vector_size(client, collection, *, timeout, interval)."""
+
+    @staticmethod
+    def _info(size: int):
+        """A fake get_collection() return value exposing .config.params.vectors."""
+        from qdrant_client.models import Distance, VectorParams
+
+        info = MagicMock()
+        info.config.params.vectors = VectorParams(size=size, distance=Distance.COSINE)
+        return info
+
+    @pytest.mark.asyncio
+    async def test_returns_size_after_one_call_when_readable(self):
+        """A readable collection returns its vector size after exactly 1 get_collection call."""
+        from _fm_helpers import collection_vector_size
+
+        client = MagicMock()
+        client.get_collection.return_value = self._info(8)
+
+        size = await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
+
+        assert size == 8
+        assert client.get_collection.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_tolerates_transient_404_then_returns(self):
+        """Two transient 404s then a readable collection: returns 8 after exactly 3 calls.
+
+        Proves the transient-404 window is a bounded retry, not a single naive
+        read — the call count is deterministic (scripted side_effect), so this
+        assertion is load-independent.
+        """
+        from _fm_helpers import collection_vector_size
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = MagicMock()
+        client.get_collection.side_effect = [
+            UnexpectedResponse(404, 'Not Found', b'{}', {}),
+            UnexpectedResponse(404, 'Not Found', b'{}', {}),
+            self._info(8),
+        ]
+
+        size = await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
+
+        assert size == 8
+        assert client.get_collection.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_persistent_404_raises_assertion_error(self):
+        """A get_collection that always 404s raises AssertionError once the deadline passes.
+
+        Uses a tiny timeout and asserts only the raise and that the probe ran
+        at least once (never elapsed wall-clock or an exact poll count) — a
+        slow host makes this slower, never falsely passing or failing.
+        """
+        from _fm_helpers import collection_vector_size
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = MagicMock()
+        client.get_collection.side_effect = UnexpectedResponse(404, 'Not Found', b'{}', {})
+
+        with pytest.raises(AssertionError):
+            await collection_vector_size(client, 'c', timeout=0.05, interval=0.01)
+
+        assert client.get_collection.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_non_404_error_propagates_immediately(self):
+        """A non-404 UnexpectedResponse (e.g. 500) propagates on the first probe — fail loud."""
+        from _fm_helpers import collection_vector_size
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = MagicMock()
+        client.get_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', {})
+
+        with pytest.raises(UnexpectedResponse):
+            await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
+
+        assert client.get_collection.call_count == 1
