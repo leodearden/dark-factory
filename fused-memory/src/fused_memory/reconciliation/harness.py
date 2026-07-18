@@ -2345,7 +2345,7 @@ class ReconciliationHarness:
             return
 
         try:
-            if completed_but_write_failed:
+            if completed_but_write_failed and isinstance(s1_report, StageReport):
                 # Arm 2 (task 2734): see docstring. Re-attempt with the REAL
                 # report — reusing it (not a zeroed synth) records honest
                 # llm_calls/tokens/stats; the upsert is idempotent so a
