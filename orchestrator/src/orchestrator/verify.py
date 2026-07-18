@@ -5852,23 +5852,92 @@ def _emit_merge_flake_suppressed(
 
 
 #: Module-global consecutive-suppression counter (INV-4 storm detector).
-#: Bumped ONLY on a suppression; reset to 0 when the storm escalation fires
-#: (see ``_bump_suppression_streak_and_maybe_escalate``, step-8). A count-window
-#: detector; time-windowing is a sanctioned PRD §9 follow-up.
+#: Bumped ONLY on a suppression; reset to 0 once the window (threshold) is
+#: reached and the storm escalation decision is made. A count-window detector;
+#: time-windowing is a sanctioned PRD §9 follow-up.
 _merge_flake_suppression_streak = 0
+
+#: Suppressions per window before the born-at-L2 storm escalation fires. A
+#: tunable (PRD §9): chronic suppression means α is repeatedly masking reds —
+#: a fleet-health "someone must look now" condition.
+_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
+
+#: Fixed dedup sentinel task_id for the storm escalation — the signal is a
+#: global fleet-health condition, not tied to any one merge task.
+_MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
 
 
 def _bump_suppression_streak_and_maybe_escalate(
     escalation_queue: Any, task_id: str | None, merge_sha: str,
 ) -> None:
-    """Bump the suppression streak on a suppression (INV-4).
+    """Advance the suppression streak; file a born-at-L2 storm escalation at
+    the threshold, then reset the counter (INV-4).
 
-    NOTE (step-6): the born-at-L2 storm escalation + counter reset are added in
-    step-8; today this only advances the counter so the orchestration wiring is
-    exercised end-to-end.
+    Modeled on ``merge_queue._alarm_verify_worktree_contention``: a born-at-L2
+    escalation (``severity='critical'``, ``level=2``,
+    ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
+    prefix marks it a harness sentinel so the escalation server never downgrades
+    the critical severity) that routes straight to a human, bypassing the
+    auto-watcher. Deduped on a fixed open-L2 sentinel task_id so a persistent
+    storm files at most one open critical per window.
+
+    The window resets to 0 whenever the threshold is reached — on submit, on a
+    dedup-skip, AND on a ``None`` queue — so the counter can never grow
+    unbounded and each fresh window makes an independent escalation decision.
+    None-safe: with no queue there is nothing to file into, so it resets and
+    returns (the CLI / remote paths that pass ``escalation_queue=None`` are not
+    the CPU-starvation target this gate addresses — see the α scope fence).
     """
     global _merge_flake_suppression_streak
     _merge_flake_suppression_streak += 1
+    if _merge_flake_suppression_streak < _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD:
+        return
+
+    # Window reached: make the escalation decision once, then reset regardless.
+    _merge_flake_suppression_streak = 0
+    if escalation_queue is None:
+        return
+
+    from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
+
+    sentinel = _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
+    # Dedup: don't re-alarm while an open L2 already exists for the storm
+    # sentinel (has_open_l1 is hardcoded to level=1, so get_by_task is used).
+    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
+        return
+
+    summary = (
+        'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate '
+        f'has suppressed {_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify '
+        'reds in a row'
+    )
+    detail = (
+        f'The role=merge isolated-rerun-confirm gate (verify.'
+        f'apply_merge_flake_suppression) has suppressed '
+        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} consecutive merge-verify '
+        f'failures as CPU-starvation flakes (most recent merge SHA: '
+        f'{merge_sha}, task_id: {task_id}). Each suppression means a merge-verify '
+        'red passed on isolated re-run — but a sustained streak indicates either '
+        'chronic host CPU starvation or a genuinely flaky test that is being '
+        'repeatedly masked. Investigate before the gate hides a real regression.'
+    )
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-flake-monitor',
+        severity='critical',
+        level=2,
+        category='merge_flake_suppression_storm',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            'Inspect merge-flake-suppressed events (EventType.merge_flake_suppressed) '
+            'and host CPU load. Confirm the suppressed tests are load flakes, not a '
+            'masked regression; if a specific test is chronically flaky, de-flake or '
+            'quarantine it.'
+        ),
+    )
+    escalation_queue.submit(esc)
 
 
 async def apply_merge_flake_suppression(
