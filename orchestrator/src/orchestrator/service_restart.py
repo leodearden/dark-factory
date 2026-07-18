@@ -386,6 +386,8 @@ class StaleServiceRestartCoordinator:
         state_path: Path | None = None,
         stamp_clock_on_fire: bool = True,
         force_fire_after_secs: float = 0.0,
+        merge_phase_hold: Callable[[], bool] | None = None,
+        merge_phase_grace_secs: float = 0.0,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -437,6 +439,17 @@ class StaleServiceRestartCoordinator:
         # delta). 0.0 disables — see the force_fire_after_secs docstring
         # above.
         self._force_fire_after_secs = force_fire_after_secs
+        # Bounded pre-enqueue MERGE-phase hold (task 2753). When set,
+        # maybe_restart HOLDS the force-fire escape while a pre-enqueue
+        # MERGE-phase workflow is racing to the durable merge journal — but
+        # only up to an ABSOLUTE owed-age ceiling of force_fire_after_secs +
+        # merge_phase_grace_secs, so a rolling merge stream can never push the
+        # redeploy past that ceiling ("grace must bound, not indefinitely
+        # veto"). None / 0.0 (the defaults, and the fused-memory / dashboard
+        # instances' values) => byte-identical prior behaviour (no hold). A
+        # raising hold is fail-open (proceed to fire) — see maybe_restart.
+        self._merge_phase_hold = merge_phase_hold
+        self._merge_phase_grace_secs = merge_phase_grace_secs
 
         # State
         self._pending: bool = False
@@ -603,6 +616,43 @@ class StaleServiceRestartCoordinator:
             # narrows it here too (its own narrowing doesn't survive past
             # the boolean expression that produced `force_fire`).
             assert first_pending is not None
+            # Bounded pre-enqueue MERGE-phase hold (task 2753). Defer the
+            # force-fire while a MERGE-phase workflow is still racing to the
+            # durable merge journal (merge_phase_hold() truthy), but ONLY up to
+            # an absolute owed-age ceiling of force_fire_after_secs +
+            # merge_phase_grace_secs. Past that ceiling we fire regardless — so
+            # a rolling stream of pre-enqueue windows can never push the
+            # redeploy past the ceiling ("grace must bound, not indefinitely
+            # veto"). A raising hold is fail-open (treated as not-held, proceed
+            # to fire), preserving force-fire's anti-starvation guarantee; the
+            # durable-queue crash-recovery + graceful SIGTERM remain the safety
+            # net for the rare workflow still un-enqueued at the ceiling.
+            owed = now - first_pending
+            ceiling = self._force_fire_after_secs + self._merge_phase_grace_secs
+            if self._merge_phase_hold is not None and owed < ceiling:
+                try:
+                    held = self._merge_phase_hold()
+                except Exception:
+                    held = False
+                    logger.warning(
+                        f'{self._service_name} merge_phase_hold raised; proceeding'
+                        ' to force-fire (fail-open) — the durable merge-queue'
+                        ' crash-recovery + graceful SIGTERM remain the safety net.',
+                        exc_info=True,
+                    )
+                if held:
+                    logger.info(
+                        f'{self._service_name} restart force-fire HELD: a'
+                        ' pre-enqueue MERGE-phase workflow is racing to the'
+                        ' durable journal (owed %.0fs < %.0fs ceiling ='
+                        ' force_fire_after %.0fs + merge_phase_grace %.0fs);'
+                        ' pending retained.',
+                        owed,
+                        ceiling,
+                        self._force_fire_after_secs,
+                        self._merge_phase_grace_secs,
+                    )
+                    return False
             logger.warning(
                 f'{self._service_name} restart FORCE-FIRING: pending restart owed'
                 ' %.0fs (>= %.0fs bound) — bypassing agents_idle, the debounce, and'

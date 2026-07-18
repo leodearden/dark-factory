@@ -2174,6 +2174,8 @@ async def test_merge_phase_hold_raising_is_fail_open(
     rather than the hold vetoing, preserving force-fire's anti-starvation
     guarantee, and a WARNING is logged.
     """
+    import logging
+
     hold = MagicMock(side_effect=RuntimeError('boom'))
     coord, current_time, _, executor = _make_force_fire_coordinator(
         force_fire_after_secs=4500.0,
