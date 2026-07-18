@@ -1059,3 +1059,150 @@ class TestByteIdenticalFreshRun:
         assert item['flag_type'] == 'orphaned_knowledge'
         assert item['cited_entities'] == []
         assert item['cited_tasks'] == []
+
+
+# ---------------------------------------------------------------------------
+# step-15: _build_recon_report_components store wiring + start/stop_persistence
+# — RED until step-16 constructs the store and adds the persistence lifecycle.
+# Socket-free, mirroring TestReconReportBoot / TestReconReportReaperWiredAtBoot
+# in test_recon_report.py.
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportStoreWiredAtBoot:
+    """_build_recon_report_components attaches a ReconReportStore (or None when
+    disabled), and ReconReportState exposes start_persistence/stop_persistence.
+    """
+
+    def _make_config(self, data_dir, *, persist=True, enabled=True, recon_port=8003):
+        from fused_memory.config.schema import (
+            FusedMemoryConfig,
+            ReconciliationConfig,
+            ServerConfig,
+        )
+
+        return FusedMemoryConfig(
+            server=ServerConfig(recon_report_port=recon_port, host='127.0.0.1'),
+            reconciliation=ReconciliationConfig(
+                enabled=enabled,
+                recon_report_persist_enabled=persist,
+                recon_report_state_ttl_seconds=300,
+                data_dir=str(data_dir),
+            ),
+        )
+
+    def test_store_attached_at_data_dir_and_not_yet_opened(self, tmp_path):
+        from pathlib import Path
+
+        from fused_memory.server.main import _build_recon_report_components
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        config = self._make_config(tmp_path, persist=True, enabled=True)
+        state, _, _ = _build_recon_report_components(config)
+
+        assert isinstance(state._store, ReconReportStore)
+        # DB is a sibling of reconciliation.db under data_dir.
+        assert state._store.db_path == Path(str(tmp_path)) / 'recon_report_state.db'
+        # NOT opened at build time — parity with the reaper-not-started-at-build
+        # invariant; only run_server()'s start_persistence() opens it.
+        assert state._store._conn is None
+        # No file materialized just by building.
+        assert not (tmp_path / 'recon_report_state.db').exists()
+
+    def test_store_none_when_persist_disabled(self, tmp_path):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config(tmp_path, persist=False, enabled=True)
+        state, _, _ = _build_recon_report_components(config)
+        assert state._store is None
+
+    def test_store_none_when_reconciliation_disabled(self, tmp_path):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config(tmp_path, persist=True, enabled=False)
+        state, _, _ = _build_recon_report_components(config)
+        assert state._store is None
+
+    def test_state_exposes_start_and_stop_persistence(self, tmp_path):
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config(tmp_path, persist=True, enabled=True)
+        state, _, _ = _build_recon_report_components(config)
+        assert callable(state.start_persistence)
+        assert callable(state.stop_persistence)
+
+    def test_start_persistence_opens_and_hydrates_then_stop_closes(self, tmp_path):
+        """start_persistence() opens the store AND runs hydrate_from_store (so a
+        pre-populated DB is read back into memory); stop_persistence() closes it
+        and is idempotent."""
+        from fused_memory.server.main import _build_recon_report_components
+        from fused_memory.server.recon_report import (
+            _Finding,
+            _ReportEntry,
+            _serialize_entry,
+        )
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        run_id = 'boot-run'
+        stage = 'memory_consolidator'
+        finding = _Finding(
+            finding_id='11111111-1111-1111-1111-111111111111',
+            severity='moderate', category='memory_stale',
+            description='pre-populated finding', suggested_action='act',
+            actionable=True, task_id='42', flag_type='orphaned_knowledge',
+        )
+        entry = _ReportEntry(
+            run_id=run_id, stage=stage, project_id='dark_factory',
+            findings=[finding], summary='pre summary', created_at=1.0,
+        )
+
+        # Pre-populate exactly the DB path _build_recon_report_components points at.
+        db_path = tmp_path / 'recon_report_state.db'
+        pre_store = ReconReportStore(db_path)
+        pre_store.open()
+        try:
+            pre_store.upsert_entry(
+                run_id=run_id, stage=stage, project_id='dark_factory',
+                is_active=True,
+                entry_json=_serialize_entry(
+                    entry, sig_anchor_slice={}, cited_task_slice={}
+                ),
+                updated_at=1.0,
+            )
+        finally:
+            pre_store.close()
+
+        config = self._make_config(tmp_path, persist=True, enabled=True)
+        state, _, _ = _build_recon_report_components(config)
+        assert state._store is not None
+        assert state._store._conn is None  # not opened yet
+
+        state.start_persistence()
+        try:
+            assert state._store._conn is not None  # opened
+            # hydrate ran during start_persistence — the pre-populated finding is
+            # now readable from in-memory state.
+            report = state.get_assembled_report(run_id, stage)
+            assert report is not None
+            assert [i['finding_id'] for i in report['flagged_items']] == [
+                finding.finding_id
+            ]
+            assert report['summary'] == 'pre summary'
+            # is_active row restored the active-stage pointer.
+            assert state.active_run_for_stage(stage, 'dark_factory') == run_id
+        finally:
+            state.stop_persistence()
+
+        assert state._store._conn is None  # closed
+        state.stop_persistence()  # idempotent — must not raise
+
+    def test_start_stop_persistence_are_noops_when_store_none(self, tmp_path):
+        """With persistence disabled (store=None), start/stop_persistence are a
+        total no-op and never raise."""
+        from fused_memory.server.main import _build_recon_report_components
+
+        config = self._make_config(tmp_path, persist=False, enabled=True)
+        state, _, _ = _build_recon_report_components(config)
+        assert state._store is None
+        state.start_persistence()  # must not raise
+        state.stop_persistence()  # must not raise
