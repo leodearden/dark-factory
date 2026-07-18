@@ -5806,6 +5806,32 @@ class GitOps:
         )
         return parse_diff_line_ranges(diff)
 
+    async def get_new_side_changed_line_ranges(
+        self, worktree: Path, from_sha: str, to_sha: str = 'HEAD',
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Return new-side (HEAD) changed line ranges for ``{from_sha}..{to_sha}``.
+
+        New-side counterpart of :meth:`get_changed_line_ranges`.  Runs
+        ``git diff {from_sha}..{to_sha} --unified=0 --no-color`` in *worktree*
+        (NOT ``self.project_root`` — the amendment SHA and HEAD live in the
+        task worktree) and delegates parsing to
+        :func:`parse_diff_added_line_ranges`.  ``--unified=0`` gives exact hunk
+        boundaries with no context padding, so the new-side ranges are the
+        minimal set of lines the amendment actually touched.
+
+        Used to scope a post-amendment review to the amendment delta: reviewer
+        ``location`` line numbers are new-side (HEAD-relative), so they are
+        directly comparable to these ranges.
+
+        Returns an empty dict when the diff is empty (no changes in the range).
+        """
+        _, diff, _ = await _run(
+            ['git', 'diff', f'{from_sha}..{to_sha}',
+             '--unified=0', '--no-color'],
+            cwd=worktree,
+        )
+        return parse_diff_added_line_ranges(diff)
+
     async def get_current_branch(self, worktree: Path) -> str:
         """Get the current branch name in a worktree."""
         _, branch, _ = await _run(
