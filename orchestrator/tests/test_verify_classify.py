@@ -30,7 +30,7 @@ import json
 
 import pytest
 
-from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
 from orchestrator.verify_cmd import ToolKind
 
 # Every recognised tool identity, including OPAQUE — the guards in step-1
@@ -762,6 +762,61 @@ class TestEnvironmentalGuardNegatives:
         assert result != FailureCategory.DISK_FULL, (
             f'a bare SIGBUS mention with no disk/linker context must not '
             f'false-positive into disk_full, got {result!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2748: SEMAPHORE_TIMEOUT deterministic-diagnostic veto. A genuine
+# flock/semaphore slot-acquisition timeout is raised by the concurrency-
+# limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE the wrapped
+# tool ever runs, so its output cannot ALSO carry a compiler/lint diagnostic.
+# But `_LOCK_TOKEN_RE` and `_TIMEOUT_TOKEN_RE` are two independent
+# whole-output searches, so a deterministic cargo clippy/rustc diagnostic
+# that happens to quote lock/slot/semaphore source and mention "timed out" in
+# a note satisfies both and is misclassified SEMAPHORE_TIMEOUT — an
+# INFRA_TRANSIENT_CATEGORIES member — which sends a deterministic lint/type
+# regression through the bounded infra-retry loop instead of the debugger.
+# Mirrors TestEnvironmentalGuardsApplyToEveryToolKind's tool-blind coverage.
+#
+# RED today: no deterministic-diagnostic veto exists yet, so both goldens
+# below still satisfy the loose lock+timeout co-occurrence heuristic and
+# classify SEMAPHORE_TIMEOUT (a member of INFRA_TRANSIENT_CATEGORIES).
+# ---------------------------------------------------------------------------
+
+_SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT = (
+    'error: this `.lock()` call is held across an `.await` point\n'
+    '  --> src/worker/pool.rs:42:19\n'
+    '   |\n'
+    '42 |         let _slot = self.semaphore.lock().await;\n'
+    '   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '   |\n'
+    "   = note: `-D clippy::await-holding-lock` implied by `-D warnings`\n"
+    '   = help: for further information visit '
+    'https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock\n'
+    '   = note: a peer that timed out waiting for the slot may hold the lock '
+    'indefinitely\n'
+    '\n'
+    'error: aborting due to previous error\n'
+)
+
+
+class TestSemaphoreTimeoutDeterministicDiagnosticVeto:
+    """task 2748: a deterministic Rust compiler/clippy diagnostic must veto
+    the loose lock+timeout co-occurrence heuristic — the lock/slot/semaphore
+    and "timed out" tokens are incidental to a deterministic lint/compile
+    failure, not evidence of a genuine slot-acquisition timeout (which is
+    raised by the wrapper BEFORE the wrapped tool runs, so it can never carry
+    a diagnostic marker)."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_clippy_lint_diagnostic_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        result = _classify(tool, _SEMAPHORE_TIMEOUT_CLIPPY_DIAGNOSTIC_OUTPUT, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a deterministic clippy lint diagnostic (clippy:: marker present) '
+            f'with incidental lock/slot/semaphore + "timed out" tokens must not '
+            f'classify infra-transient, got {result!r}'
         )
 
 
