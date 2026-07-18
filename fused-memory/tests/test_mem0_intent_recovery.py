@@ -269,3 +269,86 @@ class TestRecoverMem0Intents:
         assert summary['reconciled'] == 0
         assert summary['reissued'] == 0
         assert summary['dead_lettered'] == 1
+
+    @pytest.mark.asyncio
+    async def test_reissue_exception_dead_letters_not_left_pending(self, recovery_service):
+        """failed-only backend_op but re-issue raises → dead-lettered (not left pending)."""
+        svc = recovery_service
+        journal = svc._write_journal
+        assert journal is not None
+        write_op_id = str(uuid.uuid4())
+        intent_id = str(uuid.uuid4())
+        await _seed_pending_intent(
+            journal,
+            write_op_id=write_op_id,
+            intent_id=intent_id,
+            content='cannot reissue',
+            payload_digest='dig-x',
+        )
+        await journal.log_backend_op(
+            write_op_id=write_op_id,
+            backend='mem0',
+            operation='add',
+            success=False,
+            error='first failure',
+        )
+        svc.mem0.add = AsyncMock(side_effect=RuntimeError('reissue boom'))
+
+        summary = await svc.recover_mem0_intents()
+
+        # Not left pending — resolved 'dead' with the re-issue error captured.
+        assert await journal.get_incomplete_mem0_intents() == []
+        dead = await journal.get_mem0_intents(status='dead')
+        assert [r['id'] for r in dead] == [intent_id]
+        assert 'reissue boom' in (dead[0]['reason'] or '')
+        assert summary['scanned'] == 1
+        assert summary['reissued'] == 0
+        assert summary['dead_lettered'] == 1
+
+    @pytest.mark.asyncio
+    async def test_second_recover_is_zero_work(self, recovery_service):
+        """A second recover after all intents resolve is a zero-work no-op."""
+        svc = recovery_service
+        journal = svc._write_journal
+        assert journal is not None
+        write_op_id = str(uuid.uuid4())
+        intent_id = str(uuid.uuid4())
+        await _seed_pending_intent(
+            journal, write_op_id=write_op_id, intent_id=intent_id
+        )
+        await journal.log_backend_op(
+            write_op_id=write_op_id, backend='mem0', operation='add', success=True
+        )
+
+        first = await svc.recover_mem0_intents()
+        assert first['scanned'] == 1
+
+        svc.mem0.add.reset_mock()
+        second = await svc.recover_mem0_intents()
+
+        assert second == {
+            'scanned': 0,
+            'reconciled': 0,
+            'reissued': 0,
+            'dead_lettered': 0,
+        }
+        svc.mem0.add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_journal_unset_returns_zeroed_summary(self, mock_config):
+        """A MemoryService without a wired journal returns a zeroed summary, no error."""
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.add = AsyncMock()
+        # No set_write_journal call → self._write_journal is None.
+        assert svc._write_journal is None
+
+        summary = await svc.recover_mem0_intents()
+
+        assert summary == {
+            'scanned': 0,
+            'reconciled': 0,
+            'reissued': 0,
+            'dead_lettered': 0,
+        }
+        svc.mem0.add.assert_not_called()
