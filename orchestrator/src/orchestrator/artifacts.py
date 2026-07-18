@@ -499,6 +499,39 @@ class TaskArtifacts:
         """Return the recorded verdict record for ``tree_hash``, else ``None``."""
         return self.read_review_state()['verdicts'].get(tree_hash)
 
+    def get_amendment_rounds_total(self) -> int:
+        """Return the persisted task-lifetime amendment-round count (0 default)."""
+        try:
+            return int(self.read_review_state().get('amendment_rounds_total', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def get_review_cycles_total(self) -> int:
+        """Return the persisted task-lifetime review-cycle count (0 default)."""
+        try:
+            return int(self.read_review_state().get('review_cycles_total', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_review_counters(
+        self,
+        *,
+        amendment_rounds_total: int | None = None,
+        review_cycles_total: int | None = None,
+    ) -> None:
+        """Persist the task-lifetime review counters (read-modify-write).
+
+        Updates only the provided keys, preserving the verdicts map and the
+        other counter, so ``max_amendment_rounds`` / ``max_review_cycles``
+        can bound the whole task lifetime rather than each dispatch.
+        """
+        state = self.read_review_state()
+        if amendment_rounds_total is not None:
+            state['amendment_rounds_total'] = int(amendment_rounds_total)
+        if review_cycles_total is not None:
+            state['review_cycles_total'] = int(review_cycles_total)
+        self._write_json(self.root / 'review_state.json', state)
+
     def _read_path(self, name: str) -> Path:
         """Resolve *name* under ``self.root``."""
         return self.root / name
