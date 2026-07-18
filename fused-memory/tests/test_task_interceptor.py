@@ -8287,6 +8287,43 @@ async def test_remove_dependency_client_op_id_dedups(
         await journal.close()
 
 
+@pytest.mark.asyncio
+async def test_client_op_id_failure_result_not_pinned(
+    taskmaster,
+    reconciler,
+    event_buffer,
+    tmp_path,
+):
+    """A transiently-failed write is NOT pinned under its client_op_id, so a
+    retry re-attempts it rather than replaying a stale failure (review
+    suggestion 2 / robustness). Contrast the dedup tests above, where a
+    SUCCESSFUL outcome is pinned and the retry short-circuits."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(tmp_path / 'wj_fail')
+    await journal.initialize()
+    try:
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+        interceptor.set_write_journal(journal)
+
+        # First attempt returns a failure dict (e.g. a transient backend error).
+        taskmaster.update_task = AsyncMock(
+            return_value={'success': False, 'error': 'boom'}
+        )
+        await interceptor.update_task(
+            '1', '/project', client_op_id='op-fail', title='x'
+        )
+        # The failure was not recorded, so the retry re-attempts the write.
+        await interceptor.update_task(
+            '1', '/project', client_op_id='op-fail', title='x'
+        )
+        assert taskmaster.update_task.call_count == 2
+        # Nothing is pinned under the key.
+        assert await journal.get_idempotent_result('op-fail') is None
+    finally:
+        await journal.close()
+
+
 # ── Tests for update_task status-kwarg rejection (defence-in-depth) ─────────
 
 

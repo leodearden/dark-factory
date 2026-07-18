@@ -517,8 +517,22 @@ class TaskInterceptor:
         a ``dict`` (a gate rejection may return a non-dict / the write may not
         have produced a replayable outcome). ``record_idempotent_result`` is
         first-write-wins, so a rare concurrent double records once.
+
+        Only SUCCESSFUL outcomes are pinned. A failure dict — ``success`` is
+        explicitly ``False`` or a truthy ``error`` — is deliberately NOT
+        recorded, so a transiently-failed write (e.g. a backend hiccup whose
+        HTTP response was then lost) is RE-ATTEMPTED on the retry rather than
+        replaying a stale failure. This mirrors the gate-rejection rule (a
+        never-applied op is not pinned) and the double-apply protection is
+        unaffected: a failed write applied nothing to protect.
         """
-        if not client_op_id or self._write_journal is None or not isinstance(result, dict):
+        if (
+            not client_op_id
+            or self._write_journal is None
+            or not isinstance(result, dict)
+            or result.get('success') is False
+            or result.get('error')
+        ):
             return
         await self._write_journal.record_idempotent_result(
             client_op_id, operation, result
