@@ -2787,7 +2787,7 @@ async def test_reap_leaked_ticket_workers_does_not_count_timed_out_worker():
         # real 10s and without yielding to the loop — so the reaper's
         # cancel() is in flight but not yet processed when it re-checks
         # task.done().
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     with patch('asyncio.wait_for', _simulate_timeout):
         reaped = await reap_leaked_ticket_workers()
