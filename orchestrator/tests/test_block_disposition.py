@@ -209,6 +209,20 @@ class TestClassifyFailureKnownRows:
         assert disp.counts_against_requeue_cap is False
         assert disp.category is FailureCategory.NONE
 
+    def test_warm_lane_soft_pressure_requeues_without_counting_against_cap(self):
+        """θ soft-floor throttle (task 2443, §9.5 inv.11): pure backpressure
+        --- REQUEUE, never escalates, never counts against the requeue cap ---
+        distinct reason_prefix from ε's WarmLaneDiskPressure exit-75 row."""
+        from orchestrator.git_ops import WarmLaneSoftPressure
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(WarmLaneSoftPressure('x'))
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.escalate_to_human is False
+        assert disp.counts_against_requeue_cap is False
+        assert disp.reason_prefix == 'warm_lane_soft_pressure (backpressure)'
+        assert disp.category is FailureCategory.NONE
+
     def test_bare_warm_lane_requeue_base_matches_old_else_branch_fallback(self):
         """Amendment (reviewer_comprehensive behavior-parity): a bare
         WarmLaneRequeue (none of the 3 named subclasses) is never raised

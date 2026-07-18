@@ -1479,6 +1479,76 @@ class GitConfig(BaseModel):
             '(500 000 inodes).'
         ),
     )
+    warm_lane_soft_floor: bool = Field(
+        default=False,
+        description=(
+            'When True, GitOps._acquire_warm_lane_impl runs a PROACTIVE '
+            'soft-floor throttle (θ, task 2443) AFTER the ε hard-floor '
+            'disk-guard and BEFORE allocating a lane: invoke the reify ε '
+            'script (scripts/warm-lane-disk-guard.sh check --soft) — on '
+            'exit 3 (soft pressure, above the hard floor but below the soft '
+            'one) a FRESH allocation (no existing lane mapped to the branch) '
+            'returns WarmLaneUnavailable.SOFT_PRESSURE so the caller defers '
+            '(backpressure requeue) rather than growing resident-divergent '
+            'toward the hard floor; a REUSE of an already-mapped branch is '
+            'never throttled.  Independent of warm_lane_disk_guard — an '
+            'operator may enable either axis alone.  Gap-closing note: if '
+            'warm_lane_disk_guard is left disabled while this is enabled, '
+            'the soft-floor check also treats an exit 75 (hard pressure — '
+            'the same script reports this once free space/inodes drop below '
+            'the HARD floor, per its own "75 takes precedence" contract) as '
+            'a defer signal, so a soft-only configuration still backpressures '
+            'below the hard floor instead of allocating straight into it '
+            '(see GitOps._warm_lane_soft_pressure_defer).  Fail-open on absent '
+            'script (rc 127) — byte-identical to today until reify ships '
+            '`check --soft`.  Default False → byte-identical and trivially '
+            'revertible, mirroring the warm_lane_disk_guard knob convention.'
+        ),
+    )
+    warm_lane_soft_free_gib: int = Field(
+        default=500,
+        ge=0,
+        description=(
+            'Soft free-GiB floor, ABOVE warm_lane_min_free_gib (the hard '
+            'floor).  Passed as --soft-free-gib to the reify ε disk-guard '
+            'script (warm-lane-disk-guard.sh check --soft).  Effective only '
+            'when warm_lane_soft_floor=True; a model validator rejects a '
+            'value <= warm_lane_min_free_gib while the knob is enabled.  '
+            'Matches the reify script env default (500 GiB).'
+        ),
+    )
+    warm_lane_soft_free_inodes: int = Field(
+        default=5_000_000,
+        ge=0,
+        description=(
+            'Soft free-inodes floor, ABOVE warm_lane_min_free_inodes (the '
+            'hard floor).  Passed as --soft-free-inodes to the reify ε '
+            'disk-guard script (warm-lane-disk-guard.sh check --soft).  '
+            'Effective only when warm_lane_soft_floor=True; a model '
+            'validator rejects a value <= warm_lane_min_free_inodes while '
+            'the knob is enabled.  Matches the reify script env default '
+            '(5 000 000 inodes).'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _reject_soft_floor_at_or_below_hard_floor(self) -> 'GitConfig':
+        if self.warm_lane_soft_floor and (
+            self.warm_lane_soft_free_gib <= self.warm_lane_min_free_gib
+            or self.warm_lane_soft_free_inodes <= self.warm_lane_min_free_inodes
+        ):
+            raise ValueError(
+                'GitConfig.warm_lane_soft_floor is True but the soft floor '
+                'does not exceed the hard floor: warm_lane_soft_free_gib='
+                f'{self.warm_lane_soft_free_gib} (hard warm_lane_min_free_gib='
+                f'{self.warm_lane_min_free_gib}), warm_lane_soft_free_inodes='
+                f'{self.warm_lane_soft_free_inodes} (hard '
+                f'warm_lane_min_free_inodes={self.warm_lane_min_free_inodes}); '
+                'raise the soft floor above its hard counterpart on both axes, '
+                'or set warm_lane_soft_floor: false.'
+            )
+        return self
+
     merge_spec_warm_lane_pool: bool = Field(
         default=False,
         description=(

@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass
@@ -285,6 +286,16 @@ _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # convention in this codebase uses 124 for anything else.
 _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
 
+# Short window (seconds) over which the θ soft-floor defer path memoizes the
+# α warm-lane-audit (:meth:`GitOps._warm_lane_audit_cached`).  α is
+# observability-only (inv.12), so a slightly-stale HEADROOM in the defer
+# WARNING is acceptable; the memo exists so a SUSTAINED soft-pressure
+# condition — which requeues the same fresh allocation across many dispatch
+# cycles — does not re-fork the audit subprocess on every cycle (amendment,
+# reviewer_comprehensive performance-efficiency).  Read as a module global
+# (not a default arg) so tests can monkeypatch it (0.0 disables the memo).
+_WARM_LANE_AUDIT_CACHE_TTL_SECS: float = 30.0
+
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
 # <worktree_base>/_offline-deep.  Deliberately NOT prefixed `_merge-`, so it
@@ -462,6 +473,14 @@ class WarmLaneUnavailable(Enum):
     * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
     * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
     * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+    * ``SOFT_PRESSURE`` — θ proactive soft-floor throttle (task 2443, §9.5):
+      the reify ε script's ``check --soft`` reported soft pressure (rc=3,
+      above the hard floor but below the soft one) for a FRESH allocation
+      (no lane already mapped to the branch).  Distinct from
+      ``DISK_PRESSURE``'s exit-75 — this is pure backpressure/defer
+      (inv.11), never an escalation or a fault, and the pool lane is never
+      touched (stays FREE).  A REUSE of an already-mapped branch is never
+      throttled this way.
     * ``BASE_ABSENT`` — the warm-lane CoW seed base is provably absent/empty
       (:meth:`GitOps._warm_lane_base_resolvable` returned
       :attr:`WarmBaseHealth.ABSENT`), detected either by the pre-acquire gate
@@ -483,6 +502,7 @@ class WarmLaneUnavailable(Enum):
     EXHAUSTED = 'exhausted'
     FAULT = 'fault'
     DISK_PRESSURE = 'disk_pressure'
+    SOFT_PRESSURE = 'soft_pressure'
     BASE_ABSENT = 'base_absent'
     DISABLED = 'disabled'
 
@@ -681,6 +701,9 @@ class WarmLaneRequeue(Exception):
         WarmLanePoolExhausted — all lanes ASSIGNED (backpressure).
         WarmLaneDiskPressure  — seed exited 75 (EX_TEMPFAIL, transient infra).
         WarmLanePoolHardDown  — warm base absent (host-scoped pool condition).
+        WarmLaneSoftPressure  — θ proactive soft-floor throttle (task 2443,
+            §9.5): pure backpressure/defer for a FRESH allocation, distinct
+            from WarmLaneDiskPressure's exit-75 hard floor.
     """
 
 
@@ -688,6 +711,38 @@ class WarmLanePoolExhausted(WarmLaneRequeue):
     """All pool lanes are ASSIGNED; task must be requeued (backpressure).
 
     Scheduler should release the task and re-dispatch it when a lane frees up.
+    """
+
+
+class WarmLaneSoftPressure(WarmLaneRequeue):
+    """θ proactive soft-floor throttle detected soft pressure for a FRESH
+    allocation (task 2443, §9.5 inv.11) — pure backpressure/defer.
+
+    Raised by :meth:`GitOps.create_worktree` when ``config.warm_lane_soft_floor``
+    is enabled and :meth:`GitOps._warm_lane_soft_pressure_defer` reports soft
+    disk pressure (rc=3), OR hard disk pressure (rc=75) while
+    ``warm_lane_disk_guard`` is disabled (amendment, reviewer_comprehensive
+    robustness — a gap-closing belt-and-suspenders for the soft-only
+    configuration; see that method's docstring), for a branch with no lane
+    already mapped to it (a reuse/live-requeue is never throttled this way).
+    Distinct from :class:`WarmLaneDiskPressure` (ε's exit-75 hard floor):
+    this is NEVER an escalation or a fault — it is deliberately weaker
+    backpressure than the hard floor's requeue, and its disposition-table
+    row sets ``counts_against_requeue_cap=False`` so it never contributes to
+    a requeue-cap escalation.
+
+    Note (amendment, reviewer_comprehensive robustness — confirmed intended
+    per inv.11): a FRESH allocation under *sustained* soft pressure requeues
+    indefinitely with no escalation — by design, this is pure backpressure,
+    not a fault, so it must never itself trip an escalation path. The only
+    operator-facing signal is the per-defer WARNING journal line (grep for
+    ``warm_lane_soft_pressure`` / the θ soft-floor throttle message) and the
+    ``warm_lane_soft_pressure (backpressure)`` disposition reason_prefix. A
+    bounded consecutive-defer counter promoting to an info-level escalation
+    would need to track state across dispatch/requeue cycles — that lives in
+    the scheduler/harness layer, outside this task's locked module scope —
+    so it is intentionally left as a possible future follow-up rather than
+    implemented here.
     """
 
 
@@ -1154,6 +1209,14 @@ class GitOps:
         # when pool_storage_present() is False.  None (unwired) is
         # byte-identical to today — e.g. cli/recover/evals call sites.
         self._on_pool_storage_absent: Callable[..., Any] | None = None
+        # θ soft-floor defer α-audit memo (task 2443, amendment): a
+        # (monotonic_deadline, headroom) pair, or None before the first defer.
+        # Consulted only by _warm_lane_audit_cached() on the (non-hot) defer
+        # path; see _WARM_LANE_AUDIT_CACHE_TTL_SECS.  This GitOps is long-lived
+        # (Harness holds one for the process lifetime), so the memo genuinely
+        # survives across the requeue cycles a sustained soft-pressure
+        # condition produces.
+        self._warm_lane_audit_cache: tuple[float, str | None] | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -2121,6 +2184,11 @@ class GitOps:
                 raise WarmLaneDiskPressure(
                     f'warm-lane seed disk pressure for branch {branch_name!r}; requeue'
                 )
+            if pool_info is WarmLaneUnavailable.SOFT_PRESSURE:
+                raise WarmLaneSoftPressure(
+                    f'warm-lane soft-floor backpressure for branch {branch_name!r}; '
+                    f'defer/requeue'
+                )
             if pool_info is WarmLaneUnavailable.BASE_ABSENT:
                 raise WarmLanePoolHardDown(
                     f'warm-lane base absent (host-scoped pool hard-down) for '
@@ -3021,6 +3089,148 @@ class GitOps:
             )
             return 127
 
+    # θ: warm-lane PROACTIVE soft-floor throttle helpers (task 2443) --------
+
+    async def _run_warm_lane_soft_guard(self) -> int:
+        """Invoke ``<project_root>/scripts/warm-lane-disk-guard.sh check --soft``.
+
+        θ (task 2443, §9.5): the proactive soft-floor counterpart to
+        :meth:`_run_warm_lane_disk_guard`, run BEFORE it's too late — a soft
+        floor ABOVE the hard floor lets the caller throttle new allocations
+        before the hard floor's exit-75 backstop is ever reached. Mirrors
+        the ``_run_warm_lane_disk_guard`` fail-soft helper pattern exactly:
+        absent script → 127 sentinel; any unexpected exception → 127; never
+        raises.
+
+        Returns:
+            0   — healthy (both hard and soft floors clear).
+            3   — soft pressure (above hard floor, below soft floor;
+                  stdout carries the ``@@REIFY_WARM_LANE_SOFT_PRESSURE@@``
+                  sentinel per the reify contract — not parsed here).
+            75  — hard disk pressure (EX_TEMPFAIL); takes precedence over
+                  soft per the reify script's own contract.
+                  :meth:`_warm_lane_soft_pressure_defer` treats this rc as a
+                  defer signal unconditionally (rc==75 is never healthy), so
+                  a below-hard-floor condition that slips past ε's upstream
+                  check (the narrow TOCTOU window) — or a soft-only
+                  configuration with ε disabled — still backpressures rather
+                  than failing open. See that method's docstring (amendment,
+                  reviewer_comprehensive robustness).
+            127 — script absent or exception (fail-open sentinel).
+            other non-zero — script error (treated as fail-open by caller).
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-disk-guard.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_soft_guard: script absent at %s — no-op', script,
+                )
+                return 127
+            cmd = [
+                str(script), 'check',
+                '--mount', str(self.worktree_base),
+                '--min-free-gib', str(self.config.warm_lane_min_free_gib),
+                '--min-free-inodes', str(self.config.warm_lane_min_free_inodes),
+                '--soft',
+                '--soft-free-gib', str(self.config.warm_lane_soft_free_gib),
+                '--soft-free-inodes', str(self.config.warm_lane_soft_free_inodes),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc not in (0, 3, 75):
+                logger.warning(
+                    '_run_warm_lane_soft_guard: script exited %d (stderr=%r)', rc, err,
+                )
+            return rc
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_soft_guard: unexpected error', exc_info=True,
+            )
+            return 127
+
+    async def _run_warm_lane_audit(self) -> str | None:
+        """Invoke ``<project_root>/scripts/warm-lane-audit.sh --mount <worktree_base>``.
+
+        α (task 2443, §9.5 inv.12): OBSERVABILITY-ONLY. This wrapper never
+        gates an admission decision — it exists solely to enrich the θ
+        soft-floor defer journal line
+        (:meth:`_warm_lane_soft_pressure_defer`) with pool headroom context.
+        Mirrors the :meth:`warm_lane_ref_is_degenerate`/
+        :meth:`_run_thin_warm_lane` fail-soft wrapper pattern: absent
+        script, non-zero exit, or any exception all degrade to ``None``;
+        never raises.
+
+        **Read-only (A1)**: invoked with ONLY ``--mount`` — no reset/reclaim
+        subcommand or flag. reify's ``warm-lane-audit.sh`` is read-only by
+        its own contract (never mutates a lane); this wrapper does not add
+        any mutating flag on top of that.
+
+        Returns:
+            The trailing ``HEADROOM ...`` summary line from the script's
+            default table-format stdout, or ``None`` if the script is
+            absent, exits non-zero, its stdout carries no line beginning
+            ``HEADROOM``, or an unexpected exception occurred.
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-audit.sh'
+            if not script.exists():
+                logger.debug(
+                    '_run_warm_lane_audit: script absent at %s — no-op', script,
+                )
+                return None
+            cmd = [str(script), '--mount', str(self.worktree_base)]
+            rc, out, err = await _run(cmd, cwd=self.project_root)
+            if rc != 0:
+                logger.debug(
+                    '_run_warm_lane_audit: script exited %d (stderr=%r) — no headroom',
+                    rc, err,
+                )
+                return None
+            for line in out.splitlines():
+                if line.startswith('HEADROOM'):
+                    return line
+            logger.debug(
+                '_run_warm_lane_audit: no HEADROOM line in stdout (stdout=%r)', out,
+            )
+            return None
+        except Exception:
+            logger.warning(
+                '_run_warm_lane_audit: unexpected error', exc_info=True,
+            )
+            return None
+
+    async def _warm_lane_audit_cached(self) -> str | None:
+        """Short-window memo over :meth:`_run_warm_lane_audit` (α, inv.12).
+
+        The θ soft-floor defer path (:meth:`_warm_lane_soft_pressure_defer`)
+        enriches its WARNING with the α HEADROOM summary. Under SUSTAINED
+        soft pressure a fresh allocation requeues indefinitely (documented,
+        inv.11), so without a memo each dispatch/requeue cycle re-forks the
+        ``warm-lane-audit.sh`` subprocess even though nothing has changed
+        (amendment, reviewer_comprehensive performance-efficiency). This
+        memoizes the last HEADROOM for :data:`_WARM_LANE_AUDIT_CACHE_TTL_SECS`
+        so repeated defers within that window reuse it instead of re-forking.
+
+        α is OBSERVABILITY-ONLY (inv.12): a slightly-stale cached HEADROOM in
+        a log line is acceptable, and this NEVER gates the defer decision —
+        the per-defer WARNING itself is retained (it is the intended B10
+        backpressure signal); only the audit *subprocess* is rate-limited.
+        Fail-soft like the underlying wrapper: never raises (any error from
+        :meth:`_run_warm_lane_audit` already degrades to ``None``).
+
+        A TTL of ``0.0`` (e.g. monkeypatched in tests) disables the memo —
+        the deadline never lies strictly in the future — so every call
+        re-forks.
+        """
+        now = time.monotonic()
+        cache = self._warm_lane_audit_cache
+        if cache is not None and now < cache[0]:
+            return cache[1]
+        headroom = await self._run_warm_lane_audit()
+        self._warm_lane_audit_cache = (
+            now + _WARM_LANE_AUDIT_CACHE_TTL_SECS, headroom,
+        )
+        return headroom
+
     async def _run_warm_lane_gc_reclaim(self) -> int:
         """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
 
@@ -3303,6 +3513,82 @@ class GitOps:
             )
             return True
         return False
+
+    async def _warm_lane_soft_pressure_defer(self, branch_name: str) -> bool:
+        """θ proactive soft-floor throttle decision (task 2443, §9.5 inv.11).
+
+        Mirrors :meth:`_warm_lane_disk_admission_blocked`'s shape, one floor
+        earlier: runs :meth:`_run_warm_lane_soft_guard` and defers (True) on
+        rc==3 (soft pressure — above the hard floor, below the soft one).
+
+        rc==75 (hard pressure) ALSO defers, unconditionally — independent of
+        the ε (``warm_lane_disk_guard``) knob (amendment,
+        reviewer_comprehensive robustness). The soft guard runs the same
+        reify script with both the hard AND soft flags, so it reports rc==75
+        whenever free space/inodes are actually below the hard floor ("75
+        takes precedence over soft" per the reify contract); rc==75 is never
+        healthy, so deferring is strictly safer than failing open. In the
+        common ε-enabled case a genuine below-hard-floor condition is caught
+        UPSTREAM by :meth:`_warm_lane_disk_admission_blocked` in
+        ``_acquire_warm_lane_impl`` (ε short-circuits to DISK_PRESSURE before
+        this method runs), so this rc==75 arm only fires in the narrow TOCTOU
+        window where free space fell below the hard floor BETWEEN ε's check
+        and this one — deferring there (rather than failing open into a fresh
+        below-hard-floor allocation) closes that window. It also covers the
+        soft-only configuration (``warm_lane_soft_floor=True``,
+        ``warm_lane_disk_guard=False``), where nothing else observes the
+        hard-floor signal for a FRESH allocation. Either way the defer is
+        pure backpressure (inv.11: routes through the same
+        WarmLaneSoftPressure REQUEUE, never an escalation or ε's
+        exit-75/WarmLaneDiskPressure fault path) and never touches ε's
+        byte-identical hard path.
+
+        Every other outcome fails open (False): 0 (healthy), 127 (script
+        absent), 2 (usage error), or any other unrecognized code.
+
+        On a defer, emits a structured WARNING journal line naming
+        *branch_name* — the user-observable B10 signal that a fresh
+        allocation was throttled as backpressure (inv.11: never an
+        escalation or fault). The journal line is enriched with α's HEADROOM
+        summary (:meth:`_warm_lane_audit_cached`, a short-window memo over
+        :meth:`_run_warm_lane_audit` so a sustained soft-pressure condition
+        does not re-fork the audit subprocess on every requeue cycle) for
+        operator context — OBSERVABILITY ONLY (inv.12): a ``None`` headroom
+        (α absent/errored) degrades the log line gracefully and never affects
+        the ``True`` return value below; α is never consulted in the decision
+        itself, only after it has already been made. The WARNING itself is
+        emitted on every defer (it is the intended backpressure signal); only
+        the audit subprocess is rate-limited.
+
+        Never raises.
+        """
+        rc = await self._run_warm_lane_soft_guard()
+        # Defer on soft pressure (rc==3) OR hard pressure (rc==75). rc==75 is
+        # never healthy — the soft guard runs the same reify script with both
+        # the hard and soft thresholds, so it reports 75 whenever free space
+        # is actually below the hard floor ("75 takes precedence over soft").
+        # Deferring is strictly safer than failing open, so we do it
+        # unconditionally, independent of the ε (warm_lane_disk_guard) knob
+        # (amendment, reviewer_comprehensive robustness). See docstring.
+        if rc not in (3, 75):
+            return False
+        # α (inv.12, observability-only) — memoized for a short window so a
+        # sustained soft-pressure condition that requeues the same fresh
+        # allocation across many dispatch cycles does not re-fork the audit
+        # subprocess on every cycle (amendment, reviewer_comprehensive
+        # performance-efficiency).  Never affects the return value below.
+        headroom = await self._warm_lane_audit_cached()
+        reason = (
+            'soft disk pressure'
+            if rc == 3
+            else 'hard disk pressure (rc=75 — free fell below the hard floor)'
+        )
+        logger.warning(
+            'θ soft-floor throttle: %s (rc=%d) for branch %r — deferring '
+            'dispatch (backpressure, inv.11); audit_headroom=%s',
+            reason, rc, branch_name, headroom,
+        )
+        return True
 
     async def acquire_spec_lane(
         self,
@@ -3659,6 +3945,19 @@ class GitOps:
             guard / nothing reclaimed — byte-identical to today until reify
             γ/δ are deployed.
 
+        **θ proactive soft-floor throttle** (``config.warm_lane_soft_floor``,
+        task 2443, §9.5): runs immediately AFTER the ε hard-floor check above
+        and BEFORE :func:`acquire_for`, and ONLY for a FRESH allocation (no
+        lane already mapped to *branch_name* — a reuse/live-requeue is never
+        throttled).  When the knob is True, runs ε's ``warm-lane-disk-guard.sh
+        check --soft`` (a soft floor ABOVE the hard floor).  On soft pressure
+        (rc=3), returns ``WarmLaneUnavailable.SOFT_PRESSURE`` so
+        :meth:`create_worktree` raises :class:`WarmLaneSoftPressure` →
+        workflow requeues as backpressure (inv.11: never an escalation/fault;
+        the hard-floor exit-75 path above is unchanged).  Independent of
+        ``warm_lane_disk_guard``; fail-open on absent script (rc 127) —
+        byte-identical to today until reify ships ``check --soft``.
+
         Returns:
             WorktreeInfo  — success; lane is ASSIGNED and seeded.
             WarmLaneUnavailable.EXHAUSTED — all pool lanes are ASSIGNED
@@ -3669,6 +3968,10 @@ class GitOps:
                 detected persistent pressure (rc=75 after reclaim), OR seed
                 exited 75 (EX_TEMPFAIL); transient disk pressure (caller should
                 requeue with annotation).
+            WarmLaneUnavailable.SOFT_PRESSURE — θ proactive soft-floor
+                throttle detected soft pressure (rc=3) for a FRESH allocation
+                (caller should requeue as backpressure; never an escalation —
+                distinct from DISK_PRESSURE's exit-75 hard floor).
             WarmLaneUnavailable.BASE_ABSENT — pre-acquire base-health gate
                 found the warm-lane CoW seed base provably absent/empty
                 (:meth:`_warm_lane_base_resolvable` returned
@@ -3734,6 +4037,29 @@ class GitOps:
         # the expected contract.
         if self.config.warm_lane_disk_guard and await self._warm_lane_disk_admission_blocked():
             return WarmLaneUnavailable.DISK_PRESSURE
+
+        # θ: proactive soft-floor throttle (task 2443, §9.5 inv.11/inv.12) —
+        # runs AFTER the ε hard-floor check above (so a hard-pressure result
+        # always wins/short-circuits first, byte-identical ε precedence) and
+        # BEFORE acquire_for (so a defer touches no lane; it stays FREE, same
+        # as ε).  Gated on BOTH the independent master knob AND a FRESH
+        # allocation: an already-mapped branch (assignment_for is not None)
+        # is a reuse/live-requeue, not new resident-divergent growth, so it
+        # is never throttled — only a fresh lane allocation defers.
+        #
+        # Amendment (reviewer_comprehensive robustness): _warm_lane_soft_pressure_defer
+        # treats the soft-guard's own rc==75 (hard pressure) as a defer signal
+        # unconditionally — closing the narrow TOCTOU window where free space
+        # falls below the hard floor between ε's check above and the soft
+        # guard, and covering the soft-only config (ε off, θ on alone). Either
+        # way a fresh lane is never allocated straight past the hard floor.
+        # See that method's docstring for detail.
+        if (
+            self.config.warm_lane_soft_floor
+            and self.warm_lane_pool.assignment_for(branch_name) is None
+            and await self._warm_lane_soft_pressure_defer(branch_name)
+        ):
+            return WarmLaneUnavailable.SOFT_PRESSURE
 
         acq = await self.warm_lane_pool.acquire_for(branch_name)
         if acq is None:

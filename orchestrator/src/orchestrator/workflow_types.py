@@ -242,6 +242,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WarmLanePoolExhausted,
         WarmLanePoolHardDown,
         WarmLaneRequeue,
+        WarmLaneSoftPressure,
         WorktreeConflictError,
         WorktreeMissing,
     )
@@ -322,6 +323,33 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='warm_lane_pool_hard_down',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # θ proactive soft-floor throttle (task 2443, §9.5 inv.11): pure
+        # backpressure/defer for a FRESH allocation — deliberately weaker
+        # than ε's hard-floor WarmLaneDiskPressure exit-75 row above, so it
+        # gets its own reason_prefix and NEVER counts against the requeue
+        # cap (mirrors HARD_DOWN/DISK_PRESSURE's counts_against_requeue_cap
+        # =False, not EXHAUSTED's =True — soft pressure is not genuine pool
+        # exhaustion).
+        #
+        # Confirmed intended (amendment, reviewer_comprehensive robustness):
+        # escalate_to_human=False + counts_against_requeue_cap=False means a
+        # FRESH allocation under sustained soft pressure requeues indefinitely
+        # with no escalation path — by design, per inv.11, since soft-floor
+        # throttling must never itself become an escalation or a fault. The
+        # only operator-facing signal is the per-defer WARNING journal line
+        # (GitOps._warm_lane_soft_pressure_defer) plus this reason_prefix. A
+        # bounded consecutive-defer-then-escalate counter would need state
+        # tracked across dispatch/requeue cycles at the scheduler/harness
+        # layer — outside this row's (and this task's) module scope — so it's
+        # left as a possible future follow-up, not implemented here.
+        WarmLaneSoftPressure: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='warm_lane_soft_pressure (backpressure)',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── Verify-infra / worktree-conflict (escalate straight to human) ──
