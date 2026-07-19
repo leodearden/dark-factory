@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import pydantic_spec
+from _fm_helpers import poll_until, pydantic_spec
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -2382,7 +2382,15 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 side_effect=tracking,
             ):
                 ti._start_worker_if_needed(project_id)
-                await asyncio.sleep(0.5)
+                # Bounded poll for both drain/dispatch cycles rather than a
+                # fixed sleep, which flakes under `-n auto` CPU oversubscription
+                # when the worker is scheduled late. The `== 2` assertion below
+                # still validates the exact batch count.
+                await poll_until(
+                    lambda: len(call_args_log) >= 2,
+                    timeout=10.0,
+                    message='worker did not complete 2 drain/dispatch cycles',
+                )
         finally:
             for t in list(ti._worker_tasks.values()):
                 if not t.done():
