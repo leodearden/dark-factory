@@ -460,3 +460,120 @@ class TestRunArchitectEval:
         )
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['plan_quality'] is not None
+
+
+# ---------------------------------------------------------------------------
+# plan_quality report column — additive interim surface (step-11/12)
+#
+# A distinct per-(task_id, config_name, role_under_test) column μ/λ consume in
+# the interim — NOT a change to the Elo build_report/format_markdown schema (the
+# full C4 composite+plan_quality row is owned by λ, which θ does not depend on).
+# Mirrors η's TestRecoveryReport precisely: a populated float for architect runs,
+# the '-' null sentinel otherwise, sorted deterministically, rendering
+# byte-identically regardless of input order.
+# ---------------------------------------------------------------------------
+
+def _architect_result(
+    task_id: str = 'df_task_2605',
+    config_name: str = 'architect-sonnet-high',
+    plan_quality: float = 0.75,
+):
+    from orchestrator.evals.runner import EvalResult
+
+    return EvalResult(
+        task_id=task_id,
+        config_name=config_name,
+        outcome='done',
+        metrics={
+            'role_under_test': 'architect',
+            'plan_quality': plan_quality,
+            'composite_score': 0.0,
+        },
+        worktree_path='/tmp/wt-arch',
+    )
+
+
+def _implementer_result(
+    task_id: str = 'df_task_1993',
+    config_name: str = 'opus-high',
+):
+    from orchestrator.evals.runner import EvalResult
+
+    # No plan_quality / role_under_test keys at all → the null sentinel path.
+    return EvalResult(
+        task_id=task_id,
+        config_name=config_name,
+        outcome='done',
+        metrics={'composite_score': 1.0},
+        worktree_path='/tmp/wt-impl',
+    )
+
+
+class TestPlanQualityReport:
+    def test_build_plan_quality_report_rows(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report(
+            [_architect_result(), _implementer_result()]
+        )
+        rows = report['rows']
+        by_task = {r['task_id']: r for r in rows}
+
+        arch = by_task['df_task_2605']
+        assert arch['plan_quality'] == 0.75
+        assert arch['role_under_test'] == 'architect'
+        assert arch['config_name'] == 'architect-sonnet-high'
+
+        impl = by_task['df_task_1993']
+        assert impl['plan_quality'] is None  # null sentinel
+        assert impl['role_under_test'] is None
+
+    def test_rows_sorted_by_task_id_then_config_name(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        # Deliberately unsorted input across both task_id and config_name.
+        results = [
+            _architect_result(task_id='df_task_2605', config_name='architect-sonnet-high'),
+            _architect_result(task_id='df_task_1000', config_name='architect-opus-high'),
+            _architect_result(task_id='df_task_2605', config_name='architect-opus-high'),
+        ]
+        report = build_plan_quality_report(results)
+        keys = [(r['task_id'], r['config_name']) for r in report['rows']]
+        assert keys == sorted(keys)
+
+    def test_format_plan_quality_table_renders_column(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        report = build_plan_quality_report(
+            [_architect_result(), _implementer_result()]
+        )
+        table = format_plan_quality_table(report)
+        assert 'plan_quality' in table
+
+        arch_line = next(
+            ln for ln in table.splitlines() if 'df_task_2605' in ln
+        )
+        assert '0.7500' in arch_line     # populated float for the architect row
+        assert 'architect' in arch_line  # role_under_test column
+
+        impl_line = next(
+            ln for ln in table.splitlines() if 'df_task_1993' in ln
+        )
+        assert '-' in impl_line           # null sentinel rendered as '-'
+        assert '0.7500' not in impl_line  # implementer row is NOT populated
+
+    def test_table_renders_byte_identically_regardless_of_input_order(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = [_architect_result(), _implementer_result()]
+        a = format_plan_quality_table(build_plan_quality_report(results))
+        b = format_plan_quality_table(
+            build_plan_quality_report(list(reversed(results)))
+        )
+        assert a == b  # deterministic (sorted rows, no wall-clock dependence)
