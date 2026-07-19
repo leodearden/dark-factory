@@ -52,6 +52,17 @@ def _allowing_service():
     return mock_service
 
 
+def _allowing_episode_service():
+    """An AsyncMock memory_service whose add_episode returns a dict-dumpable
+    result (so the tool's `return result.model_dump()` yields a real dict).
+    """
+    mock_service = AsyncMock()
+    _ep_result = MagicMock()
+    _ep_result.model_dump.return_value = {'id': 'ep'}
+    mock_service.add_episode.return_value = _ep_result
+    return mock_service
+
+
 class TestAddMemoryPrematureCompletionGate:
     """Write-gate: recon-stage- agents must not write a present-tense
     completion claim about a task that is still LIVE/non-terminal via
@@ -208,3 +219,85 @@ class TestAddMemoryPrematureCompletionGate:
             f'Gate must fail open when task_interceptor is unconfigured; got: {result!r}'
         )
         mock_service.add_memory.assert_called_once()
+
+
+class TestAddEpisodePrematureCompletionGate:
+    """Write-gate: recon-stage- agents must not write a present-tense completion
+    claim about a task that is still LIVE/non-terminal via add_episode. Episodes
+    carry no `category`, so the gate fires on recon-stage + content +
+    status-check alone (mirroring the 2628 live-status add_episode arm).
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_completion_claim_for_in_progress_task(self):
+        """Completion claim + recon-stage agent + the named task LIVE in-progress
+        → rejected. Standard error dict, and add_episode must NOT be called.
+        """
+        mock_service = AsyncMock()
+        server = _server_with_statuses(mock_service, {'5252': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _COMPLETION_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert isinstance(result, dict), f'Expected dict, got {type(result)}: {result!r}'
+        assert result.get('error') == 'premature_completion_claim_write_blocked', (
+            f"Expected error='premature_completion_claim_write_blocked', got: {result!r}"
+        )
+        assert result.get('error_type') == 'ReconPrematureCompletionClaimWriteRejected', (
+            f"Expected error_type='ReconPrematureCompletionClaimWriteRejected', got: {result!r}"
+        )
+        assert result.get('content_excerpt') == _COMPLETION_CONTENT[:200], (
+            f'Expected content_excerpt=content[:200], got: {result!r}'
+        )
+        assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        mock_service.add_episode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allows_completion_claim_for_done_task(self):
+        """Same content + recon-stage agent but the named task is LIVE done
+        (terminal) → gate does NOT fire; add_episode called once.
+        """
+        mock_service = _allowing_episode_service()
+        server = _server_with_statuses(mock_service, {'5252': 'done'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _COMPLETION_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'premature_completion_claim_write_blocked', (
+            f'Gate must not fire for a done (terminal) task; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allows_non_recon_agent(self):
+        """Same content but agent_id='claude-interactive' (non-recon) → not
+        blocked even though task 5252 is in-progress.
+        """
+        mock_service = _allowing_episode_service()
+        server = _server_with_statuses(mock_service, {'5252': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _COMPLETION_CONTENT,
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'premature_completion_claim_write_blocked', (
+            f'Gate must not fire for a non-recon agent; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
