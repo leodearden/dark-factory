@@ -2936,3 +2936,79 @@ class TestRoleEnvOverridesConfig:
 
         with pytest.raises(ValidationError):
             OrchestratorConfig()
+
+
+class TestSessionResumeConfig:
+    """Session-resume γ (plans/warm-lane-session-resume-prd.md task γ): the
+    green-tier `session_resume.*` block guarding the β resume injection.
+
+    SessionResumeConfig mirrors DeliveredChecksConfig's shape (an `enabled`
+    kill-switch plus ge-bounded int knobs), is exposed on OrchestratorConfig
+    under the literal field name `session_resume` (delivered-check contract),
+    and all four leaves are green-tier hot-reloadable via the
+    `_submodel_leaf_paths('session_resume', SessionResumeConfig)` whole-submodel
+    group in RELOADABLE_FIELDS.
+    """
+
+    def test_defaults(self):
+        """SessionResumeConfig() carries the γ default knobs."""
+        from orchestrator.config import SessionResumeConfig
+
+        cfg = SessionResumeConfig()
+        assert cfg.enabled is True
+        assert cfg.freshness_window_secs == 86400
+        assert cfg.max_resumes_per_task == 3
+        assert cfg.fallback_storm_threshold == 5
+
+    def test_freshness_window_secs_ge_1_rejects_zero(self):
+        """freshness_window_secs < 1 must raise ValidationError (ge=1 bound)."""
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(freshness_window_secs=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(freshness_window_secs=-1)
+
+    def test_max_resumes_per_task_ge_1_rejects_zero(self):
+        """max_resumes_per_task < 1 must raise ValidationError (ge=1 bound)."""
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(max_resumes_per_task=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(max_resumes_per_task=-1)
+
+    def test_fallback_storm_threshold_ge_1_rejects_zero(self):
+        """fallback_storm_threshold < 1 must raise ValidationError (ge=1 bound)."""
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(fallback_storm_threshold=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(fallback_storm_threshold=-1)
+
+    def test_exposed_on_orchestrator_config(self):
+        """A default OrchestratorConfig exposes `.session_resume` as a
+        SessionResumeConfig instance under the literal field name.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        assert 'session_resume' in OrchestratorConfig.model_fields
+        config = OrchestratorConfig()
+        assert isinstance(config.session_resume, SessionResumeConfig)
+        assert config.session_resume.enabled is True
+
+    def test_leaves_in_reloadable_fields(self):
+        """All four session_resume leaves are green-tier hot-reloadable
+        (membership assertions, robust to future growth of RELOADABLE_FIELDS).
+        """
+        for leaf in (
+            'session_resume.enabled',
+            'session_resume.freshness_window_secs',
+            'session_resume.max_resumes_per_task',
+            'session_resume.fallback_storm_threshold',
+        ):
+            assert leaf in RELOADABLE_FIELDS, (
+                f'{leaf} must be a member of RELOADABLE_FIELDS '
+                '(green-tier hot-reloadable via _submodel_leaf_paths)'
+            )
