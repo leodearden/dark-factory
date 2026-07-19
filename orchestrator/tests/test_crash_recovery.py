@@ -1021,6 +1021,40 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
         assert '_lane-0' not in harness._preserved_worktrees
         assert '_lane-0' not in harness._recovered_plans
 
+    async def test_planless_lane_with_v2_sidecar_adopts_session(self, harness: Harness):
+        """Task 2772 (B3): a no-plan lane whose sidecar IS v2 (carries its
+        own task_id) -> the session is adopted (keyed by the sidecar's
+        task_id, the only source available on a no-plan lane), but the lane
+        DISPOSITION is unchanged -- still released back to the pool via
+        cleanup_worktree, same as the planless case above.
+        """
+        _pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane_path = base / '_lane-0'
+        task_dir = lane_path / '.task'
+        task_dir.mkdir(parents=True)
+        sidecar = {
+            'session_id': 'uuid-lane-b3',
+            'role': 'architect',
+            'started_at': '2026-06-18T10:00:00+00:00',
+            'owner_pid': 4242,
+            'task_id': '73',
+            'resume_count': 0,
+            'schema_version': 2,
+        }
+        (task_dir / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        await harness._recover_crashed_tasks()
+
+        assert '73' in harness._recovered_sessions
+        assert harness._recovered_sessions['73']['session_id'] == 'uuid-lane-b3'
+        assert '73' not in harness._recovered_plans
+        # Disposition unchanged: still released back to the pool.
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane_path, '_lane-0'
+        )
+        assert '_lane-0' not in harness._recovered_sessions
+
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
