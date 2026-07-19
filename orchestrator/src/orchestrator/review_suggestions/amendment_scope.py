@@ -64,10 +64,10 @@ def _line_in_ranges(
     ``s1 <= e2 and s2 <= e1`` intersection test used by
     ``workflow._line_ranges_stackable``.
     """
-    for start, end in ranges:
-        if start - context_lines <= line <= end + context_lines:
-            return True
-    return False
+    return any(
+        start - context_lines <= line <= end + context_lines
+        for start, end in ranges
+    )
 
 
 def partition_suggestions_by_delta(

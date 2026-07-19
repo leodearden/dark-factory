@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -242,12 +243,14 @@ class TestApplyAmendmentDeltaScope:
         assert result.has_blocking_issues is True
         assert result.blocking_issues == [blocking]
         # (iii) the out-of-delta suggestion is routed to the curator, once.
-        wf._route_review_suggestions_to_curator.assert_awaited_once()
-        routed = wf._route_review_suggestions_to_curator.call_args.args[0]
+        route_mock = cast(AsyncMock, wf._route_review_suggestions_to_curator)
+        route_mock.assert_awaited_once()
+        routed = route_mock.call_args.args[0]
         assert routed.suggestions == [out_sugg]
         # the git delta query used the pre-amendment head.
-        wf.git_ops.get_new_side_changed_line_ranges.assert_awaited_once()
-        gargs = wf.git_ops.get_new_side_changed_line_ranges.call_args
+        delta_mock = cast(AsyncMock, wf.git_ops.get_new_side_changed_line_ranges)
+        delta_mock.assert_awaited_once()
+        gargs = delta_mock.call_args
         assert gargs.args[0] == wf.worktree
         assert gargs.args[1] == 'PRESHA'
 
@@ -267,7 +270,7 @@ class TestApplyAmendmentDeltaScope:
         result = await wf._apply_amendment_delta_scope(reviews, ctx)
 
         assert result.suggestions == [in1, in2]
-        wf._route_review_suggestions_to_curator.assert_not_awaited()
+        cast(AsyncMock, wf._route_review_suggestions_to_curator).assert_not_awaited()
 
     async def test_fail_open_on_empty_delta(self, caplog):
         wf = _make_scope_workflow({})  # uncomputable / empty delta
@@ -288,7 +291,7 @@ class TestApplyAmendmentDeltaScope:
         # Fail-open: reviews returned unchanged (no suggestion silently dropped).
         assert result is reviews
         assert result.suggestions == [s1, s2]
-        wf._route_review_suggestions_to_curator.assert_not_awaited()
+        cast(AsyncMock, wf._route_review_suggestions_to_curator).assert_not_awaited()
         assert any(rec.levelno == logging.WARNING for rec in caplog.records), (
             'fail-open must log a WARNING for audit'
         )
@@ -391,7 +394,7 @@ class TestPostAmendmentReviewWiring:
 
         assert outcome == WorkflowOutcome.DONE
         # exactly one amendment fired.
-        wf._amend.assert_awaited_once()
+        cast(AsyncMock, wf._amend).assert_awaited_once()
 
         # (i) pre_amendment_head is captured by _get_head_commit IMMEDIATELY
         # before _amend, so it is the pre-amendment SHA.
@@ -404,16 +407,19 @@ class TestPostAmendmentReviewWiring:
         # (ii) the post-amendment (round-1) _review is called with a non-None
         # amendment_ctx carrying the pre-amendment SHA and the round-0 in-scope
         # suggestions; the round-0 review is NOT scoped (amendment_ctx=None).
-        assert wf._review.await_count == 2
-        assert _review_amendment_ctx(wf._review.await_args_list[0]) is None
-        review_ctx = _review_amendment_ctx(wf._review.await_args_list[1])
+        review_mock = cast(AsyncMock, wf._review)
+        assert review_mock.await_count == 2
+        assert _review_amendment_ctx(review_mock.await_args_list[0]) is None
+        review_ctx = _review_amendment_ctx(review_mock.await_args_list[1])
         assert isinstance(review_ctx, AmendmentReviewContext)
         assert review_ctx.pre_amendment_head == _PRE_AMENDMENT_SHA
         assert review_ctx.amended_suggestions == [in_scope]
 
         # (iii) _apply_amendment_delta_scope runs EXACTLY ONCE — for the
         # round-1 post-amendment review only (round-0's used_ctx is None).
-        wf._apply_amendment_delta_scope.assert_awaited_once()
-        scope_args = wf._apply_amendment_delta_scope.await_args.args
+        scope_mock = cast(AsyncMock, wf._apply_amendment_delta_scope)
+        scope_mock.assert_awaited_once()
+        assert scope_mock.await_args is not None
+        scope_args = scope_mock.await_args.args
         assert scope_args[0] is round1  # scoped the round-1 verdict
         assert scope_args[1] is review_ctx  # with the consume-once ctx
