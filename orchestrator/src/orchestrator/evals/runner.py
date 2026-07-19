@@ -414,6 +414,12 @@ async def run_architect_eval(
     cost_usd = 0.0
     arch_duration_ms = 0
     outcome = 'done'
+    # Honor the operator's --timeout around the LIVE architect invoke, exactly
+    # as run_eval bounds workflow.run(). timeout_override is in MINUTES
+    # (run_eval convention — the CLI threads the same --timeout to both); without
+    # this a hung architect run would block indefinitely, bounded only by
+    # max_budget_usd.
+    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
     try:
         # 2. Eval orch config (project_root / verify / profile parity).
         orch_config = build_eval_orch_config(
@@ -434,18 +440,21 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = BriefingAssembler(orch_config)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-        result = await invoke_agent(
-            prompt=prompt,
-            system_prompt=ARCHITECT.system_prompt,
-            cwd=worktree,
-            model=config.model,
-            max_turns=task.get('max_architect_turns', 50),
-            max_budget_usd=config.max_budget_usd,
-            allowed_tools=ARCHITECT.allowed_tools or None,
-            disallowed_tools=ARCHITECT.disallowed_tools or None,
-            effort=config.effort or 'high',
-            backend=config.backend,
-            env_overrides=config.env_overrides or None,
+        result = await asyncio.wait_for(
+            invoke_agent(
+                prompt=prompt,
+                system_prompt=ARCHITECT.system_prompt,
+                cwd=worktree,
+                model=config.model,
+                max_turns=task.get('max_architect_turns', 50),
+                max_budget_usd=config.max_budget_usd,
+                allowed_tools=ARCHITECT.allowed_tools or None,
+                disallowed_tools=ARCHITECT.disallowed_tools or None,
+                effort=config.effort or 'high',
+                backend=config.backend,
+                env_overrides=config.env_overrides or None,
+            ),
+            timeout=timeout_minutes * 60,
         )
         cost_usd = result.cost_usd
         arch_duration_ms = result.duration_ms
@@ -453,6 +462,12 @@ async def run_architect_eval(
             outcome = 'blocked'
         # 5. Read the produced plan artifact (the scoring input).
         plan = artifacts.read_plan() or {}
+    except TimeoutError:
+        logger.error(
+            f'Architect eval {task_id} × {config.name} timed out after '
+            f'{timeout_minutes}m'
+        )
+        outcome = 'timeout'
     except Exception as e:
         logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
         outcome = 'blocked'

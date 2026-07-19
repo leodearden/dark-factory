@@ -153,6 +153,34 @@ class TestScorePlanStructure:
             assert isinstance(s, float)
             assert 0.0 <= s <= 1.0
 
+    # -- Fail-loud contract on a malformed CODE-OWNED rubric --------------
+    # The rubric is code-owned, so a typo (unregistered criterion), an empty
+    # criteria list, or a non-positive total weight must raise ValueError rather
+    # than silently mis-score (loud-over-silent / structured-facts-at-failure).
+    # These raise paths only fire when the plan HAS steps — an empty/None plan
+    # short-circuits to 0.0 before any criterion is dispatched — so each test
+    # feeds a well-formed plan alongside the malformed rubric.
+
+    def test_unknown_criterion_name_raises_value_error(self):
+        from orchestrator.evals.judge import score_plan_structure
+
+        bad_rubric = {'criteria': [{'name': 'no_such_detector', 'weight': 1.0}]}
+        with pytest.raises(ValueError, match='unknown plan-quality criterion'):
+            score_plan_structure(_well_formed_plan(), rubric=bad_rubric)
+
+    def test_empty_criteria_list_raises_value_error(self):
+        from orchestrator.evals.judge import score_plan_structure
+
+        with pytest.raises(ValueError, match='no criteria'):
+            score_plan_structure(_well_formed_plan(), rubric={'criteria': []})
+
+    def test_non_positive_total_weight_raises_value_error(self):
+        from orchestrator.evals.judge import score_plan_structure
+
+        zero_weight_rubric = {'criteria': [{'name': 'has_steps', 'weight': 0.0}]}
+        with pytest.raises(ValueError, match='total weight'):
+            score_plan_structure(_well_formed_plan(), rubric=zero_weight_rubric)
+
 
 # ---------------------------------------------------------------------------
 # LLM plan judge judge_plan_quality (step-5/6)
@@ -338,11 +366,13 @@ async def _run_architect_eval_hermetic(
     judge_return=None,
     judge_side_effect=None,
     arch_success: bool = True,
+    invoke_side_effect=None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
     Returns ``(result, mocks)`` where ``mocks`` exposes the invoke/verify/save/
-    judge mocks for assertions.
+    judge mocks for assertions. ``invoke_side_effect`` lets a test make the live
+    architect invoke raise (e.g. ``TimeoutError`` to simulate --timeout expiry).
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -355,7 +385,7 @@ async def _run_architect_eval_hermetic(
     arch_result = MagicMock(
         success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
     )
-    mock_invoke = AsyncMock(return_value=arch_result)
+    mock_invoke = AsyncMock(return_value=arch_result, side_effect=invoke_side_effect)
 
     artifacts_instance = MagicMock()
     artifacts_instance.read_plan.return_value = produced_plan
@@ -459,6 +489,21 @@ class TestRunArchitectEval:
         )
         assert result.metrics['plan_quality'] == score_plan_structure(plan)
         assert result.metrics['plan_quality'] is not None
+
+    async def test_architect_timeout_maps_to_timeout_outcome(self):
+        # A hung architect invoke surfaces as TimeoutError — what asyncio.wait_for
+        # raises when the operator's --timeout expires. run_architect_eval must
+        # honor the timeout and map it to outcome='timeout' (mirroring run_eval),
+        # NOT the generic 'blocked', while still emitting a non-sentinel
+        # plan_quality float.
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            invoke_side_effect=TimeoutError(),
+        )
+        assert result.outcome == 'timeout'
+        assert isinstance(result.metrics['plan_quality'], float)
+        assert result.metrics['role_under_test'] == 'architect'
 
 
 # ---------------------------------------------------------------------------
