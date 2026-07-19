@@ -17,7 +17,9 @@ follows precisely.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -306,3 +308,155 @@ class TestArchitectEvalConfigs:
         assert cfg is not None
         assert cfg.name == name
         assert cfg.role == 'architect'
+
+
+# ---------------------------------------------------------------------------
+# run_architect_eval — the plan-only architect eval entry (step-9/10)
+#
+# Reuses the _run_plan_only invocation sequence (create_eval_worktree at
+# pre_task_commit → TaskArtifacts.init → briefing.build_architect_prompt →
+# invoke_agent(ARCHITECT) → read_plan), materializes the landed reference diff,
+# scores via judge_plan_quality (degrading to score_plan_structure), and
+# persists an EvalResult with role_under_test='architect'. DOWNSTREAM roles are
+# FROZEN — only the architect runs. All boundaries patched (hermetic).
+# ---------------------------------------------------------------------------
+
+def _arch_task() -> dict:
+    return {
+        'id': 'df_task_2605',
+        'name': 'implement the widget',
+        'project_root': '/fake/project',
+        'pre_task_commit': 'basecommit123',
+        'reference': {'post_task_commit': 'postcommit456'},
+        'task_definition': {'title': 'Widget', 'description': 'implement the widget'},
+    }
+
+
+async def _run_architect_eval_hermetic(
+    cfg,
+    *,
+    produced_plan: dict,
+    judge_return=None,
+    judge_side_effect=None,
+    arch_success: bool = True,
+):
+    """Drive run_architect_eval with every git/worktree/LLM boundary patched.
+
+    Returns ``(result, mocks)`` where ``mocks`` exposes the invoke/verify/save/
+    judge mocks for assertions.
+    """
+    from orchestrator.evals import runner
+    from orchestrator.evals.judge import PlanQualityVerdict
+
+    if judge_return is None and judge_side_effect is None:
+        judge_return = PlanQualityVerdict(
+            plan_quality=0.77, per_criterion={}, reasoning='good',
+        )
+
+    arch_result = MagicMock(
+        success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
+    )
+    mock_invoke = AsyncMock(return_value=arch_result)
+
+    artifacts_instance = MagicMock()
+    artifacts_instance.read_plan.return_value = produced_plan
+
+    briefing_instance = MagicMock()
+    briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
+
+    mock_judge = AsyncMock(return_value=judge_return, side_effect=judge_side_effect)
+    mock_verify = AsyncMock()
+    mock_save = MagicMock()
+
+    with contextlib.ExitStack() as es:
+        p = es.enter_context
+        p(patch('orchestrator.evals.snapshots.create_eval_worktree',
+                AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
+        p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock()))
+        p(patch('orchestrator.evals.snapshots.get_diff_between_commits',
+                AsyncMock(return_value='--- a/x\n+++ b/x\n+ landed change\n')))
+        p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
+        p(patch('orchestrator.artifacts.TaskArtifacts',
+                MagicMock(return_value=artifacts_instance)))
+        p(patch('orchestrator.agents.briefing.BriefingAssembler',
+                MagicMock(return_value=briefing_instance)))
+        p(patch('orchestrator.evals.runner.build_eval_orch_config',
+                MagicMock(return_value=MagicMock())))
+        p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
+        p(patch('orchestrator.evals.runner.save_result', mock_save))
+        p(patch('orchestrator.evals.runner.load_task',
+                MagicMock(return_value=_arch_task())))
+        p(patch('orchestrator.verify.run_verification', mock_verify))
+        result = await runner.run_architect_eval(
+            Path('/fake/task.json'), cfg, base_config=MagicMock(),
+        )
+    return result, {
+        'invoke': mock_invoke, 'verify': mock_verify,
+        'save': mock_save, 'judge': mock_judge,
+    }
+
+
+@pytest.mark.asyncio
+class TestRunArchitectEval:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_scores_plan_freezes_downstream_and_persists(self):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        # NON-sentinel plan_quality float + role_under_test stamped.
+        assert isinstance(result.metrics['plan_quality'], float)
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['role_under_test'] == 'architect'
+        assert result.config_name == 'architect-sonnet-high'
+        assert result.task_id == 'df_task_2605'
+
+        # Architect invoked with the CANDIDATE's model/backend/effort.
+        kw = mocks['invoke'].call_args.kwargs
+        assert kw['model'] == 'sonnet'
+        assert kw['backend'] == 'claude'
+        assert kw['effort'] == 'high'
+
+        # DOWNSTREAM roles FROZEN: exactly ONE agent invocation (the architect),
+        # and verification never runs.
+        assert mocks['invoke'].call_count == 1
+        mocks['verify'].assert_not_called()
+
+        # Persisted via save_result.
+        mocks['save'].assert_called_once()
+
+    async def test_judge_failure_degrades_to_deterministic_floor(self):
+        from orchestrator.evals.judge import PlanQualityVerdict, score_plan_structure
+
+        plan = _well_formed_plan()
+        # Judge returns the None sentinel (parse failure) → run_architect_eval
+        # must degrade to the deterministic structural floor, never a null.
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=PlanQualityVerdict(
+                plan_quality=None, per_criterion={}, reasoning='parse failure',
+            ),
+        )
+        assert result.metrics['plan_quality'] is not None
+        assert result.metrics['plan_quality'] == score_plan_structure(plan)
+        assert result.metrics['role_under_test'] == 'architect'
+
+    async def test_judge_raising_still_yields_non_sentinel_score(self):
+        from orchestrator.evals.judge import score_plan_structure
+
+        plan = _well_formed_plan()
+        # Even if the judge RAISES, plan_quality must be the deterministic floor.
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_side_effect=RuntimeError('judge exploded'),
+        )
+        assert result.metrics['plan_quality'] == score_plan_structure(plan)
+        assert result.metrics['plan_quality'] is not None
