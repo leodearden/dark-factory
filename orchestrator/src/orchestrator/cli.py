@@ -932,9 +932,21 @@ def _run_single_eval(
     force: bool = False, timeout: int | None = None,
     worktree_path: Path | None = None,
 ):
-    """Run eval for a single task with one or all configs."""
+    """Run eval for a single task with one or all configs.
+
+    A candidate whose ``role == 'architect'`` (eval-revival θ) is dispatched to
+    ``run_architect_eval`` — the plan-only architect eval that scores the
+    produced plan against the real landed diff and FREEZES every downstream
+    role — and its per-fixture ``plan_quality`` score is surfaced (plus a
+    plan-quality table across all architect runs). Ordinary implementer configs
+    still route to ``run_eval``, unchanged.
+    """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
-    from orchestrator.evals.runner import run_eval
+    from orchestrator.evals.report import (
+        build_plan_quality_report,
+        format_plan_quality_table,
+    )
+    from orchestrator.evals.runner import run_architect_eval, run_eval
 
     all_configs = EVAL_CONFIGS
 
@@ -949,14 +961,39 @@ def _run_single_eval(
         configs = all_configs
 
     async def _run():
+        architect_results = []
         for cfg in configs:
-            result = await run_eval(
-                task_path, cfg, base_config, timeout_override=timeout,
-                worktree_path=worktree_path,
-            )
+            if cfg.role == 'architect':
+                # θ: plan-only architect eval — downstream roles frozen.
+                # run_architect_eval manages its own eval worktree at the
+                # fixture's pre_task_commit, so it takes no worktree_path.
+                result = await run_architect_eval(
+                    task_path, cfg, base_config, timeout_override=timeout,
+                )
+                architect_results.append(result)
+                plan_quality = result.metrics.get('plan_quality')
+                click.echo(
+                    f'{result.task_id} × {result.config_name}: '
+                    f'{result.outcome} plan_quality={plan_quality} '
+                    f'({result.wall_clock_ms / 1000:.1f}s)'
+                )
+            else:
+                result = await run_eval(
+                    task_path, cfg, base_config, timeout_override=timeout,
+                    worktree_path=worktree_path,
+                )
+                click.echo(
+                    f'{result.task_id} × {result.config_name}: '
+                    f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
+                )
+
+        # Surface the θ plan-quality table across all architect runs.
+        if architect_results:
+            click.echo('')
             click.echo(
-                f'{result.task_id} × {result.config_name}: '
-                f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
+                format_plan_quality_table(
+                    build_plan_quality_report(architect_results)
+                )
             )
 
     asyncio.run(_run())
