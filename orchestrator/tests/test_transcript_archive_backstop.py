@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -101,4 +103,81 @@ class TestBackstop:
         with gzip.open(gz, 'rb') as fh:
             assert fh.read() == fake_bytes
         # Teardown still happened — the backstop runs before removal, not instead.
+        assert not wt.path.exists()
+
+    async def test_idempotent_skip_leaves_prior_archive_untouched(self, git_repo):
+        """A session already archived (matching mtime) is skipped; a fresh one is
+        archived. Proves producer→backstop idempotency (E3) rides the shared
+        helper's int-truncated size/mtime skip — the backstop is a no-op for
+        transcripts the producer already captured."""
+        tid = '2786'
+        git_ops = _make_git_ops(git_repo, transcript_archive=TranscriptArchiveConfig())
+        wt = await git_ops.create_worktree(tid)
+
+        # Session A: already archived. Lay down the source, then pre-create its
+        # gz mirror with a DISTINCTIVE marker payload and a mirrored mtime so the
+        # helper's ``int(dest.mtime) == int(src.mtime)`` skip fires — re-archiving
+        # would overwrite the marker with a real gzip of the source.
+        src_a = _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
+        gz_a = _archived_gz(git_repo, tid, 'A')
+        gz_a.parent.mkdir(parents=True, exist_ok=True)
+        gz_a.write_bytes(b'STALE-MARKER-NOT-A-REAL-GZIP')
+        src_mtime = src_a.stat().st_mtime
+        os.utime(gz_a, (src_mtime, src_mtime))
+
+        # Session B: un-archived.
+        _write_transcript(wt.path, tid, 'B', b'{"b":2}\n')
+
+        await git_ops.cleanup_worktree(wt.path, tid)
+
+        # A skipped: marker payload AND mtime both unchanged.
+        assert gz_a.read_bytes() == b'STALE-MARKER-NOT-A-REAL-GZIP'
+        assert int(gz_a.stat().st_mtime) == int(src_mtime)
+        # B newly archived to a real gzip of its source.
+        gz_b = _archived_gz(git_repo, tid, 'B')
+        assert gz_b.exists()
+        with gzip.open(gz_b, 'rb') as fh:
+            assert fh.read() == b'{"b":2}\n'
+        assert not wt.path.exists()
+
+    async def test_arg_wiring_positional_session_none_and_archive_root(self, git_repo):
+        """The backstop calls the helper with ``(config_dir, task_id, None)``
+        positionally and ``archive_root=project_root/root`` — the exact contract
+        the producer uses, so the size/mtime skip fires across producer→backstop.
+        session_id=None is what makes it archive ANY un-archived transcript (the
+        abandoned-in-flight tail), not just one session's."""
+        tid = '2786'
+        git_ops = _make_git_ops(git_repo, transcript_archive=TranscriptArchiveConfig())
+        wt = await git_ops.create_worktree(tid)
+        # Lay down a transcript so the config dir exists (survives step-4's
+        # config_dir.exists() fast-skip guard).
+        _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
+
+        with patch('orchestrator.git_ops.archive_task_transcripts') as mock_helper:
+            await git_ops.cleanup_worktree(wt.path, tid)
+
+        mock_helper.assert_called_once_with(
+            wt.path / '.task' / f'claude-config-{tid}',
+            tid,
+            None,
+            archive_root=git_repo / 'data' / 'orchestrator' / 'agent-transcripts',
+        )
+        assert not wt.path.exists()
+
+    async def test_missing_config_dir_is_a_thread_free_no_op(self, git_repo):
+        """When the per-task config dir is already gone (external worktrees,
+        already-cleaned dirs), the backstop is a cheap no-op — it never spins up a
+        worker thread to archive nothing. Drives step-4's ``config_dir.exists()``
+        fast-skip: without that guard the helper is still invoked on an empty
+        glob."""
+        tid = '2786'
+        git_ops = _make_git_ops(git_repo, transcript_archive=TranscriptArchiveConfig())
+        wt = await git_ops.create_worktree(tid)
+        # Deliberately lay down NO transcript, so the config dir never exists.
+        assert not (wt.path / '.task' / f'claude-config-{tid}').exists()
+
+        with patch('orchestrator.git_ops.archive_task_transcripts') as mock_helper:
+            await git_ops.cleanup_worktree(wt.path, tid)
+
+        mock_helper.assert_not_called()
         assert not wt.path.exists()
