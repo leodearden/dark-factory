@@ -6959,6 +6959,78 @@ class GitOps:
             pairs.append((sha, subject))
         return pairs
 
+    async def find_equivalent_commit(
+        self, worktree: Path, base_sha: str, target_sha: str,
+    ) -> str | None:
+        """Recover the sha a rebase replayed *target_sha* onto, via ``git patch-id``.
+
+        When a requeue / inter-iteration rebase rewrites a task branch, an
+        already-recorded done-step commit (*target_sha*) can be orphaned — no
+        longer reachable from HEAD — even though its content was replayed
+        byte-for-byte onto the new base as a fresh commit. This locates that
+        replayed commit so :meth:`TaskWorkflow._reconcile_done_step_commits`
+        can re-point the plan step to it instead of escalating.
+
+        Two tiers, tried in order:
+
+        1. **patch-id** (exact): compute *target_sha*'s patch-id
+           (``git log -p -1 --no-color`` piped to ``git patch-id --stable``)
+           and look it up in a ``{patch-id: sha}`` map built the same way over
+           ``base_sha..HEAD``. ``git patch-id --stable`` hashes the normalized
+           diff hunks, so a clean replay reproduces byte-identical hunks and an
+           identical patch-id — the canonical, whitespace/line-number-robust
+           equivalence the ``git cherry`` dedup in
+           :meth:`rebase_preserving_task_commits` also relies on. Using the
+           identical diff-emitting command (``git log -p``) for both the single
+           target and the range guarantees both sides are normalized by the
+           same code path. The ``<patch-id> <sha>`` line the range form emits
+           maps the shared patch-id to the REPLAYED (HEAD-side) sha, which is
+           exactly the remap target.
+        2. **unique exact-subject** (fallback): added in task 2762 step-6 —
+           for now this method returns ``None`` after a patch-id miss.
+
+        Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
+        empty patch-id output yields ``None``, letting the caller fall through
+        to its existing escalation path. No persisted state — the mapping is
+        re-derived from live git on every call, so it behaves identically
+        across orchestrator restarts, and a false negative simply reverts to
+        the pre-fix baseline rather than sinking the caller. Same best-effort
+        posture as :meth:`get_commit_subjects` / :meth:`get_commit_changed_files`.
+        """
+        try:
+            # Tier 1: patch-id equivalence. Compute the orphaned target's
+            # patch-id from its own diff.
+            rc, target_diff, _ = await _run(
+                ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=worktree,
+            )
+            if rc != 0 or not target_diff.strip():
+                return None
+            _, target_pid_out, _ = await _run(
+                ['git', 'patch-id', '--stable'], cwd=worktree, input_text=target_diff,
+            )
+            target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
+
+            # Build the {patch-id: sha} map over base..HEAD (the live branch).
+            rc, range_diff, _ = await _run(
+                ['git', 'log', '-p', '--no-color', f'{base_sha}..HEAD'], cwd=worktree,
+            )
+            if rc == 0 and range_diff.strip():
+                _, range_pid_out, _ = await _run(
+                    ['git', 'patch-id', '--stable'], cwd=worktree, input_text=range_diff,
+                )
+                pid_to_sha: dict[str, str] = {}
+                for line in range_pid_out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        pid_to_sha[parts[0]] = parts[1]
+                if target_pid and target_pid in pid_to_sha:
+                    return pid_to_sha[target_pid]
+
+            # Tier 2 (unique exact-subject fallback) added in task 2762 step-6.
+            return None
+        except Exception:
+            return None
+
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
         """Return list of files changed between two commits."""
         _, output, _ = await _run(
