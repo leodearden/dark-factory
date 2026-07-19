@@ -212,7 +212,12 @@ class CandidateTask:
     spawned_from: str | None = None  # task id of the review-chain anchor
     spawn_context: str = 'manual'  # review | steward-triage | planning | manual
     # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
-    # feeds operational_ask_registry.match_candidate's routing axis (task 2687).
+    # consulted by operational_ask_registry.match_candidate. Its routing axis
+    # (task 2687) is DEMOTED (task δ): a tagged operational/decision candidate is
+    # now SKIPPED (match_candidate returns None) because the submit boundary
+    # inject_operational_routing (task β) already owns tagged-ask routing;
+    # untagged asks still use the substring fallback. Also part of payload_hash
+    # (see below).
     execution_class: str | None = None
 
     def payload_hash(self) -> str:
@@ -232,13 +237,17 @@ class CandidateTask:
         h.update(b'\x00')
         h.update((self.spawned_from or '').encode())
         h.update(b'\x00')
-        # execution_class routes match_candidate FIRST and unconditionally
-        # (task 2687), so it must be hashed too — otherwise two candidates that
-        # differ ONLY in execution_class collide and the first-processed one's
-        # cached routing decision (e.g. a deterministic pure-gate) is wrongly
-        # returned for the second (e.g. a code_tdd change), silently skipping
-        # the architect. This is the dangerous false-positive the module
-        # docstring warns against.
+        # execution_class is hashed too (task 2687; rationale corrected task δ).
+        # The match_candidate routing axis is now DEMOTED — a tagged
+        # operational/decision candidate returns None from the route guard
+        # rather than routing (task δ) — but two candidates differing ONLY in
+        # execution_class can STILL resolve to different curator decisions: a
+        # tagged operational candidate returns None from _maybe_route_deterministic
+        # and proceeds to the LLM create/drop/combine path (which IS cached),
+        # while an otherwise-identical untagged candidate may substring-route or
+        # take a different LLM decision. Dropping execution_class from the hash
+        # would let one's cached decision be wrongly returned for the other, so
+        # it must remain part of the key.
         h.update((self.execution_class or '').encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the other
@@ -1124,14 +1133,17 @@ class TaskCurator:
         - The registry is empty.
         - No entry matches the candidate.
 
-        Note (task 2687): this includes candidates whose
-        ``metadata.execution_class`` is ``"operational"`` or ``"decision"``.
-        ``operational_ask_registry.match_candidate``'s execution_class axis
-        is authoritative and wording-independent *once it runs*, but it is
-        only reached after the registry-availability checks above already
-        passed — a missing/unconfigured/empty registry disables that axis
-        too and falls open to the architect, consistent with this method's
-        best-effort degradation philosophy.
+        Note (task δ demotion): a candidate whose ``metadata.execution_class``
+        is ``"operational"`` or ``"decision"`` now returns ``None`` here too —
+        not because it fell through to the last bullet, but because
+        ``operational_ask_registry.match_candidate`` SKIPS tagged asks
+        outright. Their routing is owned by the submit boundary
+        ``operational_routing_guard.inject_operational_routing`` (task β),
+        which coerces every tagged operational/decision ask to a deterministic
+        pure-gate on the submit path; a second coercion in the curator would be
+        lock-step duplication (INV-5). The curator retains ONLY the untagged
+        title/description substring fallback (task 2687 introduced the axis;
+        task δ narrowed it to a skip once the β boundary took ownership).
 
         Never raises.
         """
