@@ -725,6 +725,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - PROMOTED (L2 esc-42-9): design_concern — task-88 — architectural question about X
 - PROMOTED (L2 esc-42-10): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 
+### Auto-closed L1 (done-step-commit orphan amend-fold)
+- AUTO-CLOSED (L1 esc-2731-10): orphan-reaper-amend-folded-step-recurring-df — task-2731 — task status=done; deliverable(s) present on main; delivered_checks: none declared; branch task/2731 is-ancestor-of main: YES; orphan 9f8e7d6 not ancestor of main, file(s) present-and-evolved on main [benign]
+
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
 - AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false [benign]
