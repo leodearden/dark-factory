@@ -23,7 +23,12 @@ conditional config).
 """
 from __future__ import annotations
 
+import json
+from typing import Any
+
+from orchestrator.harness import _extract_tagger_entries
 from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.module_tagger_prompt import build_tagger_prompt
 
 
 def set_scores(predicted: list, gold: list) -> dict[str, float]:
@@ -55,3 +60,59 @@ def set_scores(predicted: list, gold: list) -> dict[str, float]:
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     return {'precision': precision, 'recall': recall, 'f1': f1, 'jaccard': jaccard}
+
+
+def build_replay_input(task: dict, top_level_dirs: list) -> dict:
+    """Build the per-task summary the tagger replays over.
+
+    Mirrors ``harness._tag_task_modules`` exactly: ``id`` is stringified, and
+    ``description`` falls back to ``details`` (then to ``''``) so the tagger
+    still has context when the description is empty. *top_level_dirs* is accepted
+    for call-signature uniformity with ``faithful_prompt_for`` (the dir listing
+    is embedded by the shared prompt builder, not by this per-task summary).
+    """
+    return {
+        'id': str(task.get('id', '')),
+        'title': task.get('title', ''),
+        'description': task.get('description') or task.get('details') or '',
+    }
+
+
+def faithful_prompt_for(task: dict, top_level_dirs: list) -> str:
+    """Build the module-tagger prompt for a SINGLE task, faithfully.
+
+    Delegates to the shared production builder
+    (``module_tagger_prompt.build_tagger_prompt``) over a single-element summary
+    list, so the replay's prompt is byte-identical to what production would send
+    "at the call site" — no drifting hand-copy.
+    """
+    summary = build_replay_input(task, top_level_dirs)
+    return build_tagger_prompt(top_level_dirs, [summary])
+
+
+def parse_predictions(agent_result: Any) -> list[str]:
+    """Extract the predicted file list from a single-task tagger replay result.
+
+    Reads ``AgentResult.structured_output`` first (falling back to
+    ``json.loads(result.output)``), then reuses ``harness._extract_tagger_entries``
+    to peel known StructuredOutput wrapper keys ('predictions'/legacy 'tasks')
+    before flattening the entries' ``files`` into one list. A missing/unparseable
+    payload yields ``[]`` (fail-safe, matching the harness bad-output early
+    return). The replay invokes one task at a time, so the flattened list is that
+    task's prediction.
+    """
+    payload = getattr(agent_result, 'structured_output', None)
+    if not payload:
+        output = getattr(agent_result, 'output', None)
+        try:
+            payload = json.loads(output) if output else None
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+    if not payload:
+        return []
+
+    files: list[str] = []
+    for entry in _extract_tagger_entries(payload):
+        if isinstance(entry, dict):
+            files.extend(entry.get('files') or [])
+    return files
