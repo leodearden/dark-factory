@@ -183,3 +183,36 @@ class TestClaudeEndpointPriceTable:
 
         assert cost_source == 'price_table'
         assert cost == expected_cost
+
+
+class TestGetConfigByNameAndPropagation:
+    """Selection + endpoint propagation — the dispatch-reaches-endpoint signal:
+    an OFAT eval run resolves a ν bundle by name and dispatches the
+    implementer to its non-incumbent endpoint."""
+
+    def test_get_config_by_name_resolves_a_non_incumbent_bundle(self):
+        from orchestrator.evals.configs import GLM_MODEL, get_config_by_name
+
+        cfg = get_config_by_name('glm-5.2-endpoint')
+        assert cfg is not None
+        assert cfg.model == GLM_MODEL
+
+    def test_build_eval_orch_config_propagates_endpoint_and_model(self, tmp_path):
+        # Mirrors test_eval_driver.py::_base_config's load_config() pattern:
+        # a minimal YAML setting only project_root, layered over the packaged
+        # defaults.yaml through the real production config-load entry point.
+        from orchestrator.config import load_config
+        from orchestrator.evals.configs import GLM_BASE_URL, get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(f'project_root: {tmp_path}\n')
+        base = load_config(cfg_path)
+
+        bundle = get_config_by_name('glm-5.2-endpoint')
+        assert bundle is not None
+
+        orch_config = build_eval_orch_config(bundle, {}, base)
+
+        assert orch_config.env_overrides.get('ANTHROPIC_BASE_URL') == GLM_BASE_URL
+        assert orch_config.models.implementer == bundle.model
