@@ -541,26 +541,58 @@ def test_recon_stage_prompts_carry_source_completion_directives():
     ``submit_task`` and files the residual itself; Stage 1
     (``STAGE1_SYSTEM_PROMPT``, ``can_file_tasks=False`` in stage1.py) does
     NOT hold it (``DISALLOW_TASK_WRITES``) and must relay to Stage 2 via
-    ``flag_for_stage2`` instead. Assertions are scoped to load-bearing
-    directive TOKENS (not exact prose), per the plan's scoping rationale —
-    this mirrors the ε leaf's own rendered-prompt test and realizes the
-    PRD's row-7 signal on the actual runtime artifact the LLM receives.
+    ``flag_for_stage2`` instead.
+
+    Assertions are split into two groups, both against real runtime
+    artifacts (never a docstring/comment):
+
+    1. Wiring, on the fully ASSEMBLED prompts: the section header and the
+       execution_class/operational_mode metadata literals. These are stable
+       because they are the actual field=value tokens the alpha/beta
+       machinery reads elsewhere in the codebase, not free-form prose that
+       could be benignly copy-edited.
+    2. The can_file_tasks-conditional residual-clause split, checked directly
+       against ``render_source_completion_section``'s own return value —
+       the exact string each assembled prompt's f-string interpolates
+       verbatim, so this is still the rendered content, just scoped
+       precisely — using backtick-quoted tool/field NAME tokens
+       (``submit_task``, ``flag_for_stage2``, ``flagged_items``: real
+       identifiers used elsewhere in the codebase, not English clauses).
+       Searching the full ~600-line assembled prompt for these same short
+       names would NOT actually discriminate the split: each recurs there
+       for unrelated reasons (e.g. Stage 2's own "Splitting Tasks" section
+       also mentions submit_task, and Stage 1 documents flag_for_stage2
+       extensively elsewhere), so an un-scoped token check would pass
+       regardless of which branch actually rendered. Scoping to the render
+       function's own output avoids that false-pass risk while still
+       avoiding fragile full-English-clause pinning (prior prose pins
+       'file it yourself' / 'Relay it to Stage 2' would break on a benign
+       reword with no behavioral regression).
     """
     from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
     from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+    from fused_memory.reconciliation.recon_self_model import render_source_completion_section
 
     stage1_prompt = STAGE1_SYSTEM_PROMPT
     stage2_prompt = build_stage2_system_prompt('dark_factory')
 
     for prompt in (stage1_prompt, stage2_prompt):
         assert '## Source-Completion' in prompt, f'missing section header: {prompt!r}'
-        assert 'COMPLETE the merge inline' in prompt, f'missing inline-merge directive: {prompt!r}'
         assert "execution_class='operational'" in prompt, f'missing execution_class guidance: {prompt!r}'
         assert "operational_mode='gate'" in prompt, f'missing operational_mode guidance: {prompt!r}'
 
-    # Residual-clause split (can_file_tasks): each unique phrase appears in
-    # exactly the stage whose tool authority it describes.
-    assert 'file it yourself' in stage2_prompt
-    assert 'file it yourself' not in stage1_prompt
-    assert 'Relay it to Stage 2' in stage1_prompt
-    assert 'Relay it to Stage 2' not in stage2_prompt
+    # Residual-clause split (can_file_tasks), scoped to the render function's
+    # own output rather than searched for inside the surrounding assembled
+    # prompt (see docstring). Tokens are backtick-quoted tool/field NAMES,
+    # not English clauses, so a prose copy-edit to the surrounding sentence
+    # cannot break this — only an actual change to which tool/channel each
+    # stage is told to use would.
+    stage2_section = render_source_completion_section(can_file_tasks=True)
+    stage1_section = render_source_completion_section(can_file_tasks=False)
+
+    assert '`submit_task`' in stage2_section, f'got {stage2_section!r}'
+    assert '`flag_for_stage2`' not in stage2_section, f'got {stage2_section!r}'
+
+    assert '`flag_for_stage2`' in stage1_section, f'got {stage1_section!r}'
+    assert '`flagged_items`' in stage1_section, f'got {stage1_section!r}'
+    assert '`submit_task`' not in stage1_section, f'got {stage1_section!r}'
