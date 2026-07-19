@@ -881,7 +881,16 @@ def _iteration_entry_is_work(entry: dict) -> bool:
     - ``'judge'`` ``early_exit`` entries count only when ``substantive_work``
       is True (workflow.py ~4559) — a judge can legitimately declare a task
       complete with zero plan-steps marked done.
+
+    An entry that explicitly recorded no durable commit (``committed is False``,
+    task 2759) is not prior-implementation work regardless of agent type — the
+    round ended before HEAD advanced (implementer died mid-background-wait,
+    amendment left uncommitted, …). Discriminates on the explicit ``False``
+    flag only: legacy entries lacking the key (``entry.get('committed') is
+    None``) fall through to today's classification unchanged.
     """
+    if entry.get('committed') is False:
+        return False
     agent = entry.get('agent')
     if agent == 'debugger':
         return True
