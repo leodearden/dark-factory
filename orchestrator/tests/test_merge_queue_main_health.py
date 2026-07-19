@@ -1403,7 +1403,7 @@ class TestTrivialPassMainRedGate:
         assert outcome.disposition == MergeFailureDisposition.MAIN_RED, (
             f'a pre-existing main red must be attributed MAIN_RED; got {outcome.disposition!r}'
         )
-        git_ops.cleanup_merge_worktree.assert_awaited_with(merge_wt)
+        cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_awaited_with(merge_wt)
 
     def test_b_green_baseline_advances_trivial_pass(self, tmp_path: Path) -> None:
         """seed EMPTY (green) baseline + trivial pass -> None (advance)."""
@@ -1421,7 +1421,7 @@ class TestTrivialPassMainRedGate:
         assert outcome is None, (
             f'a trivial pass over a KNOWN-green main must advance; got {outcome!r}'
         )
-        git_ops.cleanup_merge_worktree.assert_not_awaited()
+        cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_not_awaited()
 
     def test_c_cold_baseline_fails_open_advances(self, tmp_path: Path) -> None:
         """no seed (cold/unknown baseline) + trivial pass -> None (fail-open)."""
