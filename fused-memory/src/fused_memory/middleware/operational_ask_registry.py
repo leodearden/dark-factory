@@ -16,32 +16,38 @@ anchors even though the task is a bug fix, not an operational ask. Because a
 route decision short-circuits the LLM entirely, there is no downstream
 classifier to catch that false positive (2085 amendment). ``match_candidate``
 therefore checks the candidate's title against ``_CODE_CHANGE_TITLE_SIGNALS``
-first and unconditionally refuses to match when one is present, so such
-asks still reach the architect.
+before consulting any registry entry and refuses to match when one is
+present, so such asks still reach the architect.
 
-Detection axis (task 2687): a candidate whose ``metadata.execution_class``
-is ``"operational"`` or ``"decision"`` (see
-``fused_memory.reconciliation.recon_self_model.EXECUTION_CLASSES``) is
-routed to the deterministic PURE-GATE unconditionally — regardless of title/
-description wording, regardless of the seeded substring entries, and
-regardless of the ``_CODE_CHANGE_TITLE_SIGNALS`` guard above. This is checked
-FIRST in ``match_candidate``, before anything else: an explicit recon-stage
-execution_class declaration is authoritative, so it deliberately bypasses the
-code-change-title-signal guard built for the substring-only entries. Without
-this axis, an operational/decision-tagged ask whose wording doesn't match a
-seeded signature (or whose title happens to contain "fix"/"bug"/etc.) falls
-through to the architect and re-churns the exact latency 2085 eliminated for
-the seeded cases.
+Execution-class demotion (task δ): a candidate whose
+``metadata.execution_class`` is ``"operational"`` or ``"decision"`` (see
+``fused_memory.reconciliation.recon_self_model.EXECUTION_CLASSES``) is NO
+LONGER routed here — ``match_candidate`` returns ``None`` for it EARLY,
+before the ``_CODE_CHANGE_TITLE_SIGNALS`` guard and the substring loop below.
+The submit boundary ``operational_routing_guard.inject_operational_routing``
+(task β) now owns tagged-ask routing: it coerces every tagged operational/
+decision ask to a deterministic PURE-GATE on the submit path, so a second
+coercion site in the curator would be lock-step duplication (INV-5). The
+early ``None`` fires EVEN IF the tagged candidate also incidentally matches a
+substring entry — the boundary is the sole coercion site for tagged asks.
 
-Caveat: the "unconditional" guarantee above describes ``match_candidate``'s
-own logic once it runs — it holds even when ``entries`` is empty. Its sole
-caller, ``TaskCurator._maybe_route_deterministic``, still short-circuits to
-``None`` *before* ever calling ``match_candidate`` when the registry path is
+Task 2687 originally routed tagged asks here (before the β boundary existed);
+task δ narrows that axis to a SKIP now that the boundary owns it. The title/
+description substring entries below are retained ONLY as the untagged-legacy
+fallback — for asks that carry NO execution_class, where the boundary has
+nothing to key on. ``"code_tdd"`` and ``None`` tagging never engaged this
+axis and are unchanged: they fall through to the substring loop (a
+``code_tdd`` ask must still reach the TDD architect).
+
+Caveat: the substring fallback below only runs when the registry is
+configured and non-empty. ``match_candidate``'s sole caller,
+``TaskCurator._maybe_route_deterministic``, short-circuits to ``None``
+*before* ever calling ``match_candidate`` when the registry path is
 unconfigured or the registry file failed to load (missing, unreadable,
-unparseable, or empty). In that state the execution_class axis does not fire
-either, and an operational/decision-tagged candidate falls through to the
-architect like everything else — a deliberate fail-open choice (see that
-method's docstring), not a gap in this axis.
+unparseable, or empty) — a deliberate fail-open choice (see that method's
+docstring). A tagged operational/decision candidate returns ``None`` here
+regardless, so its coverage rests entirely on the β submit boundary, not on
+the registry being loaded.
 
 Usage::
 
@@ -204,36 +210,20 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
 # over recall.
 _CODE_CHANGE_TITLE_SIGNALS: tuple[str, ...] = ("fix", "bug", "crash", "implement")
 
-# Execution-class values that route unconditionally to the deterministic
-# PURE-GATE regardless of title/description wording (task 2687). Mirrors
-# fused_memory.reconciliation.recon_self_model.EXECUTION_CLASSES =
-# ('code_tdd', 'operational', 'decision'), but is spelled out explicitly
-# rather than derived by subtracting 'code_tdd' from that tuple: an explicit
-# set is drift-safe if a future execution class is ever added there that is
-# still code-oriented, since subtraction would silently start routing it too.
-# 'code_tdd' is intentionally excluded — a code_tdd-tagged candidate must
-# still reach the TDD architect.
-_ROUTE_EXECUTION_CLASSES: frozenset[str] = frozenset({"operational", "decision"})
-
-# Synthetic registry entry returned by the execution_class axis in
-# match_candidate(). A real OperationalAskEntry instance so
-# TaskCurator._maybe_route_deterministic's entry.name / entry.reason
-# justification-and-log contract needs no changes: the justification it
-# builds still starts with "operational-ask-registry:", so the existing
-# dispatch/stamping tests continue to pass unmodified. The title/description
-# substrings are inert placeholders — this entry is returned directly by the
-# axis and never reached via the substring-matching loop below.
-_EXECUTION_CLASS_ENTRY = OperationalAskEntry(
-    name="execution_class_operational_or_decision",
-    reason=(
-        "candidate.execution_class is 'operational' or 'decision' — an "
-        "explicit, authoritative recon-stage declaration that this ask is "
-        "not a code change, so it routes to the deterministic PURE-GATE "
-        "regardless of title/description wording (task 2687)"
-    ),
-    title_substrings=["<execution-class-axis>"],
-    description_substrings=["<execution-class-axis>"],
-)
+# Execution-class values the submit boundary OWNS — a candidate tagged with
+# one of these is SKIPPED by match_candidate (returns None early), NOT routed
+# (task δ demotion; task 2687 originally routed them here). The submit
+# boundary operational_routing_guard.inject_operational_routing (task β)
+# coerces every tagged operational/decision ask to a deterministic PURE-GATE
+# on the submit path, so re-routing here would be a second coercion site
+# (INV-5). Mirrors operational_routing_guard._COERCED_EXECUTION_CLASSES =
+# {'operational', 'decision'} for symmetry; spelled out explicitly (NOT
+# derived by subtracting 'code_tdd' from recon_self_model.EXECUTION_CLASSES)
+# so a future code-oriented execution class added there is not silently swept
+# into the skip set. 'code_tdd' is intentionally excluded — a code_tdd-tagged
+# candidate falls through to the substring loop below and must still reach the
+# TDD architect.
+_BOUNDARY_OWNED_EXECUTION_CLASSES: frozenset[str] = frozenset({"operational", "decision"})
 
 
 def match_candidate(
@@ -243,18 +233,21 @@ def match_candidate(
     """Return the first matching registry entry for *candidate*, or ``None``.
 
     Checked FIRST, before anything else: if ``candidate.execution_class``
-    (case-insensitively) is ``"operational"`` or ``"decision"``, this
-    unconditionally returns the synthetic ``_EXECUTION_CLASS_ENTRY`` —
-    regardless of *entries*, the ``_CODE_CHANGE_TITLE_SIGNALS`` guard, or any
-    title/description substring (task 2687). An explicit recon-stage
-    execution_class declaration is authoritative and wording-independent:
-    unlike the substring-based entries below, it deliberately bypasses the
-    code-change-title-signal guard so a mis-worded but explicitly-tagged
-    operational/decision ask (e.g. a title containing "fix") still routes.
-    ``execution_class`` of ``"code_tdd"`` or ``None`` does not engage this
-    axis and falls through to the substring-only behavior below unchanged.
+    (case-insensitively) is ``"operational"`` or ``"decision"``, this returns
+    ``None`` EARLY — regardless of *entries*, the ``_CODE_CHANGE_TITLE_SIGNALS``
+    guard, or any title/description substring (task δ demotion). Such a tagged
+    ask has already been coerced to a deterministic PURE-GATE by the submit
+    boundary ``operational_routing_guard.inject_operational_routing`` (task β),
+    so re-routing it here would be a second coercion site (INV-5). The early
+    ``None`` fires EVEN IF the tagged candidate also matches a substring entry
+    below — it does not fall through to the substring loop. ``execution_class``
+    of ``"code_tdd"`` or ``None`` does not engage this skip and falls through
+    to the substring-only behavior below unchanged (task 2687 originally
+    routed tagged asks here; task δ narrowed the axis to a skip once the β
+    boundary took ownership).
 
-    Absent that axis, matching is case-insensitive string search:
+    For an untagged (or ``"code_tdd"``) candidate, matching is case-insensitive
+    string search (the untagged-legacy fallback):
     - ALL strings in ``entry.title_substrings`` must appear in
       ``candidate.title``.
     - AT LEAST ONE string in ``entry.description_substrings`` must appear in
@@ -273,12 +266,19 @@ def match_candidate(
 
     Pure string operations — no regex, no async, no I/O. Never raises: even a
     malformed (non-string) ``candidate.execution_class`` — e.g. an int or
-    list from a corrupt metadata write — degrades to a no-match on the axis
-    rather than raising, via the ``str(...)`` coercion below.
+    list from a corrupt metadata write — degrades to being treated as untagged
+    (falls through to the substring fallback, not skipped) rather than raising,
+    via the ``str(...)`` coercion below.
     """
+    # Tagged operational/decision asks are OWNED by the submit boundary
+    # (inject_operational_routing, task β), which already coerced this ask to a
+    # deterministic pure-gate; re-routing here would be a second coercion site
+    # (INV-5). Return None EARLY — before the substring loop — so a tagged ask
+    # that incidentally matches an entry is still not routed. The substring
+    # loop below is retained ONLY as the untagged-legacy fallback (task δ).
     execution_class = str(candidate.execution_class or "").strip().lower()
-    if execution_class in _ROUTE_EXECUTION_CLASSES:
-        return _EXECUTION_CLASS_ENTRY
+    if execution_class in _BOUNDARY_OWNED_EXECUTION_CLASSES:
+        return None
 
     title_lower = (candidate.title or "").lower()
 
