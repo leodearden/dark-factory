@@ -51,6 +51,7 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
+
 # NOTE: safe top-level import — operational_routing_guard has NO top-level
 # task_interceptor import (it lazily imports TaskInterceptor inside its
 # function to break the cycle), so this does not create a circular import.
