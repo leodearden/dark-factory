@@ -47,7 +47,7 @@ from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, SIMPLE_TASK
+from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, SessionResumeConfig
 from orchestrator.event_store import EventType
