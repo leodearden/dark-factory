@@ -48,6 +48,21 @@ def _worktree_porcelain_no_branch() -> str:
     )
 
 
+def _worktree_porcelain_prunable(branch: str, path: str = '/tmp/gone') -> str:
+    """Return `git worktree list --porcelain` output for a REAPED worktree.
+
+    Its directory was removed but git still carries a stale registration for
+    *branch*, marked `prunable` — reify#5245's shape.
+    """
+    return (
+        f'worktree {path}\n'
+        f'HEAD abc1234\n'
+        f'branch refs/heads/{branch}\n'
+        'prunable gitdir file points to non-existent location\n'
+        '\n'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -737,3 +752,291 @@ class TestBlockedNormalOrchestratorSuppression:
             )
 
         assert live is False
+
+
+# ---------------------------------------------------------------------------
+# reify#5245 hardening: reaped-worktree / bare-branch / stranded-orchestrator
+# false-positive (task 2767)
+# ---------------------------------------------------------------------------
+
+
+class TestPrunableWorktreeSignal:
+    """A worktree porcelain entry marked `prunable` (its directory was reaped) must
+    not count as worktree_registered — a reaped worktree is not a live workspace,
+    even though its branch line is still present in the porcelain stanza
+    (reify#5245's shape).
+    """
+
+    def _make_run(self, stdout: str, returncode: int = 0):
+        """Build a mock subprocess.CompletedProcess for worktree list."""
+        return subprocess.CompletedProcess(
+            args=['git', 'worktree', 'list', '--porcelain'],
+            returncode=returncode,
+            stdout=stdout,
+            stderr='',
+        )
+
+    def _make_log_run(self, stdout: str = '', returncode: int = 1):
+        """Build a mock subprocess.CompletedProcess for git log (branch absent by default)."""
+        return subprocess.CompletedProcess(
+            args=['git', 'log', '-1', '--format=%cI', _BRANCH],
+            returncode=returncode,
+            stdout=stdout,
+            stderr='',
+        )
+
+    def _make_revlist_run(self, stdout: str = '0', returncode: int = 0):
+        """Build a mock subprocess.CompletedProcess for the (forthcoming) rev-list call."""
+        return subprocess.CompletedProcess(
+            args=['git', 'rev-list', '--count', f'main..{_BRANCH}'],
+            returncode=returncode,
+            stdout=stdout,
+            stderr='',
+        )
+
+    def _run_side_effect(
+        self,
+        worktree_stdout: str,
+        log_stdout: str = '',
+        log_rc: int = 1,
+        revlist_stdout: str = '0',
+        revlist_rc: int = 0,
+    ):
+        """Return a function-style subprocess.run side_effect dispatching on args.
+
+        Matches the existing style in TestWorktreeSignal (NOT a list side_effect),
+        so an unanticipated extra call — e.g. the rev-list call landing in a later
+        step — degrades gracefully instead of raising StopIteration.
+        """
+        worktree_result = self._make_run(worktree_stdout)
+        log_result = self._make_log_run(log_stdout, log_rc)
+        revlist_result = self._make_revlist_run(revlist_stdout, revlist_rc)
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return worktree_result
+            if 'rev-list' in args:
+                return revlist_result
+            return log_result
+
+        return side_effect
+
+    def test_prunable_worktree_not_counted(self, tmp_path):
+        """A prunable (reaped) worktree entry does not count as worktree_registered,
+        even though its branch line is present in the same porcelain stanza.
+        """
+        side_effect = self._run_side_effect(
+            _worktree_porcelain_prunable(_BRANCH),
+            log_rc=1,
+            revlist_stdout='0',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.worktree_registered is False
+        assert result.is_live is False
+
+    def test_live_nonprunable_worktree_still_counts_even_when_bare(self, tmp_path):
+        """A LIVE (non-prunable) worktree stays a live signal even when the branch
+        itself is bare (zero own commits) — a just-started dispatch (branch created,
+        no commits yet) must stay live.
+        """
+        side_effect = self._run_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH),
+            log_rc=1,
+            revlist_stdout='0',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path))
+
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+
+class TestBareBranchRecentCommit:
+    """A branch's tip timestamp does not count as `recent_commit` when the branch
+    has zero commits of its own — its tip is only the base-branch commit, not
+    task work (reify#5245's shape: the reflog held only a "Created from main"
+    entry with HEAD == main).
+    """
+
+    _NOW = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+
+    def _run_side_effect(
+        self,
+        commit_ts_str: str | None,
+        revlist_stdout: str = '0',
+        revlist_rc: int = 0,
+        revlist_raises: bool = False,
+    ):
+        """Return a subprocess.run side_effect: no worktree registered, a given
+        git-log tip timestamp, and a canned (or error/raising) rev-list count.
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_no_branch(), stderr=''
+                )
+            if 'rev-list' in args:
+                if revlist_raises:
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr=''
+                )
+            # git log call
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=commit_ts_str or '', stderr=''
+            )
+        return side_effect
+
+    def test_bare_branch_suppresses_recent_commit(self, tmp_path):
+        """A recent tip timestamp is suppressed when rev-list reports zero own
+        commits — the recent tip is only the base commit, not task work.
+        """
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._run_side_effect(ts, revlist_stdout='0', revlist_rc=0)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+
+    def test_recent_commit_preserved_when_branch_has_own_commits(self, tmp_path):
+        """A recent tip timestamp is preserved when rev-list reports own commits."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._run_side_effect(ts, revlist_stdout='3', revlist_rc=0)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is True
+
+    def test_revlist_error_treated_as_not_bare(self, tmp_path):
+        """An unknown own-commit count (rev-list error or exception) fails safe:
+        not bare => no suppression => recent_commit stays True.
+        """
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+
+        side_effect_rc1 = self._run_side_effect(ts, revlist_rc=1)
+        with patch('subprocess.run', side_effect=side_effect_rc1):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        assert result.recent_commit is True
+
+        side_effect_raises = self._run_side_effect(ts, revlist_raises=True)
+        with patch('subprocess.run', side_effect=side_effect_raises):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        assert result.recent_commit is True
+
+
+class TestBareStrandedOrchestratorSuppression:
+    """The reify#5245 reproduction: a task whose branch is bare (zero own
+    commits) and whose worktree was reaped (prunable) must not be kept "live"
+    by the bare project-wide orchestrator_live signal — that signal only
+    reflects a running orchestrator process is dispatching SOME task in the
+    project, not necessarily this one.  Status-agnostic (unlike rules 1-3):
+    recon_write_policy Gate 2 calls the detector without task_kind and with
+    whatever status the task currently holds, so the suppression must fire
+    regardless of status (excluding the statuses/combinations already handled
+    by rules 1-3).
+    """
+
+    def _side_effect(
+        self,
+        worktree_stdout: str,
+        revlist_stdout: str = '0',
+        revlist_rc: int = 0,
+        log_rc: int = 1,
+        log_stdout: str = '',
+    ):
+        """subprocess.run side_effect: canned worktree/rev-list/git-log results."""
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=worktree_stdout, stderr=''
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr=''
+                )
+            # git log call
+            return subprocess.CompletedProcess(
+                args=args, returncode=log_rc, stdout=log_stdout, stderr=''
+            )
+        return side_effect
+
+    @pytest.mark.parametrize('status', ['pending', 'in-progress', 'review', 'merge-deferred'])
+    def test_bare_stranded_task_not_live_under_running_orchestrator(self, tmp_path, status):
+        """A prunable worktree + a bare branch must suppress the bare project-wide
+        orchestrator_live signal, across every status not already covered by
+        rules 1-3 — the exact reify#5245 shape.  Also asserts through
+        is_workflow_live_for_task, the precise call recon_write_policy Gate 2
+        makes (status passed, task_kind not passed).
+        """
+        side_effect = self._side_effect(_worktree_porcelain_prunable(_BRANCH))
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True,
+            )
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.is_live is False
+        assert live is False
+
+    def test_bare_branch_with_live_worktree_stays_live(self, tmp_path):
+        """A LIVE (non-prunable) worktree on a bare branch must NOT be suppressed —
+        rule 4 must not fire when a live worktree exists, protecting a
+        freshly-dispatched pipeline (branch just created, worktree present, no
+        commits yet).
+        """
+        side_effect = self._side_effect(_worktree_porcelain_with_branch(_BRANCH))
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status='pending', _orchestrator_live=True,
+            )
+
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    def test_absent_branch_preserves_orchestrator_signal(self, tmp_path):
+        """No branch at all (not-yet-dispatched task) => rev-list fails => count
+        None => NOT bare => rule 4 stays inert => the deliberate task-2031
+        dispatch-race protection is preserved (a live orchestrator elsewhere
+        still marks a pending task potentially-about-to-be-dispatched as live).
+        """
+        side_effect = self._side_effect(
+            _worktree_porcelain_no_branch(), revlist_rc=1, revlist_stdout='',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status='pending', _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_revlist_error_keeps_orchestrator_signal(self, tmp_path):
+        """A rev-list exception (not just a non-zero return) also yields an unknown
+        count => NOT bare => the orchestrator signal is preserved (fail-safe
+        toward live, matching TestBareBranchRecentCommit's rev-list-error case).
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_no_branch(), stderr='',
+                )
+            if 'rev-list' in args:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status='pending', _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True

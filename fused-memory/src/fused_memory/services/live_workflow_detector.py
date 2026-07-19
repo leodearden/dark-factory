@@ -74,6 +74,25 @@ unaffected either way, since it already ORs in ``worktree_registered``/
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
+**Reaped worktrees and bare branches (task 2767, reify#5245).** A worktree
+entry in ``git worktree list --porcelain`` marked ``prunable`` (its directory
+was removed/reaped, but the registration itself was not yet pruned) does NOT
+count toward ``worktree_registered`` — only a LIVE (non-prunable) worktree
+does. Likewise, a branch with zero commits of its own beyond ``base_branch``
+(checked via ``git rev-list --count <base_branch>..<branch>``; "bare" — e.g.
+a branch whose reflog holds only a "Created from main" entry) has its tip
+timestamp stripped from ``recent_commit``, since that timestamp is just the
+base-branch commit, not evidence of task work. When BOTH hold — the branch is
+bare AND no live worktree is registered AND there is no recent commit —
+:func:`_orchestrator_signal_ineligible`'s rule 4 additionally drops the
+project-wide ``orchestrator_live`` signal, **regardless of status or
+task_kind** (unlike rules 1-3): this is the exact reify#5245 shape, where a
+task with no live work of its own kept showing worktree+orchestrator signals
+solely because a *different*, genuinely live task shared the same project-wide
+orchestrator lock. Both gates are fail-safe TOWARD live: a missing branch, a
+subprocess error, or an unparseable ``rev-list`` count never marks a worktree
+prunable or a branch bare — only positive evidence does.
+
 Branch convention: ``task/<task_id>`` (matches the orchestrator's worktree naming).
 Injectable ``now`` for deterministic tests.
 """
@@ -96,6 +115,12 @@ DEFAULT_MAX_COMMIT_AGE_HOURS: float = 6.0
 
 # Orchestrator branch naming convention: ``task/<id>``.
 DEFAULT_BRANCH_PREFIX: str = 'task/'
+
+# Default base branch a task branch is created from.  Used to compute a
+# branch's own commit count via ``git rev-list --count <base>..<branch>`` —
+# see `_branch_own_commit_count` and the `base_branch` param on
+# `detect_live_workflow`.
+DEFAULT_BASE_BRANCH: str = 'main'
 
 # Timeout for each individual git subprocess call (seconds).
 _GIT_TIMEOUT: int = 10
@@ -130,7 +155,11 @@ class WorkflowLiveness:
 
     Attributes:
         is_live: True when any of the three signals indicates an active workflow.
-        worktree_registered: True when a git worktree is registered for ``branch``.
+        worktree_registered: True when a LIVE (non-prunable) git worktree is
+            registered for ``branch``. A worktree entry marked ``prunable`` in
+            ``git worktree list --porcelain`` (its directory has been removed
+            or reaped, but the registration itself has not yet been pruned)
+            does NOT count — a reaped worktree is not a live workspace.
         recent_commit: True when the tip of ``branch`` is newer than the threshold.
         orchestrator_live: True when the project-level orchestrator lock is live.
         branch: The branch name inspected (e.g. ``task/4321``).
@@ -153,6 +182,7 @@ def detect_live_workflow(
     now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+    base_branch: str = DEFAULT_BASE_BRANCH,
     status: str | None = None,
     task_kind: str | None = None,
     _orchestrator_live: bool | None = None,
@@ -168,6 +198,16 @@ def detect_live_workflow(
         max_commit_age_hours: Commits newer than this many hours count as recent.
         branch_prefix: Branch name prefix; combined with *task_id* to form the
             branch name (e.g. ``"task/4321"``).
+        base_branch: The branch *branch* is created from.  Used to compute the
+            branch's own commit count via ``git rev-list --count
+            <base_branch>..<branch>`` — a count of ``0`` means the branch is
+            "bare" (no commits beyond *base_branch*, e.g. only a
+            `git worktree add`/branch-creation reflog entry), which forces
+            ``recent_commit`` to ``False`` even if the branch tip's timestamp
+            would otherwise be within *max_commit_age_hours* (the tip is just
+            the base-branch commit, not task work — reify#5245's shape). A
+            branch missing entirely, or any rev-list error, yields an unknown
+            count and does NOT count as bare (fail-safe toward live).
         status: The task's current status, when known.  When this is a member
             of :data:`ORCH_LIVE_INELIGIBLE_STATUSES` (statuses never actively
             dispatched: ``deferred``, ``done``, ``cancelled``), the project-wide
@@ -205,10 +245,32 @@ def detect_live_workflow(
     branch = f'{branch_prefix}{task_id}'
     root = str(project_root)
 
-    worktree_registered = _check_worktree_registered(root, branch)
+    worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+    worktree_registered = worktree_present and not worktree_prunable
     last_commit_at, recent_commit = _check_recent_commit(
         root, branch, now=now, max_commit_age_hours=max_commit_age_hours
     )
+    # branch_bare: branch carries zero commits of its own beyond base_branch
+    # (its tip is just the base-branch commit — reify#5245's shape). An
+    # unknown count (missing branch, rev-list error) is NOT bare (fail-safe
+    # toward live). A bare branch's recent-looking tip timestamp is not
+    # evidence of task work, so it is stripped from recent_commit here.
+    #
+    # Skip the rev-list subprocess call when its result cannot change any
+    # output field: if a LIVE worktree is already registered, worktree_registered
+    # is already True, so rule 4 below (which requires `not worktree_registered`)
+    # can never fire regardless of branch_bare; and if recent_commit is already
+    # False, `recent_commit and not branch_bare` stays False regardless of
+    # branch_bare. When BOTH hold, branch_bare cannot affect anything it feeds
+    # into, so computing it is skipped — saving a git subprocess call on this
+    # common already-live path, which matters when this detector is fanned out
+    # across many tasks in a recon sweep.
+    if worktree_registered and not recent_commit:
+        branch_bare = False
+    else:
+        own_commit_count = _branch_own_commit_count(root, base_branch, branch)
+        branch_bare = own_commit_count == 0
+    recent_commit = recent_commit and not branch_bare
     # orchestrator_live is the project-level lock signal (True when the
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
@@ -218,10 +280,14 @@ def detect_live_workflow(
     # project-wide lock is not evidence of liveness for a task that will never
     # be dispatched (or, for blocked deterministic tasks, never acquires a
     # worktree/branch of its own; or, for blocked normal tasks with no
-    # per-task git evidence, task 2409).  worktree_registered/recent_commit
-    # (already computed above) are threaded through so rule 3 can require
-    # their absence.
-    if _orchestrator_signal_ineligible(status, task_kind, worktree_registered, recent_commit):
+    # per-task git evidence, task 2409; or, status-agnostically, for a task
+    # whose branch is provably bare with its worktree reaped, task 2767).  The
+    # FINAL worktree_registered/recent_commit (post-prunable/post-bare, already
+    # computed above) and branch_bare are threaded through so rules 3 and 4 can
+    # evaluate the same evidence the caller sees.
+    if _orchestrator_signal_ineligible(
+        status, task_kind, worktree_registered, recent_commit, branch_bare
+    ):
         orchestrator_live = False
     else:
         orchestrator_live = (
@@ -265,12 +331,13 @@ def _orchestrator_signal_ineligible(
     task_kind: str | None,
     worktree_registered: bool = False,
     recent_commit: bool = False,
+    branch_bare: bool = False,
 ) -> bool:
     """Return True when the project-wide ``orchestrator_live`` signal must be
-    forced False for this *status*/*task_kind* (/*worktree_registered*/
-    *recent_commit*) combination.
+    forced False for this *status*/*task_kind*/*worktree_registered*/
+    *recent_commit*/*branch_bare* combination.
 
-    Three independent rules are centralized here:
+    Four independent rules are centralized here:
 
     1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
        (``deferred``, ``done``, ``cancelled``) — statuses that are never
@@ -291,6 +358,25 @@ def _orchestrator_signal_ineligible(
        concern), so this rule only suppresses the bare case, leaving
        ``is_live`` (which already ORs in ``worktree_registered``/
        ``recent_commit``) unaffected whenever real per-task evidence exists.
+    4. ``branch_bare and not worktree_registered and not recent_commit`` — the
+       task's branch is provably bare (zero commits beyond ``base_branch``)
+       AND no LIVE worktree is registered (a registered-but-prunable entry
+       does not count — see ``worktree_registered``'s meaning) AND there is
+       no recent commit, i.e. POSITIVE evidence the branch has no work and
+       its worktree was reaped, so a running project orchestrator is
+       demonstrably not on THIS task (task 2767, reify#5245). Deliberately
+       **status/task_kind-agnostic** — unlike rules 1-3, this rule is
+       evaluated regardless of ``status``/``task_kind`` (including for
+       ``pending``/``in-progress``/``review``/``merge-deferred``, and
+       independent of rules 2/3's blocked-only scoping), because
+       ``recon_write_policy`` Gate 2 calls the detector without ``task_kind``
+       and with whatever status the task currently holds — a status-gated
+       rule would not fire there. Not a race risk: an absent branch yields an
+       unknown (not ``0``) commit count (see
+       :func:`_branch_own_commit_count`), so a not-yet-dispatched task is
+       unaffected; a just-started dispatch keeps a LIVE (non-prunable)
+       worktree, so ``worktree_registered`` is True and this rule stays
+       inert.
 
     ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
     wholesale: a normal blocked task (``task_kind`` absent or not
@@ -298,26 +384,44 @@ def _orchestrator_signal_ineligible(
     the project-wide orchestrator lock remains real per-task evidence for it
     *when there is other evidence to corroborate it*. Hence the compound
     (status AND task_kind [AND NOT git-evidence]) conditions for rules 2 and 3,
-    rather than an unconditional status addition.
+    rather than an unconditional status addition. Rule 4 is the sole exception
+    to the "scoped by status" pattern, by design (see above).
     """
     if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
         return True
-    if status != 'blocked':
-        return False
-    if task_kind == DETERMINISTIC_TASK_KIND:
-        return True
-    return (
-        task_kind in (None, NORMAL_TASK_KIND)
-        and not worktree_registered
-        and not recent_commit
-    )
+    if status == 'blocked':
+        if task_kind == DETERMINISTIC_TASK_KIND:
+            return True
+        if (
+            task_kind in (None, NORMAL_TASK_KIND)
+            and not worktree_registered
+            and not recent_commit
+        ):
+            return True
+    return branch_bare and not worktree_registered and not recent_commit
 
 
-def _check_worktree_registered(project_root: str, branch: str) -> bool:
-    """Return True iff a git worktree is registered for *branch*.
+def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
+    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
 
-    Parses ``git -C <root> worktree list --porcelain`` output.  Any subprocess
-    error or unexpected output silently returns False (fail-safe).
+    Parses ``git -C <root> worktree list --porcelain`` output into
+    blank-line-delimited stanzas (one per registered worktree). ``registered``
+    is True iff some stanza contains a line equal to ``branch refs/heads/<branch>``;
+    ``prunable`` is True iff that SAME stanza also contains a line starting with
+    ``prunable`` — git's marker for a worktree whose directory has been removed
+    or reaped, but whose registration has not yet been pruned (reify#5245's
+    shape: a stale worktree entry survives after the directory itself is gone).
+
+    Any subprocess error or unexpected output silently returns ``(False, False)``
+    (fail-safe).
+
+    Note: git only started emitting the ``prunable`` porcelain annotation in
+    git 2.36 (2022). On an older git binary, a reaped worktree's directory can
+    be gone yet no ``prunable`` line is ever produced, so ``prunable`` silently
+    stays False and a reaped worktree keeps counting as registered — the same
+    silent-degradation shape reify#5245 hardened against, just one layer down
+    in the toolchain. If a stale/reaped-worktree false positive resists this
+    fix, check ``git --version`` on the host running this detector first.
     """
     try:
         result = subprocess.run(
@@ -328,17 +432,22 @@ def _check_worktree_registered(project_root: str, branch: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug('live_workflow_detector: worktree list failed: %s', exc)
-        return False
+        return False, False
 
     if result.returncode != 0:
         logger.debug(
             'live_workflow_detector: worktree list returned %d: %s',
             result.returncode, result.stderr.strip(),
         )
-        return False
+        return False, False
 
     target = f'branch refs/heads/{branch}'
-    return any(line.strip() == target for line in result.stdout.splitlines())
+    for stanza in result.stdout.split('\n\n'):
+        lines = [line.strip() for line in stanza.splitlines()]
+        if target in lines:
+            prunable = any(line.startswith('prunable') for line in lines)
+            return True, prunable
+    return False, False
 
 
 def _check_recent_commit(
@@ -388,6 +497,49 @@ def _check_recent_commit(
     age = reference - last_commit_at
     recent_commit = age <= timedelta(hours=max_commit_age_hours)
     return last_commit_at, recent_commit
+
+
+def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
+    """Return the number of commits *branch* carries beyond *base_branch*.
+
+    Runs ``git -C <root> rev-list --count <base_branch>..<branch>``.  A result
+    of ``0`` means *branch* is "bare" — created from *base_branch* but with no
+    commits of its own (e.g. only a ``git worktree add``/branch-creation
+    reflog entry — reify#5245's shape).  Any subprocess error, non-zero
+    returncode (e.g. *base_branch* or *branch* missing), or unparseable output
+    silently returns ``None`` (fail-safe: an unknown count is never treated as
+    ``0``/bare by callers).
+    """
+    try:
+        result = subprocess.run(
+            ['git', '-C', project_root, 'rev-list', '--count', f'{base_branch}..{branch}'],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug(
+            'live_workflow_detector: rev-list failed for %s..%s: %s',
+            base_branch, branch, exc,
+        )
+        return None
+
+    if result.returncode != 0:
+        logger.debug(
+            'live_workflow_detector: rev-list returned %d for %s..%s: %s',
+            result.returncode, base_branch, branch, result.stderr.strip(),
+        )
+        return None
+
+    stdout = result.stdout.strip()
+    try:
+        return int(stdout)
+    except (TypeError, ValueError):
+        logger.debug(
+            'live_workflow_detector: cannot parse rev-list count %r for %s..%s',
+            stdout, base_branch, branch,
+        )
+        return None
 
 
 def _parse_iso_timestamp(ts_str: str) -> datetime | None:
