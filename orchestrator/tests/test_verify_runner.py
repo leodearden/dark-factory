@@ -757,6 +757,16 @@ def _make_spec():
     )
 
 
+def _narrow_config():
+    """A real OrchestratorConfig pinned to the NARROW merge-gate profile.
+
+    run_merge_verify_on_worktree does a real ``config.model_copy(update=...)``
+    (task 2822 fix a), so its callers need a real config, not a fields-only
+    ``pydantic_spec`` mock (which exposes no ``model_copy``).
+    """
+    return OrchestratorConfig(merge_verify_workspace=False, merge_verify_breadth='scoped')
+
+
 @pytest.mark.asyncio
 class TestLocalRunnerBundle:
     """LocalRunner.run_merge_verify: combined scoped+unscoped bundle."""
@@ -1006,6 +1016,11 @@ class TestBuildMergeVerifySpec:
         config.effective_verify_env = verify_env or {}
         config.merge_verify_cold_command_timeout_secs = cold_timeout
         config.verify_cold_command_timeout_secs = None
+        # Fix (a), task 2822: build_merge_verify_spec now projects these two
+        # profile fields from config, so the double must carry real values
+        # (a bare MagicMock attr is not JSON-serialisable in spec_to_json).
+        config.merge_verify_workspace = False
+        config.merge_verify_breadth = 'scoped'
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -1234,8 +1249,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         merge_wt = MagicMock()
         spec = self._make_two_command_spec()
 
@@ -1259,8 +1273,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         merge_wt = MagicMock()
         spec = self._make_two_command_spec()
 
@@ -1294,8 +1307,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         spec = self._make_two_command_spec()
 
         await run_merge_verify_on_worktree(
@@ -1373,8 +1385,7 @@ class TestRunMergeVerifyOnWorktree:
                 detail='type err',
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         spec = self._make_two_command_spec()
 
         result = await run_merge_verify_on_worktree(
@@ -1406,8 +1417,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
 
         # Spec with type_check_command mirroring what build_merge_verify_spec produces
         # when the module has a real typecheck command
@@ -1471,8 +1481,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
         monkeypatch.setattr(verify_mod, 'run_scoped_verification', fake_scoped)
         monkeypatch.setattr(mq_mod, '_run_unscoped_typechecks', fake_unscoped)
 
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         spec = MergeVerifySpec(
             verify_commands=(VerifyCommand('mod', test_command='true'),),
             unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
@@ -4381,8 +4390,7 @@ class TestLocalRunnerArchiveRoot:
             captured.append(kwargs)
             return _make_pass_result()
 
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
 
         runner = LocalRunner(
@@ -4447,8 +4455,7 @@ class TestLocalRunnerArchiveRoot:
             captured.append(kwargs)
             return _make_pass_result()
 
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
 
         # Construct without archive_root (uses default)

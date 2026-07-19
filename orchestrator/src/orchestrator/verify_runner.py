@@ -493,6 +493,20 @@ async def run_merge_verify_on_worktree(
     module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
 
+    # Fix (a), task 2822 — the SPEC is the single source of truth for the
+    # merge-deciding profile. Override the reconstructed (remote) config's
+    # profile from the spec so the remote runs the IDENTICAL scope/profile as
+    # the dispatching merge gate; the laptop's own --config can no longer narrow
+    # it. The local path is unaffected — its config already equals the spec's
+    # source, so this is a value-preserving no-op there. (pydantic v2 model_copy;
+    # values originate from a validated config via build_merge_verify_spec.)
+    config = config.model_copy(
+        update={
+            'merge_verify_workspace': spec.merge_verify_workspace,
+            'merge_verify_breadth': spec.merge_verify_breadth,
+        }
+    )
+
     runner = LocalRunner(
         merge_wt,
         config,
