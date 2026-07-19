@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -648,6 +650,132 @@ class _EvalMcpStub:
 
     def mcp_config_json(self, escalation_url: str | None = None) -> dict:
         return {}
+
+
+class _RecordingMemoryHandler(BaseHTTPRequestHandler):
+    """Request handler for :class:`RecordingMemorySink`.
+
+    Records every fused-memory ``tools/call`` write on the owning server's
+    shared ``writes`` list and replies with a benign JSON-RPC success envelope
+    (mirroring ``_StubMcpSession._envelope``). Any POST path is accepted — the
+    workflow write path targets ``{url}/mcp/`` but ``BaseHTTPRequestHandler``
+    routes every POST here regardless of path.
+    """
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API name
+        server: Any = self.server  # _RecordingMemoryServer (carries writes/_envelope)
+        length = int(self.headers.get('Content-Length', 0) or 0)
+        raw = self.rfile.read(length) if length > 0 else b''
+        try:
+            body = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            body = {}
+
+        if isinstance(body, dict) and body.get('method') == 'tools/call':
+            params = body.get('params') or {}
+            server.writes.append((params.get('name'), params.get('arguments', {})))
+
+        payload = json.dumps(server._envelope('ok')).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — stdlib API name
+        """Silence the default stderr access log (no per-request spam)."""
+
+
+class _RecordingMemoryServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer carrying the shared ``writes`` list + JSON-RPC id counter."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+    ) -> None:
+        super().__init__(server_address, handler_class)
+        self.writes: list[tuple[str | None, dict]] = []
+        self._request_id = 0
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _envelope(self, text: str) -> dict:
+        return {
+            'jsonrpc': '2.0',
+            'id': self._next_id(),
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': text},
+                ],
+            },
+        }
+
+
+class RecordingMemorySink:
+    """In-process recording HTTP endpoint for eval memory writes (D8).
+
+    A real loopback HTTP endpoint (stdlib ``http.server``) that receives the
+    raw httpx POSTs the workflow's ``_write_*_to_memory`` methods send to
+    ``{self.mcp.url}/mcp/``, records each fused-memory ``tools/call`` write as
+    ``(tool_name, arguments)`` on :attr:`writes`, and replies with a benign
+    JSON-RPC success envelope (mirroring ``_StubMcpSession._envelope`` so any
+    caller that parses the reply stays happy).
+
+    The orchestrator declares only ``httpx`` (a client) — no
+    aiohttp/starlette — and the workflow write path is a raw httpx POST to a
+    URL, so a real HTTP endpoint (not an MCP-session stub) is required to
+    receive it. Stdlib ``http.server`` adds no dependency.
+
+    Isolation: pass :attr:`url` as
+    ``build_eval_orch_config(..., memory_endpoint=sink.url)`` (or
+    ``run_eval(..., memory_endpoint=sink.url)``) so
+    ``orch_config.fused_memory.url`` (hence ``self.mcp.url``) routes every eval
+    memory write here instead of the real production dark_factory store. The
+    caller owns the lifecycle via the context-manager protocol::
+
+        with RecordingMemorySink() as sink:
+            orch_config = build_eval_orch_config(cfg, task, base, memory_endpoint=sink.url)
+            ...
+            assert sink.writes  # what would have been written to production
+    """
+
+    def __init__(self) -> None:
+        # Bind to an ephemeral 127.0.0.1 port immediately (HTTPServer binds in
+        # __init__), so .url is valid before the serving thread starts.
+        self._server = _RecordingMemoryServer(('127.0.0.1', 0), _RecordingMemoryHandler)
+        self._thread: threading.Thread | None = None
+
+    @property
+    def url(self) -> str:
+        """The bound loopback base URL, e.g. ``http://127.0.0.1:54321``."""
+        port = self._server.server_address[1]
+        return f'http://127.0.0.1:{port}'
+
+    @property
+    def writes(self) -> list[tuple[str | None, dict]]:
+        """Recorded ``(tool_name, arguments)`` for every POSTed ``tools/call``."""
+        return self._server.writes
+
+    def __enter__(self) -> RecordingMemorySink:
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name='recording-memory-sink',
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
 
 
 if __name__ == '__main__':
