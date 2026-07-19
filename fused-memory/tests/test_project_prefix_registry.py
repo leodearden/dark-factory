@@ -117,6 +117,43 @@ class TestFromRootsCollisions:
 
 
 # ---------------------------------------------------------------------------
+# from_roots — rename-stable declared-id resolution
+# ---------------------------------------------------------------------------
+
+
+class TestFromRootsRenameStable:
+    """A directory whose basename differs from the project_id declared in its
+    dark-factory-orchestrator.yaml (the exact shape a project-dir rename
+    produces) registers — and owns its prefixes — under the DECLARED id, so
+    the path-scope guard stops spuriously rejecting the renamed project's
+    paths under the wrong basename-derived id.
+    """
+
+    def test_renamed_dir_owns_prefixes_under_declared_id(self, tmp_path):
+        # basename `solar-challenge` → basename-derived id 'solar_challenge',
+        # but the manifest declares 'my_solar_challenge'.
+        root = _mkproj(tmp_path, 'solar-challenge', ['firmware'])
+        (root / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "my_solar_challenge"\n',
+        )
+        r = ProjectPrefixRegistry.from_roots([str(root)])
+
+        assert r.is_known('my_solar_challenge') is True
+        assert r.root_for_project('my_solar_challenge') == str(root.resolve())
+        assert r.project_for_prefix('firmware/') == 'my_solar_challenge'
+        # The stale basename-derived id must NOT appear anywhere.
+        assert r.is_known('solar_challenge') is False
+        assert r.project_for_prefix('firmware/') != 'solar_challenge'
+
+    def test_no_manifest_still_keys_by_basename(self, tmp_path):
+        """Back-compat: a project that declares no id keys by basename."""
+        root = _mkproj(tmp_path, 'plain-proj', ['firmware'])
+        r = ProjectPrefixRegistry.from_roots([str(root)])
+        assert r.is_known('plain_proj') is True
+        assert r.project_for_prefix('firmware/') == 'plain_proj'
+
+
+# ---------------------------------------------------------------------------
 # Lookups + helpers
 # ---------------------------------------------------------------------------
 
