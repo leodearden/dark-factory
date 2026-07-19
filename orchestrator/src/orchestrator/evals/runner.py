@@ -93,14 +93,23 @@ def build_eval_orch_config(
     task: dict,
     base_config: OrchestratorConfig | None = None,
     memory_endpoint: str | None = None,
+    architect_config: EvalConfig | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
-    Architect always runs on Claude opus-high (constant planning).
+    Architect defaults to Claude opus-high (constant planning) — the frozen-plan
+    ``run_eval`` and plan-only ``run_architect_eval`` paths both leave it there.
     Reviewer is the new 1× Opus comprehensive reviewer (matches production
     after the reviewer-panel trial replaced the 5× sonnet panel; merged
     via 594658fbe3 / 2c26a30bca).
     Only the implementer varies per eval config.
+
+    ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
+    /confirm runs (``run_end_to_end``): when supplied, the architect's
+    model/backend/effort are derived from THIS candidate instead of the hardcoded
+    opus/claude/high, so an architect×implementer combo can be scored end-to-end.
+    Left ``None`` (every existing caller), the architect pin is byte-identical to
+    today, so the P1/B1 parity tripwire and the frozen-plan paths stay intact.
 
     Two task-spec knobs override the defaults below:
       - ``max_execute_iterations``: hard ceiling on implementer iterations.
@@ -125,8 +134,16 @@ def build_eval_orch_config(
         raise ValueError('build_eval_orch_config requires an explicit base_config')
     base = base_config
 
+    # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
+    # or derived from architect_config for the both-live end-to-end run (μ). When
+    # architect_config is None every value below equals the historical literal, so
+    # the config is byte-identical to today and the P1/B1 parity tripwire holds.
+    architect_model = architect_config.model if architect_config else 'opus'
+    architect_backend = architect_config.backend if architect_config else 'claude'
+    architect_effort = (architect_config.effort or 'high') if architect_config else 'high'
+
     models = ModelsConfig(
-        architect='opus',
+        architect=architect_model,
         implementer=config.model,
         debugger=config.model,
         reviewer='opus',          # 1× opus comprehensive reviewer (production parity)
@@ -146,7 +163,7 @@ def build_eval_orch_config(
     )
 
     effort = EffortConfig(
-        architect='high',
+        architect=architect_effort,
         implementer=config.effort or 'high',
         debugger=config.effort or 'high',
         reviewer='high',           # opus reviewer at high effort (matches defaults.yaml)
@@ -156,7 +173,7 @@ def build_eval_orch_config(
     )
 
     backends = BackendsConfig(
-        architect='claude',
+        architect=architect_backend,
         implementer=config.backend,
         debugger=config.backend,
         reviewer='claude',        # reviewers always on Claude
