@@ -1086,6 +1086,37 @@ class TestSemaphoreTimeoutDeterministicTestVerdictVetoNegatives:
         output = '===== semaphore slot wait timed out after 300s =====\n'
         assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
 
+    def test_bare_errors_in_seconds_wrapper_line_stays_semaphore_timeout(self):
+        """Review follow-up: `_PYTEST_FAILURE_SUMMARY_RE`'s bare trailing
+        'N (failed|errors) ... in <float>s' fallback (considered and dropped)
+        was not anchored to pytest's own `=====` banner, so a wrapper-shaped
+        message like this one would have false-positive-vetoed a genuine
+        SEMAPHORE_TIMEOUT."""
+        output = '2 errors in 30s while waiting for the slot that timed out\n'
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    def test_uppercase_trailing_failed_wrapper_line_without_test_context_stays_semaphore_timeout(
+        self,
+    ):
+        """Review follow-up: `_TEST_FAILURE_TRAILING_RE` matches ANY line
+        ending in ' FAILED', including an incidental wrapper log line with no
+        test runner involved at all. Since this evidence is consulted inside
+        the SEMAPHORE_TIMEOUT arm — i.e. only once lock/slot/semaphore +
+        "timed out" tokens are already present — an unanchored match would
+        wrongly veto a genuine slot timeout, which would make the "a veto
+        only ever removes false-positives" claim above false.
+        `_has_deterministic_test_verdict` additionally requires the FAILED
+        line to carry a test-runner-shaped 'test'/'::' token, which this
+        pure-wrapper line does not."""
+        output = 'flock: semaphore slot acquisition timed out; wait FAILED\n'
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    def test_leading_failed_wrapper_line_without_test_context_stays_semaphore_timeout(self):
+        """Same as above for the leading-form marker
+        (`_TEST_FAILURE_LEADING_RE`, '^FAILED\\s')."""
+        output = 'FAILED to release semaphore slot before it timed out\n'
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
 
 # ---------------------------------------------------------------------------
 # task 2756: broken _merge-verify worktree (unreadable/missing Cargo.lock) is

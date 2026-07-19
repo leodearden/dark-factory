@@ -155,8 +155,12 @@ _CLIPPY_LINT_MARKER = 'clippy::'
 # literal "48 passed, 6 failed"); `_has_deterministic_test_verdict` also
 # treats the shared `_TEST_FAILURE_LEADING_RE`/`_TEST_FAILURE_TRAILING_RE`
 # FAILED-line markers (defined in the shared primitives above) as verdict
-# evidence, since either one already proves a test runner emitted a
-# per-test result. Like the task-2748 markers, this is additive to the veto
+# evidence WHEN the matched line also carries a test-runner-shaped 'test'/
+# '::' token (see the context-anchor check inside `_has_deterministic_test_
+# verdict` below) — a bare line-ending-in-FAILED match with no such context
+# is an incidental wrapper log line (e.g. 'flock: lock acquisition FAILED'),
+# not proof a test runner emitted a per-test result, so it is NOT treated as
+# verdict evidence. Like the task-2748 markers, this is additive to the veto
 # marker set — it only ever REMOVES false-positives, so a genuine
 # wrapper-only timeout (no verdict marker of any kind) is unaffected and
 # still classifies SEMAPHORE_TIMEOUT.
@@ -175,40 +179,82 @@ _TEST_VERDICT_PAIR_RE = re.compile(
 # "===== 6 failed in 1.20s =====". A bare "\d+\s+failed\b" alone is NOT used
 # here (too loose — it would match an incidental "2 failed attempts" in a
 # wrapper's own log text with no test runner involved at all); this pattern
-# is anchored on pytest's own short-summary punctuation instead — either the
+# is anchored on pytest's own short-summary punctuation instead — the
 # whole-line `=+ ... =+` divider banner bracketing the count (mirroring the
 # grounded, already-production-tested shape of verify.py's OWN
 # `_PYTEST_FAILURE_SUMMARY_RE`, part of the separate `_extract_cause_hint`
 # human-hint ladder this module's docstring says NOT to import from — same
 # name is deliberate here, the same cross-module duplication convention
-# `_PYTEST_INTERNALERROR_RE` above already follows, not a collision), or the
-# trailing " in <float>s" timing suffix pytest always appends as a fallback
-# anchor — so only pytest's own generated summary line can match, not an
-# incidental mention elsewhere.
+# `_PYTEST_INTERNALERROR_RE` above already follows, not a collision) — so
+# only pytest's own generated summary line can match, not an incidental
+# mention elsewhere.
+#
+# Review follow-up (task 2821): an earlier draft ALSO accepted a bare
+# trailing " in <float>s" timing suffix as a fallback anchor, reasoning that
+# pytest always appends it. That fallback was dropped: it is not actually
+# anchored to any pytest-exclusive punctuation, so a wrapper-shaped message
+# like "2 errors in 30s while waiting for the slot that timed out" would
+# false-positive-veto a GENUINE SEMAPHORE_TIMEOUT (see
+# test_bare_errors_in_seconds_wrapper_line_stays_semaphore_timeout in
+# test_verify_classify.py). The banner-only form already fully covers the
+# grounded zero-pass golden below — pytest's short-summary line is always
+# bracketed by '=' padding, even under a non-tty/CI terminal width — so the
+# fallback bought no grounded coverage, only false-veto risk.
 _PYTEST_FAILURE_SUMMARY_RE = re.compile(
-    r'^=+\s*\d+\s+(?:failed|errors?)\b.*=+\s*$'
-    r'|'
-    r'\b\d+\s+(?:failed|errors?)\b[^\n]{0,20}?\sin\s+[\d.]+s\b',
+    r'^=+\s*\d+\s+(?:failed|errors?)\b.*=+\s*$',
     re.MULTILINE | re.IGNORECASE,
 )
+
+
+def _is_test_runner_shaped_line(line: str) -> bool:
+    """True when *line* carries a test-runner-shaped token ('test' or '::').
+
+    Review follow-up (task 2821): both grounded FAILED-line verdict goldens
+    carry one of these on their FAILED line —
+    ``_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT``'s
+    'tests/test_registry_drift.py::test_registry_pin' and
+    ``_SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT``'s 'test
+    families::non_geometry_families_disjoint' — so requiring one here is a
+    no-op for the real, grounded verdict shapes. Plain substring checks (not
+    a compiled regex — neither token has metacharacters to match), mirroring
+    the ``_CLIPPY_LINT_MARKER`` style above.
+    """
+    return 'test' in line.lower() or '::' in line
 
 
 def _has_deterministic_test_verdict(output: str) -> bool:
     """True when *output* carries a real pytest/cargo test-runner VERDICT —
     a "N passed, M failed" count pair (either order, see
     ``_TEST_VERDICT_PAIR_RE``), pytest's bracketed zero-pass failure-count
-    short-summary (``_PYTEST_FAILURE_SUMMARY_RE``), or a FAILED line
-    (``_TEST_FAILURE_LEADING_RE``/``_TEST_FAILURE_TRAILING_RE``) — the
+    short-summary (``_PYTEST_FAILURE_SUMMARY_RE``), or a test-runner-shaped
+    FAILED line (``_TEST_FAILURE_LEADING_RE``/``_TEST_FAILURE_TRAILING_RE``,
+    additionally gated by ``_is_test_runner_shaped_line``) — the
     single-output proxy (task 2821) that the wrapped tool actually ran and
     reported a result, which a wrapper-emitted pre-run slot/semaphore
     timeout can never do.
+
+    The FAILED-line markers are checked line-by-line rather than against the
+    whole output (unlike the other two checks) because
+    ``_TEST_FAILURE_LEADING_RE``/``_TEST_FAILURE_TRAILING_RE`` match ANY line
+    starting/ending with 'FAILED' — including an incidental wrapper log line
+    with no test runner involved at all (e.g. 'flock: lock acquisition
+    FAILED'). Since this evidence is consulted only inside the
+    SEMAPHORE_TIMEOUT arm — i.e. only once lock/slot/semaphore + "timed out"
+    tokens are already present — an unanchored match would veto a GENUINE
+    wrapper-emitted timeout. Requiring the matched line to also be
+    test-runner-shaped (``_is_test_runner_shaped_line``) closes that false-veto
+    risk without touching the shared regexes themselves, which other
+    classification paths (``_classify_pytest``/``_classify_cargo``/
+    ``_classify_opaque``) still consult unanchored, unaffected by this gate.
     """
-    return bool(
-        _TEST_VERDICT_PAIR_RE.search(output)
-        or _PYTEST_FAILURE_SUMMARY_RE.search(output)
-        or _TEST_FAILURE_LEADING_RE.search(output)
-        or _TEST_FAILURE_TRAILING_RE.search(output)
-    )
+    if _TEST_VERDICT_PAIR_RE.search(output) or _PYTEST_FAILURE_SUMMARY_RE.search(output):
+        return True
+    for line in output.splitlines():
+        if not (_TEST_FAILURE_LEADING_RE.search(line) or _TEST_FAILURE_TRAILING_RE.search(line)):
+            continue
+        if _is_test_runner_shaped_line(line):
+            return True
+    return False
 
 
 # Broken _merge-verify worktree (task 2756) — a guard script (e.g. reify's
