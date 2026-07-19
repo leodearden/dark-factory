@@ -3746,3 +3746,44 @@ class TestHasOpenL1CategoryFilter:
             _make_esc_with_category('esc-T-1', 'T', 'merge_error', status='resolved')
         )
         assert queue.has_open_l1('T', category='merge_error') is False
+
+
+class TestMultipleCoOpenL1Resolution:
+    """Signature-aware dedup permits N co-open L1s per task; resolving one must
+    leave the task blocked until the others are resolved (task 2757; reviewer
+    robustness follow-up, queue-layer portion).
+
+    The bare, no-category ``has_open_l1(task_id)`` is the unblock gate: it stays
+    True while ANY pending L1 remains open, so resolving one of several co-open
+    L1s never prematurely unblocks a task that still has an open root cause.
+    (The dashboards/reapers portion of the reviewer note is out of scope for
+    this task's locked modules and left to a follow-up.)
+    """
+
+    def test_resolving_one_of_two_co_open_l1s_keeps_task_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        """Two co-open L1s of different categories; resolving one leaves the
+        bare unblock gate True until the second is also resolved."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'merge_error'))
+        queue.submit(_make_esc_with_category('esc-T-2', 'T', 'post_merge_verify'))
+
+        # Both root causes open: bare gate blocks; both signatures present.
+        assert queue.has_open_l1('T') is True
+        assert queue.has_open_l1('T', category='merge_error') is True
+        assert queue.has_open_l1('T', category='post_merge_verify') is True
+
+        # Resolve ONE of the two co-open L1s.
+        queue.resolve('esc-T-1', 'human unblocked merge_error')
+
+        # Bare unblock gate STILL True — the second L1 keeps the task blocked.
+        assert queue.has_open_l1('T') is True
+        # Its own signature is cleared, but the unrelated one still stands.
+        assert queue.has_open_l1('T', category='merge_error') is False
+        assert queue.has_open_l1('T', category='post_merge_verify') is True
+
+        # Resolve the second: only now is the task fully unblocked.
+        queue.resolve('esc-T-2', 'human unblocked post_merge_verify')
+        assert queue.has_open_l1('T') is False
+        assert queue.has_open_l1('T', category='post_merge_verify') is False
