@@ -1,0 +1,68 @@
+prd: plans/integration-test-lane-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 2789
+  title: Generalize the offline-lane runner to config-driven per-project commands
+  capabilities:
+  - name: offline-lane-generic-config-driven-runner
+    binding: capability→producer (wired) — delivered by α; _run_once reads git.offline_lane_commands
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: offline_lane_commands
+      paths:
+      - orchestrator/src/orchestrator/offline_lane.py
+      expect: present
+  - name: reused-engine-and-red-path-substrate
+    binding: capability→producer (wired) — OfflineLaneWorker._run_once (offline_lane.py:363),
+      _extract_failing_test_ids (verify.py:545), compute_failing_test_set_fingerprint
+      (workflow.py:467), build_offline_lane_fix_task_arguments (workflow.py:494),
+      serial_pytest (verify_cmd.py:545) — all present on main
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: reused substrate already exists on main; a grep would pre-satisfy the
+        gate before α lands, so it is recorded but not dispatch-gating
+- label: β
+  task_id: 2790
+  title: Instantiate the config-driven off-hot-path lane for dark-factory Qdrant integration
+    tests
+  capabilities:
+  - name: df-qdrant-offline-lane-config-in-yaml
+    binding: capability→producer (wired) — delivered by β in dark-factory-orchestrator.yaml
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: offline_lane_commands
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: present
+  - name: qdrant-tests-integration-marked
+    binding: capability→producer (upstream) — producer:task-2773 (adds @pytest.mark.integration;
+      currently blocked, re-pend after α lands)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: delivered by upstream task 2773 (external local dep, DAG-enforced);
+        not in this batch so not sidecar-stampable
+  - name: pytest-m-integration-overrides-addopts
+    binding: empirical — default --collect-only selected 5, `-m integration` deselected
+      all 5 (command-line -m overrides ini addopts -m 'not integration')
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: proven this session; a dispatch-time collect-only would collect 0 until
+        2773 lands the marks, so it is not a clean mechanical gate
+- label: γ
+  task_id: 2791
+  title: 'Deterministic-deploy: activate the dark-factory offline lane'
+  capabilities:
+  - name: lane-activated-end-to-end
+    binding: DAG-direction — all legs produced upstream (α runner, β config, 2773
+      marks); restart via scripts/restart-all-orchestrators.sh --drain
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the deploy + the orchestrator log lines (worker started; qdrant-integration
+        sub-run head=...) ARE the check; leaf gates nothing downstream
