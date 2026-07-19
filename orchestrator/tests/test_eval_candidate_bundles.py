@@ -30,11 +30,42 @@ class TestClaudeEndpointCandidatesRoster:
         names = [c.name for c in candidates]
         assert len(names) == len(set(names))
 
-    def test_each_candidate_varies_exactly_one_role(self):
+    def test_returns_only_recognized_roles(self):
+        """Every candidate's ``role`` is a recognized value.
+
+        Renamed from the former ``test_each_candidate_varies_exactly_one_role``,
+        whose name/docstring claimed the "exactly one role varies" invariant
+        but whose body only checked role membership — that stronger claim is
+        a structural property of ``EvalConfig`` (it carries a single ``role``
+        field, so it cannot vary more than one by construction), not
+        something a membership check exercises. See
+        ``test_non_incumbent_bundles_all_target_the_implementer_role`` below
+        for the concrete, testable role invariant ν's bundles actually hold.
+        """
         from orchestrator.evals.configs import claude_endpoint_candidates
 
         candidates = claude_endpoint_candidates()
         assert all(c.role in ('implementer', 'architect') for c in candidates)
+
+    def test_non_incumbent_bundles_all_target_the_implementer_role(self):
+        """ν's non-incumbent bundles vary the implementer role only (design
+        decision: "Non-incumbent bundles default to role='implementer'") —
+        an architect-role ν bundle, and the both-proxied architect×implementer
+        matrix, are explicitly out of scope for this task."""
+        from orchestrator.evals.configs import (
+            DEEPSEEK_MODEL,
+            GLM_MODEL,
+            KIMI_MODEL,
+            MINIMAX_MODEL,
+            claude_endpoint_candidates,
+        )
+
+        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbents = [
+            c for c in claude_endpoint_candidates() if c.model in non_incumbent_models
+        ]
+        assert non_incumbents
+        assert all(c.role == 'implementer' for c in non_incumbents)
 
     def test_includes_the_four_non_incumbent_models(self):
         from orchestrator.evals.configs import (
