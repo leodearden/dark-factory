@@ -1055,6 +1055,36 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
         )
         assert '_lane-0' not in harness._recovered_sessions
 
+    async def test_planless_lane_corrupt_sidecar_falls_back_to_cleanup(
+        self, harness: Harness,
+    ):
+        """A no-plan lane whose sidecar is malformed JSON -> the exception
+        branch inside `_adopt_recovered_session` (harness.py:2401-2408) is
+        hit via the task_id=None call site (harness.py:2777, only reachable
+        from a lane) and returns None: nothing is adopted and disposition is
+        unchanged (still released back to the pool), exactly like the
+        cold-worktree analog `test_recover_corrupt_sidecar_falls_back_to_cleanup`
+        above -- but that test only exercises the task_id-given call site
+        (harness.py:2786), leaving this task_id=None site previously
+        untested.
+        """
+        _pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane_path = base / '_lane-0'
+        task_dir = lane_path / '.task'
+        task_dir.mkdir(parents=True)
+        (task_dir / 'agent_session.json').write_text('{not json')
+
+        await harness._recover_crashed_tasks()
+
+        # Corrupt sidecar -> nothing adopted (no key was ever parseable)
+        assert harness._recovered_sessions == {}
+        assert '_lane-0' not in harness._preserved_worktrees
+        # Disposition unchanged: still released back to the pool.
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane_path, '_lane-0'
+        )
+
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
