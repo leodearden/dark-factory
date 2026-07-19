@@ -161,6 +161,59 @@ class TestBuildPriceTable:
 
 
 # ---------------------------------------------------------------------------
+# Task 2478 μ (amend): build_pairwise_price_table — the combined arch+impl
+# price table for the end-to-end (matrix/confirm) stages. Keyed to match
+# run_end_to_end's ``f'{arch.name}+{impl.name}'`` config_name so the rendered
+# price section aligns with the end-to-end composite rows (was individual-keyed).
+# ---------------------------------------------------------------------------
+
+class TestBuildPairwisePriceTable:
+    """{arch+impl: {architect: entry, implementer: entry}} — one combined-name
+    entry per (architect, implementer) pair, carrying BOTH roles' rates.
+    """
+
+    def test_pair_keys_combined_name_with_both_roles(self):
+        from orchestrator.evals.report import build_pairwise_price_table
+
+        prices = {
+            'arch-model': {'input_per_1m': 3.0, 'output_per_1m': 12.0},
+            'impl-model': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
+        }
+        arch = _cfg('architect-x', 'arch-model', role='architect')
+        impl = _cfg('impl-y', 'impl-model', role='implementer')
+        table = build_pairwise_price_table([(arch, impl)], prices)
+        # Key is the combined name run_end_to_end stamps; both roles present.
+        assert table == {
+            'architect-x+impl-y': {
+                'architect': {'input_per_1m': 3.0, 'output_per_1m': 12.0},
+                'implementer': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
+            }
+        }
+
+    def test_unlisted_model_gets_explicit_unpriced_marker(self):
+        from orchestrator.evals.report import build_pairwise_price_table
+
+        arch = _cfg('a', 'unlisted', role='architect')
+        impl = _cfg('b', 'unlisted', role='implementer')
+        table = build_pairwise_price_table([(arch, impl)], {})
+        # EXPLICIT marker for each role, never a fabricated price.
+        assert table['a+b']['architect'] == {'source': 'unpriced'}
+        assert table['a+b']['implementer'] == {'source': 'unpriced'}
+
+    def test_deterministic_sorted_combined_keys(self):
+        from orchestrator.evals.report import build_pairwise_price_table
+
+        prices = {'m': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
+        i1 = _cfg('impl-b', 'm', role='implementer')
+        pairs = [
+            (_cfg('arch-z', 'm', role='architect'), i1),
+            (_cfg('arch-a', 'm', role='architect'), i1),
+        ]
+        table = build_pairwise_price_table(pairs, prices)
+        assert list(table.keys()) == ['arch-a+impl-b', 'arch-z+impl-b']
+
+
+# ---------------------------------------------------------------------------
 # Task 2477 step-09: build_composite_report — the C4 per-config composite report
 # over the UNION of configs (retiring the all-tasks-intersection collapse).
 # ---------------------------------------------------------------------------

@@ -101,6 +101,22 @@ def _ratio_score(value: float, best: float) -> float:
     return min(max(best / value, 0.0), 1.0)
 
 
+def _price_role_entry(model: str, prices: dict[str, Any] | None) -> dict[str, Any]:
+    """One role's price cell for *model*: its ``input/output_per_1m`` rates, or
+    the EXPLICIT ``{'source': 'unpriced'}`` marker for an unlisted model — never a
+    fabricated default (loud-over-silent). Shared by :func:`build_price_table`
+    (individual-config keys) and :func:`build_pairwise_price_table` (the μ
+    end-to-end combined ``arch+impl`` keys) so both build cells identically.
+    """
+    entry = prices.get(model) if prices else None
+    if entry is None:
+        return {'source': 'unpriced'}
+    return {
+        'input_per_1m': _rate(entry, 'input_per_1m'),
+        'output_per_1m': _rate(entry, 'output_per_1m'),
+    }
+
+
 def build_price_table(
     configs: list[Any], prices: dict[str, Any] | None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -117,15 +133,30 @@ def build_price_table(
     """
     table: dict[str, dict[str, dict[str, Any]]] = {}
     for config in sorted(configs, key=lambda c: c.name):
-        entry = prices.get(config.model) if prices else None
-        if entry is None:
-            role_price: dict[str, Any] = {'source': 'unpriced'}
-        else:
-            role_price = {
-                'input_per_1m': _rate(entry, 'input_per_1m'),
-                'output_per_1m': _rate(entry, 'output_per_1m'),
-            }
-        table[config.name] = {config.role: role_price}
+        table[config.name] = {config.role: _price_role_entry(config.model, prices)}
+    return table
+
+
+def build_pairwise_price_table(
+    pairs: list[Any], prices: dict[str, Any] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Combined-name price table for the μ end-to-end stages (matrix / confirm).
+
+    Each ``(architect_cfg, implementer_cfg)`` pair keys ONE entry under the
+    combined ``f'{arch.name}+{impl.name}'`` config name — byte-identical to the
+    ``config_name`` :func:`run_end_to_end` stamps on that pair's ``EvalResult`` —
+    carrying BOTH roles' per-model rates. Keying by the combined name keeps the
+    rendered price-table section's ``config`` column ALIGNED with an end-to-end
+    composite report's combined rows; individual-config :func:`build_price_table`
+    keys never lined up with those rows (reviewer: correctness). Pure over
+    ``(pairs, prices)``; keys inserted in sorted order for byte-determinism.
+    """
+    table: dict[str, dict[str, dict[str, Any]]] = {}
+    for arch_cfg, impl_cfg in sorted(pairs, key=lambda p: f'{p[0].name}+{p[1].name}'):
+        table[f'{arch_cfg.name}+{impl_cfg.name}'] = {
+            arch_cfg.role: _price_role_entry(arch_cfg.model, prices),
+            impl_cfg.role: _price_role_entry(impl_cfg.model, prices),
+        }
     return table
 
 
@@ -295,6 +326,116 @@ def build_composite_report(
         'price_table': price_table if price_table is not None else {},
         'configs': rows,
     }
+
+
+# ===== μ methodology-driver substrate (PRD plans/eval-framework-revival-prd.md
+# task μ) =====
+#
+# select_survivors / build_methodology_report / format_methodology_report model
+# the AUTOMATIC ofat→select_survivors→matrix→confirm→methodology-report flow.
+# That single-command auto-driver is a planned follow-up and is NOT yet wired:
+# the shipped CLI surface (eval-ofat / eval-matrix / eval-confirm) instead runs
+# each stage independently, with the operator picking survivors manually via
+# --arch/--impl between stages. These three PURE functions are the tested
+# substrate that follow-up will consume; today only test_eval_driver_report.py
+# exercises them. Kept here (not deferred) so the auto-driver lands as a thin
+# wiring change over an already-verified core.
+def select_survivors(
+    composite_report: dict[str, Any],
+    *,
+    top_k: int,
+    roles: list[str],
+) -> dict[str, list[str]]:
+    """The top-K config names per ``role_under_test`` — the μ OFAT survivor gate.
+
+    Groups the λ :func:`build_composite_report` ``'configs'`` rows by
+    ``role_under_test``, ranks each requested role's group by DESCENDING
+    ``composite`` mean (ties broken deterministically by ascending ``config``
+    name, so the surface is byte-stable), and returns the top-``top_k`` config
+    names per role. A role with fewer than ``top_k`` rows returns all it has; a
+    requested role with no rows returns ``[]``. Pure over the report dict — the
+    OFAT screen feeds these survivors into :func:`run_matrix_stage`.
+    """
+    by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in composite_report.get('configs', []):
+        by_role[row.get('role_under_test')].append(row)
+
+    survivors: dict[str, list[str]] = {}
+    for role in roles:
+        ranked = sorted(
+            by_role.get(role, []),
+            key=lambda r: (-float(r.get('composite', 0.0) or 0.0), str(r.get('config', ''))),
+        )
+        survivors[role] = [str(r['config']) for r in ranked[:top_k]]
+    return survivors
+
+
+_METHODOLOGY_STAGES = ('ofat', 'matrix', 'confirm')
+
+
+def build_methodology_report(
+    ofat_results: list[EvalResult],
+    matrix_results: list[EvalResult],
+    confirm_results: list[EvalResult],
+    *,
+    price_table: dict[str, Any] | None = None,
+    survivors: dict[str, list[str]] | None = None,
+    winner: str | None = None,
+) -> dict[str, Any]:
+    """The μ methodology report: three λ composite sub-reports + survivors + winner.
+
+    Nests a full :func:`build_composite_report` under each stage key
+    (``'ofat'`` / ``'matrix'`` / ``'confirm'``), echoing *price_table* into each
+    (so every stage is a self-contained C4 composite report), and carries the
+    OFAT *survivors*, the confirmed *winner*, and the echoed *price_table* at the
+    top level. A thin, deterministic aggregator — it invents NO new per-config
+    schema, reusing λ's substrate wholesale (decision 7). ``price_table`` /
+    ``survivors`` default to ``{}`` and ``winner`` to ``None`` when omitted.
+    """
+    pt = price_table if price_table is not None else {}
+    return {
+        'generated_at': datetime.now(UTC).isoformat(),
+        'price_table': pt,
+        'survivors': survivors if survivors is not None else {},
+        'winner': winner,
+        'stages': {
+            'ofat': build_composite_report(ofat_results, price_table=pt),
+            'matrix': build_composite_report(matrix_results, price_table=pt),
+            'confirm': build_composite_report(confirm_results, price_table=pt),
+        },
+    }
+
+
+def format_methodology_report(report: dict[str, Any]) -> str:
+    """Render :func:`build_methodology_report` output byte-stably.
+
+    A deterministic survivors/winner header, then each stage
+    (``ofat`` → ``matrix`` → ``confirm``) rendered via
+    :func:`format_composite_table` (which carries that stage's per-config
+    composite / cost / latency / CI95 columns and its price-table section). No
+    wall-clock is rendered and every row/section is sorted with fixed float
+    precision, so the same report always renders byte-identically.
+    """
+    survivors = report.get('survivors') or {}
+    lines = [
+        'methodology report:',
+        f'winner: {report.get("winner") if report.get("winner") is not None else "-"}',
+        'survivors:',
+    ]
+    for role in sorted(survivors):
+        names = ', '.join(str(n) for n in (survivors[role] or []))
+        lines.append(f'  {role}: {names}')
+
+    stages = report.get('stages') or {}
+    for stage in _METHODOLOGY_STAGES:
+        sub = stages.get(stage)
+        lines.append('')
+        lines.append(f'== {stage} stage ==')
+        if sub is None:
+            lines.append('(no results)')
+            continue
+        lines.append(format_composite_table(sub))
+    return '\n'.join(lines)
 
 
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:

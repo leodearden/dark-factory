@@ -428,3 +428,77 @@ def get_config_by_name(name: str) -> EvalConfig | None:
         if cfg.name == name:
             return cfg
     return None
+
+
+# ===== μ OFAT→matrix→confirm driver substrate (eval-revival μ / C4) =====
+#
+# The methodology driver (evals/runner.py) screens each candidate in ONE role
+# with every OTHER role pinned to its incumbent baseline (OFAT), then crosses
+# architect×implementer survivors (matrix), then confirms the winner. This
+# module owns the PURE candidate/pair curation those stages consume; the
+# fan-out orchestration lives beside run_eval/run_architect_eval in runner.py.
+
+# The pinned incumbent baseline per varied role. When an OFAT candidate varies
+# its own role, every OTHER role is held at these baselines — the same pins
+# ``build_eval_orch_config`` hardcodes (architect='opus', reviewer='opus'), so
+# a downstream role never becomes a confound. Implementer is deliberately absent
+# because the architect OFAT path (run_architect_eval) FREEZES the implementer
+# entirely rather than pinning a live one (decision 8).
+INCUMBENTS: dict[str, str] = {
+    'architect': 'opus',
+    'reviewer': 'opus',
+}
+
+
+def _cloud_implementer_incumbents() -> list[EvalConfig]:
+    """The native-cloud claude Opus/Sonnet implementer baselines from EVAL_CONFIGS.
+
+    A cloud incumbent is a native claude-backend implementer config on
+    opus/sonnet with NO proxy ``env_overrides`` — that last clause is what
+    separates a cloud baseline (``claude-opus-high``) from a vLLM-proxied config
+    (which also carries ``backend='claude', model='sonnet'`` but drives a proxied
+    endpoint via env). Computed FROM ``EVAL_CONFIGS`` so it can never drift from
+    the canonical list.
+    """
+    return [
+        c for c in EVAL_CONFIGS
+        if c.role == 'implementer'
+        and c.backend == 'claude'
+        and c.model in ('opus', 'sonnet')
+        and not c.env_overrides
+    ]
+
+
+def ofat_candidates() -> list[EvalConfig]:
+    """The one-role-each OFAT candidate set: implementer incumbents + architects.
+
+    Each candidate varies exactly ONE role (PRD §μ / C4): the implementer subset
+    (native-cloud Opus AND Sonnet claude incumbents — the G2 >=2-config floor,
+    driving the implementer via ``run_eval`` with the plan frozen) and the
+    architect subset (``ARCHITECT_EVAL_CONFIGS``, driving the architect LIVE via
+    ``run_architect_eval`` with downstream roles frozen). Pure, no I/O.
+    """
+    return [*_cloud_implementer_incumbents(), *ARCHITECT_EVAL_CONFIGS]
+
+
+def same_family(a: EvalConfig, b: EvalConfig) -> bool:
+    """True when two configs share the same model+backend family.
+
+    Used by :func:`matrix_pairs`' report layer to FLAG a same-family
+    architect×implementer diagonal (e.g. sonnet-arch × sonnet-impl) — the pair
+    that tests whether a plan style couples to its own family's implementer. It
+    never EXCLUDES a pair; the matrix runs every combination regardless.
+    """
+    return a.model == b.model and a.backend == b.backend
+
+
+def matrix_pairs(
+    arch_cfgs: list[EvalConfig], impl_cfgs: list[EvalConfig],
+) -> list[tuple[EvalConfig, EvalConfig]]:
+    """The FULL architect×implementer cross product as ``(arch, impl)`` tuples.
+
+    Deliberately INCLUDES same-family diagonals (PRD decision 9): excluding them
+    would discard exactly the plan-style/implementer coupling signal the matrix
+    exists to measure. ``len == len(arch_cfgs) * len(impl_cfgs)``. Pure.
+    """
+    return [(a, i) for a in arch_cfgs for i in impl_cfgs]

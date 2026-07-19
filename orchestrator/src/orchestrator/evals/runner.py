@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,7 +28,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome, build_workflow
 
-from .configs import EVAL_CONFIGS, EvalConfig
+from .configs import EVAL_CONFIGS, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree
@@ -93,14 +93,23 @@ def build_eval_orch_config(
     task: dict,
     base_config: OrchestratorConfig | None = None,
     memory_endpoint: str | None = None,
+    architect_config: EvalConfig | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
-    Architect always runs on Claude opus-high (constant planning).
+    Architect defaults to Claude opus-high (constant planning) — the frozen-plan
+    ``run_eval`` and plan-only ``run_architect_eval`` paths both leave it there.
     Reviewer is the new 1× Opus comprehensive reviewer (matches production
     after the reviewer-panel trial replaced the 5× sonnet panel; merged
     via 594658fbe3 / 2c26a30bca).
     Only the implementer varies per eval config.
+
+    ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
+    /confirm runs (``run_end_to_end``): when supplied, the architect's
+    model/backend/effort are derived from THIS candidate instead of the hardcoded
+    opus/claude/high, so an architect×implementer combo can be scored end-to-end.
+    Left ``None`` (every existing caller), the architect pin is byte-identical to
+    today, so the P1/B1 parity tripwire and the frozen-plan paths stay intact.
 
     Two task-spec knobs override the defaults below:
       - ``max_execute_iterations``: hard ceiling on implementer iterations.
@@ -125,8 +134,16 @@ def build_eval_orch_config(
         raise ValueError('build_eval_orch_config requires an explicit base_config')
     base = base_config
 
+    # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
+    # or derived from architect_config for the both-live end-to-end run (μ). When
+    # architect_config is None every value below equals the historical literal, so
+    # the config is byte-identical to today and the P1/B1 parity tripwire holds.
+    architect_model = architect_config.model if architect_config else 'opus'
+    architect_backend = architect_config.backend if architect_config else 'claude'
+    architect_effort = (architect_config.effort or 'high') if architect_config else 'high'
+
     models = ModelsConfig(
-        architect='opus',
+        architect=architect_model,
         implementer=config.model,
         debugger=config.model,
         reviewer='opus',          # 1× opus comprehensive reviewer (production parity)
@@ -146,7 +163,7 @@ def build_eval_orch_config(
     )
 
     effort = EffortConfig(
-        architect='high',
+        architect=architect_effort,
         implementer=config.effort or 'high',
         debugger=config.effort or 'high',
         reviewer='high',           # opus reviewer at high effort (matches defaults.yaml)
@@ -156,7 +173,7 @@ def build_eval_orch_config(
     )
 
     backends = BackendsConfig(
-        architect='claude',
+        architect=architect_backend,
         implementer=config.backend,
         debugger=config.backend,
         reviewer='claude',        # reviewers always on Claude
@@ -531,6 +548,138 @@ async def run_architect_eval(
     return result_obj
 
 
+async def run_end_to_end(
+    task_path: Path,
+    arch_config: EvalConfig,
+    impl_config: EvalConfig,
+    base_config: OrchestratorConfig | None = None,
+    trial: int = 1,
+    timeout_override: int | None = None,
+    memory_endpoint: str | None = None,
+) -> EvalResult:
+    """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
+
+    Unlike :func:`run_eval` (frozen plan → implementer varies) and
+    :func:`run_architect_eval` (live architect → downstream frozen), this is the
+    ONLY executor where BOTH the architect and the implementer run live — the
+    matrix/confirm stages (eval-revival μ). It builds the both-live orch config
+    via ``build_eval_orch_config(impl_config, ..., architect_config=arch_config)``
+    and constructs the workflow with ``initial_plan=None`` so the workflow runs
+    its PLAN phase live (the architect plans against the fixture) and feeds that
+    plan to the live implementer — the only place the plan-style/implementer
+    coupling question exists (PRD decision 9).
+
+    The result's ``config_name`` encodes the ``(architect, implementer)`` combo
+    and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
+    timeout / exception handling and persists via :func:`save_result`.
+    """
+    task = load_task(task_path)
+    task_id = task['id']
+    project_root = Path(task['project_root'])
+    config_name = f'{arch_config.name}+{impl_config.name}'
+
+    logger.info(
+        f'Starting end-to-end eval: {task_id} × {config_name} (trial {trial})'
+    )
+    start_ms = int(time.monotonic() * 1000)
+
+    # 1. Fresh worktree at the fixture's pre_task_commit.
+    worktree, run_id = await create_eval_worktree(
+        project_root, task_id, task['pre_task_commit'],
+        setup_commands=task.get('setup_commands'),
+    )
+
+    # 2. Both-live orch config: architect derived from arch_config, implementer
+    #    from impl_config.
+    orch_config = build_eval_orch_config(
+        impl_config, task, base_config,
+        memory_endpoint=memory_endpoint, architect_config=arch_config,
+    )
+
+    # 3. Task assignment.
+    task_def = task.get('task_definition', {
+        'title': task.get('name', task_id),
+        'description': task.get('name', ''),
+    })
+    modules = task.get('modules', [])
+    assignment = TaskAssignment(
+        task_id=task_id, task=task_def, modules=list(modules),
+    )
+
+    # 4. Workflow dependencies (mirrors run_eval).
+    git_ops = GitOps(orch_config.git, orch_config.project_root)
+    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
+    briefing = BriefingAssembler(orch_config)
+    mcp = _EvalMcpStub(orch_config.fused_memory.url)
+
+    usage_gate: UsageGate | None = None
+    if orch_config.usage_cap.enabled:
+        try:
+            usage_gate = UsageGate(orch_config.usage_cap)
+        except Exception as exc:
+            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+
+    # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
+    #    feeds the live implementer (the both-live path; run_eval hands a frozen
+    #    plan here instead).
+    workflow = build_workflow(
+        assignment=assignment,
+        config=orch_config,
+        git_ops=git_ops,
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=briefing,
+        mcp=mcp,  # type: ignore[arg-type]
+        initial_plan=None,
+        usage_gate=usage_gate,
+    )
+    workflow.worktree = worktree
+
+    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+    try:
+        terminal_report = await asyncio.wait_for(
+            workflow.run(), timeout=timeout_minutes * 60,
+        )
+        outcome = terminal_report.outcome
+    except TimeoutError:
+        logger.error(
+            f'End-to-end eval {task_id} × {config_name} timed out after '
+            f'{timeout_minutes}m'
+        )
+        outcome = 'timeout'
+    except Exception as e:
+        logger.error(f'End-to-end eval {task_id} × {config_name} failed: {e}')
+        outcome = WorkflowOutcome.BLOCKED
+
+    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+
+    # 6. Collect metrics, then STAMP role_under_test='end_to_end' (collect_metrics
+    #    itself does not know which methodology stage invoked it).
+    try:
+        metrics = await collect_metrics(workflow, worktree, task)
+        metrics_dict = metrics.to_dict()
+    except Exception as e:
+        logger.warning(f'Metric collection failed: {e}')
+        metrics_dict = {}
+    metrics_dict['role_under_test'] = 'end_to_end'
+
+    result = EvalResult(
+        task_id=task_id,
+        config_name=config_name,
+        outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
+        metrics=metrics_dict,
+        worktree_path=str(worktree),
+        wall_clock_ms=wall_clock_ms,
+        run_id=run_id,
+        trial=trial,
+    )
+    save_result(result)
+    logger.info(
+        f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
+        f'({wall_clock_ms / 1000:.1f}s)'
+    )
+    return result
+
+
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
     """Return all CancelledErrors from a completed asyncio.wait done-set.
 
@@ -674,6 +823,181 @@ async def run_eval_matrix(
         await asyncio.gather(*active, return_exceptions=True)
         raise
     return results
+
+
+async def _bounded_fanout(
+    thunks: list[Callable[[], Awaitable[EvalResult | None]]],
+    max_parallel: int | None = None,
+) -> list[EvalResult]:
+    """Run each *thunk* with bounded concurrency, returning the flattened results.
+
+    The single-sourced fan-out skeleton the μ methodology stages
+    (:func:`run_ofat_stage` / :func:`run_matrix_stage` / :func:`run_confirm_stage`)
+    share, mirroring :func:`run_eval_matrix`'s ``asyncio.wait(FIRST_COMPLETED)``
+    monitor loop EXACTLY: a non-cancel failure in one cell is logged and the
+    fan-out CONTINUES; a ``CancelledError`` (inner or external) cancels the
+    still-running siblings, awaits their teardown, and re-raises. Each thunk is a
+    zero-arg coroutine factory returning one ``EvalResult`` (or ``None`` to skip).
+    """
+    if not thunks:
+        return []
+    if max_parallel is None:
+        max_parallel = len(thunks)
+    sem = asyncio.Semaphore(max_parallel)
+
+    async def _guarded(thunk: Callable[[], Awaitable[EvalResult | None]]) -> EvalResult | None:
+        async with sem:
+            return await thunk()
+
+    active: set[asyncio.Task] = {asyncio.create_task(_guarded(t)) for t in thunks}
+    results: list[EvalResult] = []
+    try:
+        while active:
+            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            cancel_errors = _collect_cancel_errors(done)
+            if cancel_errors:
+                for ce in cancel_errors:
+                    logger.error('Eval cancelled', exc_info=ce)
+                for t in active:
+                    t.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
+                active.clear()
+                raise cancel_errors[0]
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    logger.error('Eval failed', exc_info=exc)
+                else:
+                    r = task.result()
+                    if r is not None:
+                        results.append(r)
+    except asyncio.CancelledError:
+        for t in active:
+            t.cancel()
+        await asyncio.gather(*active, return_exceptions=True)
+        raise
+    return results
+
+
+async def run_ofat_stage(
+    task_paths: list[Path],
+    candidates: list[EvalConfig],
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    timeout_override: int | None = None,
+) -> list[EvalResult]:
+    """OFAT screen: dispatch each candidate by role over fixtures × trials (μ).
+
+    A role-dispatching fan-out over the EXISTING frozen-input executors
+    (decision 9): an implementer candidate (``role=='implementer'``) runs through
+    :func:`run_eval` (frozen plan → implementer varies, arch/reviewer pinned), an
+    architect candidate (``role=='architect'``) through :func:`run_architect_eval`
+    (live architect → downstream frozen). No new per-role machinery. Returns the
+    flattened ``EvalResult`` list across every ``(candidate, fixture, trial)``
+    cell; a failed cell is logged and skipped via :func:`_bounded_fanout`.
+    """
+    def _thunk(
+        task_path: Path, candidate: EvalConfig, trial: int,
+    ) -> Callable[[], Awaitable[EvalResult | None]]:
+        async def _run() -> EvalResult | None:
+            if candidate.role == 'architect':
+                return await run_architect_eval(
+                    task_path, candidate, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                )
+            return await run_eval(
+                task_path, candidate, base_config,
+                trial=trial, timeout_override=timeout_override,
+            )
+        return _run
+
+    thunks = [
+        _thunk(tp, candidate, trial)
+        for tp in task_paths
+        for candidate in candidates
+        for trial in range(1, trials + 1)
+    ]
+    return await _bounded_fanout(thunks, max_parallel)
+
+
+async def run_matrix_stage(
+    task_paths: list[Path],
+    arch_survivors: list[EvalConfig],
+    impl_survivors: list[EvalConfig],
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    timeout_override: int | None = None,
+) -> list[EvalResult]:
+    """Matrix stage: both-live architect×implementer cross product over survivors (μ).
+
+    Expands :func:`configs.matrix_pairs` — the FULL ``arch_survivors ×
+    impl_survivors`` cross product, INCLUDING same-family diagonals (e.g.
+    sonnet-arch × sonnet-impl), the pair that tests whether a plan style couples
+    to its own family's implementer (PRD decision 9) — and fans
+    :func:`run_end_to_end` out over ``pairs × fixtures × trials`` via the shared
+    :func:`_bounded_fanout` skeleton (identical cancellation / error-continue
+    semantics to :func:`run_ofat_stage`). Both roles run LIVE. Returns the
+    flattened ``EvalResult`` list; a failed cell is logged and skipped.
+    """
+    def _thunk(
+        task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
+    ) -> Callable[[], Awaitable[EvalResult | None]]:
+        async def _run() -> EvalResult | None:
+            return await run_end_to_end(
+                task_path, arch, impl, base_config,
+                trial=trial, timeout_override=timeout_override,
+            )
+        return _run
+
+    pairs = matrix_pairs(arch_survivors, impl_survivors)
+    thunks = [
+        _thunk(tp, arch, impl, trial)
+        for tp in task_paths
+        for arch, impl in pairs
+        for trial in range(1, trials + 1)
+    ]
+    return await _bounded_fanout(thunks, max_parallel)
+
+
+async def run_confirm_stage(
+    task_paths: list[Path],
+    arch_winner: EvalConfig,
+    impl_winner: EvalConfig,
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 3,
+    timeout_override: int | None = None,
+) -> list[EvalResult]:
+    """Confirmation batch: the SINGLE winning combo × N trials, both-live (μ).
+
+    The final methodology stage — one end-to-end confirmation of the winning
+    ``(arch_winner, impl_winner)`` combo (PRD decision 10). Fans
+    :func:`run_end_to_end` out over ``fixtures × trials`` for the single combo
+    via the shared :func:`_bounded_fanout` skeleton (identical cancellation /
+    error-continue semantics to the screen stages). ``trials`` defaults to 3 —
+    decision 10's statistics floor, enough repeats for a CI95 on the winner,
+    NOT the 1-trial screen default of :func:`run_ofat_stage` /
+    :func:`run_matrix_stage`. Both roles run LIVE. Returns the flattened
+    ``EvalResult`` list for the confirmation batch.
+    """
+    def _thunk(
+        task_path: Path, trial: int,
+    ) -> Callable[[], Awaitable[EvalResult | None]]:
+        async def _run() -> EvalResult | None:
+            return await run_end_to_end(
+                task_path, arch_winner, impl_winner, base_config,
+                trial=trial, timeout_override=timeout_override,
+            )
+        return _run
+
+    thunks = [
+        _thunk(tp, trial)
+        for tp in task_paths
+        for trial in range(1, trials + 1)
+    ]
+    return await _bounded_fanout(thunks, max_parallel)
 
 
 def _result_exists(task_id: str, config_name: str) -> bool:
