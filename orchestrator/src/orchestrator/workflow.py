@@ -12,7 +12,7 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
@@ -55,7 +55,11 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import (
+    PLAN_SCHEMA_VERSION,
+    ReviewAggregation,
+    TaskArtifacts,
+)
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
@@ -336,7 +340,8 @@ class _BriefingLike(Protocol):
         task_id: str | None = ...,
     ) -> str: ...
     async def build_reviewer_prompt(
-        self, reviewer_type: str, diff: str, context: str | None = ...
+        self, reviewer_type: str, diff: str, context: str | None = ...,
+        *, amendment_suggestions: list[dict] | None = ...,
     ) -> str: ...
     async def build_merger_prompt(
         self, conflicts: str, task_intent: str, context: str | None = ...
@@ -624,6 +629,34 @@ def classify_rebase_cohort(
     if distance_commits < threshold:
         return 'continuous'
     return 'post-unblock' if is_first_rebase else 'big-jump'
+
+
+# Context tolerance (lines) applied on each side of an amendment's new-side
+# changed ranges when partitioning post-amendment review suggestions.  Absorbs
+# reviewer line-number drift so genuine delta-adjacent findings are not routed
+# away, while fresh nits far from the amendment are still filtered (task 2750).
+_AMENDMENT_DELTA_CONTEXT_LINES = 3
+
+
+@dataclass(frozen=True)
+class AmendmentReviewContext:
+    """Consume-once loop state scoping ONE post-amendment review to its delta.
+
+    Captured in ``_execute_verify_review_loop`` immediately before an
+    amendment ``_amend`` call and consumed by the single ``_review`` that
+    immediately follows it, then reset to ``None`` so a later
+    blocking-replan/re-execute cycle (which produces a materially different
+    diff) is never scoped against this stale pre-amendment HEAD (task 2750).
+
+    Fields:
+        pre_amendment_head: the worktree HEAD SHA *before* the amendment, so
+            ``{pre_amendment_head}..HEAD`` is exactly the amendment delta.
+        amended_suggestions: the in-scope suggestions the amendment was asked
+            to address — threaded into the advisory reviewer prompt.
+    """
+
+    pre_amendment_head: str
+    amended_suggestions: list[dict]
 
 
 @dataclass(frozen=True)
@@ -4776,6 +4809,12 @@ class TaskWorkflow:
         amendment_round = (
             self.artifacts.get_amendment_rounds_total() if self.artifacts else 0
         )
+        # Consume-once scope for the single REVIEW that immediately follows an
+        # amendment (task 2750): set after a successful _amend, read+cleared at
+        # the top of the next loop pass.  A later blocking-replan/re-execute
+        # cycle produces a materially different diff, so the captured
+        # pre-amendment HEAD must never leak into that unrelated review.
+        amendment_ctx: AmendmentReviewContext | None = None
 
         while True:
             # EXECUTE
@@ -4970,7 +5009,13 @@ class TaskWorkflow:
                     )
                     review_tree_hash = None
                     review_fingerprint = None
-            reviews = await self._review()
+            # Consume-once (task 2750): this review is scoped to the amendment
+            # delta iff it immediately follows an amendment.  Read+clear the
+            # armed context now — before _review — so it applies to exactly one
+            # review and a later replan review runs unscoped.
+            used_ctx = amendment_ctx
+            amendment_ctx = None
+            reviews = await self._review(amendment_ctx=used_ctx)
             if reviews.reviewer_errors:
                 names = ', '.join(reviews.reviewer_errors)
                 return await self._mark_blocked(
@@ -4978,6 +5023,20 @@ class TaskWorkflow:
                     f'infrastructure errors after retries: {names}'
                 )
             if not reviews.has_blocking_issues:
+                # Scope a post-amendment review to the amendment delta (task
+                # 2750).  Runs FIRST inside the non-blocking arm — after the
+                # reviewer_errors early-return and outside the blocking-replan
+                # path — so it never touches the blocking safety valve: only
+                # `suggestions` is partitioned; out-of-delta suggestions are
+                # routed to the curator inside _apply_amendment_delta_scope and
+                # dropped from the verdict.  The re-arm check, the DONE-path
+                # curator routing, and the task-2749 verdict cache below then
+                # all see only in-delta suggestions.  No-op when this review
+                # does not follow an amendment (used_ctx is None).
+                if used_ctx is not None:
+                    reviews = await self._apply_amendment_delta_scope(
+                        reviews, used_ctx,
+                    )
                 # L2b: try an amendment pass before escalating suggestions.
                 # In-scope suggestions (module-lock members) are applied by
                 # the implementer directly — no architect, no new tasks.
@@ -5013,10 +5072,21 @@ class TaskWorkflow:
                                 'Task %s: archived reviews to %s',
                                 self.task_id, archive_dir.name,
                             )
+                    # Capture HEAD immediately BEFORE the amendment so
+                    # {pre_amendment_head}..HEAD is exactly the amendment delta
+                    # the next REVIEW is scoped to (task 2750).  Co-located with
+                    # the reviews-amend archive + set_review_counters above.
+                    pre_amendment_head = await self._get_head_commit()
                     amend_ok = await self._amend(in_scope, amendment_round)
                     if not amend_ok:
                         return WorkflowOutcome.ESCALATED
                     self.metrics.amendment_rounds += 1
+                    # Arm the consume-once scope for the next REVIEW pass with
+                    # the pre-amendment HEAD and the suggestions the amendment
+                    # was asked to address (task 2750).
+                    amendment_ctx = AmendmentReviewContext(
+                        pre_amendment_head, in_scope,
+                    )
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
                 # Cap exhausted or nothing in-scope — existing DONE path.
@@ -6484,8 +6554,75 @@ class TaskWorkflow:
             if not debug_result.success:
                 logger.warning(f'Task {self.task_id}: debugger failed')
 
-    async def _review(self):
-        """Run all 5 reviewers with stagger, retry errors."""
+    async def _apply_amendment_delta_scope(
+        self, reviews: ReviewAggregation, ctx: AmendmentReviewContext,
+    ) -> ReviewAggregation:
+        """Scope a post-amendment review verdict to the amendment delta (task 2750).
+
+        Deterministically partitions ``reviews.suggestions`` by whether each
+        finding's ``location`` (``file:line``) falls within the amendment's
+        NEW-side changed line ranges (``{pre_amendment_head}..HEAD``).  In-delta
+        suggestions stay in the returned verdict; out-of-delta suggestions are
+        routed to the curator via the existing
+        :meth:`_route_review_suggestions_to_curator` path so they neither
+        re-arm the amendment loop nor bloat the DONE-path verdict.
+
+        Blocking findings are NEVER filtered — ``blocking_issues`` /
+        ``has_blocking_issues`` pass through unchanged (the safety valve).
+
+        Fail-open: if the amendment delta is empty or uncomputable, all
+        suggestions are kept in the verdict and a WARNING is logged — a git
+        error or a pathological no-op amendment must never silently discard
+        real reviewer findings (loud-over-silent).
+        """
+        assert self.worktree is not None
+        from orchestrator.review_suggestions.amendment_scope import (
+            partition_suggestions_by_delta,
+        )
+
+        delta_ranges = await self.git_ops.get_new_side_changed_line_ranges(
+            self.worktree, ctx.pre_amendment_head,
+        )
+        if not delta_ranges:
+            logger.warning(
+                'Task %s: post-amendment delta empty/uncomputable '
+                '(pre_amendment_head=%s); keeping all %d suggestion(s) in the '
+                'verdict (fail-open)',
+                self.task_id, ctx.pre_amendment_head, len(reviews.suggestions),
+            )
+            return reviews
+
+        in_delta, out_of_delta = partition_suggestions_by_delta(
+            reviews.suggestions,
+            delta_ranges,
+            context_lines=_AMENDMENT_DELTA_CONTEXT_LINES,
+        )
+        if out_of_delta:
+            await self._route_review_suggestions_to_curator(
+                ReviewAggregation(
+                    has_blocking_issues=False,
+                    blocking_issues=[],
+                    suggestions=out_of_delta,
+                    reviews={},
+                    reviewer_errors=[],
+                )
+            )
+        logger.info(
+            'Task %s: post-amendment review scoped to amendment delta — '
+            '%d in-delta suggestion(s) kept, %d out-of-delta routed to curator',
+            self.task_id, len(in_delta), len(out_of_delta),
+        )
+        return replace(reviews, suggestions=in_delta)
+
+    async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
+        """Run all 5 reviewers with stagger, retry errors.
+
+        When *amendment_ctx* is set (this review immediately follows an
+        amendment round), the amendment's addressed suggestions are threaded
+        into each reviewer's prompt as an advisory scope constraint (task
+        2750). The deterministic partition filter applied by the caller is the
+        enforceable guarantee; this only reduces wasted reviewer effort.
+        """
         assert self.worktree is not None and self.artifacts is not None
         base_commit = self.artifacts.read_base_commit()
         if base_commit:
@@ -6493,13 +6630,18 @@ class TaskWorkflow:
         else:
             diff = await self.git_ops.get_diff_from_main(self.worktree)
 
+        amendment_suggestions = (
+            amendment_ctx.amended_suggestions if amendment_ctx is not None else None
+        )
         stagger = self.config.reviewer_stagger_secs
 
         # Staggered launch — spread OAuth session creation
         async def _staggered(idx: int, role: AgentRole):
             if idx > 0:
                 await asyncio.sleep(idx * stagger)
-            return await self._run_reviewer(role, diff)
+            return await self._run_reviewer(
+                role, diff, amendment_suggestions=amendment_suggestions,
+            )
 
         tasks = [_staggered(i, r) for i, r in enumerate(ALL_REVIEWERS)]
         results = list(await asyncio.gather(*tasks, return_exceptions=True))
@@ -6520,7 +6662,10 @@ class TaskWorkflow:
             for i in error_indices:
                 await asyncio.sleep(stagger)
                 try:
-                    results[i] = await self._run_reviewer(ALL_REVIEWERS[i], diff)
+                    results[i] = await self._run_reviewer(
+                        ALL_REVIEWERS[i], diff,
+                        amendment_suggestions=amendment_suggestions,
+                    )
                 except Exception as exc:
                     results[i] = exc
 
@@ -6542,10 +6687,19 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
-    async def _run_reviewer(self, role: AgentRole, diff: str) -> dict:
-        """Run a single reviewer and read its verdict artifact."""
+    async def _run_reviewer(
+        self, role: AgentRole, diff: str,
+        amendment_suggestions: list[dict] | None = None,
+    ) -> dict:
+        """Run a single reviewer and read its verdict artifact.
+
+        *amendment_suggestions*, when set, threads the post-amendment advisory
+        scope section into the reviewer prompt (task 2750).
+        """
         assert self.worktree is not None and self.artifacts is not None
-        prompt = await self.briefing.build_reviewer_prompt(role.name, diff)
+        prompt = await self.briefing.build_reviewer_prompt(
+            role.name, diff, amendment_suggestions=amendment_suggestions,
+        )
 
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors _resolve_and_resubmit's pre-spawn

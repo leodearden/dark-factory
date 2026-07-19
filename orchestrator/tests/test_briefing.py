@@ -562,3 +562,53 @@ class TestPriorProposalStaleness:
         )
         assert isinstance(prompt, str)
         assert 'prior block-time investigation' not in prompt
+
+
+# ---------------------------------------------------------------------------
+# task 2750: build_reviewer_prompt amendment-scope advisory section
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReviewerPromptAmendmentScope:
+    """build_reviewer_prompt gains an optional amendment_suggestions kwarg.
+
+    When set, the reviewer prompt gets an advisory section constraining the
+    reviewer to verify the prior suggestions were addressed and to report only
+    new findings within the amendment delta (task 2750). The deterministic
+    partition filter is the enforceable guarantee; this section is advisory.
+    """
+
+    async def test_amendment_section_present_when_suggestions_passed(
+        self, briefing: BriefingAssembler,
+    ):
+        prior = [{
+            'location': 'src/foo.py:42',
+            'description': 'tighten the error message here',
+        }]
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', 'DIFF', context='CTX',
+            amendment_suggestions=prior,
+        )
+        # Stable anchors for the amendment-scope section.
+        assert '# Amendment Re-Review Scope' in prompt
+        assert 'were addressed' in prompt
+        assert 'amendment delta' in prompt
+        # The concrete prior suggestion is surfaced to the reviewer.
+        assert 'tighten the error message here' in prompt
+        assert 'src/foo.py:42' in prompt
+
+    async def test_no_amendment_section_by_default(
+        self, briefing: BriefingAssembler,
+    ):
+        # Omitting the kwarg and passing None must both yield the byte-identical
+        # non-amendment prompt (default path unchanged).
+        omitted = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', 'DIFF', context='CTX',
+        )
+        explicit_none = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', 'DIFF', context='CTX',
+            amendment_suggestions=None,
+        )
+        assert '# Amendment Re-Review Scope' not in omitted
+        assert omitted == explicit_none

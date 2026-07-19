@@ -689,9 +689,20 @@ This task holds locks for the following modules:
 """
 
     async def build_reviewer_prompt(
-        self, reviewer_type: str, diff: str, context: str | None = None
+        self, reviewer_type: str, diff: str, context: str | None = None,
+        *, amendment_suggestions: list[dict] | None = None,
     ) -> str:
-        """Build prompt for a reviewer agent."""
+        """Build prompt for a reviewer agent.
+
+        When *amendment_suggestions* is provided, this review immediately
+        follows an in-workflow amendment round; an advisory "# Amendment
+        Re-Review Scope" section is appended constraining the reviewer to
+        verify those prior suggestions were addressed and to report only new
+        findings within the amendment delta (task 2750).  When it is ``None``
+        the returned prompt is byte-identical to the non-amendment path.  The
+        advisory section is best-effort — the deterministic
+        ``partition_suggestions_by_delta`` filter is the enforceable guarantee.
+        """
         if context is None:
             context = await self._get_memory_context()
 
@@ -699,7 +710,7 @@ This task holds locks for the following modules:
         if len(diff) > 50000:
             diff = diff[:50000] + '\n\n... [diff truncated] ...'
 
-        return f"""\
+        prompt = f"""\
 {context}
 
 # Code Diff to Review
@@ -715,6 +726,27 @@ This task holds locks for the following modules:
 
 Your verdict is read from the `submit_review_verdict` tool call, not from your prose output — you MUST call it before finishing.
 """
+
+        if amendment_suggestions:
+            listed = '\n'.join(
+                f"- {s.get('location') or '(no location)'} — "
+                f"{s.get('description') or ''}"
+                for s in amendment_suggestions
+            )
+            prompt += f"""
+# Amendment Re-Review Scope
+
+This diff was just amended to address the prior review's in-scope suggestions,
+listed below. Do NOT hunt for fresh, unrelated nits across the full diff:
+first confirm the listed prior suggestions were addressed, then report ONLY
+new findings introduced within the amendment delta — the lines this amendment
+actually changed. Blocking regressions anywhere in the diff remain in scope.
+
+Prior suggestions the amendment was asked to address:
+{listed}
+"""
+
+        return prompt
 
     async def build_completion_judge_prompt(
         self,

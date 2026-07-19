@@ -5614,7 +5614,7 @@ class TestAmendOverwriteHaltsLoop:
             'suggested_fix': 'foo -> bar',
             'location': 'lib.py:1',
         }
-        async def _review_one_suggestion():
+        async def _review_one_suggestion(amendment_ctx=None):
             return ReviewAggregation(
                 has_blocking_issues=False,
                 blocking_issues=[],

@@ -6347,6 +6347,25 @@ index 000000..bbbbbb
 +line 5
 """
 
+# An added *content* line whose text begins with '++ b/' renders in a unified
+# diff as '+++ b/…' — indistinguishable at a string-prefix level from a real
+# '+++ b/<path>' file header.  A robust new-side parser must only treat such a
+# line as a header when it immediately follows the '--- ' old-side header, not
+# when it sits in a hunk body.  Here the injected content line and the second
+# real hunk both belong to src/real.rs.
+CANNED_DIFF_CONTENT_LOOKS_LIKE_HEADER = """\
+diff --git a/src/real.rs b/src/real.rs
+index aaaaaa..bbbbbb 100644
+--- a/src/real.rs
++++ b/src/real.rs
+@@ -1,0 +2,3 @@
++normal added line
++++ b/injected.rs
++another normal line
+@@ -50,0 +80,1 @@
++later hunk line
+"""
+
 
 class TestParseDiffLineRanges:
     """Unit tests for parse_diff_line_ranges (pure function, no git invocation)."""
@@ -6517,6 +6536,160 @@ class TestGetChangedLineRanges:
 
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
             result = await ops.get_changed_line_ranges('task/789')
+
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_diff_added_line_ranges — NEW-side pure parser unit tests (task 2750)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDiffAddedLineRanges:
+    """Unit tests for parse_diff_added_line_ranges (pure function, no git).
+
+    NEW-side (HEAD-relative) counterpart of parse_diff_line_ranges.  Reviewer
+    ``location`` line numbers are new-side, so scoping post-amendment review
+    to the amendment delta needs new-side hunk ranges, keyed by the
+    ``+++ b/<path>`` new path.  A hunk header ``@@ -x,y +a,b @@`` describes
+    new-side lines ``[a, a + max(b, 1) - 1]``; a hunk with new-count ``0``
+    (pure deletion) contributes no new-side range.
+    """
+
+    def _fn(self):
+        from orchestrator.git_ops import parse_diff_added_line_ranges
+        return parse_diff_added_line_ranges
+
+    def test_modified_file_new_side_ranges_keyed_by_new_path(self):
+        """(a) A modified file yields new-side (start,end) tuples per +++ b/ path."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        # src/bar.rs: @@ -5,2 +5,3 @@ → new_start=5, new_count=3 → (5, 7)
+        assert 'src/bar.rs' in result
+        assert (5, 7) in result['src/bar.rs']
+
+    def test_multiple_hunks_accumulate(self):
+        """(b) Multiple hunks in one file accumulate as multiple new-side ranges."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_TWO_FILES)
+        # src/foo.rs: @@ -10,3 +10,2 @@ → (10, 11); @@ -40,1 +41,1 @@ → (41, 41)
+        assert 'src/foo.rs' in result
+        assert (10, 11) in result['src/foo.rs']
+        assert (41, 41) in result['src/foo.rs']
+
+    def test_new_file_maps_to_full_new_side_range(self):
+        """(c) A new file @@ -0,0 +1,N @@ → (1, N)."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_NEW_FILE)
+        # @@ -0,0 +1,5 @@ → new_start=1, new_count=5 → (1, 5)
+        assert 'src/new.rs' in result
+        assert (1, 5) in result['src/new.rs']
+
+    def test_pure_deletion_hunk_contributes_no_new_side_range(self):
+        """(d) A pure-deletion hunk (new_count==0) contributes NO new-side range."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_DELETION_ONLY)
+        # @@ -20,4 +20,0 @@ → new_count=0 → no new-side range recorded.
+        assert result.get('src/qux.rs', []) == []
+
+    def test_fully_deleted_file_produces_no_new_side_entry(self):
+        """(e) A fully deleted file (+++ /dev/null) has no new-side entry."""
+        fn = self._fn()
+        result = fn(CANNED_DIFF_FILE_DELETED)
+        assert 'src/gone.rs' not in result, (
+            'A deleted file has no new-side path, so no entry'
+        )
+        assert all('/dev/null' not in k for k in result), (
+            '/dev/null must never be a key in the result dict'
+        )
+
+    def test_empty_diff_returns_empty_dict(self):
+        """(f) Empty/header-only diff → {}."""
+        fn = self._fn()
+        assert fn('') == {}
+
+    def test_content_line_resembling_new_file_header_is_not_a_header(self):
+        """(g) A hunk-body '+++ b/…' content line is NOT parsed as a file header.
+
+        An added content line whose text begins with '++ b/' renders as
+        '+++ b/…' in a unified diff.  It must not reset current_file: the bogus
+        path must never become a key, and the file's later hunks must stay
+        attributed to the real +++ b/ path.  (Regression: task 2750 amendment —
+        reviewer robustness note on parse_diff_added_line_ranges.)
+        """
+        fn = self._fn()
+        result = fn(CANNED_DIFF_CONTENT_LOOKS_LIKE_HEADER)
+        assert 'injected.rs' not in result, (
+            "a hunk-body '+++ b/injected.rs' content line must not be treated "
+            'as a new-file header'
+        )
+        # Both hunks belong to the real file: (2,4) from @@ +2,3 and (80,80)
+        # from @@ +80,1 — the second must not be misattributed to a bogus path.
+        assert result.get('src/real.rs') == [(2, 4), (80, 80)]
+
+
+@pytest.mark.asyncio
+class TestGetNewSideChangedLineRanges:
+    """Unit tests for GitOps.get_new_side_changed_line_ranges (task 2750).
+
+    New-side counterpart of get_changed_line_ranges: runs the diff in the
+    *worktree* (not project_root), over ``{from_sha}..HEAD`` (not
+    ``main...ref``), and delegates to the new-side parser.
+    """
+
+    async def test_invokes_correct_git_command_in_worktree(
+        self, git_config, git_repo,
+    ):
+        """git diff {from_sha}..HEAD --unified=0 --no-color, cwd=worktree."""
+        ops = GitOps(git_config, git_repo)
+        worktree = git_repo / 'wt'
+        from_sha = 'abc123'
+
+        captured: list[tuple[list[str], object]] = []
+
+        async def mock_run(cmd, cwd=None):
+            captured.append((cmd, cwd))
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            await ops.get_new_side_changed_line_ranges(worktree, from_sha)
+
+        assert len(captured) == 1
+        cmd, cwd = captured[0]
+        assert 'git' in cmd
+        assert 'diff' in cmd
+        assert f'{from_sha}..HEAD' in cmd
+        assert '--unified=0' in cmd
+        assert '--no-color' in cmd
+        assert cwd == worktree
+
+    async def test_returns_new_side_parsed_ranges(self, git_config, git_repo):
+        """Returns exactly parse_diff_added_line_ranges(<canned diff>)."""
+        from orchestrator.git_ops import parse_diff_added_line_ranges
+        ops = GitOps(git_config, git_repo)
+        worktree = git_repo / 'wt'
+
+        async def mock_run(cmd, cwd=None):
+            return (0, CANNED_DIFF_TWO_FILES, '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_new_side_changed_line_ranges(
+                worktree, 'base-sha',
+            )
+
+        assert result == parse_diff_added_line_ranges(CANNED_DIFF_TWO_FILES)
+
+    async def test_empty_diff_returns_empty_dict(self, git_config, git_repo):
+        ops = GitOps(git_config, git_repo)
+        worktree = git_repo / 'wt'
+
+        async def mock_run(cmd, cwd=None):
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await ops.get_new_side_changed_line_ranges(
+                worktree, 'base-sha',
+            )
 
         assert result == {}
 

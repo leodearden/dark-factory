@@ -1125,6 +1125,71 @@ def parse_diff_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
     return result
 
 
+def parse_diff_added_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """Parse a unified diff and return new-side (HEAD) line ranges per file.
+
+    NEW-side counterpart of :func:`parse_diff_line_ranges`.  Given the output
+    of ``git diff <from>..HEAD --unified=0 --no-color``, returns a mapping of
+    new file path (from ``+++ b/<path>``) → list of (start, end) tuples
+    representing the new-side (HEAD-relative) changed line ranges.  Reviewer
+    ``location`` line numbers are new-side, so these ranges — not the old-side
+    ranges the sibling parser produces — are what a suggestion's line number
+    is matched against when scoping a post-amendment review to the amendment
+    delta.
+
+    A hunk header ``@@ -x,y +a,b @@`` describes new-side lines
+    ``[a, a + max(b, 1) - 1]`` (``,b`` defaults to 1 when absent).  Hunks whose
+    new-side count is ``0`` (pure deletions, e.g. ``@@ -5,3 +4,0 @@``)
+    contribute NO new-side range.  A fully deleted file (``+++ /dev/null``) has
+    no new-side path and produces no entry.  Pure renames (no ``+++ b/`` line,
+    no content change) likewise produce no new-side entry.
+
+    A ``+++ b/…`` / ``+++ /dev/null`` line is treated as a file header only when
+    it immediately follows the ``--- `` old-side header.  An added *content*
+    line whose text begins with ``++ b/`` renders in a unified diff as
+    ``+++ b/…`` — indistinguishable at a string-prefix level from a real header;
+    the preceding-line guard keeps such a hunk-body line from being misread as a
+    new-file header and silently resetting the current file (which would drop
+    that file's later hunks onto a bogus path).
+
+    Returns an empty dict for an empty or header-only diff.
+    """
+    import re
+
+    result: dict[str, list[tuple[int, int]]] = {}
+    current_file: str | None = None
+    # True iff the previous line was the ``--- `` old-side diff header; gates
+    # the ``+++`` header branches below (see docstring).
+    prev_is_old_header = False
+
+    hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
+
+    for line in diff_text.splitlines():
+        if line.startswith('diff --git '):
+            # Start of a new file block — reset per-file state.
+            current_file = None
+        elif prev_is_old_header and line.startswith('+++ b/'):
+            current_file = line[6:]
+            if current_file not in result:
+                result[current_file] = []
+        elif prev_is_old_header and line.startswith('+++ /dev/null'):
+            # File deletion: no new-side path — skip hunk parsing for this block.
+            current_file = None
+        elif current_file is not None:
+            m = hunk_re.match(line)
+            if m:
+                new_start = int(m.group(1))
+                new_count = int(m.group(2)) if m.group(2) is not None else 1
+                # Pure-deletion hunk (new_count == 0): no new-side lines.
+                if new_count == 0:
+                    continue
+                end = new_start + new_count - 1
+                result[current_file].append((new_start, end))
+        prev_is_old_header = line.startswith('--- ')
+
+    return result
+
+
 class GitOps:
     """Git worktree and merge operations."""
 
@@ -5752,6 +5817,32 @@ class GitOps:
             cwd=self.project_root,
         )
         return parse_diff_line_ranges(diff)
+
+    async def get_new_side_changed_line_ranges(
+        self, worktree: Path, from_sha: str, to_sha: str = 'HEAD',
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Return new-side (HEAD) changed line ranges for ``{from_sha}..{to_sha}``.
+
+        New-side counterpart of :meth:`get_changed_line_ranges`.  Runs
+        ``git diff {from_sha}..{to_sha} --unified=0 --no-color`` in *worktree*
+        (NOT ``self.project_root`` — the amendment SHA and HEAD live in the
+        task worktree) and delegates parsing to
+        :func:`parse_diff_added_line_ranges`.  ``--unified=0`` gives exact hunk
+        boundaries with no context padding, so the new-side ranges are the
+        minimal set of lines the amendment actually touched.
+
+        Used to scope a post-amendment review to the amendment delta: reviewer
+        ``location`` line numbers are new-side (HEAD-relative), so they are
+        directly comparable to these ranges.
+
+        Returns an empty dict when the diff is empty (no changes in the range).
+        """
+        _, diff, _ = await _run(
+            ['git', 'diff', f'{from_sha}..{to_sha}',
+             '--unified=0', '--no-color'],
+            cwd=worktree,
+        )
+        return parse_diff_added_line_ranges(diff)
 
     async def get_current_branch(self, worktree: Path) -> str:
         """Get the current branch name in a worktree."""
