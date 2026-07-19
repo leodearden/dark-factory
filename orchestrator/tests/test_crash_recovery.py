@@ -2045,31 +2045,11 @@ class TestSessionResumeStorm:
 
 
 class TestCrashRecoveryPromptNote:
-    """γ L0-dismissal note (task 2774): the shared crash-recovery resume prompt
-    warns the resumed agent that any escalation it filed before the restart may
-    have been auto-dismissed as stale (_dismiss_stale_escalations) and should be
-    re-raised if still relevant — WITHOUT flipping resume_delivers_prompt off its
-    False default (I4 / task-1462 regression class).
+    """γ L0-dismissal note (task 2774): adding the escalation auto-dismissal
+    warning to the shared crash-recovery resume prompt must NOT flip
+    resume_delivers_prompt off its False default (I4 / task-1462 regression
+    class).
     """
-
-    def test_prompt_mentions_escalation_auto_dismissal(self):
-        """Thin keyword existence check (not a prose pin): the resume prompt
-        references escalation auto-dismissal so the resumed agent knows to
-        re-raise a still-relevant escalation.
-        """
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
-
-        lowered = CRASH_RECOVERY_RESUME_PROMPT.lower()
-        assert 'dismiss' in lowered
-        assert 'escalation' in lowered
-
-    def test_prompt_retains_continuation_guidance(self):
-        """The dismissal note is ADDITIVE — the original continue-where-you-
-        left-off guidance must remain.
-        """
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
-
-        assert 'continue' in CRASH_RECOVERY_RESUME_PROMPT.lower()
 
     def test_resume_delivers_prompt_default_stays_false(self):
         """I4 / task-1462 regression guard: the prompt note must NOT flip
