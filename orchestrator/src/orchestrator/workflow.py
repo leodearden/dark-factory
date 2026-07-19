@@ -10447,7 +10447,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # StewardBudgetExhausted outcome fell through from above.  Either
         # way a human should know — submit an L1 (deduped) so the task
         # isn't silently parked.
-        await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
+        #
+        # skip_escalation guard (task 2757): a skip_escalation=True caller has
+        # ALREADY filed its own signature-specific L1 (train halt → wip_conflict/
+        # unmerged_state; main-health auto-heal → preexisting_main_break; architect
+        # no-plan → the promoted L0; steward re-escalation → the steward's L1).
+        # Before the terminal gate became signature-aware, the bare
+        # has_open_l1(task_id) dedup masked this fall-through for those callers
+        # (any open L1 suppressed it).  Now that _ensure_l1_escalation_for_blocked
+        # dedups on category, this default-category='task_failure' fall-through no
+        # longer matches the caller's differently-categorised L1 and would
+        # DOUBLE-file.  Respect skip_escalation here so the caller stays the sole
+        # owner of the human-facing escalation.  The generic merge-blocked path
+        # (merge_phase=True, skip_escalation unset) is unaffected — it still
+        # surfaces unconditionally, which is task 2757's whole point.
+        if not skip_escalation:
+            await self._ensure_l1_escalation_for_blocked(
+                reason, detail or reason, category=category,
+            )
 
         # Fix #2 — dismiss any still-pending L0 now that we are exiting BLOCKED.
         # The steward has finished (or never ran) and this workflow slot is
