@@ -7080,6 +7080,14 @@ class GitOps:
                 return subject_matches[0]
             return None
         except Exception:
+            # Fully fail-safe: any git error / unresolvable target yields None so
+            # the caller falls through to its existing escalation path. Log at
+            # WARN so a persistent failure is diagnosable rather than silent.
+            logger.warning(
+                'find_equivalent_commit failed for target_sha=%s base_sha=%s '
+                'in %s; returning None (caller will fall through to escalation)',
+                target_sha, base_sha, worktree, exc_info=True,
+            )
             return None
 
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
