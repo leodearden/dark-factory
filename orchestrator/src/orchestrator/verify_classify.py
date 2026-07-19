@@ -284,20 +284,37 @@ _VERIFY_ENV_BROKEN_RE = re.compile(
 # genuine branch fault that merely mentions a missing file is not swept into
 # ENV_TRANSIENT — mirroring the Cargo.lock pattern's read-verb-adjacent-to-
 # lockfile-token discipline above.
+
+# shape 1: a read-failure of some OTHER tracked file (not Cargo.lock).
+# Reuses/extends the Cargo.lock pattern's read-verb alternation with the
+# "couldn't" contraction (the RCA's own grounded phrasing:
+# "couldn't read 'crates/core/src/lib.rs': No such file or directory"),
+# requiring the verb immediately adjacent to "read" and "No such file or
+# directory" on the same line — a bare application FileNotFoundError with
+# no adjacent read verb (e.g. "FileNotFoundError: [Errno 2] No such file
+# or directory: 'fixture.json'") does not match. Kept as its own named
+# pattern (not folded into the list below) because it alone needs the
+# rustc-diagnostic veto immediately below (task 2831 review).
+_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE = re.compile(
+    r"^.*\b(?:could not|cannot|can[’']t|unable to|failed to|couldn[’']t)\s+read\b.*"
+    r"\bNo such file or directory\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Veto for shape 1 (task 2831 review): rustc emits this EXACT phrasing —
+# "error: couldn't read <path>: No such file or directory" — for a genuine
+# branch fault too, e.g. a `#[path = "..."]` attribute pointing at a file the
+# branch forgot to add. That diagnostic is textually indistinguishable from
+# guard-script worktree-removal collateral on the "couldn't read" line alone,
+# but rustc (unlike a shell/guard script) always accompanies ANY
+# location-tied diagnostic with its stable span-pointer rendering, e.g.
+# " --> src/lib.rs:3:1" — so requiring the ABSENCE of that rendering anywhere
+# in *output* lets the genuine compiler fault fall through to per-tool
+# dispatch instead of being swallowed as host collateral. Mirrors this
+# module's existing clippy::/error[E\d+]: SEMAPHORE_TIMEOUT veto style below.
+_RUSTC_DIAGNOSTIC_SPAN_RE = re.compile(r'-->\s*\S+:\d+:\d+', re.MULTILINE)
+
 _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
-    # shape 1: a read-failure of some OTHER tracked file (not Cargo.lock).
-    # Reuses/extends the Cargo.lock pattern's read-verb alternation with the
-    # "couldn't" contraction (the RCA's own grounded phrasing:
-    # "couldn't read 'crates/core/src/lib.rs': No such file or directory"),
-    # requiring the verb immediately adjacent to "read" and "No such file or
-    # directory" on the same line — a bare application FileNotFoundError with
-    # no adjacent read verb (e.g. "FileNotFoundError: [Errno 2] No such file
-    # or directory: 'fixture.json'") does not match.
-    re.compile(
-        r"^.*\b(?:could not|cannot|can[’']t|unable to|failed to|couldn[’']t)\s+read\b.*"
-        r"\bNo such file or directory\b",
-        re.MULTILINE | re.IGNORECASE,
-    ),
     # shape 2: the verify entrypoint script itself is gone (rc=127 lint
     # stage, <0.4s) — "./scripts/verify.sh: No such file or directory".
     # Anchored on a path-boundary (start-of-line or preceding '/') immediately
@@ -427,6 +444,31 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ``_VERIFY_ENV_BROKEN_RE`` Cargo.lock check immediately above, with the
     identical ordering placement (see the ORDERING note above): after
     DISK_FULL/ENOSPC, before SEMAPHORE_TIMEOUT.
+
+    Shape-1 rustc-diagnostic veto (task 2831 review): the shape-1 read-failure
+    text — "couldn't read <path>: No such file or directory" — is also
+    rustc's OWN verbatim wording for a genuine branch fault (a
+    ``#[path = "..."]`` attribute pointing at a file the branch forgot to
+    add), so shape-1 alone additionally requires the ABSENCE of a rustc/
+    clippy diagnostic span-pointer line (``_RUSTC_DIAGNOSTIC_SPAN_RE``, e.g.
+    " --> src/lib.rs:3:1") anywhere in *output* — rustc always renders that
+    span alongside a location-tied diagnostic, but a guard/shell script's
+    worktree-removal read failure never does. Shapes 2-5 need no such veto:
+    their anchors (the ``verify.sh`` entrypoint token, the ``_merge-verify``
+    path token, bash's ``getcwd`` phrase, and the literal INTERRUPTED marker)
+    are not plausible rustc/clippy output.
+
+    Known gap (task 2831 review, narrower successor to the task-2748/2821 gap
+    above): the rustc-diagnostic veto only disambiguates rustc's OWN
+    "couldn't read" phrasing. A non-rustc tool or guard script that happens
+    to emit the identical "<read verb> ... No such file or directory" text
+    for a genuine branch-caused missing file (not caused by worktree removal)
+    is still indistinguishable from host collateral by text alone and would
+    still misclassify ENV_TRANSIENT — closing that fully general case would
+    need a positive worktree-removal anchor on shape-1 itself, which is not
+    grounded in any observed sample today (see plan.json's grounding
+    discipline note); left as a residual, accepted gap until a real
+    grounded false-positive sample of that shape is observed.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
@@ -434,6 +476,10 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
         return FailureCategory.DISK_FULL
     if _VERIFY_ENV_BROKEN_RE.search(output):
+        return FailureCategory.ENV_TRANSIENT
+    if _VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE.search(
+        output
+    ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):
         return FailureCategory.ENV_TRANSIENT
     if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
         return FailureCategory.ENV_TRANSIENT

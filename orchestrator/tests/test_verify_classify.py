@@ -1276,6 +1276,23 @@ class TestMergeVerifyCollateralEnvGuard:
         )
 
 
+# task 2831 review: rustc's OWN verbatim wording for a genuine branch fault
+# — a `#[path = "..."]` attribute pointing at a file the branch forgot to
+# add — is "couldn't read <path>: No such file or directory", textually
+# identical to shape-1's collateral read-failure golden above. Unlike a
+# guard/shell script's single-line read failure, rustc always renders its
+# stable span-pointer line (" --> path:line:col") alongside a location-tied
+# diagnostic, which is what the shape-1 veto (`_RUSTC_DIAGNOSTIC_SPAN_RE`)
+# keys on.
+_GENUINE_RUSTC_MISSING_PATH_MODULE_FAULT_OUTPUT = (
+    "error: couldn't read src/missing_module.rs: No such file or directory (os error 2)\n"
+    ' --> src/lib.rs:3:1\n'
+    '  |\n'
+    '3 | #[path = "missing_module.rs"] mod missing_module;\n'
+    '  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+)
+
+
 class TestMergeVerifyCollateralEnvGuardNegatives:
     """Narrowness / non-regression guards for the new collateral patterns —
     green both before and after the impl."""
@@ -1311,6 +1328,23 @@ class TestMergeVerifyCollateralEnvGuardNegatives:
             'note: expected struct `Foo`, found struct `Bar`\n'
         )
         assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.COMPILE_ERROR
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_genuine_rustc_missing_path_module_fault_not_env_transient(self, tool):
+        """task 2831 review: shape-1's read-failure text is also rustc's OWN
+        wording for a genuine `#[path = ...]` branch fault. Proves the
+        rustc/clippy diagnostic span-pointer line (' --> path:line:col')
+        vetoes the shape-1 match, so this genuine branch fault is left for
+        per-tool dispatch (unknown_test_failure today — the same fallback it
+        would already have received before this task, since none of the
+        existing COMPILE_ERROR patterns match this codeless rustc message
+        either — see the module docstring's shape-1 veto / Known gap notes)
+        instead of being swallowed as host collateral and granted an
+        undeserved infra retry."""
+        result = _classify(tool, _GENUINE_RUSTC_MISSING_PATH_MODULE_FAULT_OUTPUT, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE
+        assert result != FailureCategory.ENV_TRANSIENT
+        assert result not in INFRA_TRANSIENT_CATEGORIES
 
 
 # ---------------------------------------------------------------------------
