@@ -169,6 +169,49 @@ def compute_composite(m: EvalMetrics) -> float:
     return round(quality, 4)
 
 
+# The C4 efficiency-adjusted composite weights (decision 11 / this task λ):
+# quality dominant, with cost + latency as secondary tie-breakers, summing to
+# 1.0 so a best-on-every-axis run scores exactly 1.0. Code-owned (not config) so
+# price can never silently override correctness.
+DEFAULT_COMPOSITE_WEIGHTS: dict[str, float] = {
+    'quality': 0.6,
+    'cost': 0.2,
+    'latency': 0.2,
+}
+
+
+def blend_composite(
+    quality: float,
+    cost_score: float,
+    latency_score: float,
+    *,
+    tests_pass: bool | None,
+    weights: dict[str, float] = DEFAULT_COMPOSITE_WEIGHTS,
+) -> float:
+    """The C4 efficiency-adjusted ``composite``: *quality* blended with
+    normalized cost + latency scores, bounded to ``[0, 1]``.
+
+    Keeps ``compute_composite``'s HARD GATE (decision 11): a failing (or
+    ``None``) *tests_pass* returns ``0.0`` regardless of the efficiency axes, so
+    a cheap+fast WRONG answer can never outrank a correct one.
+
+    *quality* is the pure :func:`compute_composite` score; *cost_score* and
+    *latency_score* are per-fixture NORMALIZED efficiency scores in ``[0, 1]``
+    (``1.0`` == the cheapest / fastest run of the fixture — see
+    ``report._ratio_score``), supplied by the report layer where the
+    cross-config context to normalize exists. PURE and additive: this does not
+    touch ``compute_composite``.
+    """
+    if not tests_pass:
+        return 0.0
+    blended = (
+        weights['quality'] * quality
+        + weights['cost'] * cost_score
+        + weights['latency'] * latency_score
+    )
+    return round(min(max(blended, 0.0), 1.0), 4)
+
+
 # Fallback USD/1M-token rate used ONLY for a PROXIED endpoint whose model is
 # unlisted — mirrors invoke._FALLBACK_PRICE (task 2459) so cost degradation is a
 # DEFINED, logged number, never a silent one (Invariant P5 / the
