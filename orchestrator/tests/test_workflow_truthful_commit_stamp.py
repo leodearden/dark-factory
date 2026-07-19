@@ -409,6 +409,7 @@ class TestImplementerWriterTruthfulCommit:
         outcome = await wf._execute_iterations()
         assert outcome == WorkflowOutcome.BLOCKED  # cap fires after one write
 
+        assert wf.artifacts is not None  # narrow Optional; loop set it up
         entries, _ = wf.artifacts.read_iteration_log()
         impl = [
             e for e in entries
