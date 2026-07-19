@@ -556,6 +556,52 @@ class TestStage2LedgerPresenceWiring:
         assert 'retry_nonce' in STAGE2_SYSTEM_PROMPT
 
 
+class TestStage1SourceCompletionWiring:
+    """Stage 1's assembled system prompt carries the source-completion brief
+    (PRD operational-ask-routing-prd.md task ε): Stage 1 holds the
+    memory-mutation tools, so it COMPLETES safe (exact/near-exact duplicate)
+    merges inline and routes ONLY the residual irreversible judgment call to
+    Stage 2 to be filed as an operational + operational_mode='gate' task. Stage
+    1 lacks submit_task (DISALLOW_TASK_WRITES), so it relays the residual rather
+    than filing it.
+
+    This is the user-observable rendered-prompt signal for Stage 1 (PRD ε leaf).
+    """
+
+    def test_stage1_prompt_has_inline_merge_directive(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'inline' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must direct completing safe memory merges inline.'
+        )
+        assert 'near-exact' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must carry the conservative near-exact-duplicate predicate.'
+        )
+
+    def test_stage1_prompt_has_operational_gate_vocabulary(self):
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'operational_mode' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must name metadata.operational_mode for the residual gate.'
+        )
+        assert 'gate' in STAGE1_SYSTEM_PROMPT, (
+            "STAGE1_SYSTEM_PROMPT must declare the operational_mode='gate' value."
+        )
+
+    def test_stage1_prompt_relays_residual_to_stage2_not_self_file(self):
+        """Stage 1 lacks submit_task (DISALLOW_TASK_WRITES), so its
+        source-completion brief must relay the residual to Stage 2 rather than
+        tell Stage 1 to file it — loud-over-silent (never call a tool it lacks)."""
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+
+        assert 'Stage 2' in STAGE1_SYSTEM_PROMPT, (
+            'the residual must be relayed to Stage 2.'
+        )
+        assert 'do NOT hold submit_task' in STAGE1_SYSTEM_PROMPT, (
+            'Stage 1 must be told it does NOT hold submit_task (it relays, not files).'
+        )
+
+
 class TestTaskKnowledgeSyncPayload:
     """TaskKnowledgeSync.assemble_payload() uses correct project attributes."""
 
