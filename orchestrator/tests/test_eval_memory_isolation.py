@@ -23,6 +23,8 @@ depends on ε:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -177,9 +179,7 @@ async def test_memory_endpoint_override_routes_real_workflow_write_to_sink(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config(
-    tmp_path, monkeypatch
-):
+async def test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config(tmp_path, monkeypatch):
     """run_eval threads its memory_endpoint straight into build_eval_orch_config.
 
     A behavioral guard (not a signature lock): it captures the value
@@ -219,3 +219,81 @@ async def test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config(
         )
 
     assert captured['memory_endpoint'] == 'http://127.0.0.1:54321'
+
+
+def _minimal_eval_workflow(orch_config) -> TaskWorkflow:
+    """A bare TaskWorkflow wired only with the attrs the ``_write_*_to_memory`` methods read.
+
+    Built via ``object.__new__`` (no ``__init__``) so no real orchestrator wiring
+    is needed — just the ``mcp`` / ``config`` / ``task`` / ``plan`` / ``modules`` /
+    ``task_id`` the three memory-write methods touch. The plan carries a
+    design decision (with both ``decision`` and ``rationale``) so
+    ``_write_decisions_to_memory`` emits exactly one write.
+    """
+    wf = object.__new__(TaskWorkflow)
+    wf.mcp = _EvalMcpStub(orch_config.fused_memory.url)
+    wf.config = orch_config
+    wf.task = {'title': 'My task', 'description': 'does a thing'}
+    wf.plan = {
+        'analysis': 'because reasons',
+        'design_decisions': [{'decision': 'chose A', 'rationale': 'A beats B'}],
+        'steps': [{'status': 'done'}, {'status': 'pending'}],
+    }
+    wf.modules = ['orchestrator/src/orchestrator/evals']
+    wf.task_id = 't'
+    return wf
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('write_path', 'expected_category'),
+    [
+        (
+            lambda wf: wf._write_completion_to_memory(),
+            'observations_and_summaries',
+        ),
+        (
+            lambda wf: wf._write_decisions_to_memory(),
+            'decisions_and_rationale',
+        ),
+        (
+            lambda wf: wf._write_suggestions_to_memory(
+                SimpleNamespace(suggestions=[{'category': 'perf', 'description': 'do X'}])
+            ),
+            'preferences_and_norms',
+        ),
+    ],
+    ids=['completion', 'decisions', 'suggestions'],
+)
+async def test_all_memory_write_paths_route_through_mcp_url_to_sink(
+    tmp_path, write_path, expected_category
+):
+    """ALL THREE orchestrator-side memory writes funnel through ``self.mcp.url`` to the sink.
+
+    The isolation guarantee rests on every ``_write_*_to_memory`` method POSTing to
+    ``f'{self.mcp.url}/mcp/'`` — the single leaf the ``memory_endpoint`` override lands
+    on. ``test_memory_endpoint_override_routes_real_workflow_write_to_sink`` proves this
+    for the completion path only; here each real write path
+    (``_write_completion_to_memory`` / ``_write_decisions_to_memory`` /
+    ``_write_suggestions_to_memory``) is driven against the recording sink. If any
+    were refactored to compute its URL differently, its write would escape the sink
+    and this test would fail (0 captured writes) — catching the regression the
+    shared-leaf mechanism otherwise hides.
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+
+    with RecordingMemorySink() as sink:
+        orch_config = build_eval_orch_config(cfg, task, base, memory_endpoint=sink.url)
+        wf = _minimal_eval_workflow(orch_config)
+
+        await write_path(wf)
+
+        # The real write landed in the sink — never at production.
+        assert orch_config.fused_memory.url != _PRODUCTION
+        assert len(sink.writes) == 1
+        tool_name, arguments = sink.writes[0]
+        assert tool_name == 'add_memory'
+        assert arguments['category'] == expected_category
+        assert arguments['project_id'] == orch_config.fused_memory.project_id
