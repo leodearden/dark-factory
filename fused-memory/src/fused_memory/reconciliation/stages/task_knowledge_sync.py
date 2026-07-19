@@ -1340,6 +1340,18 @@ async def _write_task_count_snapshot(
         # genuinely empty project -- indistinguishable from one at the data
         # layer. Gate ONLY on total_count == 0 so the common non-empty path
         # stays byte-identical and never pays the git-subprocess cost.
+        # Note: resolve_main_checkout raises ValueError for two distinct
+        # causes -- project_root not inside any git working tree, OR the
+        # `git` executable being missing from the host entirely (it wraps
+        # FileNotFoundError) -- and does not distinguish between them. On a
+        # host with no git binary, EVERY zero-count project would take this
+        # branch, including a genuinely empty git-backed one that would
+        # otherwise get its legitimate numeric "0 total" record. This repo's
+        # hosts always have git installed, so it is not a live bug here, and
+        # "unavailable" is the fail-safe direction if it ever were (loud
+        # sentinel over a silently-wrong zero census) -- but be aware the two
+        # causes are conflated should resolve_main_checkout ever need to
+        # expose them separately.
         snapshot_unavailable = False
         if tree.total_count == 0:
             try:
