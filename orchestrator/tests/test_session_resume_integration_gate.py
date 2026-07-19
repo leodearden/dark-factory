@@ -659,3 +659,42 @@ async def test_b2_sigkill_warm_lane_identical_to_b1(harness: Harness):
     assert cap.resume_session_id['session_id'] == session_id
     assert cap.initial_plan is recovered_plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+# ── B4: foreign task acquires the lane first → corroboration fails ───────────
+@pytest.mark.asyncio
+async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
+    """B4 — a foreign task reseeds the lane between crash and re-dispatch,
+    destroying A's transcript: the session is STILL adopted at boot (plan +
+    sidecar survive) but the dispatch-time transcript re-glob finds nothing, so
+    the γ guard corroborates-and-rejects → fresh dispatch WITH the recovered
+    plan + one ``session_resume_fallback`` carrying ``reason='no_transcript'``.
+
+    Two-way: adoption genuinely happened (the recovered plan flows through as
+    ``initial_plan``) AND the guard independently rejected the resume — proving
+    β's output reached γ and γ's corroboration is load-bearing, not a rubber
+    stamp. The wiped transcript is modelled with ``with_transcript=False`` so
+    ``_adopt_recovered_session`` stashes no config-dir.
+    """
+    task_id, session_id = '44', 'uuid-b4-noxscript'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', with_transcript=False,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): session + plan recovered; NO config-dir corroboration ──
+    assert task_id in harness._recovered_sessions
+    assert task_id in harness._recovered_plans
+    assert task_id not in harness._recovered_session_config_dirs
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ): corroboration fails → fallback, plan kept ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert len(cap.emits) == 1
+    et, kwargs = cap.emits[0]
+    assert et == EventType.session_resume_fallback
+    assert kwargs['data']['reason'] == 'no_transcript'
