@@ -634,3 +634,28 @@ async def test_b5_memory_isolation_two_way(tmp_path: Path) -> None:
         assert tool_name == 'add_memory'
         assert arguments['category'] == 'observations_and_summaries'
         assert arguments['project_id'] == orch_config.fused_memory.project_id
+
+
+# ── B6: no mid-eval rebase (D3) ────────────────────────────────────────────
+
+
+def test_b6_no_mid_eval_rebase(tmp_path: Path) -> None:
+    """B6 — the eval config gates OFF the rebase-onto-live-main behaviour.
+
+    Two-way: a fresh code-default base (production side) has BOTH
+    ``rebase_before_verify`` and ``inter_iteration_rebase`` True, while the
+    eval config resolved for a fixture — ``build_eval_orch_config(cfg, task,
+    base)`` — has BOTH False. This is the config disposition that IS the causal
+    mechanism preventing the D3 rebase (a pinned ``pre_task_commit`` worktree
+    being rebased onto live main mid-eval). GREEN on main (β's profile).
+    """
+    base = _load_default_config(tmp_path)
+    assert base.rebase_before_verify is True
+    assert base.inter_iteration_rebase is True
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    eval_cfg = build_eval_orch_config(cfg, task, base)
+
+    assert eval_cfg.rebase_before_verify is False
+    assert eval_cfg.inter_iteration_rebase is False
