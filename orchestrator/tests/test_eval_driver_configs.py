@@ -82,7 +82,7 @@ class TestJudgeCandidates:
         assert any('haiku' in n for n in names)
 
     def test_judge_ofat_implementer_pin_is_fixed_cloud_incumbent(self):
-        from orchestrator.evals.configs import EvalConfig, JUDGE_OFAT_IMPLEMENTER_PIN
+        from orchestrator.evals.configs import JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig
 
         # The implementer held CONSTANT while the judge varies (true OFAT): a
         # native-cloud claude Sonnet incumbent (production implementer default),
