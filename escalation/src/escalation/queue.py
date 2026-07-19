@@ -215,12 +215,19 @@ class EscalationQueue:
 
         Lookup order:
         1. ``queue_dir/{escalation_id}.json`` (queue root).
-        2. Archive subtree (``archive/YYYY-MM-DD/{escalation_id}.json``):
+        2. Archive subtree (``archive/YYYY-MM-DD/{escalation_id}.json``), resolved
+           via the memoised per-subdir listing:
            - If exactly one candidate: return it.
            - If multiple candidates (multi-date duplicates): emit a WARNING naming the id
              and return the newest by ``parent.name`` lexicographic order
              (YYYY-MM-DD sorts lexicographically == chronologically; non-date names fall back
              to ``''`` and are treated as oldest).
+        3. Cross-process staleness fallback: when the memoised listing yields NO
+           candidates, the memo may simply predate another ``EscalationQueue``
+           instance (e.g. a long-lived escalation-server process) archiving this
+           id — a memo miss is therefore not authoritative on its own.  A single
+           TARGETED archive re-probe (``_iter_archive_paths``) is performed
+           before concluding the id is genuinely absent.
 
         Shared by ``get()`` and ``patch_resolution_metadata()`` so that the archive
         fallback and newest-by-date selection logic live in exactly one place.
@@ -238,6 +245,12 @@ class EscalationQueue:
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
+        if not candidates:
+            # The memoised listing can predate another EscalationQueue
+            # instance's archival of this id (cross-process staleness — see
+            # docstring point 3).  Do a single targeted re-probe of the
+            # archive subtree before concluding absence.
+            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -270,12 +283,14 @@ class EscalationQueue:
         is lazily built on the first archive miss and incrementally updated
         by _archive_resolved() when this instance archives a new escalation.
 
-        Per-instance freshness: escalations resolved by another
+        Cross-process freshness: an escalation resolved+archived by another
         EscalationQueue instance (e.g. a concurrent process) after this
-        instance's listing was built are not visible until this instance
-        next calls _archive_resolved().  get() returns None in that window,
-        degrading gracefully rather than raising.  This is consistent with
-        the single-writer production model (one harness process per queue).
+        instance's listing was built is still found — a memo miss triggers a
+        single targeted archive re-probe in _locate_path (see its docstring)
+        rather than being treated as authoritative absence.  This closes the
+        window that previously made a just-archived-elsewhere escalation
+        appear to vanish from a long-lived instance (e.g. the escalation
+        server) until it happened to archive something itself.
         """
         path = self._locate_path(escalation_id)
         if path is None:
