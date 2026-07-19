@@ -476,3 +476,44 @@ async def test_b1_resumed_invocation_journals_prior_session(
 
     assert cap.kwargs['resume_session_id'] == session_id
     assert f'resuming prior session {session_id}' in caplog.text
+
+
+# ── B1: WIP commit preserved across recovery + architect skipped ─────────────
+@pytest.mark.asyncio
+async def test_b1_recovery_preserves_wip_commit_and_skips_architect(
+    harness: Harness,
+):
+    """B1 (WIP-preserve + architect-skip): a REAL git lane carrying a committed
+    WIP is record-adopted at recovery — its WIP commit stays reachable and the
+    lane is NEVER cleaned up — and the recovered plan flows through REAL
+    ``_run_slot`` as ``initial_plan`` (the ratified complete-plan invariant
+    skips the architect).
+
+    Preserving committed WIP is the precondition for DISK_BACKSTOP_REUSE at
+    re-acquire: recovery adopts the lane in place rather than resetting or
+    removing it, so the next dispatch resumes atop the surviving commit. The
+    lane is a REAL git repo so ``git rev-parse HEAD`` proves the exact WIP sha
+    survives the recovery pass (not merely that ``cleanup_worktree`` was
+    skipped).
+    """
+    task_id, session_id = '55', 'uuid-b1-wip'
+    lane, wip_sha = await _make_real_git_lane(harness, task_id, session_id)
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): the real git lane is record-adopted, not cleaned ──
+    assert task_id in harness._recovered_plans
+    assert task_id in harness._recovered_sessions
+    assert harness._recovered_sessions[task_id]['session_id'] == session_id
+    harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    # ── WIP commit survives: still the exact sha, reachable via git ──
+    rc, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+    assert rc == 0
+    assert head.strip() == wip_sha
+
+    # ── INJECT side (γ): architect skipped — recovered plan is initial_plan ──
+    recovered_plan = harness._recovered_plans[task_id]
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.initial_plan is recovered_plan
