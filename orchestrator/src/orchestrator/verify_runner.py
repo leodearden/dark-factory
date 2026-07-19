@@ -269,6 +269,12 @@ class MergeVerifySpec:
     verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
+    merge_verify_workspace : force-workspace profile of the merge gate (fix a,
+                          task 2822) — carried so the remote host runs the
+                          SAME profile as the dispatching merge gate, not the
+                          laptop config's (possibly narrower) default.
+    merge_verify_breadth   : 'scoped' | 'full' breadth of the merge gate (fix a,
+                          task 2822) — same rationale.
 
     Note
     ----
@@ -285,6 +291,12 @@ class MergeVerifySpec:
     verify_env: Mapping[str, str]
     cold_timeout_secs: float
     is_merge_verify: bool = True
+    # Fix (a), task 2822 — the merge-gate PROFILE rides the spec so the remote
+    # host runs the identical scope/profile as the dispatching merge gate.
+    # Narrow defaults match the pre-fix behaviour and the OrchestratorConfig
+    # field defaults (merge_verify_workspace=False, merge_verify_breadth='scoped').
+    merge_verify_workspace: bool = False
+    merge_verify_breadth: str = "scoped"
 
     def to_dict(self) -> dict:
         return {
@@ -294,6 +306,8 @@ class MergeVerifySpec:
             "verify_env": dict(self.verify_env),
             "cold_timeout_secs": float(self.cold_timeout_secs),
             "is_merge_verify": self.is_merge_verify,
+            "merge_verify_workspace": self.merge_verify_workspace,
+            "merge_verify_breadth": self.merge_verify_breadth,
         }
 
     @classmethod
@@ -306,6 +320,10 @@ class MergeVerifySpec:
             verify_env=dict(d.get("verify_env", {})),
             cold_timeout_secs=float(d["cold_timeout_secs"]),
             is_merge_verify=d.get("is_merge_verify", True),
+            # Back-compat: a legacy spec dict (pre-task-2822) lacks these keys,
+            # so default to the narrow merge gate — same d.get idiom as verify_env.
+            merge_verify_workspace=d.get("merge_verify_workspace", False),
+            merge_verify_breadth=d.get("merge_verify_breadth", "scoped"),
         )
 
 
@@ -377,6 +395,11 @@ def build_merge_verify_spec(
         verify_env=dict(config.effective_verify_env),
         cold_timeout_secs=float(cold_timeout),
         is_merge_verify=True,
+        # Fix (a), task 2822 — project the merge-gate profile from LIVE config so
+        # the spec is the single source of truth for the profile at the transport
+        # boundary; the remote host applies these over its own (laptop) config.
+        merge_verify_workspace=config.merge_verify_workspace,
+        merge_verify_breadth=config.merge_verify_breadth,
     )
 
 
