@@ -10581,7 +10581,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         if not self.escalation_queue:
             return
-        if self.escalation_queue.has_open_l1(self.task_id):
+        # Signature-aware dedup (task 2757): a NEW root cause (different category)
+        # must not be silently suppressed by an UNRELATED open L1.  This is the
+        # terminal silent-drop for the generic merge-blocked path — reached
+        # unconditionally from _mark_blocked's fall-through call.
+        if self.escalation_queue.has_open_l1(self.task_id, category=category):
             return
         from escalation.models import Escalation
 
