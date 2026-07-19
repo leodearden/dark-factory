@@ -137,6 +137,36 @@ class TestRecoverCrashedTasks:
         assert len(done) == 3
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_recover_cold_worktree_plan_adopts_v2_sidecar_session(
+        self, harness: Harness,
+    ):
+        """Task 2772 (session-resume beta): cold worktree with plan (3/5
+        done) AND a co-located v2 agent_session.json sidecar -> the
+        heuristic plan-present site (~2943) must ALSO populate
+        _recovered_sessions[task_id], not just _recovered_plans, so the
+        already-wired _run_slot injection can --resume the prior session.
+        """
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='35')
+        wt = _setup_worktree(harness.git_ops.worktree_base, '35', plan)
+        sidecar = {
+            'session_id': 'uuid-cold',
+            'role': 'implementer',
+            'started_at': '2026-07-19T09:00:00+00:00',
+            'owner_pid': 4242,
+            'task_id': '35',
+            'resume_count': 0,
+            'schema_version': 2,
+        }
+        (wt / '.task' / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        await harness._recover_crashed_tasks()
+
+        assert '35' in harness._recovered_plans
+        assert '35' in harness._recovered_sessions
+        assert harness._recovered_sessions['35']['session_id'] == 'uuid-cold'
+        assert harness._recovered_sessions['35']['role'] == 'implementer'
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
     async def test_recover_planless_worktree_cleaned_up(self, harness: Harness):
         """Worktree with no .task/ dir -> cleaned up."""
         wt = _setup_worktree(harness.git_ops.worktree_base, '36')
@@ -652,6 +682,60 @@ class TestRecoverCrashedTasksWarmLane:
             'Plan must be keyed under real task_id, not lane dir name'
         )
         assert '_lane-0' not in harness._recovered_plans
+
+    async def test_warm_lane_recordless_plan_adopts_session_keyed_by_task_id(
+        self, harness: Harness,
+    ):
+        """Task 2772: record-less warm lane (heuristic path) with plan.json
+        (task_id='42') AND a co-located v2 sidecar -> session is adopted
+        under the real task id, not the lane dir name.
+        """
+        _pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)
+        sidecar = {
+            'session_id': 'uuid-warm-heuristic',
+            'role': 'implementer',
+            'started_at': '2026-07-19T09:00:00+00:00',
+            'owner_pid': 4242,
+            'task_id': '42',
+            'resume_count': 0,
+            'schema_version': 2,
+        }
+        (lane / '.task' / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        await harness._recover_crashed_tasks()
+
+        assert '42' in harness._recovered_plans
+        assert '42' in harness._recovered_sessions, (
+            'Session must be keyed under real task_id, not lane dir name'
+        )
+        assert harness._recovered_sessions['42']['session_id'] == 'uuid-warm-heuristic'
+        assert '_lane-0' not in harness._recovered_sessions
+
+    async def test_warm_lane_recordless_plan_adopts_v1_sidecar_via_plan_task_id(
+        self, harness: Harness,
+    ):
+        """Task 2772 (B11): a v1 sidecar (no task_id key) on a record-less
+        warm lane is still adopted, keyed via plan.json's task_id rather
+        than the sidecar itself (which has no id to key by)."""
+        _pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)
+        sidecar = {
+            'session_id': 'uuid-warm-v1',
+            'role': 'implementer',
+            'started_at': '2026-07-19T09:00:00+00:00',
+            'owner_pid': 4242,
+        }
+        (lane / '.task' / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        await harness._recover_crashed_tasks()
+
+        assert '42' in harness._recovered_sessions
+        assert harness._recovered_sessions['42'] == sidecar
 
     async def test_warm_lane_cleanup_not_called(self, harness: Harness):
         """cleanup_worktree must NOT be called for a lane with recoverable work."""
