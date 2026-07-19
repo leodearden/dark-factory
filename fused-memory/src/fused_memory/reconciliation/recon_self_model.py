@@ -414,6 +414,65 @@ def render_execution_class_section() -> str:
     )
 
 
+def render_source_completion_section(*, can_file_tasks: bool) -> str:
+    """Render the source-completion brief (PRD
+    plans/operational-ask-routing-prd.md task ε). Like
+    render_execution_class_section, this is NEW canonical text with no current
+    prompt precedent.
+
+    The tool-holding recon stage ALREADY holds the memory-mutation tools
+    (add_memory / delete_memory / merge_entities): per
+    reconciliation/cli_stage_runner.py, DISALLOW_MEMORY_WRITES is folded into
+    STAGE3_DISALLOWED ONLY (STAGE1_DISALLOWED = DISALLOW_TASK_WRITES +
+    DISALLOW_BUILTIN; STAGE2_DISALLOWED = DISALLOW_BUILTIN). So both Stage 1 and
+    Stage 2 can COMPLETE safe memory merges inline instead of filing a task to
+    ask someone else to do work they can already do — cutting the redundant
+    relay-then-bounce class off at its origin — and file ONLY the residual
+    irreversible judgment call as an operational + operational_mode='gate' human
+    gate.
+
+    The residual-handling clause is parameterized on *can_file_tasks* because
+    submit_task IS in DISALLOW_TASK_WRITES: Stage 2 (can_file_tasks=True) holds
+    submit_task and files the residual itself; Stage 1 (can_file_tasks=False)
+    does NOT hold it, and must relay the residual to Stage 2 via
+    flag_for_stage2 / flagged_items. Never instruct Stage 1 to call a tool it
+    does not hold (loud-over-silent).
+    """
+    if can_file_tasks:
+        residual_clause = (
+            'You hold `submit_task` in this stage, so file it yourself: call '
+            "`submit_task` declaring `metadata.operational_mode='gate'` "
+            "alongside `metadata.execution_class='operational'`."
+        )
+    else:
+        residual_clause = (
+            'You do NOT hold submit_task in this stage (task writes are '
+            'disallowed here via DISALLOW_TASK_WRITES), so you cannot file the '
+            'residual in this stage. Relay it to Stage 2 via the '
+            '`flag_for_stage2` / `flagged_items` channel, so Stage 2 files it '
+            "as an `operational` task with `operational_mode='gate'`."
+        )
+    return (
+        '## Source-Completion\n'
+        'You ALREADY hold the memory-mutation tools (`add_memory` / '
+        '`delete_memory` / `merge_entities`) in this stage — '
+        '`DISALLOW_MEMORY_WRITES` scopes only Stage 3, not this stage. So when '
+        'a memory consolidation is safe, COMPLETE the merge inline, right now, '
+        'instead of filing a task asking someone else to do work you can '
+        'already do (that redundant relay-then-bounce is exactly what this '
+        'section cuts off at its origin).\n\n'
+        'Conservative safe-vs-irreversible rule: merge an exact or near-exact '
+        'duplicate inline (this is the safe, reversible-enough consolidation '
+        "Stage 2's task-2785 behavior already embodied); but escalate any "
+        'content-losing or otherwise irreversible judgment call as a human '
+        'gate — do NOT resolve it silently.\n\n'
+        'File ONLY that residual irreversible judgment call as a task, with '
+        "`metadata.execution_class='operational'` and "
+        "`metadata.operational_mode='gate'` (the human-gated routing mode, not "
+        "the `'llm'` mode). " + residual_clause
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Invariant predicates
 # --------------------------------------------------------------------------- #
