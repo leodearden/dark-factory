@@ -32,13 +32,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Real-git harness — mirrors test_harness_plan_step_rederive.py /
@@ -294,3 +295,124 @@ class TestAmendWriterTruthfulCommit:
             f'got {entry.get("commit")!r}'
         )
         assert entry['committed'] is True
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: the implementer writer (_execute_iterations)
+#
+# Mocked-collaborator loop harness (mirrors
+# test_workflow_resume_on_progress.py) but with a REAL TaskArtifacts so the
+# implementer entry is genuinely written to iterations.jsonl (append/read are
+# NOT mocked). git_ops/config are MagicMocks; _get_head_commit is pinned to a
+# constant so pre==post (no HEAD advance) and has_uncommitted_work is forced
+# True so the no-commit entry records dirty:True.
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_workflow(*, tmp_path: Path, max_execute_iterations: int = 1) -> TaskWorkflow:
+    """Resume-style MagicMock harness (mirrors
+    test_workflow_resume_on_progress.py._make_workflow) with a REAL
+    TaskArtifacts on a temp worktree."""
+    assignment = MagicMock()
+    assignment.task_id = '2759'
+    assignment.task = {'id': '2759', 'title': 'T', 'description': 'd'}
+    assignment.modules = []
+
+    _spec = pydantic_spec(OrchestratorConfig)
+    cfg = MagicMock(spec_set=_spec)
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.fused_memory.url = 'http://localhost:8002'
+    cfg.max_review_cycles = 2
+    cfg.max_amendment_rounds = 1
+    cfg.lock_depth = 2
+    cfg.steward_completion_timeout = 300.0
+    cfg.project_root = tmp_path / 'proj'
+    cfg.merge_train_former_enabled = False
+    cfg.merge_train_max_members = 3
+    cfg.max_execute_iterations = max_execute_iterations
+    cfg.max_consecutive_zero_output_timeouts = 2
+    cfg.max_progress_resume_iterations = 20
+    cfg.recycle_config_dir_on_zero_output = False
+    cfg.judge_after_each_iteration = False
+    cfg.inter_iteration_rebase = False
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=cfg,
+        git_ops=MagicMock(),
+        scheduler=MagicMock(),
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+    )
+    worktree = tmp_path / 'wt'
+    worktree.mkdir(parents=True, exist_ok=True)
+    (worktree / '.task').mkdir(exist_ok=True)
+    wf.artifacts = TaskArtifacts(worktree)
+    wf.worktree = worktree
+    wf.merge_queue = MagicMock()
+    wf.plan = {
+        'files': [], 'prerequisites': [],
+        'steps': [{'id': 'step-1', 'status': 'pending'}],
+    }
+    wf._base_commit = 'base_sha'
+    wf._module_configs = []
+    return wf
+
+
+def _stub_impl_loop(wf: TaskWorkflow, *, head_sha: str, dirty: bool) -> AsyncMock:
+    """Stub the loop-driving artifacts/collaborators so _execute_iterations
+    runs one no-op implementer iteration, WITHOUT mocking append_iteration_log
+    / read_iteration_log (the entry must be genuinely written and read back).
+    Returns the mocked _invoke."""
+    wf.artifacts.get_pending_steps = MagicMock(  # type: ignore[method-assign]
+        return_value=[{'id': 'step-1'}],
+    )
+    wf.artifacts.validate_plan_owner = MagicMock(return_value=True)  # type: ignore[method-assign]
+    wf.artifacts.read_plan = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            'prerequisites': [],
+            'steps': [{'id': 'step-1', 'status': 'pending'}],
+        },
+    )
+    wf.artifacts.stamp_plan_provenance = MagicMock()  # type: ignore[method-assign]
+
+    mock_invoke = AsyncMock(  # no-op implementer: success, makes no commit
+        return_value=AgentResult(
+            success=True, output='ok', timed_out=False, turns=2, cost_usd=0.0,
+        ),
+    )
+    wf._invoke = mock_invoke  # type: ignore[method-assign]
+    wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    wf._get_head_commit = AsyncMock(return_value=head_sha)  # type: ignore[method-assign]
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=dirty)  # type: ignore[attr-defined]
+    wf.briefing.build_implementer_prompt = AsyncMock(return_value='impl-prompt')  # type: ignore[attr-defined]
+    return mock_invoke
+
+
+@pytest.mark.asyncio
+class TestImplementerWriterTruthfulCommit:
+    async def test_implementer_no_advance_records_null_committed_false_dirty(
+        self, tmp_path: Path,
+    ):
+        """A no-op implementer iteration (HEAD unchanged, dirty tree) must
+        record commit:None / committed:False / dirty:True — not the stale
+        constant HEAD sha. Fails RED: the writer stamps the constant sha with
+        no committed key."""
+        wf = _make_mock_workflow(tmp_path=tmp_path, max_execute_iterations=1)
+        _stub_impl_loop(wf, head_sha='const_sha', dirty=True)
+
+        outcome = await wf._execute_iterations()
+        assert outcome == WorkflowOutcome.BLOCKED  # cap fires after one write
+
+        entries, _ = wf.artifacts.read_iteration_log()
+        impl = [
+            e for e in entries
+            if e.get('agent') == 'implementer' and e.get('source') == 'orchestrator'
+        ]
+        assert len(impl) == 1, f'expected exactly one implementer entry, got {entries}'
+        entry = impl[0]
+        assert entry['commit'] is None, (
+            f'no HEAD advance ⇒ commit must be null, got {entry.get("commit")!r}'
+        )
+        assert entry['committed'] is False
+        assert entry['dirty'] is True
