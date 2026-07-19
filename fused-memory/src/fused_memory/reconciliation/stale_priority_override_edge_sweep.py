@@ -206,9 +206,7 @@ def select_stale_priority_override_edges(
         if tid is None:
             continue
         row = live_overrides.get(str(tid))
-        if row is None:
-            selected.append(edge)
-        elif (
+        if row is None or (
             is_ttl_override_fact(fact)
             and row.get('ttl_until') is not None
             and now >= row['ttl_until']
