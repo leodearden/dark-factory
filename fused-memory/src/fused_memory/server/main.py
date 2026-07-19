@@ -63,14 +63,25 @@ logger = logging.getLogger(__name__)
 _HARNESS_CANCEL_TIMEOUT = 25.0
 
 # Per-step cleanup budget inside _graceful_shutdown. Harness step uses
-# _HARNESS_CANCEL_TIMEOUT instead; all other steps are capped by this.
+# _HARNESS_CANCEL_TIMEOUT instead; the memory_service.close step uses
+# _MEMORY_CLOSE_STEP_TIMEOUT; all other steps are capped by this.
 _CLEANUP_STEP_TIMEOUT = 5.0
+
+# Per-step budget for the memory_service.close step specifically (task 2701).
+# MemoryService.close() runs six sub-closes sequentially, each individually
+# time-boxed at memory_service._SUBCLOSE_TIMEOUT (3.0s), so this outer step
+# budget must dominate 6 * _SUBCLOSE_TIMEOUT (=18s) with margin. 20s does and
+# fits inside _FORCE_EXIT_BUDGET's existing headroom (the worst-case step sum
+# below rises to 70s <= 75s) while leaving graceful+force<systemd untouched —
+# so the schema.py _MIRROR_* mirror and the systemd-template parity test stay
+# valid. Guarded by TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
+_MEMORY_CLOSE_STEP_TIMEOUT = 20.0
 
 # Total wall-clock budget between _graceful_shutdown starting and a hard
 # os._exit(1) firing from a background thread. Must exceed the sum of per-step
 # timeouts plus headroom so clean shutdowns never trip it.
 # Worst case (Fix A): drain(5)+close(5)+sqlite_watchdog(5)+event_queue(5)
-# +harness_cancel(25)+memory_close(5)+journal_close(5) = 55s; +20s headroom = 75.
+# +harness_cancel(25)+memory_close(20)+journal_close(5) = 70s; +5s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
 
 # Mirrors TimeoutStopSec=90 in the committed systemd unit template
@@ -1971,7 +1982,11 @@ async def _graceful_shutdown(
     if taskmaster is not None:
         await _run_shielded('taskmaster.close', taskmaster.close)
 
-    await _run_shielded('memory_service.close', memory_service.close)
+    await _run_shielded(
+        'memory_service.close',
+        memory_service.close,
+        timeout=_MEMORY_CLOSE_STEP_TIMEOUT,
+    )
 
     if recon_journal is not None:
         await _run_shielded('recon_journal.close', recon_journal.close)
