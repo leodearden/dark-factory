@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
@@ -1459,10 +1458,12 @@ def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# default_batch_source — the shipped agent_transcript_roots is threaded into
-# every enumerate_sessions call with NO operator flip (resolved against
-# cfg.project_root). Patches inventory.enumerate_sessions (the module object
-# census.py itself references via `import inventory`) to capture kwargs.
+# default_batch_source — the whole census window is enumerated in ONE walk via
+# enumerate_sessions_in_range (O(files), not O(window_days × files)), and the
+# shipped agent_transcript_roots is threaded into that single call with NO
+# operator flip (resolved against cfg.project_root). Patches
+# inventory.enumerate_sessions_in_range (the module object census.py itself
+# references via `import inventory`) to capture its window + kwargs.
 # ---------------------------------------------------------------------------
 
 def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_path, monkeypatch):
@@ -1474,19 +1475,36 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
 
     captured = []
 
-    def fake_enumerate_sessions(projects_root, cwd_prefixes, target_date, **kwargs):
-        captured.append(kwargs)
+    def fake_enumerate_sessions_in_range(
+        projects_root, cwd_prefixes, start_date, end_date, **kwargs
+    ):
+        captured.append((start_date, end_date, kwargs))
         return []
 
-    monkeypatch.setattr(inventory, "enumerate_sessions", fake_enumerate_sessions)
+    monkeypatch.setattr(
+        inventory, "enumerate_sessions_in_range", fake_enumerate_sessions_in_range
+    )
 
     now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
     # Consume the generator: nothing enumerates until it is iterated.
     list(mod.default_batch_source(cfg, projects_root=tmp_path / "projects", now=now))
 
-    assert captured, "enumerate_sessions was never called"
-    expected = inventory.resolve_agent_transcript_roots(
+    # With no census-state.json under cfg.project_root the window is the
+    # multi-date default lookback (>1 date) — the old per-date loop would have
+    # called the enumerator once per date.
+    window = mod._census_window_dates(cfg.project_root, now=now)
+    assert len(window) > 1, "sanity: this test needs a genuinely multi-date window"
+
+    # (1) ONE range-enumerate call regardless of window length — the
+    # O(files)-not-O(window_days × files) census-level signal.
+    assert len(captured) == 1, "enumerate_sessions_in_range must be called exactly once"
+
+    start_date, end_date, kwargs = captured[0]
+    # (2) resolved archive roots threaded with no operator flip.
+    expected_roots = inventory.resolve_agent_transcript_roots(
         cfg.project_root, cfg.agent_transcript_roots
     )
-    assert expected == [tmp_path / "data" / "orchestrator" / "agent-transcripts"]
-    assert all(c["agent_transcript_roots"] == expected for c in captured)
+    assert expected_roots == [tmp_path / "data" / "orchestrator" / "agent-transcripts"]
+    assert kwargs["agent_transcript_roots"] == expected_roots
+    # (3) the [start, end] window equals _census_window_dates' first/last.
+    assert (start_date, end_date) == (window[0], window[-1])

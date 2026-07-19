@@ -370,3 +370,196 @@ class TestEnumerateArchiveRoots:
             agent_transcript_roots=[tmp_path / 'does-not-exist'],
         )
         assert records == []
+
+
+class TestEnumerateSessionsInRange:
+    """enumerate_sessions_in_range walks the projects tree ONCE and keeps
+    every session whose date falls in the inclusive ``[start_date, end_date]``
+    window — the single-walk O(total_files) replacement for calling
+    :func:`enumerate_sessions` once per calendar date (which re-opens each
+    file window_days times, O(window_days × files))."""
+
+    START_DATE = dt_date(2026, 7, 12)
+    END_DATE = dt_date(2026, 7, 14)
+
+    def test_inclusive_boundaries_both_kept(self, tmp_path):
+        # A session dated == start_date AND one dated == end_date are BOTH
+        # kept: the window is inclusive on both ends.
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_session(main_dir, 'at-start', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z')
+        _write_session(main_dir, 'at-end', MAIN_CWD, timestamp='2026-07-14T23:00:00.000Z')
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.path.stem for r in records} == {'at-start', 'at-end'}
+
+    def test_out_of_range_excluded(self, tmp_path):
+        # One day before start and one day after end are BOTH excluded; a
+        # mid-window session is kept.
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_session(main_dir, 'before-start', MAIN_CWD, timestamp='2026-07-11T09:00:00.000Z')
+        _write_session(main_dir, 'after-end', MAIN_CWD, timestamp='2026-07-15T09:00:00.000Z')
+        _write_session(main_dir, 'in-range', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.path.stem for r in records} == {'in-range'}
+
+    def test_aggregates_across_multiple_encoded_dirs(self, tmp_path):
+        # Mirrors TestEnumerateSessions: aggregation spans every matching
+        # encoded dir, not just the main one.
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        worktree_dir = projects_root / '-home-leo-src-dark-factory--worktrees-2573'
+        _write_session(main_dir, 'main-in-range', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z')
+        _write_session(
+            worktree_dir, 'worktree-in-range', WORKTREE_CWD, timestamp='2026-07-14T11:00:00.000Z'
+        )
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.encoded_dir for r in records} == {
+            '-home-leo-src-dark-factory',
+            '-home-leo-src-dark-factory--worktrees-2573',
+        }
+
+    def test_single_walk_opens_each_in_range_file_exactly_once(self, tmp_path, monkeypatch):
+        # Three in-range dates across the window. A spy that wraps + delegates
+        # to _session_cwd_and_date (the single gz-decompress/open point)
+        # records each path it is called with: every in-range file must be
+        # passed EXACTLY ONCE — proving the range enumerator is O(total_files),
+        # not O(window_days × files) (the per-date loop would open each file 3×).
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_session(main_dir, 'day12', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z')
+        _write_session(main_dir, 'day13', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
+        _write_session(main_dir, 'day14', MAIN_CWD, timestamp='2026-07-14T09:00:00.000Z')
+
+        real = mod._session_cwd_and_date
+        opened = []
+
+        def spy(path):
+            opened.append(path)
+            return real(path)
+
+        monkeypatch.setattr(mod, '_session_cwd_and_date', spy)
+
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.path.stem for r in records} == {'day12', 'day13', 'day14'}
+        # Exactly one open per in-range file — no per-date re-walk.
+        for stem in ('day12', 'day13', 'day14'):
+            path = main_dir / f'{stem}.jsonl'
+            assert opened.count(path) == 1, f'{stem} opened {opened.count(path)}× (want 1)'
+        # And no extra opens beyond the three in-range files.
+        assert len(opened) == 3
+
+
+class TestArchiveEncPrefilter:
+    """The archive-roots walk cheaply pre-filters by the encoded ``<enc>``
+    directory — the archive-root-relative ``parts[1]`` — mirroring
+    :func:`iter_project_dirs`' superset pre-filter, so a proven-foreign
+    ``<enc>`` is skipped WITHOUT a gz-decompress. :func:`is_member` on the
+    real cwd remains the SOLE membership authority for lossy false-positives
+    (e.g. a ``-cockpit`` sibling that string-startswith the prefix). ``<enc>``
+    is ``parts[1]`` for BOTH the main (``<task>/<enc>/<sid>.jsonl.gz``) and
+    subagent (``<task>/<enc>/<sid>/subagents/agent-*.jsonl.gz``) layouts —
+    never ``session_path.parent.name`` (== ``'subagents'`` for the subagent
+    variant, which would wrongly drop every subagent transcript)."""
+
+    TARGET_DATE = dt_date(2026, 7, 13)
+    WT_ENC = '-home-leo-src-dark-factory--worktrees-2573'
+    OTHER_CWD = '/home/leo/src/other-project'
+    OTHER_ENC = '-home-leo-src-other-project'
+
+    @staticmethod
+    def _install_open_spy(monkeypatch) -> list[Path]:
+        """Wrap+delegate to _session_cwd_and_date (the single gz-decompress/
+        open point), recording every path it is called with."""
+        real = mod._session_cwd_and_date
+        opened: list[Path] = []
+
+        def spy(path):
+            opened.append(path)
+            return real(path)
+
+        monkeypatch.setattr(mod, '_session_cwd_and_date', spy)
+        return opened
+
+    def test_foreign_enc_excluded_and_never_opened(self, tmp_path, monkeypatch):
+        # (a) A foreign <enc> (does NOT startswith the encoded MAIN prefix) is
+        # excluded AND its path is never passed to the reader — skipped without
+        # a gz-decompress by the cheap <enc> pre-filter.
+        archive = tmp_path / 'archive'
+        _write_session_gz(
+            archive / '2573' / self.OTHER_ENC, 'foreign', self.OTHER_CWD,
+            timestamp='2026-07-13T09:00:00.000Z',
+        )
+        opened = self._install_open_spy(monkeypatch)
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        foreign_path = archive / '2573' / self.OTHER_ENC / 'foreign.jsonl.gz'
+        assert records == []
+        assert foreign_path not in opened
+
+    def test_member_enc_kept_and_opened(self, tmp_path, monkeypatch):
+        # (b) A member <enc> is kept AND its path WAS passed to the reader.
+        archive = tmp_path / 'archive'
+        member_path = _write_session_gz(
+            archive / '2573' / self.WT_ENC, 'member', WORKTREE_CWD,
+            timestamp='2026-07-13T09:00:00.000Z',
+        )
+        opened = self._install_open_spy(monkeypatch)
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        assert {r.path.name for r in records} == {'member.jsonl.gz'}
+        assert member_path in opened
+
+    def test_lossy_cockpit_false_positive_is_opened_then_is_member_rejected(
+        self, tmp_path, monkeypatch
+    ):
+        # (c) A -cockpit <enc> string-startswith the encoded main prefix (a
+        # LOSSY false-positive), so the superset pre-filter admits it as a
+        # candidate — it IS opened — but is_member on the real cwd rejects it.
+        # The pre-filter is a superset filter; is_member is the sole authority.
+        archive = tmp_path / 'archive'
+        cockpit_enc = mod.encode_cwd(COCKPIT_CWD)
+        cockpit_path = _write_session_gz(
+            archive / '9999' / cockpit_enc, 'cockpit', COCKPIT_CWD,
+            timestamp='2026-07-13T09:00:00.000Z',
+        )
+        opened = self._install_open_spy(monkeypatch)
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        assert records == []
+        assert cockpit_path in opened
+
+    def test_subagent_layout_member_kept_and_opened(self, tmp_path, monkeypatch):
+        # (d) Subagent layout: <archive>/<task>/<enc>/<sid>/subagents/agent-x.jsonl.gz.
+        # <enc> is parts[1] (the member WT_ENC), NOT parent.name (== 'subagents',
+        # which never encoded-prefix-matches a cwd and would drop EVERY subagent
+        # transcript). The member subagent file is kept + opened, and its
+        # encoded_dir is the real <enc>, not 'subagents'.
+        archive = tmp_path / 'archive'
+        sub_dir = archive / '2573' / self.WT_ENC / 'cafe-sid' / 'subagents'
+        sub_path = _write_session_gz(
+            sub_dir, 'agent-x', WORKTREE_CWD, timestamp='2026-07-13T09:00:00.000Z',
+        )
+        opened = self._install_open_spy(monkeypatch)
+        records = mod.enumerate_sessions(
+            tmp_path / 'no-projects', [MAIN_CWD], self.TARGET_DATE,
+            agent_transcript_roots=[archive],
+        )
+        assert {r.path.name for r in records} == {'agent-x.jsonl.gz'}
+        assert sub_path in opened
+        record = next(r for r in records if r.path.name == 'agent-x.jsonl.gz')
+        assert record.encoded_dir == self.WT_ENC
