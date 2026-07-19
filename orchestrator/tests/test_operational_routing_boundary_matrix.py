@@ -22,7 +22,11 @@ genuine integration gap, not a synthetic-input failure.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.deterministic_runner import OPERATIONAL_LLM_NEEDS_LANE_TOKEN
 
@@ -111,3 +115,65 @@ def _mock_scheduler(task: dict):
     scheduler.update_task = AsyncMock(return_value=True)
     scheduler.get_task = AsyncMock(return_value=task)
     return scheduler
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4b — llm escalation + never-routed-to-architect (matrix row 4,
+# consumer half; orchestrator side). Two standalone functions (not a shared
+# test class) — one sync, one async — so no class-level @pytest.mark.asyncio
+# is needed (this project's pyproject.toml does NOT set asyncio_mode="auto";
+# a class-level mark over a MIXED sync/async class is a collection-time
+# ERROR here, per test_background_service.py / test_merge_queue_resource_audit.py).
+# ---------------------------------------------------------------------------
+
+
+def test_llm_gate_task_is_deterministic_never_routed_to_architect():
+    """(a) Never-to-architect: an llm-marked pure-gate task is routed by
+    ``Scheduler.is_deterministic`` — the predicate (scheduler.py:1996-2012)
+    that sends a task to ``_run_deterministic_slot``, never the architect.
+    ``is_deterministic`` reads only ``metadata['task_kind']``, which the
+    llm-gate task shares with a plain pure gate (β's marker is an
+    additional, independent key) — so this also confirms the llm-gate
+    shape does not accidentally opt back into the architect path.
+    """
+    from orchestrator.scheduler import Scheduler
+
+    task = _llm_gate_task()
+    assert Scheduler.is_deterministic(task) is True
+
+
+@pytest.mark.asyncio
+async def test_llm_gate_escalation_carries_token_via_real_escalation_queue(
+    tmp_path: Path,
+):
+    """(b) Escalation read path: ``DeterministicRunner.run`` over the
+    llm-marked task files a born-at-L2 escalation, read back through a REAL
+    ``EscalationQueue.get_by_task`` (not a mock), whose detail carries
+    ``OPERATIONAL_LLM_NEEDS_LANE_TOKEN``, ``level==2``,
+    ``agent_role=='orchestrator-deterministic'``, and the scheduler was set
+    to ``'blocked'``. Ties β's marker (fused-memory scenario 4a,
+    ``x_operational_llm_gate``) to γ's token emission through the real
+    escalation API — the ζ integration matrix's distinct value over the γ
+    leaf test (test_deterministic_runner.py::TestOperationalLlmGateMarker),
+    which asserts the same token but not the never-to-architect routing half
+    proven alongside it here.
+    """
+    from orchestrator.deterministic_runner import DeterministicRunner
+
+    task = _llm_gate_task(task_id='99')
+    assignment = _make_assignment(task)
+    queue = EscalationQueue(tmp_path)
+    scheduler = _mock_scheduler(task)
+
+    runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+    await runner.run(assignment)
+
+    pending = queue.get_by_task('99', status='pending')
+    assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+    esc = pending[0]
+
+    assert OPERATIONAL_LLM_NEEDS_LANE_TOKEN in esc.detail, f'got {esc.detail!r}'
+    assert esc.level == 2, f'got {esc.level!r}'
+    assert esc.agent_role == 'orchestrator-deterministic', f'got {esc.agent_role!r}'
+
+    scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')
