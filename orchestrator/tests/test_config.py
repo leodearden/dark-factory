@@ -2166,7 +2166,7 @@ class TestSimpleTaskRoleConfigAddressability:
     def test_submodel_field_defaults_reproduce_current_runtime(self):
         assert ModelsConfig().simple_task == 'sonnet'
         assert BudgetsConfig().simple_task == 1.50
-        assert TurnsConfig().simple_task == 30
+        assert TurnsConfig().simple_task == 50
         assert EffortConfig().simple_task == 'high'
         assert TimeoutsConfig().simple_task == 7200.0
         assert BackendsConfig().simple_task == 'claude'
@@ -2182,7 +2182,7 @@ class TestSimpleTaskRoleConfigAddressability:
         defaults = _load_package_defaults()
         assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
         assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 1.50
-        assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 30
+        assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 50
         assert config.effort.simple_task == defaults['effort']['simple_task'] == 'high'
         assert config.timeouts.simple_task == defaults['timeouts']['simple_task'] == 7200.0
         assert config.backends.simple_task == defaults['backends']['simple_task'] == 'claude'
@@ -2342,7 +2342,7 @@ class TestSimpleTaskDeprecatedScalarHonoring:
             'A default-valued simple_task_budget_usd must not migrate into '
             'budgets.simple_task.'
         )
-        assert config.max_turns.simple_task == 30, (
+        assert config.max_turns.simple_task == 50, (
             'A default-valued simple_task_max_turns must not migrate into '
             'max_turns.simple_task.'
         )
