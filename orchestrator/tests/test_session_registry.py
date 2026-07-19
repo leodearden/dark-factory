@@ -1885,6 +1885,47 @@ def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> N
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
 
 
+def test_claim_lease_keeps_a_quiet_watchers_lease_across_a_full_slice(tmp_path: Path) -> None:
+    # The required "duplicate-through" regression (task 2796 THREAD 1): a live
+    # interactive watcher holds its lease with `--pid $$` (the ephemeral
+    # Bash-tool shell, dead moments after the claim), so _pid_alive is
+    # ~always False for a watcher lease and staleness collapses to a pure
+    # heartbeat-TTL check. That watcher heartbeats only once per Main Loop
+    # cycle, bounded by ONE canonical watcher-rearm.sh `--timeout` slice
+    # (3600s). If LEASE_HEARTBEAT_TTL is below that slice, a live-but-quiet
+    # holder's lease goes stale->reap-eligible during any quiet slice and a
+    # duplicate reaps+reclaims it -- the exact code path that let a
+    # live-lease-holder's duplicate spawn through. With TTL raised above the
+    # slice, the duplicate must instead STAND DOWN.
+    original = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    # Backdate the heartbeat by one full canonical wait slice (3600s).
+    _set_mtime(lease_path, _NOW, timedelta(seconds=3600))
+
+    duplicate = sr.LeaseHolder(session_slug='watcher-df-dup', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'watcher-df', holder=duplicate, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    # RED today: TTL=300s < 3600s slice age, so the live-but-quiet holder's
+    # lease is reaped-and-reclaimed and the duplicate ACQUIRES (claim.acquired
+    # is True) -- the duplicate-through bug. GREEN after TTL is raised: the
+    # duplicate stands down.
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-dead'
+    # No clobber / no reap: the on-disk body still names the ORIGINAL holder.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
+
+    # Invariant guard: the whole regression hinges on TTL exceeding one full
+    # canonical slice. If a future edit lowers LEASE_HEARTBEAT_TTL back below
+    # 3600s, this assertion fails loudly rather than silently re-opening the
+    # gap.
+    assert sr.LEASE_HEARTBEAT_TTL > timedelta(seconds=3600)
+
+
 def test_claim_lease_survives_lease_vanishing_between_create_and_stat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
