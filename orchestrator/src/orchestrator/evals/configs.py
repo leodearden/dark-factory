@@ -443,6 +443,17 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     call) rather than a static list — cheap at CLI/driver lookup frequency,
     and keeps this the single by-name resolver for every eval config family
     (avoids a second, per-selector lookup path).
+
+    ``JUDGE_EVAL_CONFIGS`` (ο) is DELIBERATELY absent from the search list —
+    unlike ``ARCHITECT_EVAL_CONFIGS``, which is standalone-runnable. Judge
+    candidates are an OFAT-only, indirectly-scored axis reachable solely via
+    ``ofat_candidates()`` → ``run_ofat_stage``'s judge branch (which pins the
+    implementer to ``JUDGE_OFAT_IMPLEMENTER_PIN`` and rides the candidate on
+    ``judge_config``). The single-eval CLI loop has no judge dispatch and would
+    mis-run a judge candidate as an implementer, so by-name resolution of a
+    judge candidate is intentionally unsupported: a lookup returns ``None``
+    ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
+    than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
     """
     for cfg in [
         *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
