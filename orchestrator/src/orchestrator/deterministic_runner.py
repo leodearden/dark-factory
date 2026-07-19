@@ -1360,15 +1360,18 @@ class DeterministicRunner:
         if dep_ids:
             detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
         detail = '\n'.join(detail_parts)
+        summary = title[:200]
         if _is_operational_llm_gate(metadata):
-            # Task 2803 (γ): token-first prefix so downstream truncation (the
-            # summary's [:200] below) can never sever it; detail itself is
-            # not truncated. Plain gates (marker absent) are byte-unchanged.
+            # Task 2803 (γ): token-first prefix/build so the token survives
+            # downstream truncation (the summary's [:200] slice) and any
+            # tail-only log scrape; detail itself is not truncated. Plain
+            # gates (marker absent) are byte-unchanged.
             detail = (
                 f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
                 'LLM-operational handling; no automated lane exists yet — resolve '
                 'by hand.\n\n'
             ) + detail
+            summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
         gate_options = metadata.get('gate_options') or []
 
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
@@ -1390,7 +1393,7 @@ class DeterministicRunner:
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
                 category='milestone_gate',
-                summary=title[:200],
+                summary=summary,
                 detail=detail,
                 options=list(gate_options),
                 level=2,
