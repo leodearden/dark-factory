@@ -127,6 +127,28 @@ def _make_workflow(
     return workflow, artifacts
 
 
+def _write_plan(
+    artifacts: TaskArtifacts,
+    workflow: TaskWorkflow,
+    steps: list[dict],
+    prerequisites: list[dict] | None = None,
+) -> dict:
+    """Persist a plan with the given step dicts and stamp provenance so
+    ``validate_plan_owner(workflow.session_id)`` passes, returning the re-read
+    plan. Mirrors test_harness_plan_step_rederive.py._write_plan.
+    """
+    plan = {
+        'task_id': '42',
+        'title': 'X',
+        'analysis': 'A',
+        'prerequisites': prerequisites or [],
+        'steps': steps,
+    }
+    artifacts.write_plan(plan)
+    artifacts.stamp_plan_provenance(workflow.session_id)
+    return artifacts.read_plan()
+
+
 # ---------------------------------------------------------------------------
 # step-1 RED: the _iteration_commit_provenance helper
 # ---------------------------------------------------------------------------
@@ -192,3 +214,83 @@ class TestIterationCommitProvenanceHelper:
         assert result['commit'] is None
         assert result['committed'] is False
         assert result['dirty'] is True
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: the amend writer (_amend) — the RCA origin
+# ---------------------------------------------------------------------------
+
+
+def _amend_workflow(config, git_ops, task_assignment, wt):
+    """A real-git workflow wired to drive _amend once: a plan on disk with
+    stamped provenance (so validate_plan_owner passes) and a mocked amender
+    briefing. The caller configures _invoke."""
+    workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+    _write_plan(artifacts, workflow, [
+        {'id': 'step-1', 'type': 'impl', 'status': 'done', 'commit': 'x'},
+    ])
+    workflow.plan = artifacts.read_plan()
+    workflow.briefing.build_amender_prompt = AsyncMock(  # type: ignore[attr-defined]
+        return_value='amend-prompt',
+    )
+    return workflow, artifacts
+
+
+@pytest.mark.asyncio
+class TestAmendWriterTruthfulCommit:
+    """_amend must stamp truthful provenance: commit:null / committed:false
+    when the amender left HEAD unchanged; the real new sha / committed:true
+    when it committed."""
+
+    async def test_amend_no_commit_records_null_and_uncommitted(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _amend_workflow(config, git_ops, task_assignment, wt)
+        # No-op amender: returns success but makes no commit ⇒ HEAD unchanged.
+        workflow._invoke = AsyncMock(  # type: ignore[method-assign]
+            return_value=AgentResult(success=True, output=''),
+        )
+
+        in_scope = [{'file': 'lib.py', 'suggestion': 'tidy'}]
+        ok = await workflow._amend(in_scope, amendment_round=1)
+        assert ok is True
+
+        entries, _ = artifacts.read_iteration_log()
+        amendments = [e for e in entries if e.get('source') == 'amendment']
+        assert len(amendments) == 1, f'expected one amendment entry, got {entries}'
+        entry = amendments[0]
+        assert entry['commit'] is None, (
+            f'amender made no commit ⇒ commit must be null, got {entry.get("commit")!r}'
+        )
+        assert entry['committed'] is False
+
+    async def test_amend_with_commit_records_new_head_and_committed(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _amend_workflow(config, git_ops, task_assignment, wt)
+
+        async def _commit_effect(*_args, **_kwargs):
+            (wt / 'amend.py').write_text('amended\n')
+            await git_ops.commit(wt, 'feat: amendment commit')
+            return AgentResult(success=True, output='')
+
+        workflow._invoke = AsyncMock(side_effect=_commit_effect)  # type: ignore[method-assign]
+
+        in_scope = [{'file': 'lib.py', 'suggestion': 'tidy'}]
+        ok = await workflow._amend(in_scope, amendment_round=1)
+        assert ok is True
+
+        head = await workflow._get_head_commit()
+        entries, _ = artifacts.read_iteration_log()
+        amendments = [e for e in entries if e.get('source') == 'amendment']
+        assert len(amendments) == 1, f'expected one amendment entry, got {entries}'
+        entry = amendments[0]
+        assert entry['commit'] == head, (
+            f'amender committed ⇒ commit must be the new HEAD {head!r}, '
+            f'got {entry.get("commit")!r}'
+        )
+        assert entry['committed'] is True
