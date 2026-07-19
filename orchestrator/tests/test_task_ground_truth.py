@@ -28,7 +28,7 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
@@ -392,15 +392,33 @@ class TestDeriveTruthBranchStateGitFallback:
     shapes, with ``find_merge_marker`` consulted only on the branch-gone
     path."""
 
-    async def test_ancestor_true_resolves_on_main_via_branch_tip(self) -> None:
-        git_ops = _fake_git_ops(is_ancestor=True, branch_sha='tipsha123')
+    async def test_ancestor_true_with_citation_resolves_on_main_via_citation(self) -> None:
+        """task 2787 corrected contract: a branch that is an ancestor of main
+        AND carries a positive on-main citation tied to the branch resolves
+        ON_MAIN with the CITATION sha (the authoritative landing commit) — not
+        the raw branch tip. The FIX 2 bidirectional is_ancestor lineage guard
+        is applied to the citation, mirroring validate_landing_evidence
+        DISCOVERY mode."""
+        citation_sha = 'cafefeed' + 'b' * 32
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha='tipsha123', citation_sha=citation_sha,
+        )
         resolver = _make_ground_truth(git_ops=git_ops)
 
         report = await resolver.derive_truth('7')
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'tipsha123')
-        git_ops.is_ancestor.assert_awaited_once_with('task/7', 'main')
-        git_ops.resolve_branch_sha.assert_awaited_once_with('task/7')
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, citation_sha)
+        git_ops.find_task_citation_commit.assert_awaited_once()
+        # is_ancestor is now awaited twice: once for (branch, main), once for
+        # the citation lineage check (citation, branch) — which short-circuits
+        # the `or` on its first (True) arm.
+        assert git_ops.is_ancestor.await_count == 2
+        git_ops.is_ancestor.assert_has_awaits(
+            [call('task/7', 'main'), call(citation_sha, 'task/7')],
+            any_order=True,
+        )
+        # The ON_MAIN fast-path no longer consults the raw branch tip.
+        git_ops.resolve_branch_sha.assert_not_awaited()
         git_ops.find_merge_marker.assert_not_awaited()
 
     async def test_ancestor_true_no_citation_resolves_exists_off_main(self) -> None:

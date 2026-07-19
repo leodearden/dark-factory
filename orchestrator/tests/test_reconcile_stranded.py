@@ -1524,8 +1524,10 @@ class TestReconcileStrandedInProgress:
 
         await harness._reconcile_stranded_in_progress()
 
-        # is_ancestor must have been invoked with the configured branch + main_branch
-        harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
+        # is_ancestor must have been invoked with the configured branch +
+        # main_branch (task 2787: now also awaited a second time for the
+        # citation lineage check, so assert the branch/main await specifically).
+        harness.git_ops.is_ancestor.assert_any_await('task/50', 'main')  # type: ignore[attr-defined]
 
         # set_task_status must be called exactly once: ('50', 'done') with kind/commit/note
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
@@ -1536,11 +1538,13 @@ class TestReconcileStrandedInProgress:
                 'note': 'reconcile: branch already on main when stranded in-progress',
             },
         )
-        # The citation-guard (find_task_citation_commit) is retired (task
-        # 2243, W10-θ2 step-4) — the sha now comes from the resolver's
-        # branch-state resolution (git_ops.resolve_branch_sha), not a
-        # citation grep.
-        harness.git_ops.find_task_citation_commit.assert_not_awaited()  # type: ignore[attr-defined]
+        # task 2787 re-introduced a POSITIVE-citation attribution guard on the
+        # resolver's ON_MAIN git-archaeology fast-path (mirroring
+        # validate_landing_evidence DISCOVERY mode): find_task_citation_commit
+        # IS consulted, and the ON_MAIN sha is now the citation itself — here
+        # == the fixture's resolve_branch_sha default, so the provenance commit
+        # asserted above is unchanged.
+        harness.git_ops.find_task_citation_commit.assert_awaited()  # type: ignore[attr-defined]
 
         # cleanup_worktree must NOT have been called
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
@@ -1581,8 +1585,11 @@ class TestReconcileStrandedInProgress:
 
         await harness._reconcile_stranded_in_progress()
 
-        # is_ancestor was invoked (proves we got into the branch).
-        harness.git_ops.is_ancestor.assert_awaited_once_with('task/50', 'main')  # type: ignore[attr-defined]
+        # is_ancestor was invoked (proves we got into the branch). task 2787:
+        # the resolver's ON_MAIN fast-path now awaits is_ancestor a second time
+        # for the citation lineage check, so assert the branch/main await
+        # specifically rather than an exact once.
+        harness.git_ops.is_ancestor.assert_any_await('task/50', 'main')  # type: ignore[attr-defined]
 
         # But neither mark_done nor set_task_status('done', ...) fired —
         # the L1 guard bailed before the flip.
