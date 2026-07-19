@@ -189,6 +189,43 @@ def test_eval_confirm_invokes_run_confirm_stage(
     assert 'composite report:' in r.output
 
 
+def test_eval_confirm_rejects_swapped_arch_impl_flags(
+    monkeypatch, base_config, dummy_cfg_file, fixtures_dir,
+):
+    """``eval-confirm`` fails LOUDLY when --arch/--impl resolve to the wrong role.
+
+    Passing an implementer name to --arch and an architect name to --impl
+    resolves fine via get_config_by_name but would silently build a nonsensical
+    both-live combo. The driver must reject it, NAME the offending flag, and
+    never dispatch the confirmation batch (loud-over-silent).
+    """
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+
+    cands = configs_module.ofat_candidates()
+    arch_name = next(c.name for c in cands if c.role == 'architect')
+    impl_name = next(c.name for c in cands if c.role == 'implementer')
+
+    called = False
+
+    async def fake_confirm(*args, **kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(runner_module, 'run_confirm_stage', fake_confirm)
+
+    # Flags swapped: implementer name to --arch, architect name to --impl.
+    r = CliRunner().invoke(main, [
+        'eval-confirm', '--config', str(dummy_cfg_file),
+        '--arch', impl_name, '--impl', arch_name,
+        '--tasks-dir', str(fixtures_dir),
+    ])
+
+    assert r.exit_code != 0, r.output
+    assert '--arch' in r.output, 'the error must name the offending flag'
+    assert not called, 'run_confirm_stage must not run on a role mismatch'
+
+
 def test_eval_matrix_flag_alias_routes_to_matrix_driver(
     monkeypatch, base_config, dummy_cfg_file,
 ):

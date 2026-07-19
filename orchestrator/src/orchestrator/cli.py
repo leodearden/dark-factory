@@ -10,7 +10,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import click
 from dotenv import load_dotenv
@@ -1041,24 +1041,33 @@ def _resolve_eval_task_paths(base_config, tasks_dir: Path | None) -> list[Path]:
     return sorted(tasks_dir.glob('*.json'))
 
 
-def _emit_composite_report(results, price_configs, base_config) -> None:
+def _eval_prices(base_config) -> dict[str, Any]:
+    """The μ driver's price map: ``base_config.prices`` or the packaged
+    :func:`default_price_table` fallback. Single-sourced so every stage seeds its
+    price table (individual or combined-name) from the same map.
+    """
+    from orchestrator.config import default_price_table
+
+    return base_config.prices or default_price_table()
+
+
+def _emit_composite_report(results, price_table) -> None:
     """Emit the C4 composite report for *results* (the μ driver stages' surface).
 
-    Seeds the price table from ``base_config.prices`` (falling back to the
-    packaged :func:`default_price_table`), builds λ's per-config
-    composite/cost/latency/CI95/judge report, and prints
+    *price_table* is the pre-built ``{config_name: {role: entry}}`` table the
+    caller seeds — λ's :func:`build_price_table` (OFAT's individual configs) or
+    :func:`build_pairwise_price_table` (the matrix/confirm end-to-end stages,
+    whose report rows are keyed by the combined ``arch+impl`` name, so the price
+    section must be keyed the same way to stay aligned). Builds λ's per-config
+    composite/cost/latency/CI95/judge report and prints
     :func:`format_composite_table`. The quality figure is single-sourced in λ's
     ``compute_composite`` — the driver never re-derives a score.
     """
-    from orchestrator.config import default_price_table
     from orchestrator.evals.report import (
         build_composite_report,
-        build_price_table,
         format_composite_table,
     )
 
-    prices = base_config.prices or default_price_table()
-    price_table = build_price_table(price_configs, prices)
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
 
@@ -1069,6 +1078,7 @@ def _run_ofat_driver(
 ) -> None:
     """OFAT screen: ``run_ofat_stage`` over ``ofat_candidates()`` → composite (μ)."""
     from orchestrator.evals.configs import ofat_candidates
+    from orchestrator.evals.report import build_price_table
     from orchestrator.evals.runner import run_ofat_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
@@ -1077,7 +1087,10 @@ def _run_ofat_driver(
         task_paths, candidates, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
     ))
-    _emit_composite_report(results, candidates, base_config)
+    # OFAT rows are keyed by the individual candidate name → individual price table.
+    _emit_composite_report(
+        results, build_price_table(candidates, _eval_prices(base_config)),
+    )
 
 
 def _run_matrix_driver(
@@ -1090,7 +1103,8 @@ def _run_matrix_driver(
     survivor inputs; ``run_matrix_stage`` expands the FULL cross product
     (INCLUDING same-family diagonals) via ``configs.matrix_pairs``.
     """
-    from orchestrator.evals.configs import ofat_candidates
+    from orchestrator.evals.configs import matrix_pairs, ofat_candidates
+    from orchestrator.evals.report import build_pairwise_price_table
     from orchestrator.evals.runner import run_matrix_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
@@ -1101,7 +1115,14 @@ def _run_matrix_driver(
         task_paths, arch_cfgs, impl_cfgs, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
     ))
-    _emit_composite_report(results, [*arch_cfgs, *impl_cfgs], base_config)
+    # End-to-end rows are keyed by the combined arch+impl name → a combined-name
+    # price table over the FULL cross product, so the price section aligns.
+    _emit_composite_report(
+        results,
+        build_pairwise_price_table(
+            matrix_pairs(arch_cfgs, impl_cfgs), _eval_prices(base_config),
+        ),
+    )
 
 
 def _run_confirm_driver(
@@ -1110,6 +1131,7 @@ def _run_confirm_driver(
 ) -> None:
     """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
     from orchestrator.evals.configs import get_config_by_name
+    from orchestrator.evals.report import build_pairwise_price_table
     from orchestrator.evals.runner import run_confirm_stage
 
     arch_cfg = get_config_by_name(arch)
@@ -1118,13 +1140,35 @@ def _run_confirm_driver(
         missing = arch if arch_cfg is None else impl
         click.echo(f'Unknown config: {missing}', err=True)
         sys.exit(1)
+    # Loud-over-silent: --arch must resolve to an ARCHITECT config and --impl to
+    # an IMPLEMENTER one. Swapping the flags otherwise resolves fine and silently
+    # builds a nonsensical both-live combo (implementer pinned as the architect
+    # and vice-versa) — reject the mismatch NAMING the offending flag + role.
+    if arch_cfg.role != 'architect':
+        click.echo(
+            f'--arch: {arch!r} is a {arch_cfg.role} config, expected an architect',
+            err=True,
+        )
+        sys.exit(1)
+    if impl_cfg.role != 'implementer':
+        click.echo(
+            f'--impl: {impl!r} is a {impl_cfg.role} config, expected an implementer',
+            err=True,
+        )
+        sys.exit(1)
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
     results = asyncio.run(run_confirm_stage(
         task_paths, arch_cfg, impl_cfg, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
     ))
-    _emit_composite_report(results, [arch_cfg, impl_cfg], base_config)
+    # The single winning combo's rows are keyed by the combined arch+impl name.
+    _emit_composite_report(
+        results,
+        build_pairwise_price_table(
+            [(arch_cfg, impl_cfg)], _eval_prices(base_config),
+        ),
+    )
 
 
 @main.command('eval-ofat')
