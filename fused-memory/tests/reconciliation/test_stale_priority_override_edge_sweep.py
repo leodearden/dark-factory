@@ -34,6 +34,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -464,3 +465,150 @@ class TestSweepStalePriorityOverrideEdgesCore:
         assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
         )
+
+
+def _boost_fact_edge(uuid: str, task_id: int) -> dict:
+    return {
+        'uuid': uuid,
+        'fact': f"Set priority override for task {task_id}: {{'boost_tier': 'high'}}",
+        'name': '',
+    }
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_priority_override_edges — guards
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStalePriorityOverrideEdgesGuards:
+    """Guard behavior: a falsy project_root, an enumeration failure, or an
+    enumeration with no candidate edges must short-circuit without
+    unnecessary backend calls."""
+
+    @pytest.mark.asyncio
+    async def test_empty_project_root_yields_all_zero_stats_with_no_calls(self):
+        """project_root='' -> all-zero stats; get_all_valid_edges and
+        read_live never awaited."""
+        memory_service = _make_memory_service()
+        read_live = AsyncMock()
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '', run_id='run-1', read_live=read_live,
+        )
+
+        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+        memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
+        read_live.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_all_valid_edges_failure_yields_all_zero_stats_without_raising(self):
+        """get_all_valid_edges raises -> all-zero stats except errors=1, no
+        raise, read_live/update_edge not awaited."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            side_effect=RuntimeError('transient read timeout'),
+        )
+        read_live = AsyncMock()
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
+        )
+
+        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+            f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
+        )
+        read_live.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_edges_skips_read_live(self):
+        """Enumeration returns only non-override edges (no candidate ids) ->
+        read_live never awaited and invalidated == 0."""
+        memory_service = _make_memory_service()
+        non_candidate = {'uuid': 'edge-x', 'fact': 'Task 5 is done', 'name': ''}
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [non_candidate]},
+        )
+        read_live = AsyncMock()
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
+        )
+
+        read_live.assert_not_awaited()
+        assert stats['invalidated'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_priority_override_edges — best-effort resilience
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStalePriorityOverrideEdgesBestEffort:
+    """A transient failure reading live state, or invalidating one edge, must
+    not abort the sweep for the remaining edges — it is tallied into
+    stats['errors']. asyncio.CancelledError is never swallowed."""
+
+    @pytest.mark.asyncio
+    async def test_read_live_failure_is_best_effort_no_op(self):
+        """read_live raises -> best-effort no-op: errors tallied, no
+        update_edge attempted, no raise."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [_boost_fact_edge('edge-c', 5166)]},
+        )
+        read_live = AsyncMock(side_effect=RuntimeError('db locked'))
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
+        )
+
+        assert stats == {'scanned': 1, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+            f'Expected the read_live failure tallied as an error with no invalidation, got {stats!r}'
+        )
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_edge_failure_is_swallowed_and_second_still_attempted(self):
+        """update_edge raises for the first of two stale edges; the second is
+        still attempted. Only the successful one counts as invalidated, the
+        failure counts as an error."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={
+                'entity-a': [
+                    _boost_fact_edge('edge-stale-1', 5166),
+                    _boost_fact_edge('edge-stale-2', 4079),
+                ],
+            },
+        )
+        # Empty live map -> both absent -> both stale.
+        read_live = AsyncMock(return_value={})
+        memory_service.update_edge = AsyncMock(side_effect=[RuntimeError('lock contention'), None])
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'The second stale edge must still be attempted after the first update fails'
+        )
+        assert stats == {'scanned': 2, 'candidate_edges': 2, 'invalidated': 1, 'errors': 1}, (
+            f'Expected the failed update tallied without blocking the second, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_from_update_edge_propagates(self):
+        """asyncio.CancelledError raised from update_edge must propagate — it
+        is never swallowed as a best-effort error."""
+        memory_service = _make_memory_service()
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [_boost_fact_edge('edge-stale', 5166)]},
+        )
+        read_live = AsyncMock(return_value={})
+        memory_service.update_edge = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await sweep_stale_priority_override_edges(
+                memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
+            )
