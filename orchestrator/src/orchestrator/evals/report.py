@@ -595,3 +595,117 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_COLUMNS))
     lines.extend(_fmt(rr) for rr in rendered)
     return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Composite report renderer (eval-revival λ / C4)
+#
+# The deterministic table surface for :func:`build_composite_report`, mirroring
+# the width-computed ljust idiom of format_recovery_table / format_plan_quality_
+# table above. Emits a per-config table (composite / quality / cost / cost_source
+# / latency / CI95 / trials / fixtures) followed by a DISTINCT price-table
+# section (config → role → input/output per-1M). Byte-stable: rows and sections
+# are sorted, floats fixed-precision, and no wall-clock is rendered.
+# ---------------------------------------------------------------------------
+
+_COMPOSITE_COLUMNS = (
+    'config', 'composite', 'quality', 'cost_usd', 'cost_source',
+    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
+)
+_PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
+
+
+def _ci_cell(ci: dict[str, Any] | None) -> str:
+    """Render a ``mean_ci95`` sub-dict as a ``[lo, hi]`` interval (4 dp)."""
+    if not ci:
+        return '-'
+    return f'[{float(ci.get("lo", 0.0)):.4f}, {float(ci.get("hi", 0.0)):.4f}]'
+
+
+def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
+    """Render the ``{config: {role: entry}}`` price table as a deterministic
+    block. A listed entry shows its ``input_per_1m`` / ``output_per_1m`` (4 dp);
+    an UNPRICED entry (``{'source': 'unpriced'}``) shows the explicit marker in
+    both cells — never a blank or fabricated price. Configs and roles are sorted.
+    """
+    rendered: list[dict[str, str]] = []
+    for cfg in sorted(price_table):
+        roles = price_table[cfg] or {}
+        for role in sorted(roles):
+            entry = roles[role] or {}
+            if 'input_per_1m' in entry:
+                inp = f'{float(entry["input_per_1m"]):.4f}'
+                outp = f'{float(entry["output_per_1m"]):.4f}'
+            else:
+                inp = outp = str(entry.get('source', 'unpriced'))
+            rendered.append({
+                'config': str(cfg),
+                'role': str(role),
+                'input_per_1m': inp,
+                'output_per_1m': outp,
+            })
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _PRICE_TABLE_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in _PRICE_TABLE_COLUMNS)
+
+    lines = ['price table:']
+    lines.append(_fmt({col: col for col in _PRICE_TABLE_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _PRICE_TABLE_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
+    return lines
+
+
+def format_composite_table(report: dict[str, Any]) -> str:
+    """Render :func:`build_composite_report` output as a deterministic table.
+
+    A per-config table carries composite / quality / cost_usd / cost_source /
+    latency_secs, a ``[lo, hi]`` CI95 rendering of the composite, and trial /
+    fixture counts, followed by a distinct ``price table`` section. The same
+    report always renders byte-identically (rows sorted by config, price-table
+    sections sorted, fixed float precision, no wall-clock/dict-order dependence).
+    An unpriced config's ``cost_source`` shows the explicit marker (e.g.
+    ``unpriced_proxy``), never a blank.
+    """
+    configs = sorted(report.get('configs', []), key=lambda r: str(r.get('config', '')))
+
+    rendered = [
+        {
+            'config': str(r.get('config', '')),
+            'composite': f'{float(r.get("composite", 0.0)):.4f}',
+            'quality': f'{float(r.get("quality", 0.0)):.4f}',
+            'cost_usd': f'{float(r.get("cost_usd", 0.0)):.4f}',
+            'cost_source': str(r.get('cost_source', '')),
+            'latency_secs': f'{float(r.get("latency_secs", 0.0)):.2f}',
+            'ci95_composite': _ci_cell((r.get('ci95') or {}).get('composite')),
+            'trials': str(r.get('trials', 0)),
+            'fixtures': str(r.get('fixtures', 0)),
+        }
+        for r in configs
+    ]
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _COMPOSITE_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in _COMPOSITE_COLUMNS)
+
+    lines = ['composite report:']
+    lines.append(_fmt({col: col for col in _COMPOSITE_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _COMPOSITE_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
+
+    # Distinct price-table section.
+    lines.append('')
+    lines.extend(_format_price_table_section(report.get('price_table') or {}))
+    return '\n'.join(lines)
