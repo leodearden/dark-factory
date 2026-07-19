@@ -75,6 +75,7 @@ via ``run_eval`` only when you want to capture the writes. See
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,6 +87,7 @@ from orchestrator import config as _config
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.evals import profile as _profile
 from orchestrator.evals.profile import EVAL_PROFILE
+from orchestrator.mcp import verdict_tools as _verdict_tools
 
 # ---------------------------------------------------------------------------
 # Shared committed-diff git fixture (test_snapshots.py _git / tmp_repo
@@ -264,3 +266,82 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     assert set(leaked) != set(EVAL_PROFILE)
     assert 'max_amendment_rounds' in leaked
+
+
+# ── B8: contract-agnostic scoring (P4) ─────────────────────────────────────
+
+# The single reviewer payload shape both contract eras reduce to: 1 blocking +
+# 2 suggestion issues. ``write_review`` persists this dict verbatim to
+# ``reviews/<name>.json`` (legacy ``--json-schema`` era); the MCP verdict-tool
+# era wraps the SAME payload in ``_envelope(...)['verdict']`` under
+# ``verdicts/<role>.json``. Both reduce to identical blocking/suggestion counts.
+_B8_REVIEWER = 'reviewer_comprehensive'
+_B8_PAYLOAD = {
+    'reviewer': _B8_REVIEWER,
+    'verdict': 'ISSUES_FOUND',
+    'issues': [
+        {'severity': 'blocking', 'description': 'b1', 'location': 'm/x.py:1'},
+        {'severity': 'suggestion', 'description': 's1', 'location': 'm/x.py:2'},
+        {'severity': 'suggestion', 'description': 's2', 'location': 'm/x.py:3'},
+    ],
+    'summary': 'one blocking, two suggestions',
+}
+
+
+def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
+    """B8 — one score from BOTH the legacy payload and the verdict-tool envelope.
+
+    Scoring flows reviews/<name>.json → aggregate_reviews (blocking vs
+    suggestion split by ``severity``) → compute_composite. The MCP verdict-tool
+    path writes a schema-versioned envelope ``{role, schema_version, session_id,
+    emitted_at, verdict: <payload>}``; ``_run_reviewer`` unwraps
+    ``envelope['verdict']`` to the SAME payload the legacy ``--json-schema``
+    reviewer persists. So both contract eras reduce to one payload → one score.
+
+    Asserts:
+    (1) identical float score from the legacy payload and the
+        ``_envelope``-wrapped payload (exact by construction — same
+        blocking/suggestion counts → same compute_composite);
+    (2) content-sensitivity — a PASS / zero-issue artifact scores strictly
+        higher than the 1-blocking artifact (the score is not a constant);
+    (3) scoring reads ONLY the artifact dict + scalar knobs (no transcript /
+        file-path / worktree argument) — the P4 substrate μ's driver consumes.
+
+    RED: ``orchestrator.evals.scoring`` / ``quality_from_review_artifact`` does
+    not exist yet.
+    """
+    from orchestrator.evals import scoring
+
+    legacy_artifact = dict(_B8_PAYLOAD)
+    envelope_artifact = _verdict_tools._envelope(
+        _B8_REVIEWER, 'sid-b8', dict(_B8_PAYLOAD),
+    )
+
+    plan_steps = 5
+    legacy_score = scoring.quality_from_review_artifact(
+        legacy_artifact, plan_steps=plan_steps,
+    )
+    envelope_score = scoring.quality_from_review_artifact(
+        envelope_artifact, plan_steps=plan_steps,
+    )
+
+    # (1) Contract-agnostic: identical score from both persisted shapes.
+    assert isinstance(legacy_score, float)
+    assert legacy_score == envelope_score
+
+    # (2) Content-sensitive: a clean PASS artifact scores strictly higher.
+    clean_artifact = {
+        'reviewer': _B8_REVIEWER,
+        'verdict': 'PASS',
+        'issues': [],
+        'summary': 'clean',
+    }
+    clean_score = scoring.quality_from_review_artifact(
+        clean_artifact, plan_steps=plan_steps,
+    )
+    assert clean_score > legacy_score
+
+    # (3) Reads only the artifact dict + scalar knobs — never a transcript,
+    # file path, or worktree. Pins the signature so no such argument creeps in.
+    params = set(inspect.signature(scoring.quality_from_review_artifact).parameters)
+    assert params == {'artifact', 'plan_steps', 'debug_cycles'}
