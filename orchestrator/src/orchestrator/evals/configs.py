@@ -436,16 +436,17 @@ ARCHITECT_EVAL_CONFIGS = [
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name (implementer, architect, OR ν candidates).
+    """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
-    ν's ``claude_endpoint_candidates()`` bundles are searched LAST since they
-    are a function call (env-read-at-call) rather than a static list — cheap
-    at CLI/driver lookup frequency, and keeps this the single by-name resolver
-    for every eval config family (avoids a second, ν-only lookup path).
+    ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
+    bundles are searched LAST since they are function calls (built fresh per
+    call) rather than a static list — cheap at CLI/driver lookup frequency,
+    and keeps this the single by-name resolver for every eval config family
+    (avoids a second, per-selector lookup path).
     """
     for cfg in [
         *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
-        *claude_endpoint_candidates(),
+        *claude_endpoint_candidates(), *codex_pi_candidates(),
     ]:
         if cfg.name == name:
             return cfg
