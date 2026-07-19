@@ -4177,9 +4177,10 @@ async def _do_train_merge(
        the next scheduler tick.
 
     6. ``wip_halted`` / ``done_wip_recovery`` / ``wip_recovery_no_advance`` /
-       ``unmerged_state`` → halt-owning L1 escalation for trains (task 1599):
-       ``_map_advance_failure`` can return any of these four statuses.  For a
-       *single* task they trigger automatic in-place recovery in ``workflow.py``
+       ``unmerged_state`` / ``stash_failed`` → halt-owning L1 escalation for
+       trains (task 1599): ``_map_advance_failure`` can return any of these five
+       statuses.  For a *single* task they trigger automatic in-place recovery
+       in ``workflow.py``
        (``_handle_wip_conflict`` / ``_handle_wip_recovery`` / etc.) — which
        awaits escalation resolution before retrying.  For a train, the
        GroupMergeRequest consumer gates on the orphan-halt probe:
@@ -4187,7 +4188,7 @@ async def _do_train_merge(
            merge_worker.is_wip_halted AND halt_owner_esc_id is None
 
        When the probe fires, ``_escalate_train_halt`` builds a per-status L1
-       (category='wip_conflict' or 'unmerged_state'), calls
+       (category='wip_conflict', 'unmerged_state', or 'stash_failed'), calls
        ``_submit_halt_owning_escalation`` (submit → set_halt_owner), and
        returns ``_mark_blocked(skip_escalation=True)`` — the tip stays BLOCKED
        and re-dispatches once the L1 is resolved and the queue is unhalted.
@@ -4197,8 +4198,8 @@ async def _do_train_merge(
          ``harness._on_escalation_resolved → unhalt_wip()`` (because
          ``set_halt_owner`` was called).
        • ``harness._rehydrate_merge_halt`` re-owns the L1 (category in
-         {wip_conflict, unmerged_state}) across restarts — restart-survival
-         parity with single tasks, with no harness change.
+         {wip_conflict, unmerged_state, stash_failed}) across restarts —
+         restart-survival parity with single tasks, with no harness change.
 
        Two intentional remaining differences from the single-task path:
        (i)  The train returns BLOCKED + re-dispatches rather than inline

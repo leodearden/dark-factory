@@ -1491,8 +1491,8 @@ class TaskWorkflow:
         if result.reason and result.reason.startswith(TRAIN_VERIFY_FAILED_REASON_PREFIX):
             return await self._attribute_train_failure(result, train_id, members)
         # Orphan-halt probe: _map_advance_failure halted the merge queue (one of the
-        # four halt-inducing statuses: wip_halted, done_wip_recovery,
-        # wip_recovery_no_advance, unmerged_state) and halt_owner_esc_id is None,
+        # five halt-inducing statuses: wip_halted, done_wip_recovery,
+        # wip_recovery_no_advance, unmerged_state, stash_failed) and halt_owner_esc_id is None,
         # so harness._on_escalation_resolved cannot unhalt the queue on L1 resolution.
         # Register the halt owner NOW so resolving the L1 auto-unhalts the queue
         # (parity with the single-task _handle_wip_conflict path — task 1599).
