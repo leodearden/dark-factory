@@ -325,6 +325,14 @@ class EventType(StrEnum):
     # }
     rebase_verify_cost = 'rebase_verify_cost'
 
+    # Emitted by the post-amendment WIP guard (TaskWorkflow._commit_amendment_wip,
+    # task 2760) when it rescues UNCOMMITTED amendment work by auto-committing it
+    # as `wip: amendment round N` before the loop re-enters VERIFY/REVIEW — those
+    # phases (and the merge queue) see only committed branch state, so a reviewed,
+    # verified amendment can never silently fail to land.  Phase 'review'.
+    # data keys: {amendment_round:int, recovery:'auto_commit', wip_sha:str|None}
+    amendment_uncommitted_recovered = 'amendment_uncommitted_recovered'
+
 
 class EventStore:
     """Append-only SQLite event store.
