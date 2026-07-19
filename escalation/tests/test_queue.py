@@ -3684,6 +3684,97 @@ class TestArchiveListingMemoisation:
         )
 
 
+class TestCrossProcessArchiveStaleness:
+    """Reproduces the esc-2799-1 'vanishing pending L2 escalation' incident.
+
+    The escalation MCP server holds a long-lived EscalationQueue instance
+    (``server_q`` below); the orchestrator harness holds its OWN separate
+    EscalationQueue instance (``harness_q``) over the SAME on-disk queue_dir.
+    If ``server_q``'s ``_archive_listing`` memo is built (e.g. by any archive
+    miss lookup) BEFORE ``harness_q`` resolves+archives an escalation,
+    ``server_q``'s memo is stale: it lacks the newly-archived id, so
+    ``_locate_path`` finds it in neither the queue root (moved out) nor the
+    memoised archive listing (predates the move) and incorrectly reports the
+    escalation as gone, even though it is resolved and sitting in the archive.
+
+    This is distinct from — and NOT reproduced by — ``TestArchiveListingMemoisation``,
+    whose cross-instance test uses a FRESH instance B (unbuilt memo -> complete
+    first scan finds the cross-instance archive) and whose same-id-visibility
+    test archives via the SAME instance (incremental update keeps the memo warm).
+    The uncovered gap here is: memo already BUILT, then a DIFFERENT instance
+    archives.
+    """
+
+    def test_get_finds_id_archived_by_another_instance_after_memo_built(self, tmp_path: Path):
+        """server_q.get() must find an id resolved+archived by harness_q even
+        though server_q's archive-listing memo was built beforehand (and is
+        therefore stale w.r.t. harness_q's archival).
+
+        RED on main: _locate_path's archive fallback is memo-only, so the
+        stale memo yields zero candidates and get() returns None.
+        """
+        queue_dir = tmp_path / 'queue'
+        server_q = EscalationQueue(queue_dir)
+        harness_q = EscalationQueue(queue_dir)
+
+        # harness_q submits while the escalation is still pending, in queue root.
+        harness_q.submit(_make_escalation('esc-2799-1', task_id='2799', level=2))
+
+        # Force server_q's archive-listing memo to build while esc-2799-1 is
+        # still pending (an archive miss lookup for an unrelated absent id
+        # triggers the lazy build).
+        assert server_q.get('esc-absent-0') is None, 'Setup: unrelated id must be absent'
+        assert server_q._archive_listing is not None, 'Setup: memo must be built by now'
+
+        # harness_q resolves + archives esc-2799-1 OUT OF BAND — server_q's
+        # memo, already built, does not know about this move.
+        resolved = harness_q.resolve('esc-2799-1', 'resolved out-of-band')
+        assert resolved is not None and resolved.status == 'resolved', (
+            'Setup: harness_q must have resolved+archived esc-2799-1'
+        )
+
+        # server_q must still find it despite the stale memo.
+        result = server_q.get('esc-2799-1')
+        assert result is not None, (
+            'Stale archive-listing memo caused a false "not found" for '
+            'esc-2799-1 archived by a different EscalationQueue instance — '
+            'this is the esc-2799-1 vanishing-L2-escalation incident'
+        )
+        assert result.status == 'resolved', (
+            f'Expected status=resolved, got {result.status!r}'
+        )
+
+    def test_patch_resolution_metadata_finds_id_archived_by_another_instance(
+        self, tmp_path: Path,
+    ):
+        """patch_resolution_metadata() shares _locate_path with get(), so it
+        must exhibit the same cross-process-staleness robustness.
+
+        RED on main: same stale-memo defect -> _locate_path returns None ->
+        patch_resolution_metadata returns None instead of the patched Escalation.
+        """
+        queue_dir = tmp_path / 'queue'
+        server_q = EscalationQueue(queue_dir)
+        harness_q = EscalationQueue(queue_dir)
+
+        harness_q.submit(_make_escalation('esc-2799-2', task_id='2799', level=2))
+
+        # Force server_q's memo to build while esc-2799-2 is still pending.
+        assert server_q.get('esc-absent-1') is None, 'Setup: unrelated id must be absent'
+        assert server_q._archive_listing is not None, 'Setup: memo must be built by now'
+
+        harness_q.resolve('esc-2799-2', 'resolved out-of-band')
+
+        result = server_q.patch_resolution_metadata('esc-2799-2', resolved_by='steward')
+        assert result is not None, (
+            'Stale archive-listing memo caused patch_resolution_metadata to '
+            'return None for esc-2799-2 archived by a different EscalationQueue instance'
+        )
+        assert result.resolved_by == 'steward', (
+            f"Expected resolved_by='steward'; got {result.resolved_by!r}"
+        )
+
+
 def _make_esc_with_category(
     esc_id: str,
     task_id: str,
