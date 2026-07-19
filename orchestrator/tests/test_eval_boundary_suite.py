@@ -772,3 +772,81 @@ async def test_b9_set_task_claimant_heartbeat_no_warning(
         'set_task_claimant heartbeat emitted WARNING(s) (B9/D2 regression):\n'
         + '\n'.join(offenders)
     )
+
+
+# ── Capstone: one refreshed fixture through the composed eval framework ─────
+
+
+def test_capstone_one_fixture_through_eval_framework(tmp_path: Path) -> None:
+    """Capstone — B1/B4/B5/B6/B7/B8 composed over ONE fixture + one eval config.
+
+    The "one fixture through a real eval run" gate signal (design decision):
+    rather than a paid full-agent ``run_eval``, this drives a SINGLE
+    self-contained committed-diff fixture and a SINGLE resolved eval config
+    through every Phase-1 seam in one flow, proving the mechanisms delivered by
+    α–ε *compose* (not merely that each unit works in isolation) before the
+    Phase-2 corpus re-cut (ζ). It calls the helpers/asserts established in the
+    prior B# steps — a focused composition, NOT a re-implementation.
+
+    Composed seams (each proven standalone above; here they share one fixture):
+      B1  ``eval_profile_divergence(base) == EVAL_PROFILE``
+      B6  ``rebase_before_verify`` / ``inter_iteration_rebase`` both False
+      B7  ``unblock_auto.enabled`` False
+      B4  ``get_diff(worktree, base_commit)`` is the non-empty committed diff
+      B5  ``memory_endpoint=sink`` → resolved url is the sink, never production
+      B8  ``quality_from_review_artifact``: legacy shape score == envelope shape
+    """
+    from orchestrator.evals import scoring
+
+    # One refreshed fixture (a committed landed change on an evals/<id> branch)
+    # and one code-default production base loaded via the REAL load_config().
+    worktree, base_commit = committed_diff_fixture(tmp_path)
+    base = _load_default_config(tmp_path)
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+
+    # B1 — the base's documented divergence surface is exactly EVAL_PROFILE.
+    divergence = _profile.eval_profile_divergence(base)
+    assert set(divergence) == set(EVAL_PROFILE)
+    for leaf, expected_eval in EVAL_PROFILE.items():
+        _base_value, eval_value = divergence[leaf]
+        assert eval_value == expected_eval
+
+    # One resolved eval config, with the RecordingMemorySink threaded in.
+    with RecordingMemorySink() as sink:
+        eval_cfg = build_eval_orch_config(
+            cfg, task, base, memory_endpoint=sink.url,
+        )
+
+        # B5 — memory isolation: resolved url is the sink, never production.
+        assert eval_cfg.fused_memory.url == sink.url
+        assert eval_cfg.fused_memory.url != _PRODUCTION
+
+        # B6 — no mid-eval rebase onto live main.
+        assert eval_cfg.rebase_before_verify is False
+        assert eval_cfg.inter_iteration_rebase is False
+
+        # B7 — no unmetered dry-run unblock spawn.
+        assert eval_cfg.unblock_auto.enabled is False
+
+    # B4 — the full committed diff (git diff base..HEAD), never '' / a placeholder.
+    diff = asyncio.run(_snapshots.get_diff(worktree, base_commit))
+    assert diff
+    assert _ADDED_FILE in diff
+    assert 'committed_diff_present' in diff
+
+    # B8 — contract-agnostic scoring: identical score from both persisted shapes.
+    plan_steps = 5
+    legacy_artifact = dict(_B8_PAYLOAD)
+    envelope_artifact = _verdict_tools._envelope(
+        _B8_REVIEWER, 'sid-capstone', dict(_B8_PAYLOAD),
+    )
+    legacy_score = scoring.quality_from_review_artifact(
+        legacy_artifact, plan_steps=plan_steps,
+    )
+    envelope_score = scoring.quality_from_review_artifact(
+        envelope_artifact, plan_steps=plan_steps,
+    )
+    assert isinstance(legacy_score, float)
+    assert legacy_score == envelope_score
