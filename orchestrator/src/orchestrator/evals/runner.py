@@ -28,7 +28,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome, build_workflow
 
-from .configs import EVAL_CONFIGS, EvalConfig, matrix_pairs
+from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree
@@ -932,15 +932,19 @@ async def run_ofat_stage(
     trials: int = 1,
     timeout_override: int | None = None,
 ) -> list[EvalResult]:
-    """OFAT screen: dispatch each candidate by role over fixtures × trials (μ).
+    """OFAT screen: dispatch each candidate by role over fixtures × trials (μ/ο).
 
     A role-dispatching fan-out over the EXISTING frozen-input executors
     (decision 9): an implementer candidate (``role=='implementer'``) runs through
     :func:`run_eval` (frozen plan → implementer varies, arch/reviewer pinned), an
     architect candidate (``role=='architect'``) through :func:`run_architect_eval`
-    (live architect → downstream frozen). No new per-role machinery. Returns the
-    flattened ``EvalResult`` list across every ``(candidate, fixture, trial)``
-    cell; a failed cell is logged and skipped via :func:`_bounded_fanout`.
+    (live architect → downstream frozen), and a judge candidate (``role=='judge'``,
+    ο) through :func:`run_eval` with the implementer PINNED to
+    ``JUDGE_OFAT_IMPLEMENTER_PIN`` and the candidate riding ``judge_config`` — so
+    ONLY the ζ completion judge varies (implementer/architect/reviewer held
+    constant). No new per-role machinery. Returns the flattened ``EvalResult``
+    list across every ``(candidate, fixture, trial)`` cell; a failed cell is
+    logged and skipped via :func:`_bounded_fanout`.
     """
     def _thunk(
         task_path: Path, candidate: EvalConfig, trial: int,
@@ -950,6 +954,17 @@ async def run_ofat_stage(
                 return await run_architect_eval(
                     task_path, candidate, base_config,
                     trial=trial, timeout_override=timeout_override,
+                )
+            if candidate.role == 'judge':
+                # ο: vary ONLY the judge — pin the implementer to the fixed cloud
+                # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
+                # candidate on judge_config, so run_eval derives the ζ completion
+                # judge's model/effort while implementer/architect/reviewer stay
+                # fixed (true OFAT). run_eval relabels + stamps role_under_test.
+                return await run_eval(
+                    task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    judge_config=candidate,
                 )
             return await run_eval(
                 task_path, candidate, base_config,
