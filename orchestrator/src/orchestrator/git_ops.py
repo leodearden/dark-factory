@@ -6986,8 +6986,15 @@ class GitOps:
            same code path. The ``<patch-id> <sha>`` line the range form emits
            maps the shared patch-id to the REPLAYED (HEAD-side) sha, which is
            exactly the remap target.
-        2. **unique exact-subject** (fallback): added in task 2762 step-6 —
-           for now this method returns ``None`` after a patch-id miss.
+        2. **unique exact-subject** (fallback): when the patch-id lookup
+           misses — e.g. a rebase that resolved a conflict altered the diff
+           but preserved the commit message — recover the replayed sha only if
+           EXACTLY ONE commit in ``base_sha..HEAD`` shares *target_sha*'s
+           subject (the ``%H\\x1f%s`` idiom from :meth:`get_commit_subjects`,
+           ``\\x1f``-split because subjects may contain colons/punctuation). An
+           ambiguous subject (two or more matches) or no match returns
+           ``None`` — the method fails toward the caller's escalation, never
+           toward a wrong re-point.
 
         Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
         empty patch-id output yields ``None``, letting the caller fall through
@@ -7026,7 +7033,30 @@ class GitOps:
                 if target_pid and target_pid in pid_to_sha:
                     return pid_to_sha[target_pid]
 
-            # Tier 2 (unique exact-subject fallback) added in task 2762 step-6.
+            # Tier 2: unique exact-subject fallback. Only fires when the
+            # patch-id lookup missed; recovers the replayed sha only when
+            # exactly ONE commit in base..HEAD shares the target's subject, so
+            # we never mis-point a step whose subject two replayed commits
+            # happen to share (e.g. a generic "feat: GREEN — implementation").
+            rc, target_subject, _ = await _run(
+                ['git', 'log', '-1', '--format=%s', target_sha], cwd=worktree,
+            )
+            if rc != 0 or not target_subject.strip():
+                return None
+            rc, subj_out, _ = await _run(
+                ['git', 'log', '--format=%H\x1f%s', f'{base_sha}..HEAD'], cwd=worktree,
+            )
+            if rc != 0 or not subj_out.strip():
+                return None
+            subject_matches: list[str] = []
+            for line in subj_out.splitlines():
+                if not line.strip():
+                    continue
+                sha, _, subject = line.partition('\x1f')
+                if subject == target_subject:
+                    subject_matches.append(sha)
+            if len(subject_matches) == 1:
+                return subject_matches[0]
             return None
         except Exception:
             return None
