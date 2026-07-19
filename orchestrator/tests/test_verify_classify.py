@@ -905,6 +905,18 @@ _SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT = (
     'test result: FAILED. 48 passed; 6 failed; 0 ignored\n'
 )
 
+# ZERO-PASS pytest shape: when every collected test fails, pytest omits the
+# "0 passed" token entirely, so the ONLY verdict is the bracketed
+# failure-count short-summary ("===== 6 failed in 1.20s ====="). Deliberately
+# carries NO leading/trailing FAILED line and NO "N passed"/"M failed" count
+# PAIR (no "passed" token anywhere), so step-2's `_has_deterministic_test_
+# verdict` (count-pair + FAILED-line markers only) does not yet recognize it
+# as a verdict — RED until step-4 adds a dedicated bracketed-summary marker.
+_SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT = (
+    'note: a stale peer that timed out may hold the slot\n'
+    '===== 6 failed in 1.20s =====\n'
+)
+
 
 class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
     """task 2821: a deterministic pytest/cargo test-runner VERDICT must veto
@@ -953,6 +965,25 @@ class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
             == FailureCategory.TEST_FAILURE
         )
 
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_pytest_zero_pass_verdict_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        result = _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a deterministic pytest zero-pass verdict (bracketed "N failed in '
+            f'Ts" short-summary present, no "passed" token) with incidental '
+            f'lock/slot/semaphore + "timed out" tokens must not classify '
+            f'infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
+    def test_pytest_zero_pass_verdict_is_unknown_test_failure(self, tool):
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT, 1, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
 
 class TestSemaphoreTimeoutDeterministicTestVerdictVetoNegatives:
     """Regression negatives: pure-wrapper genuine timeouts carrying no test
@@ -978,6 +1009,13 @@ class TestSemaphoreTimeoutDeterministicTestVerdictVetoNegatives:
             'Timeout after 300 seconds; 0 slots passed the wait — semaphore '
             'slot timed out\n'
         )
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+    def test_bracketed_banner_without_failure_count_stays_semaphore_timeout(self):
+        """A genuine wrapper banner using the same `=====`-bracket punctuation
+        as pytest's short-summary, but with NO numeric failure count, must not
+        false-positive into the step-4 bracketed-summary veto marker."""
+        output = '===== semaphore slot wait timed out after 300s =====\n'
         assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
 
 
