@@ -234,6 +234,7 @@ class TestMergeBlockedEventType:
                 'reason': 'Post-merge verification failed: pytest failed',
                 'category': 'post_merge_verify',
                 'failure_category': 'test_failure',
+                'cause_hint': 'pytest exited non-zero',
             },
         )
 
@@ -242,7 +243,8 @@ class TestMergeBlockedEventType:
             "SELECT event_type, task_id, "
             "json_extract(data, '$.reason') AS reason, "
             "json_extract(data, '$.category') AS category, "
-            "json_extract(data, '$.failure_category') AS failure_category "
+            "json_extract(data, '$.failure_category') AS failure_category, "
+            "json_extract(data, '$.cause_hint') AS cause_hint "
             "FROM events WHERE event_type = 'merge_blocked'"
         ).fetchall()
         conn.close()
@@ -253,6 +255,7 @@ class TestMergeBlockedEventType:
         assert rows[0][2] == 'Post-merge verification failed: pytest failed'
         assert rows[0][3] == 'post_merge_verify'
         assert rows[0][4] == 'test_failure'
+        assert rows[0][5] == 'pytest exited non-zero'
 
 
 class TestRoutingDecisionEventType:
