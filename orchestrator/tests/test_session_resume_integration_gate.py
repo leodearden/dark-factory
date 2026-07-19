@@ -698,3 +698,41 @@ async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reason'] == 'no_transcript'
+
+
+# ── B5: stale sidecar beyond the freshness window ────────────────────────────
+@pytest.mark.asyncio
+async def test_b5_stale_sidecar_falls_back(harness: Harness):
+    """B5 — a sidecar whose ``started_at`` is older than the freshness window
+    is adopted at boot but rejected at dispatch as ``stale`` → fresh dispatch
+    WITH the recovered plan + one ``session_resume_fallback`` (reason
+    ``stale``).
+
+    The transcript is present here (so ``no_transcript`` is NOT the
+    disqualifier), isolating STALENESS as the sole rejection cause: the γ guard
+    checks freshness BEFORE transcript corroboration, so an old-but-corroborated
+    session still degrades to a fresh dispatch rather than resuming a
+    long-dead agent.
+    """
+    task_id, session_id = '45', 'uuid-b5-stale'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', fresh=False,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): session + plan + config-dir all recovered ──
+    assert task_id in harness._recovered_sessions
+    assert task_id in harness._recovered_plans
+    assert task_id in harness._recovered_session_config_dirs
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ): stale → fallback, plan kept, no --resume ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert len(cap.emits) == 1
+    et, kwargs = cap.emits[0]
+    assert et == EventType.session_resume_fallback
+    assert kwargs['data']['reason'] == 'stale'
