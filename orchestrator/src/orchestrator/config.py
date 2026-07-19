@@ -2605,7 +2605,9 @@ class OrchestratorConfig(BaseSettings):
 
     # Post-merge staleness hook — restarts fused-memory.service exactly once
     # (debounced) after a merge whose landed diff touches fused-memory/src/.
-    # Fires only at the orchestrator's idle quiet-window (no dispatched agents).
+    # Prefers the orchestrator's idle quiet-window (no dispatched agents), but
+    # additionally force-fires after a bounded owed-age window under chronic
+    # saturation — see fused_memory_restart_force_fire_after_secs below.
     # See orchestrator/src/orchestrator/service_restart.py for policy details.
     fused_memory_restart_on_merge_enabled: bool = Field(default=True)
     fused_memory_restart_debounce_secs: float = Field(default=120.0)
@@ -2614,6 +2616,32 @@ class OrchestratorConfig(BaseSettings):
     )
     fused_memory_restart_script: str = Field(
         default='scripts/restart-fused-memory.sh'
+    )
+    # Force-fire escape for the fused-memory coordinator (task 2817): once a
+    # restart is pending, the coordinator normally only fires from the polite
+    # idle path (agents_idle + debounce). Under chronic fleet saturation
+    # agents_idle is rarely true, so that path can starve indefinitely and the
+    # armed restart never fires (fire-once-or-never) — the operator then has to
+    # restart fused-memory by hand (born-at-L2 esc-2814-1). Once a pending
+    # restart has been owed for this many seconds, maybe_restart bypasses
+    # agents_idle and the debounce and force-fires even on the busy-wait branch,
+    # while still preferring the polite idle path for the common (healthy) case.
+    # fused-memory keeps no min_interval rate cap, so nothing throttles the
+    # force-fire. 0 disables force-fire (byte-identical prior behaviour); the
+    # 15-min default caps the worst-case stale-bytecode window under saturation
+    # (far below the orchestrator's 4500s bound — a `--drain` fused-memory
+    # restart is far cheaper than a full orchestrator fleet redeploy).
+    # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only, captured
+    # once at coordinator construction (_build_service_restart_coordinator),
+    # matching its orchestrator_restart_force_fire_after_secs sibling.
+    fused_memory_restart_force_fire_after_secs: float = Field(
+        default=900.0,
+        description=(
+            'Max seconds a pending fused-memory restart stays owed before '
+            'force-firing (bypassing agents_idle + debounce so it still fires '
+            'under chronic fleet saturation, while preferring the polite idle '
+            'path in the healthy case); 0 disables; 15-min default.'
+        ),
     )
 
     # Post-merge staleness hook — restarts dark-factory-dashboard.service after a

@@ -16,7 +16,12 @@ This guarantees:
 Two instances are used in production:
 
 * **fused-memory** (``service_name='fused-memory'``, ``require_idle=True``):
-  fires only at the run-loop's idle quiet-window (no dispatched agents).
+  prefers the run-loop's idle quiet-window (no dispatched agents), but
+  additionally force-fires on the busy-wait branch once a pending restart is
+  owed past ``force_fire_after_secs`` (wired from
+  ``config.fused_memory_restart_force_fire_after_secs``, task 2817) — the
+  anti-starvation backstop for chronic fleet saturation, where the idle branch
+  never runs and an armed restart would otherwise starve forever.
   Script: ``scripts/restart-fused-memory.sh --drain``.
 
 * **dashboard** (``service_name='dashboard'``, ``require_idle=False``):

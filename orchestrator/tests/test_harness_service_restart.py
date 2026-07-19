@@ -53,6 +53,12 @@ def harness(tmp_path: Path, mock_orch_config):
     mock_orch_config.fused_memory_restart_debounce_secs = 60.0
     mock_orch_config.fused_memory_restart_watch_prefixes = ['fused-memory/src/']
     mock_orch_config.fused_memory_restart_script = 'scripts/restart-fused-memory.sh'
+    # Force-fire escape (task 2817). Mirrors the real Config default (15 min).
+    # Unlike dashboard (a leaf that fires promptly on the busy path and keeps
+    # the 0.0 default), the fused-memory builder now wires this in so a pending
+    # restart still fires under chronic fleet saturation once its owed-age
+    # crosses the bound — spec_set returns a real float (not a child MagicMock).
+    mock_orch_config.fused_memory_restart_force_fire_after_secs = 900.0
     # dashboard restart config
     mock_orch_config.dashboard_restart_on_merge_enabled = True
     mock_orch_config.dashboard_restart_debounce_secs = 20.0
@@ -514,6 +520,60 @@ class TestMaybeRestartStaleServiceBusyPath:
         executor.assert_not_awaited()
         assert fused_coord.is_pending is True  # still pending — waiting for the idle branch
 
+    async def test_fused_memory_builder_coordinator_force_fires_under_saturation(
+        self, harness: Harness
+    ):
+        """The REAL builder's fused-memory coordinator force-fires on the busy
+        path once its owed-age crosses force_fire_after_secs (task 2817).
+
+        Force-fire-enabled counterpart of
+        test_fused_memory_coordinator_never_fires_on_busy_path above: same
+        agents_idle=False driver, but built via the REAL
+        _build_service_restart_coordinator so it proves the builder WIRING (not
+        a hand-constructed coordinator). Under chronic fleet saturation the
+        run-loop idle branch never runs, so without the escape the armed
+        restart would starve forever (the operator-pain signal esc-2814-1).
+        With the builder wiring force_fire_after_secs=900.0, a pending restart
+        owed >= 900s fires even with agents_idle=False.
+
+        RED until step-4 wires the builder: today the builder passes no
+        force_fire_after_secs, so _force_fire_after_secs stays 0.0 (disabled)
+        and the coordinator never fires on the busy path — the final
+        `is True` / assert_awaited_once assertions fail.
+        """
+        current_time: list[float] = [0.0]
+        executor = AsyncMock()
+
+        coord = harness._build_service_restart_coordinator()
+        coord._clock = lambda: current_time[0]
+        coord._restart_executor = executor
+        harness._service_restart_coordinators = [coord]
+
+        # Arm: a fused-memory/src merge lands. _first_pending_monotonic anchors
+        # at t=0.0 (stamped only on the False->True transition).
+        await coord.note_merge(
+            't',
+            'base',
+            'head',
+            prefetched_diff=['fused-memory/src/fused_memory/server/tools.py'],
+        )
+        assert coord.is_pending is True
+
+        # Owed-age 899s < 900s bound: require_idle=True still defers on the busy
+        # path (agents_idle=False) — force-fire not yet armed.
+        current_time[0] = 899.0
+        assert await harness._maybe_restart_stale_service(agents_idle=False) is False
+        executor.assert_not_awaited()
+        assert coord.is_pending is True
+
+        # Owed-age 900s >= bound: force-fire bypasses agents_idle + the debounce
+        # and fires even under saturation. fused-memory has no min_interval rate
+        # cap (state_path=None), so nothing throttles the force-fire.
+        current_time[0] = 900.0
+        assert await harness._maybe_restart_stale_service(agents_idle=False) is True
+        executor.assert_awaited_once()
+        assert coord.is_pending is False
+
 
 # ---------------------------------------------------------------------------
 # U2 (task 1973): Harness._merge_pipeline_idle
@@ -791,11 +851,23 @@ class TestBuildOrchestratorRestartCoordinator:
         assert coord._min_interval_secs == 0.0
         assert coord._state_path is None
 
-    def test_fused_memory_coordinator_has_no_force_fire(self, harness: Harness):
-        """fused-memory keeps the 0.0 default → force-fire stays disabled (byte-identical)."""
+    def test_fused_memory_coordinator_force_fire_matches_config(self, harness: Harness):
+        """fused-memory now gets the config's force-fire bound (900.0) — task 2817.
+
+        Unlike the dashboard (a leaf service that fires promptly on the busy
+        path and needs no escape — see test_dashboard_coordinator_has_no_force_fire
+        below), the fused-memory coordinator is require_idle=True and would
+        starve under chronic saturation, so its builder wires
+        force_fire_after_secs from config. Mirrors
+        test_force_fire_after_secs_matches_config for the orchestrator coordinator.
+        """
         coord = harness._build_service_restart_coordinator()
 
-        assert coord._force_fire_after_secs == 0.0
+        assert (
+            coord._force_fire_after_secs
+            == harness.config.fused_memory_restart_force_fire_after_secs
+            == 900.0
+        )
 
     def test_dashboard_coordinator_has_no_force_fire(self, harness: Harness):
         """dashboard keeps the 0.0 default → force-fire stays disabled (byte-identical)."""

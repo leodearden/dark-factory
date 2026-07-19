@@ -306,6 +306,31 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
 
+    def test_fused_memory_restart_force_fire_default(self, monkeypatch, tmp_path):
+        """Bare OrchestratorConfig() exposes the fused-memory force-fire default.
+
+        The force-fire escape lets a pending fused-memory restart still fire
+        under chronic fleet saturation (when the run-loop idle branch is
+        starved) after a bounded owed-age window — mirroring the orchestrator
+        coordinator's own force_fire_after_secs (task 2817). Like its
+        orchestrator_restart_* siblings it is captured once at coordinator
+        construction (_build_service_restart_coordinator), so it is
+        restart-only and must NOT be reloadable.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.fused_memory_restart_force_fire_after_secs == 900.0
+        assert (
+            'fused_memory_restart_force_fire_after_secs' not in RELOADABLE_FIELDS
+        ), (
+            'fused_memory_restart_force_fire_after_secs requires a process '
+            'restart to take effect (it is captured at coordinator '
+            'construction in _build_service_restart_coordinator, matching its '
+            'orchestrator_restart_force_fire_after_secs sibling) and must NOT '
+            'be in RELOADABLE_FIELDS'
+        )
+
     def test_project_root_resolved_to_absolute(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
