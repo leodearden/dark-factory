@@ -3730,6 +3730,110 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    async def test_speculative_stash_failed_abandoned_takes_halt_early_out(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """An ABANDONED stash_failed request takes the halt-result early-out
+        (merge_queue.py:12741) — NOT the generic _map_advance_failure path.
+
+        Because stash_failed now HALTS the queue, once the sole waiter has
+        abandoned (cancelled) the request there is no workflow coroutine left
+        to own that halt.  stash_failed must therefore join
+        unmerged_state/pop_conflict_no_advance in the abandoned "skip the halt"
+        early-out — which pops cas/gate retries and returns WITHOUT calling
+        _map_advance_failure — otherwise _map_advance_failure would engage an
+        ownerless (orphan) halt that requires force_unhalt to clear.
+
+        Fails today: stash_failed is absent from _HALT_ADVANCE_RESULTS, so the
+        abandoned request falls through to the generic path — _map_advance_failure
+        is invoked and orphan-halts the worker.
+        """
+        import orchestrator.merge_queue as mq
+
+        wt = await _make_branch_with_file(
+            git_ops, 'stashf-ab-1', 'file_stashf_ab.py', 'stashf_ab = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        # Pre-seed retry counters so we can assert the early-out pops them.
+        worker._cas_retries['stashf-ab-1'] = 2
+        worker._gate_retries['stashf-ab-1'] = 1
+        worker_task = asyncio.create_task(worker.run())
+
+        advance_event = asyncio.Event()
+        release_after_advance = asyncio.Event()
+
+        async def _stash_failed(*args: Any, **kwargs: Any):
+            git_ops._last_stash_dirty_files = ['write_queue.db']
+            advance_event.set()
+            return AdvanceOutcome('stash_failed')
+
+        # Register the request as abandoned ONLY after advance_main has run, so
+        # it flows through verify + advance and is caught at the POST-advance
+        # early-out (:12741) rather than short-circuited at the pre-advance
+        # abandoned check (:12538).
+        original_abandoned = worker._request_abandoned
+
+        def _patched_abandoned(req: MergeRequest) -> bool:
+            if advance_event.is_set() and req.task_id == 'stashf-ab-1':
+                return True
+            return original_abandoned(req)
+
+        worker._request_abandoned = _patched_abandoned  # type: ignore[method-assign]
+
+        # Deterministic barrier: the post-advance cleanup runs a real
+        # git-worktree subprocess, so wait for it to RETURN before asserting —
+        # a regression's synchronous _map_advance_failure halt then fires on the
+        # very next tick, before the assertions run.
+        original_release = worker._release_or_cleanup
+
+        async def _wrapped_release(*a: Any, **k: Any):
+            out = await original_release(*a, **k)
+            if advance_event.is_set():
+                release_after_advance.set()
+            return out
+
+        worker._release_or_cleanup = _wrapped_release  # type: ignore[method-assign]
+
+        # Spy: the halt-result early-out must NOT invoke the shared mapper.
+        _orig_map = mq._map_advance_failure
+        map_spy = MagicMock()
+
+        async def _counting_map(*a: Any, **k: Any):
+            map_spy(*a, **k)
+            return await _orig_map(*a, **k)
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_stash_failed),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch('orchestrator.merge_queue._map_advance_failure', _counting_map),
+        ):
+            req = _make_request('stashf-ab-1', 'stashf-ab-1', wt, config)
+            await queue.put(req)
+            await asyncio.wait_for(advance_event.wait(), timeout=30)
+            await asyncio.wait_for(release_after_advance.wait(), timeout=30)
+            # Let a regression's generic-path halt fire before we assert it did not.
+            for _ in range(30):
+                await asyncio.sleep(0)
+
+        assert worker.is_wip_halted is False, (
+            'Abandoned stash_failed must take the halt-result early-out — '
+            'engaging a halt with no owning workflow coroutine is an orphan halt'
+        )
+        assert map_spy.call_count == 0, (
+            '_map_advance_failure must NOT run on the abandoned halt-result '
+            'early-out (it would engage the orphan halt)'
+        )
+        # cas/gate retries popped, mirroring unmerged_state abandoned handling.
+        assert 'stashf-ab-1' not in worker._cas_retries
+        assert 'stashf-ab-1' not in worker._gate_retries
+        # Abandoned request's future is dropped, never resolved.
+        assert not req.result.done()
+
+        await worker.stop()
+        await worker_task
+
     async def test_merger_post_merge_exception_cleans_worktree(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -15707,12 +15811,20 @@ class TestHaltAdvanceResults:
         from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS  # noqa: F401
 
     def test_contains_expected_results(self) -> None:
-        """All four halt-triggering advance_main results must be present."""
+        """All five halt-triggering advance_main results must be present.
+
+        ``stash_failed`` joined the set in task 2758: a shared
+        main-checkout-hygiene fault (project_root's dirty tracked WIP could
+        not be parked) now halts the queue, so an ABANDONED stash_failed
+        request must take the same halt-result early-out as unmerged_state /
+        pop_conflict_no_advance rather than engaging an ownerless orphan halt.
+        """
         from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS
 
         expected = frozenset({
             'wip_overlap', 'pop_conflict',
             'unmerged_state', 'pop_conflict_no_advance',
+            'stash_failed',
         })
         assert frozenset(_HALT_ADVANCE_RESULTS) == expected, (
             f'_HALT_ADVANCE_RESULTS mismatch: {_HALT_ADVANCE_RESULTS!r}'
