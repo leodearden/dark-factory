@@ -25,9 +25,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 from shared.capability_manifest import DeliveredCheckMeta
@@ -36,7 +37,12 @@ from orchestrator import git_ops
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['DeliveredCheckResult', 'run_delivered_check']
+__all__ = [
+    'DeliveredCheckResult',
+    'DeliveredChecksVerdict',
+    'run_delivered_check',
+    'verify_delivered_checks_on_main',
+]
 
 # (returncode, stdout, stderr) — matches orchestrator.git_ops._run's shape.
 _Runner = Callable[..., Awaitable[tuple[int, str, str]]]
@@ -54,6 +60,25 @@ class DeliveredCheckResult(Enum):
     #: descriptor, script timeout/spawn failure) — fail-safe: never treated
     #: as a definitive DELIVERED or FAILED result by callers.
     ERRORED = 'errored'
+
+
+@dataclass(frozen=True)
+class DeliveredChecksVerdict:
+    """Aggregate outcome of running a whole ``metadata.delivered_checks``
+    list against a single resolved ``main`` SHA (task 2794).
+
+    Returned by :func:`verify_delivered_checks_on_main`. ``outcome`` collapses
+    the per-check :class:`DeliveredCheckResult`\\s with the precedence
+    ``all_delivered`` > ``failed`` > ``errored`` (see that function's
+    docstring). ``main_sha`` echoes the SHA the checks were evaluated at (so a
+    caller's WARNING can name it verbatim); ``failed_check`` carries the FIRST
+    FAILED descriptor when ``outcome == 'failed'`` (``None`` otherwise), so the
+    caller can name which capability was provably absent.
+    """
+
+    outcome: Literal['all_delivered', 'failed', 'errored']
+    main_sha: str | None = None
+    failed_check: dict[str, Any] | None = None
 
 
 async def run_delivered_check(
@@ -158,3 +183,96 @@ async def _run_script_check(
         runner(argv, cwd=Path(project_root)), timeout=meta.timeout_secs
     )
     return DeliveredCheckResult.DELIVERED if rc == 0 else DeliveredCheckResult.FAILED
+
+
+async def verify_delivered_checks_on_main(
+    checks: list[dict[str, Any]],
+    *,
+    project_root: str | Path,
+    main_sha: str,
+    check_timeout_secs: float,
+    runner: _Runner = git_ops._run,
+) -> DeliveredChecksVerdict:
+    """Run a whole ``metadata.delivered_checks`` list against ``main_sha`` and
+    collapse the per-check results into one :class:`DeliveredChecksVerdict`.
+    Never raises.
+
+    This is the SHARED delivered-capability ground-truth guard: given a task's
+    declared capability checks and the SHA of ``main`` those checks should be
+    evaluated at, it answers "is the deliverable actually present on ``main``?"
+    — the layer above git-level attribution and effect-present guards, which
+    prove only that *a* merge advanced ``main``, not that *this* task's
+    declared capability survived to it.
+
+    Each check runs via :func:`run_delivered_check` (reused verbatim — NO
+    second check runner is forked) with ``ref=main_sha`` and the injected
+    *runner*, each bounded by ``asyncio.wait_for(timeout=check_timeout_secs)``.
+    A hung check (the timeout-less grep kind; defense-in-depth for scripts,
+    which also carry their own ``timeout_secs``) raises ``TimeoutError``, which
+    is mapped to :attr:`DeliveredCheckResult.ERRORED` — the same fail-safe
+    downstream handling as a runner error. ``run_delivered_check`` itself never
+    raises (a malformed descriptor degrades to ERRORED), so this loop cannot
+    raise either.
+
+    Results aggregate with the SAME precedence as
+    ``Scheduler._compute_delivered_check_cache`` (scheduler.py 3150-3211):
+
+    - every check DELIVERED (and at least one check ran) -> ``all_delivered``;
+    - else any check FAILED -> ``failed`` (carrying the FIRST FAILED
+      descriptor). A definitive absence drives the clean recovery
+      (re-dispatch) and must NOT be masked into a fail-safe no-op by an
+      unrelated ERRORED check;
+    - else (some ERRORED, none FAILED, or an empty ``checks`` list) ->
+      ``errored`` (fail-safe wait — the checks could not be evaluated, so make
+      no claim either way).
+
+    *main_sha* is a required caller-resolved parameter (not fetched here) so
+    the aggregation stays pure and unit-testable with a fake runner and no git,
+    and so the verdict can echo the exact SHA the checks ran against.
+
+    The current production caller is the reconcile-sweep
+    ``found_on_main``/MARK_DONE_WITH_PROVENANCE arm in
+    ``Harness._reconcile_one_stranded`` (harness.py, task 2794). The other
+    mark-done-on-main stamp sites SHOULD adopt this same guard so a hollow-done
+    can never be stamped from any of them: the harness pre-dispatch
+    ``found_on_main`` check (~harness.py:8033), ``TaskWorkflow._recover_before_execute``
+    in workflow.py (pre-EXECUTE recovery — a different module/class a Harness
+    method could not serve, which is why this is a module-level function), and
+    the harness coalesce ``redrive_member`` path (~harness.py:779).
+    """
+    results: list[tuple[dict[str, Any], DeliveredCheckResult]] = []
+    for check in checks:
+        try:
+            result = await asyncio.wait_for(
+                run_delivered_check(
+                    check, project_root=project_root, ref=main_sha, runner=runner
+                ),
+                timeout=check_timeout_secs,
+            )
+        except TimeoutError:
+            # Fail-safe (mirror scheduler.py 3116-3129): a hung check maps to
+            # ERRORED — same downstream handling as a runner error.
+            logger.warning(
+                'verify_delivered_checks_on_main: check %r exceeded '
+                'check_timeout_secs=%s at main@%s — treating as ERRORED '
+                '(fail-safe)',
+                check.get('name') if isinstance(check, dict) else check,
+                check_timeout_secs,
+                main_sha,
+            )
+            result = DeliveredCheckResult.ERRORED
+        results.append((check, result))
+
+    if results and all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
+        return DeliveredChecksVerdict(outcome='all_delivered', main_sha=main_sha)
+
+    failed = next(
+        (c for c, r in results if r is DeliveredCheckResult.FAILED), None
+    )
+    if failed is not None:
+        return DeliveredChecksVerdict(
+            outcome='failed', main_sha=main_sha, failed_check=failed
+        )
+
+    # Some ERRORED and none FAILED (or no checks ran at all) — fail-safe wait.
+    return DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
