@@ -73,6 +73,15 @@ _CLEANUP_STEP_TIMEOUT = 5.0
 # +harness_cancel(25)+memory_close(5)+journal_close(5) = 55s; +20s headroom = 75.
 _FORCE_EXIT_BUDGET = 75.0
 
+# Mirrors TimeoutStopSec=90 in the committed systemd unit template
+# (scripts/fused-memory.service.template). Invariant (survey finding D1):
+# ServerConfig.graceful_shutdown_timeout + _FORCE_EXIT_BUDGET must stay under
+# this value so the in-process force-exit watchdog provably fires before
+# systemd SIGKILLs the cgroup — preserving exit-code control (exit 0 for
+# operator stop; see _operator_stop_received). Enforced by
+# TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
+_SYSTEMD_TIMEOUT_STOP_SECS = 90.0
+
 # systemd watchdog heartbeat interval. The dedicated OS thread
 # (_watchdog_thread_loop, task 1731 root-cause fix) pings every
 # _WATCHDOG_INTERVAL independent of asyncio loop scheduling, so a
@@ -1053,12 +1062,12 @@ async def run_server():
             # MCP app before it can poison the SDK's shared task group.
             shielded_app = _ASGIExceptionShield(starlette_app)
 
-            uv_config = uvicorn.Config(
+            uv_config = _build_uvicorn_config(
                 shielded_app,
                 host=config.server.host,
                 port=config.server.port,
-                log_level='info',
-                timeout_keep_alive=config.server.keepalive_timeout,
+                graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
+                keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
 
@@ -1662,6 +1671,40 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
     tool_manager._fused_memory_safe_wrapped = True
 
 
+def _build_uvicorn_config(
+    app: Any,
+    *,
+    host: str,
+    port: int,
+    graceful_shutdown_timeout: int,
+    keepalive_timeout: int | None = None,
+) -> Any:  # uvicorn.Config
+    """Construct a uvicorn.Config with a bounded graceful-shutdown wait.
+
+    Single tested seam for both uvicorn.Config construction sites (primary
+    server and recon-report server) so timeout_graceful_shutdown is always
+    wired from ServerConfig.graceful_shutdown_timeout (survey finding D1).
+    uvicorn's own default is None (unbounded), which lets a single stuck
+    in-flight request hang server.shutdown() indefinitely and starve the
+    downstream _graceful_shutdown cleanup and force-exit watchdog.
+
+    keepalive_timeout is optional: when omitted, uvicorn's own
+    timeout_keep_alive default applies unchanged (matches the pre-existing
+    recon-report site, which never set it).
+    """
+    import uvicorn
+
+    kwargs: dict[str, Any] = {
+        'host': host,
+        'port': port,
+        'log_level': 'info',
+        'timeout_graceful_shutdown': graceful_shutdown_timeout,
+    }
+    if keepalive_timeout is not None:
+        kwargs['timeout_keep_alive'] = keepalive_timeout
+    return uvicorn.Config(app, **kwargs)
+
+
 def _build_recon_report_components(
     config: FusedMemoryConfig,
     memory_service: Any = None,
@@ -1679,8 +1722,6 @@ def _build_recon_report_components(
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
     """
-    import uvicorn
-
     from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
     from fused_memory.server.recon_report_store import ReconReportStore
 
@@ -1721,17 +1762,17 @@ def _build_recon_report_components(
     _add_json_http_error_handler(starlette_app)
     shielded_app = _ASGIExceptionShield(starlette_app)
 
-    uv_config = uvicorn.Config(
+    uv_config = _build_uvicorn_config(
         shielded_app,
         host=config.server.host,
         port=config.server.recon_report_port,
-        log_level='info',
+        graceful_shutdown_timeout=config.server.graceful_shutdown_timeout,
     )
     return state, mcp, uv_config
 
 
 def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
-    """Return a callback that sets ``should_exit = True`` on every passed server.
+    """Return a callback implementing graceful-then-forced shutdown escalation.
 
     Used as the ``on_operator_stop`` argument to :func:`_install_operator_stop_handler`
     so that a SIGTERM/SIGINT signal stops **both** the primary uvicorn.Server
@@ -1742,18 +1783,33 @@ def _make_operator_stop_callback(*servers: Any) -> Callable[[], None]:
     flag was flipped — the recon_report server kept running, blocking the gather,
     and ``run_server()`` hung until SIGKILL.
 
+    Stateful second-signal escalation (survey finding D1, second gap): the 1st
+    invocation sets only ``should_exit = True`` (graceful). The 2nd and every
+    subsequent invocation additionally sets ``force_exit = True``. This mirrors
+    uvicorn's own default signal handler contract (1st SIGINT/SIGTERM graceful,
+    2nd forces immediate exit) — a contract otherwise lost here because
+    ``install_signal_handlers`` is neutered, leaving an operator with no way to
+    force-exit a wedged shutdown without this escalation.
+
     Args:
-        *servers: Zero or more server objects exposing a writable ``should_exit``
-            attribute (typically :class:`uvicorn.Server` instances, but any object
-            with the attribute works — including test fakes).
+        *servers: Zero or more server objects exposing writable ``should_exit``
+            and ``force_exit`` attributes (typically :class:`uvicorn.Server`
+            instances, but any object with the attributes works — including
+            test fakes).
 
     Returns:
-        A zero-argument callable that flips ``should_exit = True`` on each server.
+        A zero-argument callable that flips ``should_exit`` (and, from the 2nd
+        call onward, ``force_exit``) to ``True`` on each server.
     """
+    call_count = 0
 
     def _stop() -> None:
+        nonlocal call_count
+        call_count += 1
         for s in servers:
             s.should_exit = True
+            if call_count >= 2:
+                s.force_exit = True
 
     return _stop
 
