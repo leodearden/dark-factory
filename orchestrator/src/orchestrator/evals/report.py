@@ -7,7 +7,7 @@ import logging
 from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .elo import (
     INDISTINGUISHABLE_THRESHOLD,
@@ -15,6 +15,9 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
+
+if TYPE_CHECKING:
+    from .runner import EvalResult
 
 logger = logging.getLogger(__name__)
 
@@ -183,4 +186,99 @@ def format_markdown(report: dict[str, Any]) -> str:
             )
         lines.append('')
 
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# recovery_score surface (eval-revival η)
+#
+# An ADDITIVE, interim per-(task_id, config_name) column distinct from the Elo
+# leaderboard above. It surfaces the ``recovery_score`` that
+# ``metrics.collect_metrics`` writes into ``EvalResult.metrics`` — a populated
+# float for adversarial fixtures, the ``None`` null sentinel otherwise. It does
+# NOT touch the Elo ``build_report`` / ``format_markdown`` schema: the full C4
+# per-config composite+cost+latency+recovery report row is owned by Phase-3
+# task λ, which η does not depend on; this is the distinct-column surface μ/λ
+# consume in the interim.
+# ---------------------------------------------------------------------------
+
+_RECOVERY_COLUMNS = ('task_id', 'config_name', 'adversarial', 'recovery_score')
+
+
+def build_recovery_report(results: list[EvalResult]) -> dict[str, Any]:
+    """Build the recovery-score column from a list of :class:`EvalResult`.
+
+    Each row carries ``task_id`` / ``config_name``, the ``recovery_score``
+    pulled from ``EvalResult.metrics`` (a populated float for adversarial
+    fixtures, ``None`` — the C4 ``recovery_score | null`` sentinel — otherwise),
+    and an ``adversarial`` bool.
+
+    The ``adversarial`` flag is taken from the explicit ``metrics['adversarial']``
+    boolean that ``collect_metrics`` stamps from the task record — NOT inferred
+    from ``recovery_score is not None``. That distinction matters: recovery
+    scoring can fail on a genuinely adversarial fixture, in which case
+    ``collect_metrics``' guard leaves ``recovery_score=None``; inferring the flag
+    from the score would then silently mislabel that run ``adversarial: false``
+    and hide the scoring failure. Keying on the explicit flag renders such a run
+    as ``adversarial: true`` with a null score instead. For results persisted
+    BEFORE the flag existed (no ``adversarial`` key in ``metrics``), we fall
+    back to the old ``recovery_score is not None`` inference so old reports
+    render unchanged. Rows are sorted by ``(task_id, config_name)`` so the
+    surface is deterministic.
+    """
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        recovery_score = result.metrics.get('recovery_score')
+        explicit_adversarial = result.metrics.get('adversarial')
+        adversarial = (
+            bool(explicit_adversarial)
+            if explicit_adversarial is not None
+            else recovery_score is not None
+        )
+        rows.append({
+            'task_id': result.task_id,
+            'config_name': result.config_name,
+            'adversarial': adversarial,
+            'recovery_score': recovery_score,
+        })
+    rows.sort(key=lambda r: (r['task_id'], r['config_name']))
+    return {'rows': rows}
+
+
+def format_recovery_table(report: dict[str, Any]) -> str:
+    """Render :func:`build_recovery_report` output as a deterministic table.
+
+    A ``recovery_score`` column shows the populated float (4 dp) for adversarial
+    rows and ``-`` (the null sentinel) for ordinary rows. The same report always
+    renders byte-identically (no wall-clock or dict-order dependence).
+    """
+    rows = report.get('rows', [])
+
+    def _score_cell(value: float | None) -> str:
+        return '-' if value is None else f'{value:.4f}'
+
+    rendered = [
+        {
+            'task_id': str(r['task_id']),
+            'config_name': str(r['config_name']),
+            'adversarial': 'yes' if r['adversarial'] else 'no',
+            'recovery_score': _score_cell(r['recovery_score']),
+        }
+        for r in rows
+    ]
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _RECOVERY_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in _RECOVERY_COLUMNS)
+
+    lines = ['recovery_score report:']
+    lines.append(_fmt({col: col for col in _RECOVERY_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _RECOVERY_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
     return '\n'.join(lines)

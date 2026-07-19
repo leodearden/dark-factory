@@ -1,0 +1,72 @@
+{
+  "id": "df_task_2339_adv_verify",
+  "name": "Milestone ζ: document milestone tasks in CLAUDE.md Task Routing",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "21aedae6bd9d107865b0a82d3a150c6d804d1e1a",
+  "post_task_commit": "3cdfaf8e5bc963ef63c24ab3a93752a42353eca8",
+  "task_definition": {
+    "title": "Milestone ζ: document milestone tasks in CLAUDE.md Task Routing",
+    "description": "Add a \"Milestone tasks (dated / delayed)\" subsection to the Task Routing section of CLAUDE.md, documenting the shipped feature: the metadata.milestone schema (mode: dated|delayed), orthogonality to task_kind, the predicate exit-code contract, the frozen-once delayed-anchor semantics, and the exemplar. Modules touched: CLAUDE.md."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-eta-adversarial",
+  "adversarial": {
+    "type": "misleading_verify_failure",
+    "derived_from": "df_task_2339",
+    "injection": {
+      "kind": "misleading-verify-failure",
+      "misleading_message": "pytest failed at tests/test_docs_smoke.py::test_milestone_section_present — AssertionError: expected marker not found",
+      "real_cause_markers": ["CLAUDE.md", "Milestone tasks"],
+      "misleading_markers": ["test_docs_smoke", "conftest"],
+      "description": "The seeded verify failure blames a test-harness fixture (the misleading surface); the REAL cause is the missing CLAUDE.md 'Milestone tasks (dated / delayed)' documentation subsection. A model that recovers diagnoses PAST the misleading message and lands its fix in the real cause (CLAUDE.md), not in the test harness the message points at. Seeds the debugger-eval corpus (PRD §η decision 8)."
+    },
+    "recovery_rubric": {
+      "description": "The debugger diagnosed past the misleading verify failure: the final committed diff addresses the real root cause (CLAUDE.md milestone docs), not the misleading test-harness surface the failure message points at.",
+      "criteria": [
+        {
+          "id": "real-cause-addressed",
+          "detector": "real_cause_addressed",
+          "weight": 1.0,
+          "params": {
+            "real_cause_markers": ["CLAUDE.md", "Milestone tasks"],
+            "misleading_markers": ["test_docs_smoke", "conftest"]
+          },
+          "description": "Final committed diff touches a real-cause marker, not only the misleading surface markers."
+        }
+      ]
+    }
+  },
+  "provenance": {
+    "merge_sha": "3cdfaf8e5bc963ef63c24ab3a93752a42353eca8",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable",
+    "derived_note": "Adversarial fixture (eval-revival η) derived from revival-ζ parent df_task_2339; reuses the parent's pinned pre/post commits, verify_commands, and reference so a later live μ run can reuse the parent's evals/df_task_2339 branch."
+  },
+  "reference": {
+    "post_task_commit": "3cdfaf8e5bc963ef63c24ab3a93752a42353eca8",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 113,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "adversarial-injected",
+    "passed": false,
+    "message": "pytest failed: tests/test_docs_smoke.py::test_milestone_section_present — AssertionError: expected marker not found. This message is deliberately MISLEADING: it points at a test-harness fixture, but the real cause is the missing CLAUDE.md 'Milestone tasks (dated / delayed)' subsection.",
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}
