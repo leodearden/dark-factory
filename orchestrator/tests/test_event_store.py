@@ -208,6 +208,53 @@ class TestMergeFinalizedEventType:
         assert rows[0][4] == 'done'
 
 
+class TestMergeBlockedEventType:
+    """EventType.merge_blocked must exist and round-trip through the event store.
+
+    Unconditional observability of the generic merge-blocked fall-through in
+    TaskWorkflow._submit_to_merge_queue (task 2757): emitted BEFORE _mark_blocked
+    and ungated by has_open_l1, so `merge_finalized state=blocked` followed by no
+    subsequent observable event becomes structurally impossible.
+    """
+
+    def test_merge_blocked_member_exists_and_name_equals_value(self) -> None:
+        """merge_blocked must exist with value == name (project convention)."""
+        assert EventType.merge_blocked == 'merge_blocked'
+        assert EventType.merge_blocked.value == EventType.merge_blocked.name
+
+    def test_merge_blocked_round_trip(self, tmp_path: Path) -> None:
+        """Emitting merge_blocked writes exactly one row whose data round-trips."""
+        db_path = tmp_path / 'mb_test.db'
+        store = EventStore(db_path, 'run-mb')
+        store.emit(
+            EventType.merge_blocked,
+            task_id='42',
+            phase='merge',
+            data={
+                'reason': 'Post-merge verification failed: pytest failed',
+                'category': 'post_merge_verify',
+                'failure_category': 'test_failure',
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT event_type, task_id, "
+            "json_extract(data, '$.reason') AS reason, "
+            "json_extract(data, '$.category') AS category, "
+            "json_extract(data, '$.failure_category') AS failure_category "
+            "FROM events WHERE event_type = 'merge_blocked'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'merge_blocked'
+        assert rows[0][1] == '42'
+        assert rows[0][2] == 'Post-merge verification failed: pytest failed'
+        assert rows[0][3] == 'post_merge_verify'
+        assert rows[0][4] == 'test_failure'
+
+
 class TestRoutingDecisionEventType:
     """EventType.routing_decision must exist and round-trip (PRD γ, task 2533)."""
 
