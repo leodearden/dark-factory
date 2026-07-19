@@ -17,6 +17,11 @@ follows precisely.
 
 from __future__ import annotations
 
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
 from orchestrator.evals.metrics import EvalMetrics
 
 
@@ -146,3 +151,115 @@ class TestScorePlanStructure:
             s = score_plan_structure(plan)
             assert isinstance(s, float)
             assert 0.0 <= s <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# LLM plan judge judge_plan_quality (step-5/6)
+#
+# Mirrors run_judge's parse-and-fallback contract: invoke_agent is mocked with
+# an AsyncMock whose structured_output is a fixed {plan_quality, per_criterion,
+# reasoning}. The judge scores the produced plan against the REAL landed diff,
+# guided by PLAN_QUALITY_RUBRIC. An unparseable/empty judge output degrades to a
+# defined fallback verdict (plan_quality=None) — the run_architect_eval path
+# then falls back to the deterministic score_plan_structure floor.
+# ---------------------------------------------------------------------------
+
+def _judge_task() -> dict:
+    return {
+        'id': 'df_task_2605',
+        'name': 'implement the widget',
+        'task_definition': {'description': 'implement the widget correctly'},
+    }
+
+
+@pytest.mark.asyncio
+class TestJudgePlanQuality:
+    async def test_returns_parsed_verdict_and_embeds_plan_diff_rubric(self):
+        from orchestrator.evals.judge import (
+            PLAN_QUALITY_RUBRIC,
+            judge_plan_quality,
+        )
+
+        plan = _well_formed_plan()
+        reference_diff = (
+            '--- a/pkg/mod.py\n+++ b/pkg/mod.py\n+    REAL_LANDED_CHANGE = 1\n'
+        )
+        verdict_payload = {
+            'plan_quality': 0.83,
+            'per_criterion': {'has_steps': 1.0, 'tdd_alternation': 1.0},
+            'reasoning': 'The plan anticipates the landed diff well.',
+        }
+        fake = MagicMock()
+        fake.structured_output = verdict_payload
+        fake.output = json.dumps(verdict_payload)
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ) as mock_invoke:
+            verdict = await judge_plan_quality(plan, reference_diff, _judge_task())
+
+        assert isinstance(verdict.plan_quality, float)
+        assert verdict.plan_quality == 0.83
+        assert verdict.per_criterion == {'has_steps': 1.0, 'tdd_alternation': 1.0}
+        assert 'landed diff' in verdict.reasoning
+
+        # The built prompt embeds the produced plan, the landed reference diff,
+        # and the rubric criterion names.
+        prompt = mock_invoke.call_args.kwargs['prompt']
+        assert 'REAL_LANDED_CHANGE' in prompt        # the reference diff
+        assert 'GREEN implement X' in prompt          # a produced-plan step
+        for crit in PLAN_QUALITY_RUBRIC['criteria']:
+            assert crit['name'] in prompt             # rubric criterion names
+
+    async def test_structured_output_none_falls_back_to_json_output(self):
+        # structured_output empty but output carries valid JSON → parsed.
+        from orchestrator.evals.judge import judge_plan_quality
+
+        payload = {'plan_quality': 0.5, 'per_criterion': {}, 'reasoning': 'ok'}
+        fake = MagicMock()
+        fake.structured_output = None
+        fake.output = json.dumps(payload)
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+        assert verdict.plan_quality == 0.5
+
+    async def test_unparseable_output_degrades_to_fallback_verdict(self):
+        from orchestrator.evals.judge import PlanQualityVerdict, judge_plan_quality
+
+        fake = MagicMock()
+        fake.structured_output = None
+        fake.output = 'not json at all {{{'
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+        # A defined fallback verdict — no crash; plan_quality is the None
+        # sentinel so run_architect_eval degrades to score_plan_structure.
+        assert isinstance(verdict, PlanQualityVerdict)
+        assert verdict.plan_quality is None
+        assert isinstance(verdict.reasoning, str)
+
+    async def test_missing_plan_quality_key_degrades_to_fallback(self):
+        from orchestrator.evals.judge import judge_plan_quality
+
+        # Valid JSON but no plan_quality field → fallback, not a KeyError crash.
+        payload = {'per_criterion': {}, 'reasoning': 'forgot the score'}
+        fake = MagicMock()
+        fake.structured_output = payload
+        fake.output = json.dumps(payload)
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=fake),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+        assert verdict.plan_quality is None
