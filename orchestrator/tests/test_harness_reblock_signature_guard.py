@@ -27,7 +27,7 @@ from _orch_helpers import assert_update_wire_mode
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import EventType, Harness
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -395,6 +395,113 @@ class TestThresholdTrip:
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'Expected a WARNING record for threshold trip'
         )
+
+
+# ---------------------------------------------------------------------------
+# escalation_created event emission (observability gap fix, task 2784)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReblockGuardEscalationEvent:
+    """_file_reblock_guard_l2 must emit escalation_created so a threshold
+    trip is visible to get_scheduler_events — mirroring every peer
+    escalation filer (harness.py:4019, harness.py:9177;
+    workflow.py:9615/9769/10389/10788)."""
+
+    async def test_threshold_trip_emits_escalation_created_event(
+        self, harness: Harness
+    ):
+        """4th same-signature flip files an L2 AND emits escalation_created.
+
+        Asserts:
+        - set_task_status is NOT called (flip withheld)
+        - Exactly one L2 submitted to the queue
+        - event_store.emit called exactly once with positional
+          EventType.escalation_created, task_id='42', and a data dict
+          carrying escalation_id/category/severity/level for the just-filed
+          L2.
+        """
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        sig = Harness._reblock_signature(esc)
+
+        q = _make_mock_queue()
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+
+        # Seed: count=3 with same signature (prev_count >= threshold)
+        _persisted_metadata, call_order = _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # Flip must be WITHHELD
+        assert 'set_task_status' not in call_order, (
+            f'set_task_status should NOT be called at threshold; got {call_order}'
+        )
+
+        # Exactly one L2 filed
+        assert len(q._submitted) == 1, (
+            f'Expected 1 L2 submitted, got {len(q._submitted)}'
+        )
+        filed = q._submitted[0]
+
+        # escalation_created must be emitted exactly once, for the new L2
+        harness.event_store.emit.assert_called_once()
+        emit_args, emit_kwargs = harness.event_store.emit.call_args
+        assert emit_args[0] == EventType.escalation_created
+        assert emit_kwargs.get('task_id') == task_id
+        data = emit_kwargs.get('data') or {}
+        assert data.get('escalation_id') == filed.id
+        assert data.get('category') == 'task_failure'
+        assert data.get('severity') == 'urgent'
+        assert data.get('level') == 2
+
+    async def test_dedup_withhold_emits_no_escalation_created_event(
+        self, harness: Harness
+    ):
+        """Dedup'd withhold (existing pending L2) submits nothing new and
+        therefore emits NO escalation_created — an emit-placement regression
+        guard proving the event fires only on a genuinely new submit, never
+        on a dedup'd repeat."""
+        task_id = '42'
+        esc = _make_l1_esc(
+            task_id=task_id,
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        sig = Harness._reblock_signature(esc)
+
+        # Queue already has a pending L2 for this task (dedup hit)
+        q = _make_mock_queue(pending_l2_root_cause='esc-42-L2-1')
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+
+        # Seed: count=3 (at threshold)
+        _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # No new L2 submitted (dedup)
+        assert len(q._submitted) == 0, (
+            f'Expected 0 new L2 submissions (dedup), got {len(q._submitted)}'
+        )
+        # ...and therefore no escalation_created event was emitted.
+        harness.event_store.emit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
