@@ -1,4 +1,11 @@
-"""Eval configuration matrix: model/backend combinations to test."""
+"""Eval configuration matrix: model/backend combinations to test.
+
+Operators running ν's proxied Claude-format-endpoint candidates (see
+``claude_endpoint_candidates()`` below) should seed live ``config.prices``
+from ``claude_endpoint_price_table()`` (merged, not replaced) so those runs
+resolve ``cost_source == 'price_table'`` instead of falling back to
+``'unpriced_proxy'``.
+"""
 
 import os
 from dataclasses import dataclass, field
@@ -426,8 +433,17 @@ ARCHITECT_EVAL_CONFIGS = [
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name (implementer OR architect candidates)."""
-    for cfg in [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS]:
+    """Look up an eval config by name (implementer, architect, OR ν candidates).
+
+    ν's ``claude_endpoint_candidates()`` bundles are searched LAST since they
+    are a function call (env-read-at-call) rather than a static list — cheap
+    at CLI/driver lookup frequency, and keeps this the single by-name resolver
+    for every eval config family (avoids a second, ν-only lookup path).
+    """
+    for cfg in [
+        *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
+        *claude_endpoint_candidates(),
+    ]:
         if cfg.name == name:
             return cfg
     return None
