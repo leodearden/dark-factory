@@ -899,7 +899,9 @@ class MergeVerifyLeaseHeld(RuntimeError):
         )
 
 
-async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+async def _run(
+    cmd: list[str], cwd: Path | None = None, *, input_text: str | None = None,
+) -> tuple[int, str, str]:
     """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
     Used throughout for git invocations and for any other subprocess call
@@ -907,6 +909,15 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     is provided but does not exist, so the caller can distinguish a deleted
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
+
+    Stdin feeding (``input_text``): when provided, the child is spawned with
+    ``stdin=PIPE`` and ``input_text.encode()`` is written to it via
+    ``communicate(input=...)``.  This is what lets callers pipe a diff into a
+    stdin-only filter such as ``git patch-id`` (see
+    :meth:`GitOps.find_equivalent_commit`).  When ``None`` (the default) the
+    behaviour is exactly as before — stdin is not piped and the child inherits
+    the parent's — so no existing caller is affected.  The capability is inert
+    unless ``input_text`` is passed.
 
     Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
     that git (and other tools) always emit English-locale diagnostics.  This is
@@ -937,6 +948,7 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd) if cwd else None,
+            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_env,
@@ -949,7 +961,9 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
             raise WorktreeMissing(cwd) from e
         raise
     try:
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await proc.communicate(
+            input=input_text.encode() if input_text is not None else None,
+        )
     except BaseException:
         # The await was interrupted (most commonly asyncio.CancelledError from
         # a caller-side asyncio.wait_for(..., timeout=...)) before the child
@@ -6944,6 +6958,137 @@ class GitOps:
             sha, _, subject = line.partition('\x1f')
             pairs.append((sha, subject))
         return pairs
+
+    async def find_equivalent_commit(
+        self, worktree: Path, base_sha: str, target_sha: str,
+    ) -> str | None:
+        """Recover the sha a rebase replayed *target_sha* onto, via ``git patch-id``.
+
+        When a requeue / inter-iteration rebase rewrites a task branch, an
+        already-recorded done-step commit (*target_sha*) can be orphaned — no
+        longer reachable from HEAD — even though its content was replayed
+        byte-for-byte onto the new base as a fresh commit. This locates that
+        replayed commit so :meth:`TaskWorkflow._reconcile_done_step_commits`
+        can re-point the plan step to it instead of escalating.
+
+        Two tiers, tried in order:
+
+        1. **patch-id** (exact): compute *target_sha*'s patch-id
+           (``git log -p -1 --no-color`` piped to ``git patch-id --stable``)
+           and look it up in a ``{patch-id: sha}`` map built the same way over
+           ``base_sha..HEAD``. ``git patch-id --stable`` hashes the normalized
+           diff hunks, so a clean replay reproduces byte-identical hunks and an
+           identical patch-id — the canonical, whitespace/line-number-robust
+           equivalence the ``git cherry`` dedup in
+           :meth:`rebase_preserving_task_commits` also relies on. Using the
+           identical diff-emitting command (``git log -p``) for both the single
+           target and the range guarantees both sides are normalized by the
+           same code path. The ``<patch-id> <sha>`` line the range form emits
+           maps the shared patch-id to the REPLAYED (HEAD-side) sha, which is
+           exactly the remap target. If TWO commits in ``base_sha..HEAD`` share
+           a patch-id (a diff reverted then re-applied, or genuinely identical
+           hunks), that patch-id is ambiguous — we cannot tell which sha the
+           orphan replayed onto — so it is skipped rather than resolved to an
+           arbitrary one of them, the same 'never guess' posture tier 2 applies
+           to an ambiguous subject.
+        2. **unique exact-subject** (fallback): when the patch-id lookup
+           misses — e.g. a rebase that resolved a conflict altered the diff
+           but preserved the commit message — recover the replayed sha only if
+           EXACTLY ONE commit in ``base_sha..HEAD`` shares *target_sha*'s
+           subject (the ``%H\\x1f%s`` idiom from :meth:`get_commit_subjects`,
+           ``\\x1f``-split because subjects may contain colons/punctuation). An
+           ambiguous subject (two or more matches) or no match returns
+           ``None`` — the method fails toward the caller's escalation, never
+           toward a wrong re-point.
+
+        Fully fail-safe: any git error, an unresolvable/GC'd *target_sha*, or
+        empty patch-id output yields ``None``, letting the caller fall through
+        to its existing escalation path. No persisted state — the mapping is
+        re-derived from live git on every call, so it behaves identically
+        across orchestrator restarts, and a false negative simply reverts to
+        the pre-fix baseline rather than sinking the caller. Same best-effort
+        posture as :meth:`get_commit_subjects` / :meth:`get_commit_changed_files`.
+        """
+        try:
+            # Tier 1: patch-id equivalence. Compute the orphaned target's
+            # patch-id from its own diff.
+            rc, target_diff, _ = await _run(
+                ['git', 'log', '-p', '-1', '--no-color', target_sha], cwd=worktree,
+            )
+            if rc != 0 or not target_diff.strip():
+                return None
+            _, target_pid_out, _ = await _run(
+                ['git', 'patch-id', '--stable'], cwd=worktree, input_text=target_diff,
+            )
+            target_pid = target_pid_out.split()[0] if target_pid_out.strip() else None
+
+            # Build the {patch-id: sha} map over base..HEAD (the live branch).
+            rc, range_diff, _ = await _run(
+                ['git', 'log', '-p', '--no-color', f'{base_sha}..HEAD'], cwd=worktree,
+            )
+            if rc == 0 and range_diff.strip():
+                _, range_pid_out, _ = await _run(
+                    ['git', 'patch-id', '--stable'], cwd=worktree, input_text=range_diff,
+                )
+                pid_to_sha: dict[str, str] = {}
+                ambiguous_pids: set[str] = set()
+                for line in range_pid_out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        pid = parts[0]
+                        if pid in pid_to_sha:
+                            # Two commits in base..HEAD share a patch-id (a
+                            # diff reverted then re-applied, or genuinely
+                            # identical hunks). We cannot know which one the
+                            # orphaned step replayed onto, so mark the patch-id
+                            # ambiguous and fall through — the same 'never
+                            # guess' posture tier 2 applies to an ambiguous
+                            # subject, rather than silently keeping whichever
+                            # colliding sha the dict happens to retain.
+                            ambiguous_pids.add(pid)
+                        pid_to_sha[pid] = parts[1]
+                if (
+                    target_pid
+                    and target_pid in pid_to_sha
+                    and target_pid not in ambiguous_pids
+                ):
+                    return pid_to_sha[target_pid]
+
+            # Tier 2: unique exact-subject fallback. Only fires when the
+            # patch-id lookup missed; recovers the replayed sha only when
+            # exactly ONE commit in base..HEAD shares the target's subject, so
+            # we never mis-point a step whose subject two replayed commits
+            # happen to share (e.g. a generic "feat: GREEN — implementation").
+            rc, target_subject, _ = await _run(
+                ['git', 'log', '-1', '--format=%s', target_sha], cwd=worktree,
+            )
+            if rc != 0 or not target_subject.strip():
+                return None
+            rc, subj_out, _ = await _run(
+                ['git', 'log', '--format=%H\x1f%s', f'{base_sha}..HEAD'], cwd=worktree,
+            )
+            if rc != 0 or not subj_out.strip():
+                return None
+            subject_matches: list[str] = []
+            for line in subj_out.splitlines():
+                if not line.strip():
+                    continue
+                sha, _, subject = line.partition('\x1f')
+                if subject == target_subject:
+                    subject_matches.append(sha)
+            if len(subject_matches) == 1:
+                return subject_matches[0]
+            return None
+        except Exception:
+            # Fully fail-safe: any git error / unresolvable target yields None so
+            # the caller falls through to its existing escalation path. Log at
+            # WARN so a persistent failure is diagnosable rather than silent.
+            logger.warning(
+                'find_equivalent_commit failed for target_sha=%s base_sha=%s '
+                'in %s; returning None (caller will fall through to escalation)',
+                target_sha, base_sha, worktree, exc_info=True,
+            )
+            return None
 
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
         """Return list of files changed between two commits."""

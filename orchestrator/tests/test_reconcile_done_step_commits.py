@@ -682,3 +682,356 @@ class TestExecuteIterationsReconcilesDoneSteps:
             f"_execute_iterations's loop, got {step_1['commit']}"
         )
         assert step_1['status'] == 'done'
+
+
+# ---------------------------------------------------------------------------
+# task 2762 step-3 RED: GitOps.find_equivalent_commit — patch-id path
+# ---------------------------------------------------------------------------
+#
+# Real temp git repo pattern (reusing the git_repo/git_ops fixtures above,
+# operating directly on git_repo as the worktree, exactly like
+# TestGetCommitChangedFiles). find_equivalent_commit(worktree, base, target)
+# must recover a rebase-replayed commit's NEW sha from an orphaned commit via
+# git patch-id --stable, and fail safe to None on anything it cannot resolve.
+
+
+async def _head(repo: Path) -> str:
+    _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    return sha.strip()
+
+
+@pytest.mark.asyncio
+class TestFindEquivalentCommit:
+    async def test_patch_id_match_recovers_replayed_sha(self, git_repo, git_ops):
+        """Case A (happy patch-id): an orphaned commit S and its byte-identical
+        replay S_prime (committed with a DIFFERENT subject) share a patch-id, so
+        find_equivalent_commit returns S_prime — proving the patch-id, not the
+        subject, drove the match."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(git_repo, 'feat: step-1')
+        assert s
+
+        # Orphan S, then re-land byte-identical content under a different subject.
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'feature.py').write_text('original implementation\n')
+        s_prime = await git_ops.commit(git_repo, 'chore: replay')
+        assert s_prime and s_prime != s
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result == s_prime, (
+            f'expected patch-id to recover the replayed sha {s_prime}, got {result}'
+        )
+
+    async def test_unresolvable_target_returns_none(self, git_repo, git_ops):
+        """Case B (unresolvable/GC'd target): a fabricated sha cannot be
+        resolved, so the method fails safe to None (never raises)."""
+        base = await _head(git_repo)
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, 'deadbeef' * 5)
+
+        assert result is None
+
+    async def test_no_equivalent_commit_returns_none(self, git_repo, git_ops):
+        """Case C (no equivalent): the orphaned commit S touches feature.py, but
+        the only commit in base..HEAD touches an unrelated file with a different
+        subject — neither patch-id nor subject can match, so None."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(git_repo, 'feat: step-1')
+        assert s
+
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'other.py').write_text('wholly unrelated\n')
+        s_prime = await git_ops.commit(git_repo, 'chore: something else')
+        assert s_prime
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None
+
+    # -----------------------------------------------------------------
+    # task 2762 step-5 RED: exact-subject fallback (patch-id miss)
+    # -----------------------------------------------------------------
+
+    async def test_unique_subject_fallback_when_patch_id_misses(self, git_repo, git_ops):
+        """Case D (unique subject, changed diff): a rebase altered the diff
+        (different bytes -> different patch-id) but preserved the commit
+        subject. The patch-id lookup misses, so the UNIQUE exact-subject match
+        recovers the replayed sha."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('content version one\n')
+        s = await git_ops.commit(git_repo, 'feat: unique-step')
+        assert s
+
+        # Orphan S, then re-land DIFFERENT content under the SAME subject.
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'feature.py').write_text('content version two, different bytes\n')
+        s_prime = await git_ops.commit(git_repo, 'feat: unique-step')
+        assert s_prime and s_prime != s
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result == s_prime, (
+            f'expected the unique-subject fallback to recover {s_prime}, got {result}'
+        )
+
+    async def test_ambiguous_subject_returns_none(self, git_repo, git_ops):
+        """Case E (ambiguous subject): two commits in base..HEAD share the
+        orphaned commit's subject. The method must never guess -> None (falls
+        toward the caller's escalation, not a wrong re-point)."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('orphaned content\n')
+        s = await git_ops.commit(git_repo, 'feat: shared-subject')
+        assert s
+
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'a.py').write_text('first replayed\n')
+        s_prime_1 = await git_ops.commit(git_repo, 'feat: shared-subject')
+        (git_repo / 'b.py').write_text('second replayed\n')
+        s_prime_2 = await git_ops.commit(git_repo, 'feat: shared-subject')
+        assert s_prime_1 and s_prime_2
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None
+
+    async def test_subject_absent_from_range_returns_none(self, git_repo, git_ops):
+        """Case F (subject present on target but shared by no base..HEAD
+        commit): neither patch-id nor subject can match -> None."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('orphaned content\n')
+        s = await git_ops.commit(git_repo, 'feat: only-on-orphan')
+        assert s
+
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'other.py').write_text('unrelated replayed\n')
+        s_prime = await git_ops.commit(git_repo, 'chore: totally different subject')
+        assert s_prime
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None
+
+    async def test_ambiguous_patch_id_in_range_returns_none(self, git_repo, git_ops):
+        """Case G (ambiguous patch-id): TWO commits in base..HEAD share the
+        orphaned commit's patch-id (a file added, removed, then re-added
+        byte-identically). The method must never silently re-point the orphan
+        to an arbitrary one of the colliding shas — it treats the patch-id as
+        ambiguous (the same 'never guess' posture tier 2 applies to an
+        ambiguous subject) and, with no unique subject to fall back on,
+        returns None.
+
+        Regression guard: `git log -p` emits newest-first, so a naive
+        {patch-id: sha} map (last write wins) would hold the OLDEST colliding
+        sha and mis-point the step to it."""
+        base = await _head(git_repo)
+
+        # Orphan S: add dup.py, then reset it away so S is unreachable from
+        # HEAD. Its subject is unique so the subject tier cannot rescue it.
+        (git_repo / 'dup.py').write_text('duplicated diff\n')
+        s = await git_ops.commit(git_repo, 'orphan: unique-subject')
+        assert s
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+
+        # Build base..HEAD with two patch-id-colliding commits: add dup.py,
+        # remove it, then re-add byte-identical content. C1 and C3 both
+        # reproduce the same "new file dup.py + duplicated diff" hunk, so they
+        # share one patch-id — which also equals S's.
+        (git_repo / 'dup.py').write_text('duplicated diff\n')
+        c1 = await git_ops.commit(git_repo, 'dup: add one')
+        (git_repo / 'dup.py').unlink()
+        c2 = await git_ops.commit(git_repo, 'dup: remove')
+        (git_repo / 'dup.py').write_text('duplicated diff\n')
+        c3 = await git_ops.commit(git_repo, 'dup: add two')
+        assert c1 and c2 and c3
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None, (
+            'an ambiguous patch-id (two colliding commits in base..HEAD) must '
+            f'never be remapped; expected None but got {result} '
+            f'(c1={c1}, c3={c3})'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2762 step-7 RED: _reconcile_done_step_commits remaps a clean rebase
+# replay (Scenario B — no WIP run at HEAD) via patch-id before escalating
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileViaPatchId:
+    """_reconcile_done_step_commits must remap an orphaned done-step commit to
+    its rebase-replayed sha via patch-id / unique-subject BEFORE escalating,
+    for Scenario B (a clean rebase replay with NO WIP safety-commit run at HEAD
+    — the case the WIP-filename heuristic cannot cover)."""
+
+    async def test_synthetic_rebase_replay_is_remapped_not_escalated(
+        self, config, git_ops, task_assignment,
+    ):
+        """PRIMARY: a real `git rebase --onto` orphans the step commit S while
+        replaying it byte-identically as S_prime at HEAD. With no WIP run at
+        HEAD, the step must be remapped to S_prime via patch-id, status kept
+        'done', and NO escalation filed."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        base = wt_info.base_commit
+
+        _, task_branch, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=wt)
+        task_branch = task_branch.strip()
+
+        # step-1's original implementation commit S (non-WIP subject).
+        (wt / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert s
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', s)
+
+        # Build a new base NB by advancing a temp branch off base with an
+        # unrelated commit, then rebase --onto it so S is replayed as S_prime
+        # at HEAD and S itself is orphaned (Scenario B: no WIP run at HEAD).
+        await _run(['git', 'switch', '-c', 'tmpbase', base], cwd=wt)
+        (wt / 'newbase.py').write_text('unrelated new-base work\n')
+        nb = await git_ops.commit(wt, 'chore: advance base')
+        assert nb
+        await _run(['git', 'switch', task_branch], cwd=wt)
+        rc, _, err = await _run(['git', 'rebase', '--onto', 'tmpbase', base], cwd=wt)
+        assert rc == 0, f'setup rebase failed: {err}'
+        s_prime = await _head(wt)
+        assert s_prime != s
+
+        # Confirm S really is orphaned (not reachable from HEAD).
+        rc_anc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor', s, 'HEAD'], cwd=wt,
+        )
+        assert rc_anc != 0, 'setup: S must be orphaned (not an ancestor of HEAD)'
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        assert reconciled['steps'][0]['commit'] == s_prime, (
+            f'expected step-1 remapped to replayed sha {s_prime}, '
+            f"got {reconciled['steps'][0]['commit']}"
+        )
+        assert reconciled['steps'][0]['status'] == 'done'
+        escalation_queue.submit.assert_not_called()
+
+    async def test_patch_id_remap_wins_when_replay_subject_differs(
+        self, config, git_ops, task_assignment,
+    ):
+        """patch-id drives the remap even when the replayed commit's subject
+        differs from the orphaned one (byte-identical content, different
+        message, no WIP run)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        base = wt_info.base_commit
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(wt, 'feat: original step subject')
+        assert s
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', s)
+
+        # Orphan S, re-land byte-identical content under a DIFFERENT subject
+        # (a normal, non-WIP commit -> no WIP run at HEAD).
+        await _run(['git', 'reset', '--hard', base], cwd=wt)
+        (wt / 'feature.py').write_text('original implementation\n')
+        s_prime = await git_ops.commit(wt, 'chore: replayed under a different subject')
+        assert s_prime and s_prime != s
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        assert reconciled['steps'][0]['commit'] == s_prime
+        assert reconciled['steps'][0]['status'] == 'done'
+        escalation_queue.submit.assert_not_called()
+
+    async def test_no_equivalent_and_no_wip_run_escalates_once(
+        self, config, git_ops, task_assignment,
+    ):
+        """When neither a patch-id nor a unique-subject equivalent exists and
+        there is no WIP run at HEAD, the orphan still escalates — exactly once,
+        deduped across repeated reconcile passes."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        base = wt_info.base_commit
+
+        (wt / 'feature.py').write_text('version one\n')
+        s = await git_ops.commit(wt, 'feat: orphan subject')
+        assert s
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', s)
+
+        # Orphan S, land a normal commit with DIFFERENT content AND subject.
+        await _run(['git', 'reset', '--hard', base], cwd=wt)
+        (wt / 'other.py').write_text('wholly unrelated\n')
+        other = await git_ops.commit(wt, 'feat: something entirely different')
+        assert other
+
+        await workflow._reconcile_done_step_commits()
+        workflow.plan = artifacts.read_plan()
+        await workflow._reconcile_done_step_commits()  # same orphan, again
+
+        unchanged = artifacts.read_plan()
+        assert unchanged['steps'][0]['commit'] == s
+        escalation_queue.submit.assert_called_once()
+
+    async def test_wip_run_superset_still_uses_wip_path(
+        self, config, git_ops, task_assignment,
+    ):
+        """BACKWARD-COMPAT: when a WIP safety-commit run IS present at HEAD and
+        its files are a superset of the orphaned step's, the existing
+        WIP-filename path still re-points to the WIP tip (the new patch-id tier
+        must not disturb Scenario A)."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        base = wt_info.base_commit
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert s
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', s)
+
+        # Orphan S; land a WIP safety-commit whose files are a strict superset.
+        await _run(['git', 'reset', '--hard', base], cwd=wt)
+        (wt / 'feature.py').write_text('original implementation\n')
+        (wt / 'extra.py').write_text('additional WIP work\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha
+
+        await workflow._reconcile_done_step_commits()
+
+        reconciled = artifacts.read_plan()
+        assert reconciled['steps'][0]['commit'] == wip_sha
+        assert reconciled['steps'][0]['status'] == 'done'
+        escalation_queue.submit.assert_not_called()

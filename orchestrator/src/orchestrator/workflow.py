@@ -5795,6 +5795,29 @@ class TaskWorkflow:
         doesn't re-escalate on every ``_execute_iterations`` loop iteration
         (see that attribute's docstring in ``__init__``).
 
+        **Clean-replay remap tier (task 2762)**: the WIP-filename heuristic
+        above only fires in Scenario A — uncommitted work squashed into a WIP
+        safety-commit at HEAD. In Scenario B, a requeue/inter-iteration rebase
+        that PRESERVES individual commits (replaying them onto a new base
+        rather than squashing) leaves NO WIP run at HEAD, so ``wip_tip_sha`` is
+        ``None`` and every orphaned done step would fall straight to the
+        escalation below — the 5205/5055/5196 escalation storms, which RCA
+        confirmed were pure bookkeeping noise (each orphaned step's commit is
+        patch-id-identical to a commit already on the live branch). So before
+        escalating, the else branch now asks
+        :meth:`GitOps.find_equivalent_commit` for a commit in ``base..HEAD``
+        that is patch-id-equivalent (or, on a diff-altering rebase that kept
+        the message, uniquely subject-matching) to the orphaned commit, and
+        re-points the step to it via the same
+        ``artifacts.update_step_status(id, 'done', new_sha)`` call. Only when
+        that returns ``None`` (no equivalent) does the step escalate. This tier
+        keeps the same best-effort/fail-safe and zero-persisted-state posture:
+        it is re-derived from live git every pass, and a false negative reverts
+        to exactly the pre-2762 escalation baseline. The WIP heuristic stays
+        FIRST because in Scenario A the step's diff is folded into a larger WIP
+        diff with a different patch-id and no standalone equivalent, so the
+        filename-subset signal is the only correct one there.
+
         **Heuristic, not a content diff**: the match above is a
         *filename-set* subset check only — it never compares file contents
         or blob shas. A WIP commit that happens to touch a superset of the
@@ -5852,10 +5875,31 @@ class TaskWorkflow:
                 if orphaned_files and wip_tip_sha and set(orphaned_files) <= wip_files:
                     self.artifacts.update_step_status(item['id'], 'done', wip_tip_sha)
                 else:
+                    # No WIP-filename match. Before escalating, try to remap the
+                    # orphaned commit to its rebase-replayed sha on the live
+                    # branch. This is the clean-replay case (Scenario B): a
+                    # requeue/inter-iteration rebase that preserves individual
+                    # commits rather than squashing them into a WIP
+                    # safety-commit leaves NO WIP run at HEAD, so wip_tip_sha is
+                    # None and the filename heuristic above never fires.
+                    # find_equivalent_commit locates a patch-id-equivalent (or,
+                    # on a diff-altering rebase that kept the message, a
+                    # uniquely subject-matching) commit in base..HEAD and
+                    # returns its sha. It is fully fail-safe (None on any git
+                    # error, an unresolvable/GC'd commit, ambiguity, or no
+                    # equivalent), so a false negative simply falls through to
+                    # the unchanged escalation path below — zero persisted
+                    # state, re-derived from live git each pass.
+                    remapped = await self.git_ops.find_equivalent_commit(
+                        self.worktree, base, commit,
+                    )
+                    if remapped:
+                        self.artifacts.update_step_status(item['id'], 'done', remapped)
+                        continue
                     # Mismatch, unresolvable original (empty file set — e.g.
-                    # GC'd), or no WIP run at HEAD at all: cannot safely
-                    # auto-reconcile. Flag for review and leave the commit
-                    # unchanged rather than guess. Deduped by
+                    # GC'd), no WIP run at HEAD, and no live-branch equivalent:
+                    # cannot safely auto-reconcile. Flag for review and leave
+                    # the commit unchanged rather than guess. Deduped by
                     # _unreconciled_done_step_escalations so a still-stuck
                     # orphan doesn't re-file an info escalation on every
                     # _execute_iterations loop iteration.
