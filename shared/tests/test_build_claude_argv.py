@@ -139,3 +139,99 @@ def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
         assert 'StructuredOutput' not in values
     finally:
         _cleanup(temp_files)
+
+
+def test_build_claude_argv_strict_mcp_config_emits_flag_after_mcp_config() -> None:
+    """strict_mcp_config=True (with an mcp_config) appends --strict-mcp-config
+    immediately after the --mcp-config <path> pair — the recon-watch isolation
+    pattern that scopes the invocation to ONLY the --mcp-config servers,
+    ignoring the ambient .mcp.json (task 2796, THREAD 2).
+    """
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys prompt text',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=['Read', 'Grep'],
+        disallowed_tools=['Bash'],
+        mcp_config={'mcpServers': {'foo': {'command': 'bar'}}},
+        output_schema={'type': 'object'},
+        effort='high',
+        resume_session_id=None,
+        session_id='sess-123',
+        strict_mcp_config=True,
+    )
+    try:
+        assert '--strict-mcp-config' in cmd
+        sysprompt_path, mcp_path = temp_files
+        expected = _normalize([
+            'claude', '--print', '--output-format', 'json',
+            '--model', 'opus',
+            '--max-budget-usd', '5.0',
+            '--system-prompt-file', sysprompt_path,
+            '--session-id', 'sess-123',
+            '--permission-mode', 'bypassPermissions',
+            '--max-turns', '50',
+            '--effort', 'high',
+            '--allowed-tools', 'Read', 'Grep',
+            '--disallowed-tools', 'Bash',
+            '--mcp-config', mcp_path,
+            '--strict-mcp-config',
+            '--json-schema', json.dumps({'type': 'object'}),
+        ], temp_files)
+        assert _normalize(cmd, temp_files) == expected, f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_default_omits_strict_mcp_config() -> None:
+    """Default (strict_mcp_config omitted) WITH an mcp_config emits NO
+    --strict-mcp-config — byte-compatible with every existing caller.
+    """
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys',
+        max_turns=10,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config={'mcpServers': {'foo': {'command': 'bar'}}},
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+    )
+    try:
+        assert '--mcp-config' in cmd
+        assert '--strict-mcp-config' not in cmd
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_strict_mcp_config_noop_without_mcp_config() -> None:
+    """strict_mcp_config=True with mcp_config=None is a no-op: --strict-mcp-config
+    is meaningless with no --mcp-config (it is emitted only inside the
+    `if mcp_config:` block), so it is never added.
+    """
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys',
+        max_turns=10,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config=None,
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+        strict_mcp_config=True,
+    )
+    try:
+        assert '--mcp-config' not in cmd
+        assert '--strict-mcp-config' not in cmd
+    finally:
+        _cleanup(temp_files)
