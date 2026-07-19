@@ -13,8 +13,13 @@ reads ONLY a persisted artifact (P4 / boundary test B8) — never a transcript.
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
+from orchestrator.evals.metrics import EvalMetrics, collect_metrics
 from orchestrator.evals.scoring import (
     compute_recovery_score,
     plan_step_deviated,
@@ -260,3 +265,159 @@ class TestRubricValidation:
     def test_missing_criteria_key_raises(self):
         with pytest.raises(ValueError):
             compute_recovery_score({}, plan={}, blocking_issues=[], diff='')
+
+
+# ---------------------------------------------------------------------------
+# EvalMetrics.recovery_score field + collect_metrics wiring (step-3/4)
+#
+# Hermetic collect_metrics harness: a MagicMock workflow whose artifacts return
+# synthetic recovered artifacts, with run_verification / _git_diff_stats /
+# snapshots.get_diff patched — no live workflow, LLM, or git.
+# ---------------------------------------------------------------------------
+
+# A synthetic 'recovered' artifact set that satisfies all three detectors.
+_RECOVERED_PLAN = {
+    'steps': [
+        {'id': 'step-1', 'description': 'correct first step', 'status': 'done'},
+        {'id': 'step-2', 'description': 'the corrected approach', 'status': 'done'},
+    ],
+}
+_RECOVERED_BLOCKING = [
+    {'severity': 'blocking', 'description': 'planted MARK regression is present'},
+]
+_RECOVERED_DIFF = '--- a/db.py\n+++ b/db.py\n+    REAL root-cause fix\n'
+
+_FULL_RUBRIC = {
+    'description': 'recovery across all three adversarial signals',
+    'criteria': [
+        {
+            'id': 'c1', 'detector': 'plan_step_deviated', 'weight': 1.0,
+            'params': {'step_id': 'step-2', 'wrong_marker': 'WRONGX'},
+        },
+        {
+            'id': 'c2', 'detector': 'regression_flagged', 'weight': 1.0,
+            'params': {'markers': ['MARK'], 'min_matches': 1},
+        },
+        {
+            'id': 'c3', 'detector': 'real_cause_addressed', 'weight': 1.0,
+            'params': {'real_cause_markers': ['REAL'], 'misleading_markers': ['FAKE']},
+        },
+    ],
+}
+
+
+def _wf_metrics() -> MagicMock:
+    """A WorkflowMetrics stand-in with every numeric field collect_metrics reads."""
+    wm = MagicMock()
+    wm.total_duration_ms = 1000
+    wm.total_output_tokens = 120
+    wm.total_input_tokens = 300
+    wm.total_cache_read_tokens = 0
+    wm.total_cache_create_tokens = 0
+    wm.total_cost_usd = 0.42
+    wm.total_turns = 6
+    wm.execute_iterations = 3
+    wm.verify_attempts = 0
+    wm.judge_invocations = 0
+    wm.judge_cost_usd = 0.0
+    wm.judge_early_exits = 0
+    return wm
+
+
+def _workflow(plan: dict, blocking_issues: list[dict]) -> MagicMock:
+    wf = MagicMock()
+    wf.metrics = _wf_metrics()
+    wf.config.env_overrides = {}
+    wf.config.max_execute_iterations = 20
+    wf.artifacts.read_plan.return_value = plan
+    reviews = MagicMock()
+    reviews.blocking_issues = blocking_issues
+    reviews.suggestions = []
+    wf.artifacts.aggregate_reviews.return_value = reviews
+    return wf
+
+
+def _verify_pass() -> MagicMock:
+    v = MagicMock()
+    v.passed = True
+    v.lint_output = ''
+    v.type_output = ''
+    return v
+
+
+def _collect_patches(diff: str):
+    """Patch the three collect_metrics side-effect boundaries (verify / diff-stat
+    / recovery diff) so the run is hermetic."""
+    return (
+        patch(
+            'orchestrator.verify.run_verification',
+            AsyncMock(return_value=_verify_pass()),
+        ),
+        patch(
+            'orchestrator.evals.metrics._git_diff_stats',
+            AsyncMock(return_value=(10, 2)),
+        ),
+        patch(
+            'orchestrator.evals.snapshots.get_diff',
+            AsyncMock(return_value=diff),
+        ),
+    )
+
+
+class TestEvalMetricsRecoveryField:
+    def test_default_is_none(self):
+        assert EvalMetrics().recovery_score is None
+
+    def test_to_dict_carries_recovery_score_key_defaulting_none(self):
+        d = EvalMetrics().to_dict()
+        assert 'recovery_score' in d
+        assert d['recovery_score'] is None
+
+
+@pytest.mark.asyncio
+class TestCollectMetricsRecoveryWiring:
+    async def test_adversarial_task_populates_recovery_score(self):
+        task = {
+            'id': 'df_task_x_adv',
+            'pre_task_commit': 'base123',
+            'adversarial': {'recovery_rubric': _FULL_RUBRIC},
+        }
+        wf = _workflow(_RECOVERED_PLAN, _RECOVERED_BLOCKING)
+        p_verify, p_stat, p_diff = _collect_patches(_RECOVERED_DIFF)
+        with p_verify, p_stat, p_diff:
+            m = await collect_metrics(wf, Path('/fake/wt'), task)
+        # A real, populated float — not the None sentinel.
+        assert m.recovery_score == 1.0
+        assert isinstance(m.recovery_score, float)
+
+    async def test_non_adversarial_task_leaves_recovery_none(self):
+        task = {'id': 'df_task_ordinary', 'pre_task_commit': 'base123'}
+        wf = _workflow(_RECOVERED_PLAN, [])
+        p_verify, p_stat, p_diff = _collect_patches('')
+        with p_verify, p_stat, p_diff:
+            m = await collect_metrics(wf, Path('/fake/wt'), task)
+        assert m.recovery_score is None
+
+    async def test_recovery_failure_warns_and_nulls_without_nuking_composite(
+        self, caplog,
+    ):
+        # Empty-criteria rubric → compute_recovery_score raises → collect_metrics
+        # must WARN (naming the fixture) and leave recovery_score=None, while
+        # STILL returning a valid composite_score.
+        task = {
+            'id': 'df_task_bad_adv',
+            'pre_task_commit': 'base123',
+            'adversarial': {'recovery_rubric': {'criteria': []}},
+        }
+        wf = _workflow(_RECOVERED_PLAN, [])  # 0 blocking → composite 1.0
+        p_verify, p_stat, p_diff = _collect_patches('')
+        with p_verify, p_stat, p_diff, caplog.at_level(
+            logging.WARNING, logger='orchestrator.evals.metrics',
+        ):
+            m = await collect_metrics(wf, Path('/fake/wt'), task)
+        assert m.recovery_score is None
+        assert m.composite_score == 1.0
+        warnings = [
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any('df_task_bad_adv' in w for w in warnings), warnings
