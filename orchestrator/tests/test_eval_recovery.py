@@ -576,7 +576,7 @@ class TestAdversarialFixtures:
 # row is owned by λ).
 # ---------------------------------------------------------------------------
 
-def _adv_result() -> object:
+def _adv_result() -> runner.EvalResult:
     return runner.EvalResult(
         task_id='df_task_2430_adv_plan',
         config_name='opus-high',
@@ -586,7 +586,7 @@ def _adv_result() -> object:
     )
 
 
-def _ordinary_result() -> object:
+def _ordinary_result() -> runner.EvalResult:
     # No recovery_score key at all → the null sentinel path.
     return runner.EvalResult(
         task_id='df_task_1993',
