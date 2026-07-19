@@ -285,7 +285,7 @@ def build_known_projects_map(
                 'build_known_projects_map: cannot resolve %r: %s', raw, exc,
             )
             continue
-        pid = resolve_project_id(resolved)
+        pid = resolve_project_id_for_root(resolved)
         if pid in out:
             # Duplicate project_id — primary wins (since it was added
             # first).  Extras with a clashing name are dropped silently
