@@ -1311,6 +1311,52 @@ class TestRunMergeVerifyOnWorktree:
         assert call_kwargs['force_workspace'] is False
         assert call_kwargs['role'] == 'merge'
 
+    async def test_spec_profile_overrides_host_config(self):
+        """Fix (a): the SPEC's merge-gate profile wins over the (remote) host
+        config, so the remote runs the SAME scope/profile as the merge gate
+        rather than the laptop config's narrow defaults."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        # The (remote) host config carries the NARROW laptop defaults ...
+        # (set explicitly: OrchestratorConfig is a BaseSettings whose bare
+        # defaults may be widened by a settings source, so pin them here).
+        config = OrchestratorConfig(merge_verify_workspace=False, merge_verify_breadth='scoped')
+        assert config.merge_verify_workspace is False
+        assert config.merge_verify_breadth == 'scoped'
+        # ... but the spec carries the FULL merge-gate profile.
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            merge_verify_workspace=True,
+            merge_verify_breadth='full',
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        # force_workspace is read from the (now spec-overridden) config -> True.
+        assert run_scoped.await_args[1]['force_workspace'] is True
+        # The config object threaded into run_scoped carries the spec's breadth,
+        # not the laptop's 'scoped'.
+        effective_config = run_scoped.await_args[0][1]
+        assert effective_config.merge_verify_breadth == 'full'
+        assert effective_config.merge_verify_workspace is True
+
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
         from orchestrator.verify_runner import (
