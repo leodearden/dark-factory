@@ -128,10 +128,13 @@ retry ladder's final rung.
 - Cross-PRD task deps (all intra-`dark_factory`, bare-integer, wired at
   decompose): δ → **2461** (harness-backend T6: steward/triage CostStore rows —
   the judge already records, per 2461's correction); ι → **2475** + **2478**
-  (eval-revival architect coverage + OFAT/confirm driver); κ → **2472**
-  (eval-revival Phase-1 validity gate — the framework currently grades empty
-  diffs), **2486** + **2485** (mcp-verdict judge/triage contract migrations —
-  trial on the post-migration transport, not the dying one).
+  (eval-revival architect coverage + OFAT/confirm driver). **κ was re-scoped
+  per-role 2026-07-19 (esc-2540-2 → D)** — see §κ; its deps are now per sub-task:
+  **module_tagger** (task 2540) → **2534** (δ rollup / post-flip watch); **judge**
+  → **2478** (eval-revival OFAT/confirm driver — the `models.judge` substitution
+  seam) + **2486** (mcp-verdict judge contract) + **2472** (eval Phase-1 validity
+  gate, now shipped); **triage** → **2485** (mcp-verdict triage contract), gated
+  on an input-replayability spike.
 - Assumed-substrate verified during authoring: `_invoke` chokepoint
   (workflow.py:7351-7359), plan shape available at selection time (workflow.py:7295),
   `retry_ledger`/typed-metadata pattern (shared/src/shared/task_metadata.py), event
@@ -152,8 +155,8 @@ Reconciled 2026-07-13 against the four sibling PRDs committed 2026-07-12
 | `plans/config-hot-reload-prd.md` (shipped) | extends | new `routing.*` config block joins green-tier `RELOADABLE_FIELDS` | this-prd | queued (task ε) |
 | `plans/author-declared-complexity-prd.md` (shipped) | extends | simple-path fallback story gains saturation stamp; declared-complexity semantics unchanged | this-prd | queued (task ν) |
 | `plans/harness-backend-reconnect-pi-prd.md` (T1=2457 **done**, T5=2460, T6=2461, pi=2463) | consumes 2461; boundary on the rest | δ consumes 2461's steward/triage CostStore rows (judge already records — do NOT re-instrument). Backend axis stays theirs: the resolver returns model/effort/budget/turns, NEVER backend; `backends.<role>` selection + provider pools + `_MODEL_COSTS`→prices are that PRD's. 2460 co-edits `_build_agent_env` (workflow.py:7304-7333) adjacent to ε — lock-serialized, no semantic overlap | each PRD its axis; **2461** owns steward/triage cost threading | δ dep wired at decompose |
-| `plans/eval-framework-revival-prd.md` (β=2466, ι=2472, ζ=2473, θ=2475, λ=2477, μ=2478, ν=2479, ξ=2480) | consumes | measurement/adoption split (decision 11): they measure, this PRD adopts. ι deps 2475+2478; κ deps 2472. This PRD never edits `evals/runner.py`/benchmark/judge machinery. Endpoint-swapped model bundles (per-role ANTHROPIC_BASE_URL) are their ν/ξ — a separate widening axis composing with this PRD's model axis | **eval-revival** owns the instrument; **this-prd** owns adoption flips | ι/κ deps wired at decompose |
-| `plans/mcp-verdict-servers-prd.md` (α=2481 in-progress, β=2482, ε=2485, ζ=2486) | consumes (contract stability) | κ trials judge/triage on the POST-migration verdict-tool transport → κ deps 2486 (judge) + 2485 (triage). 2482 injects verdict-tools at the `_invoke` spawn site; η co-edits steward.py near 2485 — lock-serialized | **mcp-verdict** owns the transport | κ deps wired at decompose |
+| `plans/eval-framework-revival-prd.md` (β=2466, ι=2472, ζ=2473, θ=2475, λ=2477, μ=2478, ν=2479, ξ=2480) | consumes | measurement/adoption split (decision 11): they measure, this PRD adopts. ι deps 2475+2478; κ-judge deps 2478 (the `models.judge` OFAT/confirm seam) + 2472 (validity gate) — per the 2026-07-19 per-role re-scope (esc-2540-2/D). This PRD never edits `evals/runner.py`/benchmark/judge machinery. Endpoint-swapped model bundles (per-role ANTHROPIC_BASE_URL) are their ν/ξ — a separate widening axis composing with this PRD's model axis | **eval-revival** owns the instrument; **this-prd** owns adoption flips | ι/κ deps wired at decompose |
+| `plans/mcp-verdict-servers-prd.md` (α=2481 in-progress, β=2482, ε=2485, ζ=2486) | consumes (contract stability) | κ trials judge/triage on the POST-migration verdict-tool transport → κ-judge deps 2486, κ-triage deps 2485 (per-role re-scope 2026-07-19, esc-2540-2/D). 2482 injects verdict-tools at the `_invoke` spawn site; η co-edits steward.py near 2485 — lock-serialized | **mcp-verdict** owns the transport | κ deps wired at decompose |
 | `plans/tier1-prompt-optimization-prd.md` (loader keys artifacts on executor model; its P-4 names this PRD) | produces | invariant 9 / decision 12: `resolve_route` completes before prompt assembly; the resolved model is available to the prompt-artifact loader call site. Per-model artifact sets make a routed reviewer/curator load the right heuristics block by construction | **this-prd** owns exposing the resolved model; **tier1** owns the loader + call site | no hard dep either way (their analysis, concurred) |
 | `plans/dashboard-taskgraph-legibility-prd.md` | none | disjoint dashboard surfaces (`tab_tasks.jsx` vs δ's new cost/routing panel) | — | no seam |
 | `plans/afk-digest.md` | produces | rollup + routing sections consumed by digest | this-prd | queued (task δ) |
@@ -342,17 +345,48 @@ Phase 3 — fleet rebalancing (survey Tier 1) + plan-shape generalization:
 - **κ — Haiku decide-and-act pilots: judge, triage, module_tagger**
   Modules: orchestrator (defaults.yaml / config; per-role trial scripts under
   scripts/ or evals/results/ artifacts — no eval-machinery restructuring), committed
-  trial reports. Per-role method: **judge** via OFAT single-role substitution
-  (`models.judge` override) on the revived framework over its fixtures — on the
-  post-2486 verdict-tool contract; **triage** + **module_tagger** via offline
-  replay-agreement trials (historical inputs, haiku-vs-sonnet output agreement,
-  frontier-adjudicated on disagreements — tier1's D-6 protocol shape, self-contained)
-  — triage on the post-2485 contract. Pass → flip that role to haiku on dark_factory
-  via hot-reload, watch δ's rollup for a fixed window, then defaults.yaml;
-  fail/marginal → report + escalate. Thresholds derive from δ's measured per-role
-  baseline (not guessed). Signal: per-role committed report + applied flips visible in
-  reload disposition + rollup rows showing haiku invocations for flipped roles.
-  Prereqs: δ; cross-PRD **2472**, **2485**, **2486**.
+  trial reports.
+
+  **Re-scoped per-role 2026-07-19 (esc-2540-2 → option D).** The original single
+  task required haiku pass/fail thresholds "derive from δ's measured per-role
+  baseline" — a false premise: δ's `model_role_rollup` (digest.py:506-584)
+  measures OUTCOME rates only (done/blocked/cap-hit, $/done), so it cannot supply
+  a *quality*/agreement parity threshold by construction. δ's real role here is
+  the post-flip fleet **watch** ("watch δ's rollup for a fixed window") and the
+  cost side of the F1/$ trade — never the pre-flip quality threshold. The three
+  roles have independent decision bases AND independent blockers, so κ is split
+  into three leaf sub-tasks (module_tagger keeps task 2540; judge/triage are new):
+
+  - **module_tagger** — proceeds now; dep δ=**2534** only. Offline
+    replay-agreement over historical tagging inputs
+    (`harness.py::_tag_task_modules`). Ground truth is directly available
+    (predicted files vs the files a task actually touched, recorded on every done
+    task), so haiku-vs-sonnet agreement + precision/recall vs ground truth is
+    self-contained: no eval framework, no 2478, no contract migration.
+  - **judge** — deferred behind the OFAT seam; deps **2478** + **2486** + **2472**.
+    OFAT single-role substitution (`models.judge` override) on the revived
+    framework over its fixtures, on the post-2486 verdict-tool contract. The
+    substitution seam is the eval-revival **OFAT/confirm driver = task 2478
+    (μ, pending)**; decision 11 forbids building it by editing `evals/runner.py`,
+    so 2478 is a hard dependency. Threshold basis: the **reviewer_trial scoring
+    precedent** (`orchestrator/src/orchestrator/evals/reviewer_trial/`) — F1 +
+    blocking_recall vs a labeled corpus, F1/$ cost efficiency,
+    adopt-if-parity-or-better-and-cheaper (coded gates recall>0.6 /
+    blocking_recall>0.5).
+  - **triage** — gated on an input-replayability spike; dep **2485**. Same
+    replay-agreement method as module_tagger, on the post-2485 contract, but the
+    steward's inner-triage INPUTS are not obviously persisted for offline replay
+    (`data/escalations/` is escalation-*watcher* output, a different role). First
+    step is a spike confirming the inner-triage inputs are reconstructable; if
+    not, bootstrap input logging or drop triage from κ.
+
+  Per-role decide-and-act unchanged: pass → flip that role to haiku on
+  dark_factory via hot-reload, watch δ's rollup a fixed window, then defaults.yaml;
+  fail/marginal → committed report + escalate. Signal (per sub-task): committed
+  trial report + applied flip visible in reload disposition + δ rollup rows
+  showing haiku invocations for the flipped role. Prereqs: δ=**2534** (all three);
+  judge additionally **2478** + **2486** + **2472**; triage additionally **2485**
+  + the spike.
 - **λ — simple_task tuning**
   Modules: orchestrator (defaults.yaml / config). Turns 30→50 + budget via α's now-live
   fields; saturation-rate metric (from δ) becomes the tracked indicator. Signal:
@@ -421,9 +455,16 @@ time.
 1. **Architect difficulty-hint field**. When the rollup shows where plan-shape routing
    mis-fires, design the plan-tool hint. **Suggested resolution:** file as a follow-up
    PRD/task once θ has ≥4 weeks of routing_decision data. Decide after Phase 3.
-2. **Exact haiku pass/fail thresholds per role in κ**. Must derive from δ's measured
-   baseline; the marginal band that escalates to a human is set inside κ. Decide during
-   κ implementation (basis: reviewer_trial scoring precedent).
+2. **Exact haiku pass/fail thresholds per role in κ** — **RESOLVED 2026-07-19
+   (esc-2540-2 → D).** Thresholds do **not** derive from δ's measured baseline: δ
+   measures outcome rates, not quality, so it cannot supply a parity threshold by
+   construction — it is the post-flip watch and the cost side of F1/$. Per-role
+   pre-flip basis: **judge** → reviewer_trial scoring precedent (F1 +
+   blocking_recall vs a labeled corpus, F1/$, adopt-if-parity-or-better-and-cheaper,
+   via the 2478 OFAT seam); **triage** + **module_tagger** → replay-agreement rate
+   (haiku-vs-sonnet output agreement, frontier-adjudicated; module_tagger also vs
+   ground-truth files). The marginal band that escalates to a human is still set
+   inside each κ sub-task. See §κ.
 3. **`metadata.routing` history depth** (N=5 suggested) and event payload size caps.
    Decide during γ.
 4. **Whether λ raises turns to 50 or 40**. Saturation data (28.6% at 30) supports a
