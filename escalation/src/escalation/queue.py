@@ -376,13 +376,22 @@ class EscalationQueue:
                 continue
         return results
 
-    def has_open_l1(self, task_id: str) -> bool:
+    def has_open_l1(self, task_id: str, *, category: str | None = None) -> bool:
         """Return True when the task has at least one pending level-1 escalation.
 
         Level-1 is the handed-to-human tier: the presence of one signals that
         the workflow must not auto-requeue the task — a human will unblock.
+
+        ``category``, when given, restricts the check to open L1s whose
+        ``.category`` matches — a signature filter (task 2757).  This lets a NEW
+        root cause (a different failure category) escape being silently
+        suppressed by an UNRELATED open L1.  Default None preserves the exact
+        prior behavior (any pending L1 counts).
         """
-        return bool(self.get_by_task(task_id, status='pending', level=1))
+        open_l1s = self.get_by_task(task_id, status='pending', level=1)
+        if category is not None:
+            open_l1s = [esc for esc in open_l1s if esc.category == category]
+        return bool(open_l1s)
 
     def get_pending(self) -> list[Escalation]:
         """Get all pending escalations."""
