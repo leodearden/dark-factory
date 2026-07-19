@@ -349,3 +349,86 @@ class TestBuildCompositeReport:
         row = report['configs'][0]
         assert row['judge']['invocations'] == 3
         assert row['judge']['cost_usd'] == pytest.approx(0.03)
+
+
+# ---------------------------------------------------------------------------
+# Task 2477 step-11: format_composite_table — deterministic renderer of the
+# C4 composite report (per-config table + a distinct price-table section).
+# ---------------------------------------------------------------------------
+
+def _priced_unpriced_report():
+    """A report with a PRICED config A and an UNPRICED-proxy config U.
+
+    A's cost_source is 'price_table' and it is listed in the price table; U's
+    cost_source is 'unpriced_proxy' and it carries the explicit unpriced marker.
+    """
+    from orchestrator.evals.report import build_composite_report
+
+    results = [
+        _mresult('f1', 'A', tr, quality=1.0, cost_usd=2.0, duration_ms=2000,
+                 cost_source='price_table')
+        for tr in (1, 2, 3)
+    ] + [
+        _mresult('f1', 'U', tr, quality=1.0, cost_usd=5.0, duration_ms=5000,
+                 cost_source='unpriced_proxy')
+        for tr in (1, 2, 3)
+    ]
+    price_table = {
+        'A': {'implementer': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
+        'U': {'implementer': {'source': 'unpriced'}},
+    }
+    return build_composite_report(results, price_table=price_table)
+
+
+class TestFormatCompositeTable:
+    """Deterministic ljust-width renderer mirroring format_recovery_table."""
+
+    def test_per_config_rows_and_columns(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(_priced_unpriced_report())
+        # A row line per config.
+        assert 'A' in out
+        assert 'U' in out
+        # The required columns are present as headers.
+        for header in ('composite', 'quality', 'cost_usd', 'cost_source', 'latency'):
+            assert header in out
+
+    def test_ci95_bracket_rendering(self):
+        import re
+
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(_priced_unpriced_report())
+        # A CI95 interval renders as ``[lo, hi]`` (e.g. [1.0000, 1.0000]).
+        assert re.search(r'\[\s*-?\d+\.\d+,\s*-?\d+\.\d+\]', out) is not None
+
+    def test_distinct_price_table_section(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(_priced_unpriced_report())
+        lower = out.lower()
+        # A distinct 'price table' section.
+        assert 'price table' in lower
+        # …listing each config→role→input/output per-1M.
+        assert 'input_per_1m' in out
+        assert 'output_per_1m' in out
+        assert 'implementer' in out
+
+    def test_unpriced_config_shows_explicit_marker_not_blank(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(_priced_unpriced_report())
+        # The per-config cost_source column shows the explicit proxy marker…
+        assert 'unpriced_proxy' in out
+        assert 'price_table' in out
+        # …and the price-table section shows the explicit 'unpriced' marker for U
+        # rather than a fabricated/blank price.
+        assert 'unpriced' in out
+
+    def test_renders_byte_identically_across_two_calls(self):
+        from orchestrator.evals.report import format_composite_table
+
+        report = _priced_unpriced_report()
+        # No wall-clock / dict-order dependence: same report → identical bytes.
+        assert format_composite_table(report) == format_composite_table(report)
