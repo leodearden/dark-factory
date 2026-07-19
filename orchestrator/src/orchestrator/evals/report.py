@@ -253,16 +253,28 @@ def build_composite_report(
 
 
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:
-    """Mean Elo across tasks, only for configs present in ALL tasks."""
+    """Mean Elo across tasks over the UNION of configs.
+
+    Retires the April all-tasks-INTERSECTION collapse (task 2477 λ / decision
+    10): a config that ran in ANY task gets an aggregate rating, averaged over
+    only the tasks in which it actually appears — rather than being dropped
+    unless it appeared in every task (which collapsed the leaderboard to the
+    handful of ever-present configs). ``build_report`` / ``compute_tiers`` /
+    ``format_markdown`` consume the returned dict unchanged. Configs are inserted
+    in sorted order so the mapping is deterministic.
+    """
     if not state.per_task:
         return {}
 
-    config_sets = [set(pool.ratings.keys()) for pool in state.per_task.values()]
-    common = set.intersection(*config_sets) if config_sets else set()
+    union = {cfg for pool in state.per_task.values() for cfg in pool.ratings}
 
     agg: dict[str, float] = {}
-    for cfg in common:
-        ratings = [state.per_task[t].ratings[cfg] for t in state.per_task]
+    for cfg in sorted(union):
+        ratings = [
+            pool.ratings[cfg]
+            for pool in state.per_task.values()
+            if cfg in pool.ratings
+        ]
         agg[cfg] = round(sum(ratings) / len(ratings), 1)
     return agg
 
