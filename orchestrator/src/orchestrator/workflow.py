@@ -6535,16 +6535,16 @@ class TaskWorkflow:
             prompt = await self.briefing.build_debugger_prompt(
                 result.failure_report(), self.plan, task_id=self.task_id,
             )
+            pre_head = await self._get_head_commit()
             debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
 
             # Write debugger iteration log entry
-            head_commit = await self._get_head_commit()
             self.artifacts.append_iteration_log({
                 'iteration': verify_attempt,
                 'agent': 'debugger',
                 'steps_attempted': [],
                 'steps_completed': [],
-                'commit': head_commit,
+                **await self._iteration_commit_provenance(pre_head),
                 'summary': f'Debug fix for: {result.summary[:100]}',
                 'source': 'orchestrator',
             })
