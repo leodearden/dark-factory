@@ -11028,3 +11028,30 @@ class TestGetHeadTreeHash:
         not_a_repo.mkdir()
         # Fail-safe: a non-git directory yields None, never raises.
         assert await git_ops.get_head_tree_hash(not_a_repo) is None
+
+
+# ---------------------------------------------------------------------------
+# step-1 RED: module-level _run helper feeds optional input_text to child stdin
+# ---------------------------------------------------------------------------
+#
+# git patch-id reads its patch only from stdin, so find_equivalent_commit needs
+# _run to be able to feed a diff to a child process. This is the primitive that
+# capability rests on; keep it hermetic (cat echoes stdin; git --version needs
+# no stdin).
+
+
+@pytest.mark.asyncio
+class TestRunInputText:
+    async def test_input_text_is_fed_to_child_stdin(self):
+        """When input_text is provided, it is written to the child stdin and
+        the child sees it (cat echoes stdin verbatim)."""
+        rc, out, _ = await _run(['cat'], input_text='hello world')
+        assert rc == 0
+        assert out == 'hello world'
+
+    async def test_input_text_omitted_still_runs_with_no_stdin(self):
+        """The default (input_text omitted) path is unchanged: a command that
+        needs no stdin still runs and returns its output."""
+        rc, out, _ = await _run(['git', '--version'])
+        assert rc == 0
+        assert out.startswith('git version')
