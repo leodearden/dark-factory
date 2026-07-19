@@ -5656,6 +5656,104 @@ class TestAmendOverwriteHaltsLoop:
 
 
 @pytest.mark.asyncio
+class TestAmendmentUncommittedWorkGuard:
+    """Task 2760: after a successful ``_amend`` that left the worktree dirty,
+    the execute/verify/review loop must auto-commit the amendment work as
+    ``wip: amendment round N`` BEFORE re-entering VERIFY/REVIEW.  Those phases
+    (and the merge queue) see only committed branch state, so a reviewed,
+    verified amendment can never silently fail to land.  Exactly one
+    ``amendment_uncommitted_recovered`` event records the recovery.
+    """
+
+    async def test_dirty_amendment_is_committed_before_reloop(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        from _recording_event_store import _RecordingEventStore
+
+        from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
+
+        stub = AgentStub()
+        workflow, _, _queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+            spawn_merge_worker=False,
+        )
+
+        # Real worktree so git_ops.commit / has_uncommitted_work operate on an
+        # actual repo (the guard commits the dirty tree for real).
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        await _init_repo(wt)
+        workflow.worktree = wt
+        workflow.event_store = _RecordingEventStore()
+
+        # All-done plan so _execute_iterations short-circuits each pass (no
+        # implementer invocation needed).
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init('42', 'T', 'd', base_commit='deadbeef')
+        plan = dict(PLAN)
+        plan['steps'] = [dict(s, status='done') for s in plan['steps']]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+
+        async def _verify_pass():
+            return WorkflowOutcome.DONE
+        workflow._verify_debugfix_loop = _verify_pass  # type: ignore[method-assign]
+
+        a_suggestion = {
+            'reviewer': 'analyst',
+            'severity': 'suggestion',
+            'category': 'naming',
+            'description': 'rename foo to bar',
+            'suggested_fix': 'foo -> bar',
+            'location': 'lib.py:1',
+        }
+        async def _review_one_suggestion(amendment_ctx=None):
+            return ReviewAggregation(
+                has_blocking_issues=False,
+                blocking_issues=[],
+                suggestions=[a_suggestion],
+                reviews={'analyst': {}},
+            )
+        workflow._review = _review_one_suggestion  # type: ignore[method-assign]
+        # Bypass the module-lock filter so the suggestion is in-scope and the
+        # amendment fires.
+        workflow._suggestions_in_scope = lambda s: list(s)  # type: ignore[method-assign]
+        # task 2750: the post-amendment review is scoped to the amendment
+        # delta; identity here (invoked on the second pass with the armed ctx).
+        workflow._apply_amendment_delta_scope = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda reviews, ctx: reviews,
+        )
+        workflow._route_review_suggestions_to_curator = AsyncMock()  # type: ignore[method-assign]
+
+        # _amend leaves the worktree dirty (uncommitted file) and returns True —
+        # exactly the data-loss condition the guard must recover.
+        async def _amend_leaves_dirty(in_scope, amendment_round):
+            (wt / 'amended.py').write_text(
+                f'# amendment round {amendment_round}\n'
+            )
+            return True
+        workflow._amend = _amend_leaves_dirty  # type: ignore[method-assign]
+
+        outcome = await workflow._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        # The guard committed the WIP: tree is now clean and HEAD is the wip
+        # commit (max_amendment_rounds defaults to 1, so round 2 exits to DONE).
+        assert (await git_ops.has_uncommitted_work(wt)) is False
+        _, subject, _ = await _run(
+            ['git', 'log', '-1', '--format=%s'], cwd=wt,
+        )
+        assert subject.strip().startswith('wip: amendment round 1')
+        # Exactly one recovery event, carrying round 1.
+        recs = [
+            rec for etype, rec in workflow.event_store.events
+            if str(etype).endswith('amendment_uncommitted_recovered')
+        ]
+        assert len(recs) == 1
+        assert recs[0]['data']['amendment_round'] == 1
+
+
+@pytest.mark.asyncio
 class TestMergePhaseEscalationGate:
     """Fix 3: Defense-in-depth gate at MERGE entry.  A blocking L0 escalation
     queued during execute/verify/review (from any code path — including
