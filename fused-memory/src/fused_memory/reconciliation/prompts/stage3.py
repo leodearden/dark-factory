@@ -1,6 +1,9 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
-from fused_memory.reconciliation.policies import SNAPSHOT_WRITE_BLOCKED_PROJECTS
+from fused_memory.reconciliation.policies import (
+    CONTAMINATION_CEILING_RETIRED_PROJECTS,
+    SNAPSHOT_WRITE_BLOCKED_PROJECTS,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
@@ -95,6 +98,32 @@ at the source keeps Stage 2 load clean.
 
 If you observe a task-count snapshot edge for any of these projects that appears \
 stale or missing, **skip the finding entirely**.
+
+## Contamination-Ceiling Retirement Exception (task 2818/2826)
+
+For projects whose Stage-1 task-ID "contamination ceiling" has been \
+**retired-by-design** (currently: {', '.join(sorted(CONTAMINATION_CEILING_RETIRED_PROJECTS))}), \
+the **ABSENCE or staleness** of a task-ID / contamination-ceiling guardrail \
+memory is the **CORRECT, intended state** — do NOT report it as \
+`missing_knowledge` or `memory_stale`.
+
+Background: the old ceiling was a hand-maintained task-ID threshold that aborted \
+task actions once the highest task ID crossed it. It was retired (task 2818) \
+because it defended against nothing real: high task IDs are normal project growth, \
+not evidence of cross-project contamination. Real contamination protection is now \
+**structural** — per-project isolation, the `DarkFactoryPathScopeViolation` \
+path-scope guard, and content-based `cross_project` routing (contamination is \
+identified by cited file paths/modules belonging to another repo, never by task-ID \
+magnitude). A guardrail memory encoding the retired ceiling is therefore something \
+that SHOULD be absent; reporting its absence/staleness triggers wasteful Stage 2 \
+remediation that would only re-invent a retired stopgap.
+
+A code-side gate (`filter_contamination_ceiling_findings` in `flag_dedup.py`) drops \
+these findings after the run as a defense-in-depth backstop — but avoiding them at \
+the source keeps Stage 2 load clean.
+
+If you are tempted to flag a task-ID / contamination-ceiling guardrail memory as \
+missing or stale for any of these projects, **skip the finding entirely**.
 
 ## Finding Classification (REQUIRED)
 Each finding MUST include these fields:
