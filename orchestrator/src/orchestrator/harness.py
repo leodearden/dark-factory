@@ -2769,6 +2769,12 @@ task, include it with an empty "files" list rather than omitting it.
                 # lane from the orphan reaper.  Release it back to the pool
                 # (cleanup_worktree routes lanes to release_warm_lane).
                 if is_lane:
+                    # Best-effort: adopt only if the sidecar is v2 (carries
+                    # its own task_id) — the only identity source available
+                    # on a no-plan lane (B3). Disposition is UNCHANGED
+                    # either way: the lane is still released back to the
+                    # pool below.
+                    self._adopt_recovered_session(entry, None)
                     logger.info(
                         f'Recovery: lane {task_id} has no plan — '
                         f'releasing back to pool'
@@ -2777,25 +2783,10 @@ task, include it with an empty "files" list rather than omitting it.
                     cleaned += 1
                     continue
 
-                sidecar_path = self._resolve_recovery_artifact(entry, 'agent_session.json')
-                if sidecar_path.exists():
-                    try:
-                        session_data = json.loads(sidecar_path.read_text())
-                        logger.info(
-                            f'Recovery: worktree {task_id} has agent session sidecar '
-                            f'(role={session_data.get("role")}, '
-                            f'session_id={session_data.get("session_id")}) '
-                            f'— preserving for resume'
-                        )
-                        self._preserved_worktrees.add(task_id)
-                        self._recovered_sessions[task_id] = session_data
-                        recovered += 1
-                        continue
-                    except (json.JSONDecodeError, OSError) as e:
-                        logger.warning(
-                            f'Recovery: worktree {task_id} sidecar unreadable, '
-                            f'falling back to cleanup: {e}'
-                        )
+                if self._adopt_recovered_session(entry, task_id) is not None:
+                    self._preserved_worktrees.add(task_id)
+                    recovered += 1
+                    continue
                 logger.info(
                     f'Recovery: worktree {task_id} has no plan — cleaning up'
                 )
