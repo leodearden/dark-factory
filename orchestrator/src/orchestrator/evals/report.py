@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import statistics
+from collections import defaultdict
 from datetime import UTC, datetime
 from itertools import combinations
 from math import sqrt
@@ -17,7 +18,7 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
-from .metrics import _rate
+from .metrics import _rate, blend_composite
 
 if TYPE_CHECKING:
     from .runner import EvalResult
@@ -126,6 +127,129 @@ def build_price_table(
             }
         table[config.name] = {config.role: role_price}
     return table
+
+
+def build_composite_report(
+    results: list[EvalResult],
+    *,
+    price_table: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the C4 per-config composite report over the UNION of configs.
+
+    This retires the April all-tasks-INTERSECTION collapse (see
+    :func:`compute_aggregate_ratings`): a config that ran in *any* fixture gets a
+    row, so a config present in only one fixture is no longer silently dropped.
+
+    Aggregation (Open-Q3 / decision 10) is per-fixture NORMALIZED composite →
+    mean with a small-sample CI:
+
+    1. For each fixture, ``best_cost`` / ``best_latency`` = the minimum POSITIVE
+       cost / latency across all trials of all configs on that fixture.
+    2. For each trial, the efficiency-adjusted composite is
+       ``blend_composite(quality=composite_score,
+       cost_score=_ratio_score(cost, best_cost),
+       latency_score=_ratio_score(latency, best_latency),
+       tests_pass=tests_pass)`` — so the cheapest+fastest+top-quality run of a
+       fixture scores highest, and a failing trial hard-gates to 0.
+    3. For each config, its per-trial composite / cost / latency / quality are
+       pooled across ALL its trials (every fixture) and reduced to a mean +
+       95% CI via :func:`mean_ci95`.
+
+    ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
+    working time, not wall-clock, so eval/scheduler overhead is not charged to
+    the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` /
+    ``cost_source`` are passthroughs of any trial's metrics (η/θ/P5 surfaces).
+    Rows are emitted sorted by ``config`` so the surface is byte-deterministic;
+    *price_table* (μ/CLI seeds it from :func:`build_price_table`) is echoed
+    verbatim, defaulting to ``{}`` when omitted.
+    """
+    # 1. Per-fixture best (min positive) cost and latency across ALL configs.
+    best_cost: dict[str, float] = {}
+    best_latency: dict[str, float] = {}
+    for r in results:
+        fixture = r.task_id
+        cost = float(r.metrics.get('cost_usd', 0.0) or 0.0)
+        latency = float(r.metrics.get('workflow_duration_ms', 0) or 0) / 1000.0
+        if cost > 0:
+            best_cost[fixture] = min(best_cost.get(fixture, cost), cost)
+        if latency > 0:
+            best_latency[fixture] = min(best_latency.get(fixture, latency), latency)
+
+    # 2/3. Accumulate per-trial normalized composites, pooled per config.
+    def _acc() -> dict[str, Any]:
+        return {
+            'composite': [], 'cost': [], 'latency': [], 'quality': [],
+            'passes': 0, 'trials': 0, 'fixtures': set(),
+            'judge_invocations': 0, 'judge_cost_usd': 0.0,
+            'first_metrics': None,
+        }
+
+    by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
+    for r in results:
+        fixture = r.task_id
+        m = r.metrics
+        quality = float(m.get('composite_score', 0.0) or 0.0)
+        cost = float(m.get('cost_usd', 0.0) or 0.0)
+        latency = float(m.get('workflow_duration_ms', 0) or 0) / 1000.0
+        tests_pass = m.get('tests_pass')
+        composite_trial = blend_composite(
+            quality,
+            _ratio_score(cost, best_cost.get(fixture, 0.0)),
+            _ratio_score(latency, best_latency.get(fixture, 0.0)),
+            tests_pass=tests_pass,
+        )
+        acc = by_config[r.config_name]
+        acc['composite'].append(composite_trial)
+        acc['cost'].append(cost)
+        acc['latency'].append(latency)
+        acc['quality'].append(quality)
+        acc['passes'] += 1 if tests_pass else 0
+        acc['trials'] += 1
+        acc['fixtures'].add(fixture)
+        acc['judge_invocations'] += int(m.get('judge_invocations', 0) or 0)
+        acc['judge_cost_usd'] += float(m.get('judge_cost_usd', 0.0) or 0.0)
+        if acc['first_metrics'] is None:
+            acc['first_metrics'] = m
+
+    rows: list[dict[str, Any]] = []
+    for cfg in sorted(by_config):
+        acc = by_config[cfg]
+        fm = acc['first_metrics'] or {}
+        composite_ci = mean_ci95(acc['composite'])
+        cost_ci = mean_ci95(acc['cost'])
+        latency_ci = mean_ci95(acc['latency'])
+        quality_ci = mean_ci95(acc['quality'])
+        trials = acc['trials']
+        rows.append({
+            'config': cfg,
+            'role_under_test': fm.get('role_under_test'),
+            'composite': composite_ci['mean'],
+            'quality': quality_ci['mean'],
+            'tests_pass_rate': (acc['passes'] / trials) if trials else 0.0,
+            'cost_usd': cost_ci['mean'],
+            'cost_source': fm.get('cost_source', 'cli'),
+            'latency_secs': latency_ci['mean'],
+            'trials': trials,
+            'fixtures': len(acc['fixtures']),
+            'ci95': {
+                'composite': composite_ci,
+                'cost': cost_ci,
+                'latency': latency_ci,
+            },
+            'judge': {
+                'invocations': acc['judge_invocations'],
+                'cost_usd': acc['judge_cost_usd'],
+            },
+            'recovery_score': fm.get('recovery_score'),
+            'plan_quality': fm.get('plan_quality'),
+        })
+
+    return {
+        'generated_at': datetime.now(UTC).isoformat(),
+        'aggregation': 'per_fixture_normalized_mean_ci',
+        'price_table': price_table if price_table is not None else {},
+        'configs': rows,
+    }
 
 
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:
