@@ -101,6 +101,14 @@ class _StoreScheduler:
         # scheduler stand-in must own the dict the same way the real Scheduler
         # does (scheduler.py: ``self._workflow_cancel_at: dict[str, float] = {}``).
         self._workflow_cancel_at: dict[str, float] = {}
+        # Task 2753: the merge-phase grace stamp dict lives on the Scheduler
+        # (single owner, beside _merge_phase_at).  The Harness reaches these
+        # through ``self.scheduler`` (harness.py: _run_slot finally →
+        # clear_merge_phase; the coordinator precondition →
+        # merge_phase_grace_active), so this stand-in mirrors them over its own
+        # dict the same way the real Scheduler does
+        # (scheduler.py: ``self._merge_phase_at: dict[str, float] = {}``).
+        self._merge_phase_at: dict[str, float] = {}
 
     def seed(self, task: dict) -> None:
         """Seed a task dict into the store (used during test setup)."""
@@ -166,6 +174,24 @@ class _StoreScheduler:
     def workflow_cancel_recent(self, tid: str) -> bool:
         cancelled_at = self._workflow_cancel_at.get(str(tid))
         return cancelled_at is not None and time.monotonic() - cancelled_at < 30.0
+
+    # Task 2753: merge-phase grace surface (mirrors the real Scheduler).  The
+    # workflow stamps entry to the pre-enqueue MERGE-phase window; the Harness
+    # _run_slot finally defensively clears it; the redeploy coordinator's
+    # precondition consults merge_phase_grace_active.
+    def note_merge_phase_entered(self, tid: str) -> None:
+        self._merge_phase_at[str(tid)] = time.monotonic()
+
+    def clear_merge_phase(self, tid: str) -> None:
+        self._merge_phase_at.pop(str(tid), None)
+
+    def merge_phase_grace_active(self, grace_secs: float) -> bool:
+        if grace_secs <= 0:
+            return False
+        now = time.monotonic()
+        return any(
+            now - stamp < grace_secs for stamp in self._merge_phase_at.values()
+        )
 
     def is_actively_held(self, tid: str) -> bool:
         """TaskGroundTruth._resolve_live_claimant (task 2243, W10-θ2) consults
