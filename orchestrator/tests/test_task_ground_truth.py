@@ -302,16 +302,23 @@ def _fake_git_ops(
     is_ancestor: bool = False,
     branch_sha: str | None = None,
     marker_sha: str | None = None,
+    citation_sha: str | None = None,
 ) -> MagicMock:
     """A minimal git_ops double exposing exactly the async surface
     TaskGroundTruth's branch-state archaeology consumes, plus the
     ``config.branch_prefix`` / ``config.main_branch`` attributes it derives
-    the branch name and main-ref from."""
+    the branch name and main-ref from.
+
+    ``citation_sha`` stubs ``find_task_citation_commit`` — the positive-citation
+    attribution guard the ON_MAIN git-archaeology fast-path applies (task 2787).
+    Defaults to ``None`` (no commit on main cites the task), which the guard
+    treats as a non-attributable trivial-ancestor branch (EXISTS_OFF_MAIN)."""
     git_ops = MagicMock()
     git_ops.config = MagicMock(branch_prefix=branch_prefix, main_branch=main_branch)
     git_ops.is_ancestor = AsyncMock(return_value=is_ancestor)
     git_ops.resolve_branch_sha = AsyncMock(return_value=branch_sha)
     git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+    git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     return git_ops
 
 
@@ -395,6 +402,28 @@ class TestDeriveTruthBranchStateGitFallback:
         git_ops.is_ancestor.assert_awaited_once_with('task/7', 'main')
         git_ops.resolve_branch_sha.assert_awaited_once_with('task/7')
         git_ops.find_merge_marker.assert_not_awaited()
+
+    async def test_ancestor_true_no_citation_resolves_exists_off_main(self) -> None:
+        """task 2787 regression: a branch trivially an ancestor of main (a
+        zero-commit tip == a FOREIGN task's merge commit — the main HEAD
+        captured at branch-create time) with NO commit on main citing this
+        task is NOT an attributable landing.  The ON_MAIN git-archaeology
+        fast-path must require a positive find_task_citation_commit hit and,
+        finding none, classify EXISTS_OFF_MAIN — never ON_MAIN carrying the
+        foreign branch tip (the 2729-stamped-with-2753's-merge recurrence).
+
+        RED on current main: the fast-path returns ON_MAIN(foreign tip)
+        unconditionally and never consults find_task_citation_commit."""
+        foreign_sha = 'fac4c813' + 'd' * 32
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha=foreign_sha, citation_sha=None,
+        )
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('2729')
+
+        assert report.branch_state == BranchState(BranchStateKind.EXISTS_OFF_MAIN)
+        git_ops.find_task_citation_commit.assert_awaited_once()
 
     async def test_branch_exists_not_ancestor_resolves_exists_off_main(self) -> None:
         git_ops = _fake_git_ops(is_ancestor=False, branch_sha='tipsha456')

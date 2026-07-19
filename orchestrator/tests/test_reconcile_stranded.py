@@ -694,6 +694,73 @@ class TestReconcileOneStrandedDegenerateBranchParity:
 
 
 # ---------------------------------------------------------------------------
+# task 2787 — the 2729/2753 foreign-branch-tip recurrence.
+#
+# A stranded in-progress task on a ZERO-COMMIT branch whose tip == the main
+# HEAD captured at branch-create time (an UNRELATED task's merge commit).
+# is_ancestor(branch, main) is trivially True, so the resolver's ON_MAIN
+# git-archaeology fast-path returns that FOREIGN commit as the "landing" sha.
+# _branch_is_degenerate no-ops (no branch_base_sha in metadata) and
+# warm_lane_ref_is_degenerate is False, so neither degeneracy signal catches
+# it; the foreign (genuinely-landed) commit's effect IS present at main, so the
+# CANDIDATE-mode effect-present guard passes too. Pre-fix the task
+# phantom-completes stamped with the foreign SHA. The resolver's
+# positive-citation attribution guard (task 2787) rejects the un-attributable
+# trivial-ancestor branch -> EXISTS_OFF_MAIN -> REVERT_TO_PENDING
+# (re-dispatch), never a found_on_main stamp of the foreign commit.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedForeignBranchTipGuard:
+    async def test_foreign_branch_tip_no_citation_reverts_not_marked_done(
+        self, harness: Harness,
+    ):
+        """The 2729/2753 recurrence: a zero-commit branch trivially an ancestor
+        of main (tip == a foreign task's merge commit) with NO commit on main
+        citing this task must NOT be stamped found_on_main with that foreign
+        SHA — it reverts to pending (re-dispatch) instead.
+
+        RED on current main: the resolver classifies ON_MAIN(foreign tip), no
+        degeneracy signal fires, the foreign effect is present, so the sweep
+        marks done with the foreign SHA."""
+        tid = '2729'
+        # The branch tip is an UNRELATED task's merge commit (the main HEAD at
+        # branch-create time), NOT any commit this task produced.
+        foreign_sha = 'fac4c813' + 'd' * 32
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        # No branch_base_sha in metadata (fixture synthesizes
+        # {'status': 'in-progress', 'metadata': {}} from get_statuses) ->
+        # _branch_is_degenerate no-ops.
+        # Zero-commit branch is trivially an ancestor of main; its tip is the
+        # foreign merge commit.
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=foreign_sha)  # type: ignore[attr-defined]
+        # NO commit on main cites 2729 — it never did any work.
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=None)  # type: ignore[attr-defined]
+        # Neither degeneracy signal fires (no branch_base_sha; primitive False),
+        # and the foreign commit's effect genuinely IS present at main — exactly
+        # the gap that let the foreign SHA through pre-fix.
+        harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+        harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+
+        result = await harness._reconcile_stranded_in_progress()
+
+        # The foreign commit is NEVER stamped as this task's landing.
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        # Belt-and-suspenders: prove no set_task_status call carried a
+        # found_on_main provenance (which would cite the foreign SHA).
+        for call in harness.scheduler.set_task_status.call_args_list:  # type: ignore[attr-defined]
+            provenance = call.kwargs.get('done_provenance')
+            assert provenance is None, (
+                f'foreign SHA must never be stamped as a landing; got {provenance!r}'
+            )
+        assert result == 1
+
+
+# ---------------------------------------------------------------------------
 # _reconcile_stranded_in_progress tests
 # ---------------------------------------------------------------------------
 
