@@ -27,8 +27,11 @@ import random
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from orchestrator.agents.triage import has_simple_task_blocker
+from orchestrator.evals.snapshots import _run as _git_run
+from orchestrator.evals.snapshots import get_diff_between_commits
 
 __all__ = [
     'Cell',
@@ -36,12 +39,17 @@ __all__ = [
     'ReferenceCapture',
     'SampleResult',
     'build_fixture_record',
+    'capture_reference',
     'cell_of',
     'classify_kind',
     'classify_path',
     'default_verify_commands',
+    'discover_completed_tasks',
     'landed_verify_outcome',
+    'materialize_reference_diff',
+    'pin_eval_branch',
     'repo_of',
+    'resolve_task_commits_from_merge',
     'sample_stratified',
     'stratify',
 ]
@@ -455,3 +463,139 @@ def build_fixture_record(
         'verify_outcome': landed_verify_outcome(verify_commands),
         'plan': plan,
     }
+
+
+# ---------------------------------------------------------------------------
+# Git glue — merge-log discovery, commit resolution, reference capture, pin
+# ---------------------------------------------------------------------------
+
+# A completed-task merge subject: ``Merge task/<id> into main``. The id is the
+# task id (may be non-numeric for legacy fixtures, so ``\S+``).
+_MERGE_SUBJECT_RE = re.compile(r'Merge task/(\S+) into main')
+
+
+async def resolve_task_commits_from_merge(
+    repo_root: Path | str, merge_sha: str,
+) -> tuple[str, str]:
+    """Resolve ``(pre, post)`` = ``(M^1, M)`` for merge commit *merge_sha*.
+
+    ``pre = M^1`` is prior main (the eval baseline
+    ``snapshots.create_eval_worktree`` checks out); ``post = M`` is the landed
+    state (where ``evals/<id>`` is pinned). Both are returned as full SHAs.
+    """
+    root = Path(repo_root)
+    pre = await _git_run(['git', 'rev-parse', f'{merge_sha}^1'], cwd=root)
+    post = await _git_run(['git', 'rev-parse', merge_sha], cwd=root)
+    return pre, post
+
+
+async def capture_reference(
+    repo_root: Path | str, pre: str, post: str,
+) -> ReferenceCapture:
+    """Capture the compact ``pre..post`` reference block (no full inline diff).
+
+    Parses ``git diff --numstat pre..post`` into a ``(files, insertions,
+    deletions)`` diff stat. Binary files (numstat ``-`` columns) count toward
+    ``files`` but contribute no line counts. The full diff stays retrievable
+    via :func:`materialize_reference_diff` off the pinned branch.
+    """
+    root = Path(repo_root)
+    numstat = await _git_run(['git', 'diff', '--numstat', f'{pre}..{post}'], cwd=root)
+    files = insertions = deletions = 0
+    for line in numstat.splitlines():
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+        added, deleted = parts[0], parts[1]
+        files += 1
+        if added != '-':
+            insertions += int(added)
+        if deleted != '-':
+            deletions += int(deleted)
+    post_full = await _git_run(['git', 'rev-parse', post], cwd=root)
+    return ReferenceCapture(
+        post_task_commit=post_full,
+        files=files,
+        insertions=insertions,
+        deletions=deletions,
+    )
+
+
+async def materialize_reference_diff(
+    repo_root: Path | str, pre: str, post: str,
+) -> str:
+    """Return the full ``git diff pre..post`` — the judge's reference diff.
+
+    Delegates to ``snapshots.get_diff_between_commits`` (no worktree needed),
+    the same helper the eval pipeline already uses; the diff stays retrievable
+    from the pinned ``evals/<id>`` branch so the judge grades a non-empty
+    landed diff via its ``result.get('diff')`` reference-contender short-circuit.
+    """
+    return await get_diff_between_commits(Path(repo_root), pre, post)
+
+
+async def pin_eval_branch(
+    repo_root: Path | str, fixture_id: str, post: str,
+) -> str:
+    """Idempotently pin branch ``evals/<fixture_id>`` at *post*; return its name.
+
+    Uses ``git update-ref`` (not ``git branch``), so a second call re-points
+    the ref to the same SHA without erroring — the branch is a stable, retriev-
+    able handle on the landed commit for the judge's reference contender.
+    """
+    root = Path(repo_root)
+    branch = f'evals/{fixture_id}'
+    post_full = await _git_run(['git', 'rev-parse', post], cwd=root)
+    await _git_run(
+        ['git', 'update-ref', f'refs/heads/{branch}', post_full], cwd=root,
+    )
+    return branch
+
+
+async def discover_completed_tasks(
+    repo_root: Path | str,
+    since: str | None = None,
+    *,
+    project: str,
+    project_root: str | None = None,
+) -> list[CompletedTaskCandidate]:
+    """Discover completed-task merges via the git log (read-only).
+
+    Runs ``git log --grep='Merge task/' [--since=<since>]`` and parses each
+    ``Merge task/<id> into main`` subject into a :class:`CompletedTaskCandidate`
+    STUB carrying ``task_id`` + ``merge_sha`` + resolved ``pre_commit`` (M^1) /
+    ``post_commit`` (M). ``title`` / ``description`` / ``complexity`` /
+    ``modules`` are left empty for a downstream enrichment pass (the CLI fills
+    them from the task DB before classifying); a stub alone classifies to the
+    default cell.
+
+    *project* / *project_root* tag the candidates with their repo of origin
+    (``project_root`` defaults to *repo_root*), so branch pinning later lands
+    in each fixture's own checkout.
+    """
+    root = Path(repo_root)
+    resolved_root = project_root or str(root)
+    cmd = ['git', 'log', '--grep=Merge task/', '--pretty=%H %s']
+    if since:
+        cmd.insert(2, f'--since={since}')
+    out = await _git_run(cmd, cwd=root)
+
+    candidates: list[CompletedTaskCandidate] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        sha, _, subject = line.partition(' ')
+        match = _MERGE_SUBJECT_RE.search(subject)
+        if not match:
+            continue
+        pre = await _git_run(['git', 'rev-parse', f'{sha}^1'], cwd=root)
+        candidates.append(CompletedTaskCandidate(
+            task_id=match.group(1),
+            project=project,
+            project_root=resolved_root,
+            pre_commit=pre,
+            post_commit=sha,
+            merge_sha=sha,
+        ))
+    return candidates
