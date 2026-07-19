@@ -410,3 +410,84 @@ class TestRunMatrixStage:
         # 1 arch × 2 impl = 2 pairs × 1 fixture × 3 trials = 6 cells.
         assert len(results) == 2 * 1 * 3
         assert sorted(seen_trials) == [1, 1, 2, 2, 3, 3]
+
+
+# ---------------------------------------------------------------------------
+# step-11/12 — run_confirm_stage: ONE end-to-end confirmation batch of the winner.
+#
+# The final both-live stage: the SINGLE winning (arch, impl) combo run across
+# every fixture × N trials, N>=3 by default (decision 10's statistics floor —
+# enough trials for a CI95 on the winner, NOT the 1-trial screen default of the
+# OFAT/matrix stages). run_end_to_end is monkeypatched to record the combo.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRunConfirmStage:
+    async def test_runs_single_winning_combo_over_fixtures_and_trials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect')
+        impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
+
+        e2e_calls: list[tuple[str, str, str, int]] = []
+
+        async def fake_run_end_to_end(task_path, arch_config, impl_config, *_a, trial=1, **_k):
+            e2e_calls.append((task_path.stem, arch_config.name, impl_config.name, trial))
+            return EvalResult(
+                task_path.stem, f'{arch_config.name}+{impl_config.name}',
+                'done', {'role_under_test': 'end_to_end'}, '/tmp/wt', trial=trial,
+            )
+
+        monkeypatch.setattr(runner, 'run_end_to_end', fake_run_end_to_end)
+
+        results = await runner.run_confirm_stage(
+            [t1, t2], arch_winner, impl_winner, base_config=None, trials=4,
+        )
+
+        # Exactly ONE combo — the winner — across every cell.
+        seen_pairs = {(c[1], c[2]) for c in e2e_calls}
+        assert seen_pairs == {('arch-opus', 'impl-sonnet')}
+        # N trials per fixture: 2 fixtures × 4 trials = 8 cells.
+        assert len(e2e_calls) == 2 * 4
+        assert len(results) == 2 * 4
+        # N distinct trials per fixture (all confirmation trials of the winner).
+        trials_for_t1 = sorted(c[3] for c in e2e_calls if c[0] == 'df_task_a')
+        assert trials_for_t1 == [1, 2, 3, 4]
+
+    async def test_default_trials_meets_statistics_floor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        # Decision 10's statistics floor: the confirmation batch defaults to
+        # N>=3 trials (enough for a CI95 on the winner) — NOT the 1-trial default
+        # of the OFAT/matrix screen stages.
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t1.touch()
+
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect')
+        impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
+
+        async def fake_run_end_to_end(task_path, arch_config, impl_config, *_a, trial=1, **_k):
+            return EvalResult(
+                task_path.stem, f'{arch_config.name}+{impl_config.name}',
+                'done', {}, '/tmp/wt', trial=trial,
+            )
+
+        monkeypatch.setattr(runner, 'run_end_to_end', fake_run_end_to_end)
+
+        # Called WITHOUT an explicit trials= → the N>=3 default kicks in.
+        results = await runner.run_confirm_stage(
+            [t1], arch_winner, impl_winner, base_config=None,
+        )
+
+        # >=3 results for the single fixture, distinct trials 1..N.
+        assert len(results) >= 3
+        assert {r.trial for r in results} >= {1, 2, 3}
