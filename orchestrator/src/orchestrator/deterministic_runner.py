@@ -320,6 +320,26 @@ _INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 # runner's own dedup/quiescence/resolution-proof signal.
 DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
 
+# Task 2803 (γ, PRD plans/operational-ask-routing-prd.md): stable, fixed
+# token emitted on a pure-gate born-at-L2 escalation's summary/detail when
+# the gate originated from an execution_class='operational' +
+# operational_mode='llm' submission — makes it machine-distinguishable from
+# a plain deterministic gate (a future LLM-operational-lane PRD consumes
+# this as its trigger; INV-2 requires a structured token, not log-scraped
+# prose).
+OPERATIONAL_LLM_NEEDS_LANE_TOKEN: str = 'operational_llm_needs_lane'
+
+# Task 2803 (γ): mirrors β's producer key
+# (fused_memory.middleware.operational_routing_guard.OPERATIONAL_LLM_GATE_MARKER_KEY,
+# task 2802) as a bare orchestrator-side literal — orchestrator does not
+# depend on the fused_memory package (see DETERMINISTIC_AGENT_ROLE-adjacent
+# metadata-key-as-literal convention used for task_kind/before_done/
+# gate_escalated_at elsewhere in this module). β stamps this key True ONLY
+# for execution_class='operational' + operational_mode='llm' — a
+# decision+operational_mode='llm' gate does NOT get it, so this (not the raw
+# operational_mode) is the precise signal to key on.
+OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
+
 # Task 2238 (W10-δ): a guaranteed-non-self placeholder `own_unit` fed to
 # proc_supervision.RestartPlan.execute() on the cross-unit blocking deploy
 # path when the runner's own ORCH_UNIT-derived own_unit is falsy (the
@@ -366,6 +386,18 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     validation happens at runtime, in the model itself.
     """
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
+
+
+def _is_operational_llm_gate(metadata: dict) -> bool:
+    """Return True iff *metadata* carries β's operational-llm-gate marker.
+
+    Task 2803 (γ). Keys on ``OPERATIONAL_LLM_GATE_MARKER_KEY`` (an explicit
+    ``is True`` check, not mere truthiness) rather than the raw
+    ``operational_mode`` field — a ``decision``+``operational_mode='llm'``
+    pure gate preserves ``operational_mode='llm'`` too but never gets this
+    marker, so reading the raw mode would false-positive that case.
+    """
+    return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
 
 
 class DeterministicRunner:
@@ -1328,6 +1360,15 @@ class DeterministicRunner:
         if dep_ids:
             detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
         detail = '\n'.join(detail_parts)
+        if _is_operational_llm_gate(metadata):
+            # Task 2803 (γ): token-first prefix so downstream truncation (the
+            # summary's [:200] below) can never sever it; detail itself is
+            # not truncated. Plain gates (marker absent) are byte-unchanged.
+            detail = (
+                f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
+                'LLM-operational handling; no automated lane exists yet — resolve '
+                'by hand.\n\n'
+            ) + detail
         gate_options = metadata.get('gate_options') or []
 
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
