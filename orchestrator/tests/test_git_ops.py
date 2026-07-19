@@ -6347,6 +6347,25 @@ index 000000..bbbbbb
 +line 5
 """
 
+# An added *content* line whose text begins with '++ b/' renders in a unified
+# diff as '+++ b/…' — indistinguishable at a string-prefix level from a real
+# '+++ b/<path>' file header.  A robust new-side parser must only treat such a
+# line as a header when it immediately follows the '--- ' old-side header, not
+# when it sits in a hunk body.  Here the injected content line and the second
+# real hunk both belong to src/real.rs.
+CANNED_DIFF_CONTENT_LOOKS_LIKE_HEADER = """\
+diff --git a/src/real.rs b/src/real.rs
+index aaaaaa..bbbbbb 100644
+--- a/src/real.rs
++++ b/src/real.rs
+@@ -1,0 +2,3 @@
++normal added line
++++ b/injected.rs
++another normal line
+@@ -50,0 +80,1 @@
++later hunk line
+"""
+
 
 class TestParseDiffLineRanges:
     """Unit tests for parse_diff_line_ranges (pure function, no git invocation)."""
@@ -6588,6 +6607,25 @@ class TestParseDiffAddedLineRanges:
         """(f) Empty/header-only diff → {}."""
         fn = self._fn()
         assert fn('') == {}
+
+    def test_content_line_resembling_new_file_header_is_not_a_header(self):
+        """(g) A hunk-body '+++ b/…' content line is NOT parsed as a file header.
+
+        An added content line whose text begins with '++ b/' renders as
+        '+++ b/…' in a unified diff.  It must not reset current_file: the bogus
+        path must never become a key, and the file's later hunks must stay
+        attributed to the real +++ b/ path.  (Regression: task 2750 amendment —
+        reviewer robustness note on parse_diff_added_line_ranges.)
+        """
+        fn = self._fn()
+        result = fn(CANNED_DIFF_CONTENT_LOOKS_LIKE_HEADER)
+        assert 'injected.rs' not in result, (
+            "a hunk-body '+++ b/injected.rs' content line must not be treated "
+            'as a new-file header'
+        )
+        # Both hunks belong to the real file: (2,4) from @@ +2,3 and (80,80)
+        # from @@ +80,1 — the second must not be misattributed to a bogus path.
+        assert result.get('src/real.rs') == [(2, 4), (80, 80)]
 
 
 @pytest.mark.asyncio

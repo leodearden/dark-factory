@@ -1144,12 +1144,23 @@ def parse_diff_added_line_ranges(diff_text: str) -> dict[str, list[tuple[int, in
     no new-side path and produces no entry.  Pure renames (no ``+++ b/`` line,
     no content change) likewise produce no new-side entry.
 
+    A ``+++ b/…`` / ``+++ /dev/null`` line is treated as a file header only when
+    it immediately follows the ``--- `` old-side header.  An added *content*
+    line whose text begins with ``++ b/`` renders in a unified diff as
+    ``+++ b/…`` — indistinguishable at a string-prefix level from a real header;
+    the preceding-line guard keeps such a hunk-body line from being misread as a
+    new-file header and silently resetting the current file (which would drop
+    that file's later hunks onto a bogus path).
+
     Returns an empty dict for an empty or header-only diff.
     """
     import re
 
     result: dict[str, list[tuple[int, int]]] = {}
     current_file: str | None = None
+    # True iff the previous line was the ``--- `` old-side diff header; gates
+    # the ``+++`` header branches below (see docstring).
+    prev_is_old_header = False
 
     hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
 
@@ -1157,11 +1168,11 @@ def parse_diff_added_line_ranges(diff_text: str) -> dict[str, list[tuple[int, in
         if line.startswith('diff --git '):
             # Start of a new file block — reset per-file state.
             current_file = None
-        elif line.startswith('+++ b/'):
+        elif prev_is_old_header and line.startswith('+++ b/'):
             current_file = line[6:]
             if current_file not in result:
                 result[current_file] = []
-        elif line.startswith('+++ /dev/null'):
+        elif prev_is_old_header and line.startswith('+++ /dev/null'):
             # File deletion: no new-side path — skip hunk parsing for this block.
             current_file = None
         elif current_file is not None:
@@ -1174,6 +1185,7 @@ def parse_diff_added_line_ranges(diff_text: str) -> dict[str, list[tuple[int, in
                     continue
                 end = new_start + new_count - 1
                 result[current_file].append((new_start, end))
+        prev_is_old_header = line.startswith('--- ')
 
     return result
 
