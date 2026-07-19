@@ -819,6 +819,47 @@ class TestFindEquivalentCommit:
 
         assert result is None
 
+    async def test_ambiguous_patch_id_in_range_returns_none(self, git_repo, git_ops):
+        """Case G (ambiguous patch-id): TWO commits in base..HEAD share the
+        orphaned commit's patch-id (a file added, removed, then re-added
+        byte-identically). The method must never silently re-point the orphan
+        to an arbitrary one of the colliding shas — it treats the patch-id as
+        ambiguous (the same 'never guess' posture tier 2 applies to an
+        ambiguous subject) and, with no unique subject to fall back on,
+        returns None.
+
+        Regression guard: `git log -p` emits newest-first, so a naive
+        {patch-id: sha} map (last write wins) would hold the OLDEST colliding
+        sha and mis-point the step to it."""
+        base = await _head(git_repo)
+
+        # Orphan S: add dup.py, then reset it away so S is unreachable from
+        # HEAD. Its subject is unique so the subject tier cannot rescue it.
+        (git_repo / 'dup.py').write_text('duplicated diff\n')
+        s = await git_ops.commit(git_repo, 'orphan: unique-subject')
+        assert s
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+
+        # Build base..HEAD with two patch-id-colliding commits: add dup.py,
+        # remove it, then re-add byte-identical content. C1 and C3 both
+        # reproduce the same "new file dup.py + duplicated diff" hunk, so they
+        # share one patch-id — which also equals S's.
+        (git_repo / 'dup.py').write_text('duplicated diff\n')
+        c1 = await git_ops.commit(git_repo, 'dup: add one')
+        (git_repo / 'dup.py').unlink()
+        c2 = await git_ops.commit(git_repo, 'dup: remove')
+        (git_repo / 'dup.py').write_text('duplicated diff\n')
+        c3 = await git_ops.commit(git_repo, 'dup: add two')
+        assert c1 and c2 and c3
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None, (
+            'an ambiguous patch-id (two colliding commits in base..HEAD) must '
+            f'never be remapped; expected None but got {result} '
+            f'(c1={c1}, c3={c3})'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 2762 step-7 RED: _reconcile_done_step_commits remaps a clean rebase

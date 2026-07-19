@@ -6985,7 +6985,12 @@ class GitOps:
            target and the range guarantees both sides are normalized by the
            same code path. The ``<patch-id> <sha>`` line the range form emits
            maps the shared patch-id to the REPLAYED (HEAD-side) sha, which is
-           exactly the remap target.
+           exactly the remap target. If TWO commits in ``base_sha..HEAD`` share
+           a patch-id (a diff reverted then re-applied, or genuinely identical
+           hunks), that patch-id is ambiguous — we cannot tell which sha the
+           orphan replayed onto — so it is skipped rather than resolved to an
+           arbitrary one of them, the same 'never guess' posture tier 2 applies
+           to an ambiguous subject.
         2. **unique exact-subject** (fallback): when the patch-id lookup
            misses — e.g. a rebase that resolved a conflict altered the diff
            but preserved the commit message — recover the replayed sha only if
@@ -7026,11 +7031,27 @@ class GitOps:
                     ['git', 'patch-id', '--stable'], cwd=worktree, input_text=range_diff,
                 )
                 pid_to_sha: dict[str, str] = {}
+                ambiguous_pids: set[str] = set()
                 for line in range_pid_out.splitlines():
                     parts = line.split()
                     if len(parts) >= 2:
-                        pid_to_sha[parts[0]] = parts[1]
-                if target_pid and target_pid in pid_to_sha:
+                        pid = parts[0]
+                        if pid in pid_to_sha:
+                            # Two commits in base..HEAD share a patch-id (a
+                            # diff reverted then re-applied, or genuinely
+                            # identical hunks). We cannot know which one the
+                            # orphaned step replayed onto, so mark the patch-id
+                            # ambiguous and fall through — the same 'never
+                            # guess' posture tier 2 applies to an ambiguous
+                            # subject, rather than silently keeping whichever
+                            # colliding sha the dict happens to retain.
+                            ambiguous_pids.add(pid)
+                        pid_to_sha[pid] = parts[1]
+                if (
+                    target_pid
+                    and target_pid in pid_to_sha
+                    and target_pid not in ambiguous_pids
+                ):
                     return pid_to_sha[target_pid]
 
             # Tier 2: unique exact-subject fallback. Only fires when the
