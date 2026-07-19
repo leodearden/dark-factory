@@ -15,6 +15,7 @@ Fixtures are kept module-local (no conftest.py) per the established convention
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -194,3 +195,74 @@ class TestSidecarV2Wiring:
         assert seen['resume_count'] == 3
         # resumed against the prior session id, not a fresh uuid4
         assert seen['session_id'] == 'prior-sess-xyz'
+
+
+def _preserve_records(caplog) -> list[logging.LogRecord]:
+    """LogRecords carrying the structured agent_session_preserved fact.
+
+    The fact lives entirely in ``extra`` (INV-2 — no log-scrape), so it is
+    identified by the ``event`` attribute, not by matching prose.
+    """
+    return [
+        r for r in caplog.records
+        if getattr(r, 'event', None) == 'agent_session_preserved'
+    ]
+
+
+@pytest.mark.asyncio
+class TestPreserveOnCancellation:
+    """MECHANISM 2 (I1): _invoke clears the sidecar on completion but PRESERVES
+    it on CancelledError (cancellation is not completion), emitting a structured
+    agent_session_preserved fact at the preserve point."""
+
+    async def test_completion_clears_sidecar(
+        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        caplog.set_level(logging.INFO)
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        # Completion → sidecar cleared, and NO preserve fact was emitted.
+        assert workflow.artifacts is not None
+        assert workflow.artifacts.read_agent_session() is None
+        assert _preserve_records(caplog) == []
+
+    async def test_cancellation_preserves_sidecar_and_emits_fact(
+        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        caplog.set_level(logging.INFO)
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ), pytest.raises(asyncio.CancelledError):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        # CancelledError from the invoke → the sidecar SURVIVES (still in-flight),
+        # carrying the durable v2 binding.
+        assert workflow.artifacts is not None
+        session = workflow.artifacts.read_agent_session()
+        assert session is not None
+        assert session.task_id == str(workflow.task_id)
+        assert session.schema_version == 2
+
+        # Exactly one structured preserve fact, with its fields at the decision
+        # point (task_id / session_id / role in extra).
+        records = _preserve_records(caplog)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.task_id == str(workflow.task_id)
+        assert rec.session_id == workflow._last_invoke_session_id
+        assert rec.role == SIMPLE_TASK.name
