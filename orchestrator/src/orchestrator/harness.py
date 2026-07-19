@@ -7870,8 +7870,10 @@ task, include it with an empty "files" list rather than omitting it.
 
         On restart, SpeculativeMergeWorker is constructed fresh (un-halted,
         no owner).  _dismiss_stale_escalations intentionally preserves pending
-        level-1 wip_conflict/unmerged_state escalations — but NOTHING
-        re-asserts the corresponding halt or re-registers the halt owner.
+        level-1 wip_conflict/unmerged_state/stash_failed escalations — but
+        NOTHING re-asserts the corresponding halt or re-registers the halt
+        owner.  (stash_failed is the main-checkout-hygiene halt category from
+        task 2758: a park of project_root's dirty tracked tree failed.)
 
         This method scans the settled post-dismissal queue for preserved L1s
         of the relevant categories and restores the (halted, owner-registered)
@@ -7886,7 +7888,8 @@ task, include it with an empty "files" list rather than omitting it.
 
         candidates = [
             esc for esc in self._escalation_queue.get_pending()
-            if esc.level == 1 and esc.category in {'wip_conflict', 'unmerged_state'}
+            if esc.level == 1
+            and esc.category in {'wip_conflict', 'unmerged_state', 'stash_failed'}
         ]
         if not candidates:
             return None
