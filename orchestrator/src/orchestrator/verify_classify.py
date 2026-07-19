@@ -327,8 +327,8 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
 
 
 def _classify_environmental(output: str) -> FailureCategory | None:
-    """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT /
-    ENV_TRANSIENT (broken ``_merge-verify`` worktree).
+    """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
+    ``_merge-verify`` worktree, incl. restart collateral) / SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -336,6 +336,23 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     per-tool table is the right home for them. Returns ``None`` (the caller
     proceeds to per-tool dispatch) when none of these conditions is grounded
     in *output*.
+
+    ORDERING (task 2831 reorder — more-specific root cause wins on
+    co-occurrence): DISK_FULL (ENOSPC/linker) is checked FIRST, then the
+    broken-``_merge-verify``-worktree ENV_TRANSIENT checks (task 2756's
+    Cargo.lock signature + task 2831's restart-collateral shapes), and ONLY
+    THEN the looser SEMAPHORE_TIMEOUT lock+timeout heuristic. Broken-worktree
+    collateral is a more-specific root cause than the loose lock+timeout
+    heuristic, so it wins over SEMAPHORE_TIMEOUT (see
+    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore`` — a replayed
+    wrapper lock/timeout line co-occurring with collateral shapes classifies
+    ENV_TRANSIENT, not SEMAPHORE_TIMEOUT); DISK_FULL/ENOSPC remains the
+    most-specific root cause and stays first (see
+    ``test_enospc_with_unreadable_lock_stays_disk_full`` and
+    ``test_enospc_with_collateral_stays_disk_full``). Before task 2831, the
+    broken-worktree checks ran AFTER the semaphore arm; they are reordered
+    ahead of it here because a removed verify worktree is never a genuine
+    slot/lock-acquisition timeout co-occurrence.
 
     SEMAPHORE_TIMEOUT deterministic-diagnostic veto (task 2748): a genuine
     slot/lock-acquisition timeout is raised by the concurrency-limiter
@@ -346,8 +363,10 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     incidental to a deterministic lint/compile failure, so this returns
     ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
     dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
-    markers are specific enough (and checked first) that a compile/lint
-    failure caused by a genuinely full disk must stay DISK_FULL.
+    markers and the broken-worktree ENV_TRANSIENT checks (below) are more
+    specific and checked first, so a compile/lint failure caused by a
+    genuinely full disk or a removed worktree stays DISK_FULL/ENV_TRANSIENT
+    respectively.
 
     SEMAPHORE_TIMEOUT deterministic-TEST-VERDICT veto (task 2821, reify
     2026-07-19 red-main incident, /deb deb-reify-964887): generalizes the
@@ -382,17 +401,19 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ENV_TRANSIENT — broken verify worktree (task 2756): a malformed
     ``_merge-verify`` worktree (e.g. an unreadable or missing ``Cargo.lock``)
     is a property of the HOST/environment, not of whichever guard script or
-    tool happened to trip over it, so it is checked LAST here — after the
-    more specific ENOSPC/linker/semaphore checks, so a co-occurring disk-full
+    tool happened to trip over it, so it is checked immediately after the
+    more specific ENOSPC/linker DISK_FULL checks — a co-occurring disk-full
     still wins as the more specific root cause (see
-    ``test_enospc_with_unreadable_lock_stays_disk_full``) — and wins over
-    per-tool dispatch regardless of ``ToolKind``. This source is DISTINCT
-    from the pytest-scoped shared-venv ``_ENV_TRANSIENT_PATTERNS`` below
-    (different grounded patterns mapping to the same ``ENV_TRANSIENT``
-    category, exactly like how ``DISK_FULL`` above is produced by this same
-    tool-blind guard rather than any per-tool table) — this does not violate
-    Invariant C1, which forbids duplicating the SAME pattern across per-tool
-    tables, not a category being reachable from more than one guard.
+    ``test_enospc_with_unreadable_lock_stays_disk_full``) — but BEFORE the
+    looser SEMAPHORE_TIMEOUT lock+timeout heuristic (task 2831 reorder — see
+    the ORDERING note above) — and wins over per-tool dispatch regardless of
+    ``ToolKind``. This source is DISTINCT from the pytest-scoped shared-venv
+    ``_ENV_TRANSIENT_PATTERNS`` below (different grounded patterns mapping to
+    the same ``ENV_TRANSIENT`` category, exactly like how ``DISK_FULL`` above
+    is produced by this same tool-blind guard rather than any per-tool
+    table) — this does not violate Invariant C1, which forbids duplicating
+    the SAME pattern across per-tool tables, not a category being reachable
+    from more than one guard.
 
     ENV_TRANSIENT — merge-verify restart collateral (task 2831): a WIDER
     class of the same broken-``_merge-verify``-worktree host condition,
@@ -403,15 +424,19 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     entrypoint, a failure to write captured output back into the worktree, a
     shell-init ``getcwd`` failure, and the anticipatory ``=== INTERRUPTED
     (worktree removed) ===`` marker (reify 5261). Checked alongside the
-    ``_VERIFY_ENV_BROKEN_RE`` Cargo.lock check immediately above — same
-    ordering rationale (more-specific ENOSPC/linker checks win on
-    co-occurrence).
+    ``_VERIFY_ENV_BROKEN_RE`` Cargo.lock check immediately above, with the
+    identical ordering placement (see the ORDERING note above): after
+    DISK_FULL/ENOSPC, before SEMAPHORE_TIMEOUT.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
         return FailureCategory.DISK_FULL
+    if _VERIFY_ENV_BROKEN_RE.search(output):
+        return FailureCategory.ENV_TRANSIENT
+    if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
+        return FailureCategory.ENV_TRANSIENT
     if (
         _LOCK_TOKEN_RE.search(output)
         and _TIMEOUT_TOKEN_RE.search(output)
@@ -420,10 +445,6 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         and not _has_deterministic_test_verdict(output)
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
-    if _VERIFY_ENV_BROKEN_RE.search(output):
-        return FailureCategory.ENV_TRANSIENT
-    if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
-        return FailureCategory.ENV_TRANSIENT
     return None
 
 
