@@ -34,13 +34,67 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
 
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     extract_priority_override_task_id,
     is_ttl_override_fact,
+    read_live_override_state,
     select_stale_priority_override_edges,
 )
+
+# Full scheduler_overrides.db schema (mirrors server/tools.py::_OVERRIDE_SCHEMA)
+# so the real-DB reader test exercises read_live_override_state against a
+# faithful table, not a trimmed stand-in.
+_OVERRIDE_SCHEMA_DDL = """
+CREATE TABLE overrides (
+    project_root  TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    boost_tier    TEXT,
+    pinned        INTEGER NOT NULL DEFAULT 0,
+    pin_order     INTEGER,
+    reserve_now   INTEGER NOT NULL DEFAULT 0,
+    ttl_until     TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project_root, task_id)
+);
+"""
+
+
+def _seed_overrides_db(project_root: Path, rows: list[dict]) -> None:
+    """Create data/orchestrator/scheduler_overrides.db under *project_root*
+    and INSERT *rows* via raw sqlite (each dict supplies the override
+    columns; project_root/created_at/updated_at are filled in)."""
+    db_path = project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_OVERRIDE_SCHEMA_DDL)
+        for r in rows:
+            conn.execute(
+                'INSERT INTO overrides (project_root, task_id, boost_tier, pinned, '
+                'pin_order, reserve_now, ttl_until, created_at, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    str(project_root),
+                    r['task_id'],
+                    r.get('boost_tier'),
+                    r.get('pinned', 0),
+                    r.get('pin_order'),
+                    r.get('reserve_now', 0),
+                    r.get('ttl_until'),
+                    '2026-07-19T00:00:00+00:00',
+                    '2026-07-19T00:00:00+00:00',
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 _NOW = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
 _PAST = _NOW - timedelta(hours=1)
@@ -262,3 +316,72 @@ class TestSelectStalePriorityOverrideEdges:
         result = select_stale_priority_override_edges([edge], {}, now=_NOW)
         assert len(result) == 1
         assert result[0]['uuid'] == 'edge-carries-uuid'
+
+
+# --------------------------------------------------------------------------- #
+# read_live_override_state — real DB reader
+# --------------------------------------------------------------------------- #
+
+
+class TestReadLiveOverrideState:
+    """read_live_override_state(project_root) reads the FULL overrides table
+    (not get_pin_queue's pinned=1 projection) from scheduler_overrides.db,
+    returning {str(task_id): {..., 'ttl_until': datetime | None}}.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_table_read_includes_non_pinned_and_parses_ttl(self, tmp_path):
+        """A pinned row (with ttl_until ISO), a non-pinned boost-only row
+        (ttl_until NULL), and a pinned row with no ttl are ALL returned
+        (full-table read), keyed by str(task_id); ttl_until is parsed to a
+        tz-aware datetime, or None when NULL."""
+        _seed_overrides_db(
+            tmp_path,
+            [
+                {
+                    'task_id': '5166',
+                    'boost_tier': 'high',
+                    'pinned': 1,
+                    'pin_order': 1,
+                    'ttl_until': '2026-07-19T13:00:00+00:00',
+                },
+                {
+                    'task_id': '4079',
+                    'boost_tier': 'medium',
+                    'pinned': 0,
+                    'pin_order': None,
+                    'ttl_until': None,
+                },
+                {
+                    'task_id': '4940',
+                    'boost_tier': None,
+                    'pinned': 1,
+                    'pin_order': 2,
+                    'ttl_until': None,
+                },
+            ],
+        )
+
+        result = await read_live_override_state(str(tmp_path))
+
+        # Full-table read: the non-pinned row (4079) must be present — a
+        # pinned=1-only projection would wrongly omit it.
+        assert set(result.keys()) == {'5166', '4079', '4940'}, (
+            f'Expected all three rows keyed by str(task_id) (full-table read, '
+            f'incl. the non-pinned 4079), got {result!r}'
+        )
+
+        ttl = result['5166']['ttl_until']
+        assert isinstance(ttl, datetime)
+        assert ttl.tzinfo is not None, 'ttl_until must be parsed tz-aware'
+        assert ttl == datetime(2026, 7, 19, 13, 0, tzinfo=UTC)
+
+        assert result['4079']['ttl_until'] is None
+        assert result['4940']['ttl_until'] is None
+
+    @pytest.mark.asyncio
+    async def test_absent_db_file_returns_empty_map(self, tmp_path):
+        """No scheduler_overrides.db under project_root -> {} (no overrides
+        recorded yet); no crash."""
+        result = await read_live_override_state(str(tmp_path))
+        assert result == {}
