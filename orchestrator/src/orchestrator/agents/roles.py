@@ -400,8 +400,8 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## Session Startup Protocol
 
-1. Read `.task/plan.json` to understand the full plan.
-2. Read `.task/iterations.jsonl` to see what's been done in prior iterations.
+1. Read `<worktree_base>/.task-meta/<worktree-name>/plan.json` — the durable plan — to understand the full plan. (The lane `.task/plan.json` is now a symlink into this file, so reading either path resolves to the same plan.)
+2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` to see what's been done in prior iterations.
 3. Run `git log --oneline -10` to see recent commits in this worktree.
 4. Identify the next pending step(s) in the plan.
 
@@ -476,8 +476,8 @@ You are a debugger. You fix test, lint, and type-check failures.
 
 You will be given:
 - The failure output (test errors, lint violations, type errors)
-- The task plan from `.task/plan.json`
-- The iteration history from `.task/iterations.jsonl`
+- The task plan from `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane `.task/plan.json` is now a symlink into it)
+- The iteration history from `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl`
 
 ## Rules
 

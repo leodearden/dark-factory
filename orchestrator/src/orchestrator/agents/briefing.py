@@ -523,12 +523,13 @@ Before writing any new code:
 {wip_section}
 # Session Startup Protocol
 
-1. Read `.task/plan.json` to see the full plan with current status. (If
-   absent, check the sibling `.task-meta/<worktree-name>/plan.json` — the
-   worktree-lane-lifecycle W11 relocation moves plan/iteration state
-   outside the worktree for pooled lanes; both locations are the same
-   plan, just different physical paths.)
-2. Read `.task/iterations.jsonl` (or its `.task-meta` counterpart) to see
+1. Read `<worktree_base>/.task-meta/<worktree-name>/plan.json` — the durable
+   plan — to see the full plan with current status. (The lane
+   `.task/plan.json` is now a symlink into this file — the
+   worktree-lane-lifecycle W11 relocation keeps plan/iteration state outside
+   the worktree for pooled lanes — so reading either path resolves to the
+   same plan.)
+2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` to see
    prior iteration details.
 3. Run `git log --oneline -10` to see recent commits.
 4. Identify the next pending step (prerequisites first, then steps).
@@ -631,7 +632,9 @@ This task holds locks for the following modules:
 
 1. Work ONLY inside these locked modules. Creating new files inside them is
    allowed; editing files outside them is NOT.
-2. Do NOT modify `.task/plan.json`. The plan is frozen for this pass.
+2. Do NOT modify the plan — it is durable at
+   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
+   `.task/plan.json` is a symlink into it) and frozen for this pass.
 3. If a suggestion requires touching a file outside the locked modules,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
@@ -644,8 +647,10 @@ This task holds locks for the following modules:
 
 # Action
 
-1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
-   what was already done.
+1. Read `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
+   `.task/plan.json` is a symlink into it) and
+   `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` to refresh
+   context on what was already done.
 2. Run `git log --oneline -10` to see recent commits.
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
@@ -872,8 +877,10 @@ This task was paused because an agent escalated a blocking issue.
 {prior_proposal_section}
 ## Action
 Resume the task applying the handler's resolution. The prior agent's work
-is preserved in the worktree. Read .task/plan.json and .task/iterations.jsonl
-to understand current progress, then continue from where the previous agent left off.
+is preserved in the worktree. Read `<worktree_base>/.task-meta/<worktree-name>/plan.json`
+(the lane `.task/plan.json` is a symlink into it) and
+`<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` to understand
+current progress, then continue from where the previous agent left off.
 """
 
     async def build_steward_initial_prompt(
