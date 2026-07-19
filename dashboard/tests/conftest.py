@@ -26,6 +26,15 @@ from pathlib import Path
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+# Also front-load this worktree's shared/src so `import shared` (e.g. the
+# shared.mcp_idempotency helper the McpSession twin imports, task 2766) loads
+# the local worktree copy rather than the editable install pinned to the main
+# tree — otherwise a brand-new shared submodule that has not yet landed on
+# main is unimportable here, breaking collection of tests that touch it.
+# Mirrors orchestrator/tests/conftest.py's shared/src insertion.
+_SHARED_SRC = Path(__file__).parent.parent.parent / 'shared' / 'src'
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))

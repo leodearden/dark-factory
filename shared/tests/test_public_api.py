@@ -154,6 +154,15 @@ class TestModuleLevelAll:
         assert hasattr(safe_io, '__all__'), 'safe_io must define __all__'
         assert set(safe_io.__all__) == {'load_json_or_warn'}
 
+    def test_mcp_idempotency_all(self):
+        from shared import mcp_idempotency
+
+        assert hasattr(mcp_idempotency, '__all__'), 'mcp_idempotency must define __all__'
+        assert set(mcp_idempotency.__all__) == {
+            'MUTATING_TASK_TOOLS',
+            'maybe_inject_client_op_id',
+        }
+
 
 class TestInitAllCompleteness:
     """Verify that shared.__all__ covers the union of all module __all__ entries."""
@@ -167,6 +176,7 @@ class TestInitAllCompleteness:
             config_models,
             cost_store,
             locking,
+            mcp_idempotency,
             safe_io,
             sqlite_sync_base,
             usage_gate,
@@ -180,6 +190,7 @@ class TestInitAllCompleteness:
             | set(cost_store.__all__)
             | set(async_sqlite_base.__all__)
             | set(locking.__all__)
+            | set(mcp_idempotency.__all__)
             | set(safe_io.__all__)
             | set(sqlite_sync_base.__all__)
         )
@@ -198,6 +209,7 @@ class TestInitAllCompleteness:
             config_models,
             cost_store,
             locking,
+            mcp_idempotency,
             safe_io,
             sqlite_sync_base,
             usage_gate,
@@ -212,6 +224,7 @@ class TestInitAllCompleteness:
             (cost_store, 'cost_store'),
             (async_sqlite_base, 'async_sqlite_base'),
             (locking, 'locking'),
+            (mcp_idempotency, 'mcp_idempotency'),
             (safe_io, 'safe_io'),
             (sqlite_sync_base, 'sqlite_sync_base'),
         ]:

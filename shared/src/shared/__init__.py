@@ -37,6 +37,7 @@ from shared.locking import (
     normalize_lock,
     strip_directory_locks,
 )
+from shared.mcp_idempotency import MUTATING_TASK_TOOLS, maybe_inject_client_op_id
 from shared.safe_io import load_json_or_warn
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.usage_gate import (
@@ -91,5 +92,7 @@ __all__ = [
     'is_file_path',
     'directory_locks',
     'strip_directory_locks',
+    'MUTATING_TASK_TOOLS',
+    'maybe_inject_client_op_id',
     'load_json_or_warn',
 ]
