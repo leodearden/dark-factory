@@ -6847,6 +6847,52 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         await self._invoke(ARCHITECT, prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 
+    async def _commit_amendment_wip(self, amendment_round: int) -> str | None:
+        """Commit uncommitted amendment work as a WIP safety-commit (task 2760).
+
+        ``_amend`` invokes the implementer but never commits — it only appends
+        the iteration log and validates plan ownership.  If the implementer
+        left file changes UNCOMMITTED, the subsequent VERIFY/REVIEW run on the
+        dirty worktree and can pass, yet the merge queue lands only COMMITTED
+        branch state — so a reviewed, verified amendment could silently fail to
+        land.  This guard enforces the invariant "an amendment round's success
+        ⟹ its work is committed on the branch" by committing the dirty tree as
+        ``wip: amendment round N`` before the loop re-enters VERIFY/REVIEW.
+        Committing also advances HEAD, so task 2750's
+        ``{pre_amendment_head}..HEAD`` review delta becomes exactly the
+        amendment change instead of empty.
+
+        Reuses the WIP-safety-commit primitive already used by
+        :meth:`_inter_iteration_rebase` (``git_ops.commit`` no-ops returning
+        None on a clean tree and raises ``WorktreeConflictError`` on a
+        conflicted one).  Event emission is fire-and-forget, guarded on
+        ``self.event_store is not None`` (mirrors :meth:`_emit_rebase_verify_cost`).
+
+        Returns the WIP commit sha (or None when the worktree was clean).
+        """
+        assert self.worktree is not None and self.git_ops is not None
+        sha = await self.git_ops.commit(
+            self.worktree, f'wip: amendment round {amendment_round}',
+        )
+        logger.warning(
+            'Task %s: amendment round %d left uncommitted work — auto-committed '
+            'as WIP %s so VERIFY/REVIEW and the merge queue see committed '
+            'branch state (task 2760)',
+            self.task_id, amendment_round, (sha or '')[:8],
+        )
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.amendment_uncommitted_recovered,
+                task_id=self.task_id,
+                phase='review',
+                data={
+                    'amendment_round': amendment_round,
+                    'recovery': 'auto_commit',
+                    'wip_sha': sha,
+                },
+            )
+        return sha
+
     async def _amend(
         self, in_scope: list[dict], amendment_round: int,
     ) -> bool:
