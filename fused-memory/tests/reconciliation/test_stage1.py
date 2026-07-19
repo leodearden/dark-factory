@@ -2840,6 +2840,14 @@ class TestStalePriorityOverrideEdgeSweepWiring:
         """
         stage = _make_consolidator(project_root='/tmp/reify')
 
+        # The task 2613 stale-status-snapshot sweep runs immediately before the
+        # 2781 sweep and is NOT patched here, so it exercises the real
+        # orchestration. Give it an empty valid-edge set so it succeeds (0
+        # scanned) and sets its stat — that stat is the "other post-processing
+        # was untouched" proof asserted below. Without this mock the 2613 sweep
+        # itself fails on an unconfigured get_all_valid_edges and never sets it.
+        stage.memory.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+
         base_report = StageReport(
             stage=StageId.memory_consolidator,
             started_at=datetime.now(UTC),
