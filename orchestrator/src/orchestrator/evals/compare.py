@@ -14,6 +14,7 @@ from orchestrator.artifacts import TaskArtifacts
 
 from .judge import _strip_metadata
 from .runner import EvalResult
+from .scoring import quality_from_review_artifact
 from .snapshots import get_diff
 
 logger = logging.getLogger(__name__)
@@ -224,6 +225,47 @@ def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
         return reviews
 
     return _read_legacy_reviews(artifacts)
+
+
+def score_result_from_artifacts(
+    result: EvalResult,
+    *,
+    plan_steps: int | None = None,
+) -> float:
+    """Contract-agnostic P4/B8 quality for one result, off its PERSISTED reviews.
+
+    The μ driver's per-result quality: reads the result's worktree reviews via
+    :func:`_read_review_artifacts` (envelope-preferring, legacy fallback — so
+    the two persisted contract shapes reduce to ONE payload), merges every
+    reviewer's issues into a single artifact, and scores it via
+    :func:`scoring.quality_from_review_artifact`. Because both shapes reduce to
+    the same payload, the SAME review content yields the SAME float regardless
+    of which reviewer/judge output contract is live — and it NEVER opens a
+    transcript / session / log (P4 / B8).
+
+    The per-reviewer ERROR filter mirrors ``artifacts.aggregate_reviews``: a
+    reviewer whose top-level ``verdict`` is ``ERROR`` (incomplete coverage)
+    contributes no issues, while every non-ERROR reviewer contributes all of
+    its issues. ``plan_steps`` is taken from the *plan_steps* arg when given,
+    else ``result.metrics['plan_steps']``; ``debug_cycles`` from
+    ``result.metrics``. The quality formula stays single-sourced in
+    ``metrics.compute_composite`` — this composes, it does not re-derive.
+    """
+    reviews = _read_review_artifacts(result.worktree_path)
+
+    merged_issues: list[Any] = []
+    for payload in reviews.values():
+        # Mirror aggregate_reviews' per-reviewer ERROR skip — an ERROR reviewer's
+        # issues are never counted by severity (incomplete coverage).
+        if payload.get('verdict') == 'ERROR':
+            continue
+        merged_issues.extend(payload.get('issues') or [])
+
+    steps = plan_steps if plan_steps is not None else int(result.metrics.get('plan_steps', 0) or 0)
+    debug_cycles = int(result.metrics.get('debug_cycles', 0) or 0)
+    return quality_from_review_artifact(
+        {'issues': merged_issues}, plan_steps=steps, debug_cycles=debug_cycles,
+    )
 
 
 def _format_review_artifacts(reviews: dict[str, Any]) -> str:
