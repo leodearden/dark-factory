@@ -3096,6 +3096,82 @@ class TestWorkingTreeSync:
         _, main_after, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_ops.project_root)
         assert main_before.strip() == main_after.strip()
 
+    async def test_stash_failed_captures_dirty_tracked_files(self, git_ops: GitOps):
+        """When park fails (MergeParkError from a sabotaged `git stash create`),
+        advance_main returns 'stash_failed' AND records the dirty TRACKED
+        file(s) on the git_ops._last_stash_dirty_files side channel — so
+        _map_advance_failure can name them in the halt escalation (task 2758).
+
+        Mirrors the established _last_overlap_files side-channel pattern.
+        RED: the attribute is never set today, so the equality check errors.
+        """
+        worktree_info = await git_ops.create_worktree('stash-fail-capture')
+        (worktree_info.path / 'stash_fail_capture.py').write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, 'Add file')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, 'stash-fail-capture')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty a TRACKED file so the park attempt is armed.
+        (git_ops.project_root / 'README.md').write_text('# dirty tracked edit\n')
+
+        from unittest.mock import patch
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                return (1, '', 'fatal: cannot stash changes')
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed'
+        assert git_ops._last_stash_dirty_files == ['README.md'], (
+            f'expected the dirty tracked file captured on the side channel, got '
+            f'{getattr(git_ops, "_last_stash_dirty_files", "<unset>")!r}'
+        )
+
+    async def test_stash_failed_contention_captures_dirty_tracked_files(self, git_ops: GitOps):
+        """The MergeParkContentionError park-failure path (a stale
+        MERGE_PARK_REF) also records the dirty TRACKED file(s) on the
+        git_ops._last_stash_dirty_files side channel (task 2758).
+
+        RED: the attribute is never set today, so the equality check errors.
+        """
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_ops.project_root)
+        head_sha = head_sha.strip()
+
+        # Pre-create the stale private ref (crash-leftover) → forces contention.
+        await _run(
+            ['git', 'update-ref', 'refs/dark-factory/merge-park', head_sha],
+            cwd=git_ops.project_root,
+        )
+
+        wt = await git_ops.create_worktree('stale-park-capture')
+        (wt.path / 'stale_park_capture.py').write_text('x = 1\n')
+        await git_ops.commit(wt.path, 'Add stale_park_capture')
+        merge_result = await git_ops.merge_to_main(wt.path, 'stale-park-capture')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+
+        # Dirty a tracked file to arm the park attempt.
+        (git_ops.project_root / 'README.md').write_text('# WIP racing a stale park ref\n')
+
+        result = await git_ops.advance_main(merge_result.merge_commit)
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed'
+        assert git_ops._last_stash_dirty_files == ['README.md'], (
+            f'expected the dirty tracked file captured on the side channel, got '
+            f'{getattr(git_ops, "_last_stash_dirty_files", "<unset>")!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestAdvanceMainConflictMarkerGate:
