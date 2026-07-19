@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import NewType
 
+import yaml
 from pydantic import BaseModel, field_validator
 
 from fused_memory.utils.validation import (
@@ -43,6 +44,12 @@ logger = logging.getLogger(__name__)
 # tracked followup is to promote this to a neutrally-named env var with a
 # deprecation period.
 KNOWN_PROJECT_ROOTS_ENV: str = 'DASHBOARD_KNOWN_PROJECT_ROOTS'
+
+# Canonical project-manifest filename every DF-targeted project exposes at
+# its root (see CLAUDE.md "Repo Map").  ``read_declared_project_id`` reads
+# only the ``project_id`` key from this one file — no legacy config-name
+# fallbacks, no orchestrator-package import.
+ORCHESTRATOR_CONFIG_NAME: str = 'dark-factory-orchestrator.yaml'
 
 # Cache of input-path -> main-working-tree path, keyed by the absolute,
 # resolved input path. Populated lazily by resolve_main_checkout so repeated
@@ -167,6 +174,46 @@ def resolve_project_id(
         return mapping[project_root]
     name = PurePosixPath(project_root.rstrip('/')).name
     return _to_underscore_canonical(name)
+
+
+def read_declared_project_id(project_root: str | Path) -> str | None:
+    """Return the project_id declared in ``<project_root>`` 's manifest, or None.
+
+    Reads only the top-level ``project_id`` key from
+    ``<project_root>/dark-factory-orchestrator.yaml`` (the canonical
+    project-manifest filename — no legacy fallbacks, no orchestrator-package
+    import), normalizing a non-empty string value via the same
+    ``_to_underscore_canonical`` rule :func:`resolve_project_id` uses so a
+    declared id and a basename-derived id share one canonicalization source
+    of truth.
+
+    Strictly **fail-open**: this NEVER raises.  A missing manifest,
+    unparseable YAML, a non-mapping document, or a missing/non-string/empty
+    ``project_id`` all return ``None`` so callers degrade to today's basename
+    derivation — mirroring :func:`build_known_projects_map`'s
+    must-not-raise-during-startup contract (both registries are built once at
+    process start).  A parse error is debug-logged, not surfaced.
+
+    This is what makes the id rename-stable: a project whose directory was
+    renamed but whose manifest still declares the original id resolves to the
+    declared id, not the new basename.
+    """
+    manifest = Path(project_root) / ORCHESTRATOR_CONFIG_NAME
+    try:
+        with open(manifest, encoding='utf-8') as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError) as exc:
+        logger.debug(
+            'read_declared_project_id: cannot read %s: %s', manifest, exc,
+        )
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    declared = data.get('project_id')
+    if not isinstance(declared, str) or not declared:
+        return None
+    return _to_underscore_canonical(declared)
 
 
 def known_project_roots_from_env(
