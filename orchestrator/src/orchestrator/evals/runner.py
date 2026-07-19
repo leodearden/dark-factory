@@ -28,7 +28,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome, build_workflow
 
-from .configs import EVAL_CONFIGS, EvalConfig
+from .configs import EVAL_CONFIGS, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree
@@ -916,6 +916,46 @@ async def run_ofat_stage(
         _thunk(tp, candidate, trial)
         for tp in task_paths
         for candidate in candidates
+        for trial in range(1, trials + 1)
+    ]
+    return await _bounded_fanout(thunks, max_parallel)
+
+
+async def run_matrix_stage(
+    task_paths: list[Path],
+    arch_survivors: list[EvalConfig],
+    impl_survivors: list[EvalConfig],
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    timeout_override: int | None = None,
+) -> list[EvalResult]:
+    """Matrix stage: both-live architect×implementer cross product over survivors (μ).
+
+    Expands :func:`configs.matrix_pairs` — the FULL ``arch_survivors ×
+    impl_survivors`` cross product, INCLUDING same-family diagonals (e.g.
+    sonnet-arch × sonnet-impl), the pair that tests whether a plan style couples
+    to its own family's implementer (PRD decision 9) — and fans
+    :func:`run_end_to_end` out over ``pairs × fixtures × trials`` via the shared
+    :func:`_bounded_fanout` skeleton (identical cancellation / error-continue
+    semantics to :func:`run_ofat_stage`). Both roles run LIVE. Returns the
+    flattened ``EvalResult`` list; a failed cell is logged and skipped.
+    """
+    def _thunk(
+        task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
+    ) -> Callable[[], Awaitable[EvalResult | None]]:
+        async def _run() -> EvalResult | None:
+            return await run_end_to_end(
+                task_path, arch, impl, base_config,
+                trial=trial, timeout_override=timeout_override,
+            )
+        return _run
+
+    pairs = matrix_pairs(arch_survivors, impl_survivors)
+    thunks = [
+        _thunk(tp, arch, impl, trial)
+        for tp in task_paths
+        for arch, impl in pairs
         for trial in range(1, trials + 1)
     ]
     return await _bounded_fanout(thunks, max_parallel)
