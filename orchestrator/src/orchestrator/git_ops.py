@@ -9327,14 +9327,20 @@ class GitOps:
         # rare real-gzip path (mirrors the producer's loop-stall avoidance).
         if self.transcript_archive is not None:
             config_dir = worktree / '.task' / f'claude-config-{branch}'
-            archive_root = self.project_root / self.transcript_archive.root
-            await asyncio.to_thread(
-                archive_task_transcripts,
-                config_dir,
-                branch,
-                None,
-                archive_root=archive_root,
-            )
+            # Fast-skip when the config dir is already gone (external worktrees,
+            # already-cleaned dirs): a cheap no-op that never spins up a worker
+            # thread just to glob an absent projects/ tree. The producer already
+            # archived the normal case; the size/mtime skip inside the helper
+            # (matching archive_root + task_id) makes any overlap idempotent.
+            if config_dir.exists():
+                archive_root = self.project_root / self.transcript_archive.root
+                await asyncio.to_thread(
+                    archive_task_transcripts,
+                    config_dir,
+                    branch,
+                    None,
+                    archive_root=archive_root,
+                )
 
         full_branch = f'{self.config.branch_prefix}{branch}'
 
