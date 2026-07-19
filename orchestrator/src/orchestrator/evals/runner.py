@@ -29,7 +29,7 @@ from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome, build_workflow
 
 from .configs import EVAL_CONFIGS, EvalConfig
-from .metrics import collect_metrics
+from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree
 
@@ -358,6 +358,162 @@ async def run_eval(
         f'workflow={metrics_dict.get("workflow_duration_ms", 0) / 1000:.1f}s)'
     )
     return result
+
+
+async def run_architect_eval(
+    task_path: Path,
+    config: EvalConfig,
+    base_config: OrchestratorConfig | None = None,
+    trial: int = 1,
+    timeout_override: int | None = None,
+    memory_endpoint: str | None = None,
+) -> EvalResult:
+    """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
+
+    Unlike :func:`run_eval` (which FREEZES the plan and scores the implementer),
+    this drives ONLY the architect — the ``_run_plan_only`` invocation sequence
+    (create_eval_worktree at ``pre_task_commit`` → ``TaskArtifacts.init`` →
+    ``briefing.build_architect_prompt`` → ``invoke_agent(ARCHITECT)`` →
+    ``artifacts.read_plan``) — so every downstream role
+    (implementer/debugger/reviewer/verify) is FROZEN (decision 8: noise
+    isolation + token savings). The architect runs with THIS candidate's
+    model/backend/effort/env_overrides, not the hardcoded opus-high the
+    implementer path pins.
+
+    The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
+    judge, against the REAL landed reference diff
+    ``pre_task_commit..reference.post_task_commit`` — the always-available
+    ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
+    the deterministic :func:`score_plan_structure` floor on ANY judge failure so
+    ``plan_quality`` is ALWAYS a non-sentinel float. The result carries
+    ``role_under_test='architect'`` and is persisted via :func:`save_result`.
+    """
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.agents.invoke import invoke_agent
+    from orchestrator.agents.roles import ARCHITECT
+    from orchestrator.artifacts import TaskArtifacts
+    from orchestrator.evals import snapshots
+    from orchestrator.evals.judge import judge_plan_quality, score_plan_structure
+
+    task = load_task(task_path)
+    task_id = task['id']
+    project_root = Path(task['project_root'])
+    pre = task['pre_task_commit']
+
+    logger.info(
+        f'Starting architect eval: {task_id} × {config.name} (trial {trial})'
+    )
+    start_ms = int(time.monotonic() * 1000)
+
+    # 1. Worktree at the fixture's pre_task_commit.
+    worktree, run_id = await snapshots.create_eval_worktree(
+        project_root, task_id, pre, setup_commands=task.get('setup_commands'),
+    )
+
+    plan: dict = {}
+    cost_usd = 0.0
+    arch_duration_ms = 0
+    outcome = 'done'
+    try:
+        # 2. Eval orch config (project_root / verify / profile parity).
+        orch_config = build_eval_orch_config(
+            config, task, base_config, memory_endpoint=memory_endpoint,
+        )
+
+        # 3. Init artifacts so the architect has a place to write plan.json.
+        artifacts = TaskArtifacts(worktree)
+        task_def = task.get('task_definition', {})
+        artifacts.init(
+            task_id,
+            task_def.get('title', ''),
+            task_def.get('description', ''),
+            base_commit=pre,
+        )
+
+        # 4. Build the architect prompt and invoke the architect LIVE with THIS
+        #    candidate's model/backend/effort/env_overrides.
+        briefing = BriefingAssembler(orch_config)
+        prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
+        result = await invoke_agent(
+            prompt=prompt,
+            system_prompt=ARCHITECT.system_prompt,
+            cwd=worktree,
+            model=config.model,
+            max_turns=task.get('max_architect_turns', 50),
+            max_budget_usd=config.max_budget_usd,
+            allowed_tools=ARCHITECT.allowed_tools or None,
+            disallowed_tools=ARCHITECT.disallowed_tools or None,
+            effort=config.effort or 'high',
+            backend=config.backend,
+            env_overrides=config.env_overrides or None,
+        )
+        cost_usd = result.cost_usd
+        arch_duration_ms = result.duration_ms
+        if not result.success:
+            outcome = 'blocked'
+        # 5. Read the produced plan artifact (the scoring input).
+        plan = artifacts.read_plan() or {}
+    except Exception as e:
+        logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
+        outcome = 'blocked'
+    finally:
+        # Plan already read above; the worktree is no longer needed (scoring
+        # reads the in-memory plan + the committed reference diff).
+        await snapshots.cleanup_eval_worktree(project_root, worktree)
+
+    # 6. Materialize the landed reference diff — the always-available ground
+    #    truth (ζ fixtures frequently carry plan: null).
+    reference = task.get('reference') or {}
+    post = reference.get('post_task_commit')
+    reference_diff = ''
+    if post:
+        try:
+            reference_diff = await snapshots.get_diff_between_commits(
+                project_root, pre, post,
+            )
+        except Exception as e:
+            logger.warning(f'reference diff failed for {task_id}: {e}')
+
+    # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
+    #    deterministic structural floor on ANY failure so plan_quality is ALWAYS
+    #    a non-sentinel float (unlike recovery scoring, which degrades to None).
+    plan_quality: float | None = None
+    try:
+        verdict = await judge_plan_quality(plan, reference_diff, task)
+        plan_quality = verdict.plan_quality
+    except Exception:
+        logger.warning(
+            f'plan judge raised for {task_id}; degrading to structural floor',
+            exc_info=True,
+        )
+    if plan_quality is None:
+        plan_quality = score_plan_structure(plan)
+
+    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+
+    metrics = EvalMetrics(
+        plan_quality=plan_quality,
+        role_under_test='architect',
+        plan_steps=len(plan.get('steps', [])),
+        cost_usd=cost_usd,
+        workflow_duration_ms=arch_duration_ms,
+    )
+    result_obj = EvalResult(
+        task_id=task_id,
+        config_name=config.name,
+        outcome=outcome,
+        metrics=metrics.to_dict(),
+        worktree_path=str(worktree),
+        wall_clock_ms=wall_clock_ms,
+        run_id=run_id,
+        trial=trial,
+    )
+    save_result(result_obj)
+    logger.info(
+        f'Architect eval complete: {task_id} × {config.name} → '
+        f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
+    )
+    return result_obj
 
 
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
