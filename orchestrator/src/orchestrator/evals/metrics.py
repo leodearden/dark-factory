@@ -67,6 +67,16 @@ class EvalMetrics:
     # distinct from a genuinely scored ``0.0``.
     recovery_score: float | None = None
 
+    # Whether this run scored an ADVERSARIAL fixture (eval-revival η), threaded
+    # explicitly from the task record. Kept distinct from ``recovery_score`` so
+    # that a recovery-scoring FAILURE (which the ``collect_metrics`` guard
+    # degrades to ``recovery_score=None``) stays distinguishable from a
+    # genuinely non-adversarial run: the report keys its ``adversarial`` column
+    # on THIS flag, not on ``recovery_score is not None``. Otherwise an
+    # adversarial run whose recovery scoring raised would be silently mislabeled
+    # ``adversarial: false``, hiding the failure.
+    adversarial: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -219,6 +229,14 @@ async def collect_metrics(
         m.typecheck_clean = None
 
     m.composite_score = compute_composite(m)
+
+    # Stamp the adversarial flag from the task record BEFORE recovery scoring
+    # runs, so it is set regardless of whether recovery scoring succeeds, is
+    # None, or raises below. The report keys its ``adversarial`` column on this
+    # flag (not on ``recovery_score is not None``), so a recovery-scoring
+    # FAILURE on an adversarial fixture renders as ``adversarial: true`` with a
+    # null score — visibly distinct from a genuinely non-adversarial run.
+    m.adversarial = bool(task.get('adversarial'))
 
     # Recovery-behavior scoring (eval-revival η) — a rubric DISTINCT from the
     # base composite, scored only for adversarial fixtures (returns None

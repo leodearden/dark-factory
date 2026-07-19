@@ -382,6 +382,14 @@ class TestEvalMetricsRecoveryField:
         assert 'recovery_score' in d
         assert d['recovery_score'] is None
 
+    def test_adversarial_flag_defaults_false(self):
+        assert EvalMetrics().adversarial is False
+
+    def test_to_dict_carries_adversarial_key_defaulting_false(self):
+        d = EvalMetrics().to_dict()
+        assert 'adversarial' in d
+        assert d['adversarial'] is False
+
 
 @pytest.mark.asyncio
 class TestCollectMetricsRecoveryWiring:
@@ -407,6 +415,29 @@ class TestCollectMetricsRecoveryWiring:
             m = await collect_metrics(wf, Path('/fake/wt'), task)
         assert m.recovery_score is None
 
+    async def test_adversarial_task_stamps_adversarial_flag(self):
+        # The adversarial flag is threaded from the task record and surfaced in
+        # to_dict() (so it flows into EvalResult.metrics for the report).
+        task = {
+            'id': 'df_task_x_adv',
+            'pre_task_commit': 'base123',
+            'adversarial': {'recovery_rubric': _FULL_RUBRIC},
+        }
+        wf = _workflow(_RECOVERED_PLAN, _RECOVERED_BLOCKING)
+        p_verify, p_stat, p_diff = _collect_patches(_RECOVERED_DIFF)
+        with p_verify, p_stat, p_diff:
+            m = await collect_metrics(wf, Path('/fake/wt'), task)
+        assert m.adversarial is True
+        assert m.to_dict()['adversarial'] is True
+
+    async def test_non_adversarial_task_clears_adversarial_flag(self):
+        task = {'id': 'df_task_ordinary', 'pre_task_commit': 'base123'}
+        wf = _workflow(_RECOVERED_PLAN, [])
+        p_verify, p_stat, p_diff = _collect_patches('')
+        with p_verify, p_stat, p_diff:
+            m = await collect_metrics(wf, Path('/fake/wt'), task)
+        assert m.adversarial is False
+
     async def test_recovery_failure_warns_and_nulls_without_nuking_composite(
         self, caplog,
     ):
@@ -426,6 +457,11 @@ class TestCollectMetricsRecoveryWiring:
             m = await collect_metrics(wf, Path('/fake/wt'), task)
         assert m.recovery_score is None
         assert m.composite_score == 1.0
+        # The adversarial flag SURVIVES the recovery-scoring failure — it is
+        # stamped from the task record before scoring runs. This is what keeps a
+        # failed adversarial run distinguishable from a non-adversarial run in
+        # the report (adversarial=true + null score, not adversarial=false).
+        assert m.adversarial is True
         warnings = [
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
@@ -597,6 +633,20 @@ def _ordinary_result() -> runner.EvalResult:
     )
 
 
+def _failed_adv_result() -> runner.EvalResult:
+    # An adversarial run whose recovery scoring FAILED: collect_metrics stamped
+    # the explicit adversarial flag (True) but the guard left recovery_score
+    # None. The report must key on the explicit flag, not the null score.
+    return runner.EvalResult(
+        task_id='df_task_2339_adv_verify',
+        config_name='opus-high',
+        outcome='done',
+        metrics={'adversarial': True, 'recovery_score': None,
+                 'composite_score': 0.8},
+        worktree_path='/tmp/wt-failadv',
+    )
+
+
 class TestRecoveryReport:
     def test_build_recovery_report_rows(self):
         from orchestrator.evals.report import build_recovery_report
@@ -634,3 +684,60 @@ class TestRecoveryReport:
         )
         assert '-' in ord_line       # null sentinel rendered as '-'
         assert '1.0' not in ord_line  # ordinary row is NOT populated
+
+    def test_failed_adversarial_scoring_stays_labeled_adversarial(self):
+        # An adversarial run whose recovery scoring failed (recovery_score None
+        # but explicit adversarial flag True) must remain adversarial=True — NOT
+        # be silently downgraded to a non-adversarial row. This is the crux of
+        # keying the flag on the explicit task-record signal, not the score.
+        from orchestrator.evals.report import build_recovery_report
+
+        report = build_recovery_report([_failed_adv_result()])
+        row = report['rows'][0]
+        assert row['adversarial'] is True
+        assert row['recovery_score'] is None
+
+    def test_failed_adversarial_row_is_distinct_from_ordinary_in_table(self):
+        # In the rendered table the failed-adversarial row shows the SAME null
+        # score marker '-' as an ordinary row, but its adversarial column reads
+        # 'yes' vs the ordinary row's 'no' — so a scoring failure on an
+        # adversarial fixture is visibly distinct, not hidden.
+        from orchestrator.evals.report import (
+            build_recovery_report,
+            format_recovery_table,
+        )
+
+        report = build_recovery_report(
+            [_failed_adv_result(), _ordinary_result()]
+        )
+        table = format_recovery_table(report)
+
+        failed_line = next(
+            ln for ln in table.splitlines()
+            if 'df_task_2339_adv_verify' in ln
+        )
+        assert 'yes' in failed_line  # adversarial column
+        assert '-' in failed_line    # null score
+
+        ord_line = next(
+            ln for ln in table.splitlines() if 'df_task_1993' in ln
+        )
+        assert 'no' in ord_line      # not adversarial
+        assert '-' in ord_line       # also null score
+
+    def test_explicit_adversarial_flag_overrides_score_inference(self):
+        # An adversarial fixture that legitimately scored 0.0 (not a failure —
+        # the model recovered on none of its criteria) is still adversarial.
+        from orchestrator.evals.report import build_recovery_report
+
+        scored_zero = runner.EvalResult(
+            task_id='df_task_2284_adv_regression',
+            config_name='opus-high',
+            outcome='done',
+            metrics={'adversarial': True, 'recovery_score': 0.0},
+            worktree_path='/tmp/wt-zero',
+        )
+        report = build_recovery_report([scored_zero])
+        row = report['rows'][0]
+        assert row['adversarial'] is True
+        assert row['recovery_score'] == 0.0

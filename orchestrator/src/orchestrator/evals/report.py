@@ -211,17 +211,34 @@ def build_recovery_report(results: list[EvalResult]) -> dict[str, Any]:
     Each row carries ``task_id`` / ``config_name``, the ``recovery_score``
     pulled from ``EvalResult.metrics`` (a populated float for adversarial
     fixtures, ``None`` — the C4 ``recovery_score | null`` sentinel — otherwise),
-    and an ``adversarial`` bool derived from whether the score is populated
-    (recovery is scored ONLY for adversarial fixtures). Rows are sorted by
-    ``(task_id, config_name)`` so the surface is deterministic.
+    and an ``adversarial`` bool.
+
+    The ``adversarial`` flag is taken from the explicit ``metrics['adversarial']``
+    boolean that ``collect_metrics`` stamps from the task record — NOT inferred
+    from ``recovery_score is not None``. That distinction matters: recovery
+    scoring can fail on a genuinely adversarial fixture, in which case
+    ``collect_metrics``' guard leaves ``recovery_score=None``; inferring the flag
+    from the score would then silently mislabel that run ``adversarial: false``
+    and hide the scoring failure. Keying on the explicit flag renders such a run
+    as ``adversarial: true`` with a null score instead. For results persisted
+    BEFORE the flag existed (no ``adversarial`` key in ``metrics``), we fall
+    back to the old ``recovery_score is not None`` inference so old reports
+    render unchanged. Rows are sorted by ``(task_id, config_name)`` so the
+    surface is deterministic.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
         recovery_score = result.metrics.get('recovery_score')
+        explicit_adversarial = result.metrics.get('adversarial')
+        adversarial = (
+            bool(explicit_adversarial)
+            if explicit_adversarial is not None
+            else recovery_score is not None
+        )
         rows.append({
             'task_id': result.task_id,
             'config_name': result.config_name,
-            'adversarial': recovery_score is not None,
+            'adversarial': adversarial,
             'recovery_score': recovery_score,
         })
     rows.sort(key=lambda r: (r['task_id'], r['config_name']))
