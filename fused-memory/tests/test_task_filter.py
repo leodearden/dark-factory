@@ -3841,3 +3841,108 @@ class TestFindPresentTenseCompletionClaimTaskIds:
         assert find_present_tense_completion_claim_task_ids('   \n  ') == set(), (
             'Expected empty set for whitespace-only string.'
         )
+
+
+class TestNonterminalCompletionClaimTaskIds:
+    """Tests for nonterminal_completion_claim_task_ids(text, status_probe) in
+    task_filter.py — the pure composition helper layering a LIVE status
+    cross-check over find_present_tense_completion_claim_task_ids().
+
+    Returns the completion-claimed task ids whose PROBED status is present AND
+    non-terminal (not done/cancelled). Fails OPEN (excludes the id) whenever
+    the probed status is None (unknown/absent). Mirrors
+    recon_claim_verification_guard.verify_attributed_claims's injected-probe
+    seam: pure and sync, so the acceptance criterion (in-progress rejected /
+    done passes) is unit-testable without the server harness. Short-circuits —
+    the probe is NOT called when the text carries no completion claim.
+    """
+
+    _COMPLETION_CONTENT = 'task 5252 has landed and now enforces the manifest gate'
+
+    @staticmethod
+    def _recording_probe(status_map):
+        """Return a Callable[[int], str|None] backed by status_map that records
+        the ids it was called with on a `.calls` attribute.
+        """
+        calls: list[int] = []
+
+        def probe(tid: int) -> str | None:
+            calls.append(tid)
+            return status_map.get(tid)
+
+        probe.calls = calls  # type: ignore[attr-defined]
+        return probe
+
+    def test_blocks_confirmed_nonterminal_status(self):
+        """A completion-claimed id whose live status is 'in-progress'
+        (non-terminal) is returned — the acceptance criterion's block case.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            nonterminal_completion_claim_task_ids,
+        )
+
+        probe = self._recording_probe({5252: 'in-progress'})
+        assert nonterminal_completion_claim_task_ids(self._COMPLETION_CONTENT, probe) == {
+            5252
+        }, 'Expected {5252} for a completion claim naming an in-progress (non-terminal) task.'
+        assert probe.calls == [5252], (
+            f'Expected the probe to be called exactly once for id 5252, got '
+            f'{probe.calls!r}'
+        )
+
+    def test_allows_done_status(self):
+        """A completion-claimed id whose live status is 'done' (terminal) is
+        NOT returned — the acceptance criterion's pass case.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            nonterminal_completion_claim_task_ids,
+        )
+
+        probe = self._recording_probe({5252: 'done'})
+        assert (
+            nonterminal_completion_claim_task_ids(self._COMPLETION_CONTENT, probe) == set()
+        ), 'Expected empty set — a completion claim naming a done (terminal) task is allowed.'
+
+    def test_allows_cancelled_status(self):
+        """A completion-claimed id whose live status is 'cancelled' (terminal)
+        is NOT returned.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            nonterminal_completion_claim_task_ids,
+        )
+
+        probe = self._recording_probe({5252: 'cancelled'})
+        assert (
+            nonterminal_completion_claim_task_ids(self._COMPLETION_CONTENT, probe) == set()
+        ), 'Expected empty set — a completion claim naming a cancelled (terminal) task is allowed.'
+
+    def test_allows_unknown_status_fails_open(self):
+        """A completion-claimed id whose probed status is None (unknown/absent)
+        is NOT returned — fail open on uncertainty.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            nonterminal_completion_claim_task_ids,
+        )
+
+        probe = self._recording_probe({5252: None})
+        assert (
+            nonterminal_completion_claim_task_ids(self._COMPLETION_CONTENT, probe) == set()
+        ), 'Expected empty set — an unknown/absent status must fail open (not block).'
+
+    def test_short_circuits_when_no_completion_claim(self):
+        """When the text carries NO completion claim (aspirational phrasing),
+        the result is empty AND the status probe is never called (short-circuit
+        keeps the common path a pure regex with no live-status read).
+        """
+        from fused_memory.reconciliation.task_filter import (
+            nonterminal_completion_claim_task_ids,
+        )
+
+        probe = self._recording_probe({5252: 'in-progress'})
+        assert (
+            nonterminal_completion_claim_task_ids('task 5252 will land soon', probe) == set()
+        ), 'Expected empty set for aspirational content with no completion claim.'
+        assert probe.calls == [], (
+            f'Expected the probe to NEVER be called when there is no completion '
+            f'claim, got calls={probe.calls!r}'
+        )
