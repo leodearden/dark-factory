@@ -171,7 +171,7 @@ class BudgetsConfig(BaseModel):
     module_tagger: float = Field(default=2.0)
     deep_reviewer: float = Field(default=15.0)
     judge: float = Field(default=0.50)
-    simple_task: float = Field(default=1.50)
+    simple_task: float = Field(default=2.50)
 
 
 class TurnsConfig(BaseModel):
@@ -187,7 +187,7 @@ class TurnsConfig(BaseModel):
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
     judge: int = Field(default=15)
-    simple_task: int = Field(default=30)
+    simple_task: int = Field(default=50)
 
 
 class EffortConfig(BaseModel):

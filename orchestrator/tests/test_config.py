@@ -2157,16 +2157,17 @@ class TestSimpleTaskRoleConfigAddressability:
 
     Byte-equivalence: these defaults reproduce simple_task's CURRENT
     effective runtime -- roles.py SIMPLE_TASK's AgentRole dataclass defaults
-    (model='sonnet', budget=1.50, max_turns=30) plus _invoke's getattr
+    (model='sonnet', budget=2.50, max_turns=50) plus _invoke's getattr
     fallbacks (effort='high', timeout=invocation_timeout=7200.0,
-    backend='claude'). Retuning these values to something better suited to
-    a "simple" task is out of scope here (task lambda).
+    backend='claude'). Task lambda (2797) retuned these to better suit a
+    "simple" task: max_turns 30->50 (PRD Open-Q 4) and budget scaled
+    proportionally (1.50 x 50/30 = 2.50).
     """
 
     def test_submodel_field_defaults_reproduce_current_runtime(self):
         assert ModelsConfig().simple_task == 'sonnet'
-        assert BudgetsConfig().simple_task == 1.50
-        assert TurnsConfig().simple_task == 30
+        assert BudgetsConfig().simple_task == 2.50
+        assert TurnsConfig().simple_task == 50
         assert EffortConfig().simple_task == 'high'
         assert TimeoutsConfig().simple_task == 7200.0
         assert BackendsConfig().simple_task == 'claude'
@@ -2181,8 +2182,8 @@ class TestSimpleTaskRoleConfigAddressability:
         config = OrchestratorConfig()
         defaults = _load_package_defaults()
         assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
-        assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 1.50
-        assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 30
+        assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 2.50
+        assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 50
         assert config.effort.simple_task == defaults['effort']['simple_task'] == 'high'
         assert config.timeouts.simple_task == defaults['timeouts']['simple_task'] == 7200.0
         assert config.backends.simple_task == defaults['backends']['simple_task'] == 'claude'
@@ -2338,11 +2339,11 @@ class TestSimpleTaskDeprecatedScalarHonoring:
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
             config = OrchestratorConfig()
 
-        assert config.budgets.simple_task == 1.50, (
+        assert config.budgets.simple_task == 2.50, (
             'A default-valued simple_task_budget_usd must not migrate into '
             'budgets.simple_task.'
         )
-        assert config.max_turns.simple_task == 30, (
+        assert config.max_turns.simple_task == 50, (
             'A default-valued simple_task_max_turns must not migrate into '
             'max_turns.simple_task.'
         )

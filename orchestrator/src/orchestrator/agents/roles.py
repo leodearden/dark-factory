@@ -1339,8 +1339,8 @@ the simple path — stop and let the architect take over.
     ],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
-    default_budget=1.50,
-    default_max_turns=30,
+    default_budget=2.50,
+    default_max_turns=50,
     # Both families (reify esc-4943-54): simple_task's prompt embeds the
     # escalation/memory instructions AND requires a plan-tools-registered
     # plan (_run_simple_task's success contract). Without 'plan_tools' here
