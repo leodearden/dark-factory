@@ -119,7 +119,13 @@ entries:
   filed_tasks: 2231 (in-flight), dep-capability probe → PRD
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-18'
+    project: dark_factory
+    session: 6f8e04c4-fb3b-4ab9-a273-a79a5a000d3f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: not_found=4 suggests agent tried to access resources (paths, entities, dependencies) that were never verified to exist. tool_error=2 + self_correct=0 indicate cascading failures with no recovery attempt. Tiny session size (338 bytes) suggests early termination following premise failures.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
