@@ -502,3 +502,62 @@ def matrix_pairs(
     exists to measure. ``len == len(arch_cfgs) * len(impl_cfgs)``. Pure.
     """
     return [(a, i) for a in arch_cfgs for i in impl_cfgs]
+
+
+# ===== Claude-format-endpoint candidate bundles (eval-revival ν / C5) =====
+#
+# Non-incumbent (harness, model) bundles: Claude Code driving a THIRD-PARTY
+# model by pointing ANTHROPIC_BASE_URL at that provider's own official
+# Anthropic-format-compatible endpoint (ANTHROPIC_AUTH_TOKEN authenticates
+# against it), while ``model`` carries the provider's OWN model id verbatim
+# (never the 'opus'/'sonnet' aliases — those only resolve against Anthropic's
+# own API). Forwarding these two env vars to the role under test is
+# production's per-role ``role_env_overrides`` mechanism (task 2460, Contract
+# C5); the eval driver already forwards a candidate's flat ``env_overrides``
+# to the one role under test (runner.py's run_eval / run_architect_eval), so
+# no runner.py change is needed here.
+
+# Official Anthropic-format base URLs (public; safe to commit). Z.AI/GLM and
+# DeepSeek match the literal already load-bearing in task 2460's
+# test_workflow_e2e.py / this PRD's reuse notes; MiniMax and Moonshot/Kimi are
+# this module's own best-effort literal (operator-adjustable, like the
+# GPU/quantization choices in VLLM_EVAL_CONFIGS above).
+GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
+DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic'
+MINIMAX_BASE_URL = 'https://api.minimax.io/anthropic'
+KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
+
+# Per-provider ANTHROPIC_AUTH_TOKEN source env var name. Never a secret
+# literal in source — the value itself is read from the operator's
+# environment at bundle-build time (see the bundle builder below).
+GLM_AUTH_TOKEN_ENV = 'ZAI_API_KEY'
+DEEPSEEK_AUTH_TOKEN_ENV = 'DEEPSEEK_API_KEY'
+MINIMAX_AUTH_TOKEN_ENV = 'MINIMAX_API_KEY'
+KIMI_AUTH_TOKEN_ENV = 'MOONSHOT_API_KEY'
+
+# Provider model ids, used verbatim as the Claude Code ``model`` value AND
+# (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
+# stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
+MINIMAX_MODEL = 'MiniMax-M2.5'
+GLM_MODEL = 'glm-5.2'
+DEEPSEEK_MODEL = 'deepseek-v4'
+KIMI_MODEL = 'kimi-latest'
+
+
+def claude_endpoint_candidates() -> list[EvalConfig]:
+    """Incumbents (native cloud Opus/Sonnet) + the four non-incumbent bundles.
+
+    Each non-incumbent bundle is a (harness, model) candidate — Claude Code
+    driving MiniMax M2.5 / GLM-5.2 / DeepSeek V4 / Kimi (PRD C5). ADDITIVE to
+    :func:`ofat_candidates`: the non-incumbent bundles are NOT added there,
+    since its implementer subset asserts every cloud incumbent carries no
+    proxy ``env_overrides`` (test_eval_driver_configs.py) — this is a
+    separate, additive selector for Phase-4 candidate screening.
+    """
+    return [
+        *_cloud_implementer_incumbents(),
+        EvalConfig('minimax-m2.5-endpoint', 'claude', MINIMAX_MODEL, 'high'),
+        EvalConfig('glm-5.2-endpoint', 'claude', GLM_MODEL, 'high'),
+        EvalConfig('deepseek-v4-endpoint', 'claude', DEEPSEEK_MODEL, 'high'),
+        EvalConfig('kimi-endpoint', 'claude', KIMI_MODEL, 'high'),
+    ]
