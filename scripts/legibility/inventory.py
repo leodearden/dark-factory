@@ -22,7 +22,7 @@ import argparse
 import gzip
 import json
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -221,18 +221,21 @@ def _build_session_record(
     session_path: Path,
     encoded_dir: str,
     cwd_prefixes: Sequence[str],
-    target_date: date,
+    date_ok: Callable[[date], bool],
 ) -> SessionRecord | None:
     """Build a :class:`SessionRecord` for one transcript file, or ``None`` to skip it.
 
     Skips (returns ``None``) a non-existent/unreadable/empty file, a session
     whose real ``cwd`` is not a project member (:func:`is_member`), and a
     session whose date — first-timestamp (:func:`_session_cwd_and_date`),
-    falling back to file mtime — is not *target_date*. Shared by the
-    ``~/.claude/projects`` loop and the archive-roots loop in
-    :func:`enumerate_sessions`: the projects path is behaviorally unchanged
-    (guarded by ``TestEnumerateSessions``), while the archive path passes the
-    encoded worktree dir (``session_path.parent.name``) as *encoded_dir*.
+    falling back to file mtime — is rejected by *date_ok* (``date_ok(d)`` is
+    ``False``). The *date_ok* predicate is what lets one shared record-builder
+    back both the single-date enumerator (``date_ok = d == target_date``) and
+    the range enumerator (``date_ok = start <= d <= end``) with no duplicated
+    walk. Shared by the ``~/.claude/projects`` loop and the archive-roots loop
+    in :func:`_enumerate`: the projects path is behaviorally unchanged (guarded
+    by ``TestEnumerateSessions``), while the archive path passes the encoded
+    worktree dir (``session_path.parent.name``) as *encoded_dir*.
     """
     try:
         st = session_path.stat()
@@ -255,7 +258,7 @@ def _build_session_record(
             session_date = datetime.fromtimestamp(st.st_mtime, tz=UTC).date()
         except OSError:
             return None
-    if session_date != target_date:
+    if not date_ok(session_date):
         return None
 
     return SessionRecord(
@@ -299,13 +302,13 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     yield from sorted(matches)
 
 
-def enumerate_sessions(
+def _enumerate(
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
-    target_date: date,
+    date_ok: Callable[[date], bool],
     agent_transcript_roots: Sequence[Path | str] = (),
 ) -> list[SessionRecord]:
-    """Enumerate every session transcript for *target_date* across all matching encoded dirs.
+    """Shared single-walk core behind :func:`enumerate_sessions` and :func:`enumerate_sessions_in_range`.
 
     Aggregates across every directory :func:`iter_project_dirs` yields
     (never assumes one dir per project — a project's agents span many
@@ -313,8 +316,8 @@ def enumerate_sessions(
     empty files, read the session's real ``cwd`` and first-timestamp date
     together in one pass (:func:`_session_cwd_and_date`) and confirm
     membership via :func:`is_member`, falling back to file mtime for the
-    date when no timestamp is present, and keep only sessions matching
-    *target_date* (all via :func:`_build_session_record`).
+    date when no timestamp is present, and keep only sessions whose date
+    satisfies *date_ok* (all via :func:`_build_session_record`).
 
     *agent_transcript_roots* is an ADDITIONAL, opt-in list of archive roots
     (the ``shared.transcript_archive`` fleet-transcript tree, resolved via
@@ -323,14 +326,18 @@ def enumerate_sessions(
     root is admitted by the same per-file membership + date filter, with the
     encoded worktree dir taken from ``session_path.parent.name``. It
     defaults to an empty tuple: when empty, the archive loop does not
-    execute and this function is byte-identical to the projects-only path.
+    execute and this walk is byte-identical to the projects-only path.
+
+    The *date_ok* predicate is the ONLY thing that varies between the two
+    public enumerators, so the walk itself — and its byte-parity for the
+    single-date path — is defined exactly once here.
     """
     root = Path(projects_root)
     records: list[SessionRecord] = []
     for project_dir in iter_project_dirs(root, cwd_prefixes):
         for session_path in sorted(project_dir.glob('*.jsonl')):
             record = _build_session_record(
-                session_path, project_dir.name, cwd_prefixes, target_date
+                session_path, project_dir.name, cwd_prefixes, date_ok
             )
             if record is not None:
                 records.append(record)
@@ -338,11 +345,64 @@ def enumerate_sessions(
     for archive_root in agent_transcript_roots:
         for session_path in _iter_archive_transcripts(Path(archive_root)):
             record = _build_session_record(
-                session_path, session_path.parent.name, cwd_prefixes, target_date
+                session_path, session_path.parent.name, cwd_prefixes, date_ok
             )
             if record is not None:
                 records.append(record)
     return records
+
+
+def enumerate_sessions(
+    projects_root: Path | str,
+    cwd_prefixes: Sequence[str],
+    target_date: date,
+    agent_transcript_roots: Sequence[Path | str] = (),
+) -> list[SessionRecord]:
+    """Enumerate every session transcript for *target_date* across all matching encoded dirs.
+
+    A thin single-date wrapper over :func:`_enumerate` with the equality
+    predicate ``date_ok = (d == target_date)`` — behaviorally unchanged from
+    the pre-refactor implementation (same walk, same equality filter),
+    guarded by ``TestEnumerateSessions`` and ``TestEnumerateArchiveRoots``.
+    See :func:`_enumerate` for the walk semantics and the
+    *agent_transcript_roots* archive-mining contract, and
+    :func:`enumerate_sessions_in_range` for the single-walk range variant the
+    census uses to avoid re-opening each file once per window date.
+    """
+    return _enumerate(
+        projects_root,
+        cwd_prefixes,
+        lambda d: d == target_date,
+        agent_transcript_roots,
+    )
+
+
+def enumerate_sessions_in_range(
+    projects_root: Path | str,
+    cwd_prefixes: Sequence[str],
+    start_date: date,
+    end_date: date,
+    agent_transcript_roots: Sequence[Path | str] = (),
+) -> list[SessionRecord]:
+    """Enumerate every session in the inclusive ``[start_date, end_date]`` window — in ONE walk.
+
+    The single-walk O(total_files) replacement for calling
+    :func:`enumerate_sessions` once per calendar date across a census window:
+    a thin wrapper over :func:`_enumerate` with the range predicate
+    ``date_ok = (start_date <= d <= end_date)``, so each session file is
+    opened exactly once regardless of the window's length (the per-date loop
+    opened it ``window_days`` times). Because a census window is a contiguous
+    inclusive calendar range and each file matches at most one date, the
+    result set is identical to the union of per-date :func:`enumerate_sessions`
+    calls. See :func:`_enumerate` for the walk semantics and the
+    *agent_transcript_roots* archive-mining contract.
+    """
+    return _enumerate(
+        projects_root,
+        cwd_prefixes,
+        lambda d: start_date <= d <= end_date,
+        agent_transcript_roots,
+    )
 
 
 def main(argv: Sequence[str]) -> int:
