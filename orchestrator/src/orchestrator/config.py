@@ -2491,6 +2491,25 @@ class OrchestratorConfig(BaseSettings):
     # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
     # activated by the τ deterministic-deploy fleet restart.
     merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
+    # When True (default), after a remote two-host verify returns a real-suite
+    # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
+    # trust-anchor on the intact merge worktree as an independent second
+    # opinion BEFORE the land: agree -> proceed (verdict_parity_ok); local
+    # FAIL vs remote PASS -> fail-closed (withhold the land, quarantine the
+    # remote runner, file a blocking verify_cross_check_mismatch escalation);
+    # local RunnerUnavailable -> fail-safe (trust the remote green, emit
+    # verify_cross_check_inconclusive).  Default True is safety-first per the
+    # loud-over-silent norm AND provably INERT on main today: reify's
+    # verify_runners is not yet enabled, so _run_post_merge_verify always gets
+    # runner=None (local dispatch path) and the ``runner is not None``
+    # cross-check branch never executes — zero behaviour change until Lever C
+    # is turned on.  UNLIKE its restart-only merge_verify_workspace /
+    # merge_verify_breadth neighbours, this knob IS green-tier hot-reloadable
+    # (see RELOADABLE_FIELDS, beside verify_env): flipping the cross-check gate
+    # mid-process is safe — it only ever ADDS a second-opinion verify, never
+    # splits an in-flight merge's breadth.
+    verify_cross_check_remote_green: bool = Field(default=True)
     # Train-former opt-in knob (β).  OFF by default so β can land before γ/δ
     # complete the full stack; an always-on former would assign metadata.train
     # and route members to merge-deferred with no stacking (γ) in place, which
@@ -3991,6 +4010,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_tasks',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
+        # Per-land remote-green cross-check gate (task 2822, fix b) — green-tier
+        # unlike its restart-only merge_verify_workspace/merge_verify_breadth
+        # siblings: it only ever ADDS a second-opinion local verify, so flipping
+        # it mid-process cannot split an in-flight merge's breadth.
+        'verify_cross_check_remote_green',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task
