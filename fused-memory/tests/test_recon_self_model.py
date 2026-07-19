@@ -324,17 +324,17 @@ class TestRenderSourceCompletionSection:
 
     def test_both_modes_state_operational_gate_filing_vocabulary(self):
         """Both stages route the residual to the operational + operational_mode='gate'
-        human gate (the metadata field delivered by prereq task α/2801)."""
+        human gate (the metadata field delivered by prereq task α/2801). Assert the
+        full literals the function emits: bare 'operational' is a trivial substring
+        of 'operational_mode', and neither bare token distinguishes the 'gate' mode
+        from the 'llm' mode the function's own text explicitly contrasts."""
         for can_file in (True, False):
             text = m.render_source_completion_section(can_file_tasks=can_file)
-            assert 'operational_mode' in text, (
-                f'can_file_tasks={can_file} must name metadata.operational_mode'
+            assert "metadata.operational_mode='gate'" in text, (
+                f"can_file_tasks={can_file} must emit metadata.operational_mode='gate'"
             )
-            assert "'gate'" in text, (
-                f"can_file_tasks={can_file} must declare the 'gate' operational_mode value"
-            )
-            assert 'operational' in text, (
-                f'can_file_tasks={can_file} must name the operational execution_class'
+            assert "execution_class='operational'" in text, (
+                f"can_file_tasks={can_file} must emit execution_class='operational'"
             )
 
     def test_can_file_tasks_true_files_residual_via_submit_task(self):
