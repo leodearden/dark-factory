@@ -675,7 +675,19 @@ async def _map_advance_failure(
 
     Handles ``wip_overlap``, ``pop_conflict``, ``unmerged_state``,
     ``pop_conflict_no_advance``, ``not_descendant``, ``contaminated``,
-    and ``stash_failed``.  Does **not** handle ``cas_failed``
+    and ``stash_failed``.
+
+    ``stash_failed`` (task 2758) HALTS the queue and returns a distinct
+    ``stash_failed`` outcome — it is a SHARED main-checkout-hygiene fault
+    (advance_main could not park project_root's dirty tracked WIP) that
+    recurs identically for every subsequent task, so it takes the
+    single-escalation halt path (parallel to ``unmerged_state``), NOT the
+    per-task ``blocked`` catch-all.  ``not_descendant``/``contaminated``
+    remain per-branch, per-task ``blocked`` with no halt — they are content
+    problems specific to one branch that do NOT recur for other tasks (same
+    reasoning as the ``conflict_markers`` per-branch → no-halt branch).
+
+    Does **not** handle ``cas_failed``
     (per-worker retry orchestration is a preserved difference) or the
     request-abandoned early-out (kept per-worker because the two workers
     differ on what to clean up).  Does **not** touch *merge_wt* — callers
@@ -785,7 +797,37 @@ async def _map_advance_failure(
             ),
         )
 
-    # not_descendant / contaminated / stash_failed — permanent failure
+    if result == 'stash_failed':
+        # SHARED main-checkout-hygiene fault (task 2758): advance_main parks
+        # project_root's uncommitted WIP onto a private ref before advancing;
+        # a park failure (MergeParkContentionError/MergeParkError) means
+        # project_root's tree carries dirty TRACKED file(s) that could not be
+        # stashed.  Because project_root is shared, this fails IDENTICALLY for
+        # every subsequent task's landing — so halt the whole queue (exactly
+        # ONE escalation is filed, by the halt owner) instead of silently
+        # blocking N tasks one at a time (the 2026-07-12 reify pileup).
+        # Contrast not_descendant/contaminated below, which are per-branch and
+        # do NOT recur for other tasks (kept per-task-blocked, no halt).
+        halt(
+            'advance_main: stash_failed — park of project_root WIP failed; '
+            'project_root has dirty tracked file(s) that could not be stashed. '
+            'Manual main-checkout hygiene required before any retry.'
+        )
+        cas_retries.pop(task_id, None)
+        dirty = getattr(git_ops, '_last_stash_dirty_files', None) or []
+        return MergeOutcome(
+            'stash_failed',
+            reason=(
+                f'advance_main returned stash_failed: could not park '
+                f'project_root WIP — dirty tracked file(s): '
+                f'{", ".join(dirty) if dirty else "(unknown)"}. Halting queue; '
+                f'manual main-checkout hygiene required before any retry. '
+                f'(task {task_id})'
+            ),
+            dirty_files=dirty,
+        )
+
+    # not_descendant / contaminated — per-branch permanent failure (no halt)
     cas_retries.pop(task_id, None)
     return MergeOutcome(
         'blocked',

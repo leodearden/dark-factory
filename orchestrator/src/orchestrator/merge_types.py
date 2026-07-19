@@ -831,11 +831,19 @@ class GroupMergeRequest(MergeRequest):
 class MergeOutcome:
     """Result delivered to the caller via the Future."""
 
-    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'unknown_branch', 'superseded', 'error']
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'stash_failed', 'unknown_branch', 'superseded', 'error']
     reason: str = ''
     conflict_details: str = ''
     recovery_branch: str | None = None
     overlap_files: list[str] | None = None
+    dirty_files: list[str] | None = None
+    """Dirty TRACKED files in project_root that ``advance_main`` could not park
+    before advancing — set only on the ``stash_failed`` outcome (task 2758).
+
+    Distinct from :attr:`overlap_files`, which means "uncommitted WIP that
+    overlaps the merge diff" (the ``wip_halted`` case): a stash_failed file
+    need not overlap the merge diff at all — it is a project_root main-checkout
+    hygiene fault (the shared park failed), not a per-merge-diff conflict."""
     merge_sha: str | None = None
     push_status: str | None = None
     failure_diagnostic: dict[str, str] | None = None
