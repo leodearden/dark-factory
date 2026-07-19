@@ -451,3 +451,28 @@ class TestBlendComposite:
         assert blend_composite(
             -5.0, 0.0, 0.0, tests_pass=True,
         ) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
+# have a SINGLE home in agents.invoke; metrics re-exports rather than
+# re-declares them, so the copy cannot drift. These guards fail loudly if a
+# future edit reintroduces a local copy in metrics.py.
+# ---------------------------------------------------------------------------
+
+class TestCostPrimitivesSingleHome:
+    """metrics._FALLBACK_PRICE / metrics._rate must BE the invoke singletons
+    (identity, not mere equality) — a re-declared local copy would fail these.
+    """
+
+    def test_fallback_price_is_the_invoke_singleton(self):
+        from orchestrator.agents import invoke
+        from orchestrator.evals import metrics
+
+        assert metrics._FALLBACK_PRICE is invoke._FALLBACK_PRICE
+
+    def test_rate_accessor_is_the_invoke_singleton(self):
+        from orchestrator.agents import invoke
+        from orchestrator.evals import metrics
+
+        assert metrics._rate is invoke._rate

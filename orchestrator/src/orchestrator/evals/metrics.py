@@ -9,6 +9,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
+# have a SINGLE home in agents.invoke (task 2459); this module re-exports them
+# rather than re-declaring so the three-way copy can never drift (reviewer:
+# code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy, and
+# report.build_price_table imports _rate FROM here. agents.invoke has no import
+# cycle back to evals (it reaches only config/fm_retry/shared.*), so a
+# module-level import is safe.
+from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
+
 if TYPE_CHECKING:
     from orchestrator.workflow import TaskWorkflow
 
@@ -212,23 +221,11 @@ def blend_composite(
     return round(min(max(blended, 0.0), 1.0), 4)
 
 
-# Fallback USD/1M-token rate used ONLY for a PROXIED endpoint whose model is
-# unlisted — mirrors invoke._FALLBACK_PRICE (task 2459) so cost degradation is a
-# DEFINED, logged number, never a silent one (Invariant P5 / the
-# loud-over-silent-degradation norm).
-_FALLBACK_PRICE: dict[str, float] = {'input_per_1m': 2.0, 'output_per_1m': 8.0}
-
-
-def _rate(entry: Any, key: str) -> float:
-    """Read *key* off a price *entry*, which may be a ``PriceEntry`` (attribute)
-    or a plain dict (item) — so both ``config.prices`` values and plain
-    ``{'input_per_1m','output_per_1m'}`` dicts work through one accessor.
-    Mirrors invoke._rate: uses ``hasattr`` (not a ``getattr`` default) so a
-    legitimate 0.0 rate is read correctly rather than masked by a fallback.
-    """
-    return getattr(entry, key) if hasattr(entry, key) else entry[key]
-
-
+# ``_FALLBACK_PRICE`` (the DEFINED, logged degradation rate used only for a
+# PROXIED endpoint whose model is unlisted — Invariant P5 / the
+# loud-over-silent-degradation norm) and ``_rate`` (the PriceEntry-or-dict
+# accessor) are imported from agents.invoke at the top of this module — a single
+# home so the copy cannot drift (reviewer: code-reuse).
 def resolve_cost_usd(
     input_tokens: int,
     output_tokens: int,
