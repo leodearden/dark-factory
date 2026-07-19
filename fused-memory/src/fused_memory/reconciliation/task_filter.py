@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
-from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
@@ -431,16 +430,41 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
 # ('task N'/'df N'/'#N', NOT bare digits), and tag a clause's ids when
 # PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
 # NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans stripped out. Requiring
-# the explicit task-ref anchor is exactly what makes otherwise-ambiguous words
-# like "resolved" safe to include (which the bare TERMINAL_OUTCOME_RE
-# deliberately dropped) — the anchor disambiguates a retrospective completion
-# claim about a specific task from generic prose ("the meeting resolved
-# nothing"). Deterministic lexical matching, no thresholds, fully
+# the explicit task-ref anchor is what lets copula-framed completion words
+# ("task N is resolved", "task N has completed") match without firing on
+# generic prose ("the meeting resolved nothing").
+#
+# Transitive-verb caveat (task 2824 review). The anchor alone does NOT
+# disambiguate "task N resolved <object>" (a transitive verb whose object is
+# the task-ref's sibling, not a completion of the task) from "task N is
+# resolved". So the most commonly transitive-capable completion words —
+# "resolved" and "completed" — are matched ONLY in copula form (the second arm
+# of PRESENT_TENSE_COMPLETION_RE), never as bare verbs; a bare "task N resolved
+# the ambiguity" therefore does not false-fire. The bare-verb arm keeps only
+# words that read as a completion of the anchored task even without a copula
+# ("task N landed/merged/shipped"). This trades a little under-firing (bare
+# intransitive "task N resolved") for many fewer false positives, matching the
+# module's fail-open-on-under-firing philosophy.
+#
+# Clause-granularity caveat (task 2824 review). When ONE clause names several
+# task ids and still contains a completion phrase after the negated/aspirational
+# spans are stripped, ALL of that clause's ids are tagged — the detector does
+# not associate the completion phrase with the nearest ref. So "task A is done
+# and task B will land" tags BOTH A and B (the aspirational "will land" for B is
+# stripped, leaving "is done" to fire clause-wide). This over-broad tagging is
+# inherited from find_conflicting_task_status_ids; because a hit only soft-
+# blocks a recon-stage write with a rephrase hint (never corrupts data), the
+# fail-toward-blocking direction is acceptable for the rare multi-task-in-one-
+# clause completion write. Deterministic lexical matching, no thresholds, fully
 # unit-testable; fails open on under-firing like every sibling detector.
 PRESENT_TENSE_COMPLETION_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
-    # bare past-tense/participle completion words (strongly imply done)
-    r'landed|merged|shipped|resolved|completed|'
+    # bare past-tense/participle completion words that read as a completion of
+    # the anchored task even without a copula ("task N landed"). The most
+    # commonly transitive-capable words ("resolved"/"completed") are deliberately
+    # NOT here — they match only in copula form below, so "task N resolved <obj>"
+    # does not false-fire (task 2824 review; see the module comment above).
+    r'landed|merged|shipped|'
     # copula/auxiliary + (been/already/now/fully)* + completion word
     r'(?:is|are|was|were|has|have|had|been)\s+(?:been\s+|already\s+|now\s+|fully\s+)*'
     r'(?:done|complete|completed|resolved|merged|fixed|landed|shipped|closed)|'
@@ -487,6 +511,11 @@ def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
     Purely textual — no live-status lookup (that cross-check is layered on by
     nonterminal_completion_claim_task_ids). Pure: no I/O, no side effects.
     Fails open on under-firing, matching every sibling detector in this module.
+
+    See the module comment above for two deliberate limitations: transitive-
+    capable verbs ("resolved"/"completed") match only in copula form (so
+    "task N resolved <object>" does not false-fire), and a single clause naming
+    several ids tags ALL of them when any completion phrase survives stripping.
     """
     result: set[int] = set()
 

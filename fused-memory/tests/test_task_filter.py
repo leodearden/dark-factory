@@ -3842,6 +3842,96 @@ class TestFindPresentTenseCompletionClaimTaskIds:
             'Expected empty set for whitespace-only string.'
         )
 
+    # ------------------------------------------------------------------ #
+    # transitive-verb caveat (task 2824 review): bare "resolved"/"completed"
+    # are transitive-capable, so they match ONLY in copula form — a bare
+    # "task N resolved <object>" must NOT false-fire.
+    # ------------------------------------------------------------------ #
+
+    def test_negative_transitive_resolved_bare_verb(self):
+        """'task N resolved <object>' uses "resolved" as a transitive verb, not a
+        completion claim about task N — must NOT fire. The anchor alone cannot
+        disambiguate this from "task N is resolved", so bare "resolved" is
+        matched only in copula form (see module comment).
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'The decision for task 5252 resolved the naming ambiguity'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set — bare transitive "resolved" must not fire.'
+            f'\ntext={text!r}'
+        )
+
+    def test_negative_transitive_completed_bare_verb(self):
+        """'task N completed <object>' uses "completed" transitively — must NOT
+        fire (bare "completed" is matched only in copula form).
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 completed the migration of the manifest gate'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set — bare transitive "completed" must not fire.'
+            f'\ntext={text!r}'
+        )
+
+    def test_positive_copula_resolved_still_fires(self):
+        """Removing bare "resolved" must NOT weaken the copula form: "task N was
+        resolved" is still an unambiguous completion claim and must fire.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 was resolved last week'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} — copula "was resolved" is still a completion claim.'
+            f'\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # clause-granularity caveat (task 2824 review): a single clause naming
+    # several ids tags ALL of them when any completion phrase survives the
+    # negated/aspirational stripping. Documented, accepted over-broad behavior.
+    # ------------------------------------------------------------------ #
+
+    def test_mixed_clause_completion_and_aspirational_tags_all_ids(self):
+        """A single clause naming two ids — one completed, one aspirational —
+        tags BOTH: the aspirational "will land" (for 5253) is stripped, leaving
+        "is done" to fire clause-wide over every id in the clause. This is the
+        detector's accepted clause-granularity limitation (inherited from
+        find_conflicting_task_status_ids); it fails toward blocking, which for a
+        recon-stage write only yields a rephrase hint. No sentence terminator
+        separates the two, so it is one clause.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 is done and task 5253 will land'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252, 5253}, (
+            f'Expected {{5252, 5253}} — clause-granularity tags all ids in a clause '
+            f'that carries a surviving completion phrase.\ntext={text!r}'
+        )
+
+    def test_split_clause_isolates_aspirational_id(self):
+        """Contrast to the above: once a sentence terminator splits the two, the
+        aspirational id is correctly isolated — "task 5253 will land." is its own
+        clause with no surviving completion phrase, so only 5252 is tagged.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 is done. task 5253 will land.'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} — a clause boundary isolates the aspirational 5253.'
+            f'\ntext={text!r}'
+        )
+
 
 class TestNonterminalCompletionClaimTaskIds:
     """Tests for nonterminal_completion_claim_task_ids(text, status_probe) in
