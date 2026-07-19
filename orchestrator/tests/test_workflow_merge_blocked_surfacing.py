@@ -156,3 +156,109 @@ class TestGenericMergeBlockedSurfacing:
         assert call_kwargs.get('merge_phase') is True, (
             f'Expected merge_phase=True forwarded; got {call_kwargs}'
         )
+
+
+class TestEnsureL1EscalationSignatureAware:
+    """The terminal L1 gate in ``_ensure_l1_escalation_for_blocked`` (the
+    unconditional fall-through from ``_mark_blocked``) must be signature-aware: a
+    NEW root cause (different category) is no longer suppressed by an UNRELATED
+    open L1, while a SAME-category open L1 still dedupes.
+
+    Direct-drive pattern mirrors test_workflow_merge_thrash.py's
+    ``test_ensure_l1_escalation_stamps_root_cause``.
+    """
+
+    def test_different_category_open_l1_does_not_suppress_new_l1(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_routing_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        store = EventStore(tmp_path / 'runs.db', run_id='run-l1')
+        workflow = _make_routing_workflow(config, worktree, event_store=store)
+
+        submitted_escs: list = []
+
+        def _has_open_l1(task_id, *, category=None):
+            # An UNRELATED L1 is open (a bare no-category query sees it), but
+            # NONE of the 'merge_error' signature -> a new root cause must file.
+            # The bare-query True is what the OLD gate reads (RED: it suppresses).
+            if category is None:
+                return True
+            return category != 'merge_error'
+
+        mock_queue = MagicMock()
+        mock_queue.has_open_l1 = MagicMock(side_effect=_has_open_l1)
+        mock_queue.make_id = MagicMock(return_value='esc-test-1')
+        mock_queue.submit = MagicMock(side_effect=submitted_escs.append)
+        workflow.escalation_queue = mock_queue  # type: ignore[assignment]
+
+        with patch.object(
+            workflow, '_build_train_state', new=AsyncMock(return_value=None),
+        ), patch.object(workflow, '_durable_ref_suffix', return_value=''):
+            asyncio.run(
+                workflow._ensure_l1_escalation_for_blocked(
+                    'Post-merge verification failed: pytest failed',
+                    'detail here',
+                    category='merge_error',
+                )
+            )
+
+        # A new L1 IS submitted with the real category (not suppressed).
+        assert len(submitted_escs) == 1, (
+            f'Expected 1 submitted escalation (a different-category open L1 must '
+            f'NOT suppress a new root cause); got {submitted_escs}'
+        )
+        assert submitted_escs[0].category == 'merge_error'
+        assert submitted_escs[0].level == 1
+
+        # The gate queried has_open_l1 WITH the category kwarg (signature-aware).
+        assert any(
+            call.kwargs.get('category') == 'merge_error'
+            for call in mock_queue.has_open_l1.call_args_list
+        ), (
+            f'has_open_l1 never queried with category=merge_error; '
+            f'calls={mock_queue.has_open_l1.call_args_list}'
+        )
+
+        # An escalation_created(level=1) event fired for the new L1.
+        rows = store.fetch_events_by_type(EventType.escalation_created)
+        assert len(rows) == 1, f'expected one escalation_created row; got {rows}'
+        assert rows[0]['data']['level'] == 1
+        assert rows[0]['data']['category'] == 'merge_error'
+
+    def test_same_category_open_l1_still_dedupes(self, tmp_path: Path) -> None:
+        config = _make_routing_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_routing_workflow(config, worktree)
+
+        submitted_escs: list = []
+        mock_queue = MagicMock()
+        # A SAME-signature L1 is open -> True for the category query.
+        mock_queue.has_open_l1 = MagicMock(return_value=True)
+        mock_queue.make_id = MagicMock(return_value='esc-test-2')
+        mock_queue.submit = MagicMock(side_effect=submitted_escs.append)
+        workflow.escalation_queue = mock_queue  # type: ignore[assignment]
+
+        with patch.object(
+            workflow, '_build_train_state', new=AsyncMock(return_value=None),
+        ), patch.object(workflow, '_durable_ref_suffix', return_value=''):
+            asyncio.run(
+                workflow._ensure_l1_escalation_for_blocked(
+                    'Post-merge verification failed: pytest failed',
+                    'detail here',
+                    category='merge_error',
+                )
+            )
+
+        # A same-signature open L1 still dedupes -> no submit.
+        assert submitted_escs == [], (
+            f'A same-category open L1 must dedupe (no new submit); got {submitted_escs}'
+        )
+        # And the gate queried WITH the category kwarg (RED on the old bare call).
+        assert mock_queue.has_open_l1.call_args is not None
+        assert mock_queue.has_open_l1.call_args.kwargs.get('category') == 'merge_error', (
+            f'Expected has_open_l1 queried with category=merge_error; '
+            f'got {mock_queue.has_open_l1.call_args}'
+        )
