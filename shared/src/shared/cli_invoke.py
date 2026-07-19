@@ -1413,6 +1413,7 @@ def build_claude_argv(
     effort: str | None,
     resume_session_id: str | None,
     session_id: str | None,
+    strict_mcp_config: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Assemble the Claude CLI argv — the single source of truth shared by the
     non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
@@ -1420,6 +1421,20 @@ def build_claude_argv(
 
     Builds the argv up to (but NOT including) any sandbox wrap, creating the
     on-disk system-prompt / mcp-config temp files it references along the way.
+
+    ``strict_mcp_config`` (default ``False``): when ``True`` AND an
+    ``mcp_config`` is supplied, ``--strict-mcp-config`` is appended right after
+    the ``--mcp-config <path>`` pair. This scopes the invocation to ONLY the
+    servers in the ``--mcp-config`` file, ignoring the ambient project
+    ``.mcp.json`` merge — the recon-watch isolation pattern. It is the
+    supervised auto-watcher rotation's guard against its capped ``escalation``
+    connection (identical server name + URL as the interactive header-less
+    block) bleeding into a concurrent interactive session under the non-strict
+    ambient merge (task 2796, THREAD 2). The flag is emitted ONLY inside the
+    ``if mcp_config:`` block, so ``strict_mcp_config=True`` with no
+    ``mcp_config`` is a no-op (``--strict-mcp-config`` is meaningless with no
+    ``--mcp-config``). The default ``False`` keeps every existing caller's argv
+    byte-identical.
 
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created (empty when resuming and
@@ -1489,6 +1504,12 @@ def build_claude_argv(
             with open(fd, 'w') as f:
                 json.dump(mcp_config, f)
             cmd.extend(['--mcp-config', mcp_config_path])
+            if strict_mcp_config:
+                # Scope the invocation to ONLY the --mcp-config servers,
+                # ignoring the ambient .mcp.json merge (recon-watch isolation
+                # pattern). Emitted here, inside `if mcp_config:`, so it is a
+                # no-op with no --mcp-config to strict-scope. See the docstring.
+                cmd.append('--strict-mcp-config')
 
         if output_schema:
             cmd.extend(['--json-schema', json.dumps(output_schema)])
