@@ -24,10 +24,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from shared.task_statuses import (
-    ACTIVE as ACTIVE_TASK_STATUSES,
-    TERMINAL as TERMINAL_STATUSES,
-)
+from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
