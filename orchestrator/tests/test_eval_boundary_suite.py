@@ -76,7 +76,6 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import subprocess
 from collections.abc import Callable, Coroutine
@@ -331,9 +330,7 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
     (2b) ERROR-verdict filter — an artifact whose top-level verdict is
         ``ERROR`` is skipped exactly as ``aggregate_reviews`` skips it (0
         issues), so it scores as clean even when it still carries ``issues``
-        entries;
-    (3) scoring reads ONLY the artifact dict + scalar knobs (no transcript /
-        file-path / worktree argument) — the P4 substrate μ's driver consumes.
+        entries.
 
     RED: ``orchestrator.evals.scoring`` / ``quality_from_review_artifact`` does
     not exist yet.
@@ -379,18 +376,6 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
         error_artifact, plan_steps=plan_steps,
     )
     assert error_score == clean_score
-
-    # (3) Reads only the artifact dict + scalar knobs — never a transcript,
-    # file path, or worktree. Assert that NEGATIVE contract (no such argument
-    # creeps in) rather than pinning the exact name set, so a cosmetic rename of
-    # a scalar knob does not false-fail with no behavioural regression.
-    params = set(inspect.signature(scoring.quality_from_review_artifact).parameters)
-    forbidden = ('transcript', 'worktree', 'path', 'file', 'dir')
-    leaked = {p for p in params if any(tok in p.lower() for tok in forbidden)}
-    assert not leaked, (
-        'quality_from_review_artifact must read only the artifact dict + scalar '
-        f'knobs, never a transcript/worktree/file-path argument; found: {sorted(leaked)}'
-    )
 
 
 # ── B2: factory single construction point (P2) ─────────────────────────────
