@@ -1156,9 +1156,17 @@ class TaskWorkflow:
         # first use so subsequent invocations are fresh.
         self._pending_resume_session_id: str | None = None
         self._pending_resume_role: str | None = None
+        # Cumulative adopted-resume count carried across restarts in the v2
+        # sidecar (task 2771).  β populates 'resume_count' in the recovered
+        # sidecar dict; α reads it defensively (absent → 0) and applies the +1
+        # increment at the adopted-resume point in _invoke.
+        self._pending_resume_count: int = 0
         if resume_session_id:
             self._pending_resume_session_id = resume_session_id.get('session_id')
             self._pending_resume_role = resume_session_id.get('role')
+            self._pending_resume_count = int(
+                resume_session_id.get('resume_count', 0) or 0
+            )
         # Session id stash for zero-output evidence enrichment.  Set in _invoke
         # right after session_id_val is determined; read by _capture_zero_output_evidence
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
@@ -8802,14 +8810,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ):
             session_id_val = self._pending_resume_session_id
             resume_session_id = session_id_val
+            # Adopted resume: bump the cumulative count off the recovered base,
+            # then reset it (consumed-on-first-use, mirroring the session-id/
+            # role resets below).
+            resume_count_to_write = self._pending_resume_count + 1
             self._pending_resume_session_id = None
             self._pending_resume_role = None
+            self._pending_resume_count = 0
             logger.info(
                 'Task %s [%s]: resuming prior session %s via --resume',
                 self.task_id, role.name, session_id_val,
             )
         else:
             session_id_val = str(uuid.uuid4())
+            resume_count_to_write = 0
 
         # Stash for _capture_zero_output_evidence — result.session_id is '' on
         # hard SIGKILL, so we capture the effective id here before the invocation.
@@ -8826,6 +8840,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.artifacts is not None:
             self.artifacts.write_agent_session(
                 session_id_val, role.name, datetime.now(UTC).isoformat(),
+                task_id=str(self.task_id), resume_count=resume_count_to_write,
             )
 
         started_at = datetime.now(UTC).isoformat()
