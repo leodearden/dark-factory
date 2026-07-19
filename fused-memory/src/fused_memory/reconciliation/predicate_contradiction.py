@@ -48,6 +48,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
 from shared.task_metadata import BeforeDone
 
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
@@ -162,15 +163,51 @@ def build_predicate_contradiction_task(
             step-6's validation.
         title / description: Optional overrides; sensible defaults are derived
             from *contradiction* / *script* / *args*.
+
+    Raises:
+        ValueError: if *execution_class* is not ``'code_tdd'``, or if the
+            ``before_done`` shape is invalid (empty *script*, non-positive
+            *timeout_secs*) — the underlying pydantic ``ValidationError`` is
+            preserved as ``__cause__``.
     """
-    before_done = BeforeDone(
-        kind='predicate',
-        script=script,
-        args=list(args),
-        timeout_secs=timeout_secs,
-        cwd=cwd,
-        env=dict(env or {}),
-    ).model_dump(exclude_none=True)
+    # Fail loud: 'code_tdd' is the ONLY execution_class compatible with a
+    # before_done.kind='predicate' task. execution_class in {'operational',
+    # 'decision'} is coerced by route_deterministic / operational_ask_registry
+    # to task_kind='deterministic' + always_escalates=True, which
+    # deterministic_task_guard invariant 6 forbids for a predicate. Reject any
+    # other value outright (rather than silently overriding a caller who reached
+    # for the wrong class) per the loud-over-silent-degradation norm.
+    if execution_class != _REQUIRED_EXECUTION_CLASS:
+        raise ValueError(
+            f'execution_class={execution_class!r} is invalid for a predicate '
+            f'contradiction task: {_REQUIRED_EXECUTION_CLASS!r} is the only '
+            "compatible class. A before_done.kind='predicate' task forbids "
+            'always_escalates=True (deterministic_task_guard invariant 6), but '
+            "execution_class in {'operational', 'decision'} is coerced to "
+            "task_kind='deterministic' + always_escalates=True at the submit "
+            f'boundary — so only {_REQUIRED_EXECUTION_CLASS!r} can be used here.'
+        )
+    # Defensive single-source check: the fixed class must be a member of the
+    # guard's accepted set, so this helper can never drift from
+    # execution_class_guard's allowlist.
+    assert _REQUIRED_EXECUTION_CLASS in EXECUTION_CLASSES
+
+    try:
+        before_done = BeforeDone(
+            kind='predicate',
+            script=script,
+            args=list(args),
+            timeout_secs=timeout_secs,
+            cwd=cwd,
+            env=dict(env or {}),
+        ).model_dump(exclude_none=True)
+    except ValidationError as exc:
+        # Re-wrap as ValueError with builder context, preserving the pydantic
+        # detail as __cause__ so the fail-loud contract is uniformly ValueError.
+        raise ValueError(
+            'before_done shape validation failed for predicate contradiction '
+            f'task (script={script!r}, timeout_secs={timeout_secs!r}): {exc}'
+        ) from exc
 
     metadata: dict[str, Any] = {
         'task_kind': 'deterministic',
