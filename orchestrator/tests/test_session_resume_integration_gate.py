@@ -806,3 +806,45 @@ async def test_b7_resume_cap_emits_capped(harness: Harness):
     assert cap.resume_session_id is None
     assert cap.initial_plan is recovered_plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume_capped]
+
+
+# ── B8: resume-failure fallback storm → one L1, streak not per-event ─────────
+@pytest.mark.asyncio
+async def test_b8_fallback_storm_files_one_l1(harness: Harness):
+    """B8 — ``fallback_storm_threshold`` CONSECUTIVE stale dispatches in one
+    boot file exactly ONE level-1 escalation (not one per fallback): the streak
+    is a per-boot RUN counter, and a run this long is the signature of a
+    SYSTEMATIC corroboration break (clock skew / mass reseed), not isolated
+    foreign-acquires.
+
+    The FIRST stale dispatch flows through REAL ``_recover_crashed_tasks`` (so
+    this stays a composition, not a hand-populated unit test); the remaining
+    two seed the recovered dicts directly — the streak is a harness-level
+    counter, so it accumulates identically either way. Reuses ``_storm_queue``.
+    """
+    harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+    harness._escalation_queue = _storm_queue()
+
+    # 1st stale dispatch — REAL recovery → adopt → stale fallback (streak=1).
+    _setup_warm_lane_session(harness, 'st0', 'uuid-st0', fresh=False)
+    await harness._recover_crashed_tasks()
+    assert 'st0' in harness._recovered_sessions  # β genuinely adopted it
+    cap0 = await _dispatch_capture(harness, 'st0')
+    assert cap0.resume_session_id is None
+
+    # 2nd + 3rd stale dispatches — leaner hand-populated recovered state.
+    for i in (1, 2):
+        tid = f'st{i}'
+        harness._recovered_sessions[tid] = _sidecar(
+            f'uuid-{tid}', 'implementer', task_id=tid, fresh=False,
+            sidecar_version=2, resume_count=0,
+        )
+        harness._recovered_plans[tid] = _make_plan(3, 5, tid)
+        cap = await _dispatch_capture(harness, tid)
+        assert cap.resume_session_id is None
+
+    # Exactly one L1 filed at the threshold — not one per fallback.
+    assert harness._escalation_queue.submit.call_count == 1
+    esc = harness._escalation_queue.submit.call_args.args[0]
+    assert esc.level == 1
+    assert 'resume' in esc.summary.lower()
