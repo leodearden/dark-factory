@@ -93,3 +93,50 @@ class TestPiSonnetControl:
         assert pi_control.model == sonnet_incumbent.model
         assert pi_control.effort == sonnet_incumbent.effort
         assert pi_control.backend != sonnet_incumbent.backend
+
+
+class TestGetConfigByNameAndPropagation:
+    """Selection + backend/model propagation — the dispatch-routing signal:
+    an OFAT eval run resolves a ξ bundle by name and routes the implementer
+    to the codex/pi backend at the right model. Never a live codex/pi
+    subprocess — that is μ's runtime driver behaviour, out of scope here."""
+
+    def test_get_config_by_name_resolves_codex_bundle(self):
+        from orchestrator.evals.configs import CODEX_RUST_MODEL, get_config_by_name
+
+        cfg = get_config_by_name('codex-gpt5.6-sol')
+        assert cfg is not None
+        assert cfg.backend == 'codex'
+        assert cfg.model == CODEX_RUST_MODEL
+
+    def test_get_config_by_name_resolves_pi_bundle(self):
+        from orchestrator.evals.configs import PI_CONTROL_MODEL, get_config_by_name
+
+        cfg = get_config_by_name('pi-sonnet-control')
+        assert cfg is not None
+        assert cfg.backend == 'pi'
+        assert cfg.model == PI_CONTROL_MODEL
+
+    def test_build_eval_orch_config_propagates_backend_and_model_for_both_bundles(
+        self, tmp_path,
+    ):
+        # Mirrors test_eval_candidate_bundles.py's
+        # test_build_eval_orch_config_propagates_endpoint_and_model: a minimal
+        # YAML setting only project_root, layered over packaged defaults.yaml
+        # through the real production config-load entry point.
+        from orchestrator.config import load_config
+        from orchestrator.evals.configs import get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(f'project_root: {tmp_path}\n')
+        base = load_config(cfg_path)
+
+        for name in ('codex-gpt5.6-sol', 'pi-sonnet-control'):
+            bundle = get_config_by_name(name)
+            assert bundle is not None, f'{name} did not resolve via get_config_by_name'
+
+            orch_config = build_eval_orch_config(bundle, {}, base)
+
+            assert orch_config.backends.implementer == bundle.backend
+            assert orch_config.models.implementer == bundle.model
