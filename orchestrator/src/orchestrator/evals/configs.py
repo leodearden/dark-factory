@@ -659,3 +659,41 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
     replaced) for proxied-endpoint cost accuracy.
     """
     return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
+
+
+# ===== Codex + pi candidate bundles (eval-revival ξ) =====
+#
+# Two additive Phase-4 candidates, resolved by name via get_config_by_name —
+# mirrors ν's claude_endpoint_candidates() pattern above: NOT injected into
+# EVAL_CONFIGS/ofat_candidates (opt-in candidates; injecting them would
+# dispatch an evaluate-only backend in every default `--matrix` run and
+# perturb the OFAT incumbent floor).
+#
+#   - codex + GPT-5.6 "Sol": Rust implementer, evaluate-only (RUST CAUTION,
+#     PRD decision 14 — Claude leads the only Rust-bearing public
+#     benchmarks and open-model Rust evidence is thin, so no architect-role
+#     variant and no production wiring).
+#   - pi + Sonnet: harness-isolating control (added in a later step) — same
+#     model+effort as the claude-sonnet-max incumbent, only the backend
+#     varies, isolating harness effect from model effect.
+
+# Operator-adjustable best-effort literal (the GPT-5.6 "Sol" snapshot
+# codename), matching this file's MINIMAX_MODEL/GPU-literal convention: the
+# exact codex `--model` string is environment-specific and unverifiable from
+# this repo, so tests assert against this named constant rather than a
+# brittle inline string.
+CODEX_RUST_MODEL = 'gpt-5.6'
+
+
+def codex_pi_candidates() -> list[EvalConfig]:
+    """The ξ candidate bundles: codex Rust implementer (+ pi Sonnet control,
+    added in a later step).
+
+    ADDITIVE, mirroring claude_endpoint_candidates() above: resolved by name
+    via get_config_by_name, never added to EVAL_CONFIGS/ofat_candidates.
+    """
+    return [
+        EvalConfig(
+            'codex-gpt5.6-sol', 'codex', CODEX_RUST_MODEL, 'xhigh', role='implementer',
+        ),
+    ]
