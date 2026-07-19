@@ -382,6 +382,52 @@ def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05
     raise AssertionError(f'holder build did not materialize {path} within {timeout}s')
 
 
+def wait_for_marker_stable(
+    path: Path,
+    *,
+    timeout: float = 20.0,
+    interval: float = 0.02,
+    stable_reads: int = 6,
+    _read_mtime_ns=None,
+) -> int:
+    """Poll *path*'s mtime until it stops changing; return the settled value.
+
+    GNU ``touch`` on a not-yet-existing file is a two-syscall op:
+    ``open(O_CREAT)`` sets an initial mtime, then ``utimensat()`` re-stamps
+    it to the final value.  Under full-xdist real-subprocess CPU contention
+    those two steps can straddle a scheduler preemption, so a caller that
+    captures the mtime the instant the file appears (e.g. via
+    :func:`wait_for_marker` alone) can observe the intermediate create-time
+    rather than the final, settled value -- task 2819 (~46ms observed drift
+    within the same wall-clock second on a loaded 503s full-verify run).
+
+    Reuses :func:`wait_for_marker` as the existence gate, then polls
+    *path*'s mtime (via the injectable *_read_mtime_ns* seam, defaulting to
+    a real ``path.stat().st_mtime_ns`` read) until it is unchanged across
+    *stable_reads* consecutive reads, and returns that settled value.
+    Raises AssertionError if it never stabilizes within *timeout* seconds.
+    """
+    wait_for_marker(path, timeout=timeout, interval=interval)
+    read = _read_mtime_ns or (lambda p: p.stat().st_mtime_ns)
+    deadline = time.monotonic() + timeout
+    last = read(path)
+    count = 1
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        cur = read(path)
+        if cur == last:
+            count += 1
+            if count >= stable_reads:
+                return cur
+        else:
+            last = cur
+            count = 1
+    raise AssertionError(
+        f'{path}: mtime did not settle within {timeout}s '
+        f'(last observed mtime_ns={last})'
+    )
+
+
 def subtree_and_leader_gone(pgid: int) -> bool:
     """True when *pgid* has no live descendants AND the pgid leader itself is gone."""
     if collect_descendants(pgid, read_ppid_map()):
