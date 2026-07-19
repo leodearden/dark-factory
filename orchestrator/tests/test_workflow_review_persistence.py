@@ -92,6 +92,11 @@ def _make_workflow(
     # pre-2750 behaviour (all suggestions routed on the DONE path) so these
     # counter/verdict tests are unaffected by delta scoping.
     wf.git_ops.get_new_side_changed_line_ranges = AsyncMock(return_value={})
+    # task 2760: the post-amendment WIP guard awaits git_ops.has_uncommitted_work
+    # before re-entering VERIFY/REVIEW.  A clean tree short-circuits it to a
+    # no-op so these counter/verdict tests are unaffected (dedicated coverage in
+    # test_workflow_amendment_wip_guard.py).
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
 
     # Spies on the REVIEW-branch side effects.
     wf._review = AsyncMock(

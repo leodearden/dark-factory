@@ -347,6 +347,12 @@ def _make_loop_workflow(tmp_path, *, round0, round1, call_order):
     wf.artifacts.get_cached_verdict.return_value = None
 
     wf.git_ops.get_head_tree_hash = AsyncMock(return_value=None)
+    # task 2760: the post-amendment WIP guard awaits git_ops.has_uncommitted_work
+    # before re-entering VERIFY/REVIEW.  These loop tests drive the amendment
+    # path but do not exercise WIP commit — a clean tree short-circuits the
+    # guard to a no-op (its dedicated coverage lives in
+    # test_workflow_amendment_wip_guard.py).
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
 
     wf._enter_phase = MagicMock()
     wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)
