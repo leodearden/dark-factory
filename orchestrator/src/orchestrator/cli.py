@@ -1006,46 +1006,223 @@ def _run_matrix_cmd(
     force: bool = False,
     timeout: int | None = None,
 ):
-    """Run full eval matrix."""
-    from orchestrator.evals.configs import EVAL_CONFIGS
-    from orchestrator.evals.runner import run_eval_matrix
+    """Backward-compatible ``eval --matrix`` alias → the μ matrix driver (task 2478).
 
-    all_configs = EVAL_CONFIGS
-
-    tasks_dir = Path(__file__).parent / 'evals' / 'tasks'
-    if not tasks_dir.exists():
-        # Try relative to project root
-        tasks_dir = base_config.project_root / 'orchestrator' / 'evals' / 'tasks'
-
-    task_paths = sorted(tasks_dir.glob('*.json'))
-    if not task_paths:
-        click.echo('No task files found in evals/tasks/', err=True)
-        sys.exit(1)
-
-    total = len(task_paths) * len(all_configs) * trials
-    click.echo(
-        f'Running eval matrix: {len(task_paths)} tasks × {len(all_configs)} configs'
-        f' × {trials} trials = {total} runs'
-        f' (max_parallel={max_parallel or "unlimited"})'
+    Open-Q4 resolution: the legacy ``--matrix`` flag now routes to the both-live
+    architect×implementer matrix driver (:func:`_run_matrix_driver` →
+    ``run_matrix_stage``) and emits the C4 composite report, instead of the old
+    all-configs ``run_eval_matrix`` summary. The signature is preserved verbatim
+    so the ``eval --matrix`` dispatch (and the vLLM-injection CLI test that pins
+    this routing) is unchanged; ``force`` is retained for kwarg back-compat — the
+    μ screen/matrix stages always run fresh, so it is not consulted.
+    """
+    _run_matrix_driver(
+        base_config, tasks_dir=None,
+        max_parallel=max_parallel, trials=trials, timeout=timeout,
     )
 
-    async def _run():
-        results = await run_eval_matrix(
-            task_paths, all_configs, base_config,
-            max_parallel=max_parallel,
-            trials=trials,
-            force=force,
-            timeout_override=timeout,
-        )
-        click.echo(f'\nCompleted {len(results)} eval runs:')
-        for r in results:
-            score = r.metrics.get('composite_score', 0)
-            click.echo(
-                f'  {r.task_id} × {r.config_name}: '
-                f'{r.outcome} (score={score:.2f}, {r.wall_clock_ms / 1000:.1f}s)'
-            )
 
-    asyncio.run(_run())
+def _resolve_eval_task_paths(base_config, tasks_dir: Path | None) -> list[Path]:
+    """Resolve the eval-fixture dir → the sorted ``*.json`` task paths (μ driver).
+
+    Defaults to the packaged ``evals/tasks`` dir (falling back to the one under
+    *base_config.project_root* when the packaged dir is absent, mirroring
+    :func:`_run_single_eval`). :func:`_load_fixture_dir` validates the corpus
+    first — a malformed fixture is surfaced loudly with the offending file NAMED
+    — and an empty corpus is a clean CLI error, not a silent no-op.
+    """
+    tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
+    if not tasks_dir.exists():
+        tasks_dir = base_config.project_root / 'orchestrator' / 'evals' / 'tasks'
+    # Loud validation (malformed fixture → named ClickException) + emptiness guard.
+    if not _load_fixture_dir(tasks_dir):
+        click.echo(f'No eval fixtures found in {tasks_dir}', err=True)
+        sys.exit(1)
+    return sorted(tasks_dir.glob('*.json'))
+
+
+def _emit_composite_report(results, price_configs, base_config) -> None:
+    """Emit the C4 composite report for *results* (the μ driver stages' surface).
+
+    Seeds the price table from ``base_config.prices`` (falling back to the
+    packaged :func:`default_price_table`), builds λ's per-config
+    composite/cost/latency/CI95/judge report, and prints
+    :func:`format_composite_table`. The quality figure is single-sourced in λ's
+    ``compute_composite`` — the driver never re-derives a score.
+    """
+    from orchestrator.config import default_price_table
+    from orchestrator.evals.report import (
+        build_composite_report,
+        build_price_table,
+        format_composite_table,
+    )
+
+    prices = base_config.prices or default_price_table()
+    price_table = build_price_table(price_configs, prices)
+    report = build_composite_report(results, price_table=price_table)
+    click.echo(format_composite_table(report))
+
+
+def _run_ofat_driver(
+    base_config, *, tasks_dir: Path | None,
+    max_parallel: int | None, trials: int, timeout: int | None,
+) -> None:
+    """OFAT screen: ``run_ofat_stage`` over ``ofat_candidates()`` → composite (μ)."""
+    from orchestrator.evals.configs import ofat_candidates
+    from orchestrator.evals.runner import run_ofat_stage
+
+    task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
+    candidates = ofat_candidates()
+    results = asyncio.run(run_ofat_stage(
+        task_paths, candidates, base_config,
+        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
+    ))
+    _emit_composite_report(results, candidates, base_config)
+
+
+def _run_matrix_driver(
+    base_config, *, tasks_dir: Path | None,
+    max_parallel: int | None, trials: int, timeout: int | None,
+) -> None:
+    """Matrix stage: both-live architect×implementer cross product → composite (μ).
+
+    Splits ``ofat_candidates()`` by role into the architect and implementer
+    survivor inputs; ``run_matrix_stage`` expands the FULL cross product
+    (INCLUDING same-family diagonals) via ``configs.matrix_pairs``.
+    """
+    from orchestrator.evals.configs import ofat_candidates
+    from orchestrator.evals.runner import run_matrix_stage
+
+    task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
+    candidates = ofat_candidates()
+    arch_cfgs = [c for c in candidates if c.role == 'architect']
+    impl_cfgs = [c for c in candidates if c.role == 'implementer']
+    results = asyncio.run(run_matrix_stage(
+        task_paths, arch_cfgs, impl_cfgs, base_config,
+        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
+    ))
+    _emit_composite_report(results, [*arch_cfgs, *impl_cfgs], base_config)
+
+
+def _run_confirm_driver(
+    base_config, *, arch: str, impl: str, tasks_dir: Path | None,
+    max_parallel: int | None, trials: int, timeout: int | None,
+) -> None:
+    """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
+    from orchestrator.evals.configs import get_config_by_name
+    from orchestrator.evals.runner import run_confirm_stage
+
+    arch_cfg = get_config_by_name(arch)
+    impl_cfg = get_config_by_name(impl)
+    if arch_cfg is None or impl_cfg is None:
+        missing = arch if arch_cfg is None else impl
+        click.echo(f'Unknown config: {missing}', err=True)
+        sys.exit(1)
+
+    task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
+    results = asyncio.run(run_confirm_stage(
+        task_paths, arch_cfg, impl_cfg, base_config,
+        max_parallel=max_parallel, trials=trials, timeout_override=timeout,
+    ))
+    _emit_composite_report(results, [arch_cfg, impl_cfg], base_config)
+
+
+@main.command('eval-ofat')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless '
+                   'ORCH_CONFIG_PATH is set).')
+@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
+              help='Fixture dir (default: orchestrator/evals/tasks)')
+@click.option('--trials', type=int, default=1,
+              help='Trials per (fixture, candidate) cell (default: 1)')
+@click.option('--max-parallel', type=int, default=None,
+              help='Max concurrent eval runs (default: unlimited)')
+@click.option('--timeout', type=int, default=None,
+              help='Timeout in minutes per eval run (overrides task JSON)')
+def eval_ofat_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
+    """OFAT screen (μ): vary ONE role per candidate, pin the rest to incumbents.
+
+    Each candidate varies exactly one role — implementer incumbents (Opus AND
+    Sonnet, the G2 >=2-config floor) drive ``run_eval`` with the plan frozen;
+    architect candidates drive ``run_architect_eval`` live with downstream roles
+    frozen. Emits the C4 composite report.
+    """
+    try:
+        base_config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    _run_ofat_driver(
+        base_config, tasks_dir=tasks_dir,
+        max_parallel=max_parallel, trials=trials, timeout=timeout,
+    )
+
+
+@main.command('eval-matrix')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless '
+                   'ORCH_CONFIG_PATH is set).')
+@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
+              help='Fixture dir (default: orchestrator/evals/tasks)')
+@click.option('--trials', type=int, default=1,
+              help='Trials per (fixture, pair) cell (default: 1)')
+@click.option('--max-parallel', type=int, default=None,
+              help='Max concurrent eval runs (default: unlimited)')
+@click.option('--timeout', type=int, default=None,
+              help='Timeout in minutes per eval run (overrides task JSON)')
+def eval_matrix_cmd(config_path, tasks_dir, trials, max_parallel, timeout):
+    """Matrix stage (μ): both-live architect×implementer cross product.
+
+    Runs the FULL architect×implementer cross product over the OFAT survivors,
+    INCLUDING same-family diagonals (the plan-style/implementer coupling
+    hypothesis, PRD decision 9). Emits the C4 composite report.
+    """
+    try:
+        base_config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    _run_matrix_driver(
+        base_config, tasks_dir=tasks_dir,
+        max_parallel=max_parallel, trials=trials, timeout=timeout,
+    )
+
+
+@main.command('eval-confirm')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless '
+                   'ORCH_CONFIG_PATH is set).')
+@click.option('--arch', required=True,
+              help='Winning architect config name (e.g. architect-opus-high)')
+@click.option('--impl', required=True,
+              help='Winning implementer config name (e.g. claude-opus-high)')
+@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
+              help='Fixture dir (default: orchestrator/evals/tasks)')
+@click.option('--trials', type=int, default=3,
+              help='Confirmation trials per fixture (default: 3, decision 10 floor)')
+@click.option('--max-parallel', type=int, default=None,
+              help='Max concurrent eval runs (default: unlimited)')
+@click.option('--timeout', type=int, default=None,
+              help='Timeout in minutes per eval run (overrides task JSON)')
+def eval_confirm_cmd(config_path, arch, impl, tasks_dir, trials, max_parallel, timeout):
+    """Confirmation batch (μ): one end-to-end batch of the winning combo.
+
+    Runs the single winning (architect, implementer) combo across all fixtures ×
+    N trials (default 3 — decision 10's statistics floor, enough repeats for a
+    CI95 on the winner). Emits the C4 composite report.
+    """
+    try:
+        base_config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    _run_confirm_driver(
+        base_config, arch=arch, impl=impl, tasks_dir=tasks_dir,
+        max_parallel=max_parallel, trials=trials, timeout=timeout,
+    )
 
 
 def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
