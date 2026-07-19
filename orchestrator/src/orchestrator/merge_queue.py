@@ -2098,7 +2098,15 @@ async def _run_post_merge_verify(
     # red main and must NOT be blocked (else main-recovery merges would stall).
     # Mirrors the failure-path idiom above (get_main_sha in a try/except, then
     # cached_main_baseline_failing_ids).
-    if verify.trivial:
+    #
+    # getattr default False mirrors the VerifyResult dataclass default
+    # (verify.py: ``trivial: bool = False``): a result object lacking the field
+    # (e.g. a lightweight verify double, or a codec round-trip predating step-2)
+    # is treated as a NON-trivial pass, so the gate stays inert — the fail-open
+    # direction (a non-trivial pass legitimately heals a red main and must never
+    # be blocked). Production always returns a real VerifyResult, so this only
+    # affects stand-ins.
+    if getattr(verify, 'trivial', False):
         try:
             _pass_main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
         except Exception:
