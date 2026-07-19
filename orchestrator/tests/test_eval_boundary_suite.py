@@ -80,6 +80,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Coroutine
 
+import pytest
+
+from orchestrator import config as _config
+from orchestrator.config import OrchestratorConfig, load_config
+from orchestrator.evals import profile as _profile
+from orchestrator.evals.profile import EVAL_PROFILE
+
 # ---------------------------------------------------------------------------
 # Shared committed-diff git fixture (test_snapshots.py _git / tmp_repo
 # convention) — a self-contained stand-in for a paid ``evals/<id>`` fixture.
@@ -174,3 +181,86 @@ def _fake_invoke_agent(
         )
 
     return _fake
+
+
+def _load_default_config(tmp_path: Path) -> OrchestratorConfig:
+    """Load a deterministic pure-code-default config via the REAL ``load_config()``.
+
+    B1 (and the capstone) must face the production config-LOAD entry point,
+    ``load_config`` — not a hand-built ``OrchestratorConfig()`` — yet stay
+    deterministic regardless of the host's ``dark-factory-orchestrator.yaml``
+    (which could pre-set a profile leaf and make the divergence
+    machine-dependent, the exact failure the parity gate must not have).
+
+    The ``code_default_config`` fixture can't serve here: it points
+    ``ORCH_CONFIG_PATH`` at an ABSENT file, and ``load_config`` raises
+    ``ConfigRequiredError`` on a missing config file (see ``config.load_config``)
+    rather than falling through to defaults. Instead we write a minimal config
+    setting only ``project_root``; ``load_config`` layers it over the
+    package-bundled ``defaults.yaml``, so every profile leaf resolves to its
+    pure code default — through the real production entry point.
+    """
+    cfg_path = tmp_path / 'orchestrator.yaml'
+    cfg_path.write_text(f'project_root: {tmp_path}\n')
+    return load_config(cfg_path)
+
+
+# ── B1: config-profile parity (P1 / D5) ────────────────────────────────────
+
+
+def test_b1_eval_profile_divergence_parity_and_tripwire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B1 — ``eval_profile_divergence(load_config())`` is EXACTLY ``EVAL_PROFILE``.
+
+    The integration-level parity tripwire, facing the REAL ``load_config()``
+    production config-LOAD entry point (distinct from β's unit test, which
+    constructs ``OrchestratorConfig`` directly). Two halves:
+
+    (1) Parity — the divergence report's key set equals ``set(EVAL_PROFILE)``
+        and every eval-side value equals the documented profile value (incl.
+        the D8 ``fused_memory.url`` null sentinel); each base-side value
+        genuinely differs, so no leaf is a vacuous no-op.
+    (2) Tripwire — a leaked non-profile field (``max_amendment_rounds``, which
+        ``EVAL_PROFILE`` never touches) makes the report NAME the offender and
+        its key set no longer equal ``set(EVAL_PROFILE)`` — the RED signal B1
+        guards.
+
+    Exactness holds by construction: ``apply_eval_profile`` is a
+    ``model_copy(update=)`` that changes exactly the profile leaves, and β
+    proves all 6 differ from their code defaults, so the divergence is
+    precisely the 6 documented keys — never more (a leak) or fewer (a no-op).
+    """
+    base = _load_default_config(tmp_path)
+
+    divergence = _profile.eval_profile_divergence(base)
+
+    # (1) Parity: exact key-set match against the documented profile.
+    assert set(divergence) == set(EVAL_PROFILE)
+    for leaf, expected_eval in EVAL_PROFILE.items():
+        base_value, eval_value = divergence[leaf]
+        assert eval_value == expected_eval, (
+            f'{leaf}: eval-side {eval_value!r} != documented {expected_eval!r}'
+        )
+        assert base_value != expected_eval, (
+            f'{leaf}: base already equals its profile value — vacuous divergence'
+        )
+
+    # (2) Tripwire: an undocumented leak trips the parity check and is named.
+    # eval_profile_divergence computes apply_eval_profile(base) vs base, so we
+    # simulate a leaked production field by having apply_eval_profile ALSO
+    # change a non-profile leaf (max_amendment_rounds). Patched on the module
+    # so eval_profile_divergence's own module-global call resolves the leak.
+    real_apply = _profile.apply_eval_profile
+
+    def _leaky_apply(cfg: OrchestratorConfig) -> OrchestratorConfig:
+        return real_apply(cfg).model_copy(
+            update={'max_amendment_rounds': cfg.max_amendment_rounds + 1},
+        )
+
+    monkeypatch.setattr(_profile, 'apply_eval_profile', _leaky_apply)
+
+    leaked = _profile.eval_profile_divergence(base)
+
+    assert set(leaked) != set(EVAL_PROFILE)
+    assert 'max_amendment_rounds' in leaked
