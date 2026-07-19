@@ -1,0 +1,44 @@
+{
+  "id": "reify_task_4959",
+  "name": "Share mesh_aabb test helper via reify-test-support (dedup 5 copies)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "0ebaf3578c5ed2d2557705f8d735656c44719cf5",
+  "post_task_commit": "68e385c34482c61a85e8c1b58ff253a7868b718d",
+  "task_definition": {
+    "title": "Share mesh_aabb test helper via reify-test-support (dedup 5 copies)",
+    "description": "The private test helper `mesh_aabb` \u2014 computes a tessellated Mesh's AABB (min/max [f32;3]) from its flat vertex buffer \u2014 is copy-pasted verbatim across 5 sites: crates/reify-eval/tests/{affine_apply_e2e.rs, geometry_conditional_e2e.rs, sub_placement_assembly_gate.rs, sub_placement_surfacing.rs} and the #[cfg(test)] module in crates/reify-kernel-occt/src/lib.rs. Add one shared `mesh_aabb(&Mesh) -> ([f32;3],[f32;3])` to reify-test-support (already imported by all 4 reify-eval e2e tests) and re-point every call site at it. Note: reify-kernel-occt's copy is cfg(test)-private and would need reify-test-support in its dev-dependencies (or its own exported helper) to share cross-crate \u2014 include it or explicitly note it stays local. Surfaced by task 3963 code review (reviewer_comprehensive, test_duplication finding, esc-3963-99); low-severity/optional cleanup, no production-behavior change."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "68e385c34482c61a85e8c1b58ff253a7868b718d",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "68e385c34482c61a85e8c1b58ff253a7868b718d",
+    "diff_stat": {
+      "files": 6,
+      "insertions": 87,
+      "deletions": 106
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null
+}

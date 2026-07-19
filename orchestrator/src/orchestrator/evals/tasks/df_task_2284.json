@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2284",
+  "name": "Attention Rail T2: title convention doc in spawn SKILL.md + titles at factory-init spawn steps",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "5da9531bb2cbdb1204c79883b1641d92bc706853",
+  "post_task_commit": "685dcb918c0f0e468aea35527c317a7ce189e0eb",
+  "task_definition": {
+    "title": "Attention Rail T2: title convention doc in spawn SKILL.md + titles at factory-init spawn steps",
+    "description": "Two doc edits establishing the terminal-title convention:\n\n1. skills/spawn/SKILL.md \u2014 make the `terminal_title` argument (documented at :45) effectively required for programmatic callers, and document the convention `<role>:<project>#<task-id> <short-slug>` (e.g. `unblock:df#2085 routing-mechanism`, `prd:df attention-rail`). Update the Arguments and Invocation sections accordingly. Do NOT alter the positional contract or spawn-claude.sh behaviour \u2014 this is documentation of the existing title plumbing.\n2. skills/factory-init/SKILL.md \u2014 the spawn steps (~lines 110-119, positional form `<cwd> <skip_perms> '<title>' '<prompt>'`) currently pass ad-hoc or empty titles; make each spawn (`/review-briefing`, `/review`, `/prd`) pass a convention-shaped title (e.g. `review-briefing:<proj>`, `review:<proj>`, `prd:<proj>`).\n\nPure doc edits over already-present title plumbing. This file group is disjoint from T1 (which edits escalation-watcher/SKILL.md) so the two run in parallel without lock contention.\n\nPRD: plans/session-attention-rail-prd.md task T2 (+ capability-manifest.md T2).\n\nUser-observable signal: spawn SKILL.md documents the convention and marks title required for programmatic callers; factory-init spawn steps each pass a non-empty convention-shaped title.\nConsumer: Leo-on-return (WM titles); future attention-manifest.\nModules touched: skills/spawn/SKILL.md, skills/factory-init/SKILL.md."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "685dcb918c0f0e468aea35527c317a7ce189e0eb",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "685dcb918c0f0e468aea35527c317a7ce189e0eb",
+    "diff_stat": {
+      "files": 2,
+      "insertions": 7,
+      "deletions": 7
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}

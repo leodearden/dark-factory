@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2778",
+  "name": "Fix stale \"interim: hand-stamp\" note in skills/prd/references/decompose-mode.md Step 5.5",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "5d07e3818b3f9cac86d8ff26713ca3ff9424e001",
+  "post_task_commit": "492f8bda2b9ebcbb089f4249e7196782dce2ffa0",
+  "task_definition": {
+    "title": "Fix stale \"interim: hand-stamp\" note in skills/prd/references/decompose-mode.md Step 5.5",
+    "description": "Step 5.5 of skills/prd/references/decompose-mode.md contains a self-contradiction: its own prose (lines 147-149) already states \"`commit_planning` is also the mechanical Greek-label \u2192 real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's mechanical (`grep`/`script`) `delivered_check`s into the producer task's `metadata.delivered_checks`\" \u2014 but the very next paragraph (lines 150-151), a blockquote headed \"> **Interim reality.**\", contradicts it: \"Until sibling task \u03b3 lands, `commit_planning` does not yet perform this stamp. Hand-stamp `task_id` into the sidecar and commit it yourself, matching the committed exemplar's file header.\"\n\nStage 1 reconciliation (finding 8923f426-ef3c-485f-a342-c67c46515861, run c1021536-18a1-4158-858a-c8e161b7c65d) identified this as a recurring-rediscovery root cause: at least 6 independent Mem0 memories across 2026-07-15..07-18 each independently re-derived and re-wrote the same correction \u2014 that commit_planning auto-stamps the capability-manifest YAML sidecar (landed via task 2578, live since 2026-07-16) \u2014 because the doc itself was never fixed, so every /prd decompose session reads the stale \"Interim reality\" note and re-discovers the same fact fresh.\n\nFIX: delete (or rewrite) the \"> **Interim reality.**\" blockquote at Step 5.5 (lines 150-151) so it no longer instructs hand-stamping. Replace with a short note that `commit_planning` auto-stamps the sidecar (task 2578, live since 2026-07-16), matching the description already given two paragraphs above it. Single coherent doc edit, no source changes.\n\nUser-observable signal: skills/prd/references/decompose-mode.md Step 5.5 no longer contains the \"Interim reality: hand-stamp\" instruction; a `git log` entry documents the fix."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "492f8bda2b9ebcbb089f4249e7196782dce2ffa0",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "492f8bda2b9ebcbb089f4249e7196782dce2ffa0",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 1,
+      "deletions": 1
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}

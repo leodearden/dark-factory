@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2430",
+  "name": "Fix red silent-fallthrough gate: log before fail-open return in get_statuses_fresh",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "3f801419abf69819529d4c5c8536c572d5f1f64c",
+  "post_task_commit": "1cfc26c1ee9b763472b3660deb7518c3d6f3dac2",
+  "task_definition": {
+    "title": "Fix red silent-fallthrough gate: log before fail-open return in get_statuses_fresh",
+    "description": "Main is RED on the whole-tree silent-fallthrough gate (shared/tests/test_silent_fallthrough_gate.py::TestWholeTreeGate::test_no_violations_outside_allowlist fails deterministically). Single offending site: fused-memory/src/fused_memory/backends/sqlite_task_backend.py:1197 SqliteTaskBackend.get_statuses_fresh \u2014 its broad `except Exception: return {}` fail-open (intentional per docstring \"fails open to {} per the any-error contract\") logs NOTHING, which violates the gate. Introduced by task 2388 (commits 711cc46839 + e060afa3f7). FIX (Option A per esc-main-sweep-b968f9da870f-2): add a logger.warning(...) (or logger.error, exc_info=True) call immediately before the `return {}` in that except block \u2014 keep the documented fail-open behaviour but make it non-silent so the gate passes. One-line change scoped to that one method. Verify the silent-fallthrough gate test passes afterward. (Do NOT weaken the fail-open contract; do NOT allowlist unless logging proves infeasible.)"
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "1cfc26c1ee9b763472b3660deb7518c3d6f3dac2",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "1cfc26c1ee9b763472b3660deb7518c3d6f3dac2",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 6,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}

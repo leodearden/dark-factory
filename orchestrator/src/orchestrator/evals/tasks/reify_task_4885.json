@@ -1,0 +1,44 @@
+{
+  "id": "reify_task_4885",
+  "name": "FEA GUI: wire createFeaModeStore() into production component tree (DualViewport.tsx)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "02b9a543ea80d8fba880fc61d6f8314deac2ebf8",
+  "post_task_commit": "f6ecb3a78b419839348598da21bbee807c2f49b9",
+  "task_definition": {
+    "title": "FEA GUI: wire createFeaModeStore() into production component tree (DualViewport.tsx)",
+    "description": "Task 2962 shipped FeaModeToolbar.tsx, scalarRange.ts, and conditional Viewport.tsx effects all gated on `props.feaModeStore`, but never called `createFeaModeStore()` in any production call site. DualViewport.tsx passes feaDiagnostics to &lt;Viewport&gt; (line 232) but has zero reference to feaModeStore or createFeaModeStore. App.tsx likewise has zero references. All B5/B6 PRD signals (contour renders, deformed shape via warp slider) are permanently dead code in the running app because `props.feaModeStore === undefined` gates all contour/deformed rendering. This blocks task 2968 (FEA visual regression baselines)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "f6ecb3a78b419839348598da21bbee807c2f49b9",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "f6ecb3a78b419839348598da21bbee807c2f49b9",
+    "diff_stat": {
+      "files": 2,
+      "insertions": 73,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null
+}

@@ -1,0 +1,44 @@
+{
+  "id": "reify_task_5221",
+  "name": "_merge-verify warm-lane concurrency race: concurrent lane reseed/mutation causes \"file vanished mid-run\" failures during background integrity sweeps",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "6c88cfcd5ce78fabfe093da7a85ec96b81db0ccd",
+  "post_task_commit": "a3fe8f7e3c453014963c467444820a63bed93bb9",
+  "task_definition": {
+    "title": "_merge-verify warm-lane concurrency race: concurrent lane reseed/mutation causes \"file vanished mid-run\" failures during background integrity sweeps",
+    "description": "Recurring infra bug, distinct from any single task's code correctness. Task 5210's newly-added DF_VERIFY_ROLE=background main-tip integrity sweep hit the same failure signature TWICE against the shared `_merge-verify` warm lane at /home/leo/src/warm-lanes/worktrees/_merge-verify on 2026-07-14 (~16:36-16:38Z and again ~18:12-18:22Z, the second AFTER task 5210 had already landed on main at 6c88cfcd5c). In both incidents, files that were present and actively in use moments earlier (scripts/verify.sh, scripts/verify-pipeline-guard.sh, .cargo/run-with-occt.sh, Cargo.lock) became unreadable/missing mid-run, producing cascading exit-127 / nextest \"[double-spawn] ... No such file or directory (os error 2)\" / check-manifold-deps.sh \"could not read manifold-csg-sys version from Cargo.lock\" failures \u2014 none touching files in the task under test's own diff. Both were triaged by unblock-auto as risk_label=human-review-required under escalation esc-main-sweep-8eb24cf25f39-2.\n\nSuspected root cause: a concurrent merge/land or lane-reclaim/reseed process violating the \"one consumer per lane at a time; acquire_lane always re-seeds from base\" warm-lane invariant (docs/prds/warm-lane-pool-cow-seeding.md \u00a79.3/\u00a79.5) \u2014 i.e. `_merge-verify`'s exclusivity guarantee is not actually enforced against a second concurrent acquirer, and/or the newly-added DF_VERIFY_ROLE=background main-tip sweep reads/acquires the lane without holding the same exclusivity lock the merge worker uses.\n\nInvestigate:\n1. Run scripts/warm-lane-audit.sh for a RECLAIMABLE/LEAKED/PRESERVED-OK read on `_merge-verify`.\n2. Correlate orchestrator/merge-queue logs and the background-sweep invocation schedule around 2026-07-14T16:36:05Z-16:38:17Z and 18:12:55Z-18:20:37Z to identify what else acquired/reseeded/wrote that lane concurrently with the verify run.\n3. Once the second concurrent actor is identified, harden lane acquisition (locking/exclusivity check) so a concurrent acquire is refused or queued rather than silently mutating a lane mid-read by another consumer.\n\nThis is currently undermining the credibility of the new background main-tip integrity sweep (task 5210): unaddressed, repeat occurrences will misleadingly present as main-is-red and generate spurious escalations."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "a3fe8f7e3c453014963c467444820a63bed93bb9",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "a3fe8f7e3c453014963c467444820a63bed93bb9",
+    "diff_stat": {
+      "files": 2,
+      "insertions": 239,
+      "deletions": 4
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null
+}

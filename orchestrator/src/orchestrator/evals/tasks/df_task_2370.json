@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2370",
+  "name": "Harden main-tip integrity sweep: confirm-re-run a named failing test on the current tip before filing a red-main alarm (kill parallelism-flake false CRITICALs)",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "587e26c011c0739e6af27237201bfe17ff788798",
+  "post_task_commit": "f03dff179fb9238ebef83b960dc030daf12e9864",
+  "task_definition": {
+    "title": "Harden main-tip integrity sweep: confirm-re-run a named failing test on the current tip before filing a red-main alarm (kill parallelism-flake false CRITICALs)",
+    "description": "The async main-tip integrity sweep (task 1832's deliverable, orchestrator/src/orchestrator/verify.py run_main_tip_sweep + its alarm-filing path) repeatedly files FALSE red-main escalations from load-induced parallelism flakes that are 3/3 GREEN on isolated re-run, while main keeps merging cleanly. Recurrence is chronic: esc-main-sweep-ea2bd3c95e33-2 records 3 false alarms in ONE rotation on orchestrator/tests/test_concurrent_verify_boundary.py::test_concurrent_verify_boundary (B7/B4b/B6, all 3/3 green on re-run); a 2026-07-09 incident recorded 2 more false born-at-L2 CRITICALs (park_stop@324d09c742 + symlink-loop@935c, both 3/3 pass on re-run). These are the same load-sensitive xdist-contention flake class as done tasks 1836/1851/1925/2320/2350.\n\nHARM: false CRITICAL red-main alarms are high-severity L2 noise and \u2014 worse \u2014 a false CRITICAL can prompt a defensive main ref-move; the standing operator rule is \"NEVER ref-move on a sweep critical without re-running the named test on current tip first.\" The sweep should encode that rule itself instead of relying on a human to re-run by hand.\n\nFIX (confirm-before-alarm gate, precedented by task 1690's merge-verify main-health re-probe): when the full-suite sweep run reports a test FAILURE (assertion failure OR pytest-xdist worker crash / \"node down: Not properly terminated\"), before filing any red-main escalation, re-run JUST the named failing test id(s) against the SAME current main tip in isolation (-n0, addopts cleared, small bounded retry e.g. up to 2 attempts). Only file the red-main alarm if the isolated re-run still fails on the current tip. If the isolated re-run passes, suppress the alarm and instead emit a non-blocking INFO/log note (\"sweep flake suppressed: <test id> failed under load, passed on isolated re-run at <sha>\") so the flake is still visible for de-flaking without paging a human.\n\nCoordinate with pending task 2365 (treat pytest-xdist worker crash as a transient verify-infra error worth one auto-retry) \u2014 that fix is at the orchestrator per-task verify layer (workflow.py _run_verify_with_infra_retry); THIS task is the distinct main-tip integrity SWEEP layer (verify.py run_main_tip_sweep + the sweep's own alarm-filing path). Do not conflate the two subsystems; the sweep needs its own isolated-re-run confirm gate.\n\nCONSUMER (G1): the human reading the orchestrator L2 escalation queue \u2014 they must stop receiving false red-main CRITICALs that are green on re-run. LEAF SIGNAL: a sweep run whose only failures are isolated-re-run-green files ZERO red-main escalations (emits an INFO suppression log instead); a genuine red (fails on isolated re-run at the same tip) STILL files the alarm \u2014 cover both with a regression test that injects a flaky-then-green fake test result and a genuinely-red fake test result."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "f03dff179fb9238ebef83b960dc030daf12e9864",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "f03dff179fb9238ebef83b960dc030daf12e9864",
+    "diff_stat": {
+      "files": 4,
+      "insertions": 1026,
+      "deletions": 7
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}
