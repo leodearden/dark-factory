@@ -275,6 +275,56 @@ _VERIFY_ENV_BROKEN_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# Merge-verify restart-collateral shapes (task 2831) — a WIDER class of
+# broken-worktree signal than the single Cargo.lock read-failure above.
+# Grounded in the reify merge-gate RCA (2026-07-19): when the ephemeral
+# _merge-verify worktree is removed out from under a running verify, the
+# guard/wrapper/shell emits one of these five shapes. Each carries its own
+# worktree-removal-specific anchor (see the per-pattern comments) so a
+# genuine branch fault that merely mentions a missing file is not swept into
+# ENV_TRANSIENT — mirroring the Cargo.lock pattern's read-verb-adjacent-to-
+# lockfile-token discipline above.
+_VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
+    # shape 1: a read-failure of some OTHER tracked file (not Cargo.lock).
+    # Reuses/extends the Cargo.lock pattern's read-verb alternation with the
+    # "couldn't" contraction (the RCA's own grounded phrasing:
+    # "couldn't read 'crates/core/src/lib.rs': No such file or directory"),
+    # requiring the verb immediately adjacent to "read" and "No such file or
+    # directory" on the same line — a bare application FileNotFoundError with
+    # no adjacent read verb (e.g. "FileNotFoundError: [Errno 2] No such file
+    # or directory: 'fixture.json'") does not match.
+    re.compile(
+        r"^.*\b(?:could not|cannot|can[’']t|unable to|failed to|couldn[’']t)\s+read\b.*"
+        r"\bNo such file or directory\b",
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    # shape 2: the verify entrypoint script itself is gone (rc=127 lint
+    # stage, <0.4s) — "./scripts/verify.sh: No such file or directory".
+    # Anchored on a path-boundary (start-of-line or preceding '/') immediately
+    # before 'verify.sh' so an unrelated 'smoke-verify.sh'-style script name
+    # cannot false-positive.
+    re.compile(r'(?:^|/)verify\.sh: No such file or directory', re.MULTILINE),
+    # shape 3: the shell cannot write its captured output back into the
+    # (now-removed) _merge-verify worktree — anchored on the `_merge-verify`
+    # path token co-occurring with the "could not write output to" phrase so
+    # a generic "could not write output to" (some other destination) does not
+    # false-positive.
+    re.compile(r'could not write output to.*_merge-verify', re.MULTILINE),
+    # shape 4: bash's own shell-init cwd probe fails because its cwd (inside
+    # the removed worktree) no longer exists — anchored on the full
+    # "error retrieving current directory: getcwd:" phrase bash emits, not a
+    # bare 'getcwd' mention (which could appear in unrelated code/log text).
+    re.compile(
+        r'error retrieving current directory:\s*getcwd:',
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    # shape 5: the anticipatory marker reify emits once reify 5261 lands (see
+    # this module's classify_failure docstring / plan.json design_decisions
+    # for why this is landed ahead of reify 5261). Line-anchored on the
+    # literal marker text.
+    re.compile(r'^=== INTERRUPTED \(worktree removed\) ===', re.MULTILINE),
+]
+
 
 def _classify_environmental(output: str) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT /
@@ -343,6 +393,19 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     tool-blind guard rather than any per-tool table) — this does not violate
     Invariant C1, which forbids duplicating the SAME pattern across per-tool
     tables, not a category being reachable from more than one guard.
+
+    ENV_TRANSIENT — merge-verify restart collateral (task 2831): a WIDER
+    class of the same broken-``_merge-verify``-worktree host condition,
+    grounded in the reify merge-gate RCA (2026-07-19) — five documented
+    shapes (``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``) emitted when the
+    ephemeral worktree is removed out from under a running verify: a
+    read-failure of some other tracked file, a missing ``verify.sh``
+    entrypoint, a failure to write captured output back into the worktree, a
+    shell-init ``getcwd`` failure, and the anticipatory ``=== INTERRUPTED
+    (worktree removed) ===`` marker (reify 5261). Checked alongside the
+    ``_VERIFY_ENV_BROKEN_RE`` Cargo.lock check immediately above — same
+    ordering rationale (more-specific ENOSPC/linker checks win on
+    co-occurrence).
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
@@ -358,6 +421,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
     if _VERIFY_ENV_BROKEN_RE.search(output):
+        return FailureCategory.ENV_TRANSIENT
+    if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
         return FailureCategory.ENV_TRANSIENT
     return None
 
