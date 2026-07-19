@@ -318,3 +318,174 @@ def test_render_report_embeds_machine_readable_summary_block():
     assert payload['sonnet']['f1'] == pytest.approx(0.80)
     assert payload['agreement']['jaccard'] == pytest.approx(0.85)
     assert payload['adjudication']['haiku_worse_fraction'] == pytest.approx(0.4)
+
+
+# ── run_trial: end-to-end deterministic orchestration over fixtures ──────────
+
+class _FakeResult:
+    """Minimal AgentResult stand-in that parse_predictions can read.
+
+    Carries the production tagger output_schema shape
+    ``{"predictions": [{id, files}]}`` on ``structured_output``.
+    """
+
+    def __init__(self, files):
+        self.structured_output = {'predictions': [{'id': 'x', 'files': list(files)}]}
+        self.output = None
+
+
+_DIRS = ['orchestrator', 'scripts', 'shared']
+
+# Eligible: done tasks carrying non-empty metadata.files (the ground truth).
+_T1 = {'id': 1, 'title': 'exact match', 'description': 'd1',
+       'metadata': {'files': ['a.py', 'b.py']}}
+_T2 = {'id': 2, 'title': 'haiku misses one', 'description': 'd2',
+       'metadata': {'files': ['x.py', 'y.py']}}
+_T3 = {'id': 3, 'title': 'haiku over-predicts', 'description': 'd3',
+       'metadata': {'files': ['m.py']}}
+_T4 = {'id': 4, 'title': 'both partial', 'description': 'd4',
+       'metadata': {'files': ['p.py', 'q.py', 'r.py']}}
+# Excluded: deterministic (task_kind), empty files, absent files key, no metadata.
+_T5_DET = {'id': 5, 'title': 'deterministic', 'description': 'd5',
+           'metadata': {'files': ['z.py'], 'task_kind': 'deterministic'}}
+_T6_EMPTY = {'id': 6, 'title': 'empty files', 'description': 'd6',
+             'metadata': {'files': []}}
+_T7_NOFILES = {'id': 7, 'title': 'no files key', 'description': 'd7',
+               'metadata': {}}
+_T8_NOMETA = {'id': 8, 'title': 'no metadata', 'description': 'd8'}
+
+_ELIGIBLE = (_T1, _T2, _T3, _T4)
+_EXCLUDED = (_T5_DET, _T6_EMPTY, _T7_NOFILES, _T8_NOMETA)
+_ALL_TASKS = [_T1, _T2, _T3, _T4, _T5_DET, _T6_EMPTY, _T7_NOFILES, _T8_NOMETA]
+
+# (haiku prediction, sonnet prediction) per eligible task id.
+_PREDS = {
+    '1': (['a.py', 'b.py'], ['a.py', 'b.py']),        # agree → NO adjudication
+    '2': (['x.py'], ['x.py', 'y.py']),                # disagree → adjudicate
+    '3': (['m.py', 'extra.py'], ['m.py']),            # disagree → adjudicate
+    '4': (['p.py', 'q.py'], ['p.py', 'z.py']),        # disagree → adjudicate
+}
+# Frontier (opus) winners keyed by task id — only disagreements are adjudicated.
+_WINNERS = {'2': 'sonnet', '3': 'haiku', '4': 'tie'}
+
+
+def _make_invoke_fn(calls):
+    """Fake invoke_fn(prompt, model) → _FakeResult of canned predictions.
+
+    ``canned`` is keyed on the FAITHFUL prompt (``faithful_prompt_for``), so a
+    non-faithful prompt from run_trial raises KeyError — the lookup itself
+    asserts prompt fidelity. Records every (prompt, model) call for inspection.
+    """
+    canned = {}
+    for t in _ELIGIBLE:
+        prompt = mod.faithful_prompt_for(t, _DIRS)
+        haiku_pred, sonnet_pred = _PREDS[str(t['id'])]
+        canned[prompt] = {'haiku': haiku_pred, 'sonnet': sonnet_pred}
+
+    def invoke_fn(prompt, model):
+        calls.append((prompt, model))
+        return _FakeResult(canned[prompt][model])
+
+    return invoke_fn
+
+
+def _make_adjudicate_fn(calls):
+    """Fake adjudicate_fn(prompt) → {'winner': ...} keyed on the task id.
+
+    The task id is read back out of the adjudication prompt. ``_WINNERS`` only
+    has entries for disagreeing tasks, so an adjudication of an AGREEING task
+    (a bug) would KeyError — guarding "adjudicate only on disagreements".
+    """
+    import re
+
+    def adjudicate_fn(prompt):
+        calls.append(prompt)
+        tid = re.search(r'^id: (\S+)$', prompt, re.MULTILINE).group(1)
+        return {'winner': _WINNERS[tid]}
+
+    return adjudicate_fn
+
+
+def test_run_trial_invokes_each_eligible_task_per_model_with_faithful_prompt():
+    invoke_calls, adj_calls = [], []
+    mod.run_trial(_ALL_TASKS, _DIRS, _make_invoke_fn(invoke_calls),
+                  _make_adjudicate_fn(adj_calls))
+
+    # 4 eligible tasks × {haiku, sonnet} = 8 invocations; nothing else.
+    assert len(invoke_calls) == 8
+    for t in _ELIGIBLE:
+        prompt = mod.faithful_prompt_for(t, _DIRS)
+        assert (prompt, 'haiku') in invoke_calls
+        assert (prompt, 'sonnet') in invoke_calls
+    # Excluded tasks (deterministic / empty / absent files / no metadata) never invoked.
+    for t in _EXCLUDED:
+        prompt = mod.faithful_prompt_for(t, _DIRS)
+        assert (prompt, 'haiku') not in invoke_calls
+        assert (prompt, 'sonnet') not in invoke_calls
+    # Exactly the two trial models were used.
+    assert {m for _, m in invoke_calls} == {'haiku', 'sonnet'}
+
+
+def test_run_trial_adjudicates_only_haiku_sonnet_disagreements():
+    import re
+    invoke_calls, adj_calls = [], []
+    mod.run_trial(_ALL_TASKS, _DIRS, _make_invoke_fn(invoke_calls),
+                  _make_adjudicate_fn(adj_calls))
+
+    # T1 haiku==sonnet (exact agreement) → NOT adjudicated; T2/T3/T4 disagree.
+    adjudicated_ids = {
+        re.search(r'^id: (\S+)$', p, re.MULTILINE).group(1) for p in adj_calls
+    }
+    assert adjudicated_ids == {'2', '3', '4'}
+    assert len(adj_calls) == 3
+
+
+def test_run_trial_result_aggregates_scores_tally_and_decision():
+    invoke_calls, adj_calls = [], []
+    result = mod.run_trial(_ALL_TASKS, _DIRS, _make_invoke_fn(invoke_calls),
+                           _make_adjudicate_fn(adj_calls))
+
+    assert isinstance(result, mod.TrialResult)
+    assert result.n_samples == 4  # only the eligible tasks
+
+    # Per-model mean precision/recall/F1 vs ground truth — computed via the
+    # already-tested set_scores primitive so this pins orchestration, not arithmetic.
+    def _mean_vs_gold(key, side):
+        vals = []
+        for t in _ELIGIBLE:
+            haiku_pred, sonnet_pred = _PREDS[str(t['id'])]
+            pred = haiku_pred if side == 'haiku' else sonnet_pred
+            vals.append(mod.set_scores(pred, t['metadata']['files'])[key])
+        return sum(vals) / len(vals)
+
+    for key in ('precision', 'recall', 'f1'):
+        assert result.haiku[key] == pytest.approx(_mean_vs_gold(key, 'haiku'))
+        assert result.sonnet[key] == pytest.approx(_mean_vs_gold(key, 'sonnet'))
+
+    # Mean symmetric haiku-vs-sonnet agreement = mean set_scores(haiku, sonnet).
+    def _mean_agreement(key):
+        vals = []
+        for t in _ELIGIBLE:
+            haiku_pred, sonnet_pred = _PREDS[str(t['id'])]
+            vals.append(mod.set_scores(haiku_pred, sonnet_pred)[key])
+        return sum(vals) / len(vals)
+
+    for key in ('precision', 'recall', 'f1', 'jaccard'):
+        assert result.agreement[key] == pytest.approx(_mean_agreement(key))
+
+    # Adjudication tally: T3→haiku, T2→sonnet, T4→tie.
+    assert result.adjudication['haiku_better'] == 1
+    assert result.adjudication['sonnet_better'] == 1
+    assert result.adjudication['tie'] == 1
+    assert result.adjudication['haiku_worse_fraction'] == pytest.approx(0.5)
+
+    # N=4 < MIN_SAMPLES → marginal, and it must equal decide() over the same
+    # summary the result exposes (decide is wired into the pipeline).
+    assert result.decision == 'marginal'
+    assert result.decision == mod.decide({
+        'mean_haiku_f1': result.haiku['f1'],
+        'mean_sonnet_f1': result.sonnet['f1'],
+        'mean_jaccard': result.agreement['jaccard'],
+        'haiku_worse_fraction': result.adjudication['haiku_worse_fraction'],
+        'n_samples': result.n_samples,
+    })
