@@ -682,3 +682,73 @@ class TestExecuteIterationsReconcilesDoneSteps:
             f"_execute_iterations's loop, got {step_1['commit']}"
         )
         assert step_1['status'] == 'done'
+
+
+# ---------------------------------------------------------------------------
+# task 2762 step-3 RED: GitOps.find_equivalent_commit — patch-id path
+# ---------------------------------------------------------------------------
+#
+# Real temp git repo pattern (reusing the git_repo/git_ops fixtures above,
+# operating directly on git_repo as the worktree, exactly like
+# TestGetCommitChangedFiles). find_equivalent_commit(worktree, base, target)
+# must recover a rebase-replayed commit's NEW sha from an orphaned commit via
+# git patch-id --stable, and fail safe to None on anything it cannot resolve.
+
+
+async def _head(repo: Path) -> str:
+    _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    return sha.strip()
+
+
+@pytest.mark.asyncio
+class TestFindEquivalentCommit:
+    async def test_patch_id_match_recovers_replayed_sha(self, git_repo, git_ops):
+        """Case A (happy patch-id): an orphaned commit S and its byte-identical
+        replay S_prime (committed with a DIFFERENT subject) share a patch-id, so
+        find_equivalent_commit returns S_prime — proving the patch-id, not the
+        subject, drove the match."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(git_repo, 'feat: step-1')
+        assert s
+
+        # Orphan S, then re-land byte-identical content under a different subject.
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'feature.py').write_text('original implementation\n')
+        s_prime = await git_ops.commit(git_repo, 'chore: replay')
+        assert s_prime and s_prime != s
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result == s_prime, (
+            f'expected patch-id to recover the replayed sha {s_prime}, got {result}'
+        )
+
+    async def test_unresolvable_target_returns_none(self, git_repo, git_ops):
+        """Case B (unresolvable/GC'd target): a fabricated sha cannot be
+        resolved, so the method fails safe to None (never raises)."""
+        base = await _head(git_repo)
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, 'deadbeef' * 5)
+
+        assert result is None
+
+    async def test_no_equivalent_commit_returns_none(self, git_repo, git_ops):
+        """Case C (no equivalent): the orphaned commit S touches feature.py, but
+        the only commit in base..HEAD touches an unrelated file with a different
+        subject — neither patch-id nor subject can match, so None."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('original implementation\n')
+        s = await git_ops.commit(git_repo, 'feat: step-1')
+        assert s
+
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'other.py').write_text('wholly unrelated\n')
+        s_prime = await git_ops.commit(git_repo, 'chore: something else')
+        assert s_prime
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None
