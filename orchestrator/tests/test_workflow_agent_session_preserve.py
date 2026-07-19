@@ -269,3 +269,30 @@ class TestPreserveOnCancellation:
         assert getattr(rec, 'task_id', None) == str(workflow.task_id)
         assert getattr(rec, 'session_id', None) == workflow._last_invoke_session_id
         assert getattr(rec, 'role', None) == SIMPLE_TASK.name
+
+    async def test_non_cancelled_exception_clears_sidecar(
+        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+    ):
+        """The THIRD documented branch (design decision 3): a hard, non-
+        CancelledError failure is an abnormal terminal end — NOT a resumable
+        in-flight suspension — so it must fall through the finally and CLEAR the
+        sidecar, emitting no preserve fact. Only CancelledError preserves; this
+        guards against a regression that broadened the except to preserve (and
+        emit the fact) on any exception."""
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        caplog.set_level(logging.INFO)
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('boom'),
+        ), pytest.raises(RuntimeError, match='boom'):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        # Non-CancelledError → sidecar cleared (session_preserved stayed False),
+        # and NO preserve fact was emitted.
+        assert workflow.artifacts is not None
+        assert workflow.artifacts.read_agent_session() is None
+        assert _preserve_records(caplog) == []
