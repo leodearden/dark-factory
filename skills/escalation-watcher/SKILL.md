@@ -989,6 +989,19 @@ be possible under the enforced guard, and is the actual anomaly worth reporting 
 (possible guard regression, bypassed connection headers, or a stale pre-guard orchestrator/server
 pair that hasn't been restarted onto the fix yet).
 
+**Capped identity leaking into an interactive session (task 2796):** the supervised auto rotation
+now attaches its capped `escalation` connection with `--strict-mcp-config`, scoping the rotation to
+only its own MCP config and no longer merging the ambient project `.mcp.json`. Because the capped
+block shares the identical server name (`escalation`) and URL (port `8102`) as an interactive
+session's header-less block, that non-strict ambient merge was the path by which a capped
+`X-Escalation-Identity: orchestrator-escalation-watcher-auto` / `X-Escalation-Levels: 0,1` identity
+could bleed into a concurrent header-less **interactive** watcher session — making that session's own
+L2 `resolve_issue`/`park` fail `level_forbidden` as if it were the capped auto-watcher. With the
+strict isolation now in place, a capped identity should no longer leak into an interactive session.
+**If it recurs anyway**, the supervised rotation is no longer the likely culprit — suspect a
+hand-injected `--mcp-config` (e.g. a `CLAUDE_SPAWN_CLAUDE_ARGS` passthrough) or a config generator
+writing capped headers directly into `.mcp.json`.
+
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
 ## Red-on-main recovery (enforce-safe, break-glass)

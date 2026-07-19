@@ -1328,12 +1328,33 @@ def build_lease_name(role: str, project: str, task_id: str | None = None) -> str
     return name
 
 
-LEASE_HEARTBEAT_TTL = timedelta(minutes=5)
+LEASE_HEARTBEAT_TTL = timedelta(hours=2)
 """How long a lease survives with a dead holder pid and no fresh heartbeat
 (mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
 role for session records: staleness requires BOTH a dead holder pid AND an
 aged heartbeat (see claim_lease/reap_stale_leases) -- a live holder is never
-reaped regardless of heartbeat age."""
+reaped regardless of heartbeat age.
+
+VALUE DERIVATION (task 2796, THREAD 1): watcher leases are effectively
+HEARTBEAT-ONLY, not pid-guarded. The interactive escalation-watcher SKILL
+claims with ``--pid $$`` -- the EPHEMERAL Bash-tool shell pid, dead within
+milliseconds of the lease-claim -- so ``_pid_alive`` is ~always False for a
+watcher lease and the (dead-pid AND aged-heartbeat) staleness AND-guard
+collapses to a pure heartbeat-TTL check. That watcher heartbeats only ONCE
+per Main Loop cycle, and each cycle's blocking wait is one watcher-rearm.sh
+``--timeout`` slice (canonical 3600s). So the staleness TTL MUST exceed that
+heartbeat cadence, or a live-but-quiet holder's lease goes
+stale->reap-eligible during any single quiet slice and a duplicate
+reaps-and-reclaims it (the duplicate-spawn incident). 7200s = 2x the 3600s
+slice gives a full quiet slice plus a full slice of margin -- a
+cadence-derived bound, not an arbitrary bump.
+
+TRADE-OFF: a GENUINELY-crashed holder's lease now survives up to 2h before
+it is stale-reapable, versus 5min before. This is loud and recoverable, not
+silent: a contender STANDS DOWN with an explicit "dead, heartbeat Ns ago"
+message, an operator can force-reclaim immediately via ``lease-release``, and
+any reap-and-reclaim of a supposedly-live holder now emits a structured
+WARNING (see claim_lease)."""
 
 
 class LeasePolicy(StrEnum):
@@ -1550,6 +1571,28 @@ def claim_lease(
             # at most once -- we do not loop).
             existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
         else:
+            # Reaped-and-reclaimed a stale lease. The displaced holder was
+            # SUPPOSED to be dead (dead pid AND heartbeat aged past
+            # LEASE_HEARTBEAT_TTL), but this is exactly the path that -- with a
+            # mis-tuned TTL -- once let a duplicate steal a live-but-quiet
+            # watcher's lease (task 2796, THREAD 1). Emit a structured, greppable
+            # WARNING naming the displaced holder (slug + pid), the observed
+            # heartbeat age, and the new holder, so any residual reclaim of a
+            # supposedly-live holder is loud rather than silent. Pure logging --
+            # no effect on the claim outcome (fail-safe); *existing_holder* may
+            # be None (a corrupt/unreadable displaced body), rendered as an
+            # explicit placeholder rather than raising.
+            displaced_slug = existing_holder.session_slug if existing_holder is not None else '<unknown>'
+            displaced_pid = existing_holder.pid if existing_holder is not None else -1
+            logger.warning(
+                'claim_lease: reaped stale lease %s (displaced holder=%s pid=%s '
+                'heartbeat_age=%.0fs); acquired by %s',
+                name,
+                displaced_slug,
+                displaced_pid,
+                age_secs,
+                holder.session_slug,
+            )
             return _acquired_claim(name, holder)
 
     decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED

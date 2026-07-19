@@ -1868,6 +1868,43 @@ def test_claim_lease_reaps_and_reclaims_a_stale_lease(tmp_path: Path) -> None:
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == new_holder
 
 
+def test_claim_lease_reap_and_reclaim_emits_structured_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # THREAD 1 hardened detection (task 2796): a reap-and-reclaim displaces
+    # whoever currently held the lease. That holder is SUPPOSED to be dead,
+    # but if the TTL is ever mis-tuned again this same path would silently
+    # steal a live-but-quiet watcher's lease. Make every reap-and-reclaim
+    # loud/greppable so any residual displacement of a supposedly-live holder
+    # is surfaced rather than silent.
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    # Backdate past the (new) TTL so the lease IS reap-eligible.
+    age = sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1)
+    _set_mtime(lease_path, _NOW, age)
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    with caplog.at_level(logging.WARNING, logger=sr.logger.name):
+        claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    # Sanity: the reclaim actually happened (the WARNING is on that path).
+    assert claim.acquired is True
+
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == sr.logger.name
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # Names the displaced holder (slug + pid), the observed heartbeat age, and
+    # the new holder's slug.
+    assert 'watcher-df-dead' in message
+    assert str(_DEAD_PID) in message
+    assert f'{age.total_seconds():.0f}' in message
+    assert 'watcher-df-new' in message
+
+
 def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> None:
     # Proves the reap rule is (age > TTL) AND (pid dead), not either alone:
     # a dead-pid holder with a still-fresh heartbeat is NOT reaped.
@@ -1883,6 +1920,47 @@ def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> N
     assert claim.holder is not None
     assert claim.holder.session_slug == 'watcher-df-dead'
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == stale_holder
+
+
+def test_claim_lease_keeps_a_quiet_watchers_lease_across_a_full_slice(tmp_path: Path) -> None:
+    # The required "duplicate-through" regression (task 2796 THREAD 1): a live
+    # interactive watcher holds its lease with `--pid $$` (the ephemeral
+    # Bash-tool shell, dead moments after the claim), so _pid_alive is
+    # ~always False for a watcher lease and staleness collapses to a pure
+    # heartbeat-TTL check. That watcher heartbeats only once per Main Loop
+    # cycle, bounded by ONE canonical watcher-rearm.sh `--timeout` slice
+    # (3600s). If LEASE_HEARTBEAT_TTL is below that slice, a live-but-quiet
+    # holder's lease goes stale->reap-eligible during any quiet slice and a
+    # duplicate reaps+reclaims it -- the exact code path that let a
+    # live-lease-holder's duplicate spawn through. With TTL raised above the
+    # slice, the duplicate must instead STAND DOWN.
+    original = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=original, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    # Backdate the heartbeat by one full canonical wait slice (3600s).
+    _set_mtime(lease_path, _NOW, timedelta(seconds=3600))
+
+    duplicate = sr.LeaseHolder(session_slug='watcher-df-dup', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease(
+        'watcher-df', holder=duplicate, policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    # RED today: TTL=300s < 3600s slice age, so the live-but-quiet holder's
+    # lease is reaped-and-reclaimed and the duplicate ACQUIRES (claim.acquired
+    # is True) -- the duplicate-through bug. GREEN after TTL is raised: the
+    # duplicate stands down.
+    assert claim.acquired is False
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is not None
+    assert claim.holder.session_slug == 'watcher-df-dead'
+    # No clobber / no reap: the on-disk body still names the ORIGINAL holder.
+    assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
+
+    # Invariant guard: the whole regression hinges on TTL exceeding one full
+    # canonical slice. If a future edit lowers LEASE_HEARTBEAT_TTL back below
+    # 3600s, this assertion fails loudly rather than silently re-opening the
+    # gap.
+    assert timedelta(seconds=3600) < sr.LEASE_HEARTBEAT_TTL
 
 
 def test_claim_lease_survives_lease_vanishing_between_create_and_stat(

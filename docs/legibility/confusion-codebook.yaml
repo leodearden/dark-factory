@@ -40,13 +40,15 @@ entries:
   - escalation-watcher-auto L1 rotation
   - interactive /escalation-watcher
   status: fixed
-  fix: 'Residual only: add triaged_at/triaged_by ack marker to escalation records so successive rotations stop re-deriving identical dispositions'
+  fix: 'Residual only: add triaged_at/triaged_by ack marker to escalation records so successive rotations stop re-deriving identical dispositions. Capped-identity leak into interactive sessions (task 2796): the supervised auto-watcher rotation now isolates its capped escalation connection with --strict-mcp-config, so its identical-server-name (escalation, port 8102) capped block can no longer win the non-strict ambient .mcp.json merge for a concurrent header-less interactive session and stamp that session with the level-{0,1} X-Escalation-Identity that made a real L2 resolve fail level_forbidden.'
   fix_where:
   - escalation/src/escalation/server.py
   - skills/escalation-watcher-auto/SKILL.md
+  - orchestrator/src/orchestrator/harness.py
+  - shared/src/shared/cli_invoke.py
   fix_effort: S
   known_cause_match: Escalation-resolution semantics traps (cap is by design) + feedback notes exist — but the structural gap (envelope never declared at spawn; lessons can't persist in-context) is new
-  filed_tasks: '2555'
+  filed_tasks: '2555, 2796'
   origin_phase: unknown
   manifested_phase: unknown
   sightings: []

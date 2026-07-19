@@ -794,8 +794,15 @@ async def invoke_claude_agent(
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
+    strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
+
+    *strict_mcp_config*, when True (and an *mcp_config* is set), emits
+    ``--strict-mcp-config`` so the invocation is scoped to only *mcp_config*'s
+    servers, ignoring the ambient ``.mcp.json`` merge (task 2796, THREAD 2);
+    forwarded verbatim to ``build_claude_argv``. Default ``False`` keeps every
+    existing caller byte-identical.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
@@ -854,6 +861,7 @@ async def invoke_claude_agent(
         sandbox_wrap=sandbox_wrap,
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
+        strict_mcp_config=strict_mcp_config,
     )
 
 
@@ -1413,6 +1421,7 @@ def build_claude_argv(
     effort: str | None,
     resume_session_id: str | None,
     session_id: str | None,
+    strict_mcp_config: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Assemble the Claude CLI argv — the single source of truth shared by the
     non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
@@ -1420,6 +1429,20 @@ def build_claude_argv(
 
     Builds the argv up to (but NOT including) any sandbox wrap, creating the
     on-disk system-prompt / mcp-config temp files it references along the way.
+
+    ``strict_mcp_config`` (default ``False``): when ``True`` AND an
+    ``mcp_config`` is supplied, ``--strict-mcp-config`` is appended right after
+    the ``--mcp-config <path>`` pair. This scopes the invocation to ONLY the
+    servers in the ``--mcp-config`` file, ignoring the ambient project
+    ``.mcp.json`` merge — the recon-watch isolation pattern. It is the
+    supervised auto-watcher rotation's guard against its capped ``escalation``
+    connection (identical server name + URL as the interactive header-less
+    block) bleeding into a concurrent interactive session under the non-strict
+    ambient merge (task 2796, THREAD 2). The flag is emitted ONLY inside the
+    ``if mcp_config:`` block, so ``strict_mcp_config=True`` with no
+    ``mcp_config`` is a no-op (``--strict-mcp-config`` is meaningless with no
+    ``--mcp-config``). The default ``False`` keeps every existing caller's argv
+    byte-identical.
 
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created (empty when resuming and
@@ -1489,6 +1512,12 @@ def build_claude_argv(
             with open(fd, 'w') as f:
                 json.dump(mcp_config, f)
             cmd.extend(['--mcp-config', mcp_config_path])
+            if strict_mcp_config:
+                # Scope the invocation to ONLY the --mcp-config servers,
+                # ignoring the ambient .mcp.json merge (recon-watch isolation
+                # pattern). Emitted here, inside `if mcp_config:`, so it is a
+                # no-op with no --mcp-config to strict-scope. See the docstring.
+                cmd.append('--strict-mcp-config')
 
         if output_schema:
             cmd.extend(['--json-schema', json.dumps(output_schema)])
@@ -1555,6 +1584,7 @@ async def _invoke_claude(
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
+    strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd, temp_files = build_claude_argv(
@@ -1570,6 +1600,7 @@ async def _invoke_claude(
         effort=effort,
         resume_session_id=resume_session_id,
         session_id=session_id,
+        strict_mcp_config=strict_mcp_config,
     )
 
     # User prompt is piped via stdin to avoid ARG_MAX on large payloads
