@@ -1,5 +1,6 @@
 """Eval configuration matrix: model/backend combinations to test."""
 
+import os
 from dataclasses import dataclass, field
 
 
@@ -544,20 +545,58 @@ DEEPSEEK_MODEL = 'deepseek-v4'
 KIMI_MODEL = 'kimi-latest'
 
 
+def _claude_endpoint_config(
+    name: str, model: str, *, base_url: str, auth_token_env: str,
+) -> EvalConfig:
+    """Build one non-incumbent Claude-format-endpoint candidate bundle.
+
+    Mirrors ``_vllm_config``'s env-dict builder pattern: ``ANTHROPIC_BASE_URL``
+    is the public literal *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
+    *auth_token_env* via ``os.environ.get`` at CALL time (never baked into
+    source as a secret), so an operator supplies it via the environment and a
+    test can monkeypatch it and observe the value flow through.
+    """
+    return EvalConfig(
+        name=name, backend='claude', model=model, effort='high',
+        env_overrides={
+            'ANTHROPIC_BASE_URL': base_url,
+            'ANTHROPIC_AUTH_TOKEN': os.environ.get(auth_token_env, ''),
+        },
+    )
+
+
 def claude_endpoint_candidates() -> list[EvalConfig]:
     """Incumbents (native cloud Opus/Sonnet) + the four non-incumbent bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M2.5 / GLM-5.2 / DeepSeek V4 / Kimi (PRD C5). ADDITIVE to
-    :func:`ofat_candidates`: the non-incumbent bundles are NOT added there,
-    since its implementer subset asserts every cloud incumbent carries no
-    proxy ``env_overrides`` (test_eval_driver_configs.py) — this is a
-    separate, additive selector for Phase-4 candidate screening.
+    driving MiniMax M2.5 / GLM-5.2 / DeepSeek V4 / Kimi via their official
+    Anthropic-format endpoint (PRD C5). ADDITIVE to :func:`ofat_candidates`:
+    the non-incumbent bundles are NOT added there, since its implementer
+    subset asserts every cloud incumbent carries no proxy ``env_overrides``
+    (test_eval_driver_configs.py) — this is a separate, additive selector for
+    Phase-4 candidate screening.
+
+    A function, not a module-level list: the four non-incumbent bundles are
+    (re)built on every call via :func:`_claude_endpoint_config`, so each reads
+    its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
+    value from import time.
     """
     return [
         *_cloud_implementer_incumbents(),
-        EvalConfig('minimax-m2.5-endpoint', 'claude', MINIMAX_MODEL, 'high'),
-        EvalConfig('glm-5.2-endpoint', 'claude', GLM_MODEL, 'high'),
-        EvalConfig('deepseek-v4-endpoint', 'claude', DEEPSEEK_MODEL, 'high'),
-        EvalConfig('kimi-endpoint', 'claude', KIMI_MODEL, 'high'),
+        _claude_endpoint_config(
+            'minimax-m2.5-endpoint', MINIMAX_MODEL,
+            base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'glm-5.2-endpoint', GLM_MODEL,
+            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'deepseek-v4-endpoint', DEEPSEEK_MODEL,
+            base_url=DEEPSEEK_BASE_URL, auth_token_env=DEEPSEEK_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'kimi-endpoint', KIMI_MODEL,
+            base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
+        ),
     ]
