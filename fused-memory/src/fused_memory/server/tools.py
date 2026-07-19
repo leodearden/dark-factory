@@ -18,7 +18,7 @@ from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pra
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.config.reload import apply_reload
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -4796,7 +4796,11 @@ def create_mcp_server(
         ``reloaded``: a successful reload can still leave restart-only edits
         unapplied.
         """
-        config_path = os.environ.get('CONFIG_PATH')
+        # Report the path the loader will ACTUALLY read — mirror the loader's own
+        # fallback (schema.settings_customise_sources) so the disposition report
+        # never claims ``config_path=None`` while a bare ``FusedMemoryConfig()``
+        # silently read the ``DEFAULT_CONFIG_PATH`` file.
+        config_path = os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH)
 
         def _load_failure_report(error: str) -> dict[str, Any]:
             """Fail-closed report shape for a load/validation failure — the live

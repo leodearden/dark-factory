@@ -15,6 +15,13 @@ from pydantic_settings import (
 )
 from shared.config_models import UsageCapConfig
 
+# Config path used when the ``CONFIG_PATH`` env var is unset. Single-sourced here
+# so both ``settings_customise_sources`` (the actual loader) and the reload_config
+# MCP tool's ``config_path`` disposition field agree on the file actually read —
+# otherwise the tool could report ``config_path=None`` while the reload silently
+# read and applied leaves from this default file.
+DEFAULT_CONFIG_PATH = 'config/config.yaml'
+
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
     """Custom settings source for loading from YAML files."""
@@ -1198,6 +1205,6 @@ class FusedMemoryConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        config_path = Path(os.environ.get('CONFIG_PATH', 'config/config.yaml'))
+        config_path = Path(os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH))
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
