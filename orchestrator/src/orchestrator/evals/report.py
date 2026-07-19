@@ -129,6 +129,23 @@ def build_price_table(
     return table
 
 
+def _summarize_cost_source(sources: set[str]) -> str:
+    """Collapse a config's per-trial cost sources to ONE row-level label.
+
+    A config's ``cost_usd`` is a mean across all its trials; when those trials
+    carry more than one distinct ``cost_source`` (e.g. ``price_table`` on one
+    fixture, ``unpriced_proxy`` on another) reporting just the first trial's
+    source would mislabel the cross-source mean, so surface ``'mixed'`` instead
+    (reviewer: robustness). Exactly one distinct source → that source; none (a
+    config with no trials, unreachable here) → ``'cli'`` for back-compat.
+    """
+    if not sources:
+        return 'cli'
+    if len(sources) == 1:
+        return next(iter(sources))
+    return 'mixed'
+
+
 def build_composite_report(
     results: list[EvalResult],
     *,
@@ -144,7 +161,11 @@ def build_composite_report(
     mean with a small-sample CI:
 
     1. For each fixture, ``best_cost`` / ``best_latency`` = the minimum POSITIVE
-       cost / latency across all trials of all configs on that fixture.
+       cost / latency across the PASSING (``tests_pass`` truthy) trials of all
+       configs on that fixture. A cheap-but-WRONG run (which itself hard-gates
+       to 0) must not set the efficiency floor and deflate the correct configs'
+       cost/latency scores (reviewer: correctness); a fixture with NO passing
+       trial falls back to all trials so its baseline stays defined.
     2. For each trial, the efficiency-adjusted composite is
        ``blend_composite(quality=composite_score,
        cost_score=_ratio_score(cost, best_cost),
@@ -157,23 +178,45 @@ def build_composite_report(
 
     ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
     working time, not wall-clock, so eval/scheduler overhead is not charged to
-    the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` /
-    ``cost_source`` are passthroughs of any trial's metrics (η/θ/P5 surfaces).
+    the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` are
+    passthroughs of any trial's metrics (η/θ surfaces). ``cost_source`` (P5) is
+    the config's single distinct per-trial source, or ``'mixed'`` when its
+    trials span more than one — since ``cost_usd`` is a cross-trial mean,
+    labelling it with just the first trial's source would mislabel a blended
+    figure (reviewer: robustness).
     Rows are emitted sorted by ``config`` so the surface is byte-deterministic;
     *price_table* (μ/CLI seeds it from :func:`build_price_table`) is echoed
     verbatim, defaulting to ``{}`` when omitted.
     """
-    # 1. Per-fixture best (min positive) cost and latency across ALL configs.
+    # 1. Per-fixture best (min positive) cost and latency, taken from the
+    #    PASSING trials only so a cheap-but-WRONG run cannot set the efficiency
+    #    floor and deflate the correct configs (reviewer: correctness). The
+    #    ``*_all`` maps mirror the same minima over ALL trials and seed the
+    #    fallback for a fixture where nothing passed.
     best_cost: dict[str, float] = {}
     best_latency: dict[str, float] = {}
+    best_cost_all: dict[str, float] = {}
+    best_latency_all: dict[str, float] = {}
     for r in results:
         fixture = r.task_id
         cost = float(r.metrics.get('cost_usd', 0.0) or 0.0)
         latency = float(r.metrics.get('workflow_duration_ms', 0) or 0) / 1000.0
+        passed = bool(r.metrics.get('tests_pass'))
         if cost > 0:
-            best_cost[fixture] = min(best_cost.get(fixture, cost), cost)
+            best_cost_all[fixture] = min(best_cost_all.get(fixture, cost), cost)
+            if passed:
+                best_cost[fixture] = min(best_cost.get(fixture, cost), cost)
         if latency > 0:
-            best_latency[fixture] = min(best_latency.get(fixture, latency), latency)
+            best_latency_all[fixture] = min(best_latency_all.get(fixture, latency), latency)
+            if passed:
+                best_latency[fixture] = min(best_latency.get(fixture, latency), latency)
+    # Fixtures with no passing trial fall back to the all-trials baseline so the
+    # normalization denominator stays defined (every such trial hard-gates to 0
+    # regardless, so this only keeps the baseline non-empty).
+    for fixture, v in best_cost_all.items():
+        best_cost.setdefault(fixture, v)
+    for fixture, v in best_latency_all.items():
+        best_latency.setdefault(fixture, v)
 
     # 2/3. Accumulate per-trial normalized composites, pooled per config.
     def _acc() -> dict[str, Any]:
@@ -181,6 +224,7 @@ def build_composite_report(
             'composite': [], 'cost': [], 'latency': [], 'quality': [],
             'passes': 0, 'trials': 0, 'fixtures': set(),
             'judge_invocations': 0, 'judge_cost_usd': 0.0,
+            'cost_sources': set(),
             'first_metrics': None,
         }
 
@@ -208,6 +252,7 @@ def build_composite_report(
         acc['fixtures'].add(fixture)
         acc['judge_invocations'] += int(m.get('judge_invocations', 0) or 0)
         acc['judge_cost_usd'] += float(m.get('judge_cost_usd', 0.0) or 0.0)
+        acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
         if acc['first_metrics'] is None:
             acc['first_metrics'] = m
 
@@ -227,7 +272,7 @@ def build_composite_report(
             'quality': quality_ci['mean'],
             'tests_pass_rate': (acc['passes'] / trials) if trials else 0.0,
             'cost_usd': cost_ci['mean'],
-            'cost_source': fm.get('cost_source', 'cli'),
+            'cost_source': _summarize_cost_source(acc['cost_sources']),
             'latency_secs': latency_ci['mean'],
             'trials': trials,
             'fixtures': len(acc['fixtures']),

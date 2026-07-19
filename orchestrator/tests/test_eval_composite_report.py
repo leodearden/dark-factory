@@ -351,6 +351,84 @@ class TestBuildCompositeReport:
         assert row['judge']['cost_usd'] == pytest.approx(0.03)
 
 
+class TestEfficiencyBaselineIgnoresFailingTrials:
+    """Amendment (reviewer: correctness): the per-fixture cost/latency floor is
+    taken from PASSING trials only, so a cheap-but-WRONG run cannot deflate the
+    efficiency scores of the correct configs on that fixture.
+    """
+
+    def test_failing_cheap_run_does_not_deflate_passing_config(self):
+        from orchestrator.evals.report import build_composite_report
+
+        # Fixture h1: GOOD passes at cost/latency 2.0/2000; BADCHEAP FAILS but is
+        # cheaper+faster (1.0/1000). If the failing run set the baseline, GOOD's
+        # cost_score/latency_score would each drop to 0.5 → composite 0.8.
+        # Restricting the baseline to PASSING trials makes GOOD the best passing
+        # run → each efficiency score 1.0 → composite 1.0.
+        results = [
+            _mresult('h1', 'GOOD', tr, quality=1.0, cost_usd=2.0,
+                     duration_ms=2000, tests_pass=True)
+            for tr in (1, 2, 3)
+        ] + [
+            _mresult('h1', 'BADCHEAP', tr, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, tests_pass=False)
+            for tr in (1, 2, 3)
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+        assert rows['GOOD']['composite'] == pytest.approx(1.0)
+        # The failing config still hard-gates to 0 regardless of its cheapness.
+        assert rows['BADCHEAP']['composite'] == pytest.approx(0.0)
+
+    def test_all_failing_fixture_falls_back_to_all_trials_baseline(self):
+        """No passing trial on a fixture → baseline falls back to all trials, so
+        the report still builds (every such trial hard-gates to 0 anyway)."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('h2', 'X', tr, quality=1.0, cost_usd=3.0, duration_ms=3000,
+                     tests_pass=False)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['config'] == 'X'
+        assert row['composite'] == pytest.approx(0.0)
+        assert row['tests_pass_rate'] == pytest.approx(0.0)
+
+
+class TestCostSourceMixedLabel:
+    """Amendment (reviewer: robustness): when a config's trials span more than
+    one distinct cost_source, the row-level label is 'mixed' rather than
+    silently the first trial's source — since cost_usd is a cross-trial mean.
+    """
+
+    def test_mixed_sources_render_as_mixed(self):
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'M', 1, quality=1.0, cost_usd=2.0, duration_ms=2000,
+                     cost_source='price_table'),
+            _mresult('f2', 'M', 1, quality=1.0, cost_usd=2.0, duration_ms=2000,
+                     cost_source='unpriced_proxy'),
+            _mresult('f3', 'M', 1, quality=1.0, cost_usd=2.0, duration_ms=2000,
+                     cost_source='cli'),
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['config'] == 'M'
+        assert row['cost_source'] == 'mixed'
+
+    def test_single_source_reports_that_source(self):
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'S', tr, quality=1.0, cost_usd=2.0, duration_ms=2000,
+                     cost_source='unpriced_proxy')
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['cost_source'] == 'unpriced_proxy'
+
+
 # ---------------------------------------------------------------------------
 # Task 2477 step-11: format_composite_table — deterministic renderer of the
 # C4 composite report (per-config table + a distinct price-table section).
