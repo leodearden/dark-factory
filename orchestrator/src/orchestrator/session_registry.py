@@ -1571,6 +1571,28 @@ def claim_lease(
             # at most once -- we do not loop).
             existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
         else:
+            # Reaped-and-reclaimed a stale lease. The displaced holder was
+            # SUPPOSED to be dead (dead pid AND heartbeat aged past
+            # LEASE_HEARTBEAT_TTL), but this is exactly the path that -- with a
+            # mis-tuned TTL -- once let a duplicate steal a live-but-quiet
+            # watcher's lease (task 2796, THREAD 1). Emit a structured, greppable
+            # WARNING naming the displaced holder (slug + pid), the observed
+            # heartbeat age, and the new holder, so any residual reclaim of a
+            # supposedly-live holder is loud rather than silent. Pure logging --
+            # no effect on the claim outcome (fail-safe); *existing_holder* may
+            # be None (a corrupt/unreadable displaced body), rendered as an
+            # explicit placeholder rather than raising.
+            displaced_slug = existing_holder.session_slug if existing_holder is not None else '<unknown>'
+            displaced_pid = existing_holder.pid if existing_holder is not None else -1
+            logger.warning(
+                'claim_lease: reaped stale lease %s (displaced holder=%s pid=%s '
+                'heartbeat_age=%.0fs); acquired by %s',
+                name,
+                displaced_slug,
+                displaced_pid,
+                age_secs,
+                holder.session_slug,
+            )
             return _acquired_claim(name, holder)
 
     decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
