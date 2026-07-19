@@ -252,7 +252,7 @@ def _plan_tdd_alternation(plan: dict) -> bool:
     """
     steps = plan.get('steps') or []
     types = [s.get('type') for s in steps if isinstance(s, dict)]
-    return any(a == 'test' and b == 'impl' for a, b in zip(types, types[1:]))
+    return any(a == 'test' and b == 'impl' for a, b in zip(types, types[1:], strict=False))
 
 
 def _plan_files_declared(plan: dict) -> bool:

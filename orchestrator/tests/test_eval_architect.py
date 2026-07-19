@@ -26,7 +26,6 @@ import pytest
 
 from orchestrator.evals.metrics import EvalMetrics
 
-
 # ---------------------------------------------------------------------------
 # Synthetic produced-plan builders (shared across the θ tests)
 # ---------------------------------------------------------------------------
