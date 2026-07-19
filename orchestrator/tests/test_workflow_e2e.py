@@ -5684,7 +5684,7 @@ class TestAmendmentUncommittedWorkGuard:
         wt.mkdir()
         await _init_repo(wt)
         workflow.worktree = wt
-        workflow.event_store = _RecordingEventStore()
+        workflow.event_store = _RecordingEventStore()  # type: ignore[assignment]
 
         # All-done plan so _execute_iterations short-circuits each pass (no
         # implementer invocation needed).
@@ -5746,7 +5746,7 @@ class TestAmendmentUncommittedWorkGuard:
         assert subject.strip().startswith('wip: amendment round 1')
         # Exactly one recovery event, carrying round 1.
         recs = [
-            rec for etype, rec in workflow.event_store.events
+            rec for etype, rec in workflow.event_store.events  # type: ignore[union-attr]
             if str(etype).endswith('amendment_uncommitted_recovered')
         ]
         assert len(recs) == 1

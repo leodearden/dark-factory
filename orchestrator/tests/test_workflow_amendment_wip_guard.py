@@ -18,6 +18,7 @@ and a :class:`_RecordingEventStore` double.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -73,9 +74,10 @@ def _make_workflow(
         mcp=MagicMock(),
     )
     wf.worktree = tmp_path
-    wf.event_store = (
+    resolved_store = (
         _RecordingEventStore() if event_store is _DEFAULT else event_store
     )
+    wf.event_store = resolved_store  # type: ignore[assignment]
     return wf
 
 
@@ -99,8 +101,10 @@ async def test_dirty_tree_commits_and_emits_event(tmp_path):
     sha = await wf._commit_amendment_wip(2)
 
     # (a) commit awaited exactly once with the worktree + a round-2 message.
-    wf.git_ops.commit.assert_awaited_once()
-    (call_wt, call_msg), _kwargs = wf.git_ops.commit.await_args
+    commit_mock = cast(AsyncMock, wf.git_ops.commit)
+    commit_mock.assert_awaited_once()
+    assert commit_mock.await_args is not None
+    (call_wt, call_msg), _kwargs = commit_mock.await_args
     assert call_wt == tmp_path
     assert 'amendment round 2' in call_msg
     # (b) returns the WIP sha.
@@ -124,9 +128,9 @@ async def test_clean_tree_is_noop_no_commit_no_event(tmp_path):
     sha = await wf._commit_amendment_wip(1)
 
     assert sha is None
-    wf.git_ops.commit.assert_not_awaited()
+    cast(AsyncMock, wf.git_ops.commit).assert_not_awaited()
     assert _recovery_events(wf) == []
-    assert wf.event_store.events == []
+    assert wf.event_store.events == []  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -144,4 +148,4 @@ async def test_dirty_tree_with_no_event_store_commits_without_raising(tmp_path):
     sha = await wf._commit_amendment_wip(1)
 
     assert sha == 'sha'
-    wf.git_ops.commit.assert_awaited_once()
+    cast(AsyncMock, wf.git_ops.commit).assert_awaited_once()
