@@ -171,6 +171,58 @@ async def _poll_until(condition, *, timeout: float = 2.0, interval: float = 0.01
 
 
 # ---------------------------------------------------------------------------
+# task 2758: stash_failed halt-escalation text (_build_wip_halt_escalation_text)
+# ---------------------------------------------------------------------------
+
+def test_build_wip_halt_escalation_text_stash_failed(workflow: TaskWorkflow) -> None:
+    """stash_failed renders a DEDICATED main-checkout-hygiene halt escalation:
+    category=='stash_failed', with a summary + detail that name the dirty
+    tracked files and frame the incident as a project_root park/hygiene fault
+    requiring manual intervention.
+
+    RED: the builder has no stash_failed branch today, so status falls through
+    to the else (wip_halted) arm → category=='wip_conflict' and the dirty
+    files are never rendered.
+    """
+    category, summary, detail = workflow._build_wip_halt_escalation_text(
+        'stash_failed',
+        MergeOutcome(status='stash_failed', dirty_files=['README.md', 'write_queue.db']),
+        branch_name='task/x',
+    )
+
+    assert category == 'stash_failed'
+
+    # Summary names at least the first dirty file.
+    assert 'README.md' in summary, f'summary should name the dirty file(s): {summary!r}'
+
+    # Detail lists every dirty file and frames it as a main-checkout hygiene fault.
+    assert 'README.md' in detail and 'write_queue.db' in detail
+    detail_l = detail.lower()
+    assert 'park' in detail_l or 'stash' in detail_l, (
+        f'detail should describe the failed park/stash: {detail!r}'
+    )
+    assert 'project_root' in detail
+    # Infrastructure / hygiene incident → route to a human.
+    assert 'manual' in detail_l
+
+
+def test_build_wip_halt_escalation_text_stash_failed_empty_dirty_files(
+    workflow: TaskWorkflow,
+) -> None:
+    """An empty dirty_files list (side channel was unset) renders the
+    stash_failed escalation text without crashing."""
+    category, summary, detail = workflow._build_wip_halt_escalation_text(
+        'stash_failed',
+        MergeOutcome(status='stash_failed', dirty_files=[]),
+        branch_name='task/x',
+    )
+
+    assert category == 'stash_failed'
+    assert isinstance(summary, str) and summary
+    assert isinstance(detail, str) and detail
+
+
+# ---------------------------------------------------------------------------
 # Step 1: _handle_wip_conflict
 # ---------------------------------------------------------------------------
 
