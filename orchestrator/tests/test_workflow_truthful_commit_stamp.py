@@ -564,3 +564,57 @@ class TestIterationEntryIsWorkCommittedGuard:
         assert _iteration_entry_is_work({
             'agent': 'debugger', 'steps_completed': [], 'committed': True,
         }) is True
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED: the rederive-union guard excludes committed:False entries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRederiveUnionExcludesUncommitted:
+    async def test_committed_false_step_is_not_rederived_to_done(
+        self, config, git_ops, task_assignment,
+    ):
+        """With a genuine branch commit (SHA-primary has_work guard passes),
+        a durable legacy entry (step-1, no committed key) is re-derived to
+        done, but a no-durable-work entry (step-2, committed:False) must NOT
+        be — even though the branch has real work elsewhere. Fails RED: the
+        union counts step-2 and flips it to done."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('implementation\n')
+        real_sha = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        assert real_sha, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        # Durable legacy entry (no committed key) — genuine prior work.
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+            'commit': real_sha,
+        })
+        # No-durable-work entry — HEAD did not advance for this round.
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-2'],
+            'commit': None, 'committed': False,
+        })
+
+        result = await workflow._rederive_step_status_from_branch_state()
+
+        assert result == ['step-1'], (
+            f'only the durably-committed step-1 may be re-derived; step-2 '
+            f'(committed:False) must be excluded, got {result}'
+        )
+        plan = artifacts.read_plan()
+        step_1 = next(s for s in plan['steps'] if s['id'] == 'step-1')
+        step_2 = next(s for s in plan['steps'] if s['id'] == 'step-2')
+        assert step_1['status'] == 'done'
+        assert step_2['status'] == 'pending', (
+            'step-2 recorded no durable commit and must stay pending'
+        )
