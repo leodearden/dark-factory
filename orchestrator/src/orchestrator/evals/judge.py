@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
@@ -221,3 +222,142 @@ async def run_elo_tournament(
         rounds_used += 1
 
     return rounds_used
+
+
+# ---------------------------------------------------------------------------
+# Plan-quality scoring (eval-revival θ)
+#
+# The architect is the #1 cost line (42.7%/39.2% DF/reify spend) yet had ZERO
+# eval coverage — the framework FROZE the plan. θ invokes the architect LIVE
+# and scores the produced plan two ways:
+#   (1) score_plan_structure — a DETERMINISTIC structural rubric that is always
+#       a non-sentinel floor (no LLM); and
+#   (2) judge_plan_quality — an LLM plan judge scoring the produced plan against
+#       the REAL landed diff, guided by the SAME code-owned PLAN_QUALITY_RUBRIC.
+# Both read ONLY the produced plan artifact (+ the committed reference diff),
+# never a transcript (Invariant P4). run_architect_eval degrades to (1) whenever
+# (2) fails, so an architect-eval run ALWAYS emits a non-sentinel plan_quality.
+# ---------------------------------------------------------------------------
+
+
+def _plan_has_steps(plan: dict) -> bool:
+    return bool(plan.get('steps'))
+
+
+def _plan_tdd_alternation(plan: dict) -> bool:
+    """True when the plan interleaves test and impl steps (TDD discipline).
+
+    Satisfied when at least one ``test`` step is IMMEDIATELY followed by an
+    ``impl`` step — the RED→GREEN pairing a TDD plan is built around.
+    """
+    steps = plan.get('steps') or []
+    types = [s.get('type') for s in steps if isinstance(s, dict)]
+    return any(a == 'test' and b == 'impl' for a, b in zip(types, types[1:]))
+
+
+def _plan_files_declared(plan: dict) -> bool:
+    return bool(plan.get('files'))
+
+
+def _plan_design_decisions_present(plan: dict) -> bool:
+    return bool(plan.get('design_decisions'))
+
+
+def _plan_reuse_items_present(plan: dict) -> bool:
+    return bool(plan.get('reuse'))
+
+
+def _plan_confirmed(plan: dict) -> bool:
+    """True when the plan carries the ``_finalized_at`` completeness marker.
+
+    ``confirm_plan`` (and ``artifacts.stamp_plan_provenance``) stamp
+    ``_finalized_at`` once the architect finalizes a complete plan, so its
+    presence is the code-observable "confirmed" signal.
+    """
+    return bool(plan.get('_finalized_at'))
+
+
+# Code-owned structural rubric. Each criterion is
+# ``{name, weight, description}`` and ``name`` dispatches through this closed
+# detector registry (a pure predicate over the produced plan dict). The
+# names/descriptions are embedded verbatim into the LLM plan-judge prompt
+# (:func:`judge_plan_quality`) so the deterministic floor and the semantic
+# judge score the SAME named signals. An unregistered criterion name raises
+# loudly (code-owned rubric typo).
+_PLAN_QUALITY_DETECTORS: dict[str, Callable[[dict], bool]] = {
+    'has_steps': _plan_has_steps,
+    'tdd_alternation': _plan_tdd_alternation,
+    'files_declared': _plan_files_declared,
+    'design_decisions_present': _plan_design_decisions_present,
+    'reuse_items_present': _plan_reuse_items_present,
+    'plan_confirmed': _plan_confirmed,
+}
+
+PLAN_QUALITY_RUBRIC: dict[str, Any] = {
+    'description': (
+        'Structural quality of a produced implementation plan: a well-formed '
+        'TDD plan declares alternating test/impl steps, names the files it '
+        'touches, records its design decisions and code reuse, and is confirmed '
+        'complete.'
+    ),
+    'criteria': [
+        {'name': 'has_steps', 'weight': 2.0,
+         'description': 'The plan contains at least one concrete step.'},
+        {'name': 'tdd_alternation', 'weight': 2.0,
+         'description': 'Steps interleave test (RED) and impl (GREEN) — TDD discipline.'},
+        {'name': 'files_declared', 'weight': 1.0,
+         'description': 'The plan names the files it will create or modify.'},
+        {'name': 'design_decisions_present', 'weight': 1.0,
+         'description': 'The plan records the design decisions it made and their rationale.'},
+        {'name': 'reuse_items_present', 'weight': 1.0,
+         'description': 'The plan identifies existing code to reuse rather than reinvent.'},
+        {'name': 'plan_confirmed', 'weight': 1.0,
+         'description': 'The plan is marked finalized / confirmed complete.'},
+    ],
+}
+
+
+def score_plan_structure(
+    plan: dict | None, rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
+) -> float:
+    """Deterministic structural plan-quality score in ``[0, 1]``.
+
+    Reads ONLY the produced plan dict — no LLM, no worktree, no transcript. A
+    plan with no steps (empty / ``None`` / empty ``steps`` list) is not a plan
+    and scores ``0.0`` outright. Otherwise returns the weight-weighted fraction
+    of satisfied structural criteria,
+    ``round(satisfied_weight / total_weight, 4)``, clamped to ``[0, 1]``.
+
+    This is the ALWAYS-non-sentinel floor :func:`run_architect_eval` degrades to
+    when the LLM plan judge fails, so an architect-eval run never emits a null
+    ``plan_quality`` (unlike recovery scoring, which degrades to ``None``).
+
+    Raises ``ValueError`` on an empty ``criteria`` list, an unknown criterion
+    name, or a non-positive total weight — the rubric is code-owned, so a typo
+    must fail loudly (structured-facts-at-failure / loud-over-silent).
+    """
+    if not plan or not isinstance(plan, dict) or not plan.get('steps'):
+        return 0.0
+    criteria = rubric.get('criteria') or []
+    if not criteria:
+        raise ValueError(
+            'plan-quality rubric has no criteria — a code-owned rubric must '
+            'define >=1 criterion'
+        )
+    total_weight = 0.0
+    satisfied_weight = 0.0
+    for criterion in criteria:
+        name = criterion.get('name')
+        if name not in _PLAN_QUALITY_DETECTORS:
+            raise ValueError(
+                f'unknown plan-quality criterion: {name!r} '
+                f'(registered: {sorted(_PLAN_QUALITY_DETECTORS)})'
+            )
+        weight = float(criterion.get('weight', 1.0))
+        total_weight += weight
+        if _PLAN_QUALITY_DETECTORS[name](plan):
+            satisfied_weight += weight
+    if total_weight <= 0.0:
+        raise ValueError('plan-quality rubric total weight must be > 0')
+    score = satisfied_weight / total_weight
+    return round(min(max(score, 0.0), 1.0), 4)
