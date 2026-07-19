@@ -950,10 +950,12 @@ class TaskArtifacts:
         """Return the parsed ``.task/agent_session.json`` as a typed
         :class:`AgentSession`, or ``None`` if missing/corrupt.
 
-        Fail-safe: a missing file, corrupt/unreadable JSON, or a present-but-
-        non-object payload all return ``None`` (the caller reads absence as
-        "no in-flight session").  A v1 sidecar (missing v2 keys) is tolerated
-        via :meth:`AgentSession.from_mapping`, which supplies legacy defaults.
+        Fail-safe: a missing file, corrupt/unreadable JSON, a present-but-
+        non-object payload, or a payload whose numeric fields
+        (``resume_count`` / ``schema_version``) cannot be coerced to ``int``
+        all return ``None`` (the caller reads absence as "no in-flight
+        session").  A v1 sidecar (missing v2 keys) is tolerated via
+        :meth:`AgentSession.from_mapping`, which supplies legacy defaults.
         """
         path = self._read_path('agent_session.json')
         if not path.exists():
@@ -968,7 +970,17 @@ class TaskArtifacts:
                 'Malformed agent_session.json at %s: not an object', path
             )
             return None
-        return AgentSession.from_mapping(data)
+        try:
+            return AgentSession.from_mapping(data)
+        except (ValueError, TypeError) as exc:
+            # A non-numeric resume_count/schema_version (e.g. "abc" or null)
+            # makes from_mapping's int() coercion raise; map that to the same
+            # fail-safe None as any other corruption rather than propagating.
+            logger.warning(
+                'Malformed agent_session.json at %s: unparseable field (%s)',
+                path, exc,
+            )
+            return None
 
     # ──────────────────────────────────────────────────────────────────
     # Verdict artifacts — written by the per-worktree verdict-tools MCP

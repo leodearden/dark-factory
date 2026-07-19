@@ -600,6 +600,36 @@ class TestAgentSession:
         assert data.started_at == '2026-05-01T00:00:00+00:00'
         assert data.owner_pid == 12345
 
+    def test_read_returns_none_on_unparseable_numeric_field(
+        self, artifacts: TaskArtifacts
+    ):
+        """Fail-safe contract holds when a well-formed JSON object carries a
+        non-numeric resume_count/schema_version: from_mapping's int() coercion
+        raises ValueError/TypeError, which must map to None (not propagate)
+        like any other corruption."""
+        # Non-numeric string resume_count → int('abc') raises ValueError.
+        bad_str = {
+            'session_id': 'sess-bad',
+            'role': 'architect',
+            'started_at': 'now',
+            'owner_pid': 1,
+            'resume_count': 'abc',
+            'schema_version': 2,
+        }
+        (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_str))
+        assert artifacts.read_agent_session() is None
+        # Null schema_version → int(None) raises TypeError.
+        bad_null = {
+            'session_id': 'sess-bad',
+            'role': 'architect',
+            'started_at': 'now',
+            'owner_pid': 1,
+            'resume_count': 0,
+            'schema_version': None,
+        }
+        (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_null))
+        assert artifacts.read_agent_session() is None
+
 
 class TestVerdicts:
     """Verdict artifacts written by the verdict-tools MCP server (task 2481)."""
