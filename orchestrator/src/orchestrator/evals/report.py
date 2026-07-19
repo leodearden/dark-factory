@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
+from collections import defaultdict
 from datetime import UTC, datetime
 from itertools import combinations
+from math import sqrt
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +18,7 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
+from .metrics import _rate, blend_composite
 
 if TYPE_CHECKING:
     from .runner import EvalResult
@@ -24,17 +28,298 @@ logger = logging.getLogger(__name__)
 REPORT_FILE = Path(__file__).parent / 'judge_report.json'
 
 
+# ---------------------------------------------------------------------------
+# Composite-report statistics substrate (task 2477 λ) — stdlib only.
+#
+# Neither scipy nor numpy is a declared dependency, so small-sample confidence
+# intervals use stdlib ``statistics`` plus this df→t-critical lookup. Trials are
+# few (decision 10: ≥3/cell), so the Student-t interval — not a normal z — is
+# the correct estimator; the ``sufficient`` flag surfaces when n<3.
+# ---------------------------------------------------------------------------
+
+# Two-sided 95% (0.975 one-tail) Student-t critical values, indexed by degrees
+# of freedom (n-1). df>30 (or df<1) falls back to the normal approximation 1.96.
+_T_CRITICAL_0975: dict[int, float] = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+    6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+    11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+    16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+    21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060,
+    26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
+_T_CRITICAL_NORMAL = 1.96
+
+
+def _t_critical(df: int) -> float:
+    """Two-sided 95% Student-t critical value for *df* degrees of freedom,
+    falling back to the normal approximation (1.96) for df>30 or df<1.
+    """
+    if df < 1:
+        return _T_CRITICAL_NORMAL
+    return _T_CRITICAL_0975.get(df, _T_CRITICAL_NORMAL)
+
+
+def mean_ci95(values: list[float]) -> dict[str, Any]:
+    """Mean and two-sided 95% Student-t confidence interval of *values*.
+
+    Returns ``{mean, lo, hi, n, sufficient}``. A CI is computed for n>=2 (via
+    the df→t-critical table); for n<2 the interval collapses to the point
+    estimate (``lo == hi == mean``). ``sufficient`` is ``n>=3`` (decision 10:
+    ≥3 trials/cell), surfacing when the sample is too small to trust. An empty
+    input yields ``mean==0.0, n==0``. Pure, stdlib-only (statistics.stdev is the
+    ddof=1 sample stdev).
+    """
+    n = len(values)
+    if n == 0:
+        return {'mean': 0.0, 'lo': 0.0, 'hi': 0.0, 'n': 0, 'sufficient': False}
+    mean = statistics.mean(values)
+    if n < 2:
+        return {'mean': mean, 'lo': mean, 'hi': mean, 'n': n, 'sufficient': False}
+    stdev = statistics.stdev(values)  # ddof=1 (sample stdev)
+    half_width = _t_critical(n - 1) * stdev / sqrt(n)
+    return {
+        'mean': mean,
+        'lo': mean - half_width,
+        'hi': mean + half_width,
+        'n': n,
+        'sufficient': n >= 3,
+    }
+
+
+def _ratio_score(value: float, best: float) -> float:
+    """Normalize *value* against the *best* (min) observed, as ``best/value``
+    clamped to ``[0, 1]``.
+
+    ``1.0`` == this run IS the best (cheapest / fastest). A larger *value* (more
+    cost / higher latency) scores lower. When either operand is non-positive —
+    a single-config fixture, a zero denominator, or an otherwise undefined
+    normalization — returns the neutral ``1.0`` so such fixtures never
+    spuriously penalize.
+    """
+    if best <= 0 or value <= 0:
+        return 1.0
+    return min(max(best / value, 0.0), 1.0)
+
+
+def build_price_table(
+    configs: list[Any], prices: dict[str, Any] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Build the C4 per-config price table ``{config_name: {role: entry}}``.
+
+    Each config's ``model`` is looked up in *prices* (a ``config.prices``-shaped
+    map; ``PriceEntry`` objects and plain ``{'input_per_1m','output_per_1m'}``
+    dicts are both accepted via :func:`_rate`). A listed model yields
+    ``{role: {'input_per_1m', 'output_per_1m'}}``; an UNLISTED model yields the
+    explicit ``{role: {'source': 'unpriced'}}`` marker — never a fabricated
+    default (loud-over-silent). Pure over ``(configs, prices)``; the caller
+    (μ / CLI) seeds *prices* from ``default_price_table()`` / ``config.prices``.
+    Config keys are inserted in sorted order so the table is byte-deterministic.
+    """
+    table: dict[str, dict[str, dict[str, Any]]] = {}
+    for config in sorted(configs, key=lambda c: c.name):
+        entry = prices.get(config.model) if prices else None
+        if entry is None:
+            role_price: dict[str, Any] = {'source': 'unpriced'}
+        else:
+            role_price = {
+                'input_per_1m': _rate(entry, 'input_per_1m'),
+                'output_per_1m': _rate(entry, 'output_per_1m'),
+            }
+        table[config.name] = {config.role: role_price}
+    return table
+
+
+def _summarize_cost_source(sources: set[str]) -> str:
+    """Collapse a config's per-trial cost sources to ONE row-level label.
+
+    A config's ``cost_usd`` is a mean across all its trials; when those trials
+    carry more than one distinct ``cost_source`` (e.g. ``price_table`` on one
+    fixture, ``unpriced_proxy`` on another) reporting just the first trial's
+    source would mislabel the cross-source mean, so surface ``'mixed'`` instead
+    (reviewer: robustness). Exactly one distinct source → that source; none (a
+    config with no trials, unreachable here) → ``'cli'`` for back-compat.
+    """
+    if not sources:
+        return 'cli'
+    if len(sources) == 1:
+        return next(iter(sources))
+    return 'mixed'
+
+
+def build_composite_report(
+    results: list[EvalResult],
+    *,
+    price_table: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the C4 per-config composite report over the UNION of configs.
+
+    This retires the April all-tasks-INTERSECTION collapse (see
+    :func:`compute_aggregate_ratings`): a config that ran in *any* fixture gets a
+    row, so a config present in only one fixture is no longer silently dropped.
+
+    Aggregation (Open-Q3 / decision 10) is per-fixture NORMALIZED composite →
+    mean with a small-sample CI:
+
+    1. For each fixture, ``best_cost`` / ``best_latency`` = the minimum POSITIVE
+       cost / latency across the PASSING (``tests_pass`` truthy) trials of all
+       configs on that fixture. A cheap-but-WRONG run (which itself hard-gates
+       to 0) must not set the efficiency floor and deflate the correct configs'
+       cost/latency scores (reviewer: correctness); a fixture with NO passing
+       trial falls back to all trials so its baseline stays defined.
+    2. For each trial, the efficiency-adjusted composite is
+       ``blend_composite(quality=composite_score,
+       cost_score=_ratio_score(cost, best_cost),
+       latency_score=_ratio_score(latency, best_latency),
+       tests_pass=tests_pass)`` — so the cheapest+fastest+top-quality run of a
+       fixture scores highest, and a failing trial hard-gates to 0.
+    3. For each config, its per-trial composite / cost / latency / quality are
+       pooled across ALL its trials (every fixture) and reduced to a mean +
+       95% CI via :func:`mean_ci95`.
+
+    ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
+    working time, not wall-clock, so eval/scheduler overhead is not charged to
+    the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` are
+    passthroughs of any trial's metrics (η/θ surfaces). ``cost_source`` (P5) is
+    the config's single distinct per-trial source, or ``'mixed'`` when its
+    trials span more than one — since ``cost_usd`` is a cross-trial mean,
+    labelling it with just the first trial's source would mislabel a blended
+    figure (reviewer: robustness).
+    Rows are emitted sorted by ``config`` so the surface is byte-deterministic;
+    *price_table* (μ/CLI seeds it from :func:`build_price_table`) is echoed
+    verbatim, defaulting to ``{}`` when omitted.
+    """
+    # 1. Per-fixture best (min positive) cost and latency, taken from the
+    #    PASSING trials only so a cheap-but-WRONG run cannot set the efficiency
+    #    floor and deflate the correct configs (reviewer: correctness). The
+    #    ``*_all`` maps mirror the same minima over ALL trials and seed the
+    #    fallback for a fixture where nothing passed.
+    best_cost: dict[str, float] = {}
+    best_latency: dict[str, float] = {}
+    best_cost_all: dict[str, float] = {}
+    best_latency_all: dict[str, float] = {}
+    for r in results:
+        fixture = r.task_id
+        cost = float(r.metrics.get('cost_usd', 0.0) or 0.0)
+        latency = float(r.metrics.get('workflow_duration_ms', 0) or 0) / 1000.0
+        passed = bool(r.metrics.get('tests_pass'))
+        if cost > 0:
+            best_cost_all[fixture] = min(best_cost_all.get(fixture, cost), cost)
+            if passed:
+                best_cost[fixture] = min(best_cost.get(fixture, cost), cost)
+        if latency > 0:
+            best_latency_all[fixture] = min(best_latency_all.get(fixture, latency), latency)
+            if passed:
+                best_latency[fixture] = min(best_latency.get(fixture, latency), latency)
+    # Fixtures with no passing trial fall back to the all-trials baseline so the
+    # normalization denominator stays defined (every such trial hard-gates to 0
+    # regardless, so this only keeps the baseline non-empty).
+    for fixture, v in best_cost_all.items():
+        best_cost.setdefault(fixture, v)
+    for fixture, v in best_latency_all.items():
+        best_latency.setdefault(fixture, v)
+
+    # 2/3. Accumulate per-trial normalized composites, pooled per config.
+    def _acc() -> dict[str, Any]:
+        return {
+            'composite': [], 'cost': [], 'latency': [], 'quality': [],
+            'passes': 0, 'trials': 0, 'fixtures': set(),
+            'judge_invocations': 0, 'judge_cost_usd': 0.0,
+            'cost_sources': set(),
+            'first_metrics': None,
+        }
+
+    by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
+    for r in results:
+        fixture = r.task_id
+        m = r.metrics
+        quality = float(m.get('composite_score', 0.0) or 0.0)
+        cost = float(m.get('cost_usd', 0.0) or 0.0)
+        latency = float(m.get('workflow_duration_ms', 0) or 0) / 1000.0
+        tests_pass = m.get('tests_pass')
+        composite_trial = blend_composite(
+            quality,
+            _ratio_score(cost, best_cost.get(fixture, 0.0)),
+            _ratio_score(latency, best_latency.get(fixture, 0.0)),
+            tests_pass=tests_pass,
+        )
+        acc = by_config[r.config_name]
+        acc['composite'].append(composite_trial)
+        acc['cost'].append(cost)
+        acc['latency'].append(latency)
+        acc['quality'].append(quality)
+        acc['passes'] += 1 if tests_pass else 0
+        acc['trials'] += 1
+        acc['fixtures'].add(fixture)
+        acc['judge_invocations'] += int(m.get('judge_invocations', 0) or 0)
+        acc['judge_cost_usd'] += float(m.get('judge_cost_usd', 0.0) or 0.0)
+        acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
+        if acc['first_metrics'] is None:
+            acc['first_metrics'] = m
+
+    rows: list[dict[str, Any]] = []
+    for cfg in sorted(by_config):
+        acc = by_config[cfg]
+        fm = acc['first_metrics'] or {}
+        composite_ci = mean_ci95(acc['composite'])
+        cost_ci = mean_ci95(acc['cost'])
+        latency_ci = mean_ci95(acc['latency'])
+        quality_ci = mean_ci95(acc['quality'])
+        trials = acc['trials']
+        rows.append({
+            'config': cfg,
+            'role_under_test': fm.get('role_under_test'),
+            'composite': composite_ci['mean'],
+            'quality': quality_ci['mean'],
+            'tests_pass_rate': (acc['passes'] / trials) if trials else 0.0,
+            'cost_usd': cost_ci['mean'],
+            'cost_source': _summarize_cost_source(acc['cost_sources']),
+            'latency_secs': latency_ci['mean'],
+            'trials': trials,
+            'fixtures': len(acc['fixtures']),
+            'ci95': {
+                'composite': composite_ci,
+                'cost': cost_ci,
+                'latency': latency_ci,
+            },
+            'judge': {
+                'invocations': acc['judge_invocations'],
+                'cost_usd': acc['judge_cost_usd'],
+            },
+            'recovery_score': fm.get('recovery_score'),
+            'plan_quality': fm.get('plan_quality'),
+        })
+
+    return {
+        'generated_at': datetime.now(UTC).isoformat(),
+        'aggregation': 'per_fixture_normalized_mean_ci',
+        'price_table': price_table if price_table is not None else {},
+        'configs': rows,
+    }
+
+
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:
-    """Mean Elo across tasks, only for configs present in ALL tasks."""
+    """Mean Elo across tasks over the UNION of configs.
+
+    Retires the April all-tasks-INTERSECTION collapse (task 2477 λ / decision
+    10): a config that ran in ANY task gets an aggregate rating, averaged over
+    only the tasks in which it actually appears — rather than being dropped
+    unless it appeared in every task (which collapsed the leaderboard to the
+    handful of ever-present configs). ``build_report`` / ``compute_tiers`` /
+    ``format_markdown`` consume the returned dict unchanged. Configs are inserted
+    in sorted order so the mapping is deterministic.
+    """
     if not state.per_task:
         return {}
 
-    config_sets = [set(pool.ratings.keys()) for pool in state.per_task.values()]
-    common = set.intersection(*config_sets) if config_sets else set()
+    union = {cfg for pool in state.per_task.values() for cfg in pool.ratings}
 
     agg: dict[str, float] = {}
-    for cfg in common:
-        ratings = [state.per_task[t].ratings[cfg] for t in state.per_task]
+    for cfg in sorted(union):
+        ratings = [
+            pool.ratings[cfg]
+            for pool in state.per_task.values()
+            if cfg in pool.ratings
+        ]
         agg[cfg] = round(sum(ratings) / len(ratings), 1)
     return agg
 
@@ -366,4 +651,118 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     lines.append(_fmt({col: col for col in _PLAN_QUALITY_COLUMNS}))
     lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_COLUMNS))
     lines.extend(_fmt(rr) for rr in rendered)
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Composite report renderer (eval-revival λ / C4)
+#
+# The deterministic table surface for :func:`build_composite_report`, mirroring
+# the width-computed ljust idiom of format_recovery_table / format_plan_quality_
+# table above. Emits a per-config table (composite / quality / cost / cost_source
+# / latency / CI95 / trials / fixtures) followed by a DISTINCT price-table
+# section (config → role → input/output per-1M). Byte-stable: rows and sections
+# are sorted, floats fixed-precision, and no wall-clock is rendered.
+# ---------------------------------------------------------------------------
+
+_COMPOSITE_COLUMNS = (
+    'config', 'composite', 'quality', 'cost_usd', 'cost_source',
+    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
+)
+_PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
+
+
+def _ci_cell(ci: dict[str, Any] | None) -> str:
+    """Render a ``mean_ci95`` sub-dict as a ``[lo, hi]`` interval (4 dp)."""
+    if not ci:
+        return '-'
+    return f'[{float(ci.get("lo", 0.0)):.4f}, {float(ci.get("hi", 0.0)):.4f}]'
+
+
+def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
+    """Render the ``{config: {role: entry}}`` price table as a deterministic
+    block. A listed entry shows its ``input_per_1m`` / ``output_per_1m`` (4 dp);
+    an UNPRICED entry (``{'source': 'unpriced'}``) shows the explicit marker in
+    both cells — never a blank or fabricated price. Configs and roles are sorted.
+    """
+    rendered: list[dict[str, str]] = []
+    for cfg in sorted(price_table):
+        roles = price_table[cfg] or {}
+        for role in sorted(roles):
+            entry = roles[role] or {}
+            if 'input_per_1m' in entry:
+                inp = f'{float(entry["input_per_1m"]):.4f}'
+                outp = f'{float(entry["output_per_1m"]):.4f}'
+            else:
+                inp = outp = str(entry.get('source', 'unpriced'))
+            rendered.append({
+                'config': str(cfg),
+                'role': str(role),
+                'input_per_1m': inp,
+                'output_per_1m': outp,
+            })
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _PRICE_TABLE_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in _PRICE_TABLE_COLUMNS)
+
+    lines = ['price table:']
+    lines.append(_fmt({col: col for col in _PRICE_TABLE_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _PRICE_TABLE_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
+    return lines
+
+
+def format_composite_table(report: dict[str, Any]) -> str:
+    """Render :func:`build_composite_report` output as a deterministic table.
+
+    A per-config table carries composite / quality / cost_usd / cost_source /
+    latency_secs, a ``[lo, hi]`` CI95 rendering of the composite, and trial /
+    fixture counts, followed by a distinct ``price table`` section. The same
+    report always renders byte-identically (rows sorted by config, price-table
+    sections sorted, fixed float precision, no wall-clock/dict-order dependence).
+    An unpriced config's ``cost_source`` shows the explicit marker (e.g.
+    ``unpriced_proxy``), never a blank.
+    """
+    configs = sorted(report.get('configs', []), key=lambda r: str(r.get('config', '')))
+
+    rendered = [
+        {
+            'config': str(r.get('config', '')),
+            'composite': f'{float(r.get("composite", 0.0)):.4f}',
+            'quality': f'{float(r.get("quality", 0.0)):.4f}',
+            'cost_usd': f'{float(r.get("cost_usd", 0.0)):.4f}',
+            'cost_source': str(r.get('cost_source', '')),
+            'latency_secs': f'{float(r.get("latency_secs", 0.0)):.2f}',
+            'ci95_composite': _ci_cell((r.get('ci95') or {}).get('composite')),
+            'trials': str(r.get('trials', 0)),
+            'fixtures': str(r.get('fixtures', 0)),
+        }
+        for r in configs
+    ]
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _COMPOSITE_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in _COMPOSITE_COLUMNS)
+
+    lines = ['composite report:']
+    lines.append(_fmt({col: col for col in _COMPOSITE_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _COMPOSITE_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
+
+    # Distinct price-table section.
+    lines.append('')
+    lines.extend(_format_price_table_section(report.get('price_table') or {}))
     return '\n'.join(lines)

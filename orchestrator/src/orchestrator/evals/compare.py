@@ -734,16 +734,23 @@ def format_comparison_markdown(report: ComparisonReport) -> str:
             # Metrics summary
             ma = assessment.metrics_a
             mb = assessment.metrics_b
+            # cost_source (P5 provenance) + latency accompany the cost so the
+            # comparison states WHICH source produced each figure rather than an
+            # unlabeled CLI cost. cost_source defaults to 'cli' for a pre-P5
+            # report that lacks the key (backward compat); latency is
+            # workflow_duration_ms/1000 seconds.
             lines.append(
                 f'  {a}: {ma.get("composite_score", 0):.2f} score, '
-                f'${ma.get("cost_usd", 0):.2f}, '
+                f'${ma.get("cost_usd", 0):.2f} ({ma.get("cost_source", "cli")}), '
+                f'{ma.get("workflow_duration_ms", 0) / 1000:.1f}s latency, '
                 f'{ma.get("iterations", 0)} iter, '
                 f'{ma.get("debug_cycles", 0)} debug, '
                 f'{ma.get("lines_changed", 0)} lines'
             )
             lines.append(
                 f'  {b}: {mb.get("composite_score", 0):.2f} score, '
-                f'${mb.get("cost_usd", 0):.2f}, '
+                f'${mb.get("cost_usd", 0):.2f} ({mb.get("cost_source", "cli")}), '
+                f'{mb.get("workflow_duration_ms", 0) / 1000:.1f}s latency, '
                 f'{mb.get("iterations", 0)} iter, '
                 f'{mb.get("debug_cycles", 0)} debug, '
                 f'{mb.get("lines_changed", 0)} lines'

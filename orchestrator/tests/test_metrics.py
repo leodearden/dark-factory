@@ -304,3 +304,175 @@ class TestGitDiffStatsReturncode:
         assert not parse_warnings, (
             f'No WARNING expected for empty-diff (no-change); got: {parse_warnings}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2477 step-01: resolve_cost_usd — Invariant P5 cost-source resolution
+# ---------------------------------------------------------------------------
+
+class TestResolveCostUsd:
+    """A PURE resolver of ``(cost_usd, cost_source)`` implementing Invariant P5.
+
+    Cost provenance ∈ {price_table, cli, unpriced_proxy}:
+      - price_table  → the run's model is listed in ``prices`` (trust the table)
+      - cli          → NATIVE cloud endpoint, model unlisted (CLI cost is
+                       trustworthy for the real Anthropic API)
+      - unpriced_proxy → a PROXIED endpoint (is_local_model) whose model is
+                       unlisted → loud WARNING + a DEFINED fallback, never the
+                       raw CLI number (which is wrong for proxied endpoints).
+    """
+
+    def test_priced_model_uses_price_table(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        # 1_000_000 in @ $2/1M + 500_000 out @ $8/1M = 2.0 + 4.0 = 6.0
+        cost, source = resolve_cost_usd(
+            1_000_000, 500_000,
+            model='model-x',
+            prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
+            cli_cost_usd=99.0,          # must be IGNORED when the model is priced
+            is_local_model=False,
+        )
+        assert source == 'price_table'
+        assert cost == pytest.approx(6.0)
+
+    def test_priced_model_accepts_price_entry_object(self):
+        """Dual handling: a PriceEntry object works exactly like a plain dict."""
+        from orchestrator.config import PriceEntry
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            1_000_000, 500_000,
+            model='model-x',
+            prices={'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)},
+            cli_cost_usd=99.0,
+            is_local_model=False,
+        )
+        assert source == 'price_table'
+        assert cost == pytest.approx(6.0)
+
+    def test_native_cloud_unlisted_uses_cli_cost(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            1_000_000, 1_000_000,
+            model='claude-sonnet-4',    # not in prices
+            prices={},
+            cli_cost_usd=3.5,
+            is_local_model=False,       # NATIVE cloud → CLI cost is trustworthy
+        )
+        assert source == 'cli'
+        assert cost == pytest.approx(3.5)
+
+    def test_proxied_unlisted_warns_and_uses_defined_fallback(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            cost, source = resolve_cost_usd(
+                1_000_000, 1_000_000,
+                model='local-llama-70b',    # not in prices
+                prices={},
+                cli_cost_usd=0.0,           # raw CLI cost is WRONG for proxied
+                is_local_model=True,        # PROXIED endpoint (ANTHROPIC_BASE_URL)
+            )
+
+        assert source == 'unpriced_proxy'
+        # Defined fallback ($2/1M in + $8/1M out): (1e6*2 + 1e6*8)/1e6 = 10.0
+        assert cost == pytest.approx(10.0)
+        # Crucially NOT the raw CLI cost (0.0) — a defined number, never silent.
+        assert cost != 0.0
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, (
+            'Expected a WARNING at orchestrator.evals.metrics for an unpriced '
+            'proxied model; got none'
+        )
+
+    def test_proxied_but_priced_still_uses_price_table(self):
+        """A proxied endpoint whose model IS listed trusts the table, not 'cli'."""
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            1_000_000, 500_000,
+            model='model-x',
+            prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
+            cli_cost_usd=99.0,
+            is_local_model=True,        # proxied — but priced → price_table wins
+        )
+        assert source == 'price_table'
+        assert cost == pytest.approx(6.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 2477 step-03: blend_composite — the C4 efficiency-adjusted composite
+# ---------------------------------------------------------------------------
+
+class TestBlendComposite:
+    """The C4 ``composite`` = quality blended with normalized cost + latency,
+    keeping the ``tests_pass`` HARD GATE (decision 11). PURE and additive —
+    ``compute_composite`` (the pure ``quality`` score) is untouched.
+    """
+
+    def test_default_weights_sum_to_one(self):
+        from orchestrator.evals.metrics import DEFAULT_COMPOSITE_WEIGHTS
+
+        assert sum(DEFAULT_COMPOSITE_WEIGHTS.values()) == pytest.approx(1.0)
+
+    def test_tests_fail_hard_gates_to_zero(self):
+        """The HARD GATE: tests_pass falsy → 0.0 regardless of the axes."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            1.0, 1.0, 1.0, tests_pass=False,
+        ) == 0.0
+
+    def test_weighted_blend_default_weights(self):
+        from orchestrator.evals.metrics import blend_composite
+
+        # 0.6*1.0 + 0.2*0.5 + 0.2*0.5 == 0.6 + 0.1 + 0.1 == 0.8
+        assert blend_composite(
+            1.0, 0.5, 0.5, tests_pass=True,
+        ) == pytest.approx(0.8, abs=1e-4)
+
+    def test_best_on_every_axis_is_one(self):
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            1.0, 1.0, 1.0, tests_pass=True,
+        ) == pytest.approx(1.0)
+
+    def test_result_clamped_to_unit_interval(self):
+        from orchestrator.evals.metrics import blend_composite
+
+        # Over-unit inputs clamp to 1.0 …
+        assert blend_composite(
+            2.0, 1.0, 1.0, tests_pass=True,
+        ) == 1.0
+        # … and a negative combination clamps to 0.0 (still, tests passed).
+        assert blend_composite(
+            -5.0, 0.0, 0.0, tests_pass=True,
+        ) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
+# have a SINGLE home in agents.invoke; metrics re-exports rather than
+# re-declares them, so the copy cannot drift. These guards fail loudly if a
+# future edit reintroduces a local copy in metrics.py.
+# ---------------------------------------------------------------------------
+
+class TestCostPrimitivesSingleHome:
+    """metrics._FALLBACK_PRICE / metrics._rate must BE the invoke singletons
+    (identity, not mere equality) — a re-declared local copy would fail these.
+    """
+
+    def test_fallback_price_is_the_invoke_singleton(self):
+        from orchestrator.agents import invoke
+        from orchestrator.evals import metrics
+
+        assert metrics._FALLBACK_PRICE is invoke._FALLBACK_PRICE
+
+    def test_rate_accessor_is_the_invoke_singleton(self):
+        from orchestrator.agents import invoke
+        from orchestrator.evals import metrics
+
+        assert metrics._rate is invoke._rate
