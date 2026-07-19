@@ -48,6 +48,17 @@ from orchestrator.merge_queue import (
 )
 from orchestrator.verify import run_scoped_verification
 
+# Real git + real cargo integration module (see module docstring): a workspace
+# compile legitimately exceeds the 60s pyproject default under `-n auto` xdist
+# oversubscription, where pytest-timeout's thread method os._exit()s the worker
+# ("node down: Not properly terminated") — a false failure on a starved-but-
+# correct test. The scoped merge/verify command does not always carry an
+# explicit --timeout (only --extra propagates via verify._config_test_extras),
+# so opt this whole integration module into the 300s ceiling via the
+# pyproject-sanctioned "slow tests opt out with @pytest.mark.timeout(N)"
+# mechanism — mirroring the merge-path per-test 300s timeout (task 2769).
+pytestmark = pytest.mark.timeout(300)
+
 # ---------------------------------------------------------------------------
 # Fixture constants
 # ---------------------------------------------------------------------------
