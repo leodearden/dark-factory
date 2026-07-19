@@ -37,6 +37,9 @@ from fused_memory.middleware.lock_charter_guard import (
     lock_charter_error,
 )
 from fused_memory.middleware.model_overrides_guard import model_overrides_error
+from fused_memory.middleware.operational_routing_guard import (
+    inject_operational_routing,
+)
 from fused_memory.middleware.operational_suggestion_guard import (
     operational_suggestion_finding,
     operational_suggestion_warning,
@@ -3524,6 +3527,21 @@ def create_mcp_server(
         if _exec_err is not None:
             return _exec_err
         metadata = inject_execution_class(metadata)
+
+        # Operational-routing boundary coercion (task 2802/β) — the
+        # AUTHORITATIVE operational→deterministic coercion, an unbypassable
+        # boundary invariant. Maps the declared (execution_class,
+        # operational_mode) to routing metadata: operational+gate/absent and
+        # decision → deterministic pure gate (task_kind='deterministic',
+        # always_escalates=True, before_done dropped); operational+llm also
+        # stamps the x_ llm-gate marker; code_tdd/absent → untouched. Runs
+        # here — before the single task_interceptor.submit_task call below, so
+        # it fires BEFORE the interceptor's planning_mode branch — covering the
+        # normal, planning_mode, and every MCP-tool caller path. Idempotent, so
+        # the interceptor-side twin re-running on this coerced metadata is a
+        # no-op. This deliberately reverses the declaration-only scoping of
+        # tasks 2085/2563 (owner-greenlit 2026-07-19).
+        metadata = inject_operational_routing(metadata)
 
         # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.
         _premise_err = premise_lint_error(
