@@ -648,7 +648,8 @@ async def test_submit_failure_does_not_release_foreign_owned_halt(
     ('wip_recovery', WorkflowOutcome.DONE),
     ('wip_recovery_no_advance', WorkflowOutcome.BLOCKED),
     ('unmerged_state', WorkflowOutcome.BLOCKED),
-], ids=['wip_conflict', 'wip_recovery', 'wip_recovery_no_advance', 'unmerged_state'])
+    ('stash_failed', WorkflowOutcome.BLOCKED),
+], ids=['wip_conflict', 'wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'stash_failed'])
 async def test_handler_warns_on_orphan_halt_when_no_escalation_queue(
     handler_id: str,
     expected_outcome: WorkflowOutcome,
@@ -700,6 +701,11 @@ async def test_handler_warns_on_orphan_halt_when_no_escalation_queue(
                     recovery_branch='wip/r',
                 ),
             )
+        elif handler_id == 'stash_failed':
+            outcome = await workflow_no_esc._handle_stash_failed(
+                MergeOutcome(status='stash_failed', dirty_files=['README.md']),
+                'task/1765',
+            )
         else:  # unmerged_state
             outcome = await workflow_no_esc._handle_unmerged_state(
                 MergeOutcome(status='unmerged_state'),
@@ -738,3 +744,46 @@ async def test_handler_warns_on_orphan_halt_when_no_escalation_queue(
         'is None — no esc was filed and no auto-recovery path exists; '
         'operator must run force_unhalt_merge_queue'
     )
+
+
+@pytest.mark.asyncio
+async def test_handle_stash_failed_submits_single_halt_owning_l1(
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """_handle_stash_failed submits exactly ONE level-1 escalation with
+    category=='stash_failed' naming the dirty file, and registers it as the
+    merge worker halt owner — the single loud signal that replaces N per-task
+    blocked finalizations (task 2758).
+
+    RED: _handle_stash_failed does not exist yet.
+    """
+    # Merger pre-engaged the (ownerless) halt, mirroring _map_advance_failure.
+    fake_worker.halt_for_wip('stash_failed')
+    assert fake_worker.is_wip_halted
+    assert fake_worker.halt_owner_esc_id is None
+
+    task = asyncio.create_task(
+        workflow._handle_stash_failed(
+            MergeOutcome(status='stash_failed', dirty_files=['README.md']),
+            'task/x',
+        )
+    )
+    try:
+        # The handler submits + registers the owner, then awaits resolution.
+        await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
+
+        pending = workflow.escalation_queue.get_pending()
+        assert len(pending) == 1, f'expected exactly one L1, got {pending!r}'
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.category == 'stash_failed'
+        assert 'README.md' in esc.summary
+        assert fake_worker.halt_owner_esc_id == esc.id, (
+            'halt owner must be registered to the filed escalation id'
+        )
+    finally:
+        # The handler is parked on _escalation_event.wait(); cancel to clean up.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
