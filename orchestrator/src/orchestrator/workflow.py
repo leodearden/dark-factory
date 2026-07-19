@@ -9435,7 +9435,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         dirty = False
         if self.git_ops is not None and self.worktree is not None:
             try:
-                dirty = await self.git_ops.has_uncommitted_work(self.worktree)
+                dirty = bool(
+                    await self.git_ops.has_uncommitted_work(self.worktree),
+                )
             except Exception:
                 logger.warning(
                     'Task %s: dirty-tree probe failed while stamping iteration '
