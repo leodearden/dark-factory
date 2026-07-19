@@ -282,3 +282,88 @@ def format_recovery_table(report: dict[str, Any]) -> str:
     lines.append('  '.join('-' * widths[col] for col in _RECOVERY_COLUMNS))
     lines.extend(_fmt(rr) for rr in rendered)
     return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# plan_quality surface (eval-revival θ)
+#
+# An ADDITIVE, interim per-(task_id, config_name, role_under_test) column
+# distinct from the Elo leaderboard above — the architect-eval analogue of the
+# recovery_score surface. It surfaces the ``plan_quality`` that
+# ``run_architect_eval`` writes into ``EvalResult.metrics`` — a populated float
+# for architect runs (role_under_test=='architect'), the ``None`` null sentinel
+# otherwise (ordinary implementer runs never invoke the plan judge). It does NOT
+# touch the Elo ``build_report`` / ``format_markdown`` schema: the full C4
+# per-config composite+cost+latency+plan_quality report row is owned by Phase-3
+# task λ, which θ does not depend on; this is the distinct-column surface μ/λ
+# consume in the interim, mirroring η's recovery surface.
+# ---------------------------------------------------------------------------
+
+_PLAN_QUALITY_COLUMNS = ('task_id', 'config_name', 'role_under_test', 'plan_quality')
+
+
+def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
+    """Build the plan-quality column from a list of :class:`EvalResult` (θ).
+
+    Each row carries ``task_id`` / ``config_name`` / ``role_under_test`` and the
+    ``plan_quality`` pulled from ``EvalResult.metrics`` — a populated float for
+    architect runs (``role_under_test=='architect'``), ``None`` (the C4
+    ``plan_quality | null`` sentinel) otherwise. Both are read directly from the
+    persisted metrics dict; a result predating the θ fields (no ``plan_quality``
+    / ``role_under_test`` key) reads back as ``None`` for each, so old reports
+    render unchanged. Rows are sorted by ``(task_id, config_name)`` so the
+    surface is deterministic.
+    """
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        rows.append({
+            'task_id': result.task_id,
+            'config_name': result.config_name,
+            'role_under_test': result.metrics.get('role_under_test'),
+            'plan_quality': result.metrics.get('plan_quality'),
+        })
+    rows.sort(key=lambda r: (r['task_id'], r['config_name']))
+    return {'rows': rows}
+
+
+def format_plan_quality_table(report: dict[str, Any]) -> str:
+    """Render :func:`build_plan_quality_report` output as a deterministic table.
+
+    A ``plan_quality`` column shows the populated float (4 dp) for architect rows
+    and ``-`` (the null sentinel) for non-architect rows; ``role_under_test``
+    renders ``-`` when ``None``. The same report always renders byte-identically
+    (no wall-clock or dict-order dependence).
+    """
+    rows = report.get('rows', [])
+
+    def _score_cell(value: float | None) -> str:
+        return '-' if value is None else f'{value:.4f}'
+
+    def _role_cell(value: str | None) -> str:
+        return '-' if value is None else str(value)
+
+    rendered = [
+        {
+            'task_id': str(r['task_id']),
+            'config_name': str(r['config_name']),
+            'role_under_test': _role_cell(r['role_under_test']),
+            'plan_quality': _score_cell(r['plan_quality']),
+        }
+        for r in rows
+    ]
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _PLAN_QUALITY_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_COLUMNS)
+
+    lines = ['plan_quality report:']
+    lines.append(_fmt({col: col for col in _PLAN_QUALITY_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
+    return '\n'.join(lines)
