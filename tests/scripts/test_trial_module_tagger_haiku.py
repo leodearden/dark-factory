@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import pytest
 
+from orchestrator import module_tagger_prompt
+
 import trial_module_tagger_haiku as mod
 
 
@@ -88,3 +90,41 @@ def test_set_scores_all_directory_predicted_scores_zero_against_real_gold():
     assert s['recall'] == pytest.approx(0.0)
     assert s['f1'] == pytest.approx(0.0)
     assert s['jaccard'] == pytest.approx(0.0)
+
+
+# ── build_replay_input / faithful_prompt_for: faithful "at the call site" ────
+
+def test_build_replay_input_uses_description_when_present():
+    task = {'id': 42, 'title': 'Fix foo', 'description': 'the description', 'details': 'the details'}
+    summary = mod.build_replay_input(task, ['orchestrator'])
+    assert summary == {'id': '42', 'title': 'Fix foo', 'description': 'the description'}
+
+
+def test_build_replay_input_falls_back_to_details_when_description_empty():
+    # Matches harness: description or details or '' (empty description → details).
+    task = {'id': 7, 'title': 'Bar', 'description': '', 'details': 'from details'}
+    summary = mod.build_replay_input(task, [])
+    assert summary['description'] == 'from details'
+
+
+def test_build_replay_input_empty_when_neither_present():
+    task = {'id': 9, 'title': 'Baz'}
+    summary = mod.build_replay_input(task, [])
+    assert summary == {'id': '9', 'title': 'Baz', 'description': ''}
+
+
+def test_build_replay_input_id_is_stringified():
+    summary = mod.build_replay_input({'id': 123, 'title': 't', 'description': 'd'}, [])
+    assert summary['id'] == '123'
+    assert isinstance(summary['id'], str)
+
+
+def test_faithful_prompt_for_delegates_to_shared_production_builder():
+    task = {'id': 55, 'title': 'Add widget', 'description': 'wire the widget'}
+    dirs = ['orchestrator', 'scripts', 'shared']
+
+    summary = mod.build_replay_input(task, dirs)
+    # The replay prompt is EXACTLY the production builder over a single-task
+    # summary list — byte-identical inputs "at the call site".
+    expected = module_tagger_prompt.build_tagger_prompt(dirs, [summary])
+    assert mod.faithful_prompt_for(task, dirs) == expected
