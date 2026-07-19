@@ -124,3 +124,62 @@ class TestEndpointAuthEnvContract:
         assert incumbents
         assert all(c.backend == 'claude' for c in incumbents)
         assert all(not c.env_overrides for c in incumbents)
+
+
+class TestClaudeEndpointPriceTable:
+    """claude_endpoint_price_table(): default seeds + candidate-model prices,
+    proven to resolve via λ's resolve_cost_usd (cost_source='price_table')."""
+
+    def test_contains_every_default_price_table_key(self):
+        from orchestrator.config import default_price_table
+        from orchestrator.evals.configs import claude_endpoint_price_table
+
+        table = claude_endpoint_price_table()
+        for key in default_price_table():
+            assert key in table
+
+    def test_has_a_valid_entry_for_every_non_incumbent_candidate_model(self):
+        from orchestrator.evals.configs import (
+            DEEPSEEK_MODEL,
+            GLM_MODEL,
+            KIMI_MODEL,
+            MINIMAX_MODEL,
+            claude_endpoint_candidates,
+            claude_endpoint_price_table,
+        )
+
+        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        candidate_models = {
+            c.model for c in claude_endpoint_candidates() if c.model in non_incumbent_models
+        }
+        # Sanity: cross-checks model-key alignment — every non-incumbent
+        # candidate model is accounted for (none silently missing).
+        assert candidate_models == non_incumbent_models
+
+        table = claude_endpoint_price_table()
+        for model in candidate_models:
+            entry = table[model]
+            assert entry['input_per_1m'] > 0
+            assert entry['output_per_1m'] > 0
+
+    def test_resolve_cost_usd_resolves_price_table_for_a_candidate_model(self):
+        from orchestrator.evals.configs import DEEPSEEK_MODEL, claude_endpoint_price_table
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        table = claude_endpoint_price_table()
+        entry = table[DEEPSEEK_MODEL]
+        input_tokens, output_tokens = 10_000, 2_000
+        expected_cost = (
+            input_tokens * entry['input_per_1m'] + output_tokens * entry['output_per_1m']
+        ) / 1_000_000
+
+        cost, cost_source = resolve_cost_usd(
+            input_tokens, output_tokens,
+            model=DEEPSEEK_MODEL,
+            prices=table,
+            cli_cost_usd=99999.0,  # deliberately wrong — must NOT be used
+            is_local_model=True,
+        )
+
+        assert cost_source == 'price_table'
+        assert cost == expected_cost
