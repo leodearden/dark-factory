@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import heapq
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
+from shared.task_statuses import (
+    ACTIVE as ACTIVE_TASK_STATUSES,
+    TERMINAL as TERMINAL_STATUSES,
+)
 
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
@@ -502,6 +505,38 @@ def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
             result.update(ids_in_clause)
 
     return result
+
+
+def nonterminal_completion_claim_task_ids(
+    text: str,
+    status_probe: Callable[[int], str | None],
+) -> set[int]:
+    """Return the task ids that `text` frames as complete (via
+    find_present_tense_completion_claim_task_ids) whose LIVE status — resolved
+    through the injected `status_probe` — is present AND non-terminal (not
+    done/cancelled).
+
+    The probe is the composition seam (mirroring
+    recon_claim_verification_guard.verify_attributed_claims's injected probe): a
+    Callable[[int], str | None] returning a task's current status, or None when
+    it cannot be resolved. Fails OPEN — an id whose probed status is None
+    (unknown/absent) is excluded, so an unresolvable status never blocks the
+    write. Short-circuits: when the text carries no completion claim the probe
+    is never called, keeping the common path a pure in-process regex with no
+    live-status read.
+
+    Pure and sync: no I/O of its own — every liveness lookup goes through the
+    injected probe. This makes the acceptance criterion (in-progress rejected /
+    done passes) unit-testable without the server harness.
+    """
+    named = find_present_tense_completion_claim_task_ids(text)
+    if not named:
+        return set()
+    return {
+        tid
+        for tid in named
+        if (status := status_probe(tid)) is not None and status not in TERMINAL_STATUSES
+    }
 
 
 # --------------------------------------------------------------------------- #
