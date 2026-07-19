@@ -158,3 +158,44 @@ async def _get_task_meta(server, root: str, task_id: str) -> dict:
     )
     assert 'error' not in result, f'get_task failed unexpectedly: {result!r}'
     return result['metadata']
+
+
+# ---------------------------------------------------------------------------
+# Scenario 2 — gate via planning_mode (matrix row 1/2: operational+gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_operational_gate_coerces_to_pure_gate(_real_stack, tmp_path):
+    """A planning_mode submit declaring execution_class='operational' +
+    operational_mode='gate' is coerced to a deterministic pure gate.
+
+    planning_mode bypasses the curator entirely (_submit_task_planning_mode
+    is a synchronous, curator-free path), so this independently proves the
+    submit-boundary coercion (inject_operational_routing, task β) fires on
+    its own — the curator is never even consulted on this path.
+    """
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Zeta boundary probe: gate via planning_mode',
+            'description': 'Operational human-gated ask, submitted via planning_mode.',
+            'planning_mode': True,
+            'metadata': {
+                'execution_class': 'operational',
+                'operational_mode': 'gate',
+            },
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+    task_id = result['task_id']
+
+    meta = await _get_task_meta(server, root, task_id)
+
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert 'before_done' not in meta, f'got {meta!r}'
