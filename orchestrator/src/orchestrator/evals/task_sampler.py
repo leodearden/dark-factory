@@ -23,17 +23,37 @@ audit/listing surface land in later slices.
 
 from __future__ import annotations
 
+import random
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 
 from orchestrator.agents.triage import has_simple_task_blocker
 
 __all__ = [
+    'Cell',
     'CompletedTaskCandidate',
+    'SampleResult',
+    'cell_of',
     'classify_kind',
     'classify_path',
     'repo_of',
+    'sample_stratified',
+    'stratify',
 ]
+
+# A stratification cell: the ``(repo, kind, path)`` 3-tuple.
+Cell = tuple[str, str, str]
+
+# The full axis product — every possible (repo, kind, path) cell. Used to
+# surface EMPTY cells loudly (a cell the corpus offers nothing for) rather
+# than letting thin coverage pass silently.
+_REPOS = ('df', 'reify')
+_KINDS = ('bugfix', 'feature', 'refactor')
+_PATHS = ('simple', 'full')
+_ALL_CELLS: tuple[Cell, ...] = tuple(
+    (repo, kind, path) for repo in _REPOS for kind in _KINDS for path in _PATHS
+)
 
 
 @dataclass
@@ -168,3 +188,129 @@ def classify_path(candidate: CompletedTaskCandidate) -> str:
     if has_simple_task_blocker(text):
         return 'full'
     return 'simple'
+
+
+def cell_of(candidate: CompletedTaskCandidate) -> Cell:
+    """Return the ``(repo, kind, path)`` stratification cell for *candidate*."""
+    return (repo_of(candidate), classify_kind(candidate), classify_path(candidate))
+
+
+# ---------------------------------------------------------------------------
+# stratify + sample_stratified — deterministic round-robin cut over the band
+# ---------------------------------------------------------------------------
+
+def stratify(
+    candidates: list[CompletedTaskCandidate],
+) -> dict[Cell, list[CompletedTaskCandidate]]:
+    """Bucket *candidates* into ``(repo, kind, path)`` cells.
+
+    Returns a dict keyed by the 3-tuple; a cell with no candidates is simply
+    absent (not a zero-valued key), mirroring ``curator_corpus``'s
+    ``by_action`` bucketing. Empty-cell surfacing is the sampler's job
+    (:func:`sample_stratified` notes), not this partition's.
+    """
+    cells: dict[Cell, list[CompletedTaskCandidate]] = {}
+    for candidate in candidates:
+        cells.setdefault(cell_of(candidate), []).append(candidate)
+    return cells
+
+
+@dataclass
+class SampleResult:
+    """Result of a stratified cut: the selection, per-cell counts, and notes.
+
+    ``notes`` carries human-readable, loud-over-silent signals — a shortfall
+    when the corpus can't fill the band floor, and one entry per EMPTY axis
+    cell — so a thin cut is never silently truncated.
+    """
+
+    selected: list[CompletedTaskCandidate]
+    cell_counts: dict[Cell, int] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+def _round_robin_select(
+    cells: dict[Cell, list[CompletedTaskCandidate]], n: int, seed: int,
+) -> list[CompletedTaskCandidate]:
+    """Deterministically pick *n* candidates round-robin across *cells*.
+
+    Mirrors ``curator_corpus._sample_stratified``: within each cell the
+    candidates are ordered by ``task_id`` then shuffled with a per-cell seeded
+    ``random.Random`` (no wall-clock / unseeded randomness), and the picker
+    walks the cells in sorted order taking one per cell per round until *n* is
+    reached or every cell is exhausted (a thin cell is thereby taken in full).
+    Round-robin keeps a bounded selection representative even when one cell
+    dominates the raw corpus.
+    """
+    shuffled: dict[Cell, list[CompletedTaskCandidate]] = {}
+    for cell, items in cells.items():
+        ordered = sorted(items, key=lambda c: c.task_id)
+        rng = random.Random(f'{seed}:{cell}')
+        rng.shuffle(ordered)
+        shuffled[cell] = ordered
+
+    selected: list[CompletedTaskCandidate] = []
+    cursors = dict.fromkeys(shuffled, 0)
+    cell_cycle = sorted(shuffled)
+    while len(selected) < n:
+        progressed = False
+        for cell in cell_cycle:
+            if len(selected) >= n:
+                break
+            cursor = cursors[cell]
+            pool = shuffled[cell]
+            if cursor < len(pool):
+                selected.append(pool[cursor])
+                cursors[cell] = cursor + 1
+                progressed = True
+        if not progressed:
+            break  # every cell exhausted before reaching n
+    return selected
+
+
+def _coverage_notes(
+    cells: dict[Cell, list[CompletedTaskCandidate]],
+    total: int,
+    target_low: int,
+    selected_n: int,
+) -> list[str]:
+    """Loud-over-silent coverage notes: shortfall + every empty axis cell."""
+    notes: list[str] = []
+    if total < target_low:
+        notes.append(
+            f'shortfall: corpus has {total} candidate(s), below target floor '
+            f'{target_low}; selected all {selected_n} (no silent truncation)'
+        )
+    for cell in _ALL_CELLS:
+        if not cells.get(cell):
+            notes.append(f'empty cell: {cell[0]}/{cell[1]}/{cell[2]}')
+    return notes
+
+
+def sample_stratified(
+    candidates: list[CompletedTaskCandidate],
+    target_low: int = 10,
+    target_high: int = 14,
+    seed: int = 0,
+) -> SampleResult:
+    """Deterministically sample *candidates* down to the ``[target_low,
+    target_high]`` band, round-robin across ``(repo, kind, path)`` cells.
+
+    - Rich corpus (``total > target_high``): sample down to exactly
+      *target_high*, round-robin, so no single over-supplied cell dominates.
+    - In-band or thin corpus (``total <= target_high``): take ALL candidates
+      (a thin cell is taken in full). When ``total < target_low`` the floor
+      can't be met — that shortfall is recorded in ``notes`` rather than
+      silently truncated.
+
+    Determinism is by explicit *seed* only (no wall-clock / unseeded random),
+    so a cut is exactly reproducible; a different *seed* may reorder/repick.
+    Empty axis cells are always surfaced in ``notes``.
+    """
+    cells = stratify(candidates)
+    total = len(candidates)
+    target_n = total if total <= target_high else target_high
+    selected = _round_robin_select(cells, target_n, seed)
+    cell_counts = dict(Counter(cell_of(c) for c in selected))
+    notes = _coverage_notes(cells, total, target_low, len(selected))
+    return SampleResult(selected=selected, cell_counts=cell_counts, notes=notes)
