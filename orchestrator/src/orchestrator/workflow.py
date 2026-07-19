@@ -7765,11 +7765,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ----------
         status:
             The ``MergeOutcome.status`` string.  Handled: ``'unmerged_state'``,
-            ``'done_wip_recovery'``, ``'wip_recovery_no_advance'``,
-            ``'wip_halted'`` (default branch).
+            ``'stash_failed'``, ``'done_wip_recovery'``,
+            ``'wip_recovery_no_advance'``, ``'wip_halted'`` (default branch).
         result:
             The ``MergeOutcome`` object (for ``overlap_files``,
-            ``recovery_branch``).
+            ``recovery_branch``, ``dirty_files``).
         branch_name:
             Single-task context — the local branch being merged.
             Mutually exclusive with ``train_id``.
@@ -7883,6 +7883,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f'Manual intervention required — do NOT let automated tooling '
                 f'resolve this escalation. Resolve this escalation to un-halt '
                 f'the merge queue.'
+            )
+
+        elif status == 'stash_failed':
+            # SHARED main-checkout-hygiene fault (task 2758): advance_main could
+            # not park project_root's dirty tracked WIP before advancing. Unlike
+            # wip_halted (WIP overlapping the merge diff), these files need not
+            # overlap the diff at all — project_root's tree is persistently
+            # dirty, so EVERY task landing fails identically until a human
+            # cleans it. The queue is halted so exactly ONE escalation is filed.
+            category = 'stash_failed'
+            dirty = result.dirty_files or []
+            dirty_head = ', '.join(dirty[:5]) if dirty else '(unknown)'
+            if is_train:
+                summary = (
+                    f'Train member {task_id} blocked: project_root park failed '
+                    f'(dirty tracked tree) — {dirty_head}'
+                )
+            else:
+                summary = (
+                    f'project_root park failed (dirty tracked tree) — '
+                    f'merge queue halted: {dirty_head}'
+                )
+            dirty_block = (
+                '\n'.join(f'  - {f}' for f in dirty) if dirty
+                else '  (dirty tracked file list unavailable)'
+            )
+            detail = (
+                f'{merge_ctx} was blocked because advance_main could not park '
+                f'the uncommitted WIP in project_root before advancing: '
+                f'project_root has dirty TRACKED file(s) that could not be '
+                f'stashed. This is a shared main-checkout infrastructure/hygiene '
+                f'incident — it recurs identically for every task landing until '
+                f'project_root is cleaned, so the merge queue has been halted '
+                f'(one escalation, not one per stalled task).\n\n'
+                f'Dirty tracked file(s):\n'
+                f'{dirty_block}\n\n'
+                f'Action required: inspect ``git status`` in project_root, then '
+                f'commit or clean the persistently-dirty tracked file(s) '
+                f'(``git commit`` / ``git checkout -- <path>`` / ``git stash``), '
+                f'then resolve this escalation to un-halt the merge queue.\n\n'
+                f'Manual intervention required — do NOT let automated tooling '
+                f'resolve this escalation.'
             )
 
         else:
