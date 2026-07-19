@@ -6020,6 +6020,13 @@ class TaskWorkflow:
         task's design_decisions) — per-step correctness depends entirely on
         implementer log fidelity, not on independent per-step verification.
 
+        Entries recording no durable commit (``committed is False``, task
+        2759) are excluded from the ``steps_completed`` union: a step marked
+        completed in a round where HEAD never advanced did not actually land
+        on the branch, so it must not be re-derived to done even when the
+        branch has other genuine work. Legacy entries lacking the ``committed``
+        key are unaffected.
+
         Emits a single ``event='plan_step_rederive'`` iteration-log entry
         (naming every re-derived step id) when at least one step is
         re-derived; emits nothing on a clean pass, so the common case does
@@ -6047,6 +6054,13 @@ class TaskWorkflow:
 
             completed_ids: set[str] = set()
             for entry in status.entries:
+                # An entry that explicitly recorded no durable commit
+                # (committed:False, task 2759) did not land its step on the
+                # branch — exclude it from the union so a step "completed" with
+                # no commit is not re-derived to done even when the branch has
+                # other real work. Legacy entries lack the key and fall through.
+                if entry.get('committed') is False:
+                    continue
                 completed_ids.update(entry.get('steps_completed') or [])
 
             plan = self.artifacts.read_plan()
