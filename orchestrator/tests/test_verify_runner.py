@@ -208,6 +208,47 @@ class TestMergeVerifySpec:
             "SCCACHE_DIR": "/home/user/.cache/sccache",
         }
 
+    # --- Fix (a): the merge-gate PROFILE now rides the spec (task 2822) ------
+
+    def test_roundtrip_profile_fields(self):
+        """merge_verify_workspace + merge_verify_breadth survive to_dict->from_dict."""
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=("src/a/mod.py",),
+            verify_env={},
+            cold_timeout_secs=300.0,
+            is_merge_verify=True,
+            merge_verify_workspace=True,
+            merge_verify_breadth="full",
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored.merge_verify_workspace is True
+        assert restored.merge_verify_breadth == "full"
+        assert restored == spec
+
+    def test_profile_fields_default_narrow(self):
+        """A spec built without the profile fields defaults to the NARROW gate."""
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.merge_verify_workspace is False
+        assert spec.merge_verify_breadth == "scoped"
+
+    def test_from_dict_back_compat_missing_profile_keys(self):
+        """BACK-COMPAT: a legacy dict WITHOUT the profile keys deserialises to the
+        narrow defaults (mirrors the verify_env / is_merge_verify d.get idiom)."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("merge_verify_workspace", None)
+        legacy.pop("merge_verify_breadth", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.merge_verify_workspace is False
+        assert restored.merge_verify_breadth == "scoped"
+
 
 # ---------------------------------------------------------------------------
 # VerifyResult codec  (result_to_dict / result_from_dict)
