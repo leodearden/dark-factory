@@ -7169,6 +7169,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return await self._handle_wip_recovery_no_advance(result)
         if result.status == 'unmerged_state':
             return await self._handle_unmerged_state(result, branch_name)
+        if result.status == 'stash_failed':
+            return await self._handle_stash_failed(result, branch_name)
         if result.status == 'done':
             if result.merge_sha is not None:
                 self._merge_sha = result.merge_sha
@@ -8339,11 +8341,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             and merge_worker.is_wip_halted
             and merge_worker.halt_owner_esc_id is None
 
-        Covers all four ``_map_advance_failure`` halt-inducing statuses:
+        Covers all five ``_map_advance_failure`` halt-inducing statuses (train
+        coverage is automatic via the shared ``_build_wip_halt_escalation_text``):
           - ``wip_halted``             → category='wip_conflict'  (WIP overlaps diff)
           - ``done_wip_recovery``      → category='wip_conflict'  (merge landed; stash pop conflict)
           - ``wip_recovery_no_advance``→ category='wip_conflict'  (CAS failure; no advance)
           - ``unmerged_state``         → category='unmerged_state' (pre-existing UU/AA/DD)
+          - ``stash_failed``           → category='stash_failed'  (project_root park failed; dirty tracked tree)
 
         Unlike the single-task ``_handle_wip_conflict`` etc., this helper does NOT
         await escalation resolution — the train tip stays BLOCKED and re-dispatches
@@ -8357,7 +8361,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
           Resolving the returned L1 triggers harness._on_escalation_resolved →
           unhalt_wip() because ``_submit_halt_owning_escalation`` registered this
           workflow as halt owner.  harness._rehydrate_merge_halt re-owns the L1
-          across restarts (category in {wip_conflict, unmerged_state}).
+          across restarts (category in {wip_conflict, unmerged_state, stash_failed}).
         """
         status = result.status
         category, summary, detail = self._build_wip_halt_escalation_text(
@@ -8583,6 +8587,55 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(
                 f'Task {self.task_id}: unmerged_state escalation resolved'
+            )
+        else:
+            self._warn_orphan_halt_no_queue(result.status)
+
+        return WorkflowOutcome.BLOCKED
+
+    async def _handle_stash_failed(
+        self, result, branch_name: str,
+    ) -> WorkflowOutcome:
+        """Handle a stash_failed merge outcome.
+
+        ``advance_main`` could not park project_root's dirty tracked WIP before
+        advancing — a SHARED main-checkout-hygiene fault that recurs identically
+        for every task landing (task 2758). The merge did NOT land and the queue
+        is halted; the halt stays in effect until a human inspects project_root,
+        commits or cleans the persistently-dirty tracked file(s), and resolves
+        the escalation. Because the halt serializes the fleet, exactly ONE
+        halt-owning level-1 escalation is filed (by the halt owner) instead of
+        N per-task blocked finalizations. Mirrors ``_handle_unmerged_state``.
+        """
+        category, summary, detail = self._build_wip_halt_escalation_text(
+            result.status, result, branch_name=branch_name,
+        )
+        dirty = result.dirty_files or []
+        logger.warning(
+            f'Task {self.task_id}: stash_failed — could not park project_root '
+            f'WIP; dirty tracked file(s): {", ".join(dirty) or "(unknown)"} '
+            f'— creating level-1 escalation'
+        )
+
+        if self.escalation_queue:
+            from escalation.models import Escalation
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category=category,
+                summary=summary,
+                detail=detail,
+                suggested_action='manual_intervention',
+                level=1,
+                worktree=str(self.worktree) if self.worktree else None,
+                workflow_state=self.state.value,
+            )
+            await self._submit_halt_escalation_and_wait(esc)
+            logger.info(
+                f'Task {self.task_id}: stash_failed escalation resolved'
             )
         else:
             self._warn_orphan_halt_no_queue(result.status)
