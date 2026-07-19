@@ -948,3 +948,50 @@ async def test_b9_cold_worktree_plan_present_adopts_and_injects(harness: Harness
     assert cap.resume_session_id['session_id'] == session_id
     assert cap.initial_plan is recovered_plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+# ── B10: completion still clears → no adoption on next boot ──────────────────
+@pytest.mark.asyncio
+async def test_b10_completion_clears_sidecar_no_adoption_next_boot(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """B10 — a COMPLETED invocation clears its sidecar (α), so the next boot
+    finds a plan to recover but NO session to adopt: a clean finish never
+    leaves a resumable session behind.
+
+    Two-way (producer + consumer):
+      PRODUCER (α): a REAL ``_invoke`` driven to COMPLETION (patched
+        ``invoke_with_cap_retry`` returns success — no CancelledError) writes
+        the sidecar in-flight, then its ``finally`` CLEARS it (``session_pre-
+        served`` stays False) — so ``read_agent_session()`` is None afterwards.
+      CONSUMER (β/γ): the post-completion on-disk state (``plan.json`` present,
+        ``agent_session.json`` absent) is recovered as a plan-only task —
+        ``_recovered_plans`` populated, ``_recovered_sessions`` NOT — and at
+        dispatch degrades to a plain fresh dispatch WITH the recovered plan and
+        NO session_resume* event of any kind (there is simply nothing to
+        resume, distinct from an ineligible fallback).
+    """
+    # ── PRODUCER (α): a COMPLETING invoke clears the sidecar it wrote ──
+    cap = await _drive_resumed_invoke(tmp_path, None, IMPLEMENTER, caplog)
+    assert cap.sidecar_midflight is not None            # written in-flight
+    assert cap.workflow.artifacts is not None
+    assert cap.workflow.artifacts.read_agent_session() is None  # cleared on done
+
+    # ── CONSUMER (β/γ): plan-but-no-sidecar → plan recovered, no session ──
+    task_id, session_id = '50', 'uuid-b10-cleared'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', with_sidecar=False,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    assert task_id in harness._recovered_plans
+    assert task_id not in harness._recovered_sessions  # completion cleared it
+    recovered_plan = harness._recovered_plans[task_id]
+
+    cap2 = await _dispatch_capture(harness, task_id)
+    assert cap2.resume_session_id is None
+    assert cap2.initial_plan is recovered_plan
+    assert cap2.emits == []
+    assert _session_resume_emits(harness) == []
