@@ -3,7 +3,7 @@
 import json
 import logging
 import shutil
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -153,7 +153,7 @@ def _session_resume_emits(harness: Harness) -> list[tuple]:
         EventType.session_resume_capped,
     }
     out: list[tuple] = []
-    for call in harness.event_store.emit.call_args_list:
+    for call in harness.event_store.emit.call_args_list:  # type: ignore[attr-defined]
         if call.args and call.args[0] in wanted:
             out.append((call.args[0], call.kwargs))
     return out
@@ -493,7 +493,7 @@ class TestRecoverCrashedTasks:
         session_dict = {
             'session_id': 'uuid-resume-me',
             'role': 'implementer',
-            'started_at': datetime.now(timezone.utc).isoformat(),
+            'started_at': datetime.now(UTC).isoformat(),
             'owner_pid': 9999,
             'resume_count': 0,
         }
@@ -1783,7 +1783,7 @@ class TestSessionResumeGuard:
         session = {
             'session_id': 'uuid-elig',
             'role': 'implementer',
-            'started_at': datetime.now(timezone.utc).isoformat(),
+            'started_at': datetime.now(UTC).isoformat(),
             'resume_count': 0,
         }
         cfg = _make_transcript(tmp_path, 'uuid-elig')
@@ -1800,7 +1800,7 @@ class TestSessionResumeGuard:
         session = {
             'session_id': 'uuid-dis',
             'role': 'implementer',
-            'started_at': datetime.now(timezone.utc).isoformat(),
+            'started_at': datetime.now(UTC).isoformat(),
             'resume_count': 0,
         }
         cfg = _make_transcript(tmp_path, 'uuid-dis')
@@ -1814,7 +1814,7 @@ class TestSessionResumeGuard:
     async def test_stale_falls_back(self, harness: Harness, tmp_path: Path):
         """Sidecar older than freshness_window → fallback reason 'stale' (B5)."""
         real = SessionResumeConfig()
-        stale = datetime.now(timezone.utc) - timedelta(
+        stale = datetime.now(UTC) - timedelta(
             seconds=2 * real.freshness_window_secs
         )
         session = {
@@ -1871,7 +1871,7 @@ class TestSessionResumeGuard:
         session = {
             'session_id': 'uuid-notr',
             'role': 'implementer',
-            'started_at': datetime.now(timezone.utc).isoformat(),
+            'started_at': datetime.now(UTC).isoformat(),
             'resume_count': 0,
         }
         empty_cfg = tmp_path / 'claude-config-empty'
@@ -1892,7 +1892,7 @@ class TestSessionResumeGuard:
         session = {
             'session_id': 'uuid-nocfg',
             'role': 'implementer',
-            'started_at': datetime.now(timezone.utc).isoformat(),
+            'started_at': datetime.now(UTC).isoformat(),
             'resume_count': 0,
         }
         harness.config.session_resume = SessionResumeConfig()
@@ -1913,7 +1913,7 @@ class TestSessionResumeGuard:
         session = {
             'session_id': 'uuid-cap',
             'role': 'implementer',
-            'started_at': datetime.now(timezone.utc).isoformat(),
+            'started_at': datetime.now(UTC).isoformat(),
             'resume_count': 3,
         }
         cfg = _make_transcript(tmp_path, 'uuid-cap')
@@ -1938,7 +1938,7 @@ class TestSessionResumeStorm:
 
     @staticmethod
     def _stale_session(sid: str) -> dict:
-        stale = datetime.now(timezone.utc) - timedelta(seconds=2 * 86400)
+        stale = datetime.now(UTC) - timedelta(seconds=2 * 86400)
         return {
             'session_id': sid,
             'role': 'implementer',
@@ -1994,7 +1994,7 @@ class TestSessionResumeStorm:
             harness, 'ok1',
             {
                 'session_id': 'uuid-ok', 'role': 'implementer',
-                'started_at': datetime.now(timezone.utc).isoformat(),
+                'started_at': datetime.now(UTC).isoformat(),
                 'resume_count': 0,
             },
             config_dir=cfg,
@@ -2025,7 +2025,7 @@ class TestSessionResumeStorm:
                 harness, f'cap{i}',
                 {
                     'session_id': f'uuid-cap{i}', 'role': 'implementer',
-                    'started_at': datetime.now(timezone.utc).isoformat(),
+                    'started_at': datetime.now(UTC).isoformat(),
                     'resume_count': 1,
                 },
                 config_dir=cfg,
