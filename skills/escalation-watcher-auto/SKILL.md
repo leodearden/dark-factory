@@ -447,6 +447,80 @@ A task is blocked with no active workflow and no pending sibling escalation (fil
    ```
    Add to digest: `DISPATCHED: stranded_blocked — <task_id> — predicate stale, closed (close_only)`
 
+#### Done-step-commit "orphan" amend-fold (`orphan-reaper-amend-folded-step-recurring-df`)
+
+Decision-id: `orphan-reaper-amend-folded-step-recurring-df`.
+
+A done task's step-commit was flagged as an **orphan** by the harness orphan-L0 reaper (`_escalate_unreconciled_done_step`, filed at L0) and promoted L0→L1 — this arrives at you already as a level-1 record, so no server carve-out is needed; you act within your existing `{0,1}` authority. Task 2725 taught the reaper to dismiss this at L0 when the subject task's `done_provenance.kind` is in the "merged family" — but it deliberately excludes `found_on_main`, since `found_on_main`-done does not by itself prove content landed (see the HOLLOW-DONE note below). So a `found_on_main`-done task whose step commit was folded into a later review-cycle amend still gets promoted here even though nothing was actually lost. This section resolves that specific, recurring, benign case directly at L1 instead of promoting it to L2 for a human to re-derive the same git checks. Modeled on the [`stranded_blocked`](#stranded_blocked) predicate-verify-then-resolve-or-promote pattern immediately above.
+
+**Class discriminator.** Match a pending L1 escalation where **both** hold:
+- `agent_role == "harness-orphan-reaper"`
+- `summary` contains the substring `"is orphaned and could not be auto-reconciled against WIP tip"`
+
+Match on the **summary signature**, never on `suggested_action` — the promoted record's `suggested_action == "manual_intervention"` is shared by many unrelated escalation classes across the harness and cannot discriminate this one by itself. The reaper wraps the original summary as `"Orphan L0 (<age>s old, no active workflow): <original summary>"`, so use a substring match, not an exact match — the signature survives the wrap.
+
+**Extraction.** Recover from `esc["detail"]`:
+- `stale_commit` (the full 40-hex SHA) and `step_id`, from the line `"Step <step_id> recorded commit <stale_commit>, which is no longer reachable from HEAD..."`. Always read the SHA from `detail`, never from `summary` — `summary` truncates it to 10 characters.
+- `branch`, from the appended `"[note] originating worktree may be reaped; branch=<branch>"` line — the reaper cites this durable branch ref precisely because the originating worktree is likely already gone. This is the ref condition 4 below checks for ancestry. If this note is missing, condition 4 cannot be verified — PROMOTE.
+
+**Read-only investigation.** Using only the [read-only investigation toolset](#read-only-investigation-toolset) plus `mcp__fused-memory__get_task` — no new tool grants:
+```bash
+git cat-file -t <stale_commit>
+```
+If the output is not `commit` (the object is unresolvable or garbage-collected) → the orphan cannot be inspected at all; PROMOTE, do not guess. Otherwise recover its deliverable paths:
+```bash
+git diff-tree --no-commit-id --name-only -r <stale_commit>
+```
+
+**Close conditions — ALL FIVE must hold, each quoted verbatim in `resolution`:**
+
+| # | Condition | Check | Rules out |
+|---|-----------|-------|-----------|
+| 1 | Subject task is terminal | `mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` → `status == "done"` (or `"cancelled"`) | — |
+| 2 | Every deliverable path is present on main | `git cat-file -e main:<path>` succeeds, for each path from the investigation step | whole-file drop |
+| 3 | The task's declared `delivered_checks`, if any, PASS on main (quote check name + PASS) | see below | check-covered / hollow-done capability loss |
+| 4 | Branch tip is an ancestor of main | `git merge-base --is-ancestor <branch> main` exits `0` (YES) | never-merged hollow-done (task 2729's class) |
+| 5 | Amend/rebase-fold signature | orphan is a commit (investigation step), **not** itself an ancestor of main (`git merge-base --is-ancestor <stale_commit> main` exits non-zero), and its deliverable path(s) are present on main (condition 2) | confirms this is genuinely the amend-fold shape, not a coincidence |
+
+Condition 3 detail: read `task["metadata"].get("delivered_checks")` — a list of `{name, kind: "grep"|"script", ...}` descriptors (CLAUDE.md "Delivered-check dependency gate"; `orchestrator/src/orchestrator/delivered_checks.py`). The scheduler's real check runs `git grep`/the script directly — both outside your granted toolset — so approximate read-only, per kind:
+- `grep`-kind with declared `paths`: for each path, `git show main:<path>` (allowed) and read whether `pattern` is present in the dumped content; the check DELIVERS when that presence/absence matches `expect` (`"present"` wants a match, `"absent"` wants none).
+- `grep`-kind with no declared `paths` (repo-wide), or any `script`-kind check: not feasibly verifiable read-only — treat as **failed**.
+
+No declared checks trivially satisfies condition 3.
+
+Condition 4 detail: this check depends on the branch ref named in the reaper's `[note]` line (see Extraction above) still resolving at the project root. Branch refs are not guaranteed to survive indefinitely post-merge — e.g. `task/1625`, an older merged task branch, no longer resolves as of this writing, confirming refs do get pruned over time and this is not merely a hypothetical risk. When the named branch does not resolve, `git merge-base --is-ancestor <branch> main` fails fatally (`fatal: Not a valid object name '<branch>'`, exit `128`) rather than cleanly reporting "not an ancestor" (exit `1`) — treat a fatal/unresolvable-ref result exactly like a missing branch note: condition 4 cannot be verified → PROMOTE, and note in the promotion that the ref did not resolve (as distinct from "resolved but not an ancestor") so a human can tell branch-pruning inertness apart from a genuine never-merged case. Expect this handler's close rate to skew toward more-recently-merged subjects and to fail-safe to promote once a subject's branch is eventually pruned — that is the intended, non-masking degradation, not a malfunction.
+
+**Close.** When all five hold, close at L1 — **never** `resume` (the subject task is already done; `resume` would wrongly re-pend it):
+```python
+mcp__escalation__resolve_issue(
+  escalation_id="...",
+  resolution=(
+    "Benign amend-fold (orphan-reaper-amend-folded-step-recurring-df): "
+    "(1) task <task_id> status=<done|cancelled>; "
+    "(2) deliverable(s) <paths> present on main; "
+    "(3) delivered_checks <names> PASS on main (or: none declared); "
+    "(4) branch <branch> is-ancestor-of main: YES; "
+    "(5) orphan <stale_commit> is a commit, not an ancestor of main, "
+    "and its file(s) are present-and-evolved on main."
+  ),
+  action='close_only',
+  resolved_by="escalation-watcher-auto",
+  resolution_class="benign",
+)
+```
+Add to digest: `AUTO-CLOSED (L1 <esc_id>): orphan-reaper-amend-folded-step-recurring-df — <task_id> — <one-line summary of the 5 conditions> [benign]`
+
+**Default: promote.** Any failed condition — a GC'd/unresolvable `stale_commit` object, an absent, repo-wide, or `script`-kind `delivered_checks` entry, an absent deliverable path, a missing or unresolvable (pruned) branch ref, or a tip that is not an ancestor of main — routes to `promote_to_l2` exactly like any other [promote-to-L2](#promote-to-l2) category, with `root_cause="orphan-reaper-amend-fold:<task_id>"` and `category=esc["category"]`. **When unsure, promote.** `harness-escalation-revalidation-sweep` remains the regression backstop that re-validates closed records.
+
+**Non-regression.**
+- **HOLLOW-DONE** (`found_on_main`-done, capability absent from main — task 2729's class): conditions 2/3/4 must **fail** here → promote. Never close on `status == "done"` alone — that is exactly the trap the `stale_task_scoped` carve-out (see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out)) would fall into if applied to this class.
+- **PARTIAL LOSS** (a whole file/step dropped): condition 2 fails → promote.
+- **Task 2725 is unchanged.** The orphan-L0 reaper's merged-family dismiss path (`_is_done_step_commit_orphan` + `_is_terminal_merged`) is untouched by this section — this only adds an L1 handler for the promoted L1s that already slip past that dismiss.
+
+**Documented residual.** a dropped HUNK within a file the deliverable still contains, uncovered by any delivered_check, would satisfy all five conditions and be closed at L1 — the SAME residual the L2-human dismissal already accepts today; this moves that judgement from L2 to L1 and adds no masking risk beyond the current human standard; reducing it further is an orthogonal delivered_checks-coverage problem.
+
+Enumerate every L1 close of this class in the rotation digest — see [Digest Format](#digest-format).
+
 ---
 
 ### Promote-to-L2 categories (require human judgment)
@@ -652,6 +726,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 - PROMOTED cluster (L2 esc-42-8): bad-merge-to-main-breaks-scheduler — 3 members: [esc-42-1, esc-42-3, esc-42-5]
 - PROMOTED (L2 esc-42-9): design_concern — task-88 — architectural question about X
 - PROMOTED (L2 esc-42-10): dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
+
+### Auto-closed L1 (done-step-commit orphan amend-fold)
+- AUTO-CLOSED (L1 esc-2731-10): orphan-reaper-amend-folded-step-recurring-df — task-2731 — task status=done; deliverable(s) present on main; delivered_checks: none declared; branch task/2731 is-ancestor-of main: YES; orphan 9f8e7d6 not ancestor of main, file(s) present-and-evolved on main [benign]
 
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
