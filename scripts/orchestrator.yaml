@@ -10,4 +10,4 @@
 # no first-party package, so its env suffices. No --directory, so cwd stays at the
 # worktree root and the tests/scripts/ path still resolves. Mirrors the other
 # subprojects' --project <member> convention.
-test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q"
+test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"

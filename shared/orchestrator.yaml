@@ -4,5 +4,5 @@
 # Verification commands
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --project shared --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
-test_command: "uv run --project shared --directory shared pytest tests/ --tb=short -q"
+test_command: "uv run --project shared --directory shared pytest tests/ --tb=short -q --timeout=300"
 type_check_command: "uv run --project shared --directory shared pyright src/ tests/"

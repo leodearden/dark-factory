@@ -2,7 +2,7 @@
 # Scopes verification to orchestrator's own venv.
 
 # Verification commands
-test_command: "uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q"
+test_command: "uv run --project orchestrator --directory orchestrator pytest tests/ --tb=short -q --timeout=300"
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --project orchestrator --directory orchestrator ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py orchestrator/tests"
 type_check_command: "uv run --project orchestrator --directory orchestrator pyright src/ tests/"

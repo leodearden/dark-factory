@@ -6,7 +6,7 @@
 # subprojects' --project <member> --directory <member> convention.
 
 # Verification commands
-test_command: "uv run --project sampler --directory sampler pytest tests/ --tb=short -q"
+test_command: "uv run --project sampler --directory sampler pytest tests/ --tb=short -q --timeout=300"
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --project sampler --directory sampler ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py sampler/tests"
 type_check_command: "uv run --project sampler --directory sampler pyright src/ tests/"
