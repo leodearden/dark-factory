@@ -75,6 +75,7 @@ via ``run_eval`` only when you want to capture the writes. See
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 import subprocess
@@ -85,10 +86,17 @@ from typing import Any, Callable, Coroutine
 import pytest
 
 import orchestrator
+import orchestrator.scheduler
 from orchestrator import config as _config
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.evals import profile as _profile
+from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.profile import EVAL_PROFILE
+from orchestrator.evals.runner import (
+    _build_eval_scheduler,
+    _StubMcpSession,
+    build_eval_orch_config,
+)
 from orchestrator.mcp import verdict_tools as _verdict_tools
 
 # ---------------------------------------------------------------------------
@@ -420,3 +428,78 @@ def test_b2_factory_single_construction_point(
         assert _FACTORY_CALL_RE.search(source), (
             f'{rel} must construct its TaskWorkflow via build_workflow('
         )
+
+
+# ── B3: dispatch-literal tripwire through the real eval scheduler (D2) ──────
+
+
+def _dispatch_tool_literals() -> set[str]:
+    """String-literal first args of every ``dispatch_tool`` call in scheduler.py.
+
+    AST scan (not regex): 6 of 7 call sites put the literal on a line separate
+    from ``dispatch_tool(``. Reuses the scanner logic from
+    test_scheduler_dispatch_literal_tripwire.py.
+    """
+    source_path = Path(orchestrator.scheduler.__file__)
+    tree = ast.parse(source_path.read_text())
+    literals: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_dispatch = (
+            (isinstance(func, ast.Attribute) and func.attr == 'dispatch_tool')
+            or (isinstance(func, ast.Name) and func.id == 'dispatch_tool')
+        )
+        if not is_dispatch or not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            literals.add(first.value)
+    return literals
+
+
+@pytest.mark.asyncio
+async def test_b3_dispatch_literals_resolve_through_eval_scheduler(
+    tmp_path: Path,
+) -> None:
+    """B3 — every ``scheduler.py`` dispatch literal resolves through the eval stub.
+
+    The integration variant (real ``_build_eval_scheduler`` wiring) of δ's
+    bare-stub unit test: build the eval scheduler through the ACTUAL eval entry
+    point ``_build_eval_scheduler(build_eval_orch_config(...), task_id, modules)``
+    and assert the returned ``_StubMcpSession`` resolves EVERY enumerated
+    dispatch literal without ``NotImplementedError`` (any other outcome — e.g. a
+    ``KeyError`` from the empty args — proves the branch exists). A new
+    ``dispatch_tool('new_tool', ...)`` without a stub branch fails at CI here,
+    not as swallowed heartbeat WARNING spam at eval runtime (D2/B9).
+    """
+    literals = _dispatch_tool_literals()
+    # Guard against a broken scanner producing a vacuous empty set.
+    assert literals, (
+        'AST scan found no dispatch_tool literals in scheduler.py — scanner '
+        'broken or dispatch_tool renamed. Fix _dispatch_tool_literals.'
+    )
+
+    base = OrchestratorConfig(project_root=tmp_path)
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    orch_config = build_eval_orch_config(cfg, task, base)
+
+    scheduler, stub = _build_eval_scheduler(orch_config, 't', ['some_module'])
+    assert isinstance(stub, _StubMcpSession)
+
+    missing: list[str] = []
+    for name in sorted(literals):
+        try:
+            await stub.call_tool(name, {})
+        except NotImplementedError:
+            missing.append(name)
+        except Exception:
+            # Any other outcome proves the branch exists (decoupled from args).
+            pass
+
+    assert not missing, (
+        'Dispatched via dispatch_tool(...) in scheduler.py but NO branch in the '
+        f'eval scheduler stub (D2/B9 heartbeat spam): {missing}'
+    )
