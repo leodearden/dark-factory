@@ -7,6 +7,7 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_marker_lifecycle_section,
+    render_source_completion_section,
     render_suppression_schema_section,
 )
 
@@ -56,6 +57,8 @@ You do not have access to task *write* tools — task reconciliation is Stage 2'
 observations to preferences/procedures when warranted.
 4. **Flag for Stage 2**: Flag any findings relevant to task planning (e.g., knowledge that \
 invalidates task assumptions, completed work not reflected in tasks).
+
+{render_source_completion_section(can_file_tasks=False)}
 
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
