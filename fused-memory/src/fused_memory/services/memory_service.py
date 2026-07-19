@@ -839,7 +839,16 @@ class MemoryService:
         if timeout is None:
             timeout = _SUBCLOSE_TIMEOUT
         start = time.monotonic()
-        close_task = asyncio.ensure_future(resource.close())
+        try:
+            close_task = asyncio.ensure_future(resource.close())
+        except Exception:
+            # resource.close() raised synchronously, or returned a
+            # non-awaitable (e.g. a bare Mock in tests, or a driver whose
+            # close() is a plain function). Match the pre-time-boxing
+            # `await resource.close()` behaviour: log and swallow so close()
+            # continues through every remaining resource.
+            logger.exception('MemoryService.close: %s.close failed', label)
+            return
         # asyncio.wait signals a budget overrun structurally (via `pending`),
         # never by raising — so a TimeoutError the resource's own close() raises
         # stays a generic failure (ERROR) instead of being misread as an overrun.
