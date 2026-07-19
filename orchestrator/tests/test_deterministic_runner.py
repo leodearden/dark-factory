@@ -46,6 +46,36 @@ def _gate_task(
     return task
 
 
+def _llm_gate_task(
+    task_id: str = '99',
+    title: str = 'Ship feature gate',
+    description: str = 'Gate that guards the feature launch',
+    deps: list | None = None,
+    gate_options: list | None = None,
+    gate_escalated_at: str | None = None,
+) -> dict:
+    """Build a deterministic pure-gate task dict carrying β's llm-gate marker.
+
+    Mirrors ``_gate_task`` verbatim, then additionally stamps
+    ``metadata['x_operational_llm_gate'] = True`` and
+    ``metadata['operational_mode'] = 'llm'`` — the exact shape β's
+    ``inject_operational_routing`` produces for an
+    ``execution_class='operational'`` + ``operational_mode='llm'`` submission
+    (fused_memory.middleware.operational_routing_guard.OPERATIONAL_LLM_GATE_MARKER_KEY).
+    """
+    task = _gate_task(
+        task_id=task_id,
+        title=title,
+        description=description,
+        deps=deps,
+        gate_options=gate_options,
+        gate_escalated_at=gate_escalated_at,
+    )
+    task['metadata']['x_operational_llm_gate'] = True
+    task['metadata']['operational_mode'] = 'llm'
+    return task
+
+
 def _make_assignment(task: dict):
     """Build a minimal TaskAssignment-like object for the runner.
 
@@ -7830,4 +7860,144 @@ class TestStopInstructionGuard:
             f'Expected the pre-existing infra_issue escalation to remain '
             f'AND a new stop_instruction escalation to be filed alongside '
             f'it, got categories={categories}: {pending}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2803 (γ, part 2): operational_llm-gate born-at-L2 escalation marker
+# (PRD plans/operational-ask-routing-prd.md, task γ). β (task 2802) stamps
+# metadata['x_operational_llm_gate']=True (+ preserved operational_mode='llm')
+# on an execution_class='operational' + operational_mode='llm' submission,
+# ALREADY merged to main. γ is the consumer: emit the stable token
+# 'operational_llm_needs_lane' in the filed escalation's summary/detail so an
+# llm-operational gate is machine-distinguishable from a plain gate.
+# (RED until the impl step adds the token emission in
+# _file_milestone_gate_and_block.)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestOperationalLlmGateMarker:
+    """DeterministicRunner — operational_mode='llm' pure gate (β's
+    x_operational_llm_gate marker) emits the operational_llm_needs_lane token
+    so its born-at-L2 escalation is machine-distinguishable from a plain
+    deterministic gate."""
+
+    async def test_llm_gate_escalation_detail_contains_token_and_preserves_invariants(
+        self, tmp_path: Path,
+    ):
+        """An operational_mode='llm' pure gate files a born-at-L2 escalation
+        whose detail contains the literal token 'operational_llm_needs_lane',
+        while preserving every plain pure-gate invariant: exactly one pending
+        escalation, level==2, agent_role=='orchestrator-deterministic',
+        category=='milestone_gate', task set to blocked, gate_escalated_at
+        stamped, and the original description still present in detail."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        desc = 'This gate guards the Q3 launch milestone'
+        task = _llm_gate_task(task_id='99', description=desc)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        pending = queue.get_by_task('99', status='pending')
+        assert len(pending) == 1, f'Expected 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+
+        assert 'operational_llm_needs_lane' in esc.detail, (
+            f'Expected the operational_llm_needs_lane token in detail: {esc.detail!r}'
+        )
+        assert desc in esc.detail, (
+            f'Original description must still appear in detail: {esc.detail!r}'
+        )
+        assert esc.level == 2
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'milestone_gate'
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')
+
+        scheduler.update_task.assert_awaited_once()
+        call_args = scheduler.update_task.call_args
+        metadata_update = (
+            call_args.args[1] if call_args.args else call_args.kwargs.get('metadata', {})
+        )
+        assert metadata_update.get('gate_escalated_at'), (
+            'gate_escalated_at should be a truthy ISO timestamp'
+        )
+
+    async def test_llm_gate_escalation_summary_contains_token(self, tmp_path: Path):
+        """The llm-gate escalation summary must also carry the token
+        (dashboard/watcher visibility) — built token-first so it survives
+        the summary's [:200] truncation."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _llm_gate_task(task_id='99', title='My LLM Gate')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('99', status='pending')
+        assert len(escs) == 1
+        assert 'operational_llm_needs_lane' in escs[0].summary, (
+            f'Expected the operational_llm_needs_lane token in summary: {escs[0].summary!r}'
+        )
+
+    async def test_plain_gate_has_no_token(self, tmp_path: Path):
+        """Distinguishability guard (a): a PLAIN pure gate (no marker) must
+        carry NO token in summary or detail, and its summary must still
+        equal the task title verbatim — proving the token emission is
+        marker-gated, not unconditional."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _gate_task(task_id='99', title='Plain Gate')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('99', status='pending')
+        assert len(escs) == 1
+        esc = escs[0]
+        assert 'operational_llm_needs_lane' not in esc.summary, (
+            f'Plain gate summary must carry no token: {esc.summary!r}'
+        )
+        assert 'operational_llm_needs_lane' not in esc.detail, (
+            f'Plain gate detail must carry no token: {esc.detail!r}'
+        )
+        assert esc.summary == 'Plain Gate'
+
+    async def test_decision_llm_mode_without_marker_has_no_token(self, tmp_path: Path):
+        """Distinguishability guard (b): a decision+operational_mode='llm'
+        pure gate preserves the raw operational_mode but β withholds the
+        x_operational_llm_gate marker for `decision` submissions — so it
+        must get NO token either, proving the marker (not the raw
+        operational_mode) gates the token."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _gate_task(task_id='99', title='Decision Gate')
+        task['metadata']['operational_mode'] = 'llm'  # raw mode preserved, no marker
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        await runner.run(assignment)
+
+        escs = queue.get_by_task('99', status='pending')
+        assert len(escs) == 1
+        esc = escs[0]
+        assert 'operational_llm_needs_lane' not in esc.summary, (
+            f'decision+llm gate (no marker) summary must carry no token: {esc.summary!r}'
+        )
+        assert 'operational_llm_needs_lane' not in esc.detail, (
+            f'decision+llm gate (no marker) detail must carry no token: {esc.detail!r}'
         )
