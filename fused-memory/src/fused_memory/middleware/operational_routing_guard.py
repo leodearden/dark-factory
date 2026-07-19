@@ -39,9 +39,17 @@ boundary (task ζ integration matrix), not β.
 - **Idempotent** — re-running on already-coerced metadata yields a
   by-value-identical result, so the tools.py→interceptor double-application
   is a no-op.
-- **Override-safe** — a hand-supplied ``task_kind='normal'`` / ``before_done``
-  on an ``operational``|``decision`` task is overwritten to the pure-gate
-  shape.
+- **Override-safe (this transform in isolation)** — a hand-supplied
+  ``task_kind='normal'`` / ``before_done`` on an ``operational``|``decision``
+  task is overwritten to the pure-gate shape *by this transform*. This
+  guarantee is scoped to the transform itself, **not** the full ``submit_task``
+  tool boundary. At that boundary the deterministic-task guard
+  (``deterministic_task_guard.deterministic_task_error``, invariants 3/3b)
+  runs *before* this coercion and hard-rejects an operational submission that
+  pre-declares ``before_done`` (not ``None``) or ``always_escalates=True``
+  under the default ``task_kind='normal'`` parameter — such a submission is
+  rejected, not coerced. The common operational path (neither field
+  pre-declared) is coerced as the contract table describes.
 - **Pure** — no I/O; the caller's object is never mutated on the coercion
   branch (the reused stamp shallow-copies), and the *original* object is
   returned verbatim on the non-coercion branch (a byte-identical no-op for

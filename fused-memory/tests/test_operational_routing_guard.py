@@ -156,7 +156,13 @@ class TestInjectOperationalRoutingMatrix:
 
     def test_override_safe_normal_and_before_done_overwritten(self):
         """(h) a hand-supplied task_kind='normal' + before_done + always_escalates=False
-        on an operational task is overwritten to the pure-gate shape."""
+        on an operational task is overwritten to the pure-gate shape.
+
+        Scoped to the transform in isolation. At the full submit_task tool
+        boundary, deterministic_task_error (invariants 3/3b) rejects an
+        operational submission pre-declaring before_done / always_escalates=True
+        under the default task_kind='normal' param *before* this coercion runs —
+        see the guard module's "Override-safe" note."""
         from fused_memory.middleware.operational_routing_guard import (
             inject_operational_routing,
         )
