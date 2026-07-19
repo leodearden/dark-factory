@@ -3693,6 +3693,34 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         assert result == 0
         helper.assert_not_awaited()
 
+    # --- main-sha empty string -> fail-safe (distinct from the raises path) --
+
+    async def test_main_sha_empty_is_fail_safe(self, harness: Harness):
+        """If get_main_sha() returns an empty/falsy string (rather than
+        raising), we still cannot resolve the ref the checks would run
+        against: the ``if not main_sha`` arm defers mark-done exactly like the
+        raises path — no mark, no revert, no helper call, retried next sweep.
+
+        This pins the empty-string branch of the fail-safe, which is DISTINCT
+        from test_main_sha_unresolved_is_fail_safe (that covers get_main_sha()
+        *raising*). Without this, a regression dropping the ``if not main_sha``
+        guard would still pass CI."""
+        tid = '2794008'
+        check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
+        self._on_main_in_progress(
+            harness, tid, sha='deadbeef' + '8' * 32, main_sha='',
+            metadata={'delivered_checks': [check]},
+        )
+        helper = AsyncMock()
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_not_awaited()
+
     # --- row 6: FAILED, blocked -> leave untouched (blocked discipline) ------
 
     async def test_failed_blocked_leaves_task_untouched(self, harness: Harness):
@@ -3716,6 +3744,41 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
         verdict = DeliveredChecksVerdict(
             outcome='failed', main_sha=main_sha, failed_check=failing,
         )
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_awaited_once()
+
+    # --- blocked + ERRORED -> leave untouched (blocked discipline + fail-safe) -
+
+    async def test_errored_blocked_leaves_task_untouched(self, harness: Harness):
+        """An ERRORED delivered-check verdict on a stranded 'blocked' task
+        takes the same no-action ``return None`` path as the blocked+FAILED
+        case: the ERRORED arm is fail-safe (make no claim either way) AND
+        blocked discipline forbids a blocked->pending flip — so no mark_done,
+        no set_task_status. Parallel to test_failed_blocked_leaves_task_untouched;
+        together they pin blocked discipline across BOTH non-satisfied
+        outcomes (the helper IS consulted here, unlike the main-sha-unresolved
+        fail-safe which short-circuits before it)."""
+        tid = '2794009'
+        main_sha = 'mg' * 20
+        check = {'name': 'cap-be', 'kind': 'grep', 'pattern': 'BEPat'}
+        harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'blocked',
+                          'metadata': {'delivered_checks': [check]}},
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + '9' * 32,
+        )
+        harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
+        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
         helper = AsyncMock(return_value=verdict)
 
         with patch(self._PATCH_TARGET, helper):
