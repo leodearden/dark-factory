@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import subprocess
 from collections import Counter
 from pathlib import Path
 
 import pytest
 from _eval_sampler_fixtures import make_candidate, rich_corpus
+from click.testing import CliRunner
 
+from orchestrator.cli import main
 from orchestrator.evals.task_sampler import (
     CompletedTaskCandidate,
     FixtureAuditReport,
@@ -30,6 +33,7 @@ from orchestrator.evals.task_sampler import (
     classify_path,
     default_verify_commands,
     discover_completed_tasks,
+    enrich_candidates_from_task_db,
     format_stratification_table,
     materialize_reference_diff,
     pin_eval_branch,
@@ -681,3 +685,154 @@ class TestAuditFixtureCorpus:
         assert report.ok is True
         assert report.count == 12
         assert report.failures == []
+
+
+# ---------------------------------------------------------------------------
+# enrich_candidates_from_task_db — best-effort title/description/complexity fill
+# ---------------------------------------------------------------------------
+
+def _make_tasks_db(tmp_path: Path, rows: list[tuple]) -> Path:
+    """Build a minimal read-only taskmaster tasks.db with *rows*.
+
+    Each row is ``(id, title, description, metadata_json)`` — the columns
+    :func:`enrich_candidates_from_task_db` reads.
+    """
+    db = tmp_path / 'tasks.db'
+    conn = sqlite3.connect(db)
+    conn.execute(
+        'CREATE TABLE tasks (id INTEGER, title TEXT, description TEXT, metadata TEXT)'
+    )
+    conn.executemany('INSERT INTO tasks VALUES (?, ?, ?, ?)', rows)
+    conn.commit()
+    conn.close()
+    return db
+
+
+class TestEnrichCandidatesFromTaskDb:
+    def test_fills_title_description_complexity(self, tmp_path: Path) -> None:
+        db = _make_tasks_db(tmp_path, [
+            (12, 'Bug: fix the thing', 'a crash occurs', '{"complexity": "simple"}'),
+        ])
+        enriched = enrich_candidates_from_task_db(
+            [_cand(task_id='12', title='', description='', complexity=None)], db,
+        )
+        assert enriched[0].title == 'Bug: fix the thing'
+        assert enriched[0].description == 'a crash occurs'
+        assert enriched[0].complexity == 'simple'
+
+    def test_missing_db_returns_candidates_unchanged(self, tmp_path: Path) -> None:
+        enriched = enrich_candidates_from_task_db(
+            [_cand(task_id='12', title='orig')], tmp_path / 'nope.db',
+        )
+        assert enriched[0].title == 'orig'
+
+    def test_unknown_id_left_as_stub(self, tmp_path: Path) -> None:
+        db = _make_tasks_db(tmp_path, [(12, 'known', 'd', '{}')])
+        enriched = enrich_candidates_from_task_db(
+            [_cand(task_id='999', title='')], db,
+        )
+        assert enriched[0].title == ''
+
+    def test_non_numeric_id_left_as_stub(self, tmp_path: Path) -> None:
+        # Legacy fixtures may carry a non-numeric id; enrichment skips them
+        # rather than raising on the int() lookup.
+        db = _make_tasks_db(tmp_path, [(12, 'known', 'd', '{}')])
+        enriched = enrich_candidates_from_task_db(
+            [_cand(task_id='df_12', title='')], db,
+        )
+        assert enriched[0].title == ''
+
+
+# ---------------------------------------------------------------------------
+# CLI — eval-list-fixtures and eval-sample --dry-run (CliRunner, hermetic)
+# ---------------------------------------------------------------------------
+
+def _seed_fixture_dir(tasks_dir: Path, specs: list[tuple[str, dict]]) -> None:
+    """Write one fixture JSON per spec into *tasks_dir*."""
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    for task_id, kw in specs:
+        rec = _fixture(task_id, **kw)
+        (tasks_dir / f'{rec["id"]}.json').write_text(json.dumps(rec))
+
+
+def _repo_with_merges(tmp_path: Path, task_ids: list[str]) -> Path:
+    """A temp repo with one ``Merge task/<id> into main`` no-ff commit per id."""
+    repo = tmp_path / 'df-repo'
+    repo.mkdir()
+    _git(['init', '-q', '-b', 'main'], repo)
+    _git(['config', 'user.email', 'test@example.com'], repo)
+    _git(['config', 'user.name', 'Test User'], repo)
+    _git(['config', 'commit.gpgsign', 'false'], repo)
+    (repo / 'base.txt').write_text('base\n')
+    _git(['add', '.'], repo)
+    _git(['commit', '-q', '-m', 'base'], repo)
+    for tid in task_ids:
+        _git(['checkout', '-q', '-b', f'task/{tid}'], repo)
+        (repo / f'f{tid}.txt').write_text(f'work {tid}\n')
+        _git(['add', '.'], repo)
+        _git(['commit', '-q', '-m', f'work {tid}'], repo)
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', f'task/{tid}', '-m', f'Merge task/{tid} into main'], repo)
+    return repo
+
+
+class TestEvalListFixturesCLI:
+    def test_lists_table_and_exits_zero(self, tmp_path: Path) -> None:
+        tasks_dir = tmp_path / 'tasks'
+        _seed_fixture_dir(tasks_dir, [
+            ('1', dict(repo='df', kind='bugfix', path='full')),
+            ('2', dict(repo='reify', kind='feature', path='full')),
+        ])
+        result = CliRunner().invoke(
+            main, ['eval-list-fixtures', '--tasks-dir', str(tasks_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        assert 'stratification' in result.output
+        assert 'bugfix' in result.output
+
+    def test_needs_no_orchestrator_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The listing reads only the tasks dir — no ORCH_CONFIG_PATH / --config.
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        tasks_dir = tmp_path / 'tasks'
+        _seed_fixture_dir(tasks_dir, [('1', dict(repo='df', kind='bugfix', path='full'))])
+        result = CliRunner().invoke(
+            main, ['eval-list-fixtures', '--tasks-dir', str(tasks_dir)],
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_cohort_option_scopes_output(self, tmp_path: Path) -> None:
+        tasks_dir = tmp_path / 'tasks'
+        _seed_fixture_dir(tasks_dir, [
+            ('1', dict(repo='df', kind='bugfix', path='full', cohort='revival-zeta')),
+            ('2', dict(repo='df', kind='feature', path='full', cohort='legacy-april')),
+        ])
+        result = CliRunner().invoke(
+            main,
+            ['eval-list-fixtures', '--tasks-dir', str(tasks_dir), '--cohort', 'revival-zeta'],
+        )
+        assert result.exit_code == 0, result.output
+        assert 'revival-zeta' in result.output
+        assert 'TOTAL: 1' in result.output
+
+
+class TestEvalSampleDryRunCLI:
+    def test_dry_run_prints_selection_and_makes_no_changes(self, tmp_path: Path) -> None:
+        repo = _repo_with_merges(tmp_path, ['101', '102', '103'])
+        tasks_dir = tmp_path / 'tasks'
+        tasks_dir.mkdir()
+        result = CliRunner().invoke(main, [
+            'eval-sample', '--dry-run',
+            '--df-root', str(repo),
+            '--reify-root', str(tmp_path / 'no-reify'),  # absent -> skipped loudly
+            '--tasks-dir', str(tasks_dir),
+            '--seed', '1',
+        ])
+        assert result.exit_code == 0, result.output
+        assert 'dry-run' in result.output.lower()
+        # Discovered all three completed-task merges.
+        assert '3' in result.output
+        # No fixture files written and no evals/* branches pinned.
+        assert list(tasks_dir.glob('*.json')) == []
+        assert _git(['branch', '--list', 'evals/*'], repo) == ''
