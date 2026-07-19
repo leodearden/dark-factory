@@ -510,24 +510,40 @@ class TestPlanLock:
 
 
 class TestAgentSession:
-    """Sidecar marker for in-flight agent subprocesses (crash-recovery resume)."""
+    """Sidecar marker for in-flight agent subprocesses (crash-recovery resume).
+
+    Sidecar schema v2 (task 2771): the payload is a TYPED ``AgentSession``
+    carrying the durable ``task_id`` lane→task binding, a ``resume_count``,
+    and ``schema_version: 2``.  ``read_agent_session`` returns the typed model
+    (attribute access, not dict subscript) and tolerates a pre-deploy v1
+    sidecar (missing v2 keys → legacy defaults).
+    """
 
     def test_write_read_roundtrip(self, artifacts: TaskArtifacts):
         artifacts.write_agent_session(
             'sess-abc', 'architect', '2026-05-12T10:00:00+00:00',
+            task_id='t-42',
         )
         data = artifacts.read_agent_session()
         assert data is not None
-        assert data['session_id'] == 'sess-abc'
-        assert data['role'] == 'architect'
-        assert data['started_at'] == '2026-05-12T10:00:00+00:00'
-        assert data['owner_pid'] == os.getpid()
+        # Typed AgentSession — attribute access, not a raw dict.
+        assert not isinstance(data, dict)
+        assert data.session_id == 'sess-abc'
+        assert data.role == 'architect'
+        assert data.started_at == '2026-05-12T10:00:00+00:00'
+        assert data.owner_pid == os.getpid()
+        # v2 fields exposed as attributes.
+        assert data.task_id == 't-42'
+        assert data.resume_count == 0
+        assert data.schema_version == 2
 
     def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
         assert artifacts.read_agent_session() is None
 
     def test_clear_removes_file(self, artifacts: TaskArtifacts):
-        artifacts.write_agent_session('sess-x', 'implementer', 'now')
+        artifacts.write_agent_session(
+            'sess-x', 'implementer', 'now', task_id='t-1',
+        )
         assert (artifacts.root / 'agent_session.json').exists()
         artifacts.clear_agent_session()
         assert not (artifacts.root / 'agent_session.json').exists()
@@ -540,6 +556,49 @@ class TestAgentSession:
     def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
         (artifacts.root / 'agent_session.json').write_text('{not valid json')
         assert artifacts.read_agent_session() is None
+
+    def test_write_persists_resume_count(self, artifacts: TaskArtifacts):
+        artifacts.write_agent_session(
+            'sess-r', 'implementer', 'now', task_id='t-7', resume_count=3,
+        )
+        data = artifacts.read_agent_session()
+        assert data is not None
+        assert data.resume_count == 3
+        assert data.schema_version == 2
+
+    def test_write_emits_v2_on_disk(self, artifacts: TaskArtifacts):
+        """The on-disk JSON always carries schema_version:2 and the two new
+        keys — the delivered-check contract shape for this task."""
+        artifacts.write_agent_session(
+            'sess-d', 'architect', 'now', task_id='t-9', resume_count=1,
+        )
+        raw = json.loads((artifacts.root / 'agent_session.json').read_text())
+        assert raw['schema_version'] == 2
+        assert 'task_id' in raw
+        assert 'resume_count' in raw
+
+    def test_read_v1_sidecar_legacy_semantics(self, artifacts: TaskArtifacts):
+        """B11: a pre-deploy v1 sidecar (no v2 keys) reads with legacy
+        defaults — task_id None, resume_count 0, schema_version 1 — while the
+        four v1 fields are preserved verbatim."""
+        v1 = {
+            'session_id': 'sess-v1',
+            'role': 'architect',
+            'started_at': '2026-05-01T00:00:00+00:00',
+            'owner_pid': 12345,
+        }
+        (artifacts.root / 'agent_session.json').write_text(json.dumps(v1))
+        data = artifacts.read_agent_session()
+        assert data is not None
+        # Legacy defaults for the absent v2 keys.
+        assert data.task_id is None
+        assert data.resume_count == 0
+        assert data.schema_version == 1
+        # v1 fields preserved.
+        assert data.session_id == 'sess-v1'
+        assert data.role == 'architect'
+        assert data.started_at == '2026-05-01T00:00:00+00:00'
+        assert data.owner_pid == 12345
 
 
 class TestVerdicts:
