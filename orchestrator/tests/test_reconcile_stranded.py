@@ -18,6 +18,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.delivered_checks import DeliveredChecksVerdict
 from orchestrator.harness import Harness, _pid_alive
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.warm_lane_pool import WarmLanePool
@@ -3513,3 +3514,309 @@ class TestReconcileStrandedResolverGuard:
             r.levelno == logging.DEBUG and 'empty' in r.message.lower()
             for r in caplog.records
         ), f'Expected DEBUG naming empty; got: {[r.message for r in caplog.records]!r}'
+
+
+# ---------------------------------------------------------------------------
+# task 2794 — the delivered-capability ground-truth guard.
+#
+# Structurally mirrors TestReconcileOneStrandedEffectPresentGuard (above):
+# the same ON_MAIN git-fallback setup (is_ancestor True, resolve_branch_sha
+# <sha>, commit_effect_present_in_main default True so control reaches the
+# NEW guard AFTER the effect-present downgrade), but with a truthy
+# metadata.delivered_checks and orchestrator.harness.verify_delivered_checks_on_main
+# patched to return each row of the acceptance matrix. The capability guard
+# asks the orthogonal question git attribution + effect-present cannot: is
+# the task's OWN declared capability actually present on main? A hollow-done
+# (attribution/effect present, but the declared capability absent) must
+# re-dispatch (in-progress) or be left alone (blocked), never stamped
+# found_on_main.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestReconcileOneStrandedDeliveredChecksGuard:
+    _PATCH_TARGET = 'orchestrator.harness.verify_delivered_checks_on_main'
+
+    def _on_main_in_progress(self, harness: Harness, tid: str, *, sha: str,
+                             main_sha: str, metadata: dict) -> None:
+        """Common ON_MAIN git-fallback setup for an in-progress stranded task
+        whose effect IS present (so the effect-present guard passes and
+        control reaches the new delivered-checks guard).
+
+        With an active commit-citation pattern (dark-factory's default), the
+        ON_MAIN landing sha is the CITATION commit, not the raw branch tip
+        (task_ground_truth._resolve_branch_state) — so find_task_citation_commit
+        is what determines report.branch_state.sha (and thus the found_on_main
+        provenance commit), pinned here to *sha*.
+        """
+        harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'in-progress', 'metadata': metadata},
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(return_value=sha)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=sha)  # type: ignore[attr-defined]
+        harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
+
+    # --- row 2: FAILED, in-progress -> re-dispatch (revert to pending) ------
+
+    async def test_failed_in_progress_reverts_and_warns(
+        self, harness: Harness, caplog,
+    ):
+        """A FAILED delivered check on an in-progress task means the declared
+        capability is provably absent from main: NOT marked done, reverted to
+        pending for re-dispatch, and a WARNING naming the task, the failed
+        check, its pattern, and the main SHA."""
+        tid = '2794001'
+        sha = 'deadbeef' + 'a' * 32
+        main_sha = 'ma' * 20
+        failing = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern'}
+        self._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [failing]},
+        )
+        verdict = DeliveredChecksVerdict(
+            outcome='failed', main_sha=main_sha, failed_check=failing,
+        )
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper), \
+                caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'pending',
+        )
+        assert result == 1
+        helper.assert_awaited_once()
+        assert tid in caplog.text
+        assert 'cap-x' in caplog.text
+        assert 'SomePattern' in caplog.text
+        assert main_sha in caplog.text
+
+    # --- row 3: all_delivered -> mark done (unchanged) ----------------------
+
+    async def test_all_delivered_marks_done(self, harness: Harness):
+        """All checks DELIVERED on main -> the capability is present, so the
+        stranded in-progress task is stamped found_on_main exactly as today."""
+        tid = '2794002'
+        sha = 'deadbeef' + 'b' * 32
+        main_sha = 'mb' * 20
+        check = {'name': 'cap-y', 'kind': 'grep', 'pattern': 'Pat', 'expect': 'present'}
+        self._on_main_in_progress(
+            harness, tid, sha=sha, main_sha=main_sha,
+            metadata={'delivered_checks': [check]},
+        )
+        verdict = DeliveredChecksVerdict(outcome='all_delivered', main_sha=main_sha)
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
+        )
+        assert result == 1
+        helper.assert_awaited_once()
+
+    # --- row 4: no delivered_checks -> guard inert, mark done, helper skipped -
+
+    async def test_no_delivered_checks_marks_done_and_skips_helper(
+        self, harness: Harness,
+    ):
+        """A check-less task must not gain a new requirement: it is stamped
+        found_on_main exactly as today and the helper is never consulted."""
+        tid = '2794003'
+        sha = 'deadbeef' + 'c' * 32
+        self._on_main_in_progress(
+            harness, tid, sha=sha, main_sha='mc' * 20, metadata={},
+        )
+        helper = AsyncMock()
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
+        )
+        assert result == 1
+        helper.assert_not_awaited()
+
+    # --- row 5: ERRORED/timeout -> fail-safe (no mark, no revert) ------------
+
+    async def test_errored_is_fail_safe_no_action(self, harness: Harness):
+        """An ERRORED verdict (a check could not be evaluated) is fail-safe:
+        make no claim either way — do not mark done, do not revert, leave the
+        task in-progress to be retried next sweep (result uncounted)."""
+        tid = '2794004'
+        main_sha = 'md' * 20
+        check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
+        self._on_main_in_progress(
+            harness, tid, sha='deadbeef' + 'd' * 32, main_sha=main_sha,
+            metadata={'delivered_checks': [check]},
+        )
+        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_awaited_once()
+
+    # --- main-sha unresolved -> fail-safe (sibling of ERRORED) --------------
+
+    async def test_main_sha_unresolved_is_fail_safe(self, harness: Harness):
+        """If get_main_sha() raises, we cannot resolve the ref the checks
+        would run against: fail-safe no-op (no mark, no revert, no helper
+        call), retried next sweep."""
+        tid = '2794005'
+        check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
+        self._on_main_in_progress(
+            harness, tid, sha='deadbeef' + 'e' * 32, main_sha='unused',
+            metadata={'delivered_checks': [check]},
+        )
+        harness.git_ops.get_main_sha = AsyncMock(  # type: ignore[attr-defined]
+            side_effect=RuntimeError('git rev-parse failed'),
+        )
+        helper = AsyncMock()
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_not_awaited()
+
+    # --- main-sha empty string -> fail-safe (distinct from the raises path) --
+
+    async def test_main_sha_empty_is_fail_safe(self, harness: Harness):
+        """If get_main_sha() returns an empty/falsy string (rather than
+        raising), we still cannot resolve the ref the checks would run
+        against: the ``if not main_sha`` arm defers mark-done exactly like the
+        raises path — no mark, no revert, no helper call, retried next sweep.
+
+        This pins the empty-string branch of the fail-safe, which is DISTINCT
+        from test_main_sha_unresolved_is_fail_safe (that covers get_main_sha()
+        *raising*). Without this, a regression dropping the ``if not main_sha``
+        guard would still pass CI."""
+        tid = '2794008'
+        check = {'name': 'cap-z', 'kind': 'grep', 'pattern': 'Pat'}
+        self._on_main_in_progress(
+            harness, tid, sha='deadbeef' + '8' * 32, main_sha='',
+            metadata={'delivered_checks': [check]},
+        )
+        helper = AsyncMock()
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_not_awaited()
+
+    # --- row 6: FAILED, blocked -> leave untouched (blocked discipline) ------
+
+    async def test_failed_blocked_leaves_task_untouched(self, harness: Harness):
+        """A FAILED delivered check on a stranded 'blocked' task must NOT
+        silently flip it: blocked discipline forbids a blocked->pending
+        revert (mirrors the effect-present blocked case), so the result is no
+        action at all — no mark_done, no set_task_status."""
+        tid = '2794006'
+        main_sha = 'mf' * 20
+        failing = {'name': 'cap-b', 'kind': 'grep', 'pattern': 'BPat'}
+        harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'blocked',
+                          'metadata': {'delivered_checks': [failing]}},
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + 'f' * 32,
+        )
+        harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
+        verdict = DeliveredChecksVerdict(
+            outcome='failed', main_sha=main_sha, failed_check=failing,
+        )
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_awaited_once()
+
+    # --- blocked + ERRORED -> leave untouched (blocked discipline + fail-safe) -
+
+    async def test_errored_blocked_leaves_task_untouched(self, harness: Harness):
+        """An ERRORED delivered-check verdict on a stranded 'blocked' task
+        takes the same no-action ``return None`` path as the blocked+FAILED
+        case: the ERRORED arm is fail-safe (make no claim either way) AND
+        blocked discipline forbids a blocked->pending flip — so no mark_done,
+        no set_task_status. Parallel to test_failed_blocked_leaves_task_untouched;
+        together they pin blocked discipline across BOTH non-satisfied
+        outcomes (the helper IS consulted here, unlike the main-sha-unresolved
+        fail-safe which short-circuits before it)."""
+        tid = '2794009'
+        main_sha = 'mg' * 20
+        check = {'name': 'cap-be', 'kind': 'grep', 'pattern': 'BEPat'}
+        harness.scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)  # type: ignore[attr-defined]
+        harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+            return_value={'status': 'blocked',
+                          'metadata': {'delivered_checks': [check]}},
+        )
+        harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        harness.git_ops.resolve_branch_sha = AsyncMock(  # type: ignore[attr-defined]
+            return_value='deadbeef' + '9' * 32,
+        )
+        harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
+        verdict = DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+        assert result == 0
+        helper.assert_awaited_once()
+
+    # --- kill switch: enabled=False -> guard inert even on a FAILED verdict --
+
+    async def test_kill_switch_disabled_marks_done_and_skips_helper(
+        self, harness: Harness,
+    ):
+        """config.delivered_checks.enabled=False turns the whole guard off:
+        even with a FAILED verdict staged, the task is STILL marked done and
+        the helper is never consulted — kill-switch parity with the
+        dependent-side dispatch gate's documented inertness."""
+        tid = '2794007'
+        sha = 'deadbeef' + '7' * 32
+        failing = {'name': 'cap-k', 'kind': 'grep', 'pattern': 'KPat'}
+        harness.config.delivered_checks.enabled = False
+        self._on_main_in_progress(
+            harness, tid, sha=sha, main_sha='mk' * 20,
+            metadata={'delivered_checks': [failing]},
+        )
+        verdict = DeliveredChecksVerdict(
+            outcome='failed', main_sha='mk' * 20, failed_check=failing,
+        )
+        helper = AsyncMock(return_value=verdict)
+
+        with patch(self._PATCH_TARGET, helper):
+            result = await harness._reconcile_stranded_in_progress()
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            tid, 'done',
+            done_provenance={'kind': 'found_on_main', 'commit': sha, 'note': ANY},
+        )
+        assert result == 1
+        helper.assert_not_awaited()

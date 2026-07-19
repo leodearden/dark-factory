@@ -40,6 +40,10 @@ from orchestrator.config import (
     apply_reload,
     load_config,
 )
+from orchestrator.delivered_checks import (
+    DeliveredChecksVerdict,
+    verify_delivered_checks_on_main,
+)
 from orchestrator.deploy_state import DeployPhase, DeployState
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
@@ -3904,6 +3908,86 @@ task, include it with an empty "files" list rather than omitting it.
                         tid, mid_run=mid_run, metadata=metadata, status=status,
                     )
                 return None
+
+            # Delivered-capability ground-truth guard (task 2794). Sibling to
+            # the effect-present refinement above (same downgrade shape): git
+            # attribution and the effect-present check prove a merge advanced
+            # main and that the cited commit's paths survive at HEAD — but NOT
+            # that THIS task's OWN declared capability
+            # (metadata.delivered_checks) is actually complete on main. A
+            # journal row / citation / merge marker attributes a landing; it
+            # does not certify the deliverable. So — AFTER all
+            # attribution/effect guards, applied UNIFORMLY to every evidence
+            # source (ON_MAIN, GONE_WITH_MERGE_MARKER, MergeProvenance journal)
+            # funneling through this one arm — verify the declared capability
+            # is present on main before stamping found_on_main. Kept as an
+            # early return on failed/errored (in-progress -> revert-to-pending
+            # for re-dispatch; blocked -> leave alone, blocked discipline) so
+            # _mark_in_progress_done below is structurally reachable ONLY on
+            # the all_delivered fall-through — never behind a mutable boolean a
+            # later refactor could drift out of sync. Gated on the enabled kill
+            # switch AND truthy delivered_checks so check-less tasks keep their
+            # exact pre-2794 attribution+effect-present bar (kill-switch parity
+            # with the dependent-side dispatch gate's documented inertness).
+            delivered_checks = metadata.get('delivered_checks')
+            if delivered_checks and self.config.delivered_checks.enabled:
+                try:
+                    main_sha = await self.git_ops.get_main_sha()
+                except Exception:
+                    # get_main_sha() raises on git error — the caller owns the
+                    # fail-safe: no mark, no revert, retry when main is
+                    # readable again (sibling of the ERRORED outcome below).
+                    logger.warning(
+                        'Reconcile: task %s carries delivered_checks but the '
+                        'main SHA could not be resolved — deferring mark-done '
+                        '(fail-safe), will retry next sweep',
+                        tid, exc_info=True,
+                    )
+                    return None
+                if not main_sha:
+                    logger.warning(
+                        'Reconcile: task %s carries delivered_checks but '
+                        'get_main_sha() returned empty — deferring mark-done '
+                        '(fail-safe), will retry next sweep',
+                        tid,
+                    )
+                    return None
+                dc_verdict: DeliveredChecksVerdict = await verify_delivered_checks_on_main(
+                    delivered_checks,
+                    project_root=str(self.config.project_root),
+                    main_sha=main_sha,
+                    check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+                )
+                if dc_verdict.outcome == 'failed':
+                    failed_check = dc_verdict.failed_check or {}
+                    is_grep = failed_check.get('kind') == 'grep'
+                    logger.warning(
+                        'Reconcile: task %s delivered-check %r (%s=%r) is '
+                        'absent from main@%s — declared capability not present, '
+                        'not marking done',
+                        tid, failed_check.get('name'),
+                        'pattern' if is_grep else 'script',
+                        failed_check.get('pattern') if is_grep else failed_check.get('script'),
+                        main_sha,
+                    )
+                    if status == 'in-progress':
+                        return await self._revert_in_progress_if_no_live_claimant(
+                            tid, mid_run=mid_run, metadata=metadata, status=status,
+                        )
+                    return None
+                if dc_verdict.outcome == 'errored':
+                    # Some check could not be evaluated and none FAILED — make
+                    # no claim either way; fail-safe wait (no mark, no revert).
+                    logger.warning(
+                        'Reconcile: task %s delivered-checks could not be '
+                        'evaluated at main@%s (errored) — deferring mark-done '
+                        '(fail-safe), will retry next sweep',
+                        tid, main_sha,
+                    )
+                    return None
+                # dc_verdict.outcome == 'all_delivered' -> the declared
+                # capability is present; fall through to note-building /
+                # _mark_in_progress_done below, unchanged.
 
             if status == 'blocked':
                 note = (
