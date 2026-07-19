@@ -10007,17 +10007,27 @@ task, include it with an empty "files" list rather than omitting it.
                 suggested_action='investigate_reblock_loop',
             )
             queue.submit(esc)
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.escalation_created,
-                    task_id=task_id,
-                    data={
-                        'escalation_id': esc.id,
-                        'category': esc.category,
-                        'severity': esc.severity,
-                        'level': esc.level,
-                        'reason': 'reblock-guard-threshold',
-                    },
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=task_id,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': esc.category,
+                            'severity': esc.severity,
+                            'level': esc.level,
+                            'reason': 'reblock-guard-threshold',
+                        },
+                    )
+            except Exception:
+                # Isolated from the outer handler: the L2 is already filed at
+                # this point, so a failure here is an observability-only
+                # miss, never a "failed to file L2" condition.
+                logger.warning(
+                    'reblock-guard: L2 %s filed for task %s but '
+                    'escalation_created emit failed', esc.id, task_id,
+                    exc_info=True,
                 )
             logger.warning(
                 'reblock-guard: task %s hit threshold (count=%d, sig=%r); '
