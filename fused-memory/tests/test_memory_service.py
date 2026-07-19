@@ -1724,6 +1724,43 @@ class TestCloseBoundsSlowSubclose:
         for name in ('mem0', '_write_journal', '_event_buffer', 'planned_episode_registry'):
             resources[name].close.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_subclose_overrun_emits_diagnostic_naming_culprit(
+        self, service, caplog, monkeypatch
+    ):
+        """A sub-close overrun emits exactly one WARNING that names BOTH the
+        overrunning sub-close (its label) and the timeout value, so the restart
+        journal identifies which backend hung. close() still returns and the
+        resources ordered after the culprit still close."""
+        monkeypatch.setattr(
+            memory_service, '_SUBCLOSE_TIMEOUT', 0.2, raising=False
+        )
+        resources = self._wire_resources(service)
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        service.mem0.close = AsyncMock(side_effect=_hang)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service'
+        ):
+            await asyncio.wait_for(service.close(), timeout=2.0)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, (
+            f'Expected exactly one overrun WARNING, got {len(warnings)}: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        msg = warnings[0].getMessage()
+        assert 'mem0' in msg, f'WARNING must name the overrunning sub-close: {msg!r}'
+        assert '0.2' in msg, f'WARNING must name the timeout value: {msg!r}'
+
+        # Resources ordered AFTER the hung mem0 still closed (not starved).
+        resources['_write_journal'].close.assert_awaited_once()
+        resources['_event_buffer'].close.assert_awaited_once()
+        resources['planned_episode_registry'].close.assert_awaited_once()
+
 
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
