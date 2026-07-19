@@ -1,0 +1,119 @@
+# Machine-readable twin of operational-ask-routing-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc);
+# field reference plans/capability-delivered-checks-prd.md §Contract.
+# task_id values are null until commit_planning stamps them (Greek labels only).
+prd: plans/operational-ask-routing-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "operational_mode schema field + validation"
+    capabilities:
+      - name: "operational_mode-recognized-and-validated"
+        binding: "capability→producer (wired) — mirrors execution_class field handling in shared/src/shared/task_metadata.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "operational_mode"
+          paths: ["shared/src/shared/task_metadata.py"]
+          expect: present
+      - name: "invalid-value-rejected"
+        binding: "rejection-mechanism — parallel to execution_class_error; built+bound by α (validator fixtures observe the ValidationError fire)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by α's own test fixtures asserting ValidationError on operational_mode ∉ {gate,llm}, not a grep"
+  - label: "β"
+    task_id: null
+    title: "submit-boundary inject_operational_routing"
+    capabilities:
+      - name: "inject-runs-before-planning_mode-branch"
+        binding: "capability→producer (wired) — tools.py:submit_task inject chain precedes interceptor.submit_task planning_mode branch (verified on main)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "inject_operational_routing"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "pure-gate-stamp-reused"
+        binding: "capability→producer (wired) — _inject_deterministic_pure_gate reused (INV-5, no lock-step re-impl)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "inject_operational_routing"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "operational_mode-field"
+        binding: "DAG-direction — producer:task-α upstream delivers the validated field"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "α's delivered_check (operational_mode present) already gates this dependency edge"
+  - label: "γ"
+    task_id: null
+    title: "operational_llm distinct human-gate"
+    capabilities:
+      - name: "distinct-escalation-reason-token"
+        binding: "capability→producer (wired) — DeterministicRunner pure-gate born-at-L2 escalation with author-influenceable summary/detail/category exists in orchestrator/src/orchestrator/deterministic_runner.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "operational_llm_needs_lane"
+          paths: ["orchestrator/src/orchestrator/deterministic_runner.py", "fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "llm-marker"
+        binding: "DAG-direction — producer:task-β upstream stamps the llm-gate marker γ consumes"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "β is upstream; the marker's presence is exercised by γ's own escalation-reason test"
+  - label: "δ"
+    task_id: null
+    title: "demote curator execution_class axis to legacy fallback"
+    capabilities:
+      - name: "execution_class-axis-and-substring-entries-exist"
+        binding: "capability→producer (wired) — match_candidate execution_class axis + substring loop exist in operational_ask_registry.py"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the demotion is a behavioral narrowing (tagged asks no longer routed by the curator; untagged still are) — asserted by δ's tests, not a positive grep"
+      - name: "boundary-owns-tagged-routing"
+        binding: "DAG-direction — producer:task-β upstream must own tagged routing before the curator axis is demoted"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "β upstream; edge gated by β's inject_operational_routing delivered_check"
+  - label: "ε"
+    task_id: null
+    title: "recon source-completion brief"
+    capabilities:
+      - name: "recon-stage-render-and-prompts-exist"
+        binding: "capability→producer (wired) — recon_self_model.render_* + Stage 1/2 prompt modules exist under fused-memory/src/fused_memory/reconciliation/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "operational_mode"
+          paths: ["fused-memory/src/fused_memory/reconciliation/"]
+          expect: present
+      - name: "stage-1-2-hold-memory-mutation-tools"
+        binding: "capability (existing) — Stage 1/2 have add/delete_memory+merge_entities; DISALLOW_MEMORY_WRITES scopes only Stage 3 (cli_stage_runner.py, verified on main)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an existing-substrate fact verified once at authoring; not a symbol this batch lands"
+      - name: "operational_mode-declared-on-recon-submits"
+        binding: "DAG-direction — producer:task-α upstream delivers the field the stages declare"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "α upstream; edge gated by α's delivered_check"
+  - label: "ζ"
+    task_id: null
+    title: "boundary integration gate (B+H)"
+    capabilities:
+      - name: "boundary-matrix-green-e2e"
+        binding: "DAG-direction — every leg produced upstream (α field, β boundary inject, γ llm-gate, δ curator demotion, ε recon brief)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task IS the check suite; its signal is the CI-green boundary matrix"
