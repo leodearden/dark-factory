@@ -26,7 +26,12 @@ from _recording_event_store import _RecordingEventStore
 from pydantic import ValidationError
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
-from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
+from orchestrator.delivered_checks import (
+    DeliveredCheckResult,
+    DeliveredChecksVerdict,
+    run_delivered_check,
+    verify_delivered_checks_on_main,
+)
 from orchestrator.event_store import EventType
 from orchestrator.scheduler import (
     _CONTINUE,
@@ -2440,3 +2445,138 @@ class TestAcquireNextDeliveredGateRealFilteredFetch:
             f'transparent when the check actually passes; got {result!r}'
         )
         assert self._held_events(scheduler) == []
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyDeliveredChecksOnMain (task 2794 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyDeliveredChecksOnMain:
+    """``verify_delivered_checks_on_main``'s pure aggregation/precedence.
+
+    Drives the shared reconcile-side capability guard (task 2794) directly
+    with an injected fake runner — no Harness, no real git repo. Pins the
+    SAME precedence as ``Scheduler._compute_delivered_check_cache``
+    (scheduler.py 3150-3211): all-DELIVERED > any-FAILED > ERRORED, with a
+    hung check (``asyncio.wait_for`` past ``check_timeout_secs``) mapped to
+    ERRORED (fail-safe). The function must NEVER raise.
+    """
+
+    def _grep(self, name: str, pattern: str) -> dict:
+        """A minimal valid grep descriptor (expect=present is required)."""
+        return {'name': name, 'kind': 'grep', 'pattern': pattern, 'expect': 'present'}
+
+    def _rc_by_pattern_runner(self, rc_by_pattern: dict[str, int]):
+        """Fake runner returning a per-pattern rc.
+
+        ``run_delivered_check``'s grep branch builds argv
+        ``['git','-C',<proj>,'grep','-E','-e',<pattern>,<ref>, ...]`` — the
+        pattern sits at index 6, so keying the returned rc off it lets each
+        check in a multi-check list resolve to a distinct outcome.
+        """
+
+        async def _runner(argv, **kwargs):
+            pattern = argv[6]
+            return (rc_by_pattern[pattern], '', '')
+
+        return _runner
+
+    @pytest.mark.asyncio
+    async def test_all_delivered_carries_passed_main_sha(self):
+        """(a) two grep checks both rc==0 (expect=present) -> 'all_delivered',
+        and the verdict echoes the passed main_sha."""
+        checks = [self._grep('a', 'PatA'), self._grep('b', 'PatB')]
+        runner = self._rc_by_pattern_runner({'PatA': 0, 'PatB': 0})
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='deadbeef',
+            check_timeout_secs=5.0,
+            runner=runner,
+        )
+
+        assert isinstance(verdict, DeliveredChecksVerdict)
+        assert verdict.outcome == 'all_delivered'
+        assert verdict.main_sha == 'deadbeef'
+        assert verdict.failed_check is None
+
+    @pytest.mark.asyncio
+    async def test_single_failed_carries_that_descriptor(self):
+        """(b) one rc==1 -> 'failed', and failed_check is that descriptor."""
+        failing = self._grep('gone', 'PatGone')
+        checks = [self._grep('ok', 'PatOk'), failing]
+        runner = self._rc_by_pattern_runner({'PatOk': 0, 'PatGone': 1})
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='sha1',
+            check_timeout_secs=5.0,
+            runner=runner,
+        )
+
+        assert verdict.outcome == 'failed'
+        assert verdict.failed_check is failing
+
+    @pytest.mark.asyncio
+    async def test_failed_beats_errored(self):
+        """(c) precedence: one rc==1 (FAILED) + one rc==2 (ERRORED) ->
+        'failed'. A definitive absence must drive re-dispatch, never be
+        masked into a fail-safe no-op by an unrelated errored check —
+        even when the ERRORED check is encountered first."""
+        failing = self._grep('gone', 'PatGone')
+        checks = [self._grep('boom', 'PatBoom'), failing]
+        runner = self._rc_by_pattern_runner({'PatBoom': 2, 'PatGone': 1})
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='sha1',
+            check_timeout_secs=5.0,
+            runner=runner,
+        )
+
+        assert verdict.outcome == 'failed'
+        assert verdict.failed_check is failing
+
+    @pytest.mark.asyncio
+    async def test_errored_without_failed_is_fail_safe(self):
+        """(d) one rc>=2 (git error) with the rest DELIVERED and none FAILED
+        -> 'errored' (fail-safe wait; no failed_check)."""
+        checks = [self._grep('ok', 'PatOk'), self._grep('boom', 'PatBoom')]
+        runner = self._rc_by_pattern_runner({'PatOk': 0, 'PatBoom': 128})
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='sha1',
+            check_timeout_secs=5.0,
+            runner=runner,
+        )
+
+        assert verdict.outcome == 'errored'
+        assert verdict.failed_check is None
+
+    @pytest.mark.asyncio
+    async def test_hung_check_times_out_to_errored(self):
+        """(e) a runner that awaits longer than check_timeout_secs ->
+        TimeoutError mapped to ERRORED -> 'errored'. Reaching the assert
+        (no exception propagated) is itself the never-raises guarantee."""
+
+        async def _slow_runner(argv, **kwargs):
+            await asyncio.sleep(1.0)
+            return (0, '', '')
+
+        checks = [self._grep('slow', 'PatSlow')]
+
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root='/proj',
+            main_sha='sha1',
+            check_timeout_secs=0.01,
+            runner=_slow_runner,
+        )
+
+        assert verdict.outcome == 'errored'
