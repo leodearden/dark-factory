@@ -6,6 +6,9 @@ from fused_memory.reconciliation.policies.autopilot_video import (
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID as _AUTOPILOT_VIDEO_PROJECT_ID,
 )
+from fused_memory.reconciliation.predicate_contradiction import (
+    render_predicate_contradiction_section,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
@@ -55,6 +58,8 @@ returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 
 {render_execution_class_section()}
+
+{render_predicate_contradiction_section()}
 
 ## Splitting Tasks (do NOT create subtasks)
 Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \
