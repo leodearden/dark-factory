@@ -61,6 +61,12 @@ class EvalMetrics:
     # Derived
     composite_score: float = 0.0
 
+    # Recovery-behavior rubric (eval-revival η) — a rubric DISTINCT from the
+    # base composite, populated ONLY for adversarial fixtures. ``None`` is the
+    # C4 ``recovery_score | null`` sentinel for non-adversarial runs, kept
+    # distinct from a genuinely scored ``0.0``.
+    recovery_score: float | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -213,6 +219,25 @@ async def collect_metrics(
         m.typecheck_clean = None
 
     m.composite_score = compute_composite(m)
+
+    # Recovery-behavior scoring (eval-revival η) — a rubric DISTINCT from the
+    # base composite, scored only for adversarial fixtures (returns None
+    # otherwise). The local import breaks the metrics<->scoring cycle (scoring
+    # imports EvalMetrics/compute_composite from this module), mirroring the
+    # run_verification local import above. Guarded: a recovery-scoring bug
+    # degrades to a named WARNING + null column and never nukes the run's
+    # composite/cost/gate metrics.
+    try:
+        from orchestrator.evals.scoring import recovery_score_for_run
+        m.recovery_score = await recovery_score_for_run(
+            task, workflow.artifacts, worktree, task['pre_task_commit'],
+        )
+    except Exception:
+        logger.warning(
+            'recovery scoring failed for %s', task.get('id', '?'),
+            exc_info=True,
+        )
+
     return m
 
 
