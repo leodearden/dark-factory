@@ -263,6 +263,9 @@ class TestPreserveOnCancellation:
         records = _preserve_records(caplog)
         assert len(records) == 1
         rec = records[0]
-        assert rec.task_id == str(workflow.task_id)
-        assert rec.session_id == workflow._last_invoke_session_id
-        assert rec.role == SIMPLE_TASK.name
+        # Fields live in ``extra`` (INV-2), so LogRecord doesn't statically
+        # declare them — read via getattr with a default, matching
+        # ``_preserve_records`` above (the default also keeps ruff B009 happy).
+        assert getattr(rec, 'task_id', None) == str(workflow.task_id)
+        assert getattr(rec, 'session_id', None) == workflow._last_invoke_session_id
+        assert getattr(rec, 'role', None) == SIMPLE_TASK.name
