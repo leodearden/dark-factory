@@ -881,7 +881,16 @@ def _iteration_entry_is_work(entry: dict) -> bool:
     - ``'judge'`` ``early_exit`` entries count only when ``substantive_work``
       is True (workflow.py ~4559) — a judge can legitimately declare a task
       complete with zero plan-steps marked done.
+
+    An entry that explicitly recorded no durable commit (``committed is False``,
+    task 2759) is not prior-implementation work regardless of agent type — the
+    round ended before HEAD advanced (implementer died mid-background-wait,
+    amendment left uncommitted, …). Discriminates on the explicit ``False``
+    flag only: legacy entries lacking the key (``entry.get('committed') is
+    None``) fall through to today's classification unchanged.
     """
+    if entry.get('committed') is False:
+        return False
     agent = entry.get('agent')
     if agent == 'debugger':
         return True
@@ -5295,6 +5304,7 @@ class TaskWorkflow:
                 self.plan, iteration_log, rebase_notice=rebase_notice,
                 task_id=self.task_id, wip_notice=wip_notice,
             )
+            pre_head = await self._get_head_commit()
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
             self.metrics.execute_iterations += 1
@@ -5322,7 +5332,6 @@ class TaskWorkflow:
                 if isinstance(s, dict) and s.get('status') == 'done'
             }
             newly_completed = sorted(completed_after - completed_before)
-            head_commit = await self._get_head_commit()
 
             if newly_completed:
                 step_descs = [
@@ -5340,7 +5349,7 @@ class TaskWorkflow:
                 'agent': 'implementer',
                 'steps_attempted': newly_completed,
                 'steps_completed': newly_completed,
-                'commit': head_commit,
+                **await self._iteration_commit_provenance(pre_head),
                 'summary': summary,
                 'source': 'orchestrator',
             })
@@ -6011,6 +6020,13 @@ class TaskWorkflow:
         task's design_decisions) — per-step correctness depends entirely on
         implementer log fidelity, not on independent per-step verification.
 
+        Entries recording no durable commit (``committed is False``, task
+        2759) are excluded from the ``steps_completed`` union: a step marked
+        completed in a round where HEAD never advanced did not actually land
+        on the branch, so it must not be re-derived to done even when the
+        branch has other genuine work. Legacy entries lacking the ``committed``
+        key are unaffected.
+
         Emits a single ``event='plan_step_rederive'`` iteration-log entry
         (naming every re-derived step id) when at least one step is
         re-derived; emits nothing on a clean pass, so the common case does
@@ -6038,6 +6054,13 @@ class TaskWorkflow:
 
             completed_ids: set[str] = set()
             for entry in status.entries:
+                # An entry that explicitly recorded no durable commit
+                # (committed:False, task 2759) did not land its step on the
+                # branch — exclude it from the union so a step "completed" with
+                # no commit is not re-derived to done even when the branch has
+                # other real work. Legacy entries lack the key and fall through.
+                if entry.get('committed') is False:
+                    continue
                 completed_ids.update(entry.get('steps_completed') or [])
 
             plan = self.artifacts.read_plan()
@@ -6535,16 +6558,16 @@ class TaskWorkflow:
             prompt = await self.briefing.build_debugger_prompt(
                 result.failure_report(), self.plan, task_id=self.task_id,
             )
+            pre_head = await self._get_head_commit()
             debug_result = await self._invoke(DEBUGGER, prompt, self.worktree)
 
             # Write debugger iteration log entry
-            head_commit = await self._get_head_commit()
             self.artifacts.append_iteration_log({
                 'iteration': verify_attempt,
                 'agent': 'debugger',
                 'steps_attempted': [],
                 'steps_completed': [],
-                'commit': head_commit,
+                **await self._iteration_commit_provenance(pre_head),
                 'summary': f'Debug fix for: {result.summary[:100]}',
                 'source': 'orchestrator',
             })
@@ -6854,16 +6877,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             locked_modules=list(self.modules),
             task_id=self.task_id,
         )
+        pre_head = await self._get_head_commit()
         await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
-        head_commit = await self._get_head_commit()
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
             'agent': 'implementer',
             'source': 'amendment',
             'amendment_round': amendment_round,
             'suggestions_count': len(in_scope),
-            'commit': head_commit,
+            **await self._iteration_commit_provenance(pre_head),
             'summary': (
                 f'Amendment round {amendment_round} '
                 f'({len(in_scope)} suggestions)'
@@ -9379,6 +9402,50 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
+
+    async def _iteration_commit_provenance(self, pre_head: str) -> dict:
+        """Compare pre/post HEAD and report truthful commit provenance for an
+        iteration-ledger entry (task 2759).
+
+        Every iteration-ledger writer (implementer / debugger / amender)
+        captures ``pre_head = await self._get_head_commit()`` immediately
+        before invoking its agent, then merges this helper's result into the
+        entry dict after the agent returns. This is the single source of truth
+        for the pre/post comparison so the three writers cannot drift.
+
+        - HEAD advanced (``post`` is truthy and ``!= pre_head``) ⇒ the agent
+          committed: return ``{'commit': post, 'committed': True}``. No
+          ``dirty`` read is performed on this happy path (avoids an extra
+          ``git status`` on the common case).
+        - HEAD unchanged ⇒ the agent's session ended before committing (died
+          mid-background-wait, amendment left uncommitted, …). Recording the
+          stale ``pre_head`` here is the reify-5164 false-provenance bug;
+          instead return ``{'commit': None, 'committed': False,
+          'dirty': <porcelain-nonempty>}`` so recovery guards can treat the
+          round as no durable work.
+
+        The ``dirty`` read reuses :meth:`GitOps.has_uncommitted_work` and is
+        fail-soft (observability-only): guarded on ``git_ops``/``worktree``
+        being present and wrapped in try/except, defaulting ``dirty=False`` on
+        any error so it never sinks the iteration loop or the ledger append.
+        """
+        post = await self._get_head_commit()
+        if post and post != pre_head:
+            return {'commit': post, 'committed': True}
+        dirty = False
+        if self.git_ops is not None and self.worktree is not None:
+            try:
+                dirty = bool(
+                    await self.git_ops.has_uncommitted_work(self.worktree),
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: dirty-tree probe failed while stamping iteration '
+                    'provenance; recording dirty=False (observability-only)',
+                    self.task_id, exc_info=True,
+                )
+                dirty = False
+        return {'commit': None, 'committed': False, 'dirty': dirty}
 
     async def _check_branch_on_main(self) -> tuple[str, str] | None:
         """Probe whether the worktree HEAD is reachable from main.
