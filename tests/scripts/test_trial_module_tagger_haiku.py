@@ -9,11 +9,21 @@ Resolved via tests/scripts/conftest.py, which puts scripts/ on sys.path.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from orchestrator import module_tagger_prompt
 
 import trial_module_tagger_haiku as mod
+
+
+def _extract_json_block(md: str) -> dict:
+    """Parse the first ```json fenced block out of a rendered report."""
+    start = md.index('```json')
+    rest = md[start + len('```json'):]
+    end = rest.index('```')
+    return json.loads(rest[:end])
 
 
 # ── set_scores: precision/recall/F1/Jaccard over sanitized file sets ─────────
@@ -255,3 +265,56 @@ def test_decide_adjudication_in_between_band_is_marginal():
     # floor → marginal (locks decision 5's two adjudication boundaries).
     s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.85, worse=0.55, n=25)
     assert mod.decide(s) == 'marginal'
+
+
+# ── render_report: markdown leaderboard + machine-readable summary ───────────
+
+def _trial_result(decision='pass'):
+    return mod.TrialResult(
+        n_samples=22,
+        haiku={'precision': 0.80, 'recall': 0.75, 'f1': 0.77},
+        sonnet={'precision': 0.82, 'recall': 0.78, 'f1': 0.80},
+        agreement={'precision': 0.90, 'recall': 0.88, 'f1': 0.89, 'jaccard': 0.85},
+        adjudication={'haiku_better': 3, 'sonnet_better': 2, 'tie': 5, 'haiku_worse_fraction': 0.4},
+        decision=decision,
+    )
+
+
+def test_render_report_is_markdown_with_leaderboard_and_verdict():
+    md = mod.render_report(_trial_result('pass'))
+    assert isinstance(md, str) and md.strip()
+
+    low = md.lower()
+    # Leaderboard: both models named + precision/recall/F1 columns.
+    assert 'haiku' in low
+    assert 'sonnet' in low
+    assert 'precision' in low
+    assert 'recall' in low
+    assert 'f1' in low
+    # Mean haiku-vs-sonnet agreement / Jaccard.
+    assert 'jaccard' in low
+    # Adjudication tally + decision verdict + N.
+    assert 'adjudication' in low
+    assert 'pass' in low
+    assert '22' in md
+
+
+def test_render_report_lists_threshold_constants_used():
+    md = mod.render_report(_trial_result('pass'))
+    # The design thresholds the decision was computed against.
+    assert 'F1_PARITY_BAND' in md
+    assert 'MIN_SAMPLES' in md
+    assert '0.05' in md
+    assert '20' in md
+
+
+def test_render_report_embeds_machine_readable_summary_block():
+    md = mod.render_report(_trial_result('marginal'))
+    payload = _extract_json_block(md)
+    # The act step (step 16) parses this block for the decision + numbers.
+    assert payload['decision'] == 'marginal'
+    assert payload['n_samples'] == 22
+    assert payload['haiku']['f1'] == pytest.approx(0.77)
+    assert payload['sonnet']['f1'] == pytest.approx(0.80)
+    assert payload['agreement']['jaccard'] == pytest.approx(0.85)
+    assert payload['adjudication']['haiku_worse_fraction'] == pytest.approx(0.4)
