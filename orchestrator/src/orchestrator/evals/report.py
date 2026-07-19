@@ -327,6 +327,74 @@ def select_survivors(
     return survivors
 
 
+_METHODOLOGY_STAGES = ('ofat', 'matrix', 'confirm')
+
+
+def build_methodology_report(
+    ofat_results: list[EvalResult],
+    matrix_results: list[EvalResult],
+    confirm_results: list[EvalResult],
+    *,
+    price_table: dict[str, Any] | None = None,
+    survivors: dict[str, list[str]] | None = None,
+    winner: str | None = None,
+) -> dict[str, Any]:
+    """The μ methodology report: three λ composite sub-reports + survivors + winner.
+
+    Nests a full :func:`build_composite_report` under each stage key
+    (``'ofat'`` / ``'matrix'`` / ``'confirm'``), echoing *price_table* into each
+    (so every stage is a self-contained C4 composite report), and carries the
+    OFAT *survivors*, the confirmed *winner*, and the echoed *price_table* at the
+    top level. A thin, deterministic aggregator — it invents NO new per-config
+    schema, reusing λ's substrate wholesale (decision 7). ``price_table`` /
+    ``survivors`` default to ``{}`` and ``winner`` to ``None`` when omitted.
+    """
+    pt = price_table if price_table is not None else {}
+    return {
+        'generated_at': datetime.now(UTC).isoformat(),
+        'price_table': pt,
+        'survivors': survivors if survivors is not None else {},
+        'winner': winner,
+        'stages': {
+            'ofat': build_composite_report(ofat_results, price_table=pt),
+            'matrix': build_composite_report(matrix_results, price_table=pt),
+            'confirm': build_composite_report(confirm_results, price_table=pt),
+        },
+    }
+
+
+def format_methodology_report(report: dict[str, Any]) -> str:
+    """Render :func:`build_methodology_report` output byte-stably.
+
+    A deterministic survivors/winner header, then each stage
+    (``ofat`` → ``matrix`` → ``confirm``) rendered via
+    :func:`format_composite_table` (which carries that stage's per-config
+    composite / cost / latency / CI95 columns and its price-table section). No
+    wall-clock is rendered and every row/section is sorted with fixed float
+    precision, so the same report always renders byte-identically.
+    """
+    survivors = report.get('survivors') or {}
+    lines = [
+        'methodology report:',
+        f'winner: {report.get("winner") if report.get("winner") is not None else "-"}',
+        'survivors:',
+    ]
+    for role in sorted(survivors):
+        names = ', '.join(str(n) for n in (survivors[role] or []))
+        lines.append(f'  {role}: {names}')
+
+    stages = report.get('stages') or {}
+    for stage in _METHODOLOGY_STAGES:
+        sub = stages.get(stage)
+        lines.append('')
+        lines.append(f'== {stage} stage ==')
+        if sub is None:
+            lines.append('(no results)')
+            continue
+        lines.append(format_composite_table(sub))
+    return '\n'.join(lines)
+
+
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:
     """Mean Elo across tasks over the UNION of configs.
 
