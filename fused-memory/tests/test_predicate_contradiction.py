@@ -26,6 +26,7 @@ from fused_memory.middleware.execution_class_guard import execution_class_error
 from fused_memory.reconciliation.predicate_contradiction import (
     PredicateContradictionTask,
     build_predicate_contradiction_task,
+    render_predicate_contradiction_section,
 )
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
@@ -238,3 +239,45 @@ class TestBuildPredicateContradictionRejections:
         # Regression guard: the valid baseline must NOT raise.
         task = build_predicate_contradiction_task(**_base_build_kwargs())
         assert task.metadata['execution_class'] == 'code_tdd'
+
+
+class TestRenderPredicateContradictionSection:
+    """render_predicate_contradiction_section() single-sources the prompt
+    guidance: WHEN to use this path, the exit-code contract, the code_tdd
+    rationale, and that it replaces ad-hoc Mem0 notes/suppression records.
+    Pins stable load-bearing substrings only (not verbatim prose), per the
+    test_recon_self_model.py convention."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(render_predicate_contradiction_section(), str)
+        assert render_predicate_contradiction_section()
+
+    def test_has_section_header(self):
+        assert 'Predicate' in render_predicate_contradiction_section()
+
+    def test_names_before_done_predicate(self):
+        text = render_predicate_contradiction_section()
+        assert 'before_done' in text
+        assert 'predicate' in text
+
+    def test_states_exit_code_contract(self):
+        text = render_predicate_contradiction_section()
+        # exit 0 -> done via done_provenance.kind='deterministic-milestone'
+        assert 'exit 0' in text
+        assert 'deterministic-milestone' in text
+        # non-zero -> milestone_check_failed born-at-L2 escalation
+        assert 'non-zero' in text
+        assert 'milestone_check_failed' in text
+
+    def test_states_code_tdd_and_forbidden_classes(self):
+        text = render_predicate_contradiction_section()
+        assert 'code_tdd' in text
+        # operational/decision are called out as forbidden for this path.
+        assert 'operational' in text
+        assert 'decision' in text
+
+    def test_points_away_from_adhoc_mem0_notes(self):
+        text = render_predicate_contradiction_section()
+        lowered = text.lower()
+        assert 'instead of' in lowered
+        assert 'suppression' in lowered or 'mem0' in lowered
