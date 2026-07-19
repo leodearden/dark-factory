@@ -7311,7 +7311,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         else:
             category = 'merge_error'
         self._write_merge_failure_review(category, result.reason)
-        return await self._mark_blocked(result.reason, merge_phase=merge_phase)
+        # Unconditional observability (task 2757; Reify 5120 RCA RC-2): emit the
+        # durable merge_blocked event BEFORE _mark_blocked and ungated by
+        # has_open_l1, so this generic fall-through can never again go
+        # `merge_finalized state=blocked` -> total silence when an unrelated open
+        # L1 suppresses the escalation at either has_open_l1 gate.  Threading the
+        # real review-category into _mark_blocked (not the default 'task_failure')
+        # also makes the signature-aware L1 dedup meaningful.
+        if self.event_store:
+            self.event_store.emit(
+                EventType.merge_blocked,
+                task_id=self.task_id, phase=self.state.value,
+                data={
+                    'reason': result.reason[:500],
+                    'category': category,
+                    'failure_category': result.failure_category,
+                    'cause_hint': result.failure_cause_hint,
+                },
+            )
+        return await self._mark_blocked(
+            result.reason, merge_phase=merge_phase, category=category,
+        )
 
     async def _spawn_main_health_fix_task(
         self,
