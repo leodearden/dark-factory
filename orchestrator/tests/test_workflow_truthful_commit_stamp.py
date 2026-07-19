@@ -40,7 +40,11 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowOutcome,
+    _iteration_entry_is_work,
+)
 
 # ---------------------------------------------------------------------------
 # Real-git harness — mirrors test_harness_plan_step_rederive.py /
@@ -509,3 +513,54 @@ class TestDebuggerWriterTruthfulCommit:
             f'no HEAD advance ⇒ commit must be null, got {entry.get("commit")!r}'
         )
         assert entry['committed'] is False
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: _iteration_entry_is_work treats committed:False as no work
+# ---------------------------------------------------------------------------
+
+
+class TestIterationEntryIsWorkCommittedGuard:
+    """A committed:False entry recorded no durable commit (task 2759) and must
+    not count as prior-implementation work, regardless of agent type. The guard
+    keys strictly on the explicit False flag, so legacy entries lacking the key
+    keep today's classification (backward compatible with all live logs)."""
+
+    def test_committed_false_entries_are_never_work(self):
+        # All of these classify as work TODAY (RED) but must be False once the
+        # explicit-False guard lands.
+        assert _iteration_entry_is_work({
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+            'committed': False,
+        }) is False
+        assert _iteration_entry_is_work({
+            'agent': 'debugger', 'steps_completed': [], 'committed': False,
+        }) is False
+        assert _iteration_entry_is_work({
+            'agent': 'implementer', 'source': 'amendment', 'committed': False,
+        }) is False
+
+    def test_legacy_entries_without_committed_key_unchanged(self):
+        # No 'committed' key ⇒ entry.get('committed') is None (≠ False) ⇒ the
+        # guard falls through to today's classification.
+        assert _iteration_entry_is_work({
+            'agent': 'implementer', 'source': 'amendment',
+        }) is True
+        assert _iteration_entry_is_work({
+            'agent': 'debugger', 'steps_completed': [],
+        }) is True
+        assert _iteration_entry_is_work({
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+        }) is True
+        assert _iteration_entry_is_work({
+            'agent': 'implementer', 'steps_completed': [],
+        }) is False
+
+    def test_committed_true_entries_unchanged(self):
+        assert _iteration_entry_is_work({
+            'agent': 'implementer', 'steps_completed': ['step-1'],
+            'committed': True,
+        }) is True
+        assert _iteration_entry_is_work({
+            'agent': 'debugger', 'steps_completed': [], 'committed': True,
+        }) is True
