@@ -90,6 +90,7 @@ class TestModuleLevelAll:
             'is_timed_out_with_progress',
             'is_zero_output_timeout',
             'read_transcript_records',
+            'transcript_exists',
         }
 
     def test_usage_gate_all(self):

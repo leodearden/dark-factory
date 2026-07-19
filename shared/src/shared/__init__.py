@@ -25,6 +25,7 @@ from shared.cli_invoke import (
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    transcript_exists,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
@@ -76,6 +77,7 @@ __all__ = [
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
     'read_transcript_records',
+    'transcript_exists',
     'AccountConfig',
     'UsageCapConfig',
     'CostStore',
