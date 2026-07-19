@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
+from fused_memory.config.reload import apply_reload
+from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -90,6 +93,12 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock bound on the thread-off ``FusedMemoryConfig()`` re-read inside the
+# reload_config tool (mirrors orchestrator.harness._RELOAD_LOAD_TIMEOUT_SECS): a
+# slow/hanging YAML parse must never block the event loop; on timeout the tool
+# returns a fail-closed report leaving the live config untouched.
+_RELOAD_LOAD_TIMEOUT_SECS = 30.0
 
 # ---------------------------------------------------------------------------
 # Scheduler-override constants
@@ -4765,5 +4774,71 @@ def create_mcp_server(
         finally:
             if db is not None:
                 await db.close()
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def reload_config() -> dict[str, Any]:
+        """Hot-apply the green-tier allowlisted subset of THIS server's own config.
+
+        Takes NO arguments: it re-reads the process's own ``CONFIG_PATH`` (set
+        once at startup) so a reload can never retarget the server at a different
+        project's config — the same cross-project safeguard the
+        escalation/orchestrator ``reload_config`` tools enforce. Applies only the
+        leaves in ``fused_memory.config.reload.RELOADABLE_FIELDS`` (genuinely
+        reload-safe knobs, read live from the shared config object), mutating them
+        in place on ``memory_service.config`` so held references observe the change
+        with no restart. Every other differing leaf is reported
+        ``restart_required`` and left untouched.
+
+        Returns the machine-checked disposition report
+        ``{reloaded, config_path, applied, restart_required, unchanged, error}``.
+        Callers MUST inspect ``applied`` / ``restart_required`` — NOT just
+        ``reloaded``: a successful reload can still leave restart-only edits
+        unapplied.
+        """
+        # Report the path the loader will ACTUALLY read — mirror the loader's own
+        # fallback (schema.settings_customise_sources) so the disposition report
+        # never claims ``config_path=None`` while a bare ``FusedMemoryConfig()``
+        # silently read the ``DEFAULT_CONFIG_PATH`` file.
+        config_path = os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH)
+
+        def _load_failure_report(error: str) -> dict[str, Any]:
+            """Fail-closed report shape for a load/validation failure — the live
+            config is left completely untouched (no apply on this path)."""
+            logger.warning('config reload failed: %s', error)
+            return {
+                'reloaded': False,
+                'config_path': config_path,
+                'applied': {},
+                'restart_required': {},
+                'unchanged': 0,
+                'error': error,
+            }
+
+        # Fail-closed thread-off load: a slow/hanging YAML parse can't block the
+        # event loop (asyncio.wait_for + to_thread), and ANY load or validation
+        # failure returns a fail-closed report with memory_service.config left
+        # untouched rather than propagating — the loud-over-silent-degradation norm.
+        try:
+            fresh = await asyncio.wait_for(
+                asyncio.to_thread(FusedMemoryConfig),
+                timeout=_RELOAD_LOAD_TIMEOUT_SECS,
+            )
+        except TimeoutError:
+            return _load_failure_report(
+                f'config re-read timed out after {_RELOAD_LOAD_TIMEOUT_SECS}s'
+            )
+        except Exception as exc:
+            return _load_failure_report(str(exc))
+
+        report = apply_reload(memory_service.config, fresh)
+        report['config_path'] = config_path
+        if report['restart_required'] or not report['reloaded']:
+            logger.warning(
+                'config reload: restart_required=%s error=%s',
+                sorted(report['restart_required']),
+                report['error'],
+            )
+        return report
 
     return mcp

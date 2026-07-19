@@ -15,6 +15,13 @@ from pydantic_settings import (
 )
 from shared.config_models import UsageCapConfig
 
+# Config path used when the ``CONFIG_PATH`` env var is unset. Single-sourced here
+# so both ``settings_customise_sources`` (the actual loader) and the reload_config
+# MCP tool's ``config_path`` disposition field agree on the file actually read —
+# otherwise the tool could report ``config_path=None`` while the reload silently
+# read and applied leaves from this default file.
+DEFAULT_CONFIG_PATH = 'config/config.yaml'
+
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
     """Custom settings source for loading from YAML files."""
@@ -586,7 +593,10 @@ class ReconciliationConfig(BaseModel):
             'comfortably exceeding 30 minutes when actionable findings exist. '
             '1800 s gives clean separation from typical cycle length while '
             'still bounding orphan-detection latency well below the lock-'
-            'staleness TTL of 7200 s.  See plans/recon-stale-recovery-rca.md.'
+            'staleness TTL of 7200 s.  See plans/recon-stale-recovery-rca.md. '
+            'Green-tier hot-reloadable via the reload_config MCP tool: the '
+            'reaper reads this live from the shared config object, so a reload '
+            'is observed on the next reaper pass with no restart (task 2718).'
         ),
     )
     # Per-CLI-invocation wall-clock budgets — semantically distinct from
@@ -850,7 +860,9 @@ class ReconciliationConfig(BaseModel):
         default=True,
         description=(
             'Enable the add_memory write-time near-duplicate guard for '
-            'category=procedural_knowledge. Hot-reloadable green-tier knob.'
+            'category=procedural_knowledge. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live per add_memory by '
+            'resolve_near_dup_guard_enabled; backed by task 2718).'
         ),
     )
     procedural_knowledge_near_dup_threshold: float = Field(
@@ -860,7 +872,9 @@ class ReconciliationConfig(BaseModel):
         description=(
             'Minimum relevance_score (cosine similarity) against an existing '
             'procedural_knowledge Mem0 entry that soft-blocks an add_memory write. '
-            'Default 0.92 mirrors Mem0\'s own cited ~0.92 cosine dedup threshold.'
+            'Default 0.92 mirrors Mem0\'s own cited ~0.92 cosine dedup threshold. '
+            'Green-tier hot-reloadable via the reload_config MCP tool (read live '
+            'per add_memory by resolve_near_dup_threshold; task 2718).'
         ),
     )
 
@@ -1191,6 +1205,6 @@ class FusedMemoryConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        config_path = Path(os.environ.get('CONFIG_PATH', 'config/config.yaml'))
+        config_path = Path(os.environ.get('CONFIG_PATH', DEFAULT_CONFIG_PATH))
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
