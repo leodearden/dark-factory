@@ -335,3 +335,39 @@ async def test_planning_mode_operational_llm_stamps_gate_marker(_real_stack, tmp
     assert meta['always_escalates'] is True, f'got {meta!r}'
     assert meta[OPERATIONAL_LLM_GATE_MARKER_KEY] is True, f'got {meta!r}'
     assert meta['operational_mode'] == 'llm', f'got {meta!r}'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1 — gate via NORMAL submit (matrix row 1/2: operational+gate,
+# the two-way twin of scenario 2's planning_mode realization).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_normal_submit_operational_gate_coerces_to_pure_gate(
+    _real_stack, tmp_path, monkeypatch,
+):
+    """A NORMAL (non-planning_mode) submit declaring execution_class='operational'
+    + operational_mode='gate' is coerced to a deterministic pure gate, even
+    with a REAL (curator-neutralized) curator in the loop.
+
+    Uses _submit_normal_and_get (step-4), which monkeypatches TaskCurator.curate
+    to a no-op 'create' decision carrying no routing opinion of its own — so a
+    deterministic task_kind surviving persist+read-back on THIS path can only
+    have come from the submit-boundary coercion (inject_operational_routing,
+    task β), never from the curator. Two-way with scenario 2: that scenario
+    proves the coercion on the curator-BYPASSING planning_mode path; this one
+    proves it on the curator-CONSULTED normal path.
+    """
+    root = str(tmp_path / 'proj')
+
+    meta = await _submit_normal_and_get(
+        _real_stack,
+        root,
+        {'execution_class': 'operational', 'operational_mode': 'gate'},
+        monkeypatch,
+    )
+
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert 'before_done' not in meta, f'got {meta!r}'
