@@ -1,4 +1,13 @@
-"""Elo rating system for pairwise eval judging."""
+"""Elo rating system for pairwise eval judging.
+
+DEMOTED (task 2477 λ / decision 10): the primary eval leaderboard is now
+:func:`orchestrator.evals.report.build_composite_report` — every run yields a
+dense composite score, whereas pairwise judge data is sparse and this Elo path
+was ~32% self-admitted noise. The pairwise machinery below is RETAINED, not
+deleted (``judge.run_elo_tournament`` and the CLI ``--judge`` path still use
+it), but is meaningful only when the pairwise data is dense — gated by
+:func:`is_pairwise_data_dense`.
+"""
 
 from __future__ import annotations
 
@@ -86,6 +95,33 @@ def save_state(state: JudgeState, path: Path = STATE_FILE) -> None:
 def _pair_key(a: str, b: str) -> str:
     """Canonical key for an unordered pair."""
     return f'{min(a, b)}|{max(a, b)}'
+
+
+def is_pairwise_data_dense(
+    pool: TaskPool, *, min_matches_per_pair: int = 3,
+) -> bool:
+    """Whether *pool* has DENSE pairwise judge data (task 2477 λ / decision 10).
+
+    The Open-Q3 gate — "drop Elo unless pairwise judge data is dense" — that
+    decides whether this task's demoted Elo path is meaningful. Returns:
+
+    - ``False`` when the pool has fewer than 2 configs (no pair is possible).
+    - otherwise ``True`` iff EVERY unordered config pair (keyed via
+      :func:`_pair_key` over the sorted ``pool.ratings`` keys) has been judged at
+      least *min_matches_per_pair* times per ``pool.pair_counts``.
+
+    A single under-filled (or unjudged → 0) pair makes the pool non-dense, so a
+    caller can fall back to :func:`report.build_composite_report` (the dense
+    composite-score leaderboard) rather than trusting a sparse Elo ranking. Pure
+    query over ``pool.ratings`` / ``pool.pair_counts``.
+    """
+    configs = sorted(pool.ratings.keys())
+    if len(configs) < 2:
+        return False
+    return all(
+        pool.pair_counts.get(_pair_key(a, b), 0) >= min_matches_per_pair
+        for a, b in combinations(configs, 2)
+    )
 
 
 def expected_score(rating_a: float, rating_b: float) -> float:
