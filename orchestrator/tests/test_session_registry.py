@@ -1868,6 +1868,43 @@ def test_claim_lease_reaps_and_reclaims_a_stale_lease(tmp_path: Path) -> None:
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == new_holder
 
 
+def test_claim_lease_reap_and_reclaim_emits_structured_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # THREAD 1 hardened detection (task 2796): a reap-and-reclaim displaces
+    # whoever currently held the lease. That holder is SUPPOSED to be dead,
+    # but if the TTL is ever mis-tuned again this same path would silently
+    # steal a live-but-quiet watcher's lease. Make every reap-and-reclaim
+    # loud/greppable so any residual displacement of a supposedly-live holder
+    # is surfaced rather than silent.
+    stale_holder = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=stale_holder, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    # Backdate past the (new) TTL so the lease IS reap-eligible.
+    age = sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1)
+    _set_mtime(lease_path, _NOW, age)
+
+    new_holder = sr.LeaseHolder(session_slug='watcher-df-new', pid=os.getpid(), start_ts=_NOW.isoformat())
+    with caplog.at_level(logging.WARNING, logger=sr.logger.name):
+        claim = sr.claim_lease('watcher-df', holder=new_holder, root=tmp_path, now=_NOW)
+
+    # Sanity: the reclaim actually happened (the WARNING is on that path).
+    assert claim.acquired is True
+
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == sr.logger.name
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # Names the displaced holder (slug + pid), the observed heartbeat age, and
+    # the new holder's slug.
+    assert 'watcher-df-dead' in message
+    assert str(_DEAD_PID) in message
+    assert f'{age.total_seconds():.0f}' in message
+    assert 'watcher-df-new' in message
+
+
 def test_claim_lease_does_not_reap_a_dead_holder_within_ttl(tmp_path: Path) -> None:
     # Proves the reap rule is (age > TTL) AND (pid dead), not either alone:
     # a dead-pid holder with a still-fresh heartbeat is NOT reaped.
