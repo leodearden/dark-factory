@@ -9325,7 +9325,7 @@ class GitOps:
         # so it is the task_id the config-dir path and archive layout key on.
         # Offloaded to a worker thread to keep the shared event loop free for the
         # rare real-gzip path (mirrors the producer's loop-stall avoidance).
-        if self.transcript_archive is not None:
+        if self.transcript_archive is not None and self.transcript_archive.enabled:
             config_dir = worktree / '.task' / f'claude-config-{branch}'
             # Fast-skip when the config dir is already gone (external worktrees,
             # already-cleaned dirs): a cheap no-op that never spins up a worker
