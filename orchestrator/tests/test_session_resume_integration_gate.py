@@ -132,3 +132,38 @@ def _make_plan(
     if session_id is not None:
         plan['_session_id'] = session_id
     return plan
+
+
+# ── B1: clean SIGTERM mid-implementer, warm lane ─────────────────────────────
+@pytest.mark.asyncio
+async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
+    """B1 — the flagship two-way seam: REAL recovery adopts the session/plan,
+    then that SAME recovered state flows through REAL ``_run_slot`` as
+    ``resume_session_id`` + ``initial_plan`` with one ``session_resume`` event.
+
+    Chains β's output (``_recovered_sessions`` / ``_recovered_session_config_dirs``
+    / ``_recovered_plans``) straight into γ's input, proving they are the same
+    dict (``is`` identity) — not merely equal — across the boot→dispatch seam.
+    """
+    task_id, session_id = '42', 'uuid-b1-implementer'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β) ──
+    assert task_id in harness._recovered_sessions
+    assert harness._recovered_sessions[task_id]['session_id'] == session_id
+    assert task_id in harness._recovered_session_config_dirs
+    assert task_id in harness._recovered_plans
+    harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    adopted = harness._recovered_sessions[task_id]
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ) ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id['session_id'] == session_id
+    assert cap.initial_plan is recovered_plan
+    assert [et for et, _ in cap.emits] == [EventType.session_resume]
