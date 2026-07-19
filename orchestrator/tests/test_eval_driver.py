@@ -105,6 +105,63 @@ class TestBuildEvalOrchConfigArchitectOverride:
 
 
 # ---------------------------------------------------------------------------
+# step-01/02 — build_eval_orch_config gains an optional judge_config param.
+#
+# Default None keeps the current sonnet/medium/claude judge pin byte-identical
+# (every existing caller + the P1/B1 parity tripwire stay intact); a supplied
+# judge_config derives ONLY models.judge / effort.judge from the candidate for
+# the judge OFAT axis, leaving backends.judge / budgets.judge PINNED (always-
+# Claude read-only judge) and implementer/architect/reviewer untouched.
+# ---------------------------------------------------------------------------
+
+class TestBuildEvalOrchConfigJudgeOverride:
+    def test_default_none_keeps_sonnet_judge_pin(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base, judge_config=None)
+
+        # Current pin, unchanged (byte-identical parity tripwire): the completion
+        # judge stays sonnet/medium/claude at its pinned 0.50 budget.
+        assert cfg.models.judge == 'sonnet'
+        assert cfg.effort.judge == 'medium'
+        assert cfg.budgets.judge == 0.50
+        assert cfg.backends.judge == 'claude'
+        # Implementer / architect / reviewer are untouched by the judge knob.
+        assert cfg.models.implementer == 'sonnet'
+        assert cfg.models.architect == 'opus'
+        assert cfg.models.reviewer == 'opus'
+
+    def test_judge_config_overrides_judge_model_and_effort(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        # model!='sonnet' AND effort!='medium' so BOTH derived fields diverge.
+        judge = EvalConfig('judge-haiku-high', 'claude', 'haiku', 'high', role='judge')
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base, judge_config=judge)
+
+        # The judge's model/effort now derive from the candidate (judge OFAT axis).
+        assert cfg.models.judge == 'haiku'
+        assert cfg.effort.judge == 'high'
+        # Backend and budget stay PINNED (not derived) — always-Claude read-only judge.
+        assert cfg.backends.judge == 'claude'
+        assert cfg.budgets.judge == 0.50
+        # Implementer / architect / reviewer are untouched by the judge override.
+        assert cfg.models.implementer == 'sonnet'
+        assert cfg.models.architect == 'opus'
+        assert cfg.models.reviewer == 'opus'
+
+    def test_judge_config_none_backward_compatible_positionally(self, tmp_path: Path):
+        # The new param must be keyword-optional with a None default so every
+        # existing positional caller (run_eval / run_end_to_end) is intact.
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+        assert cfg.models.judge == 'sonnet'
+
+
+# ---------------------------------------------------------------------------
 # step-05/06 — run_end_to_end: the ONE both-live executor (architect LIVE +
 # implementer LIVE). It builds the both-live orch config
 # (build_eval_orch_config(architect_config=arch)) and constructs the workflow
