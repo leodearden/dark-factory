@@ -10007,6 +10007,18 @@ task, include it with an empty "files" list rather than omitting it.
                 suggested_action='investigate_reblock_loop',
             )
             queue.submit(esc)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=task_id,
+                    data={
+                        'escalation_id': esc.id,
+                        'category': esc.category,
+                        'severity': esc.severity,
+                        'level': esc.level,
+                        'reason': 'reblock-guard-threshold',
+                    },
+                )
             logger.warning(
                 'reblock-guard: task %s hit threshold (count=%d, sig=%r); '
                 'flip withheld, L2 filed %s',
