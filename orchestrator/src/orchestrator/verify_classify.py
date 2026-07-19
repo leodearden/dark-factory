@@ -144,6 +144,45 @@ _TIMEOUT_TOKEN_RE = re.compile(r'\btimed?\s*out\b', re.IGNORECASE)
 # style used a few lines below).
 _CLIPPY_LINT_MARKER = 'clippy::'
 
+# task 2821 (reify 2026-07-19 red-main incident, /deb deb-reify-964887):
+# generalizes the task-2748 veto above from Rust compiler/clippy diagnostics
+# to ANY deterministic pytest/cargo test-runner VERDICT, for the identical
+# reason — the wrapper emits a genuine slot/semaphore timeout BEFORE the
+# wrapped tool runs, so its output can never ALSO carry a pass/fail test
+# verdict. `_TEST_VERDICT_PAIR_RE` matches a "N passed"/"M failed" count PAIR
+# in EITHER order within a short same-line span (pytest's "6 failed, 48
+# passed" and cargo's "48 passed; 6 failed" both grounded in the incident's
+# literal "48 passed, 6 failed"); `_has_deterministic_test_verdict` also
+# treats the shared `_TEST_FAILURE_LEADING_RE`/`_TEST_FAILURE_TRAILING_RE`
+# FAILED-line markers (defined in the shared primitives above) as verdict
+# evidence, since either one already proves a test runner emitted a
+# per-test result. Like the task-2748 markers, this is additive to the veto
+# marker set — it only ever REMOVES false-positives, so a genuine
+# wrapper-only timeout (no verdict marker of any kind) is unaffected and
+# still classifies SEMAPHORE_TIMEOUT.
+_TEST_VERDICT_PAIR_RE = re.compile(
+    r'\b\d+\s+passed\b[^\n]{0,20}?\b\d+\s+failed\b'
+    r'|'
+    r'\b\d+\s+failed\b[^\n]{0,20}?\b\d+\s+passed\b',
+    re.IGNORECASE,
+)
+
+
+def _has_deterministic_test_verdict(output: str) -> bool:
+    """True when *output* carries a real pytest/cargo test-runner VERDICT —
+    a "N passed, M failed" count pair (either order, see
+    ``_TEST_VERDICT_PAIR_RE``) or a FAILED line (``_TEST_FAILURE_LEADING_RE``/
+    ``_TEST_FAILURE_TRAILING_RE``) — the single-output proxy (task 2821) that
+    the wrapped tool actually ran and reported a result, which a
+    wrapper-emitted pre-run slot/semaphore timeout can never do.
+    """
+    return bool(
+        _TEST_VERDICT_PAIR_RE.search(output)
+        or _TEST_FAILURE_LEADING_RE.search(output)
+        or _TEST_FAILURE_TRAILING_RE.search(output)
+    )
+
+
 # Broken _merge-verify worktree (task 2756) — a guard script (e.g. reify's
 # check-manifold-deps.sh) that cannot read the ephemeral merge-verify
 # worktree's own Cargo.lock is a broken verify ENVIRONMENT, not a branch
@@ -186,21 +225,35 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     markers are specific enough (and checked first) that a compile/lint
     failure caused by a genuinely full disk must stay DISK_FULL.
 
-    Known gap (out of scope for task 2748): the veto marker set is
-    Rust-specific (clippy/rustc diagnostics only), because this guard runs
-    tool-blind, BEFORE per-tool dispatch, for every ``ToolKind``. A
-    deterministic non-Rust failure whose output incidentally quotes a
-    lock/slot/semaphore token together with a "timed out" token — e.g. a
-    pytest failure in a test named ``test_lock_timed_out``, or a similarly
-    incidental npm/tree-sitter message — still satisfies the loose
-    ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE`` co-occurrence with no veto
-    marker to suppress it, and is still misclassified ``SEMAPHORE_TIMEOUT``.
-    That looseness predates task 2748 and is only narrowed for Rust here; a
-    future task extending the marker set per-tool, or tightening
-    ``_LOCK_TOKEN_RE``/``_TIMEOUT_TOKEN_RE`` to require wrapper-emitted
-    context (e.g. an anchored ``lib_slot_acquire.sh``/``flock -w`` marker so
-    a genuine slot timeout is matched positively instead of by loose
-    co-occurrence), would close it.
+    SEMAPHORE_TIMEOUT deterministic-TEST-VERDICT veto (task 2821, reify
+    2026-07-19 red-main incident, /deb deb-reify-964887): generalizes the
+    task-2748 veto above from Rust compiler/clippy diagnostics to ANY
+    deterministic pytest/cargo test-runner VERDICT — identical
+    justification: a genuine slot timeout is raised by the wrapper BEFORE
+    the wrapped tool runs, so it can never carry a pass/fail verdict either.
+    When *output* carries a real "N passed, M failed" count pair
+    (``_TEST_VERDICT_PAIR_RE``) or a FAILED line
+    (``_has_deterministic_test_verdict``), the lock/slot/semaphore + timeout
+    tokens are incidental to a deterministic test failure, so this returns
+    ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
+    dispatch, exactly like the clippy/rustc veto above.
+
+    Known gap (out of scope for task 2821, narrowed from task 2748's
+    Rust-only gap): a deterministic failure whose output incidentally quotes
+    a lock/slot/semaphore token together with a "timed out" token but
+    carries NO grounded verdict marker of any kind — e.g. a deterministic
+    SHELL-script assertion (a gate script's manifest-drift check) that emits
+    neither a pytest/cargo count pair nor a FAILED line — still satisfies
+    the loose ``_LOCK_TOKEN_RE`` + ``_TIMEOUT_TOKEN_RE`` co-occurrence with
+    no veto marker to suppress it, and is still misclassified
+    ``SEMAPHORE_TIMEOUT``. That looseness predates task 2748 and is now
+    narrowed for Rust diagnostics (2748) and pytest/cargo test verdicts
+    (2821); a future task extending the marker set to a grounded
+    shell-assertion shape, or tightening ``_LOCK_TOKEN_RE``/
+    ``_TIMEOUT_TOKEN_RE`` to require wrapper-emitted context (e.g. an
+    anchored ``lib_slot_acquire.sh``/``flock -w`` marker so a genuine slot
+    timeout is matched positively instead of by loose co-occurrence), would
+    close it.
 
     ENV_TRANSIENT — broken verify worktree (task 2756): a malformed
     ``_merge-verify`` worktree (e.g. an unreadable or missing ``Cargo.lock``)
@@ -227,6 +280,7 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         and _TIMEOUT_TOKEN_RE.search(output)
         and _CLIPPY_LINT_MARKER not in output
         and not _COMPILE_ERROR_RUSTC_CODE_RE.search(output)
+        and not _has_deterministic_test_verdict(output)
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
     if _VERIFY_ENV_BROKEN_RE.search(output):
