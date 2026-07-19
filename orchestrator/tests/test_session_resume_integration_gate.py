@@ -736,3 +736,38 @@ async def test_b5_stale_sidecar_falls_back(harness: Harness):
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reason'] == 'stale'
+
+
+# ── B6: kill switch (session_resume.enabled = false) ─────────────────────────
+@pytest.mark.asyncio
+async def test_b6_kill_switch_fresh_dispatch_no_event(harness: Harness):
+    """B6 — with the kill switch off, an otherwise-eligible session is STILL
+    adopted at boot but degrades SILENTLY at dispatch: ``resume_session_id`` is
+    None, the recovered plan is kept, and NO session_resume* event of any kind
+    is emitted.
+
+    ω asserts the LANDED inject-time-only semantics (ω design_decision #3):
+    ``_adopt_recovered_session`` has no ``enabled`` gate, so recovery populates
+    ``_recovered_sessions`` regardless; only ``_session_resume_eligible``
+    returns ``(False, 'disabled')`` and ``_run_slot`` degrades without an
+    event or a storm-streak bump. This deliberately does NOT assert the PRD §8
+    prose "no adoption at boot" — that would be a RED-doomed false premise
+    against merged γ.
+    """
+    task_id, session_id = '46', 'uuid-b6-killswitch'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig(enabled=False)
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): the kill switch does NOT gate boot-time adoption ──
+    assert task_id in harness._recovered_sessions
+    assert task_id in harness._recovered_plans
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ): disabled → silent fresh dispatch, plan kept, NO event ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert cap.emits == []
+    assert _session_resume_emits(harness) == []
