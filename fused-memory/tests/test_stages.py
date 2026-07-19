@@ -568,30 +568,25 @@ class TestStage1SourceCompletionWiring:
     This is the user-observable rendered-prompt signal for Stage 1 (PRD ε leaf).
     """
 
-    def test_stage1_prompt_has_inline_merge_directive(self):
+    def test_stage1_prompt_embeds_source_completion_section(self):
+        """The source-completion section is embedded in the assembled Stage 1
+        prompt. Anchor on the unique '## Source-Completion' header (emitted only
+        by render_source_completion_section) rather than a generic vocabulary
+        substring like bare 'gate' — the detailed vocabulary is asserted once, at
+        the unit level, in
+        test_recon_self_model.TestRenderSourceCompletionSection."""
         from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 
-        assert 'inline' in STAGE1_SYSTEM_PROMPT, (
-            'STAGE1_SYSTEM_PROMPT must direct completing safe memory merges inline.'
-        )
-        assert 'near-exact' in STAGE1_SYSTEM_PROMPT, (
-            'STAGE1_SYSTEM_PROMPT must carry the conservative near-exact-duplicate predicate.'
-        )
-
-    def test_stage1_prompt_has_operational_gate_vocabulary(self):
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'operational_mode' in STAGE1_SYSTEM_PROMPT, (
-            'STAGE1_SYSTEM_PROMPT must name metadata.operational_mode for the residual gate.'
-        )
-        assert 'gate' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must declare the operational_mode='gate' value."
+        assert '## Source-Completion' in STAGE1_SYSTEM_PROMPT, (
+            'STAGE1_SYSTEM_PROMPT must embed the render_source_completion_section brief.'
         )
 
     def test_stage1_prompt_relays_residual_to_stage2_not_self_file(self):
         """Stage 1 lacks submit_task (DISALLOW_TASK_WRITES), so its
         source-completion brief must relay the residual to Stage 2 rather than
-        tell Stage 1 to file it — loud-over-silent (never call a tool it lacks)."""
+        tell Stage 1 to file it — loud-over-silent (never call a tool it lacks).
+        This is the Stage-1-specific clause distinguishing it from Stage 2's
+        self-file wiring."""
         from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 
         assert 'Stage 2' in STAGE1_SYSTEM_PROMPT, (
@@ -613,30 +608,23 @@ class TestStage2SourceCompletionWiring:
     This is the user-observable rendered-prompt signal for Stage 2 (PRD ε leaf).
     """
 
-    def test_stage2_prompt_has_inline_merge_directive(self):
+    def test_stage2_prompt_embeds_source_completion_section(self):
+        """The source-completion section is embedded in the assembled Stage 2
+        prompt. Anchor on the unique '## Source-Completion' header rather than a
+        generic vocabulary substring like bare 'gate' (which
+        render_execution_class_section also emits) — the detailed vocabulary is
+        asserted once, at the unit level, in
+        test_recon_self_model.TestRenderSourceCompletionSection."""
         from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
-        assert 'inline' in STAGE2_SYSTEM_PROMPT, (
-            'STAGE2_SYSTEM_PROMPT must direct completing safe memory merges inline.'
-        )
-        assert 'near-exact' in STAGE2_SYSTEM_PROMPT, (
-            'STAGE2_SYSTEM_PROMPT must carry the conservative near-exact-duplicate predicate.'
-        )
-
-    def test_stage2_prompt_has_operational_gate_vocabulary(self):
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        assert 'operational_mode' in STAGE2_SYSTEM_PROMPT, (
-            'STAGE2_SYSTEM_PROMPT must name metadata.operational_mode for the residual gate.'
-        )
-        assert 'gate' in STAGE2_SYSTEM_PROMPT, (
-            "STAGE2_SYSTEM_PROMPT must declare the operational_mode='gate' value."
+        assert '## Source-Completion' in STAGE2_SYSTEM_PROMPT, (
+            'STAGE2_SYSTEM_PROMPT must embed the render_source_completion_section brief.'
         )
 
     def test_stage2_prompt_files_residual_via_submit_task(self):
         """Stage 2 holds submit_task (only DISALLOW_BUILTIN applies), so it files
-        the residual itself rather than relaying it — distinguishing its clause
-        from Stage 1's relay-to-Stage-2 clause."""
+        the residual itself rather than relaying it — the Stage-2-specific clause
+        distinguishing it from Stage 1's relay-to-Stage-2 clause."""
         from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
         assert 'submit_task' in STAGE2_SYSTEM_PROMPT, (
@@ -648,17 +636,15 @@ class TestStage2SourceCompletionWiring:
 
     def test_build_stage2_system_prompt_includes_source_completion_guidance(self):
         """The assembled runtime path build_stage2_system_prompt('dark_factory')
-        must also carry the guidance — for a non-autopilot_video project it
-        returns STAGE2_SYSTEM_PROMPT unmodified, so the source-completion brief
-        must survive assembly."""
+        must also carry the brief — for a non-autopilot_video project it returns
+        STAGE2_SYSTEM_PROMPT unmodified, so the source-completion section must
+        survive assembly. Anchor on the unique header, not the vocabulary."""
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 
         prompt = build_stage2_system_prompt('dark_factory')
-        assert 'inline' in prompt
-        assert 'near-exact' in prompt
-        assert 'operational_mode' in prompt
-        assert 'gate' in prompt
-        assert 'submit_task' in prompt
+        assert '## Source-Completion' in prompt, (
+            'the source-completion brief must survive build_stage2_system_prompt assembly.'
+        )
 
 
 class TestTaskKnowledgeSyncPayload:
