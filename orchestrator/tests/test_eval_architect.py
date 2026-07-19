@@ -263,3 +263,46 @@ class TestJudgePlanQuality:
                 _well_formed_plan(), 'diff', _judge_task(),
             )
         assert verdict.plan_quality is None
+
+
+# ---------------------------------------------------------------------------
+# Architect-role candidate in configs.py (step-7/8)
+#
+# EvalConfig gains role (default 'implementer' → every existing EVAL_CONFIGS
+# entry unchanged); ARCHITECT_EVAL_CONFIGS carries role=='architect' candidates;
+# get_config_by_name resolves them. Pure-data assertions, no LLM.
+# ---------------------------------------------------------------------------
+
+class TestArchitectEvalConfigs:
+    def test_evalconfig_role_defaults_to_implementer(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        cfg = EvalConfig('x', 'claude', 'opus', 'high')
+        assert cfg.role == 'implementer'
+
+    def test_existing_eval_configs_all_resolve_implementer(self):
+        from orchestrator.evals.configs import EVAL_CONFIGS
+
+        assert EVAL_CONFIGS  # non-empty
+        assert all(c.role == 'implementer' for c in EVAL_CONFIGS)
+
+    def test_architect_eval_configs_exist_with_architect_role(self):
+        from orchestrator.evals.configs import ARCHITECT_EVAL_CONFIGS
+
+        assert len(ARCHITECT_EVAL_CONFIGS) >= 1
+        assert all(c.role == 'architect' for c in ARCHITECT_EVAL_CONFIGS)
+        # Candidate names are unique (they key results/lookup).
+        names = [c.name for c in ARCHITECT_EVAL_CONFIGS]
+        assert len(names) == len(set(names))
+
+    def test_get_config_by_name_resolves_architect_candidate(self):
+        from orchestrator.evals.configs import (
+            ARCHITECT_EVAL_CONFIGS,
+            get_config_by_name,
+        )
+
+        name = ARCHITECT_EVAL_CONFIGS[0].name
+        cfg = get_config_by_name(name)
+        assert cfg is not None
+        assert cfg.name == name
+        assert cfg.role == 'architect'
