@@ -128,7 +128,7 @@ def _make_transcript(base: Path, session_id: str) -> Path:
     """Create a real ``<cfg>/projects/<slug>/<session_id>.jsonl`` transcript and
     return the ``<cfg>`` claude-config dir path.
 
-    Mirrors the on-disk layout that ``_resolve_transcript_path(config_dir,
+    Mirrors the on-disk layout that ``transcript_exists(config_dir,
     session_id)`` globs (``<config_dir>/projects/*/<session_id>.jsonl``), so a
     stashed ``_recovered_session_config_dirs`` entry pointing at the returned
     dir corroborates the session as eligible.
@@ -2048,7 +2048,9 @@ class TestCrashRecoveryPromptNote:
     """γ L0-dismissal note (task 2774): adding the escalation auto-dismissal
     warning to the shared crash-recovery resume prompt must NOT flip
     resume_delivers_prompt off its False default (I4 / task-1462 regression
-    class).
+    class), and a crash-recovery resume (resume_delivers_prompt=False) must
+    still DELIVER CRASH_RECOVERY_RESUME_PROMPT to the underlying invocation
+    (the behavior the signature default protects).
     """
 
     def test_resume_delivers_prompt_default_stays_false(self):
@@ -2061,3 +2063,68 @@ class TestCrashRecoveryPromptNote:
 
         sig = inspect.signature(invoke_with_cap_retry)
         assert sig.parameters['resume_delivers_prompt'].default is False
+
+    @pytest.mark.asyncio
+    async def test_crash_recovery_resume_delivers_recovery_prompt(self):
+        """Behavioral complement to the signature guard: a caller-initiated
+        resume (resume_session_id pre-set) with the default
+        resume_delivers_prompt=False must deliver CRASH_RECOVERY_RESUME_PROMPT
+        to the underlying invocation — NOT the real task prompt, which is kept
+        only as original_prompt for fresh-fallback (I4 / task-1462 contract).
+
+        Asserts BEHAVIOR (the prompt actually delivered) rather than a
+        signature detail, so a refactor that preserved the default but changed
+        the delivery path would still be caught.
+        """
+        from shared.cli_invoke import (
+            CRASH_RECOVERY_RESUME_PROMPT,
+            AgentResult,
+            invoke_with_cap_retry,
+        )
+
+        seen: dict = {}
+
+        async def _fake_invoke(**kwargs) -> AgentResult:
+            seen.update(kwargs)
+            return AgentResult(success=True, output='ok')
+
+        # usage_gate=None → the single-invocation fast path; invoke_fn is the
+        # public injection seam, so no subprocess/gate machinery is exercised.
+        await invoke_with_cap_retry(
+            None, 'lbl',
+            prompt='REAL TASK CONTEXT — kept only as original_prompt',
+            resume_session_id='sess-crash-1',
+            invoke_fn=_fake_invoke,
+        )
+        assert seen['prompt'] == CRASH_RECOVERY_RESUME_PROMPT
+        assert seen['resume_session_id'] == 'sess-crash-1'
+
+    @pytest.mark.asyncio
+    async def test_live_continuation_delivers_real_prompt(self):
+        """Contrast case proving the fork is real: resume_delivers_prompt=True
+        (the steward's live continuation) delivers the caller's REAL prompt,
+        NOT the crash-recovery prompt — so the False-default guard above pins a
+        genuine behavioral branch, not a no-op that would pass regardless.
+        """
+        from shared.cli_invoke import (
+            CRASH_RECOVERY_RESUME_PROMPT,
+            AgentResult,
+            invoke_with_cap_retry,
+        )
+
+        seen: dict = {}
+
+        async def _fake_invoke(**kwargs) -> AgentResult:
+            seen.update(kwargs)
+            return AgentResult(success=True, output='ok')
+
+        real = 'REAL CONTINUATION PROMPT the resumed session has not seen'
+        await invoke_with_cap_retry(
+            None, 'lbl',
+            prompt=real,
+            resume_session_id='sess-live-1',
+            resume_delivers_prompt=True,
+            invoke_fn=_fake_invoke,
+        )
+        assert seen['prompt'] == real
+        assert seen['prompt'] != CRASH_RECOVERY_RESUME_PROMPT
