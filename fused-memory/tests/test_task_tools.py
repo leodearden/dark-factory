@@ -943,6 +943,144 @@ async def test_submit_task_non_recon_without_execution_class_accepted(
 
 
 # ------------------------------------------------------------------
+# submit_task operational-routing boundary coercion (task 2802/β)
+#
+# The unit-level coercion-table matrix for inject_operational_routing lives
+# in test_operational_routing_guard.py; these tests assert the transform is
+# WIRED into the submit_task tool boundary AFTER inject_execution_class, so
+# the operational→deterministic coercion is an unbypassable boundary
+# invariant: the metadata FORWARDED to the interceptor is already coerced
+# (task_kind='deterministic', always_escalates, before_done dropped) for
+# operational/decision submissions, and untouched for code_tdd/absent.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_task_operational_gate_coerced_at_boundary(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(a) operational + operational_mode='gate' → forwarded metadata is a
+    deterministic pure gate, with execution_class still present (proving the
+    coercion runs AFTER inject_execution_class in the same chain)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Handle the ask',
+            'agent_id': 'claude-interactive',
+            'metadata': {'execution_class': 'operational', 'operational_mode': 'gate'},
+        },
+    )
+    assert 'error' not in result, f'got {result!r}'
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'got {forwarded!r}'
+    assert forwarded.get('task_kind') == 'deterministic', f'got {forwarded!r}'
+    assert forwarded.get('always_escalates') is True, f'got {forwarded!r}'
+    assert 'before_done' not in forwarded, f'got {forwarded!r}'
+    assert forwarded.get('execution_class') == 'operational', (
+        f'execution_class must survive (ordering proof); got {forwarded!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_task_operational_llm_stamps_marker_at_boundary(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(b) operational + operational_mode='llm' → forwarded metadata is a
+    deterministic pure gate AND carries the x_ llm-gate marker True."""
+    from fused_memory.middleware.operational_routing_guard import (
+        OPERATIONAL_LLM_GATE_MARKER_KEY,
+    )
+
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Handle the ask',
+            'agent_id': 'claude-interactive',
+            'metadata': {'execution_class': 'operational', 'operational_mode': 'llm'},
+        },
+    )
+    assert 'error' not in result, f'got {result!r}'
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'got {forwarded!r}'
+    assert forwarded.get('task_kind') == 'deterministic', f'got {forwarded!r}'
+    assert forwarded.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True, f'got {forwarded!r}'
+
+
+@pytest.mark.asyncio
+async def test_submit_task_decision_coerced_at_boundary(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(c) execution_class='decision' → forwarded metadata is a deterministic
+    pure gate."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Adjudicate the design question',
+            'agent_id': 'claude-interactive',
+            'metadata': {'execution_class': 'decision'},
+        },
+    )
+    assert 'error' not in result, f'got {result!r}'
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'got {forwarded!r}'
+    assert forwarded.get('task_kind') == 'deterministic', f'got {forwarded!r}'
+
+
+@pytest.mark.asyncio
+async def test_submit_task_code_tdd_untouched_at_boundary(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(d) execution_class='code_tdd' → forwarded task_kind stays 'normal'
+    (op-routing leaves it untouched; only inject_task_kind's default applies)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Implement the feature',
+            'agent_id': 'claude-interactive',
+            'metadata': {'execution_class': 'code_tdd'},
+        },
+    )
+    assert 'error' not in result, f'got {result!r}'
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'got {forwarded!r}'
+    assert forwarded.get('task_kind') == 'normal', f'got {forwarded!r}'
+
+
+@pytest.mark.asyncio
+async def test_submit_task_no_execution_class_untouched_at_boundary(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """(e) a plain submit with no execution_class → forwarded task_kind stays
+    'normal' (op-routing is inert without an operational/decision class)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Do the thing',
+            'agent_id': 'claude-interactive',
+        },
+    )
+    assert 'error' not in result, f'got {result!r}'
+    task_interceptor.submit_task.assert_awaited_once()
+    forwarded = task_interceptor.submit_task.call_args.kwargs.get('metadata')
+    assert isinstance(forwarded, dict), f'got {forwarded!r}'
+    assert forwarded.get('task_kind') == 'normal', f'got {forwarded!r}'
+
+
+# ------------------------------------------------------------------
 # submit_task operational-suggestion guard (task 2679, part 2) — warn-only
 # boundary wiring
 #

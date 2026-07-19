@@ -6267,6 +6267,111 @@ class TestSubmitTaskGuardrail:
             f'Expected routing_override_reason in planning-mode metadata, got: {decoded!r}'
         )
 
+    # -- Operational-routing boundary twin (task 2802/β) -------------------
+    #
+    # These prove the DIRECT interceptor path coerces without going through
+    # server/tools.py. planning_mode calls taskmaster.add_task synchronously
+    # and BYPASSES the curator, so a coerced pure gate in the metadata handed
+    # to add_task is the PRD user-observable signal that the boundary twin —
+    # not the curator's route_deterministic fallback — did the coercion.
+
+    @pytest.mark.asyncio
+    async def test_submit_task_planning_mode_operational_gate_coerced_direct_path(
+        self,
+        interceptor_with_store,
+        taskmaster,
+    ):
+        """β twin: a direct planning_mode submit of an operational+gate task is
+        coerced to a deterministic pure gate by the interceptor-side twin."""
+        result = await interceptor_with_store.submit_task(
+            project_root='/some-other-project',
+            title='Restart the fused-memory service',
+            description='operational ask',
+            planning_mode=True,
+            metadata={'execution_class': 'operational', 'operational_mode': 'gate'},
+        )
+
+        assert 'error_type' not in result, f'got: {result!r}'
+        taskmaster.add_task.assert_called_once()
+        decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+        assert decoded.get('task_kind') == 'deterministic', f'got: {decoded!r}'
+        assert decoded.get('always_escalates') is True, f'got: {decoded!r}'
+        assert 'before_done' not in decoded, f'got: {decoded!r}'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_planning_mode_operational_llm_marker_direct_path(
+        self,
+        interceptor_with_store,
+        taskmaster,
+    ):
+        """β twin: a direct planning_mode submit of an operational+llm task is a
+        deterministic pure gate AND carries the x_ llm-gate marker True."""
+        from fused_memory.middleware.operational_routing_guard import (
+            OPERATIONAL_LLM_GATE_MARKER_KEY,
+        )
+
+        result = await interceptor_with_store.submit_task(
+            project_root='/some-other-project',
+            title='Operational ask needing an llm lane',
+            description='operational ask',
+            planning_mode=True,
+            metadata={'execution_class': 'operational', 'operational_mode': 'llm'},
+        )
+
+        assert 'error_type' not in result, f'got: {result!r}'
+        taskmaster.add_task.assert_called_once()
+        decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+        assert decoded.get('task_kind') == 'deterministic', f'got: {decoded!r}'
+        assert decoded.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True, f'got: {decoded!r}'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_planning_mode_code_tdd_untouched_direct_path(
+        self,
+        interceptor_with_store,
+        taskmaster,
+    ):
+        """β twin: a direct planning_mode submit of a code_tdd task is left
+        untouched — task_kind is NOT coerced to 'deterministic'."""
+        result = await interceptor_with_store.submit_task(
+            project_root='/some-other-project',
+            title='Implement the feature',
+            description='engineering task',
+            planning_mode=True,
+            metadata={'execution_class': 'code_tdd'},
+        )
+
+        assert 'error_type' not in result, f'got: {result!r}'
+        taskmaster.add_task.assert_called_once()
+        decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+        assert decoded.get('task_kind') != 'deterministic', f'got: {decoded!r}'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_planning_mode_already_coerced_stays_pure_gate_direct_path(
+        self,
+        interceptor_with_store,
+        taskmaster,
+    ):
+        """β twin idempotency: metadata already carrying task_kind=
+        'deterministic'/always_escalates=True/execution_class='operational'
+        stays a valid pure gate when re-run through the twin (no crash)."""
+        result = await interceptor_with_store.submit_task(
+            project_root='/some-other-project',
+            title='Already-coerced operational ask',
+            description='operational ask',
+            planning_mode=True,
+            metadata={
+                'execution_class': 'operational',
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+            },
+        )
+
+        assert 'error_type' not in result, f'got: {result!r}'
+        taskmaster.add_task.assert_called_once()
+        decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+        assert decoded.get('task_kind') == 'deterministic', f'got: {decoded!r}'
+        assert decoded.get('always_escalates') is True, f'got: {decoded!r}'
+
 
 # ---------------------------------------------------------------------------
 # Task 2206: submit_task end-to-end with a real multi-project registry wired
