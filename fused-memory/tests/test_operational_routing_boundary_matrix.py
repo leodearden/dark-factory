@@ -43,6 +43,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from fused_memory.middleware.operational_routing_guard import OPERATIONAL_LLM_GATE_MARKER_KEY
 from fused_memory.server.tools import create_mcp_server
 
 
@@ -236,3 +237,51 @@ async def test_planning_mode_decision_coerces_to_pure_gate(_real_stack, tmp_path
     assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
     assert meta['always_escalates'] is True, f'got {meta!r}'
     assert 'before_done' not in meta, f'got {meta!r}'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 4a — llm task state (matrix row 4, producer half: the llm-gate
+# marker + preserved operational_mode that task γ's DeterministicRunner
+# (orchestrator/tests/test_operational_routing_boundary_matrix.py, scenario
+# 4b) consumes).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_operational_llm_stamps_gate_marker(_real_stack, tmp_path):
+    """A planning_mode submit declaring execution_class='operational' +
+    operational_mode='llm' is coerced to a deterministic pure gate AND
+    stamped with the machine-checkable llm-gate marker.
+
+    Confirms inject_operational_routing's llm sub-branch: the pure-gate
+    shape applies (task_kind/always_escalates/before_done, as in scenario
+    2) PLUS OPERATIONAL_LLM_GATE_MARKER_KEY is stamped True, PLUS the
+    declared operational_mode='llm' survives the pure-gate stamp verbatim
+    (both are readable by consumers — task γ's DeterministicRunner reads
+    either).
+    """
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Zeta boundary probe: llm gate needs a lane',
+            'description': 'Operational ask that needs an LLM lane, submitted via planning_mode.',
+            'planning_mode': True,
+            'metadata': {
+                'execution_class': 'operational',
+                'operational_mode': 'llm',
+            },
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+    task_id = result['task_id']
+
+    meta = await _get_task_meta(server, root, task_id)
+
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert meta[OPERATIONAL_LLM_GATE_MARKER_KEY] is True, f'got {meta!r}'
+    assert meta['operational_mode'] == 'llm', f'got {meta!r}'
