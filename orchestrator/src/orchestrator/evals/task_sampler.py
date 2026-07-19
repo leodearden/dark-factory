@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import random
 import re
+import subprocess
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,8 +38,11 @@ from orchestrator.evals.snapshots import get_diff_between_commits
 __all__ = [
     'Cell',
     'CompletedTaskCandidate',
+    'FixtureAuditReport',
     'ReferenceCapture',
     'SampleResult',
+    'StratificationCounts',
+    'audit_fixture_corpus',
     'build_fixture_record',
     'capture_reference',
     'cell_of',
@@ -45,12 +50,15 @@ __all__ = [
     'classify_path',
     'default_verify_commands',
     'discover_completed_tasks',
+    'format_stratification_table',
+    'git_ref_exists',
     'landed_verify_outcome',
     'materialize_reference_diff',
     'pin_eval_branch',
     'repo_of',
     'resolve_task_commits_from_merge',
     'sample_stratified',
+    'stratification_counts',
     'stratify',
 ]
 
@@ -599,3 +607,192 @@ async def discover_completed_tasks(
             merge_sha=sha,
         ))
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Listing + audit surface — stratification counts, table render, corpus audit
+# ---------------------------------------------------------------------------
+
+def _candidate_from_fixture(fixture: dict) -> CompletedTaskCandidate:
+    """Reconstruct a classification-only candidate from a fixture dict.
+
+    Only the fields the three classifiers read (``project`` / ``title`` /
+    ``description`` / ``complexity``) are populated; the git/provenance fields
+    are irrelevant to :func:`cell_of` and left empty. ``task_id`` carries the
+    fixture ``id`` purely for error messages (``repo_of`` names it on an
+    unrecognised project).
+    """
+    task_def = fixture.get('task_definition') or {}
+    return CompletedTaskCandidate(
+        task_id=str(fixture.get('id', '')),
+        project=str(fixture.get('project', '')),
+        project_root=str(fixture.get('project_root', '')),
+        title=str(task_def.get('title', '')),
+        description=str(task_def.get('description', '')),
+        complexity=fixture.get('complexity'),
+        modules=list(fixture.get('modules') or []),
+    )
+
+
+@dataclass
+class StratificationCounts:
+    """Per-cell counts of a fixture corpus, plus totals and plan-capture tally.
+
+    ``cells`` maps each observed ``(repo, kind, path)`` cell to its count
+    (Counter-style — an absent cell is simply not a key; :func:`format_
+    stratification_table` fills the zeros over the full axis product).
+    ``plan_captured`` counts fixtures carrying a non-``None`` ``plan`` (the
+    subset usable by the downstream implementer eval). ``cohort`` records the
+    scope filter applied (``None`` = all cohorts).
+    """
+
+    cells: dict[Cell, int]
+    total: int
+    plan_captured: int
+    cohort: str | None = None
+
+
+def stratification_counts(
+    fixtures: list[dict], cohort: str | None = None,
+) -> StratificationCounts:
+    """Count *fixtures* per ``(repo, kind, path)`` cell (optionally cohort-scoped).
+
+    Reclassifies each fixture through the same axis functions the sampler used
+    (:func:`cell_of` over a :func:`_candidate_from_fixture` view), so the
+    listing reflects the live classification rather than a stored label. When
+    *cohort* is given, only fixtures whose ``cohort`` field matches are counted
+    — letting ``eval-list-fixtures --cohort`` report the fresh near-HEAD
+    stratification cleanly without the retained legacy fixtures muddying it.
+    """
+    scoped = [
+        f for f in fixtures if cohort is None or f.get('cohort') == cohort
+    ]
+    cells = Counter(cell_of(_candidate_from_fixture(f)) for f in scoped)
+    plan_captured = sum(1 for f in scoped if f.get('plan') is not None)
+    return StratificationCounts(
+        cells=dict(cells),
+        total=len(scoped),
+        plan_captured=plan_captured,
+        cohort=cohort,
+    )
+
+
+def format_stratification_table(counts: StratificationCounts) -> str:
+    """Render *counts* as a stable, human-readable fixed-width table.
+
+    Iterates the full 12-cell axis product in a fixed order (so EVERY cell —
+    including empty ones — renders as a stable row), then a totals line
+    carrying the grand total and the plan-captured tally. Deterministic: the
+    same :class:`StratificationCounts` always renders byte-identically (no
+    dict-iteration-order or wall-clock dependence).
+    """
+    scope = counts.cohort if counts.cohort is not None else 'all cohorts'
+    rule = f'  {"-" * 6} {"-" * 9} {"-" * 7} {"-" * 5}'
+    lines = [
+        f'stratification ({scope}):',
+        f'  {"repo":<6} {"kind":<9} {"path":<7} {"count":>5}',
+        rule,
+    ]
+    for cell in _ALL_CELLS:
+        repo, kind, path = cell
+        lines.append(
+            f'  {repo:<6} {kind:<9} {path:<7} {counts.cells.get(cell, 0):>5}'
+        )
+    lines.append(rule)
+    lines.append(
+        f'  TOTAL: {counts.total}   plan_captured: {counts.plan_captured}'
+    )
+    return '\n'.join(lines)
+
+
+# A predicate ``(project_root, ref) -> bool`` — injected into
+# :func:`audit_fixture_corpus` so the branch-presence check is hermetic in
+# tests. :func:`git_ref_exists` is the production wiring.
+RefExistsFn = Callable[[str, str], bool]
+
+
+def git_ref_exists(project_root: str, ref: str) -> bool:
+    """Return True iff *ref* resolves to a commit in the repo at *project_root*.
+
+    A synchronous, read-only ``git rev-parse --verify`` probe, used to wire
+    :func:`audit_fixture_corpus`'s ``ref_exists`` predicate to a real checkout
+    at the CLI boundary. Returns False (never raises) when the ref is absent or
+    *project_root* isn't a git repo, so a missing pin surfaces as a named audit
+    failure rather than crashing the listing command.
+    """
+    try:
+        proc = subprocess.run(
+            ['git', 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}'],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+@dataclass
+class FixtureAuditReport:
+    """Structured result of :func:`audit_fixture_corpus`'s integrity checks.
+
+    ``ok`` is True only when every check passes; otherwise ``failures`` names
+    each failing check (band violation, or a per-fixture
+    ``missing_reference:<id>`` / ``missing_verify_outcome:<id>`` /
+    ``missing_branch:<id>``) so a CLI/CI caller reports exactly what's wrong
+    rather than a bare pass/fail. Mirrors ``curator_corpus.AuditReport``.
+    """
+
+    ok: bool
+    count: int
+    failures: list[str] = field(default_factory=list)
+
+
+def audit_fixture_corpus(
+    fixtures: list[dict],
+    *,
+    target_low: int = 10,
+    target_high: int = 14,
+    ref_exists: RefExistsFn | None = None,
+) -> FixtureAuditReport:
+    """Audit a fixture corpus for band + per-fixture completeness.
+
+    Checks, each contributing a named reason to ``FixtureAuditReport.failures``
+    when violated:
+
+    - ``band``                       — the corpus size is within
+      ``[target_low, target_high]`` (the revival-ζ [10,14] band).
+    - ``missing_reference:<id>``      — every fixture carries a ``reference``
+      block (the judge's reference-contender provenance).
+    - ``missing_verify_outcome:<id>`` — every fixture carries a
+      ``verify_outcome`` block (the deterministic gate's landed ground truth).
+    - ``missing_branch:<id>``         — the fixture's ``evals/<id>`` branch is
+      pinned in its own ``project_root``. Only checked when *ref_exists* is
+      supplied; when ``None`` the branch check is SKIPPED (a structural-only
+      audit for callers without a git checkout, e.g. a bare listing).
+
+    Never raises: an empty corpus simply fails ``band``. The branch predicate
+    is dependency-injected (:func:`git_ref_exists` is the production wiring) so
+    the audit is hermetic in tests.
+    """
+    failures: list[str] = []
+    count = len(fixtures)
+
+    if not (target_low <= count <= target_high):
+        failures.append(
+            f'band: count {count} outside [{target_low},{target_high}]'
+        )
+
+    for fixture in fixtures:
+        fid = fixture.get('id', '<unknown>')
+        if not fixture.get('reference'):
+            failures.append(f'missing_reference:{fid}')
+        if not fixture.get('verify_outcome'):
+            failures.append(f'missing_verify_outcome:{fid}')
+        if ref_exists is not None:
+            branch = f'evals/{fid}'
+            if not ref_exists(str(fixture.get('project_root', '')), branch):
+                failures.append(f'missing_branch:{fid}')
+
+    return FixtureAuditReport(ok=not failures, count=count, failures=failures)
