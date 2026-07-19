@@ -262,3 +262,75 @@ class TestEnsureL1EscalationSignatureAware:
             f'Expected has_open_l1 queried with category=merge_error; '
             f'got {mock_queue.has_open_l1.call_args}'
         )
+
+
+class TestPreStewardL0GateSignatureAware:
+    """The pre-steward L0 gate in ``_mark_blocked`` must be signature-aware: a
+    DIFFERENT-signature open L1 no longer suppresses the steward-facing L0.
+
+    Drives ``_mark_blocked`` directly with the terminal fall-through L1 stubbed
+    out (``_ensure_l1_escalation_for_blocked`` -> AsyncMock) and no steward, so
+    ``has_open_l1`` is exercised exactly once — at the L0 gate under test.
+    """
+
+    def test_different_category_open_l1_does_not_suppress_l0(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_routing_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        workflow = _make_routing_workflow(config, worktree)
+
+        submitted_escs: list = []
+
+        def _has_open_l1(task_id, *, category=None):
+            # An UNRELATED L1 is open (bare query True — what the OLD gate reads),
+            # but NOT of the 'merge_error' signature -> the steward-facing L0 must
+            # still be filed.
+            if category is None:
+                return True
+            return category != 'merge_error'
+
+        mock_queue = MagicMock()
+        mock_queue.has_open_l1 = MagicMock(side_effect=_has_open_l1)
+        mock_queue.make_id = MagicMock(return_value='esc-l0-1')
+        mock_queue.submit = MagicMock(side_effect=submitted_escs.append)
+        mock_queue.get_by_task = MagicMock(return_value=[])
+        workflow.escalation_queue = mock_queue  # type: ignore[assignment]
+
+        # Isolate the L0 gate: no steward, and stub the terminal fall-through L1.
+        with patch.object(
+            workflow, '_ensure_steward_started', new=AsyncMock(return_value=None),
+        ), patch.object(
+            workflow, '_ensure_l1_escalation_for_blocked',
+            new=AsyncMock(return_value=None),
+        ):
+            workflow._steward = None
+            outcome = asyncio.run(
+                workflow._mark_blocked(
+                    reason='verification failed: X',
+                    merge_phase=True,
+                    escalate_to_human=False,
+                    category='merge_error',
+                )
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # (a) has_open_l1 was queried WITH the category kwarg at the L0 gate.
+        assert any(
+            call.kwargs.get('category') == 'merge_error'
+            for call in mock_queue.has_open_l1.call_args_list
+        ), (
+            f'L0 gate never queried has_open_l1 with category=merge_error; '
+            f'calls={mock_queue.has_open_l1.call_args_list}'
+        )
+
+        # (b) a steward-facing L0 (level==0) was submitted with the real category —
+        # a different-signature open L1 no longer suppresses it.
+        l0s = [e for e in submitted_escs if e.level == 0]
+        assert len(l0s) == 1, (
+            f'Expected exactly one L0 escalation submitted (a different-category '
+            f'open L1 must not suppress the steward-facing L0); got {submitted_escs}'
+        )
+        assert l0s[0].category == 'merge_error'
