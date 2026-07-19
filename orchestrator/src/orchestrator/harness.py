@@ -7487,6 +7487,20 @@ task, include it with an empty "files" list rather than omitting it.
         Called once from _start_merge_worker (where git_ops, event_store, and
         config are all live).  The coordinator is stored on self so the
         run-forever idle branch can call maybe_restart(agents_idle=True).
+
+        require_idle stays at its True default: a fused-memory ``--drain``
+        restart disrupts in-flight reconciliation, so the polite idle
+        quiet-window is preferred.  But ``force_fire_after_secs`` is wired
+        from config as the anti-starvation backstop (task 2817) — under
+        chronic fleet saturation the run-loop idle branch never runs, so a
+        pending restart armed by ``note_merge`` would otherwise starve
+        forever (the operator then has to restart fused-memory by hand, cf.
+        esc-2814-1).  Once the pending restart is owed past the bound it
+        force-fires on the busy-wait branch anyway (bypassing agents_idle +
+        the debounce).  fused-memory keeps no min_interval rate cap
+        (state_path=None), so nothing throttles that force-fire.  See
+        service_restart.StaleServiceRestartCoordinator.maybe_restart and
+        config.fused_memory_restart_force_fire_after_secs.
         """
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -7496,6 +7510,7 @@ task, include it with an empty "files" list rather than omitting it.
             enabled=self.config.fused_memory_restart_on_merge_enabled,
             script_path=self.config.fused_memory_restart_script,
             project_root=self.config.project_root,
+            force_fire_after_secs=self.config.fused_memory_restart_force_fire_after_secs,
         )
 
     def _build_dashboard_restart_coordinator(self) -> StaleServiceRestartCoordinator:
