@@ -752,3 +752,69 @@ class TestFindEquivalentCommit:
         result = await git_ops.find_equivalent_commit(git_repo, base, s)
 
         assert result is None
+
+    # -----------------------------------------------------------------
+    # task 2762 step-5 RED: exact-subject fallback (patch-id miss)
+    # -----------------------------------------------------------------
+
+    async def test_unique_subject_fallback_when_patch_id_misses(self, git_repo, git_ops):
+        """Case D (unique subject, changed diff): a rebase altered the diff
+        (different bytes -> different patch-id) but preserved the commit
+        subject. The patch-id lookup misses, so the UNIQUE exact-subject match
+        recovers the replayed sha."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('content version one\n')
+        s = await git_ops.commit(git_repo, 'feat: unique-step')
+        assert s
+
+        # Orphan S, then re-land DIFFERENT content under the SAME subject.
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'feature.py').write_text('content version two, different bytes\n')
+        s_prime = await git_ops.commit(git_repo, 'feat: unique-step')
+        assert s_prime and s_prime != s
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result == s_prime, (
+            f'expected the unique-subject fallback to recover {s_prime}, got {result}'
+        )
+
+    async def test_ambiguous_subject_returns_none(self, git_repo, git_ops):
+        """Case E (ambiguous subject): two commits in base..HEAD share the
+        orphaned commit's subject. The method must never guess -> None (falls
+        toward the caller's escalation, not a wrong re-point)."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('orphaned content\n')
+        s = await git_ops.commit(git_repo, 'feat: shared-subject')
+        assert s
+
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'a.py').write_text('first replayed\n')
+        s_prime_1 = await git_ops.commit(git_repo, 'feat: shared-subject')
+        (git_repo / 'b.py').write_text('second replayed\n')
+        s_prime_2 = await git_ops.commit(git_repo, 'feat: shared-subject')
+        assert s_prime_1 and s_prime_2
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None
+
+    async def test_subject_absent_from_range_returns_none(self, git_repo, git_ops):
+        """Case F (subject present on target but shared by no base..HEAD
+        commit): neither patch-id nor subject can match -> None."""
+        base = await _head(git_repo)
+
+        (git_repo / 'feature.py').write_text('orphaned content\n')
+        s = await git_ops.commit(git_repo, 'feat: only-on-orphan')
+        assert s
+
+        await _run(['git', 'reset', '--hard', base], cwd=git_repo)
+        (git_repo / 'other.py').write_text('unrelated replayed\n')
+        s_prime = await git_ops.commit(git_repo, 'chore: totally different subject')
+        assert s_prime
+
+        result = await git_ops.find_equivalent_commit(git_repo, base, s)
+
+        assert result is None
