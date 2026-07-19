@@ -750,6 +750,162 @@ def eval_cmd(
     )
 
 
+def _load_fixture_dir(tasks_dir: Path) -> list[dict]:
+    """Load every ``*.json`` eval fixture in *tasks_dir* (empty list if absent)."""
+    fixtures: list[dict] = []
+    if tasks_dir.exists():
+        for tp in sorted(tasks_dir.glob('*.json')):
+            fixtures.append(json.loads(tp.read_text()))
+    return fixtures
+
+
+@main.command('eval-list-fixtures')
+@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
+              help='Fixture dir to list (default: orchestrator/evals/tasks)')
+@click.option('--cohort', default=None,
+              help='Scope the stratification to one cohort (e.g. revival-zeta)')
+@click.option('--audit', is_flag=True,
+              help='Also run the corpus audit (band + per-fixture completeness); '
+                   'exits non-zero on any audit failure')
+def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bool):
+    """Print the eval-fixture stratification (repo×kind×path) counts.
+
+    Reads only the fixtures dir — needs no orchestrator config.
+    """
+    from orchestrator.evals.task_sampler import (
+        audit_fixture_corpus,
+        format_stratification_table,
+        git_ref_exists,
+        stratification_counts,
+    )
+    tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
+    fixtures = _load_fixture_dir(tasks_dir)
+    counts = stratification_counts(fixtures, cohort=cohort)
+    click.echo(format_stratification_table(counts))
+
+    if audit:
+        scoped = [f for f in fixtures if cohort is None or f.get('cohort') == cohort]
+        report = audit_fixture_corpus(scoped, ref_exists=git_ref_exists)
+        click.echo('')
+        click.echo(f'audit: ok={report.ok} count={report.count}')
+        for failure in report.failures:
+            click.echo(f'  FAIL {failure}')
+        if not report.ok:
+            sys.exit(1)
+
+
+@main.command('eval-sample')
+@click.option('--since', default='6 weeks ago',
+              help="git --since discovery window (default: '6 weeks ago')")
+@click.option('--target-low', type=int, default=10, help='Band floor (default 10)')
+@click.option('--target-high', type=int, default=14, help='Band ceiling (default 14)')
+@click.option('--seed', type=int, default=0, help='Deterministic sampling seed')
+@click.option('--cohort', default='revival-zeta',
+              help='Cohort marker stamped on each cut fixture')
+@click.option('--dry-run', is_flag=True,
+              help='Print the intended stratified selection without pinning '
+                   'branches or writing fixtures')
+@click.option('--tasks-dir', type=click.Path(path_type=Path), default=None,
+              help='Where fixture JSONs are written (default: orchestrator/evals/tasks)')
+@click.option('--df-root', type=click.Path(path_type=Path),
+              default=Path('/home/leo/src/dark-factory'),
+              help='dark_factory checkout to discover merges in')
+@click.option('--reify-root', type=click.Path(path_type=Path),
+              default=Path('/home/leo/src/reify'),
+              help='reify checkout to discover merges in')
+@click.option('--sampled-at', default=None,
+              help='ISO-8601 provenance timestamp (default: now, UTC)')
+def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
+                    cohort: str, dry_run: bool, tasks_dir: Path | None,
+                    df_root: Path, reify_root: Path, sampled_at: str | None):
+    """Cut a stratified near-HEAD eval-fixture corpus from both repos.
+
+    Discovers completed-task merges in the df + reify checkouts, samples them
+    down to the [target_low, target_high] band round-robin across
+    repo×kind×path cells, and (unless --dry-run) captures each reference diff,
+    pins its ``evals/<id>`` branch, and writes the fixture JSON. Needs no
+    orchestrator config — the seed + sampled_at are supplied here at the CLI
+    boundary so the sampler library stays wall-clock-free.
+    """
+    asyncio.run(_run_eval_sample(
+        since=since, target_low=target_low, target_high=target_high, seed=seed,
+        cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
+        df_root=Path(df_root), reify_root=Path(reify_root), sampled_at=sampled_at,
+    ))
+
+
+async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
+                           seed: int, cohort: str, dry_run: bool,
+                           tasks_dir: Path | None, df_root: Path,
+                           reify_root: Path, sampled_at: str | None):
+    """Async worker for ``eval-sample`` (discover → sample → capture/pin/write)."""
+    from datetime import UTC, datetime
+
+    from orchestrator.evals.task_sampler import (
+        build_fixture_record,
+        capture_reference,
+        default_verify_commands,
+        discover_completed_tasks,
+        enrich_candidates_from_task_db,
+        pin_eval_branch,
+        repo_of,
+        sample_stratified,
+    )
+
+    tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
+
+    candidates = []
+    for project, root in (('dark_factory', df_root), ('reify', reify_root)):
+        if not root.exists():
+            click.echo(f'WARNING: {project} checkout {root} not found; skipping',
+                       err=True)
+            continue
+        found = await discover_completed_tasks(
+            root, since=since, project=project, project_root=str(root),
+        )
+        found = enrich_candidates_from_task_db(
+            found, root / '.taskmaster' / 'tasks' / 'tasks.db',
+        )
+        click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
+        candidates.extend(found)
+
+    result = sample_stratified(
+        candidates, target_low=target_low, target_high=target_high, seed=seed,
+    )
+    click.echo(f'selected {len(result.selected)} of {len(candidates)} candidate(s):')
+    for cell, count in sorted(result.cell_counts.items()):
+        click.echo(f'  {cell[0]}/{cell[1]}/{cell[2]}: {count}')
+    for note in result.notes:
+        click.echo(f'  note: {note}')
+
+    if dry_run:
+        click.echo('(dry-run) no branches pinned, no fixtures written')
+        return
+
+    if sampled_at is None:
+        sampled_at = datetime.now(UTC).isoformat()
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for cand in result.selected:
+        repo = repo_of(cand)
+        reference = await capture_reference(
+            cand.project_root, cand.pre_commit, cand.post_commit,
+        )
+        record = build_fixture_record(
+            cand, reference, default_verify_commands(repo), plan=None,
+            cohort=cohort, sampled_at=sampled_at, seed=seed,
+        )
+        branch = await pin_eval_branch(
+            cand.project_root, record['id'], cand.post_commit,
+        )
+        (tasks_dir / f'{record["id"]}.json').write_text(
+            json.dumps(record, indent=2) + '\n',
+        )
+        click.echo(f'  wrote {record["id"]}.json + pinned {branch}')
+        written += 1
+    click.echo(f'wrote {written} fixture(s) to {tasks_dir}')
+
+
 def _run_single_eval(
     task_path: Path, config_name: str | None, base_config,
     force: bool = False, timeout: int | None = None,

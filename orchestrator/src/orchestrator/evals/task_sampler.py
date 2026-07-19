@@ -23,17 +23,22 @@ audit/listing surface land in later slices.
 
 from __future__ import annotations
 
+import json
+import logging
 import random
 import re
+import sqlite3
 import subprocess
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from orchestrator.agents.triage import has_simple_task_blocker
 from orchestrator.evals.snapshots import _run as _git_run
 from orchestrator.evals.snapshots import get_diff_between_commits
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'Cell',
@@ -50,6 +55,7 @@ __all__ = [
     'classify_path',
     'default_verify_commands',
     'discover_completed_tasks',
+    'enrich_candidates_from_task_db',
     'format_stratification_table',
     'git_ref_exists',
     'landed_verify_outcome',
@@ -607,6 +613,74 @@ async def discover_completed_tasks(
             merge_sha=sha,
         ))
     return candidates
+
+
+def enrich_candidates_from_task_db(
+    candidates: list[CompletedTaskCandidate], db_path: Path | str,
+) -> list[CompletedTaskCandidate]:
+    """Fill ``title`` / ``description`` / ``complexity`` from a taskmaster db.
+
+    :func:`discover_completed_tasks` yields STUBS — the merge log carries only
+    the task id, not its title/description/complexity — so the three
+    classifiers would collapse every stub into the default cell. This
+    best-effort pass looks each *numeric* task id up in the ``tasks`` table at
+    *db_path* (``<project_root>/.taskmaster/tasks/tasks.db``) and returns copies
+    with those fields filled (``complexity`` read from the row's ``metadata``
+    JSON blob). Opened ``mode=ro`` (mirroring
+    ``curator_corpus.read_curator_decisions``) so it never locks the live db.
+
+    Degrades to the UNCHANGED stub — never raises — for a non-numeric id
+    (legacy fixtures), an id absent from the db, or a missing/unreadable db: a
+    stub still classifies (to the default cell) rather than crashing the cut.
+    """
+    db_path = Path(db_path)
+    if not db_path.exists():
+        logger.warning(
+            'enrich_candidates_from_task_db: no task db at %s; keeping %d '
+            'candidate(s) as stubs', db_path, len(candidates),
+        )
+        return list(candidates)
+
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                'SELECT id, title, description, metadata FROM tasks'
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning(
+            'enrich_candidates_from_task_db: read of %s failed (%s); keeping stubs',
+            db_path, exc,
+        )
+        return list(candidates)
+
+    by_id = {str(row['id']): row for row in rows}
+
+    enriched: list[CompletedTaskCandidate] = []
+    for cand in candidates:
+        row = by_id.get(str(cand.task_id).strip())
+        if row is None:
+            enriched.append(cand)
+            continue
+        complexity = cand.complexity
+        raw_meta = row['metadata']
+        if raw_meta:
+            try:
+                meta = json.loads(raw_meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+            if isinstance(meta, dict) and meta.get('complexity'):
+                complexity = str(meta['complexity'])
+        enriched.append(replace(
+            cand,
+            title=row['title'] or cand.title,
+            description=row['description'] or cand.description,
+            complexity=complexity,
+        ))
+    return enriched
 
 
 # ---------------------------------------------------------------------------
