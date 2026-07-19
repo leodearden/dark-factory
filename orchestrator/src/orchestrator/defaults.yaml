@@ -283,7 +283,9 @@ budgets:
   module_tagger: 2.0
   deep_reviewer: 15.0
   judge: 0.50
-  simple_task: 1.50
+  # task λ (2797): scaled proportionally with the 30→50 turn raise
+  # (1.50 × 50/30 = 2.50) so the USD budget does not re-cap the turn raise.
+  simple_task: 2.50
 
 # Turn limits per invocation
 max_turns:
