@@ -2646,6 +2646,59 @@ def _is_task_count_snapshot_finding(flag: dict[str, Any]) -> bool:
     return is_count_snapshot(f'{description} {suggested_action}')
 
 
+# --------------------------------------------------------------------------- #
+# Retired-contamination-ceiling finding filter for Stage 3 (task-2818/2826)
+# --------------------------------------------------------------------------- #
+
+#: Categories that are subject to contamination-ceiling suppression.  Only flags
+#: in these categories whose text matches the contamination-ceiling signature are
+#: dropped; all other categories pass through unchanged (fail-open).  Mirrors
+#: :data:`_SUPPRESSED_SNAPSHOT_CATEGORIES`.
+_SUPPRESSED_CEILING_CATEGORIES: frozenset[str] = frozenset({
+    'missing_knowledge',
+    'memory_stale',
+})
+
+#: Case-insensitive marker substrings that identify a finding as being about the
+#: retired Stage-1 task-ID "contamination ceiling" guardrail memory for a
+#: ceiling-retired project (task 2818).  These target the absence/staleness
+#: wording shape a Stage-3 LLM produces when it (wrongly) reports the retired
+#: guardrail as a knowledge gap.
+#:
+#: NOTE: bare 'ceiling' is DELIBERATELY excluded — it is a substring of unrelated,
+#: legitimate findings (e.g. 'per-model daily ceiling', budget ceilings) that must
+#: NOT be suppressed.  The specific multi-word markers below subsume every
+#: intended phrasing while keeping the blast radius tight — exactly mirroring the
+#: bare-'count snapshot' exclusion in :data:`_TASK_COUNT_SNAPSHOT_MARKERS`.
+_CONTAMINATION_CEILING_MARKERS: tuple[str, ...] = (
+    'contamination ceiling',
+    'contamination-ceiling',
+    'task-id ceiling',
+    'task id ceiling',
+    'id-magnitude ceiling',
+    'ceiling guardrail',
+)
+
+
+def _is_contamination_ceiling_finding(flag: dict[str, Any]) -> bool:
+    """Return True iff *flag* is about the retired contamination-ceiling guardrail.
+
+    Case-insensitive substring scan of the combined ``description`` +
+    ``suggested_action`` text against :data:`_CONTAMINATION_CEILING_MARKERS`.
+
+    Unlike :func:`_is_task_count_snapshot_finding`, there is NO numeric
+    (``is_count_snapshot``) branch — the retired ceiling was a hand-maintained
+    task-ID threshold, not a paired count string, so a marker-phrase scan is the
+    only applicable strategy.
+
+    Pure, sync, no I/O.
+    """
+    description = flag.get('description') or ''
+    suggested_action = flag.get('suggested_action') or ''
+    combined = f'{description} {suggested_action}'.lower()
+    return any(marker in combined for marker in _CONTAMINATION_CEILING_MARKERS)
+
+
 async def acknowledge_flag_marker(
     memory_service: Any,
     *,
@@ -2879,6 +2932,63 @@ def filter_blocked_snapshot_findings(
             logger.debug(
                 'filter_blocked_snapshot_findings: dropping %s finding for task_id=%s '
                 '(snapshot writes blocked-by-design for project %s)',
+                category,
+                flag.get('task_id'),
+                project_id,
+            )
+            # do NOT append — flag is dropped
+        else:
+            kept.append(flag)
+
+    return kept
+
+
+def filter_contamination_ceiling_findings(
+    flags: list[dict[str, Any]],
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Drop Stage-3 false-positive findings about a retired contamination ceiling.
+
+    For projects in :data:`CONTAMINATION_CEILING_RETIRED_PROJECTS`, the Stage-1
+    task-ID "contamination ceiling" is retired-by-design (task 2818): real
+    cross-project-contamination protection is now structural (project isolation +
+    path-scope guard + content-based ``cross_project`` routing), never task-ID
+    magnitude.  The ABSENCE or staleness of a contamination-ceiling guardrail
+    memory is therefore the CORRECT state, and Stage 3 findings asserting the
+    memory is missing or stale are false positives that must be suppressed.
+
+    A flag is DROPPED iff **all three** conditions hold:
+    1. ``project_id`` is in :data:`CONTAMINATION_CEILING_RETIRED_PROJECTS`
+       (via :func:`is_contamination_ceiling_retired`).
+    2. ``flag['category']`` is in :data:`_SUPPRESSED_CEILING_CATEGORIES`
+       (``missing_knowledge`` or ``memory_stale``).
+    3. :func:`_is_contamination_ceiling_finding` returns ``True`` for the flag.
+
+    All other flags pass through unchanged (fail-open).  The blast radius is
+    tight: only registered projects × two categories × matching signature.
+
+    A ``logger.debug`` line is emitted per dropped flag for observability.
+
+    Args:
+        flags: List of flag dicts from Stage 3 ``items_flagged``.
+        project_id: The project being reconciled.
+
+    Returns:
+        Filtered list with false-positive contamination-ceiling findings removed.
+    """
+    from fused_memory.reconciliation.policies import is_contamination_ceiling_retired
+
+    if not is_contamination_ceiling_retired(project_id):
+        # Fail-open: project's ceiling is not retired; return all flags unchanged.
+        return list(flags)
+
+    kept: list[dict[str, Any]] = []
+    for flag in flags:
+        category = flag.get('category') or ''
+        if category in _SUPPRESSED_CEILING_CATEGORIES and _is_contamination_ceiling_finding(flag):
+            logger.debug(
+                'filter_contamination_ceiling_findings: dropping %s finding for task_id=%s '
+                '(contamination ceiling retired-by-design for project %s)',
                 category,
                 flag.get('task_id'),
                 project_id,
