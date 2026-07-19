@@ -59,3 +59,37 @@ class TestCodexPiCandidatesRoster:
         eval_config_names = {c.name for c in EVAL_CONFIGS}
         for c in codex_pi_candidates():
             assert c.name not in eval_config_names
+
+
+class TestPiSonnetControl:
+    """pi + Sonnet harness-isolating control: same model+effort as the
+    claude-sonnet-max incumbent, only the backend varies."""
+
+    def test_pi_bundle_contract(self):
+        from orchestrator.evals.configs import PI_CONTROL_MODEL, codex_pi_candidates
+
+        pi_bundles = [c for c in codex_pi_candidates() if c.backend == 'pi']
+        assert len(pi_bundles) == 1
+        bundle = pi_bundles[0]
+        assert bundle.model == PI_CONTROL_MODEL
+        assert bundle.role == 'implementer'
+
+    def test_pi_control_isolates_harness_from_claude_sonnet_incumbent(self):
+        """Cross-references ``_cloud_implementer_incumbents()`` (not a
+        hardcoded literal) so the control property is drift-resistant: the
+        pi control must share the claude sonnet incumbent's model AND
+        effort, differing ONLY in backend."""
+        from orchestrator.evals.configs import (
+            _cloud_implementer_incumbents,
+            codex_pi_candidates,
+        )
+
+        sonnet_incumbent = next(
+            c for c in _cloud_implementer_incumbents()
+            if c.backend == 'claude' and c.model == 'sonnet'
+        )
+        pi_control = next(c for c in codex_pi_candidates() if c.backend == 'pi')
+
+        assert pi_control.model == sonnet_incumbent.model
+        assert pi_control.effort == sonnet_incumbent.effort
+        assert pi_control.backend != sonnet_incumbent.backend
