@@ -33,10 +33,14 @@ from orchestrator.agents.triage import has_simple_task_blocker
 __all__ = [
     'Cell',
     'CompletedTaskCandidate',
+    'ReferenceCapture',
     'SampleResult',
+    'build_fixture_record',
     'cell_of',
     'classify_kind',
     'classify_path',
+    'default_verify_commands',
+    'landed_verify_outcome',
     'repo_of',
     'sample_stratified',
     'stratify',
@@ -314,3 +318,140 @@ def sample_stratified(
     cell_counts = dict(Counter(cell_of(c) for c in selected))
     notes = _coverage_notes(cells, total, target_low, len(selected))
     return SampleResult(selected=selected, cell_counts=cell_counts, notes=notes)
+
+
+# ---------------------------------------------------------------------------
+# Fixture-record building: reference block, verify outcome, canonical schema
+# ---------------------------------------------------------------------------
+
+# The canonical fixture `project` string per repo — matches the existing
+# evals/tasks/*.json fixtures (df fixtures spell it 'dark-factory'). The field
+# is provenance only: runner.load_task consumes project_root / verify_commands
+# / task_definition / modules / plan, never `project` itself.
+_CANONICAL_PROJECT = {'df': 'dark-factory', 'reify': 'reify'}
+
+# Per-repo standard gate command sets — byte-for-byte the commands the existing
+# fixtures already hardcode (df_task_12 / reify_task_27), so a landed task's
+# gates are captured as the known-good per-repo standard rather than re-run.
+_DEFAULT_VERIFY_COMMANDS: dict[str, dict[str, str]] = {
+    'df': {
+        'test': 'cd orchestrator && uv run pytest tests/ -x',
+        'lint': 'cd orchestrator && uv run ruff check src/',
+        'typecheck': 'cd orchestrator && uv run pyright src/',
+    },
+    'reify': {
+        'test': 'cargo test --workspace',
+        'lint': 'cargo clippy --workspace',
+        'typecheck': '',
+    },
+}
+
+
+@dataclass
+class ReferenceCapture:
+    """The judge's ``reference`` contender provenance for a fixture.
+
+    Stores the landed ``post_task_commit`` plus a compact diff stat
+    (``files`` / ``insertions`` / ``deletions``) — NOT the full inline diff,
+    which would bloat the fixture JSON and which stays retrievable from the
+    pinned ``evals/<id>`` branch via ``materialize_reference_diff`` (git glue,
+    a later slice). Produced by ``capture_reference`` over ``pre..post``.
+    """
+
+    post_task_commit: str
+    files: int
+    insertions: int
+    deletions: int
+
+
+def default_verify_commands(repo: str) -> dict[str, str]:
+    """Return the per-repo standard gate command set (``{test,lint,typecheck}``).
+
+    ``df`` → pytest / ruff / pyright; ``reify`` → cargo test / clippy. Raises
+    ``ValueError`` on an unknown repo (loud-over-silent). Returns a fresh copy
+    so callers can't mutate the module-level template.
+    """
+    try:
+        return dict(_DEFAULT_VERIFY_COMMANDS[repo])
+    except KeyError:
+        raise ValueError(
+            f'default_verify_commands: unknown repo {repo!r} (expected df or reify)'
+        ) from None
+
+
+def landed_verify_outcome(verify_commands: dict[str, str]) -> dict:
+    """Return the landed-status verify outcome for a fixture.
+
+    Ground truth is free: the task merged to ``main`` ⇒ its gates passed at
+    the post commit. So the outcome is ``{source:'landed', passed:True,
+    commands:<verify_commands>}`` — never a live re-run of a 6-week-old SHA
+    (env-dependent, slow, non-deterministic).
+    """
+    return {'source': 'landed', 'passed': True, 'commands': dict(verify_commands)}
+
+
+def build_fixture_record(
+    candidate: CompletedTaskCandidate,
+    reference: ReferenceCapture,
+    verify_commands: dict[str, str],
+    plan: dict | None,
+    cohort: str,
+    sampled_at: str,
+    seed: int = 0,
+    plan_source: str | None = None,
+) -> dict:
+    """Emit the canonical eval-fixture record (a JSON-serializable dict).
+
+    Matches the existing ``evals/tasks/*.json`` schema (so ``runner.load_task``
+    + ``run_eval`` consume it unchanged) — ``id`` = ``<repo>_task_<task_id>``,
+    ``name``, ``project``, ``project_root``, ``pre_task_commit``,
+    ``post_task_commit``, ``task_definition``, ``verify_commands``, ``modules``,
+    ``complexity`` — extended with the revival-ζ fields: ``cohort``,
+    ``provenance`` (``merge_sha`` / ``sampled_at`` / ``seed`` / ``plan_source``),
+    a compact ``reference`` block (post commit + diff stat), and a landed
+    ``verify_outcome``.
+
+    The frozen ``plan`` is captured opportunistically: when present it is
+    embedded verbatim and ``provenance.plan_source`` defaults to ``'embedded'``;
+    when ``None`` the record carries ``plan: null`` and
+    ``provenance.plan_source == 'unavailable'`` (a completed task's
+    ``.task/plan.json`` is gitignored, scrubbed post-merge, and not persisted
+    in fused-memory, so it is frequently unrecoverable). Callers may pass an
+    explicit *plan_source* (e.g. ``'transcript_archive'``) to record where a
+    present plan was recovered from.
+    """
+    repo = repo_of(candidate)
+    if plan_source is None:
+        plan_source = 'embedded' if plan is not None else 'unavailable'
+    return {
+        'id': f'{repo}_task_{candidate.task_id}',
+        'name': candidate.title,
+        'project': _CANONICAL_PROJECT[repo],
+        'project_root': candidate.project_root,
+        'pre_task_commit': candidate.pre_commit,
+        'post_task_commit': candidate.post_commit,
+        'task_definition': {
+            'title': candidate.title,
+            'description': candidate.description,
+        },
+        'verify_commands': dict(verify_commands),
+        'modules': list(candidate.modules),
+        'complexity': candidate.complexity,
+        'cohort': cohort,
+        'provenance': {
+            'merge_sha': candidate.merge_sha,
+            'sampled_at': sampled_at,
+            'seed': seed,
+            'plan_source': plan_source,
+        },
+        'reference': {
+            'post_task_commit': reference.post_task_commit,
+            'diff_stat': {
+                'files': reference.files,
+                'insertions': reference.insertions,
+                'deletions': reference.deletions,
+            },
+        },
+        'verify_outcome': landed_verify_outcome(verify_commands),
+        'plan': plan,
+    }
