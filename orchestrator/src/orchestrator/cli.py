@@ -480,32 +480,83 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         # git_ops closed over from outer scope — same instance, no redundant construction.
         wt = await git_ops.acquire_host_verify_worktree(sha)
         try:
-            return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
+            # LANE-lock hold scoped to the BUILD only (task 2830, esc-2830-1).
+            #
+            # acquire_host_verify_worktree -> reset_persistent_merge_worktree
+            # (git_ops.py) itself acquires the SAME lane lock across its tree
+            # mutation and releases it before returning. The CLI span therefore
+            # must NOT hold the lane lock across the reset: a second in-process
+            # fcntl.flock on the same inode via an independent fd self-conflicts
+            # (flock(2): independent fds are treated independently and deny each
+            # other), so reset's bounded lane-lock wait could never succeed —
+            # 30s timeout -> RuntimeError -> verify exits without ever building.
+            #
+            # Instead mirror the LOCAL flow (merge_queue.py: reset-hold released,
+            # THEN merge_verify_lease re-acquires the same lane lock around the
+            # build): re-take the lane lock HERE, after the reset returns, for the
+            # build's duration only, and record the shared holder-pgid so a
+            # concurrent lane actor / waiter reads the correct holder. Fail-OPEN
+            # on a contended acquire (proceed unrecorded, mirroring
+            # GitOps.merge_verify_lease) — any live actor is already excluded by
+            # the pre-flight gate + the compat co-lock held across the whole span.
+            build_lane_fd: int | None = None
+            if config.git.persistent_merge_worktree:
+                build_wait = _env_float(
+                    'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
+                )
+                build_lane_fd = await asyncio.to_thread(
+                    acquire_merge_verify_flock,
+                    lane_lock_path(git_ops.persistent_merge_worktree_path),
+                    build_wait,
+                )
+                if build_lane_fd is not None:
+                    write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+            try:
+                return await run_merge_verify_on_worktree(wt, config, spec, merge_sha=sha)
+            finally:
+                if build_lane_fd is not None:
+                    remove_lock_holder_pgid(git_ops.worktree_base)
+                    release_merge_verify_flock(build_lane_fd)
         finally:
             await git_ops.cleanup_merge_worktree(wt)
 
     # Flock guard (task 2306 α; converged onto the shared lane lock in task 2830):
-    # serialize the whole verify span under a laptop-side exclusive fcntl.flock when
-    # the persistent-worktree knob is on — the per-host serial invariant that
+    # serialize the verify span under a laptop-side exclusive fcntl.flock when the
+    # persistent-worktree knob is on — the per-host serial invariant that
     # _bump_host_verify_attempt_count relies on is only supplied at WORKSTATION
     # startup, not on the laptop.
     #
-    # DUAL-LOCK (additive, task 2830): the PRIMARY lock is now the SHARED
-    # <lane_dir>.lock (lane_lock_path(persistent_merge_worktree_path) =
-    # <worktree_base>/_merge-verify.lock) — the SAME lock GitOps.merge_verify_lease
-    # and reify's seed/thin/gc take (task 2685) — so a laptop lane actor is mutually
-    # excluded from a live laptop verify. The divergent .merge_verify.lock
-    # (merge_verify_lock_path) is RETAINED as a transitional rollout CO-lock so an
-    # in-flight OLD verify-merge (holding only that lock, before checkout-sync ships
-    # this code) still mutually excludes during rollout; a post-rollout follow-up
-    # drops it, leaving the CLI on the lane lock alone (matching merge_verify_lease).
+    # DUAL-LOCK with SPLIT lane-lock lifetime (task 2830, esc-2830-1): the PRIMARY
+    # lock is the SHARED <lane_dir>.lock (lane_lock_path(persistent_merge_worktree_path)
+    # = <worktree_base>/_merge-verify.lock) — the SAME lock GitOps.merge_verify_lease,
+    # GitOps.reset_persistent_merge_worktree, and reify's seed/thin/gc take (task
+    # 2685) — so a laptop lane actor is mutually excluded from a live laptop verify.
+    # Because reset_persistent_merge_worktree re-acquires this SAME lane lock across
+    # its own tree mutation, the CLI CANNOT hold it continuously across _run() (an
+    # in-process second flock on the same inode self-conflicts — esc-2830-1). The
+    # lane lock therefore has a SPLIT lifetime, mirroring the LOCAL flow's sequential
+    # reset-hold-then-lease-hold (merge_queue.py):
+    #   (a) here, PRE-FLIGHT — a bounded-wait acquire used purely as a contention
+    #       GATE (a live lane actor -> distinguished result, NO tree touch, PRD
+    #       Invariant 5), then RELEASED before _run() so reset can take it;
+    #   (b) inside _run(), re-acquired around the BUILD only (see _run above).
     #
-    # Acquire LANE-first, then COMPAT, and write the shared holder-pgid ONLY after
-    # BOTH are held: an in-flight OLD caller wrote that holder when it took the old
-    # lock, so a NEW waiter that loses the bounded wait on the compat lock must still
-    # read the CORRECT holder (we must not clobber it). acquire_merge_verify_flock is
-    # a bounded-wait poll (returns None on timeout, never blocks), so the two-lock
-    # acquire cannot deadlock — worst case is a timeout -> contention.
+    # The divergent .merge_verify.lock (merge_verify_lock_path) is RETAINED as a
+    # transitional rollout CO-lock, held across the WHOLE span: it is a DIFFERENT
+    # inode (no self-conflict with reset), so its continuous hold both (i) closes
+    # the momentary lane-release gaps between the gate, reset, and the build against
+    # a concurrent waiter, and (ii) still mutually excludes an in-flight OLD
+    # verify-merge (holding only that lock, before checkout-sync ships this code)
+    # during rollout. A post-rollout follow-up drops it, leaving the CLI on the lane
+    # lock's split lifetime alone (matching merge_verify_lease).
+    #
+    # Acquire LANE-first (the gate), then COMPAT. The shared holder-pgid is written
+    # by _run()'s build-scoped hold, NOT here: an in-flight OLD caller wrote that
+    # holder when it took the old lock, so a NEW waiter that loses the bounded wait
+    # must still read the CORRECT (un-clobbered) holder on the contention path below.
+    # acquire_merge_verify_flock is a bounded-wait poll (returns None on timeout,
+    # never blocks), so the two-lock acquire cannot deadlock — worst case is a
+    # timeout -> contention.
     #
     # Knob OFF -> lane_fd/compat_fd stay None -> byte-identical back-compat (no lock).
     lane_fd: int | None = None
@@ -552,8 +603,18 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
                 release_merge_verify_flock(lane_fd)
                 lane_fd = None
             else:
-                # (3) Both locks held — now record the shared holder-pgid.
-                write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+                # (3) Gate passed — no laptop lane actor is present. RELEASE the
+                # lane lock now: reset_persistent_merge_worktree (inside
+                # acquire_host_verify_worktree) re-acquires this SAME lane lock
+                # across its tree mutation, and an in-process second flock on the
+                # same inode would self-conflict (esc-2830-1). _run() re-takes the
+                # lane lock and writes the shared holder-pgid for the build's
+                # duration only. The compat co-lock (compat_fd) stays held across
+                # the WHOLE span — a DIFFERENT inode, so no self-conflict — closing
+                # the momentary lane-release gaps against a concurrent waiter and
+                # preserving rollout back-compat exclusion.
+                release_merge_verify_flock(lane_fd)
+                lane_fd = None
 
     if contention_result is not None:
         # Always remove the pgid file so cancel-verify knows this run is done.
@@ -602,14 +663,12 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     finally:
-        # Past the contention gate lane_fd and compat_fd are both non-None (both
-        # locks held) or both None (knob off / contention already returned). Release
-        # both and clear the shared holder-pgid (task 2830 dual-lock).
-        if lane_fd is not None:
-            remove_lock_holder_pgid(git_ops.worktree_base)
-            if compat_fd is not None:
-                release_merge_verify_flock(compat_fd)
-            release_merge_verify_flock(lane_fd)
+        # Past the contention gate the lane lock is already released (the gate
+        # holds it only pre-flight; _run()'s build-scoped hold manages the lane
+        # lock and the shared holder-pgid — task 2830 split lifetime, esc-2830-1).
+        # Only the compat co-lock is held across the whole span here; release it.
+        if compat_fd is not None:
+            release_merge_verify_flock(compat_fd)
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)

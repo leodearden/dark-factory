@@ -1052,6 +1052,13 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
     fake_worktree_base.mkdir()
     mock_git_ops = MagicMock()
     mock_git_ops.worktree_base = fake_worktree_base
+    # Knob is ON below, so the CLI span references the shared lane lock
+    # (lane_lock_path(persistent_merge_worktree_path)) in both the pre-flight
+    # contention gate and _run()'s build-scoped hold (task 2830). Point it at a
+    # real path so acquire_merge_verify_flock can open the lock file (mirrors the
+    # sibling knob-ON pins test_verify_merge_holds_lane_lock_during_warm_run /
+    # test_verify_merge_lane_actor_contention_emits_distinguished_result).
+    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
     mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
     mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
     # _create_merge_worktree is a spy: return a valid 2-tuple so the old code
