@@ -654,6 +654,111 @@ class TestSubmitToMergeQueueRegistersInRegistry:
 
 
 @pytest.mark.asyncio
+class TestMergePhaseGraceStampLifecycle:
+    """task 2753: TaskWorkflow drives the Scheduler merge-phase grace stamp —
+    note_merge_phase_entered at _run_merge_phase entry (the pre-enqueue window)
+    and clear_merge_phase at the durable-enqueue boundary in
+    _submit_to_merge_queue (right after register_and_enqueue_merge_request)."""
+
+    async def test_submit_clears_merge_phase_after_enqueue(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """_submit_to_merge_queue calls scheduler.clear_merge_phase(task_id)
+        once the durable enqueue/attach resolves (the merge_queued durability
+        line)."""
+        import asyncio
+
+        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
+
+        real_queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+
+        assignment = MagicMock()
+        assignment.task_id = 'B'
+        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
+        assignment.modules = []
+
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.fused_memory.project_id = 'dark_factory'
+        config.fused_memory.url = 'http://localhost:8002'
+        config.max_review_cycles = 2
+        config.max_amendment_rounds = 1
+        config.lock_depth = 2
+        config.steward_completion_timeout = 300.0
+        config.project_root = tmp_path
+
+        wt = tmp_path / 'wt'
+        wt.mkdir(parents=True, exist_ok=True)
+
+        scheduler = MagicMock()
+        wf = TaskWorkflow(
+            assignment=assignment,
+            config=config,
+            git_ops=MagicMock(),
+            scheduler=scheduler,
+            briefing=MagicMock(),
+            mcp=MagicMock(),
+            merge_queue=real_queue,
+            merge_inflight_registry=registry,
+        )
+        wf.worktree = wt
+        wf.plan = {}          # empty → _task_files=None → gate skipped
+        wf._base_commit = None
+        wf._module_configs = []
+        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
+
+        async def _worker():
+            req = await real_queue.get()
+            req.result.set_result(MergeOutcome(status='done', merge_sha='sha'))
+
+        worker_task = asyncio.create_task(_worker())
+        outcome = await wf._submit_to_merge_queue('B')
+        await worker_task
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.clear_merge_phase.assert_called_once_with('B')
+
+    async def test_run_merge_phase_stamps_note_on_entry(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """_run_merge_phase calls scheduler.note_merge_phase_entered(task_id) at
+        merge-phase entry, before submitting to the queue (the pre-enqueue
+        window the self-redeploy must not cancel)."""
+        wf = _make_workflow(tmp_path=tmp_path, task_id='2656')
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'branch_head_sha\n', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=_PASSING_VERIFY_RESULT),
+        )
+
+        wf.event_store = None
+        wf.config.max_merge_retries = 1
+        wf.config.max_pre_merge_retries = 1
+        # Stub the merge internals so _run_merge_phase reaches Phase 2 and the
+        # stubbed _submit_to_merge_queue returns DONE (loop breaks, falls
+        # through to SUCCESS → returns None).
+        wf._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf._enter_phase = MagicMock()  # type: ignore[method-assign]
+        wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+        wf._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
+        wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+        wf._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
+            return_value=WorkflowOutcome.DONE,
+        )
+
+        result = await wf._run_merge_phase('task/2656')
+
+        assert result is None  # fell through to SUCCESS
+        cast(MagicMock, wf.scheduler.note_merge_phase_entered).assert_called_once_with('2656')
+        cast(AsyncMock, wf._submit_to_merge_queue).assert_awaited_once()
+
+
+@pytest.mark.asyncio
 class TestSubmitToMergeQueueAttachesAsPeer:
     """_submit_to_merge_queue attaches as a peer waiter when an entry is in-flight."""
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -73,6 +74,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # coordinator receives this — the fused-memory/dashboard builders keep
     # the 0.0 default (force-fire disabled, byte-identical behaviour).
     mock_orch_config.orchestrator_restart_force_fire_after_secs = 4500.0
+    # Bounded pre-enqueue MERGE-phase grace (task 2753). Mirrors the real
+    # Config default (10 min). Only the orchestrator's own coordinator receives
+    # this (as merge_phase_grace_secs) — the fused-memory/dashboard builders
+    # keep the 0.0 default (no hold, byte-identical behaviour).
+    mock_orch_config.orchestrator_restart_merge_phase_grace_secs = 600.0
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -81,6 +87,9 @@ def harness(tmp_path: Path, mock_orch_config):
 
     h.scheduler = MagicMock()
     h.scheduler._dispatched = set()
+    # Default: no pre-enqueue MERGE-phase workflow in the grace window, so the
+    # merge pipeline reads idle unless a test opts in (task 2753).
+    h.scheduler.merge_phase_grace_active.return_value = False
     h.event_store = MagicMock()
     h.git_ops.get_merge_diff_files = AsyncMock(return_value=([], None))
     return h
@@ -561,6 +570,79 @@ class TestMergePipelineIdle:
 
         assert result is False
 
+    def test_false_when_merge_phase_grace_active(self, harness: Harness):
+        """(f, task 2753) depth==0 + queue empty but a pre-enqueue MERGE-phase
+        workflow is inside the grace window → NOT idle (the polite redeploy
+        must defer until the workflow reaches the durable merge journal)."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        assert harness._merge_queue.empty()
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.return_value = True
+
+        assert harness._merge_pipeline_idle() is False
+
+    def test_true_when_merge_phase_grace_inactive(self, harness: Harness):
+        """(g, task 2753) depth==0 + queue empty + no active merge-phase grace
+        → idle (the new gate does not spuriously withhold when no workflow is
+        in its pre-enqueue window)."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.return_value = False
+
+        assert harness._merge_pipeline_idle() is True
+
+
+# ---------------------------------------------------------------------------
+# task 2753: Harness._merge_phase_grace_active — fail-toward-FALSE add-on gate
+# ---------------------------------------------------------------------------
+
+
+class TestMergePhaseGraceActive:
+    """_merge_phase_grace_active() reads the config grace and delegates to the
+    Scheduler, but fails toward FALSE (no grace) — unlike _merge_pipeline_idle's
+    snapshot fail-safe which defers.  A bug in this protective add-on must
+    degrade to exact pre-task-2753 behaviour (never a NEW indefinite veto).
+    """
+
+    def test_delegates_to_scheduler_with_config_grace(self, harness: Harness):
+        """Passes the config grace to scheduler.merge_phase_grace_active and
+        returns its result."""
+        harness.config.orchestrator_restart_merge_phase_grace_secs = 600.0
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.return_value = True
+
+        assert harness._merge_phase_grace_active() is True
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.assert_called_once_with(600.0)
+
+    def test_false_when_config_grace_zero_without_calling_scheduler(
+        self, harness: Harness
+    ):
+        """grace_secs <= 0 short-circuits to False (kill switch) — the scheduler
+        is never consulted."""
+        harness.config.orchestrator_restart_merge_phase_grace_secs = 0
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.side_effect = AssertionError(
+            'scheduler must not be consulted when the config grace is disabled'
+        )
+
+        assert harness._merge_phase_grace_active() is False
+
+    def test_false_and_warns_when_scheduler_raises(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture
+    ):
+        """A raising scheduler call degrades to False (no grace) + a WARNING —
+        NOT a defer, which would reintroduce the indefinite-veto failure mode
+        this task fixes."""
+        harness.config.orchestrator_restart_merge_phase_grace_secs = 600.0
+        cast(MagicMock, harness.scheduler).merge_phase_grace_active.side_effect = RuntimeError('boom')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            assert harness._merge_phase_grace_active() is False
+
+        assert any(
+            'merge_phase' in r.message.lower() for r in caplog.records
+        ), 'a raising merge-phase grace check must log a WARNING'
+
 
 # ---------------------------------------------------------------------------
 # U2 (task 1973): Harness._build_orchestrator_restart_coordinator
@@ -617,6 +699,24 @@ class TestBuildOrchestratorRestartCoordinator:
 
         # Bound-method equality: __self__ identity + __func__ identity.
         assert coord._restart_precondition == harness._merge_pipeline_idle
+
+    def test_merge_phase_hold_is_grace_active(self, harness: Harness):
+        """(task 2753) merge_phase_hold is harness._merge_phase_grace_active —
+        the bounded pre-enqueue MERGE-phase hold on the force-fire path."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        # Bound-method equality: __self__ identity + __func__ identity.
+        assert coord._merge_phase_hold == harness._merge_phase_grace_active
+
+    def test_merge_phase_grace_secs_matches_config(self, harness: Harness):
+        """(task 2753) merge_phase_grace_secs is wired from
+        config.orchestrator_restart_merge_phase_grace_secs."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert (
+            coord._merge_phase_grace_secs
+            == harness.config.orchestrator_restart_merge_phase_grace_secs
+        )
 
     def test_restart_executor_is_custom_injected(self, harness: Harness):
         """restart_executor is a custom closure — NOT the coordinator's default path.

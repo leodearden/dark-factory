@@ -661,6 +661,8 @@ class SchedulerFacade(Protocol):
     ) -> tuple[dict[str, str], Exception | None]: ...
     async def tasks_by_train(self, train_id: str, /) -> list[dict]: ...
     def clear_requeue_count(self, task_id: str, /) -> None: ...
+    def note_merge_phase_entered(self, tid: str, /) -> None: ...
+    def clear_merge_phase(self, tid: str, /) -> None: ...
 
 
 @dataclass
@@ -1433,6 +1435,19 @@ class Scheduler:
         # harness's former _workflow_cancel_recent exactly.
         self._workflow_cancel_at: dict[str, float] = {}
         self._RECONCILE_CANCEL_GRACE_S: float = 30.0
+        # --- Pre-enqueue MERGE-phase grace stamp (task 2753) ---
+        # Written by TaskWorkflow.note_merge_phase_entered on entry to
+        # ``_run_merge_phase`` (Phase-1 rebase + scoped re-verify), cleared at
+        # the durable-enqueue boundary (clear_merge_phase, after
+        # register_and_enqueue_merge_request) and defensively in the harness's
+        # slot-exit finally.  Read by the orchestrator self-redeploy
+        # coordinator's precondition/force-fire hold via merge_phase_grace_active
+        # so a pre-enqueue merge workflow — invisible to the merge-queue-depth
+        # check — is not cancelled by a redeploy before it reaches the durable
+        # journal.  Per-task monotonic stamp (not a bare set) so a hung verify
+        # auto-expires and can never veto the redeploy forever.  Mirrors the
+        # _workflow_cancel_at idiom above.
+        self._merge_phase_at: dict[str, float] = {}
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
         self._module_cache: dict[str, list[str]] = {}  # task_id -> expanded modules
@@ -6874,6 +6889,42 @@ class Scheduler:
         return (
             cancelled_at is not None
             and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+        )
+
+    # --- Pre-enqueue MERGE-phase grace accessors (task 2753) ---
+    # Mirror the workflow-cancel note/clear/query trio above.  The stamp marks
+    # the window between ``_run_merge_phase`` entry and the durable-enqueue
+    # boundary (merge_queued) — the pre-enqueue verify that a self-redeploy
+    # must not cancel.  See ``_merge_phase_at`` init for the full rationale.
+
+    def note_merge_phase_entered(self, tid: str) -> None:
+        """Stamp *tid* as entering the pre-enqueue MERGE-phase window.
+
+        Re-stamps ``time.monotonic()`` on each call (each REQUEUED retry
+        re-runs a vulnerable pre-merge verify), so the grace tracks the most
+        recent entry.
+        """
+        self._merge_phase_at[tid] = time.monotonic()
+
+    def clear_merge_phase(self, tid: str) -> None:
+        """Clear *tid*'s merge-phase stamp, if any (no-op if absent)."""
+        self._merge_phase_at.pop(tid, None)
+
+    def merge_phase_grace_active(self, grace_secs: float) -> bool:
+        """True iff some tracked task is inside the merge-phase grace window.
+
+        Returns False when ``grace_secs <= 0`` (the grace is disabled — a
+        byte-identical kill switch) or when no tracked task's stamp is younger
+        than ``grace_secs``.  A per-task monotonic stamp makes the grace
+        auto-expire: a workflow whose pre-merge rebase+verify hangs longer than
+        ``grace_secs`` stops counting automatically, so a stuck merge can never
+        veto the self-redeploy indefinitely.
+        """
+        if grace_secs <= 0:
+            return False
+        now = time.monotonic()
+        return any(
+            now - stamp < grace_secs for stamp in self._merge_phase_at.values()
         )
 
     def is_actively_held(self, tid: str) -> bool:

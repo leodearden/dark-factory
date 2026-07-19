@@ -82,6 +82,12 @@ class _Scheduler:
     def clear_requeue_count(self, task_id: str, /) -> None:
         pass
 
+    def note_merge_phase_entered(self, tid: str) -> None:
+        pass
+
+    def clear_merge_phase(self, tid: str) -> None:
+        pass
+
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '42',
                    enabled: bool = True) -> tuple[TaskWorkflow, _Scheduler]:

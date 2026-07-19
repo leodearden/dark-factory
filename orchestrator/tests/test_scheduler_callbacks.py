@@ -318,6 +318,77 @@ class TestWorkflowCancelGraceAndActivelyHeld:
         assert scheduler.is_actively_held('T1') is False
 
 
+class TestMergePhaseGraceTracking:
+    """(task 2753) Pre-enqueue MERGE-phase grace stamp on the Scheduler.
+
+    Mirrors the workflow-cancel grace idiom (``_workflow_cancel_at`` +
+    note/clear/query): a per-task monotonic stamp that both the Harness's
+    self-redeploy precondition and the TaskWorkflow can see.  A workflow
+    entering ``_run_merge_phase`` stamps ``note_merge_phase_entered``; the
+    stamp is cleared at the durable-enqueue boundary (``clear_merge_phase``)
+    and defensively in the slot-exit finally.  ``merge_phase_grace_active``
+    is True while ANY tracked task's stamp is younger than ``grace_secs``, so
+    a hung pre-merge verify auto-expires and can never veto the redeploy
+    forever, and ``grace_secs <= 0`` disables the grace entirely.
+    """
+
+    def test_grace_inactive_when_empty(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler.merge_phase_grace_active(600.0) is False
+
+    def test_grace_active_within_grace_after_note(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.note_merge_phase_entered('T1')
+        assert scheduler.merge_phase_grace_active(600.0) is True
+
+    def test_clear_merge_phase_makes_it_inactive(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.note_merge_phase_entered('T1')
+        assert scheduler.merge_phase_grace_active(600.0) is True
+
+        scheduler.clear_merge_phase('T1')
+
+        assert scheduler.merge_phase_grace_active(600.0) is False
+
+    def test_clear_merge_phase_absent_tid_is_noop(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        # Never stamped — clearing must not raise and stays inactive.
+        scheduler.clear_merge_phase('T1')
+        assert scheduler.merge_phase_grace_active(600.0) is False
+
+    def test_grace_inactive_when_grace_nonpositive(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.note_merge_phase_entered('T1')
+        # grace_secs <= 0 is the kill switch: no grace even with a fresh stamp.
+        assert scheduler.merge_phase_grace_active(0.0) is False
+        assert scheduler.merge_phase_grace_active(-5.0) is False
+
+    def test_grace_auto_expires_past_grace_window(self, monkeypatch):
+        scheduler = Scheduler(OrchestratorConfig())
+        clock = {'t': 1000.0}
+        # scheduler.py stamps via ``time.monotonic()`` — patch the shared
+        # module attribute so the stamp and the read use the same fake clock.
+        monkeypatch.setattr(time, 'monotonic', lambda: clock['t'])
+        scheduler.note_merge_phase_entered('T1')  # stamped at t=1000
+        clock['t'] = 1000.0 + 50.0  # 50s elapsed, within a 100s grace
+        assert scheduler.merge_phase_grace_active(100.0) is True
+        clock['t'] = 1000.0 + 150.0  # 150s elapsed, past a 100s grace
+        assert scheduler.merge_phase_grace_active(100.0) is False
+
+    def test_grace_active_if_any_tracked_task_is_fresh(self, monkeypatch):
+        scheduler = Scheduler(OrchestratorConfig())
+        clock = {'t': 1000.0}
+        monkeypatch.setattr(time, 'monotonic', lambda: clock['t'])
+        scheduler.note_merge_phase_entered('OLD')  # stamped at t=1000
+        clock['t'] = 1000.0 + 500.0
+        scheduler.note_merge_phase_entered('FRESH')  # stamped at t=1500
+        clock['t'] = 1000.0 + 550.0  # OLD is 550s old, FRESH is 50s old
+        # OLD alone would be expired past a 100s grace, but FRESH keeps it on.
+        assert scheduler.merge_phase_grace_active(100.0) is True
+        scheduler.clear_merge_phase('FRESH')
+        assert scheduler.merge_phase_grace_active(100.0) is False
+
+
 class TestStartupGate:
     """(step-7) ``acquire_next()`` must not run before ``finish_startup()``.
 

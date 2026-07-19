@@ -2925,6 +2925,17 @@ class TaskWorkflow:
             return _r
 
         for _merge_attempt in range(self.config.max_merge_retries):
+            # task 2753: stamp the pre-enqueue MERGE-phase grace on the
+            # Scheduler at the TOP of the retry loop — this is the precise
+            # pre-enqueue window (Phase-1 rebase + scoped re-verify + Phase-2
+            # submit, before register_and_enqueue_merge_request emits
+            # merge_queued). Re-stamps on each REQUEUED retry (each re-runs a
+            # vulnerable pre-merge verify). The orchestrator self-redeploy
+            # coordinator reads this so a polite/force-fire restart does not
+            # cancel the workflow before it reaches the durable merge journal.
+            # Cleared at the durable-enqueue boundary in _submit_to_merge_queue
+            # and defensively in the harness _run_slot finally.
+            self.scheduler.note_merge_phase_entered(self.task_id)
             # Phase 1: pre-merge rebase (no lock, no queue slot)
             # Rebase the task branch onto current main and re-verify
             # so the queued merge phase is fast/trivial.
@@ -6954,6 +6965,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             _acquired = await register_and_enqueue_merge_request(
                 self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
             )
+
+        # task 2753: the request is now on the durable, crash-safe merge journal
+        # (merge_queued emitted) — whether attached as a peer or acquired as the
+        # sole waiter, a self-redeploy from here on is recovered on restart. Clear
+        # the pre-enqueue MERGE-phase grace stamp immediately so it stops
+        # withholding the redeploy; the grace protected ONLY the pre-enqueue
+        # window. (A defensive clear in the harness _run_slot finally covers
+        # abnormal exits before this point.)
+        self.scheduler.clear_merge_phase(self.task_id)
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
         # the future so the primary entry (and any remaining peers) stay alive.

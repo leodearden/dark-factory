@@ -167,6 +167,12 @@ class FakeScheduler:
     def clear_requeue_count(self, task_id: str, /) -> None:
         pass
 
+    def note_merge_phase_entered(self, tid: str) -> None:
+        pass
+
+    def clear_merge_phase(self, tid: str) -> None:
+        pass
+
 
 class FakeBriefing:
     """BriefingAssembler that returns canned prompts."""
