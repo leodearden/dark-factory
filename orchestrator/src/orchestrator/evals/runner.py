@@ -548,6 +548,138 @@ async def run_architect_eval(
     return result_obj
 
 
+async def run_end_to_end(
+    task_path: Path,
+    arch_config: EvalConfig,
+    impl_config: EvalConfig,
+    base_config: OrchestratorConfig | None = None,
+    trial: int = 1,
+    timeout_override: int | None = None,
+    memory_endpoint: str | None = None,
+) -> EvalResult:
+    """Run ONE both-live end-to-end eval: architect LIVE feeding implementer LIVE.
+
+    Unlike :func:`run_eval` (frozen plan → implementer varies) and
+    :func:`run_architect_eval` (live architect → downstream frozen), this is the
+    ONLY executor where BOTH the architect and the implementer run live — the
+    matrix/confirm stages (eval-revival μ). It builds the both-live orch config
+    via ``build_eval_orch_config(impl_config, ..., architect_config=arch_config)``
+    and constructs the workflow with ``initial_plan=None`` so the workflow runs
+    its PLAN phase live (the architect plans against the fixture) and feeds that
+    plan to the live implementer — the only place the plan-style/implementer
+    coupling question exists (PRD decision 9).
+
+    The result's ``config_name`` encodes the ``(architect, implementer)`` combo
+    and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
+    timeout / exception handling and persists via :func:`save_result`.
+    """
+    task = load_task(task_path)
+    task_id = task['id']
+    project_root = Path(task['project_root'])
+    config_name = f'{arch_config.name}+{impl_config.name}'
+
+    logger.info(
+        f'Starting end-to-end eval: {task_id} × {config_name} (trial {trial})'
+    )
+    start_ms = int(time.monotonic() * 1000)
+
+    # 1. Fresh worktree at the fixture's pre_task_commit.
+    worktree, run_id = await create_eval_worktree(
+        project_root, task_id, task['pre_task_commit'],
+        setup_commands=task.get('setup_commands'),
+    )
+
+    # 2. Both-live orch config: architect derived from arch_config, implementer
+    #    from impl_config.
+    orch_config = build_eval_orch_config(
+        impl_config, task, base_config,
+        memory_endpoint=memory_endpoint, architect_config=arch_config,
+    )
+
+    # 3. Task assignment.
+    task_def = task.get('task_definition', {
+        'title': task.get('name', task_id),
+        'description': task.get('name', ''),
+    })
+    modules = task.get('modules', [])
+    assignment = TaskAssignment(
+        task_id=task_id, task=task_def, modules=list(modules),
+    )
+
+    # 4. Workflow dependencies (mirrors run_eval).
+    git_ops = GitOps(orch_config.git, orch_config.project_root)
+    scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
+    briefing = BriefingAssembler(orch_config)
+    mcp = _EvalMcpStub(orch_config.fused_memory.url)
+
+    usage_gate: UsageGate | None = None
+    if orch_config.usage_cap.enabled:
+        try:
+            usage_gate = UsageGate(orch_config.usage_cap)
+        except Exception as exc:
+            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+
+    # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
+    #    feeds the live implementer (the both-live path; run_eval hands a frozen
+    #    plan here instead).
+    workflow = build_workflow(
+        assignment=assignment,
+        config=orch_config,
+        git_ops=git_ops,
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=briefing,
+        mcp=mcp,  # type: ignore[arg-type]
+        initial_plan=None,
+        usage_gate=usage_gate,
+    )
+    workflow.worktree = worktree
+
+    timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+    try:
+        terminal_report = await asyncio.wait_for(
+            workflow.run(), timeout=timeout_minutes * 60,
+        )
+        outcome = terminal_report.outcome
+    except TimeoutError:
+        logger.error(
+            f'End-to-end eval {task_id} × {config_name} timed out after '
+            f'{timeout_minutes}m'
+        )
+        outcome = 'timeout'
+    except Exception as e:
+        logger.error(f'End-to-end eval {task_id} × {config_name} failed: {e}')
+        outcome = WorkflowOutcome.BLOCKED
+
+    wall_clock_ms = int(time.monotonic() * 1000) - start_ms
+
+    # 6. Collect metrics, then STAMP role_under_test='end_to_end' (collect_metrics
+    #    itself does not know which methodology stage invoked it).
+    try:
+        metrics = await collect_metrics(workflow, worktree, task)
+        metrics_dict = metrics.to_dict()
+    except Exception as e:
+        logger.warning(f'Metric collection failed: {e}')
+        metrics_dict = {}
+    metrics_dict['role_under_test'] = 'end_to_end'
+
+    result = EvalResult(
+        task_id=task_id,
+        config_name=config_name,
+        outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
+        metrics=metrics_dict,
+        worktree_path=str(worktree),
+        wall_clock_ms=wall_clock_ms,
+        run_id=run_id,
+        trial=trial,
+    )
+    save_result(result)
+    logger.info(
+        f'End-to-end eval complete: {task_id} × {config_name} → {result.outcome} '
+        f'({wall_clock_ms / 1000:.1f}s)'
+    )
+    return result
+
+
 def _collect_cancel_errors(done: Iterable[asyncio.Task[Any]]) -> list[asyncio.CancelledError]:
     """Return all CancelledErrors from a completed asyncio.wait done-set.
 
