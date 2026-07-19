@@ -327,3 +327,29 @@ async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
     assert cap.resume_session_id['session_id'] == session_id
     assert cap.initial_plan is recovered_plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+# ── B1: invocation-level journal proof (γ → invocation seam) ─────────────────
+@pytest.mark.asyncio
+async def test_b1_resumed_invocation_journals_prior_session(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """B1 (γ→invocation): the adopted session dict, fed as ``resume_session_id``
+    into a REAL ``TaskWorkflow``, drives a REAL ``_invoke`` that passes the SAME
+    session id to ``invoke_with_cap_retry`` and journals ``resuming prior
+    session <sid>``.
+
+    Chains β's adopted dict straight into α's resumed invocation — the strongest
+    "the resumed invocation actually used the session" proof ω can make without
+    a live agent.
+    """
+    task_id, session_id = '77', 'uuid-b1-journal'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(tmp_path, recovered, IMPLEMENTER, caplog)
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert f'resuming prior session {session_id}' in caplog.text
