@@ -30,6 +30,19 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.deterministic_runner import OPERATIONAL_LLM_NEEDS_LANE_TOKEN
 
+# NOTE (review follow-up, task 2806 amendment pass): _gate_task /
+# _llm_gate_task / _make_assignment / _mock_scheduler below are
+# intentionally duplicated from test_deterministic_runner.py rather than
+# imported from one shared conftest/test-support module, so the two copies
+# could in principle drift if the pure-gate metadata shape or the
+# TaskAssignment/mock-scheduler contract changes and only one copy is
+# updated. Extracting a shared module is the right fix, but this task's
+# lock scope covers only this file and
+# fused-memory/tests/test_operational_routing_boundary_matrix.py —
+# test_deterministic_runner.py is out of scope for this pass. Flagged as a
+# follow-up: extract these four helpers into a shared test-support module
+# imported by both files so the pure-gate shape is defined exactly once.
+
 
 def _gate_task(
     task_id: str = '99',
