@@ -1313,6 +1313,92 @@ class TestMergeVerifyCollateralEnvGuardNegatives:
         assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.COMPILE_ERROR
 
 
+# ---------------------------------------------------------------------------
+# task 2831 (the task SIGNAL): replayed reify 5164/5071 outputs — a wrapper
+# lock/timeout line co-occurring with collateral shapes. Dep 2821 (merged,
+# ee39b89bd7) tightened the SEMAPHORE_TIMEOUT deterministic-diagnostic/
+# test-verdict veto, but that veto only suppresses a genuine compiler/lint/
+# test VERDICT — it does not recognize a broken worktree as a MORE-SPECIFIC
+# root cause. Today (before the step-4 reorder) the broken-worktree
+# ENV_TRANSIENT checks sit AFTER the semaphore lock+timeout arm in
+# _classify_environmental, so these replayed outputs still classify
+# SEMAPHORE_TIMEOUT — the exact failure mode this task exists to fix, since
+# the collateral shapes below carry NO 2821 veto marker (no clippy::, no
+# error[E\d+]:, no test-verdict count-pair, no pytest ===== failure banner,
+# no test-runner-shaped FAILED line), so they genuinely trip the semaphore
+# arm rather than passing incidentally via the veto's None-return.
+#
+# RED today: the broken-worktree ENV_TRANSIENT checks run AFTER the
+# semaphore arm, so both replayed outputs below classify SEMAPHORE_TIMEOUT
+# instead of ENV_TRANSIENT.
+# ---------------------------------------------------------------------------
+
+# Replayed reify 5164: a wrapper lock/timeout line + a getcwd failure + a
+# missing verify.sh entrypoint (two collateral shapes co-occurring).
+_REPLAY_REIFY_5164_OUTPUT = (
+    'flock: waiting for the merge-verify slot ... a peer timed out holding the lock\n'
+    'shell-init: error retrieving current directory: getcwd: cannot access parent '
+    'directories: No such file or directory\n'
+    './scripts/verify.sh: No such file or directory\n'
+)
+
+# Replayed reify 5071: a wrapper lock/timeout line + a couldn't-read failure +
+# a could-not-write-to-_merge-verify failure (two collateral shapes
+# co-occurring, distinct from the 5164 pair above).
+_REPLAY_REIFY_5071_OUTPUT = (
+    'note: a peer holding the semaphore slot had timed out\n'
+    "error: couldn't read 'crates/core/src/lib.rs': No such file or directory\n"
+    'bash: line 1: could not write output to /work/_merge-verify/target/out.log\n'
+)
+
+
+class TestReplayedMergeVerifyCollateralWinsOverSemaphore:
+    """task 2831 (the task SIGNAL): a replayed lock+timeout wrapper line
+    co-occurring with broken-worktree collateral shapes must classify
+    ENV_TRANSIENT, not SEMAPHORE_TIMEOUT (the more-specific root cause wins,
+    exactly like DISK_FULL already does on ENOSPC co-occurrence) and not
+    TEST_FAILURE (the fall-through this task heads off once dep 2821's
+    tightened veto stops handing these outputs a free SEMAPHORE_TIMEOUT
+    infra-retry)."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_replayed_reify_5164_is_env_transient(self, tool):
+        result = _classify(tool, _REPLAY_REIFY_5164_OUTPUT, 1, False)
+        assert result == FailureCategory.ENV_TRANSIENT
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT
+        assert result != FailureCategory.TEST_FAILURE
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_replayed_reify_5071_is_env_transient(self, tool):
+        result = _classify(tool, _REPLAY_REIFY_5071_OUTPUT, 1, False)
+        assert result == FailureCategory.ENV_TRANSIENT
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT
+        assert result != FailureCategory.TEST_FAILURE
+
+
+class TestBrokenWorktreeOrderingNegatives:
+    """Ordering negatives (green throughout, both before and after step-4's
+    reorder): the more-specific DISK_FULL root cause still wins on ENOSPC
+    co-occurrence, and a genuine wrapper-only timeout with NO collateral
+    shape still classifies SEMAPHORE_TIMEOUT."""
+
+    def test_enospc_with_collateral_stays_disk_full(self):
+        output = _DISK_FULL_ENOSPC_OUTPUT + _COLLATERAL_GETCWD_OUTPUT
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.DISK_FULL
+
+    def test_genuine_flock_timeout_without_collateral_stays_semaphore_timeout(self):
+        assert (
+            _classify(ToolKind.OPAQUE, _SEMAPHORE_TIMEOUT_FLOCK_OUTPUT, 1, False)
+            == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+    def test_genuine_slot_timeout_without_collateral_stays_semaphore_timeout(self):
+        assert (
+            _classify(ToolKind.OPAQUE, _SEMAPHORE_TIMEOUT_SLOT_OUTPUT, 1, False)
+            == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
