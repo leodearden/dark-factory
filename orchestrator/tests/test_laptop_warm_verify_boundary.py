@@ -382,6 +382,52 @@ def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05
     raise AssertionError(f'holder build did not materialize {path} within {timeout}s')
 
 
+def wait_for_marker_stable(
+    path: Path,
+    *,
+    timeout: float = 20.0,
+    interval: float = 0.02,
+    stable_reads: int = 6,
+    _read_mtime_ns=None,
+) -> int:
+    """Poll *path*'s mtime until it stops changing; return the settled value.
+
+    GNU ``touch`` on a not-yet-existing file is a two-syscall op:
+    ``open(O_CREAT)`` sets an initial mtime, then ``utimensat()`` re-stamps
+    it to the final value.  Under full-xdist real-subprocess CPU contention
+    those two steps can straddle a scheduler preemption, so a caller that
+    captures the mtime the instant the file appears (e.g. via
+    :func:`wait_for_marker` alone) can observe the intermediate create-time
+    rather than the final, settled value -- task 2819 (~46ms observed drift
+    within the same wall-clock second on a loaded 503s full-verify run).
+
+    Reuses :func:`wait_for_marker` as the existence gate, then polls
+    *path*'s mtime (via the injectable *_read_mtime_ns* seam, defaulting to
+    a real ``path.stat().st_mtime_ns`` read) until it is unchanged across
+    *stable_reads* consecutive reads, and returns that settled value.
+    Raises AssertionError if it never stabilizes within *timeout* seconds.
+    """
+    wait_for_marker(path, timeout=timeout, interval=interval)
+    read = _read_mtime_ns or (lambda p: p.stat().st_mtime_ns)
+    deadline = time.monotonic() + timeout
+    last = read(path)
+    count = 1
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        cur = read(path)
+        if cur == last:
+            count += 1
+            if count >= stable_reads:
+                return cur
+        else:
+            last = cur
+            count = 1
+    raise AssertionError(
+        f'{path}: mtime did not settle within {timeout}s '
+        f'(last observed mtime_ns={last})'
+    )
+
+
 def subtree_and_leader_gone(pgid: int) -> bool:
     """True when *pgid* has no live descendants AND the pgid leader itself is gone."""
     if collect_descendants(pgid, read_ppid_map()):
@@ -409,6 +455,66 @@ def worktree_base_for(repo: Path) -> Path:
     """Derive worktree_base exactly as the spawned CLI does: GitOps(config.git, repo).worktree_base."""
     config = OrchestratorConfig(project_root=repo)
     return GitOps(config.git, repo).worktree_base
+
+
+# ---------------------------------------------------------------------------
+# Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
+# create+utimensat settle helper that de-flakes the Row 5 marker-retention
+# assertion below.  Both tests inject a private mtime-reader seam
+# (_read_mtime_ns) so there is ZERO real timing -- a real-timing settle test
+# would itself be load-sensitive (fixing a flake with a flake).
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_marker_stable_returns_settled_not_intermediate(tmp_path):
+    """wait_for_marker_stable returns the SETTLED mtime, not the intermediate one.
+
+    Models GNU ``touch``'s two-syscall create->utimensat drift (task 2819):
+    the injected reader yields the intermediate create-time mtime a few
+    times, then the final settled mtime for the remainder of the scripted
+    sequence.  Uses a real tmp_path marker so the existence gate
+    (wait_for_marker) passes instantly, and interval=0 so the settle loop
+    itself burns no real wall-clock time.
+    """
+    marker = tmp_path / 'warm.marker'
+    marker.touch()
+
+    sequence = [100, 100, 100, 150, 150, 150, 150, 150, 150, 150, 150, 150]
+    calls = iter(sequence)
+
+    def fake_read_mtime_ns(_path):
+        return next(calls)
+
+    result = wait_for_marker_stable(
+        marker, interval=0, stable_reads=6, _read_mtime_ns=fake_read_mtime_ns,
+    )
+
+    assert result == 150, (
+        f'expected the settled mtime (150), not the create-time intermediate '
+        f'(100); got {result}'
+    )
+
+
+def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
+    """wait_for_marker_stable raises AssertionError if the mtime never quiets down.
+
+    An always-changing reader can never satisfy the consecutive-unchanged
+    window, so with a tiny timeout this must raise promptly rather than
+    hang or silently return an unsettled value.
+    """
+    marker = tmp_path / 'warm.marker'
+    marker.touch()
+
+    call_count = [0]
+
+    def fake_read_mtime_ns(_path):
+        call_count[0] += 1
+        return call_count[0]
+
+    with pytest.raises(AssertionError):
+        wait_for_marker_stable(
+            marker, timeout=0.05, interval=0, _read_mtime_ns=fake_read_mtime_ns,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -994,8 +1100,12 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 
         persistent_wt = worktree_base / '_merge-verify'
         marker = persistent_wt / 'target' / 'warm.marker'
-        wait_for_marker(marker)
-        marker_mtime_before = marker.stat().st_mtime_ns
+        # Capture the baseline only AFTER the holder's touch (create +
+        # utimensat) has settled -- under full-xdist load those two syscalls
+        # can straddle a preemption, so the instant-of-appearance mtime can
+        # still drift ~tens of ms (task 2819), which would spuriously trip
+        # the retention equality assertion below.
+        marker_mtime_before = wait_for_marker_stable(marker)
 
         waiter = spawn_verify_merge(
             sha=head_sha,
