@@ -436,16 +436,17 @@ ARCHITECT_EVAL_CONFIGS = [
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name (implementer, architect, OR ν candidates).
+    """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
-    ν's ``claude_endpoint_candidates()`` bundles are searched LAST since they
-    are a function call (env-read-at-call) rather than a static list — cheap
-    at CLI/driver lookup frequency, and keeps this the single by-name resolver
-    for every eval config family (avoids a second, ν-only lookup path).
+    ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
+    bundles are searched LAST since they are function calls (built fresh per
+    call) rather than a static list — cheap at CLI/driver lookup frequency,
+    and keeps this the single by-name resolver for every eval config family
+    (avoids a second, per-selector lookup path).
     """
     for cfg in [
         *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
-        *claude_endpoint_candidates(),
+        *claude_endpoint_candidates(), *codex_pi_candidates(),
     ]:
         if cfg.name == name:
             return cfg
@@ -659,3 +660,53 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
     replaced) for proxied-endpoint cost accuracy.
     """
     return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
+
+
+# ===== Codex + pi candidate bundles (eval-revival ξ) =====
+#
+# Two additive Phase-4 candidates, resolved by name via get_config_by_name —
+# mirrors ν's claude_endpoint_candidates() pattern above: NOT injected into
+# EVAL_CONFIGS/ofat_candidates (opt-in candidates; injecting them would
+# dispatch an evaluate-only backend in every default `--matrix` run and
+# perturb the OFAT incumbent floor).
+#
+#   - codex + GPT-5.6 "Sol": Rust implementer, evaluate-only (RUST CAUTION,
+#     PRD decision 14 — Claude leads the only Rust-bearing public
+#     benchmarks and open-model Rust evidence is thin, so no architect-role
+#     variant and no production wiring).
+#   - pi + Sonnet: harness-isolating control — same model+effort as the
+#     claude-sonnet-max incumbent, only the backend varies, isolating
+#     harness effect from model effect.
+
+# Operator-adjustable best-effort literal (the GPT-5.6 "Sol" snapshot
+# codename), matching this file's MINIMAX_MODEL/GPU-literal convention: the
+# exact codex `--model` string is environment-specific and unverifiable from
+# this repo, so tests assert against this named constant rather than a
+# brittle inline string.
+CODEX_RUST_MODEL = 'gpt-5.6'
+
+# Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
+# vs claude delta attributes cleanly to harness effect rather than a model
+# swap. Concrete Anthropic model-id resolution for the pi CLI is owned by
+# the pi backend / harness-reconnect-pi spike, not this config layer — this
+# constant's job is only to declare "same model as incumbent".
+PI_CONTROL_MODEL = 'sonnet'
+
+
+def codex_pi_candidates() -> list[EvalConfig]:
+    """The two ξ candidate bundles: codex Rust implementer + pi Sonnet control.
+
+    ADDITIVE, mirroring claude_endpoint_candidates() above: resolved by name
+    via get_config_by_name, never added to EVAL_CONFIGS/ofat_candidates.
+    """
+    return [
+        EvalConfig(
+            'codex-gpt5.6-sol', 'codex', CODEX_RUST_MODEL, 'xhigh', role='implementer',
+        ),
+        # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
+        # a valid _pi_thinking level) — model+effort held constant, backend
+        # varied, so any quality/cost delta attributes to harness effect.
+        EvalConfig(
+            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role='implementer',
+        ),
+    ]
