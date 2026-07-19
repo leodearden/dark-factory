@@ -1,0 +1,44 @@
+{
+  "id": "reify_task_5021",
+  "name": "Doc-correction: point continuous-cost-min \u00a710 row-4 at realized M-UNITS",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "5558953f0e6f11604f78d725a64b003bf1c16a1c",
+  "post_task_commit": "f71618d18721048657bd6356ef4cbcedb0dfe78e",
+  "task_definition": {
+    "title": "Doc-correction: point continuous-cost-min \u00a710 row-4 at realized M-UNITS",
+    "description": "Companion doc-correction (\u03b5) for the multi-aspect-objective-units-coherence PRD: after the mechanism ships (\u03b1/\u03b2/\u03b4), update the parent PRD's out-of-scope pointer so the record reflects the realized mechanism rather than the stub.\n\nDELIVERABLE: in docs/prds/v0_6/continuous-cost-minimisation.md \u00a710 (out-of-scope), update row 4 (multi-aspect dimensional coherence \u2192 M-UNITS) to point at the realized mechanism (the units-coherence guard + normalised idiom + Massive aspect) rather than the forward-stub. Add a \u00a718 \"realized-in-v0.6\" row if that convention is present. Prose-only.\n\nPRD: docs/prds/v0_6/multi-aspect-objective-units-coherence.md task \u03b5.\nUser-observable signal: the parent PRD's \u00a710 row-4 points at the realized M-UNITS mechanism (not the stub).\nConsumer: the PRD record / future readers.\nDepends on \u03b4 (correct the record after the mechanism ships)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "f71618d18721048657bd6356ef4cbcedb0dfe78e",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "f71618d18721048657bd6356ef4cbcedb0dfe78e",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 1,
+      "deletions": 1
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null
+}

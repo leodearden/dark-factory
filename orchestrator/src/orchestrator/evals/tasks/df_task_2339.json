@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2339",
+  "name": "Milestone \u03b6: document milestone tasks in CLAUDE.md Task Routing",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "21aedae6bd9d107865b0a82d3a150c6d804d1e1a",
+  "post_task_commit": "3cdfaf8e5bc963ef63c24ab3a93752a42353eca8",
+  "task_definition": {
+    "title": "Milestone \u03b6: document milestone tasks in CLAUDE.md Task Routing",
+    "description": "PRD: docs/prds/milestone-tasks.md task \u03b6. Depends on \u03b5 (document shipped, tested behaviour).\n\nWHAT: Add a \"Milestone tasks (dated / delayed)\" subsection to the Task Routing section of CLAUDE.md, documenting the shipped feature:\n- The metadata.milestone schema (mode: dated|delayed; dated \u2192 at ISO-8601; delayed \u2192 after_secs int>0).\n- Orthogonality to task_kind: a milestone gates ANY task (normal agent, deterministic predicate, or pure human gate).\n- The predicate exit-code contract (before_done.kind='predicate': rc==0 \u2192 done with deterministic-milestone provenance; rc!=0 \u2192 milestone_check_failed L2; script owns the threshold, orchestrator parses nothing).\n- The frozen-once delayed-anchor semantics (timer starts when deps are satisfied; persisted wall-clock, survives restart; dispatch still re-checks live deps).\n- The exemplar: a delayed deterministic predicate milestone (\"one week after X lands, check flakiness < 5%, else escalate\").\n\nModules touched: CLAUDE.md.\n\nUser-observable signal (docs leaf, roped to \u03b5's shipped surface): CLAUDE.md documents the milestone metadata schema + the exit-code verdict contract + the delayed-anchor semantics.\nConsumer: operators authoring milestone tasks (the CLAUDE.md Task Routing reference).\nSubstrate: the behaviour documented is delivered + tested by \u03b5 (upstream)."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "3cdfaf8e5bc963ef63c24ab3a93752a42353eca8",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "3cdfaf8e5bc963ef63c24ab3a93752a42353eca8",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 113,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}

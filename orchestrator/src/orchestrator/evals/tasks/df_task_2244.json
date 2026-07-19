@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2244",
+  "name": "W10-\u03b9: B+H supervision composition integration gate (deterministic self-restart deploy crash\u2192named-phase recovery)",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "07e9f92497375471abc132c84af8acefacf7c4ae",
+  "post_task_commit": "fd1cb4c88a537d7686f3ec6e6ee5b99e200d1341",
+  "task_definition": {
+    "title": "W10-\u03b9: B+H supervision composition integration gate (deterministic self-restart deploy crash\u2192named-phase recovery)",
+    "description": "Stream W10 (harness-supervision), PRD plans/harness-supervision-prd.md \u00a77 boundary sketch, manifest \u00a7\u03b9 (LEAF, C-as-integration-gate). The G5 two-way boundary artifact roping proc_supervision + DeployState + TaskGroundTruth + BackgroundService together \u2014 the 2064/2105/1900/2059/2066 incident chain as ONE green test.\n\nImplement the composition boundary suite (real producer + real consumer across seams; crashes simulated by injected fault points, not real process kills):\n- D1 (RestartPlan \u00d7 DeployState \u00d7 TaskGroundTruth): drive a deterministic self-restart deploy through `RestartPlan.execute()` (own-unit self-restart cell), inject a fault after the `ran` phase write, restart, and assert `TaskGroundTruth.derive_truth` sees `deploy_phase==ran` (a NAMED state) \u2192 `_RECOVERY` yields the defined action, NOT phantom-done; then a cross-unit blocking-verify cell (RP-4/RP-5) reaches `verified\u2192done`.\n- R3 (2064 cell) + R2 (2105 cell): the RestartPlan matrix \u2014 unset ORCH_UNIT self-target REFUSES+escalates (no self-kill); relative-script cell carries --working-directory + absolute script.\n- S1: the registry shutdown-order test with an injected wedging BackgroundService completes stop_all() bounded (no hang).\n- G1: a stranded task with a landed-outbox journal row is recovered to done{merged,sha} journal-first.\n\nObservable signal: the composition suite (D1 + R3 + R4 + S1 + G1) is GREEN in CI \u2014 a deterministic self-restart deploy crashed mid-phase recovers to the correct named DeployState phase + classified recovery action, with the restart matrix and shutdown-order green. This is an end-to-end integration gate exercising the real RestartPlan/DeployState/TaskGroundTruth/LifecycleRegistry across their seams (not a synthetic-input unit test).\nConsumer: CI (proves the supervision stack composes before program-level deploy).\nModules: orchestrator. Depends on \u03b4 (RestartPlan delegate), \u03b6 (DeployState writes), \u03b7 (LifecycleRegistry), \u03b82 (sweep recovery)."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "fd1cb4c88a537d7686f3ec6e6ee5b99e200d1341",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "fd1cb4c88a537d7686f3ec6e6ee5b99e200d1341",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 688,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}

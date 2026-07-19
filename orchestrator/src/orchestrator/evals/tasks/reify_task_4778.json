@@ -1,0 +1,44 @@
+{
+  "id": "reify_task_4778",
+  "name": "G-allow done-cite cleanup (CU3): reify-compiler (#3530 schema-delegation shim/registry)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "ca200413409640190f05dd5d23480e6d182cb524",
+  "post_task_commit": "f73711e3ecf3b30c486142ed4eeb78b0e0b695f9",
+  "task_definition": {
+    "title": "G-allow done-cite cleanup (CU3): reify-compiler (#3530 schema-delegation shim/registry)",
+    "description": "Comment-only G-allow done-cite cleanup. Prereq #4774 establishes the broadened grammar + an ADVISORY repo-wide g-allow scan to verify against.\n\nCONTRACT (from #4774): a terminal-task cite is provenance-exempt iff `done`/`cancelled` (case-insensitive) appears in the parenthetical attached to or immediately following it. Per marker: (a) permanent/attribution \u2192 annotate done; (b) stale wiring-pending (consumer LANDED) \u2192 DELETE if symbol now traceable, else annotate done; (c) re-home if a LIVE successor exists. VERIFY: reify-audit repo-wide advisory g-allow scan reports ZERO for these files. Touch ONLY the listed files.\n\nBoth cite #3530 (done):\n- crates/reify-compiler/src/lib.rs:116 \u2014 \"task #3530 parity shim \u2014 test-support-gated; consumed by validate_annotations parity tests during schema-delegation migration; remove when delegation is complete\". Verify whether the schema-delegation migration is complete; if the shim is genuinely dead now, DELETE it; otherwise annotate done-provenance.\n- crates/reify-compiler/src/annotations/schema.rs:220 \u2014 \"task #3530 const-slice/OnceLock AnnotationSchema registry; consumer is the schema-delegating validate_annotations rewrite (task #3530 step-10)\". Annotate done-provenance.\n\nModules: crates/reify-compiler."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "f73711e3ecf3b30c486142ed4eeb78b0e0b695f9",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "f73711e3ecf3b30c486142ed4eeb78b0e0b695f9",
+    "diff_stat": {
+      "files": 2,
+      "insertions": 2,
+      "deletions": 2
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null
+}

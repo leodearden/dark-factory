@@ -1,0 +1,44 @@
+{
+  "id": "reify_task_3981",
+  "name": "result-fallback \u03b2: recovery-combinator evaluation over Value::Option",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "1f486f9f3eee3a90ec7c629f168b81cf5f7be96d",
+  "post_task_commit": "0fb1f67d0b234e2fab2f0ba8ab655667f1482c56",
+  "task_definition": {
+    "title": "result-fallback \u03b2: recovery-combinator evaluation over Value::Option",
+    "description": "Layer A task \u03b2 of PRD docs/prds/v0_6/result-and-fallback.md \u00a78. Implement evaluation of the recovery combinators over Value::Option (three-state some/none/undef, spec \u00a79.2.8). Tag-driven recovery (contract C-1): some(x)->x, none->default/alternative, undef-of-Option->undef (D2 undef passthrough \u2014 only a DETERMINED none recovers, mirroring \u00a79.2.4). Pure + eager (C-2). MUST NOT read Freshness (INV-1 orthogonality). Likely implemented as reify-expr intrinsics rather than pure .ri bodies because the some(v)/none match form is itself a grammar gap today (DCE F4); decide at impl (Q1)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "0fb1f67d0b234e2fab2f0ba8ab655667f1482c56",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "0fb1f67d0b234e2fab2f0ba8ab655667f1482c56",
+    "diff_stat": {
+      "files": 3,
+      "insertions": 1082,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null
+}

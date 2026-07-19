@@ -1,0 +1,44 @@
+{
+  "id": "df_task_2605",
+  "name": "Delete task_curator.py pre-refactor prompt parity scaffolding (post-2494 cleanup)",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "79f196b4adabae67667ddddd544d60d3a47cb186",
+  "post_task_commit": "97beea8e273e16f3a6ef03ebda1c52bddbc4d2c2",
+  "task_definition": {
+    "title": "Delete task_curator.py pre-refactor prompt parity scaffolding (post-2494 cleanup)",
+    "description": "Task 2494 split the curator's system prompts into frozen CONTRACT + editable HEURISTICS and added a one-time refactor safety net in fused-memory/tests/test_task_curator.py: the frozen verbatim copies _PRE_REFACTOR_SYSTEM_PROMPT / _PRE_REFACTOR_BATCH_SYSTEM_PROMPT, plus two superset-of-stripped-lines parity tests that consume them. These exist only to prove the 2494 split dropped no instruction line during that one refactor. They are not a living contract test and must not be extended to track future prompt edits \u2014 the in-file comments say so explicitly."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": "simple",
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "97beea8e273e16f3a6ef03ebda1c52bddbc4d2c2",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "97beea8e273e16f3a6ef03ebda1c52bddbc4d2c2",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 0,
+      "deletions": 159
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}

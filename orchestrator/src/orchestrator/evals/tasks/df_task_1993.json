@@ -1,0 +1,44 @@
+{
+  "id": "df_task_1993",
+  "name": "MQ-refactor \u03b8: SpeculationController \u2014 explicit permit ownership + merger state machine (R3+R5)",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "ee941ca7babdfb42168aa23b2a40d9e07cb0072c",
+  "post_task_commit": "ded9a9a5334c0d0511e3a602b2c46055aedaaf31",
+  "task_definition": {
+    "title": "MQ-refactor \u03b8: SpeculationController \u2014 explicit permit ownership + merger state machine (R3+R5)",
+    "description": "Reify the merger loop's implicit speculation state machine into a SpeculationController object owning what are today six loop-locals (:8730\u20138756): spec_base, prefetched, held_spec_permit, pending_spec_base, pending_predecessor (task-1862 late-arrival attach), exited_via_sentinel stays loop-local. The controller owns the _speculation_slot permit lifecycle with EXPLICIT ownership-transfer semantics: acquire-on-lookahead (:9248), transfer-to-verifier-on-put (:9236\u20139238), retain-for-late-arrival (:9287), release-on-fallback/abort/shutdown (:8835, :9324, :9356, :9364), cascade release stays with \u03b6's chokepoint (was_speculative). Suggested surface: on_merge_success(commit) \u2192 prefetch decision; on_dequeue(req) \u2192 base_sha (ATTACH/FALLBACK per :8818\u20138841 four-condition rule); on_abort(); on_shutdown(). Preserve the documented double-release tolerance (plain Semaphore \u2014 do NOT convert to BoundedSemaphore, :9216\u20139232) and the DD1 coalesce gate condition (spec_base/prefetched/pending all clear, :8786). Expose controller state via a snapshot() 'speculation' key (additive). The permit-conservation identity (:217\u2013228) becomes a queryable property for task \u03b9.\n\nPRD: plans/merge-queue-modularization-invariants-prd.md task \u03b8.\n\nUser-observable signal: a permit-conservation property test across prefetch/attach/fallback/cascade/shutdown scenarios asserts semaphore value + controller-held + inflight-speculative == K at every await point; snapshot() gains the speculation-state key (dashboard-visible).\nConsumer: _merger_loop; task \u03b9 (conservation audit reads controller-held count); snapshot/dashboard.\nModules touched: orchestrator/src/orchestrator/, orchestrator/tests/.\nPrereq: \u03b7."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "revival-zeta",
+  "provenance": {
+    "merge_sha": "ded9a9a5334c0d0511e3a602b2c46055aedaaf31",
+    "sampled_at": "2026-07-19T09:46:25.408415+00:00",
+    "seed": 20260719,
+    "plan_source": "unavailable"
+  },
+  "reference": {
+    "post_task_commit": "ded9a9a5334c0d0511e3a602b2c46055aedaaf31",
+    "diff_stat": {
+      "files": 4,
+      "insertions": 1656,
+      "deletions": 114
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null
+}
