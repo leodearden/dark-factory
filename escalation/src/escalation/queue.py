@@ -227,7 +227,11 @@ class EscalationQueue:
            instance (e.g. a long-lived escalation-server process) archiving this
            id — a memo miss is therefore not authoritative on its own.  A single
            TARGETED archive re-probe (``_iter_archive_paths``) is performed
-           before concluding the id is genuinely absent.
+           before concluding the id is genuinely absent.  A re-probe HIT is
+           folded into the memoised listing (mirroring the incremental update
+           in ``_archive_resolved``) so a subsequent lookup for the same
+           archived-elsewhere id is a cache hit — bounding the re-probe to at
+           most one targeted rglob per id per instance lifetime.
 
         Shared by ``get()`` and ``patch_resolution_metadata()`` so that the archive
         fallback and newest-by-date selection logic live in exactly one place.
@@ -245,12 +249,14 @@ class EscalationQueue:
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
+        reprobed = False
         if not candidates:
             # The memoised listing can predate another EscalationQueue
             # instance's archival of this id (cross-process staleness — see
             # docstring point 3).  Do a single targeted re-probe of the
             # archive subtree before concluding absence.
             candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+            reprobed = True
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -261,7 +267,7 @@ class EscalationQueue:
             # YYYY-MM-DD sorts lexicographically == chronologically.
             # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
             # matching the comment and ensuring valid date dirs always win.
-            return max(
+            selected = max(
                 candidates,
                 key=lambda p: (
                     p.parent.name
@@ -269,7 +275,14 @@ class EscalationQueue:
                     else ''
                 ),
             )
-        return candidates[0]
+        else:
+            selected = candidates[0]
+        if reprobed:
+            # Fold the re-probe hit into the memo so a repeated lookup for
+            # this id is a cache hit rather than a re-scan (bounds a polled
+            # server to at most one targeted rglob per archived-elsewhere id).
+            listing.setdefault(selected.parent.name, set()).add(escalation_id)
+        return selected
 
     def get(self, escalation_id: str) -> Escalation | None:
         """Read a single escalation by ID.
