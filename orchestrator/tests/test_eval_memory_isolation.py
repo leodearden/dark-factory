@@ -24,8 +24,19 @@ depends on ε:
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from orchestrator.evals.runner import RecordingMemorySink
+from orchestrator.config import OrchestratorConfig
+from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.profile import EVAL_PROFILE
+from orchestrator.evals.runner import RecordingMemorySink, build_eval_orch_config
+
+# The non-routable null sentinel the eval profile pins fused_memory.url to:
+# 127.0.0.1:1 gives an immediate ECONNREFUSED (fast-fail, no slow DNS/timeout)
+# and can never be the production dark_factory memory store.
+_NULL_SENTINEL = 'http://127.0.0.1:1'
+# The production fused-memory endpoint an un-isolated eval run would write into.
+_PRODUCTION = 'http://localhost:8002'
 
 
 def _add_memory_request(
@@ -79,3 +90,31 @@ def test_recording_sink_records_posted_write():
         assert arguments['content'] == 'Completed: something'
         assert arguments['category'] == 'observations_and_summaries'
         assert arguments['project_id'] == 'dark_factory'
+
+
+def test_eval_profile_pins_fused_memory_url_to_null_sentinel():
+    """EVAL_PROFILE isolates the fused-memory endpoint to a non-routable sentinel (D8)."""
+    assert EVAL_PROFILE['fused_memory.url'] == _NULL_SENTINEL
+
+
+@pytest.mark.usefixtures('code_default_config')
+def test_build_eval_orch_config_default_isolates_memory_off_production(tmp_path):
+    """With no memory_endpoint, the built eval config points fused_memory.url off production.
+
+    Default isolation flows purely through the profile — no recording wiring
+    and no CLI change required. Even a zero-wiring eval run can never reach the
+    real dark_factory memory store.
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+    # Premise: a fresh code-default base carries the real production endpoint,
+    # so the sentinel below is a genuine off-production divergence.
+    assert base.fused_memory.url == _PRODUCTION
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+
+    result = build_eval_orch_config(cfg, task, base)
+
+    assert result.fused_memory.url == _NULL_SENTINEL
+    assert result.fused_memory.url != _PRODUCTION
+    assert result.fused_memory.url != base.fused_memory.url

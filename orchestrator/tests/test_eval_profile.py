@@ -47,13 +47,14 @@ def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str
 
 
 def test_eval_profile_documented_keys():
-    """EVAL_PROFILE is exactly the 5 documented C1 leaves — no more, no less."""
+    """EVAL_PROFILE is exactly the 6 documented C1 leaves — no more, no less."""
     assert EVAL_PROFILE == {
         'rebase_before_verify': False,
         'inter_iteration_rebase': False,
         'unblock_auto.enabled': False,
         'auto_eval_enabled': False,
         'simple_task_enabled': False,
+        'fused_memory.url': 'http://127.0.0.1:1',
     }
 
 
@@ -97,19 +98,23 @@ def test_apply_eval_profile_parity(tmp_path):
 
     Invariant P1 / Boundary test B1 — the D5 root-cause guard. Exactness holds
     by identity: model_copy(update=X) changes exactly X's leaves and every
-    profile leaf flips True -> False, so the diff is precisely the 5
-    documented EVAL_PROFILE keys — never more (an undocumented leak) or fewer
-    (a no-op profile entry).
+    profile leaf diverges from its base value (the 5 bool True -> False flips
+    plus the D8 fused_memory.url production -> null-sentinel change), so the
+    diff is precisely the 6 documented EVAL_PROFILE keys — never more (an
+    undocumented leak) or fewer (a no-op profile entry).
     """
     base = OrchestratorConfig(project_root=tmp_path)
 
-    # Loud premise guard: every EVAL_PROFILE path must read True on a fresh
-    # code-default base, or flipping it to False below wouldn't actually
-    # change anything and the parity assertion would pass vacuously.
+    # Loud premise guard: every EVAL_PROFILE path must DIFFER from its profile
+    # value on a fresh code-default base, or applying it below wouldn't
+    # actually change anything and the parity assertion would pass vacuously.
+    # Generalized from the old "is True" form (which only held for the bool
+    # flips) so the string-valued fused_memory.url entry is guarded too.
     for path in EVAL_PROFILE:
-        assert config._get_leaf(base, path) is True, (
-            f'premise violated: {path!r} is not True on a fresh code-default '
-            f'OrchestratorConfig — the parity assertion below would be vacuous'
+        assert config._get_leaf(base, path) != EVAL_PROFILE[path], (
+            f'premise violated: {path!r} already equals its EVAL_PROFILE value '
+            f'on a fresh code-default OrchestratorConfig — the parity assertion '
+            f'below would be vacuous for this leaf'
         )
 
     resolved = apply_eval_profile(base)
