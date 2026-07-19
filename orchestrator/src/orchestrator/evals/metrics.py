@@ -30,6 +30,11 @@ class EvalMetrics:
 
     # Efficiency
     cost_usd: float = 0.0
+    # Cost provenance (Invariant P5): one of 'price_table' | 'cli' |
+    # 'unpriced_proxy' — see :func:`resolve_cost_usd`. Defaults to 'cli' (the
+    # trustworthy native-cloud source) so a result JSON persisted before this
+    # field existed reads back sanely.
+    cost_source: str = 'cli'
     workflow_duration_ms: int = 0
     turns_used: int = 0
     iterations: int = 0          # implementer re-invocations
@@ -55,8 +60,11 @@ class EvalMetrics:
 
     # Inference speed
     tokens_per_second: float = 0.0       # output_tokens / generation_seconds
-    is_local_model: bool = False          # True when env_overrides has ANTHROPIC_BASE_URL
-    hardware_time_seconds: float = 0.0    # wall-clock for hardware cost imputation
+    # True when env_overrides has ANTHROPIC_BASE_URL — i.e. a PROXIED endpoint.
+    # Repurposed by Invariant P5 as the cost-source signal: a proxied endpoint's
+    # CLI cost is untrustworthy, so an unlisted model there resolves to
+    # 'unpriced_proxy' (see resolve_cost_usd) rather than the raw CLI number.
+    is_local_model: bool = False
 
     # Derived
     composite_score: float = 0.0
@@ -161,6 +169,82 @@ def compute_composite(m: EvalMetrics) -> float:
     return round(quality, 4)
 
 
+# Fallback USD/1M-token rate used ONLY for a PROXIED endpoint whose model is
+# unlisted — mirrors invoke._FALLBACK_PRICE (task 2459) so cost degradation is a
+# DEFINED, logged number, never a silent one (Invariant P5 / the
+# loud-over-silent-degradation norm).
+_FALLBACK_PRICE: dict[str, float] = {'input_per_1m': 2.0, 'output_per_1m': 8.0}
+
+
+def _rate(entry: Any, key: str) -> float:
+    """Read *key* off a price *entry*, which may be a ``PriceEntry`` (attribute)
+    or a plain dict (item) — so both ``config.prices`` values and plain
+    ``{'input_per_1m','output_per_1m'}`` dicts work through one accessor.
+    Mirrors invoke._rate: uses ``hasattr`` (not a ``getattr`` default) so a
+    legitimate 0.0 rate is read correctly rather than masked by a fallback.
+    """
+    return getattr(entry, key) if hasattr(entry, key) else entry[key]
+
+
+def resolve_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    model: str,
+    prices: dict[str, Any] | None,
+    cli_cost_usd: float,
+    is_local_model: bool,
+) -> tuple[float, str]:
+    """Resolve ``(cost_usd, cost_source)`` for a run, per Invariant P5.
+
+    ``cost_source`` ∈ ``{'price_table', 'cli', 'unpriced_proxy'}``:
+
+    - **price_table** — the run's *model* is listed in *prices*: cost is the
+      token-weighted price-table figure ``(in*input_per_1m +
+      out*output_per_1m)/1e6`` (the identical formula
+      ``invoke._estimate_cost`` uses). This wins even for a proxied endpoint —
+      a listed price is always preferred to the (proxy-untrustworthy) CLI
+      number.
+    - **cli** — a NATIVE cloud endpoint (``is_local_model=False``) whose model
+      is unlisted: the CLI's own ``cli_cost_usd`` is trustworthy for the real
+      Anthropic API, so it is used verbatim.
+    - **unpriced_proxy** — a PROXIED endpoint (``is_local_model=True`` —
+      ``ANTHROPIC_BASE_URL`` set) whose model is unlisted: the CLI cost is
+      WRONG for a proxied endpoint, so emit a loud WARNING (mirroring task
+      2459) and fall back to a DEFINED ``_FALLBACK_PRICE`` figure — never a
+      silent or raw-CLI number.
+
+    Pure: no I/O, no config access; *prices* is passed in by the caller.
+    Accepts ``PriceEntry`` objects and plain dicts interchangeably (via
+    :func:`_rate`), exactly as invoke.py does.
+    """
+    entry = prices.get(model) if prices else None
+    if entry is not None:
+        cost = (
+            input_tokens * _rate(entry, 'input_per_1m')
+            + output_tokens * _rate(entry, 'output_per_1m')
+        ) / 1_000_000
+        return cost, 'price_table'
+
+    if not is_local_model:
+        # Native cloud endpoint — the CLI's own cost figure is trustworthy.
+        return cli_cost_usd, 'cli'
+
+    # Proxied endpoint with an unlisted model: the CLI cost is wrong here, so
+    # warn loudly and fall back to a DEFINED rate rather than a silent number.
+    logger.warning(
+        'No configured price for proxied-endpoint model %r; the CLI cost is '
+        'unreliable for a proxied endpoint, falling back to $%.2f/1M input, '
+        '$%.2f/1M output (add it to config.prices to silence)',
+        model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
+    )
+    cost = (
+        input_tokens * _FALLBACK_PRICE['input_per_1m']
+        + output_tokens * _FALLBACK_PRICE['output_per_1m']
+    ) / 1_000_000
+    return cost, 'unpriced_proxy'
+
+
 async def collect_metrics(
     workflow: TaskWorkflow,
     worktree: Path,
@@ -195,13 +279,30 @@ async def collect_metrics(
     tps = wf_metrics.total_output_tokens / duration_secs if duration_secs > 0 else 0.0
     is_local = bool(workflow.config.env_overrides.get('ANTHROPIC_BASE_URL'))
 
+    # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
+    # proxied endpoint, so resolve cost from the config price table by the run's
+    # model, tracking which source was used. collect_metrics is the IMPLEMENTER
+    # path (run_eval), so the model under test is config.models.implementer; the
+    # architect eval builds EvalMetrics directly in run_architect_eval (out of
+    # scope here).
+    run_model = workflow.config.models.implementer
+    resolved_cost, cost_source = resolve_cost_usd(
+        wf_metrics.total_input_tokens,
+        wf_metrics.total_output_tokens,
+        model=run_model,
+        prices=workflow.config.prices,
+        cli_cost_usd=wf_metrics.total_cost_usd,
+        is_local_model=is_local,
+    )
+
     m = EvalMetrics(
         tests_pass=verify.passed if verify else False,
         lint_clean=(not verify.lint_output) if verify else False,
         typecheck_clean=(not verify.type_output) if verify else False,
         plan_completion_pct=plan_completion,
         plan_steps=total_steps,
-        cost_usd=wf_metrics.total_cost_usd,
+        cost_usd=resolved_cost,
+        cost_source=cost_source,
         workflow_duration_ms=wf_metrics.total_duration_ms,
         turns_used=wf_metrics.total_turns,
         iterations=wf_metrics.execute_iterations,
@@ -219,7 +320,6 @@ async def collect_metrics(
         files_changed=files_changed,
         tokens_per_second=round(tps, 2),
         is_local_model=is_local,
-        hardware_time_seconds=round(duration_secs, 3),
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
