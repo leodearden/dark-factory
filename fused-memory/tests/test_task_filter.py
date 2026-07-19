@@ -3687,3 +3687,157 @@ class TestIsProposedResolutionFraming:
                 f"'resolution options' substring with no structural cue, got True."
                 f'\ntext={text!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# find_present_tense_completion_claim_task_ids (task 2824)
+# ---------------------------------------------------------------------------
+
+
+class TestFindPresentTenseCompletionClaimTaskIds:
+    """Tests for find_present_tense_completion_claim_task_ids() in task_filter.py.
+
+    Extracts task ids that a recon-stage write frames as COMPLETE in
+    present/past-completion tense ("has landed", "is done", "is resolved",
+    "now enforces") when co-occurring with an explicit task-ref anchor
+    ('task N'/'df N'/'#N') in the same clause. The explicit anchor is what
+    makes otherwise-ambiguous completion words ("resolved") safe to match — it
+    disambiguates a retrospective completion claim about a specific task from
+    generic prose. Purely textual (no live-status lookup); that cross-check is
+    layered on top by nonterminal_completion_claim_task_ids().
+
+    Exempts aspirational/future framing ("will land", "planned to resolve",
+    "intended to enforce") and negated-terminal framing ("has not yet
+    landed") — those describe work that has NOT completed and must not be
+    flagged as a premature completion claim.
+    """
+
+    # ------------------------------------------------------------------ #
+    # positive fixtures (present-tense completion claim -> non-empty set)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_landed_and_now_enforces(self):
+        """The canonical incident shape ("has landed and now enforces ...") must fire."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 has landed and now enforces the manifest gate'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} for the "has landed and now enforces" completion '
+            f'claim.\ntext={text!r}'
+        )
+
+    def test_positive_df_is_done(self):
+        """'df N is done' must fire (df-form anchor + "is done")."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'df 5252 is done'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} for "df 5252 is done".\ntext={text!r}'
+        )
+
+    def test_positive_is_resolved(self):
+        """'task N is resolved' must fire — the explicit anchor makes the
+        otherwise-ambiguous "resolved" safe to match.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 is resolved'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} for "task 5252 is resolved".\ntext={text!r}'
+        )
+
+    def test_positive_multi_clause_two_ids(self):
+        """Multiple clauses, each with its own completion claim, aggregate ids."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 10 landed. task 11 is done.'
+        assert find_present_tense_completion_claim_task_ids(text) == {10, 11}, (
+            f'Expected {{10, 11}} for two clauses each framing a distinct task as '
+            f'complete.\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # negative/exemption fixtures (must return empty set)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_aspirational_will_land(self):
+        """'task N will land soon' is aspirational — must NOT fire."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 will land soon'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set for aspirational "will land".\ntext={text!r}'
+        )
+
+    def test_negative_aspirational_planned_to_resolve(self):
+        """'task N is planned to resolve X' is aspirational — must NOT fire."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 is planned to resolve the manifest gap'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set for aspirational "planned to resolve".\ntext={text!r}'
+        )
+
+    def test_negative_aspirational_intended_to_enforce(self):
+        """'task N is intended to enforce Y' is aspirational — must NOT fire."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 is intended to enforce the manifest gate'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set for aspirational "intended to enforce".\ntext={text!r}'
+        )
+
+    def test_negative_negated_terminal(self):
+        """'task N has not yet landed' is a negated-terminal (non-terminal)
+        statement — the negated span is stripped so this must NOT fire.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'task 5252 has not yet landed'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set for negated-terminal "has not yet landed".'
+            f'\ntext={text!r}'
+        )
+
+    def test_negative_no_task_reference_anchor(self):
+        """A completion claim with NO explicit task-ref anchor must NOT fire —
+        the anchor is required to disambiguate from generic prose.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'the manifest gate landed and is now enforced'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected empty set when no explicit task reference is present.'
+            f'\ntext={text!r}'
+        )
+
+    def test_negative_empty_and_whitespace(self):
+        """Empty and whitespace-only input must return an empty set."""
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        assert find_present_tense_completion_claim_task_ids('') == set(), (
+            'Expected empty set for empty string.'
+        )
+        assert find_present_tense_completion_claim_task_ids('   \n  ') == set(), (
+            'Expected empty set for whitespace-only string.'
+        )
