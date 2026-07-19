@@ -1033,7 +1033,7 @@ def _resolve_eval_task_paths(base_config, tasks_dir: Path | None) -> list[Path]:
     """
     tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
     if not tasks_dir.exists():
-        tasks_dir = base_config.project_root / 'orchestrator' / 'evals' / 'tasks'
+        tasks_dir = Path(base_config.project_root) / 'orchestrator' / 'evals' / 'tasks'
     # Loud validation (malformed fixture → named ClickException) + emptiness guard.
     if not _load_fixture_dir(tasks_dir):
         click.echo(f'No eval fixtures found in {tasks_dir}', err=True)
