@@ -44,6 +44,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.middleware.operational_routing_guard import OPERATIONAL_LLM_GATE_MARKER_KEY
+from fused_memory.middleware.task_curator import CuratorDecision, TaskCurator
 from fused_memory.server.tools import create_mcp_server
 
 
@@ -159,6 +160,55 @@ async def _get_task_meta(server, root: str, task_id: str) -> dict:
     )
     assert 'error' not in result, f'get_task failed unexpectedly: {result!r}'
     return result['metadata']
+
+
+async def _submit_normal_and_get(
+    stack: tuple, root: str, metadata: dict, monkeypatch: pytest.MonkeyPatch,
+) -> dict:
+    """Drive a NORMAL (non-planning_mode) submit_task -> resolve_ticket ->
+    get_task round-trip, with the curator neutralized to a no-op 'create'.
+
+    Monkeypatches ``TaskCurator.curate`` at the CLASS level to an async stub
+    that always returns a plain ``action='create'`` decision carrying no
+    corpus/LLM-derived routing opinion of its own. Patching the class
+    (rather than a specific instance) matters because the interceptor's
+    curator is lazily constructed inside the ticket worker
+    (``TaskInterceptor._get_curator``) AFTER this helper runs — patching the
+    class before the submit call means whichever instance ``_get_curator``
+    goes on to build still resolves ``.curate`` through the patched class
+    attribute, so a REAL ``TaskCurator`` is still consulted (proving the
+    boundary — not a merely-absent curator — is what coerces the result).
+    This isolates the submit-boundary coercion (``inject_operational_routing``,
+    task β) as the SOLE possible source of a deterministic pure-gate
+    ``task_kind`` on this path: a no-op 'create' decision carries no routing
+    opinion of its own.
+    """
+    async def _neutral_curate(self, candidate, project_id, project_root):
+        return CuratorDecision(action='create', justification='ζ-test-neutralized')
+
+    monkeypatch.setattr(TaskCurator, 'curate', _neutral_curate)
+
+    server, _interceptor = stack
+    submit_result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Zeta boundary probe: normal submit',
+            'description': 'Normal (non-planning_mode) submission for the ζ boundary matrix.',
+            'metadata': metadata,
+        },
+    )
+    assert 'error' not in submit_result, f'submit_task failed unexpectedly: {submit_result!r}'
+    ticket = submit_result['ticket']
+
+    resolved = await server._tool_manager.call_tool(
+        'resolve_ticket',
+        {'ticket': ticket, 'project_root': root, 'timeout_seconds': 30},
+    )
+    assert resolved.get('status') == 'created', f'resolve_ticket did not create: {resolved!r}'
+    task_id = resolved['task_id']
+
+    return await _get_task_meta(server, root, task_id)
 
 
 # ---------------------------------------------------------------------------
