@@ -27,13 +27,24 @@ inventory this closes):
     through a single-agent fast path). Eval fixtures must route through the
     full architect+implementer path deterministically, regardless of how a
     given fixture's description happens to read.
-
-NOTE for a future task (ε, D8): the fused-memory endpoint override (pointing
-eval writes at a null/recording sink instead of the real dark_factory memory
-store) belongs here too — add a ``fused_memory.url``-style entry to
-EVAL_PROFILE when that task lands. Until then, the parity tripwire
-(test_eval_profile.py) asserts against ``set(EVAL_PROFILE)``, so adding a key
-here auto-extends the tripwire with no separate test edit.
+  - ``fused_memory.url`` (ε, D8): production defaults to the real dark_factory
+    memory endpoint (``http://localhost:8002``). Every orchestrator-side eval
+    memory write (``TaskWorkflow._write_completion_to_memory`` /
+    ``_write_decisions_to_memory`` / ``_write_suggestions_to_memory``) POSTs
+    raw httpx to ``{self.mcp.url}/mcp/``, where
+    ``self.mcp = _EvalMcpStub(orch_config.fused_memory.url)`` — so an
+    un-isolated green eval run would write observations/decisions/suggestions
+    into PRODUCTION dark_factory memory. This one profiled leaf neutralizes
+    every such write at once: ``http://127.0.0.1:1`` is a non-routable null
+    sentinel that fast-fails with an immediate ECONNREFUSED (no slow
+    DNS/timeout) and can never be production. This is the safe DEFAULT — the
+    CLI/default eval path picks it up with zero extra wiring. A caller that
+    wants to CAPTURE the intended writes (Boundary test B5, integration gate ι,
+    or an operator) starts a ``RecordingMemorySink`` and passes its ``.url`` as
+    ``build_eval_orch_config(..., memory_endpoint=...)`` /
+    ``run_eval(..., memory_endpoint=...)`` (runner.py), which layers over this
+    null-sentinel default so the real writes are recorded and the production
+    write-count delta stays 0.
 """
 
 from __future__ import annotations
@@ -46,12 +57,13 @@ from orchestrator.config import OrchestratorConfig
 # paths matching orchestrator.config._iter_leaves's output 1:1 (e.g.
 # 'unblock_auto.enabled'), so the parity tripwire can assert
 # `_changed_leaf_paths(...) == set(EVAL_PROFILE)` verbatim.
-EVAL_PROFILE: dict[str, bool] = {
+EVAL_PROFILE: dict[str, bool | str] = {
     'rebase_before_verify': False,     # D3 — no mid-eval rebase onto live main
     'inter_iteration_rebase': False,   # D3 — same
     'unblock_auto.enabled': False,     # D4 — no unmetered $5 dry-run per block
     'auto_eval_enabled': False,        # eval never re-triggers itself
     'simple_task_enabled': False,      # fixtures route through the full path deterministically
+    'fused_memory.url': 'http://127.0.0.1:1',  # D8 — non-routable null sentinel; immediate ECONNREFUSED, never production
 }
 
 
