@@ -2369,6 +2369,55 @@ task, include it with an empty "files" list rather than omitting it.
         )
         (entry / '.task' / name).unlink(missing_ok=True)
 
+    def _adopt_recovered_session(self, entry: Path, task_id: str | None) -> str | None:
+        """Best-effort adopt an `agent_session.json` sidecar into
+        ``_recovered_sessions`` (task 2772, session-resume beta).
+
+        Resolves the sidecar via :meth:`_resolve_recovery_artifact` (INV-5 —
+        reuse the resolver rather than duplicating new-then-old path logic)
+        and reads it as a RAW dict: ``_run_slot`` pops
+        ``_recovered_sessions[assignment.task_id]`` and passes it straight
+        through as ``resume_session_id`` (typed ``dict | None``), and
+        ``TaskWorkflow.__init__`` consumes it via
+        ``.get('session_id')/.get('role')/.get('resume_count')`` — there is
+        no ``TaskArtifacts`` instance during recovery to read a typed
+        ``AgentSession`` through.
+
+        Keying: when *task_id* is given (the plan-present sites, keyed by
+        the plan-derived recovery id) it is used directly — this covers both
+        a v2 sidecar (whose own ``task_id`` should equal it) and a v1
+        sidecar (which has no ``task_id`` of its own, B11 fallback). When
+        *task_id* is ``None`` (the no-plan lane site, which has no
+        plan-derived id) falls back to the sidecar's own v2 ``task_id``. If
+        neither yields a usable key (a v1 sidecar on a no-plan lane) — or the
+        sidecar is missing/unreadable — nothing is adopted and ``None`` is
+        returned. Never raises.
+
+        Returns the adopted key, or ``None`` if nothing was adopted.
+        """
+        sidecar_path = self._resolve_recovery_artifact(entry, 'agent_session.json')
+        if not sidecar_path.exists():
+            return None
+        try:
+            session_data = json.loads(sidecar_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                'Recovery: %s sidecar unreadable (%s) — not adopting session',
+                entry.name, e,
+            )
+            return None
+        key = task_id if task_id is not None else session_data.get('task_id')
+        if not key:
+            return None
+        key = str(key)
+        self._recovered_sessions[key] = session_data
+        logger.info(
+            'Recovery: adopting agent session for task %s (role=%s, '
+            'session_id=%s) — will --resume on re-dispatch',
+            key, session_data.get('role'), session_data.get('session_id'),
+        )
+        return key
+
     async def _recover_crashed_tasks(self) -> None:
         """Scan surviving worktrees and recover plans with completed work.
 
@@ -2945,6 +2994,7 @@ task, include it with an empty "files" list rather than omitting it.
                 f'{len(completed)}/{total} steps done — storing for resumption'
             )
             self._recovered_plans[recovery_id] = plan
+            self._adopt_recovered_session(entry, recovery_id)
             # Clear stale plan.lock so the new session doesn't immediately requeue
             lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
             if lock_path.exists():
