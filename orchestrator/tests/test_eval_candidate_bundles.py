@@ -62,3 +62,65 @@ class TestClaudeEndpointCandidatesRoster:
         models = {c.model for c in incumbents}
         assert 'opus' in models
         assert 'sonnet' in models
+
+
+class TestEndpointAuthEnvContract:
+    """Non-incumbent bundles carry a real endpoint+auth env contract;
+    incumbent bundles stay proxy-free (native cloud, no proxy)."""
+
+    def _non_incumbents(self):
+        from orchestrator.evals.configs import (
+            DEEPSEEK_MODEL,
+            GLM_MODEL,
+            KIMI_MODEL,
+            MINIMAX_MODEL,
+            claude_endpoint_candidates,
+        )
+
+        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        return [c for c in claude_endpoint_candidates() if c.model in non_incumbent_models]
+
+    def test_non_incumbents_carry_claude_backend_and_env_contract(self):
+        non_incumbents = self._non_incumbents()
+        assert non_incumbents
+        for c in non_incumbents:
+            assert c.backend == 'claude'
+            assert c.env_overrides.get('ANTHROPIC_BASE_URL', '').startswith('https://')
+            assert 'ANTHROPIC_AUTH_TOKEN' in c.env_overrides
+
+    def test_non_incumbent_base_urls_carry_the_provider_domain(self):
+        from orchestrator.evals.configs import (
+            DEEPSEEK_MODEL,
+            GLM_MODEL,
+            KIMI_MODEL,
+            MINIMAX_MODEL,
+        )
+
+        expected_domain = {
+            MINIMAX_MODEL: 'minimax',
+            GLM_MODEL: 'z.ai',
+            DEEPSEEK_MODEL: 'deepseek',
+            KIMI_MODEL: 'moonshot',
+        }
+        for c in self._non_incumbents():
+            assert expected_domain[c.model] in c.env_overrides['ANTHROPIC_BASE_URL']
+
+    def test_monkeypatched_auth_token_env_flows_into_env_overrides(self, monkeypatch):
+        from orchestrator.evals.configs import (
+            DEEPSEEK_AUTH_TOKEN_ENV,
+            DEEPSEEK_MODEL,
+            claude_endpoint_candidates,
+        )
+
+        monkeypatch.setenv(DEEPSEEK_AUTH_TOKEN_ENV, 'patched-token-xyz')
+        candidates = claude_endpoint_candidates()
+        bundle = next(c for c in candidates if c.model == DEEPSEEK_MODEL)
+        assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == 'patched-token-xyz'
+
+    def test_incumbents_have_no_env_overrides(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        incumbents = [c for c in claude_endpoint_candidates() if c.model in ('opus', 'sonnet')]
+        assert incumbents
+        assert all(c.backend == 'claude' for c in incumbents)
+        assert all(not c.env_overrides for c in incumbents)
