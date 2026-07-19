@@ -23,6 +23,30 @@ AUTOPILOT_VIDEO_PROJECT_ID: str = 'autopilot_video'
 # (evidence: memory fccfa232-16fe-404a-880a-8eca32eb974e)
 AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED: bool = True
 
+# Stage-1 task-ID "contamination ceiling" retired-by-design for autopilot_video.
+#
+# The old Stage-1 task-ID contamination ceiling (the 606 -> 610 -> 612 -> 613 ->
+# 621 -> 637 -> 644 manual-bump ritual that aborted/suppressed task actions once
+# the highest task ID crossed a hand-maintained threshold) is RETIRED (task 2818
+# decision B; the live guardrail memories were retired 2026-07-19).
+#
+# It was a 2026-05 stopgap for a real cross-project-contamination bug that has
+# since been fixed STRUCTURALLY by task 1143 (commit 8a9609f652).  Real
+# protection is now:
+#   1. structural project isolation (per-project stores / routing),
+#   2. the ``DarkFactoryPathScopeViolation`` path-scope guard that rejects
+#      mis-routed task writes at the API level, and
+#   3. content-based ``flag_type='cross_project'`` routing (contamination is
+#      identified by cited file paths/modules belonging to another repo).
+# NONE of these depend on task-ID magnitude — high IDs are normal project growth.
+#
+# As a result the ABSENCE (or staleness) of a contamination-ceiling guardrail
+# memory is the CORRECT state for this project.  Stage 3 findings asserting that
+# such a guardrail memory is missing or stale are therefore false positives and
+# must be suppressed (see ``filter_contamination_ceiling_findings`` in
+# ``flag_dedup.py`` for the code-side backstop).
+AUTOPILOT_VIDEO_CONTAMINATION_CEILING_RETIRED: bool = True
+
 # Prompt fragment injected by build_stage2_system_prompt() only when
 # project_id == AUTOPILOT_VIDEO_PROJECT_ID.  Content-based: cross-project
 # contamination is detected by cited file paths/modules belonging to another
