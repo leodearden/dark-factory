@@ -1034,8 +1034,11 @@ def _stratified_random_order(by_stratum: dict, *, rng: random.Random) -> list:
 def default_batch_source(cfg, *, projects_root, now: datetime,
                           batch_size: int = _DEFAULT_CENSUS_BATCH_SIZE, rng=None):
     """Real stratified-RANDOM batch_source: enumerate every session across
-    the census window (:func:`_census_window_dates`) under *projects_root*
-    matching *cfg*'s ``cwd_prefixes``, score + classify each (mirrors
+    the census window's inclusive ``[start, end]`` date range
+    (:func:`_census_window_dates` first/last) in ONE walk via
+    :func:`inventory.enumerate_sessions_in_range` — O(total_files), not
+    O(window_days × files) — under *projects_root* matching *cfg*'s
+    ``cwd_prefixes``, score + classify each (mirrors
     ``nightly.select_scored_records``'s one-pass loop), interleave into a
     random cross-stratum order, and lazily render each session to a digest
     via ``digest.build_digest`` one ``batch_size``-sized batch at a time.
@@ -1049,17 +1052,23 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
     """
     rng = rng if rng is not None else random.Random()
 
+    # _census_window_dates always returns a non-empty list (even its span<0
+    # branch returns [end_date]), so window[0]/window[-1] are always safe.
+    # The inclusive [start, end] range predicate yields the same record set as
+    # the per-date union — each file matches at most one date — but walks the
+    # tree ONCE (O(total_files), not O(window_days × files)).
+    window = _census_window_dates(cfg.project_root, now=now)
+    start_date, end_date = window[0], window[-1]
     scored = []
-    for target_date in _census_window_dates(cfg.project_root, now=now):
-        for session in inventory.enumerate_sessions(
-            projects_root, cfg.cwd_prefixes, target_date,
-            agent_transcript_roots=inventory.resolve_agent_transcript_roots(
-                cfg.project_root, cfg.agent_transcript_roots
-            ),
-        ):
-            counts, first_turn = sampling._score_and_find_first_turn(session.path)
-            stratum = sampling.classify_agent_class(first_turn, session.path)
-            scored.append(sampling.ScoredRecord(session=session, stratum=stratum, counts=counts))
+    for session in inventory.enumerate_sessions_in_range(
+        projects_root, cfg.cwd_prefixes, start_date, end_date,
+        agent_transcript_roots=inventory.resolve_agent_transcript_roots(
+            cfg.project_root, cfg.agent_transcript_roots
+        ),
+    ):
+        counts, first_turn = sampling._score_and_find_first_turn(session.path)
+        stratum = sampling.classify_agent_class(first_turn, session.path)
+        scored.append(sampling.ScoredRecord(session=session, stratum=stratum, counts=counts))
 
     by_stratum: dict[str, list] = {}
     for record in scored:
