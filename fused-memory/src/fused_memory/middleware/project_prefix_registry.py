@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fused_memory.models.scope import resolve_project_id
+from fused_memory.models.scope import resolve_project_id_for_root
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ class ProjectPrefixRegistry:
 
         for raw in roots:
             root_path = Path(str(raw)).resolve()
-            project_id = resolve_project_id(str(root_path))
+            project_id = resolve_project_id_for_root(str(root_path))
             if project_id in project_to_root:
                 logger.warning(
                     'project_prefix_registry: duplicate project_id %r '

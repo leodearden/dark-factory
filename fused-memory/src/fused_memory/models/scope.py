@@ -24,10 +24,12 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import NewType
 
+import yaml
 from pydantic import BaseModel, field_validator
 
 from fused_memory.utils.validation import (
     InputValidationError,
+    PathShapedProjectIdError,
     _to_underscore_canonical,
     canonicalize_project_id,
     require_project_root,
@@ -43,6 +45,12 @@ logger = logging.getLogger(__name__)
 # tracked followup is to promote this to a neutrally-named env var with a
 # deprecation period.
 KNOWN_PROJECT_ROOTS_ENV: str = 'DASHBOARD_KNOWN_PROJECT_ROOTS'
+
+# Canonical project-manifest filename every DF-targeted project exposes at
+# its root (see CLAUDE.md "Repo Map").  ``read_declared_project_id`` reads
+# only the ``project_id`` key from this one file — no legacy config-name
+# fallbacks, no orchestrator-package import.
+ORCHESTRATOR_CONFIG_NAME: str = 'dark-factory-orchestrator.yaml'
 
 # Cache of input-path -> main-working-tree path, keyed by the absolute,
 # resolved input path. Populated lazily by resolve_main_checkout so repeated
@@ -169,6 +177,92 @@ def resolve_project_id(
     return _to_underscore_canonical(name)
 
 
+def read_declared_project_id(project_root: str | Path) -> str | None:
+    """Return the project_id declared in ``<project_root>`` 's manifest, or None.
+
+    Reads only the top-level ``project_id`` key from
+    ``<project_root>/dark-factory-orchestrator.yaml`` (the canonical
+    project-manifest filename — no legacy fallbacks, no orchestrator-package
+    import), normalizing a non-empty string value via the same
+    ``_to_underscore_canonical`` rule :func:`resolve_project_id` uses so a
+    declared id and a basename-derived id share one canonicalization source
+    of truth.
+
+    Strictly **fail-open**: this NEVER raises.  A missing manifest,
+    unparseable YAML (including invalid non-UTF-8 bytes, whose
+    ``UnicodeDecodeError`` is a ``ValueError`` subclass rather than an
+    ``OSError``/``yaml.YAMLError``), a non-mapping document, a
+    missing/non-string/empty ``project_id``, or a path-shaped declared value
+    (one containing a path separator or a leading ``-``/``/`` — something
+    :func:`resolve_project_id` could never produce from a basename) all
+    return ``None`` so callers degrade to today's basename derivation —
+    mirroring :func:`build_known_projects_map`'s
+    must-not-raise-during-startup contract (both registries are built once at
+    process start).  A parse error is debug-logged, not surfaced.
+
+    This is what makes the id rename-stable: a project whose directory was
+    renamed but whose manifest still declares the original id resolves to the
+    declared id, not the new basename.
+    """
+    manifest = Path(project_root) / ORCHESTRATOR_CONFIG_NAME
+    try:
+        with open(manifest, encoding='utf-8') as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (a ValueError subclass, not an OSError/
+        # yaml.YAMLError) is raised by yaml.safe_load when the manifest holds
+        # invalid UTF-8 bytes; catch it too so the never-raise contract holds.
+        logger.debug(
+            'read_declared_project_id: cannot read %s: %s', manifest, exc,
+        )
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    declared = data.get('project_id')
+    if not isinstance(declared, str) or not declared:
+        return None
+    # The declared value is raw operator-supplied input, so canonicalize it
+    # through canonicalize_project_id's path-shape guard (NOT the bare
+    # _to_underscore_canonical resolve_project_id applies to an already-
+    # extracted basename): a value with a path separator or leading '-'/'/'
+    # is something resolve_project_id could never produce, so reject it and
+    # fail open to basename derivation instead of registering a nonsensical
+    # id.  canonicalize_project_id delegates to the same _to_underscore_canonical
+    # rule for every non-path-shaped value, so declared and derived ids still
+    # share one canonicalization source of truth.
+    try:
+        return canonicalize_project_id(declared)
+    except PathShapedProjectIdError as exc:
+        logger.debug(
+            'read_declared_project_id: declared project_id %r in %s is '
+            'path-shaped; ignoring (falling back to basename): %s',
+            declared, manifest, exc,
+        )
+        return None
+
+
+def resolve_project_id_for_root(project_root: str | Path) -> str:
+    """Rename-stable project_id resolver: manifest-declared id first.
+
+    Returns the id declared in ``<project_root>/dark-factory-orchestrator.yaml``
+    (via :func:`read_declared_project_id`) when present, else falls back to
+    the pure basename derivation of :func:`resolve_project_id`.  This is the
+    resolver the two registry BUILDERS
+    (:func:`build_known_projects_map` and
+    :class:`~fused_memory.middleware.project_prefix_registry.ProjectPrefixRegistry.from_roots`)
+    use so a directory rename that preserves the manifest's ``project_id``
+    re-points them to the new path under the SAME id instead of churning.
+
+    :func:`resolve_project_id` itself is intentionally left unchanged (still a
+    pure, no-I/O basename derivation) so its many hot-path callers are
+    unaffected.
+    """
+    return read_declared_project_id(project_root) or resolve_project_id(
+        str(project_root)
+    )
+
+
 def known_project_roots_from_env(
     env_var: str = KNOWN_PROJECT_ROOTS_ENV,
 ) -> list[str]:
@@ -217,7 +311,7 @@ def build_known_projects_map(
                 'build_known_projects_map: cannot resolve %r: %s', raw, exc,
             )
             continue
-        pid = resolve_project_id(resolved)
+        pid = resolve_project_id_for_root(resolved)
         if pid in out:
             # Duplicate project_id — primary wins (since it was added
             # first).  Extras with a clashing name are dropped silently

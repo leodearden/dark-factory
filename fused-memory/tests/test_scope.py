@@ -1,5 +1,7 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,7 +10,9 @@ from fused_memory.models.scope import (
     Scope,
     build_known_projects_map,
     known_project_roots_from_env,
+    read_declared_project_id,
     resolve_project_id,
+    resolve_project_id_for_root,
 )
 
 
@@ -52,6 +56,186 @@ class TestResolveProjectId:
     def test_hyphens_and_case_combined(self):
         """Hyphens replaced and lowercased."""
         assert resolve_project_id('/srv/My-Cool-App') == 'my_cool_app'
+
+
+class TestReadDeclaredProjectId:
+    """read_declared_project_id reads the manifest-declared project_id from
+    `<root>/dark-factory-orchestrator.yaml`, normalizing it with the same
+    underscore-canonical rule as resolve_project_id, and fails open (returns
+    None, never raises) on any error or absent/ill-typed key.
+
+    This is what makes project_id rename-stable: a directory whose basename
+    differs from its declared manifest id (the exact shape produced by a
+    project-dir rename) resolves to the DECLARED id, not the basename.
+    """
+
+    def _write_manifest(self, root: Path, body: str) -> None:
+        (root / 'dark-factory-orchestrator.yaml').write_text(body)
+
+    def test_declared_id_wins_over_basename(self, tmp_path):
+        """A dir named `solar-challenge` whose manifest declares
+        project_id my_solar_challenge resolves to 'my_solar_challenge'
+        (declared id), NOT the basename-derived 'solar_challenge'."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "my_solar_challenge"\n')
+        assert read_declared_project_id(str(d)) == 'my_solar_challenge'
+        # sanity: this is genuinely different from the basename derivation.
+        assert resolve_project_id(str(d)) == 'solar_challenge'
+
+    def test_accepts_path_argument(self, tmp_path):
+        """Signature is `str | Path` — a Path argument works too."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "my_solar_challenge"\n')
+        assert read_declared_project_id(d) == 'my_solar_challenge'
+
+    def test_hyphenated_declared_value_is_normalized(self, tmp_path):
+        """A hyphenated declared value normalizes with the same
+        _to_underscore_canonical rule resolve_project_id uses."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "my-solar-challenge"\n')
+        assert read_declared_project_id(str(d)) == 'my_solar_challenge'
+
+    # --- fail-open cases: each returns None, never raises ---
+
+    def test_missing_manifest_returns_none(self, tmp_path):
+        d = tmp_path / 'no-manifest'
+        d.mkdir()
+        assert read_declared_project_id(str(d)) is None
+
+    def test_missing_directory_returns_none(self, tmp_path):
+        """A project_root that does not exist at all fails open to None."""
+        assert read_declared_project_id(str(tmp_path / 'does_not_exist')) is None
+
+    def test_malformed_yaml_returns_none(self, tmp_path):
+        d = tmp_path / 'bad-yaml'
+        d.mkdir()
+        # Unclosed flow mapping — yaml.safe_load raises yaml.YAMLError.
+        self._write_manifest(d, '{ project_id: "x"\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_not_a_mapping_returns_none(self, tmp_path):
+        d = tmp_path / 'list-yaml'
+        d.mkdir()
+        # Valid YAML, but the top-level document is a list, not a mapping.
+        self._write_manifest(d, '- a\n- b\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_scalar_yaml_returns_none(self, tmp_path):
+        d = tmp_path / 'scalar-yaml'
+        d.mkdir()
+        # Valid YAML that parses to a bare scalar string, not a mapping.
+        self._write_manifest(d, 'just a scalar\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_empty_yaml_returns_none(self, tmp_path):
+        d = tmp_path / 'empty-yaml'
+        d.mkdir()
+        # Empty file → yaml.safe_load returns None (not a mapping).
+        self._write_manifest(d, '')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_no_project_id_key_returns_none(self, tmp_path):
+        d = tmp_path / 'no-key'
+        d.mkdir()
+        self._write_manifest(d, 'some_other_key: value\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_non_string_project_id_returns_none(self, tmp_path):
+        d = tmp_path / 'int-id'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: 123\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_null_project_id_returns_none(self, tmp_path):
+        d = tmp_path / 'null-id'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: null\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_empty_string_project_id_returns_none(self, tmp_path):
+        d = tmp_path / 'empty-id'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: ""\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_invalid_utf8_bytes_returns_none(self, tmp_path):
+        """A manifest containing invalid (non-UTF-8) bytes fails open to None
+        rather than letting UnicodeDecodeError — a ValueError subclass that is
+        NOT an OSError or yaml.YAMLError — escape the never-raise contract and
+        crash startup."""
+        d = tmp_path / 'bad-bytes'
+        d.mkdir()
+        # 0xff/0xfe are not valid UTF-8; yaml.safe_load raises
+        # UnicodeDecodeError while decoding the opened stream.
+        (d / 'dark-factory-orchestrator.yaml').write_bytes(
+            b'project_id: "\xff\xfe not utf-8"\n',
+        )
+        assert read_declared_project_id(str(d)) is None
+
+    def test_path_separator_in_declared_value_returns_none(self, tmp_path):
+        """A declared value containing a path separator (something
+        resolve_project_id could never produce — it extracts a basename first)
+        is rejected via canonicalize_project_id's path-shape guard, failing
+        open to None so the caller degrades to basename derivation instead of
+        registering a nonsensical slash-bearing id."""
+        d = tmp_path / 'weird'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "foo/bar"\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_leading_dash_declared_value_returns_none(self, tmp_path):
+        """A path-shaped (leading '-', i.e. a mangled absolute path) declared
+        value is likewise rejected and fails open to None."""
+        d = tmp_path / 'weird2'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "-home-leo-src-x"\n')
+        assert read_declared_project_id(str(d)) is None
+
+
+class TestResolveProjectIdForRoot:
+    """resolve_project_id_for_root is the rename-stable resolver:
+    manifest-declared id first, pure basename derivation as the fallback."""
+
+    def test_declared_id_wins(self, tmp_path):
+        """A dir named `solar-challenge` whose manifest declares
+        project_id my_solar_challenge resolves to 'my_solar_challenge'."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        (d / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "my_solar_challenge"\n',
+        )
+        assert resolve_project_id_for_root(str(d)) == 'my_solar_challenge'
+
+    def test_basename_fallback_no_manifest(self, tmp_path):
+        """A dir with NO manifest resolves to the basename derivation,
+        identical to resolve_project_id — back-compat for every project
+        that does not declare an id."""
+        d = tmp_path / 'foo-bar'
+        d.mkdir()
+        assert resolve_project_id_for_root(str(d)) == 'foo_bar'
+        assert resolve_project_id_for_root(str(d)) == resolve_project_id(str(d))
+
+    def test_basename_fallback_manifest_without_project_id(self, tmp_path):
+        """A manifest present but lacking a project_id key still falls back
+        to the basename derivation."""
+        d = tmp_path / 'foo-bar'
+        d.mkdir()
+        (d / 'dark-factory-orchestrator.yaml').write_text('other_key: 1\n')
+        assert resolve_project_id_for_root(str(d)) == 'foo_bar'
+
+    def test_basename_fallback_path_shaped_declared_value(self, tmp_path):
+        """A manifest whose declared id is path-shaped (rejected by
+        read_declared_project_id) falls back to the basename derivation rather
+        than propagating the nonsensical value."""
+        d = tmp_path / 'foo-bar'
+        d.mkdir()
+        (d / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "foo/bar"\n',
+        )
+        assert resolve_project_id_for_root(str(d)) == 'foo_bar'
 
 
 class TestKnownProjectRootsFromEnv:
@@ -146,6 +330,29 @@ class TestBuildKnownProjectsMap:
             'reify': str(a.resolve()),
             'dark_factory': str(b.resolve()),
         }
+
+    def test_renamed_dir_registers_under_declared_manifest_id(self, tmp_path):
+        """Core guard: a directory whose basename (`solar-challenge`) differs
+        from the project_id declared in its manifest (`my_solar_challenge`)
+        registers under the DECLARED id — re-pointing the recon registry to
+        the new path under the SAME id after a rename, instead of orphaning
+        the records under the basename-derived 'solar_challenge'.
+        """
+        renamed = tmp_path / 'solar-challenge'
+        renamed.mkdir()
+        (renamed / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "my_solar_challenge"\n',
+        )
+        # Back-compat: a project that declares no id still keys by basename.
+        plain = tmp_path / 'plain-proj'
+        plain.mkdir()
+
+        result = build_known_projects_map(
+            '', extra_roots=[str(renamed), str(plain)],
+        )
+        assert result['my_solar_challenge'] == str(renamed.resolve())
+        assert 'solar_challenge' not in result
+        assert result['plain_proj'] == str(plain.resolve())
 
 
 class TestScopeCanonicalizesProjectId:
