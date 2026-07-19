@@ -117,6 +117,33 @@ class TestEndpointAuthEnvContract:
         bundle = next(c for c in candidates if c.model == DEEPSEEK_MODEL)
         assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == 'patched-token-xyz'
 
+    def test_missing_auth_token_env_yields_empty_token_and_logs_a_warning(
+        self, monkeypatch, caplog,
+    ):
+        """An operator who forgot to export the provider's token env var gets
+        a loud build-time WARNING, not a silent well-formed-looking bundle
+        that only fails as an opaque 401 mid-run (loud-over-silent-degradation).
+        """
+        import logging
+
+        from orchestrator.evals.configs import (
+            DEEPSEEK_AUTH_TOKEN_ENV,
+            DEEPSEEK_MODEL,
+            claude_endpoint_candidates,
+        )
+
+        monkeypatch.delenv(DEEPSEEK_AUTH_TOKEN_ENV, raising=False)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            candidates = claude_endpoint_candidates()
+        bundle = next(c for c in candidates if c.model == DEEPSEEK_MODEL)
+
+        assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == ''
+        assert any(
+            record.levelno == logging.WARNING
+            and DEEPSEEK_AUTH_TOKEN_ENV in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_incumbents_have_no_env_overrides(self):
         from orchestrator.evals.configs import claude_endpoint_candidates
 

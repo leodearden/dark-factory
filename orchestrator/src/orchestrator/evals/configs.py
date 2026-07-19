@@ -7,10 +7,13 @@ resolve ``cost_source == 'price_table'`` instead of falling back to
 ``'unpriced_proxy'``.
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 
 from orchestrator.config import default_price_table
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -573,12 +576,26 @@ def _claude_endpoint_config(
     *auth_token_env* via ``os.environ.get`` at CALL time (never baked into
     source as a secret), so an operator supplies it via the environment and a
     test can monkeypatch it and observe the value flow through.
+
+    An unset/empty *auth_token_env* is loud, not silent: unlike
+    ``_vllm_config``'s constant ``'dummy'`` key (intentional — vLLM ignores
+    it), a missing token HERE means the run cannot authenticate against the
+    provider at all, so a WARNING is logged at build time rather than only
+    surfacing later as an opaque 401/auth error mid-run.
     """
+    auth_token = os.environ.get(auth_token_env, '')
+    if not auth_token:
+        logger.warning(
+            "ν candidate %r: %s is not set in the environment — "
+            "ANTHROPIC_AUTH_TOKEN will be empty and the %s endpoint will "
+            "reject the request (401/auth error) once the run reaches it.",
+            name, auth_token_env, base_url,
+        )
     return EvalConfig(
         name=name, backend='claude', model=model, effort='high',
         env_overrides={
             'ANTHROPIC_BASE_URL': base_url,
-            'ANTHROPIC_AUTH_TOKEN': os.environ.get(auth_token_env, ''),
+            'ANTHROPIC_AUTH_TOKEN': auth_token,
         },
     )
 
