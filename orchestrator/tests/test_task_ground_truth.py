@@ -28,7 +28,7 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
@@ -302,16 +302,35 @@ def _fake_git_ops(
     is_ancestor: bool = False,
     branch_sha: str | None = None,
     marker_sha: str | None = None,
+    citation_sha: str | None = None,
+    commit_citation_pattern: str | None = None,
 ) -> MagicMock:
     """A minimal git_ops double exposing exactly the async surface
     TaskGroundTruth's branch-state archaeology consumes, plus the
-    ``config.branch_prefix`` / ``config.main_branch`` attributes it derives
-    the branch name and main-ref from."""
+    ``config.branch_prefix`` / ``config.main_branch`` /
+    ``config.commit_citation_pattern`` attributes it derives the branch name,
+    main-ref, and citation pattern from.
+
+    ``citation_sha`` stubs ``find_task_citation_commit`` — the positive-citation
+    attribution guard the ON_MAIN git-archaeology fast-path applies (task 2787).
+    Defaults to ``None`` (no commit on main cites the task), which the guard
+    treats as a non-attributable trivial-ancestor branch (EXISTS_OFF_MAIN).
+
+    ``commit_citation_pattern`` sets ``config.commit_citation_pattern``. Defaults
+    to ``None`` (real default: use the built-in pattern, guard active). Set to
+    ``''`` to model a project that has EXPLICITLY disabled citations — the guard
+    then short-circuits to the pre-2787 legacy ON_MAIN(branch tip) classification
+    (task 2787 amendment)."""
     git_ops = MagicMock()
-    git_ops.config = MagicMock(branch_prefix=branch_prefix, main_branch=main_branch)
+    git_ops.config = MagicMock(
+        branch_prefix=branch_prefix,
+        main_branch=main_branch,
+        commit_citation_pattern=commit_citation_pattern,
+    )
     git_ops.is_ancestor = AsyncMock(return_value=is_ancestor)
     git_ops.resolve_branch_sha = AsyncMock(return_value=branch_sha)
     git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
+    git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     return git_ops
 
 
@@ -385,16 +404,121 @@ class TestDeriveTruthBranchStateGitFallback:
     shapes, with ``find_merge_marker`` consulted only on the branch-gone
     path."""
 
-    async def test_ancestor_true_resolves_on_main_via_branch_tip(self) -> None:
-        git_ops = _fake_git_ops(is_ancestor=True, branch_sha='tipsha123')
+    async def test_ancestor_true_with_citation_resolves_on_main_via_citation(self) -> None:
+        """task 2787 corrected contract: a branch that is an ancestor of main
+        AND carries a positive on-main citation tied to the branch resolves
+        ON_MAIN with the CITATION sha (the authoritative landing commit) — not
+        the raw branch tip. The FIX 2 bidirectional is_ancestor lineage guard
+        is applied to the citation, mirroring validate_landing_evidence
+        DISCOVERY mode."""
+        citation_sha = 'cafefeed' + 'b' * 32
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha='tipsha123', citation_sha=citation_sha,
+        )
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('7')
+
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, citation_sha)
+        git_ops.find_task_citation_commit.assert_awaited_once()
+        # is_ancestor is now awaited twice: once for (branch, main), once for
+        # the citation lineage check (citation, branch) — which short-circuits
+        # the `or` on its first (True) arm.
+        assert git_ops.is_ancestor.await_count == 2
+        git_ops.is_ancestor.assert_has_awaits(
+            [call('task/7', 'main'), call(citation_sha, 'task/7')],
+            any_order=True,
+        )
+        # The ON_MAIN fast-path no longer consults the raw branch tip.
+        git_ops.resolve_branch_sha.assert_not_awaited()
+        git_ops.find_merge_marker.assert_not_awaited()
+
+    async def test_ancestor_true_no_citation_resolves_exists_off_main(self) -> None:
+        """task 2787 regression: a branch trivially an ancestor of main (a
+        zero-commit tip == a FOREIGN task's merge commit — the main HEAD
+        captured at branch-create time) with NO commit on main citing this
+        task is NOT an attributable landing.  The ON_MAIN git-archaeology
+        fast-path must require a positive find_task_citation_commit hit and,
+        finding none, classify EXISTS_OFF_MAIN — never ON_MAIN carrying the
+        foreign branch tip (the 2729-stamped-with-2753's-merge recurrence).
+
+        RED on current main: the fast-path returns ON_MAIN(foreign tip)
+        unconditionally and never consults find_task_citation_commit."""
+        foreign_sha = 'fac4c813' + 'd' * 32
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha=foreign_sha, citation_sha=None,
+        )
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('2729')
+
+        assert report.branch_state == BranchState(BranchStateKind.EXISTS_OFF_MAIN)
+        git_ops.find_task_citation_commit.assert_awaited_once()
+
+    async def test_ancestor_true_citation_lineage_fails_resolves_exists_off_main(self) -> None:
+        """task 2787 amendment (test-coverage): the third outcome of the
+        attribution guard. A citation IS found on main, but the FIX 2
+        bidirectional is_ancestor lineage guard rejects it — NEITHER
+        is_ancestor(citation, branch) NOR is_ancestor(branch, citation) holds
+        (e.g. the citation is a coarse --grep pattern match on an unrelated
+        commit sharing no lineage with the branch). This must classify
+        EXISTS_OFF_MAIN, never ON_MAIN(citation) — a distinct guarded path from
+        the citation-None case above that a future refactor could silently
+        break."""
+        citation_sha = 'deadbeef' + 'c' * 32
+
+        async def _is_ancestor(a: str, b: str) -> bool:
+            # (branch, main) ancestry holds (a trivial-ancestor branch); BOTH
+            # citation-lineage directions fail.
+            return (a, b) == ('task/2729', 'main')
+
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha='tipsha123', citation_sha=citation_sha,
+        )
+        git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
+        resolver = _make_ground_truth(git_ops=git_ops)
+
+        report = await resolver.derive_truth('2729')
+
+        assert report.branch_state == BranchState(BranchStateKind.EXISTS_OFF_MAIN)
+        git_ops.find_task_citation_commit.assert_awaited_once()
+        # The `or` evaluates BOTH lineage directions when the first is False,
+        # plus the initial (branch, main) check → 3 awaits total.
+        assert git_ops.is_ancestor.await_count == 3
+        git_ops.is_ancestor.assert_has_awaits(
+            [
+                call('task/2729', 'main'),
+                call(citation_sha, 'task/2729'),
+                call('task/2729', citation_sha),
+            ],
+            any_order=True,
+        )
+        # A non-attributable citation is NOT stamped as the branch tip either.
+        git_ops.resolve_branch_sha.assert_not_awaited()
+
+    async def test_ancestor_true_citations_disabled_resolves_on_main_via_branch_tip(self) -> None:
+        """task 2787 amendment (robustness): on a project that has EXPLICITLY
+        disabled citations (empty commit_citation_pattern),
+        find_task_citation_commit always returns None, so the attribution guard
+        can never find a citation. The ON_MAIN fast-path must SHORT-CIRCUIT to
+        the pre-2787 legacy classification — ON_MAIN carrying the raw branch tip
+        — rather than misclassifying a genuinely-landed journal-miss task as
+        EXISTS_OFF_MAIN and re-dispatch-looping it. Mirrors the citation-disabled
+        degradation merge_queue._commits_already_merged documents."""
+        git_ops = _fake_git_ops(
+            is_ancestor=True, branch_sha='tipsha123', citation_sha=None,
+            commit_citation_pattern='',
+        )
         resolver = _make_ground_truth(git_ops=git_ops)
 
         report = await resolver.derive_truth('7')
 
         assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, 'tipsha123')
+        # Citations disabled → the attribution guard is skipped entirely.
+        git_ops.find_task_citation_commit.assert_not_awaited()
+        # Only the (branch, main) ancestry check runs — no citation lineage check.
         git_ops.is_ancestor.assert_awaited_once_with('task/7', 'main')
         git_ops.resolve_branch_sha.assert_awaited_once_with('task/7')
-        git_ops.find_merge_marker.assert_not_awaited()
 
     async def test_branch_exists_not_ancestor_resolves_exists_off_main(self) -> None:
         git_ops = _fake_git_ops(is_ancestor=False, branch_sha='tipsha456')

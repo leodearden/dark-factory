@@ -306,8 +306,51 @@ class TaskGroundTruth:
         # against real git for this path is deferred to θ2 wiring, per that
         # review's own suggested fix.)
         if await self.git_ops.is_ancestor(branch, main_branch):
-            sha = await self.git_ops.resolve_branch_sha(branch)
-            return BranchState(BranchStateKind.ON_MAIN, sha)
+            # ON_MAIN attribution guard (task 2787): is_ancestor(branch, main)
+            # is TRIVIALLY True for a zero-commit branch whose tip == the main
+            # HEAD captured at branch-create time (a FOREIGN task's merge
+            # commit) — resolve_branch_sha(branch) would then hand back that
+            # foreign commit as this task's "landing" sha and phantom-complete
+            # it (the 2729-stamped-with-2753's-merge recurrence). Mirror
+            # landing_evidence.validate_landing_evidence DISCOVERY mode:
+            # require a POSITIVE on-main citation for tid (find_task_citation_
+            # commit's own docstring, git_ops.py, prescribes exactly this to
+            # reject the degenerate trivial-ancestor case) plus the FIX 2
+            # bidirectional is_ancestor lineage guard tying that citation to
+            # this branch. The citation — not the raw branch tip — is the
+            # authoritative landing sha.
+            citation_pattern = self.git_ops.config.commit_citation_pattern
+            if citation_pattern == '':
+                # Citations EXPLICITLY disabled for this project (empty
+                # commit_citation_pattern — distinct from None, which selects
+                # the built-in default and keeps the guard active):
+                # find_task_citation_commit always returns None here (its own
+                # docstring, git_ops.py, short-circuits on ''), so the
+                # attribution guard below could never find a citation and would
+                # misclassify EVERY journal-miss ON_MAIN task — including a
+                # genuinely-landed one — as EXISTS_OFF_MAIN, revert it to
+                # pending, and re-dispatch-loop it until it re-lands. Retain the
+                # pre-2787 legacy ON_MAIN(branch tip) classification for
+                # citation-disabled projects: the same citation-disabled
+                # degradation merge_queue._commits_already_merged documents
+                # (merge_queue.py). dark-factory's default pattern is None, so
+                # this arm is inert on this repo.
+                sha = await self.git_ops.resolve_branch_sha(branch)
+                return BranchState(BranchStateKind.ON_MAIN, sha)
+            citation = await self.git_ops.find_task_citation_commit(
+                tid, pattern_template=citation_pattern,
+            )
+            if citation is not None and (
+                await self.git_ops.is_ancestor(citation, branch)
+                or await self.git_ops.is_ancestor(branch, citation)
+            ):
+                return BranchState(BranchStateKind.ON_MAIN, citation)
+            # Trivially-ancestor branch with no attributable citation is NOT a
+            # landing. The branch ref genuinely exists (that is how is_ancestor
+            # was evaluable), so classify EXISTS_OFF_MAIN — the recovery table
+            # then reverts an in-progress task with no live claimant to pending
+            # (re-dispatch) and leaves a blocked task alone.
+            return BranchState(BranchStateKind.EXISTS_OFF_MAIN)
 
         if await self.git_ops.resolve_branch_sha(branch) is not None:
             # Branch ref still exists but is not an ancestor of main — no
