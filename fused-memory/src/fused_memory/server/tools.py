@@ -61,6 +61,7 @@ from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     find_conflicting_task_status_ids,
+    find_present_tense_completion_claim_task_ids,
     frames_live_task_status_as_current_fact,
     is_batch_plan_framing,
     is_count_snapshot,
@@ -814,6 +815,80 @@ def create_mcp_server(
             'temporal_facts',
         }
     )
+    # Remediation hint returned alongside premature_completion_claim_write_blocked
+    # (task 2824) so a blocked recon-stage agent can self-correct: reframe a
+    # premature completion claim as aspirational/future work.
+    _PREMATURE_COMPLETION_HINT = (
+        'do not frame a task as already complete while it is still non-terminal; '
+        'rephrase to past/aspirational tense — "will land" / "planned to resolve" / '
+        '"intended to enforce" — or wait until the task is actually done/cancelled'
+    )
+    # Categories the premature-completion-claim guard (task 2824) covers — the
+    # same four the live-task-status guard (task 2628) covers.
+    # preferences_and_norms/procedural_knowledge are deliberately excluded: a norm
+    # ABOUT completion phrasing legitimately lives there. A dedicated constant
+    # (vs. reusing 2628's) keeps the two gates independently tunable.
+    _COMPLETION_CLAIM_GATED_CATEGORIES = frozenset(
+        {
+            'decisions_and_rationale',
+            'observations_and_summaries',
+            'entities_and_relations',
+            'temporal_facts',
+        }
+    )
+
+    async def _premature_completion_block(
+        content: str, agent_id: str, project_id: str
+    ) -> dict[str, Any] | None:
+        """Shared status-lookup + block computation for the add_memory /
+        add_episode premature-completion-claim gate (task 2824).
+
+        Returns a soft-block error dict when `content` frames a specific task as
+        COMPLETE in present/past tense while that task's LIVE status is confirmed
+        non-terminal; returns None (allow) otherwise. The cheap textual extractor
+        runs first, so the async status read only fires on the rare write that
+        actually contains a completion claim.
+
+        Fails OPEN — returns None — whenever the live status cannot be resolved:
+        no task_interceptor configured, project_id absent from the known_projects
+        registry, get_statuses raises, or a named task's status is unknown/absent.
+        Blocking every completion write on a transient status-read failure would
+        be worse than the occasional stale claim the manual remediation passes
+        already catch. (nonterminal_completion_claim_task_ids in task_filter.py is
+        the pure, unit-tested twin of the block computation below.)
+        """
+        named = find_present_tense_completion_claim_task_ids(content)
+        if not named:
+            return None
+        if not _taskmaster_configured or project_id not in _kp:
+            return None  # fail open: live status is unresolvable
+        try:
+            statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
+                project_root=_kp[project_id],
+                ids=[str(t) for t in sorted(named)],
+            )
+            status_map = {int(k): v for k, v in statuses.items() if str(k).isdigit()}
+            blocked = {
+                t
+                for t in named
+                if (s := status_map.get(t)) is not None and s not in TERMINAL_STATUSES
+            }
+        except Exception:
+            logger.warning(
+                'premature-completion gate: live status lookup failed; failing open',
+                exc_info=True,
+            )
+            return None
+        if not blocked:
+            return None
+        return {
+            'error': 'premature_completion_claim_write_blocked',
+            'error_type': 'ReconPrematureCompletionClaimWriteRejected',
+            'agent_id': agent_id,
+            'content_excerpt': content[:200],
+            'blocked_task_ids': sorted(blocked),
+            'hint': _PREMATURE_COMPLETION_HINT,
+        }
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1081,6 +1156,18 @@ def create_mcp_server(
                 'content_excerpt': content[:200],
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
+        # task 2824: reject a recon-stage present-tense completion claim ("task N
+        # has landed / is done / now enforces X") naming a task whose LIVE status
+        # is still non-terminal. Ordered after the 2628 live-status gate; fails
+        # open (allows the write) whenever the live status cannot be resolved.
+        if (
+            category in _COMPLETION_CLAIM_GATED_CATEGORIES
+            and isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+        ):
+            premature_block = await _premature_completion_block(content, agent_id, project_id)
+            if premature_block is not None:
+                return premature_block
         allow_near_duplicate = (
             isinstance(metadata, dict) and metadata.get('allow_near_duplicate') is True
         )
