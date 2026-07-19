@@ -488,6 +488,8 @@ Condition 3 detail: read `task["metadata"].get("delivered_checks")` — a list o
 
 No declared checks trivially satisfies condition 3.
 
+Condition 4 detail: this check depends on the branch ref named in the reaper's `[note]` line (see Extraction above) still resolving at the project root. Branch refs are not guaranteed to survive indefinitely post-merge — e.g. `task/1625`, an older merged task branch, no longer resolves as of this writing, confirming refs do get pruned over time and this is not merely a hypothetical risk. When the named branch does not resolve, `git merge-base --is-ancestor <branch> main` fails fatally (`fatal: Not a valid object name '<branch>'`, exit `128`) rather than cleanly reporting "not an ancestor" (exit `1`) — treat a fatal/unresolvable-ref result exactly like a missing branch note: condition 4 cannot be verified → PROMOTE, and note in the promotion that the ref did not resolve (as distinct from "resolved but not an ancestor") so a human can tell branch-pruning inertness apart from a genuine never-merged case. Expect this handler's close rate to skew toward more-recently-merged subjects and to fail-safe to promote once a subject's branch is eventually pruned — that is the intended, non-masking degradation, not a malfunction.
+
 **Close.** When all five hold, close at L1 — **never** `resume` (the subject task is already done; `resume` would wrongly re-pend it):
 ```python
 mcp__escalation__resolve_issue(
@@ -508,7 +510,7 @@ mcp__escalation__resolve_issue(
 ```
 Add to digest: `AUTO-CLOSED (L1 <esc_id>): orphan-reaper-amend-folded-step-recurring-df — <task_id> — <one-line summary of the 5 conditions> [benign]`
 
-**Default: promote.** Any failed condition — a GC'd/unresolvable `stale_commit` object, an absent, repo-wide, or `script`-kind `delivered_checks` entry, an absent deliverable path, a missing branch note, or a tip that is not an ancestor of main — routes to `promote_to_l2` exactly like any other [promote-to-L2](#promote-to-l2) category, with `root_cause="orphan-reaper-amend-fold:<task_id>"` and `category=esc["category"]`. **When unsure, promote.** `harness-escalation-revalidation-sweep` remains the regression backstop that re-validates closed records.
+**Default: promote.** Any failed condition — a GC'd/unresolvable `stale_commit` object, an absent, repo-wide, or `script`-kind `delivered_checks` entry, an absent deliverable path, a missing or unresolvable (pruned) branch ref, or a tip that is not an ancestor of main — routes to `promote_to_l2` exactly like any other [promote-to-L2](#promote-to-l2) category, with `root_cause="orphan-reaper-amend-fold:<task_id>"` and `category=esc["category"]`. **When unsure, promote.** `harness-escalation-revalidation-sweep` remains the regression backstop that re-validates closed records.
 
 **Non-regression.**
 - **HOLLOW-DONE** (`found_on_main`-done, capability absent from main — task 2729's class): conditions 2/3/4 must **fail** here → promote. Never close on `status == "done"` alone — that is exactly the trap the `stale_task_scoped` carve-out (see [Auto-closing a rubber-stamp L2](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out)) would fall into if applied to this class.
