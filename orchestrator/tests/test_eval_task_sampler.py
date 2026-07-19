@@ -19,19 +19,24 @@ from _eval_sampler_fixtures import make_candidate, rich_corpus
 
 from orchestrator.evals.task_sampler import (
     CompletedTaskCandidate,
+    FixtureAuditReport,
     ReferenceCapture,
     SampleResult,
+    StratificationCounts,
+    audit_fixture_corpus,
     build_fixture_record,
     capture_reference,
     classify_kind,
     classify_path,
     default_verify_commands,
     discover_completed_tasks,
+    format_stratification_table,
     materialize_reference_diff,
     pin_eval_branch,
     repo_of,
     resolve_task_commits_from_merge,
     sample_stratified,
+    stratification_counts,
     stratify,
 )
 
@@ -488,3 +493,191 @@ class TestGitGlue:
         assert c.post_commit == post
         assert c.pre_commit == pre
         assert c.project == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Listing + audit surface — stratification counts, table, corpus audit
+# ---------------------------------------------------------------------------
+
+def _fixture(
+    task_id: object,
+    *,
+    repo: str = 'df',
+    kind: str = 'feature',
+    path: str = 'full',
+    cohort: str = 'revival-zeta',
+    plan: dict | None = None,
+    with_reference: bool = True,
+    with_verify_outcome: bool = True,
+) -> dict:
+    """Build a canonical fixture dict (via ``build_fixture_record``) in a cell.
+
+    Optionally drops the ``reference`` / ``verify_outcome`` blocks so the audit
+    tests can exercise the per-fixture completeness failures.
+    """
+    cand = make_candidate(
+        task_id, repo=repo, kind=kind, path=path,
+        pre_commit=f'pre{task_id}', post_commit=f'post{task_id}',
+        merge_sha=f'merge{task_id}',
+    )
+    rec = build_fixture_record(
+        cand,
+        ReferenceCapture(
+            post_task_commit=f'post{task_id}', files=1, insertions=2, deletions=0,
+        ),
+        default_verify_commands(repo),
+        plan=plan, cohort=cohort, sampled_at='t', seed=0,
+    )
+    if not with_reference:
+        rec.pop('reference')
+    if not with_verify_outcome:
+        rec.pop('verify_outcome')
+    return rec
+
+
+# Six populated cells the healthy-corpus builder cycles through (matching the
+# cells make_candidate can deterministically synthesise).
+_HEALTHY_CELLS = [
+    ('df', 'bugfix', 'full'),
+    ('df', 'feature', 'full'),
+    ('df', 'refactor', 'full'),
+    ('df', 'feature', 'simple'),
+    ('reify', 'bugfix', 'full'),
+    ('reify', 'feature', 'full'),
+]
+
+
+def _healthy_corpus(n: int = 12) -> list[dict]:
+    """A band-plausible corpus of *n* complete fixtures spread across cells."""
+    out: list[dict] = []
+    for i in range(n):
+        repo, kind, path = _HEALTHY_CELLS[i % len(_HEALTHY_CELLS)]
+        out.append(_fixture(i, repo=repo, kind=kind, path=path, plan={'steps': []}))
+    return out
+
+
+class TestStratificationCounts:
+    def test_per_cell_counts_and_total(self) -> None:
+        fixtures = [
+            _fixture('1', repo='df', kind='bugfix', path='full'),
+            _fixture('2', repo='df', kind='bugfix', path='full'),
+            _fixture('3', repo='reify', kind='feature', path='full'),
+        ]
+        counts = stratification_counts(fixtures)
+        assert isinstance(counts, StratificationCounts)
+        assert counts.total == 3
+        assert counts.cells[('df', 'bugfix', 'full')] == 2
+        assert counts.cells[('reify', 'feature', 'full')] == 1
+
+    def test_plan_captured_counts_only_fixtures_with_a_plan(self) -> None:
+        fixtures = [
+            _fixture('1', plan={'steps': []}),
+            _fixture('2', plan=None),
+            _fixture('3', plan={'steps': [{'id': 'step-1'}]}),
+        ]
+        counts = stratification_counts(fixtures)
+        assert counts.total == 3
+        assert counts.plan_captured == 2
+
+    def test_cohort_filter_scopes_counts(self) -> None:
+        fixtures = [
+            _fixture('1', repo='df', kind='bugfix', path='full', cohort='revival-zeta'),
+            _fixture('2', repo='df', kind='bugfix', path='full', cohort='legacy-april'),
+            _fixture('3', repo='reify', kind='feature', path='full', cohort='revival-zeta'),
+        ]
+        counts = stratification_counts(fixtures, cohort='revival-zeta')
+        assert counts.total == 2
+        assert counts.cohort == 'revival-zeta'
+        assert counts.cells[('df', 'bugfix', 'full')] == 1
+        assert counts.cells[('reify', 'feature', 'full')] == 1
+
+    def test_cohort_none_counts_all_cohorts(self) -> None:
+        fixtures = [
+            _fixture('1', cohort='revival-zeta'),
+            _fixture('2', cohort='legacy-april'),
+        ]
+        counts = stratification_counts(fixtures, cohort=None)
+        assert counts.total == 2
+        assert counts.cohort is None
+
+
+class TestFormatStratificationTable:
+    def test_table_is_a_stable_string(self) -> None:
+        fixtures = [
+            _fixture('1', repo='df', kind='bugfix', path='full'),
+            _fixture('2', repo='reify', kind='feature', path='simple'),
+        ]
+        counts = stratification_counts(fixtures)
+        table = format_stratification_table(counts)
+        assert isinstance(table, str)
+        # Deterministic render: same counts -> byte-identical table.
+        assert format_stratification_table(counts) == table
+
+    def test_table_reports_cells_totals_and_plan_capture(self) -> None:
+        fixtures = [
+            _fixture(str(i), repo='df', kind='bugfix', path='full', plan={'steps': []})
+            for i in range(3)
+        ]
+        counts = stratification_counts(fixtures)
+        table = format_stratification_table(counts)
+        assert 'df' in table
+        assert 'bugfix' in table
+        assert 'reify' in table  # the full axis product renders (empty cells too)
+        assert 'refactor' in table
+        # Grand total and the plan-captured tally both surface in the table.
+        assert '3' in table
+        assert 'plan' in table.lower()
+
+
+class TestAuditFixtureCorpus:
+    def test_healthy_corpus_is_ok(self) -> None:
+        fixtures = _healthy_corpus(12)
+        report = audit_fixture_corpus(fixtures, ref_exists=lambda root, branch: True)
+        assert isinstance(report, FixtureAuditReport)
+        assert report.ok is True
+        assert report.count == 12
+        assert report.failures == []
+
+    def test_band_violation_too_few(self) -> None:
+        report = audit_fixture_corpus(_healthy_corpus(5), ref_exists=lambda *_: True)
+        assert report.ok is False
+        assert any('band' in f for f in report.failures), report.failures
+
+    def test_band_violation_too_many(self) -> None:
+        report = audit_fixture_corpus(_healthy_corpus(15), ref_exists=lambda *_: True)
+        assert report.ok is False
+        assert any('band' in f for f in report.failures), report.failures
+
+    def test_missing_reference_block_flagged_by_id(self) -> None:
+        fixtures = _healthy_corpus(12)
+        fixtures[3].pop('reference')
+        report = audit_fixture_corpus(fixtures, ref_exists=lambda *_: True)
+        assert report.ok is False
+        assert any(
+            'reference' in f and fixtures[3]['id'] in f for f in report.failures
+        ), report.failures
+
+    def test_missing_verify_outcome_flagged_by_id(self) -> None:
+        fixtures = _healthy_corpus(12)
+        fixtures[2].pop('verify_outcome')
+        report = audit_fixture_corpus(fixtures, ref_exists=lambda *_: True)
+        assert report.ok is False
+        assert any(
+            'verify_outcome' in f and fixtures[2]['id'] in f for f in report.failures
+        ), report.failures
+
+    def test_missing_pinned_branch_flagged_per_fixture(self) -> None:
+        fixtures = _healthy_corpus(12)
+        report = audit_fixture_corpus(fixtures, ref_exists=lambda root, branch: False)
+        assert report.ok is False
+        # Every fixture is flagged as missing its pinned branch.
+        assert sum('branch' in f for f in report.failures) == 12
+        assert any(fixtures[0]['id'] in f for f in report.failures), report.failures
+
+    def test_ref_exists_none_skips_branch_check(self) -> None:
+        # Structural-only audit (no git checkout available): the branch-presence
+        # check is skipped, so a band-and-completeness-clean corpus still passes.
+        report = audit_fixture_corpus(_healthy_corpus(12), ref_exists=None)
+        assert report.ok is True
+        assert report.count == 12
+        assert report.failures == []
