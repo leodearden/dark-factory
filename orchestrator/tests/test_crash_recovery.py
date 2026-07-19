@@ -3,12 +3,14 @@
 import json
 import logging
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import SessionResumeConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
@@ -119,6 +121,73 @@ def _setup_worktree(base: Path, task_id: str, plan: dict | None = None):
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(plan))
     return wt
+
+
+# ── Session-resume γ guard helpers (task 2774) ───────────────────────────────
+def _make_transcript(base: Path, session_id: str) -> Path:
+    """Create a real ``<cfg>/projects/<slug>/<session_id>.jsonl`` transcript and
+    return the ``<cfg>`` claude-config dir path.
+
+    Mirrors the on-disk layout that ``_resolve_transcript_path(config_dir,
+    session_id)`` globs (``<config_dir>/projects/*/<session_id>.jsonl``), so a
+    stashed ``_recovered_session_config_dirs`` entry pointing at the returned
+    dir corroborates the session as eligible.
+    """
+    cfg = base / f'claude-config-{session_id}'
+    proj = cfg / 'projects' / 'some-slug'
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
+    return cfg
+
+
+def _session_resume_emits(harness: Harness) -> list[tuple]:
+    """Return ``[(event_type, kwargs), ...]`` for every session_resume* emit.
+
+    Referencing the new EventType members lives here (call-time), never at
+    module scope, so a missing member in the RED phase fails only these tests
+    rather than breaking collection of the whole module.
+    """
+    wanted = {
+        EventType.session_resume,
+        EventType.session_resume_fallback,
+        EventType.session_resume_capped,
+    }
+    out: list[tuple] = []
+    for call in harness.event_store.emit.call_args_list:
+        if call.args and call.args[0] in wanted:
+            out.append((call.args[0], call.kwargs))
+    return out
+
+
+async def _drive_session_slot(
+    harness: Harness,
+    task_id: str,
+    session: dict,
+    *,
+    config_dir: Path | str | None = None,
+):
+    """Populate recovered-session state and run ``_run_slot`` with
+    ``build_workflow`` patched; return the ``resume_session_id`` kwarg it saw.
+    """
+    harness._recovered_sessions[task_id] = session
+    if config_dir is not None:
+        harness._recovered_session_config_dirs[task_id] = str(config_dir)
+
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {'title': f'task {task_id}'}
+    sem = MagicMock()
+    sem.release = MagicMock()
+
+    with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+        mock_wf = AsyncMock()
+        mock_wf.run.return_value = MagicMock(value='done')
+        mock_wf.metrics = MagicMock(
+            total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
+        )
+        MockWorkflow.return_value = mock_wf
+        await harness._run_slot(assignment, sem)
+        return MockWorkflow.call_args.kwargs['resume_session_id']
 
 
 @pytest.mark.asyncio
@@ -412,15 +481,26 @@ class TestRecoverCrashedTasks:
         assert '89' not in harness._preserved_worktrees
         harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '89')  # type: ignore[attr-defined]
 
-    async def test_run_slot_passes_recovered_session(self, harness: Harness):
-        """A recovered session dict flows through to TaskWorkflow as resume_session_id."""
+    async def test_run_slot_passes_recovered_session(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """An ELIGIBLE recovered session flows through to TaskWorkflow as
+        resume_session_id (γ guard keeps it: fresh + under-cap + transcript on
+        disk). Updated for task 2774 — the pre-γ setup (stale started_at, no
+        transcript) is now ineligible, so the guard needs a corroborated
+        session for this assertion to hold.
+        """
         session_dict = {
             'session_id': 'uuid-resume-me',
             'role': 'implementer',
-            'started_at': '2026-05-12T10:00:00+00:00',
+            'started_at': datetime.now(timezone.utc).isoformat(),
             'owner_pid': 9999,
+            'resume_count': 0,
         }
+        cfg = _make_transcript(tmp_path, 'uuid-resume-me')
+        harness.config.session_resume = SessionResumeConfig()
         harness._recovered_sessions['55'] = session_dict
+        harness._recovered_session_config_dirs['55'] = str(cfg)
         harness._preserved_worktrees.add('55')
 
         assignment = MagicMock()
@@ -1687,3 +1767,161 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
 
         assert pool.assignment_for('42') == lane
         assert '42' in harness._recovered_plans
+
+
+@pytest.mark.asyncio
+class TestSessionResumeGuard:
+    """γ eligibility guard in _run_slot (task 2774): an ineligible recovered
+    session degrades to fresh dispatch (resume_session_id=None) with a
+    reason-carrying event (B4/B5/B7); an eligible one is injected and emits a
+    session_resume event. The kill switch (enabled=False) degrades silently
+    with no event (B6). The guard is fail-safe (I3) — every ineligible path
+    is no-worse than today's fresh dispatch.
+    """
+
+    async def test_eligible_keeps_session_and_emits(self, harness: Harness, tmp_path: Path):
+        session = {
+            'session_id': 'uuid-elig',
+            'role': 'implementer',
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-elig')
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(harness, 'e1', session, config_dir=cfg)
+
+        assert resume_id is session
+        emits = _session_resume_emits(harness)
+        assert [et for et, _ in emits] == [EventType.session_resume]
+
+    async def test_disabled_falls_back_silently(self, harness: Harness, tmp_path: Path):
+        """enabled=False → no --resume injected AND no session_resume_* event (B6)."""
+        session = {
+            'session_id': 'uuid-dis',
+            'role': 'implementer',
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-dis')
+        harness.config.session_resume = SessionResumeConfig(enabled=False)
+
+        resume_id = await _drive_session_slot(harness, 'd1', session, config_dir=cfg)
+
+        assert resume_id is None
+        assert _session_resume_emits(harness) == []
+
+    async def test_stale_falls_back(self, harness: Harness, tmp_path: Path):
+        """Sidecar older than freshness_window → fallback reason 'stale' (B5)."""
+        real = SessionResumeConfig()
+        stale = datetime.now(timezone.utc) - timedelta(
+            seconds=2 * real.freshness_window_secs
+        )
+        session = {
+            'session_id': 'uuid-stale',
+            'role': 'implementer',
+            'started_at': stale.isoformat(),
+            'resume_count': 0,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-stale')
+        harness.config.session_resume = real
+
+        resume_id = await _drive_session_slot(harness, 's1', session, config_dir=cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'stale'
+
+    async def test_unparseable_or_missing_started_at_falls_back_stale(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A garbage or absent started_at fails the freshness parse (fail-safe)
+        → fallback reason 'stale', BEFORE the transcript leg is reached.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+
+        cfg1 = _make_transcript(tmp_path, 'uuid-bad')
+        s1 = {
+            'session_id': 'uuid-bad', 'role': 'r',
+            'started_at': 'not-a-date', 'resume_count': 0,
+        }
+        rid1 = await _drive_session_slot(harness, 'u1', s1, config_dir=cfg1)
+        assert rid1 is None
+
+        cfg2 = _make_transcript(tmp_path, 'uuid-bad2')
+        s2 = {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0}  # no started_at
+        rid2 = await _drive_session_slot(harness, 'u2', s2, config_dir=cfg2)
+        assert rid2 is None
+
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 2
+        for et, kwargs in emits:
+            assert et == EventType.session_resume_fallback
+            assert kwargs['data']['reason'] == 'stale'
+
+    async def test_transcript_absent_falls_back_no_transcript(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """config_dir stashed but the transcript jsonl was wiped (B4 foreign-
+        acquire reseed shape) → fallback reason 'no_transcript'.
+        """
+        session = {
+            'session_id': 'uuid-notr',
+            'role': 'implementer',
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'resume_count': 0,
+        }
+        empty_cfg = tmp_path / 'claude-config-empty'
+        (empty_cfg / 'projects').mkdir(parents=True)
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(harness, 'n1', session, config_dir=empty_cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        et, kwargs = emits[0]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reason'] == 'no_transcript'
+
+    async def test_no_config_dir_falls_back_no_transcript(self, harness: Harness):
+        """No stashed config_dir at all → cannot corroborate → 'no_transcript'."""
+        session = {
+            'session_id': 'uuid-nocfg',
+            'role': 'implementer',
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'resume_count': 0,
+        }
+        harness.config.session_resume = SessionResumeConfig()
+
+        resume_id = await _drive_session_slot(harness, 'nc1', session)  # config_dir=None
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        assert emits[0][0] == EventType.session_resume_fallback
+        assert emits[0][1]['data']['reason'] == 'no_transcript'
+
+    async def test_capped_emits_capped(self, harness: Harness, tmp_path: Path):
+        """resume_count at the cap → fresh dispatch + session_resume_capped (B7).
+
+        Distinct from a fallback: capped is by-design throttling, its own event.
+        """
+        session = {
+            'session_id': 'uuid-cap',
+            'role': 'implementer',
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'resume_count': 3,
+        }
+        cfg = _make_transcript(tmp_path, 'uuid-cap')
+        harness.config.session_resume = SessionResumeConfig(max_resumes_per_task=3)
+
+        resume_id = await _drive_session_slot(harness, 'c1', session, config_dir=cfg)
+
+        assert resume_id is None
+        emits = _session_resume_emits(harness)
+        assert len(emits) == 1
+        assert emits[0][0] == EventType.session_resume_capped
