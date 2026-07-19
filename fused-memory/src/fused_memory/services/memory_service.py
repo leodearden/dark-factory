@@ -56,6 +56,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-sub-close timeout used by MemoryService._safe_close (task 2701). A healthy
+# FalkorDB/Qdrant localhost driver teardown completes in well under 1s; 3s gives
+# headroom under load while capping a hung network-driver close so no single
+# backend can consume the whole shutdown budget or starve the durable-flush
+# SQLite closes (_write_journal/_event_buffer) that run after it. The paired
+# outer step budget lives in server/main.py as _MEMORY_CLOSE_STEP_TIMEOUT and
+# must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
+_SUBCLOSE_TIMEOUT = 3.0
+
 # Canonical relational verb for dependency facts (mirrors routing/classifier.py:19).
 # Used by _restore_superseded_dependency_edges to identify edges that should
 # never be superseded by LLM edge-resolution.
@@ -811,13 +820,37 @@ class MemoryService:
 
         logger.info('MemoryService initialized')
 
-    async def _safe_close(self, label: str, resource: Any) -> None:
-        """Close one resource, logging any failure without re-raising.
+    async def _safe_close(
+        self, label: str, resource: Any, timeout: float | None = None
+    ) -> None:
+        """Close one resource, time-boxed and logging any failure without re-raising.
 
-        Lets close() continue through every resource even when one fails.
+        Each close is bounded by ``timeout`` (default: the module-level
+        ``_SUBCLOSE_TIMEOUT``, read at call time so it can be monkeypatched) so a
+        hung network-driver teardown can neither consume the whole shutdown budget
+        nor starve the durable-flush closes that run after it. Both the timeout and
+        the generic-failure paths swallow the error so close() continues through
+        every resource.
         """
+        if timeout is None:
+            timeout = _SUBCLOSE_TIMEOUT
+        close_task = asyncio.ensure_future(resource.close())
+        # asyncio.wait signals a budget overrun structurally (via `pending`),
+        # never by raising — so a TimeoutError the resource's own close() raises
+        # stays a generic failure (ERROR) instead of being misread as an overrun.
+        _, pending = await asyncio.wait({close_task}, timeout=timeout)
+        if pending:
+            # Budget expired: the close is still running. Cancel it and move on
+            # so a hung backend can't starve the durable-flush closes that follow.
+            # Data-safe: graphiti/mem0 closes only tear down sockets (writes are
+            # already durable via durable_queue / synchronous commits).
+            close_task.cancel()
+            with contextlib.suppress(BaseException):
+                await close_task
+            logger.warning('MemoryService.close: %s.close timed out', label)
+            return
         try:
-            await resource.close()
+            close_task.result()
         except Exception:
             logger.exception('MemoryService.close: %s.close failed', label)
 
