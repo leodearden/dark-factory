@@ -128,3 +128,62 @@ def test_faithful_prompt_for_delegates_to_shared_production_builder():
     # summary list — byte-identical inputs "at the call site".
     expected = module_tagger_prompt.build_tagger_prompt(dirs, [summary])
     assert mod.faithful_prompt_for(task, dirs) == expected
+
+
+# ── frontier adjudication (D-6 shape): prompt + tally ────────────────────────
+
+def test_build_adjudication_prompt_names_both_sets_and_ground_truth():
+    task = {'id': 5, 'title': 'Add thing', 'description': 'wire it'}
+    haiku = ['a.py', 'b.py']
+    sonnet = ['a.py', 'c.py']
+    gt = ['a.py', 'b.py']
+    prompt = mod.build_adjudication_prompt(task, haiku, sonnet, gt)
+
+    assert isinstance(prompt, str) and prompt.strip()
+    # Both candidate file sets appear.
+    for f in set(haiku) | set(sonnet):
+        assert f in prompt
+    # Ground truth appears.
+    for f in gt:
+        assert f in prompt
+    # D-6 framing: which better matches ground truth, constrained answer.
+    low = prompt.lower()
+    assert 'ground truth' in low
+    assert 'haiku' in low
+    assert 'sonnet' in low
+    assert 'tie' in low
+
+
+def test_tally_adjudications_counts_and_worse_fraction():
+    verdicts = [
+        {'winner': 'haiku'},
+        {'winner': 'haiku'},
+        {'winner': 'sonnet'},
+        {'winner': 'tie'},
+    ]
+    t = mod.tally_adjudications(verdicts)
+    assert t['haiku_better'] == 2
+    assert t['sonnet_better'] == 1
+    assert t['tie'] == 1
+    # haiku_worse_fraction = sonnet_better / max(1, total_non_tie) = 1/3.
+    assert t['haiku_worse_fraction'] == pytest.approx(1.0 / 3.0)
+
+
+def test_tally_adjudications_empty_is_zero_no_zerodiv():
+    t = mod.tally_adjudications([])
+    assert t['haiku_better'] == 0
+    assert t['sonnet_better'] == 0
+    assert t['tie'] == 0
+    assert t['haiku_worse_fraction'] == pytest.approx(0.0)
+
+
+def test_tally_adjudications_all_ties_worse_fraction_zero():
+    t = mod.tally_adjudications([{'winner': 'tie'}, {'winner': 'tie'}])
+    assert t['tie'] == 2
+    assert t['haiku_worse_fraction'] == pytest.approx(0.0)
+
+
+def test_tally_adjudications_all_sonnet_worse_fraction_one():
+    t = mod.tally_adjudications([{'winner': 'sonnet'}, {'winner': 'sonnet'}])
+    assert t['sonnet_better'] == 2
+    assert t['haiku_worse_fraction'] == pytest.approx(1.0)
