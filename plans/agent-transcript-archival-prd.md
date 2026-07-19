@@ -227,6 +227,7 @@ dispatch path is introduced.
 | `git_ops.cleanup_worktree` chokepoint | this PRD adds an idempotent backstop | same helper (β) | this PRD (β owns) | wired by this batch |
 | FM restart-safety batch σ2717 "session-resume gate" (tasks 2700–2718) | complementary — that batch evaluates reusing the *resume* mechanism for FM recon; this PRD archives *orchestrator* transcripts | none shared (FM recon vs orchestrator invocation) | separate session/batch | independent; do not absorb |
 | Existing `data/` GC follow-up (Cockpit C10 18k-record GC ticket) | sibling disk-hygiene concern | this PRD's δ is a *new* sweep over a *new* dir; it does not touch the C10 GC | δ owns the archive-dir GC | independent |
+| `plans/warm-lane-session-resume-prd.md` | disjoint (non-overlapping) | live-dir vs gz-archive: this PRD's α/β gz-copy transcripts out of the live `CLAUDE_CONFIG_DIR` for forensics/mining; session-resume needs that *same* directory to stay live and uncompressed as its resume substrate (glob-by-session-id against the running transcript). This PRD keeps the live dir in place — no relocation — so session-resume's read path, this PRD's producer hook (α), and its teardown backstop (β) are all unaffected by each other | each its own | wired |
 
 ## 8. Decomposition (G5: B+H — contract = §5 + Appendix A; boundary tests = ε)
 

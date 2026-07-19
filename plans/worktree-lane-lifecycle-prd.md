@@ -263,10 +263,20 @@ Because M1 δ/ε are not yet filed, W11's M1-δ/ε-dependent tasks are **anchore
 | M3 `dashboard-alignment` | W11 owns derivation; M3 documented the reader | `.task/` path derivation (`TaskArtifacts`) + dashboard `read_task_artifacts` | **W11** | **retired** — dashboard reader deleted; per-task runtime now served via the escalation `get_task_runtime_state` MCP tool (`plans/dashboard-task-runtime-endpoint-prd.md`), so M3 ζ's doc-only signpost has no reader left to hand off |
 | W10 `harness-supervision` | independent | `proc_supervision` restart plans | W10 | no seam (W11 restart capstone is a plain deterministic task) |
 | W7 `verify-plan` | independent | `ephemeral_worktree` verify probes | W7 | no seam (verify probe worktrees out of W11 scope) |
+| `plans/warm-lane-session-resume-prd.md` | consumed-by (companion) | that PRD's β teaches `_recover_crashed_tasks` to read the `agent_session.json` sidecar for plan-bearing lanes and populate `_recovered_sessions`; W11's record-driven adopt/quarantine rewrite must **preserve** this sidecar-adopt behavior, not just the plan-adopt path it replaces | session-resume PRD owns the adopt logic; W11 owns the rewrite | to-preserve when W11 lands (companion task ψ) |
 
 No contested/reciprocal ownership: M3 explicitly cedes `.task/` derivation to W11;
 M1 owns its three primitives outright. (The M3 seam itself is now moot per the
 retirement note above — there is no more dashboard reader for W11 to take over.)
+
+**Session-resume interaction.** `plans/warm-lane-session-resume-prd.md`'s β
+mechanism reads the `agent_session.json` sidecar for plan-bearing lanes
+during `_recover_crashed_tasks` and populates `_recovered_sessions`, in
+addition to the existing plan-adopt path. When W11 replaces that heuristic
+recovery tree with the record-driven `LaneLifecycle` adopt/quarantine logic,
+the rewrite must carry the sidecar-adopt behavior forward — a lane that
+recovers via the new durable record still needs to surface a recovered
+session id to the dispatcher, not just a recovered plan.
 
 ## Contract (B+H)
 
