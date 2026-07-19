@@ -61,13 +61,21 @@ re-raised unchanged.
 
 from __future__ import annotations
 
+import logging
 import re
-from datetime import datetime
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    _SWEEP_AGENT_ID,
+    flatten_dedup_edges,
+)
 from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # extract_priority_override_task_id — pure lexical extraction
@@ -270,3 +278,85 @@ async def read_live_override_state(project_root: str) -> dict[str, dict]:
             'ttl_until': datetime.fromisoformat(ttl_until) if ttl_until else None,
         }
     return live
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_priority_override_edges — async orchestrator
+# --------------------------------------------------------------------------- #
+
+
+async def sweep_stale_priority_override_edges(
+    memory_service,
+    project_id: str,
+    project_root: str,
+    *,
+    run_id: str,
+    read_live: Callable[[str], Awaitable[dict[str, dict]]] | None = None,
+    now: datetime | None = None,
+    log: logging.Logger = logger,
+) -> dict:
+    """Enumerate valid priority-override edges and invalidate the stale ones.
+
+    Enumerates ALL currently-valid Graphiti edges for *project_id* via
+    ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
+    query — never the LLM's semantic search), lexically extracts each edge's
+    single subject task_id, reads LIVE override state via *read_live*, and
+    invalidates (``memory_service.update_edge(..., invalid_at=...)``) every
+    edge whose task is absent from the live override table OR whose (TTL)
+    edge's live ``ttl_until`` has elapsed.
+
+    Args:
+        memory_service: Object exposing ``.graphiti.get_all_valid_edges`` and
+            ``.update_edge``.
+        project_id: Graphiti group_id to enumerate and invalidate within.
+        project_root: Project root whose ``scheduler_overrides.db`` supplies
+            live override state.
+        run_id: Reconciliation run id, threaded through as update_edge's
+            causation_id.
+        read_live: Async live-override reader; defaults to
+            ``read_live_override_state``. Injected in tests (mirroring how
+            2613 injects ``taskmaster``). Resolved at call time (not as a
+            bound default) so a monkeypatch of the module-level
+            ``read_live_override_state`` is honored by the default path.
+        now: Invalidation + TTL-comparison timestamp; defaults to
+            ``datetime.now(UTC)``.
+        log: Logger to use (default: this module's logger).
+
+    Returns:
+        dict with int counts: ``scanned`` (edges enumerated after dedup),
+        ``candidate_edges`` (edges selected as stale), ``invalidated``
+        (successful update_edge calls), ``errors`` (caught failures).
+    """
+    stats = {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+
+    if read_live is None:
+        read_live = read_live_override_state
+
+    grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+
+    edges = flatten_dedup_edges(grouped)
+    stats['scanned'] = len(edges)
+
+    candidate_edges = [
+        edge
+        for edge in edges
+        if extract_priority_override_task_id(edge.get('fact') or '') is not None
+    ]
+
+    live = await read_live(project_root)
+
+    invalidate_at = now or datetime.now(UTC)
+    stale = select_stale_priority_override_edges(candidate_edges, live, now=invalidate_at)
+    stats['candidate_edges'] = len(stale)
+
+    for edge in stale:
+        await memory_service.update_edge(
+            edge['uuid'],
+            invalid_at=invalidate_at,
+            project_id=project_id,
+            agent_id=_SWEEP_AGENT_ID,
+            causation_id=run_id,
+        )
+        stats['invalidated'] += 1
+
+    return stats
