@@ -3,6 +3,7 @@
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from _fm_helpers import submit_and_resolve
 
@@ -723,7 +724,7 @@ class TestEnsureFreshCollection:
         client = MagicMock()
         client.collection_exists.return_value = False
         client.create_collection.side_effect = [
-            UnexpectedResponse(409, 'Conflict', b'{}', {}),
+            UnexpectedResponse(409, 'Conflict', b'{}', httpx.Headers()),
             None,
         ]
 
@@ -747,7 +748,7 @@ class TestEnsureFreshCollection:
 
         client = MagicMock()
         client.collection_exists.return_value = False
-        client.create_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', {})
+        client.create_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', httpx.Headers())
 
         with pytest.raises(UnexpectedResponse):
             ensure_fresh_collection(client, 'c', size=8)
@@ -807,8 +808,8 @@ class TestCollectionVectorSize:
 
         client = MagicMock()
         client.get_collection.side_effect = [
-            UnexpectedResponse(404, 'Not Found', b'{}', {}),
-            UnexpectedResponse(404, 'Not Found', b'{}', {}),
+            UnexpectedResponse(404, 'Not Found', b'{}', httpx.Headers()),
+            UnexpectedResponse(404, 'Not Found', b'{}', httpx.Headers()),
             self._info(8),
         ]
 
@@ -829,7 +830,7 @@ class TestCollectionVectorSize:
         from qdrant_client.http.exceptions import UnexpectedResponse
 
         client = MagicMock()
-        client.get_collection.side_effect = UnexpectedResponse(404, 'Not Found', b'{}', {})
+        client.get_collection.side_effect = UnexpectedResponse(404, 'Not Found', b'{}', httpx.Headers())
 
         with pytest.raises(AssertionError):
             await collection_vector_size(client, 'c', timeout=0.05, interval=0.01)
@@ -843,7 +844,7 @@ class TestCollectionVectorSize:
         from qdrant_client.http.exceptions import UnexpectedResponse
 
         client = MagicMock()
-        client.get_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', {})
+        client.get_collection.side_effect = UnexpectedResponse(500, 'err', b'{}', httpx.Headers())
 
         with pytest.raises(UnexpectedResponse):
             await collection_vector_size(client, 'c', timeout=5.0, interval=0.001)
