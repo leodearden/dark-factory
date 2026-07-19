@@ -5111,6 +5111,214 @@ class TestFilterBlockedSnapshotFindings:
 
 
 # ---------------------------------------------------------------------------
+# filter_contamination_ceiling_findings (task-2826 step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterContaminationCeilingFindings:
+    """Pure-function tests for _is_contamination_ceiling_finding and
+    filter_contamination_ceiling_findings(flags, project_id).
+
+    Mirrors TestFilterBlockedSnapshotFindings one-to-one for the retired
+    autopilot_video Stage-1 task-ID "contamination ceiling" (task 2818/2826).
+    All tests call the functions directly — no mocks, no I/O.
+
+    RED until step-4 adds the symbols to flag_dedup.py.
+    """
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _make_flag(category: str, description: str, suggested_action: str = '') -> dict:
+        return {
+            'task_id': None,
+            'flag_type': 'missing_knowledge',
+            'category': category,
+            'description': description,
+            'suggested_action': suggested_action,
+            'actionable': False,
+        }
+
+    # -----------------------------------------------------------------------
+    # _is_contamination_ceiling_finding — marker matcher (True cases)
+    # -----------------------------------------------------------------------
+
+    def test_matcher_true_for_contamination_ceiling_marker(self):
+        """'contamination ceiling' marker matches (True)."""
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='autopilot_video is missing its contamination ceiling guardrail memory',
+        )
+        assert _is_contamination_ceiling_finding(flag) is True
+
+    def test_matcher_true_for_task_id_ceiling_marker(self):
+        """'task-ID ceiling' marker matches case-insensitively (True)."""
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='memory_stale',
+            description='the task-ID ceiling guardrail for autopilot_video is stale',
+        )
+        assert _is_contamination_ceiling_finding(flag) is True
+
+    def test_matcher_true_for_id_magnitude_ceiling_marker(self):
+        """'ID-magnitude ceiling' marker matches case-insensitively (True)."""
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='no ID-magnitude ceiling is recorded for autopilot_video',
+        )
+        assert _is_contamination_ceiling_finding(flag) is True
+
+    def test_matcher_true_for_ceiling_guardrail_in_suggested_action(self):
+        """'ceiling guardrail' marker matches when it appears only in suggested_action."""
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='',  # marker only in suggested_action
+            suggested_action='Re-add the ceiling guardrail memory for autopilot_video',
+        )
+        assert _is_contamination_ceiling_finding(flag) is True
+
+    # -----------------------------------------------------------------------
+    # _is_contamination_ceiling_finding — negatives (False cases)
+    # -----------------------------------------------------------------------
+
+    def test_matcher_false_for_unrelated_finding(self):
+        """An unrelated finding (no ceiling marker) does NOT match (False)."""
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='task 5 has no design doc and no implementation notes',
+            suggested_action='Add a design doc for task 5',
+        )
+        assert _is_contamination_ceiling_finding(flag) is False
+
+    def test_matcher_false_for_benign_per_model_daily_ceiling(self):
+        """A benign 'per-model daily ceiling' finding does NOT match (bare 'ceiling' excluded)."""
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='the per-model daily ceiling for opus is not documented in memory',
+            suggested_action='Record the per-model daily ceiling budget',
+        )
+        assert _is_contamination_ceiling_finding(flag) is False, (
+            "bare 'ceiling' must NOT match — 'per-model daily ceiling' is a legitimate, "
+            "unrelated finding that must be KEPT"
+        )
+
+    # -----------------------------------------------------------------------
+    # filter_contamination_ceiling_findings — retired project (dropped cases)
+    # -----------------------------------------------------------------------
+
+    def test_missing_knowledge_ceiling_finding_dropped_for_retired_project(self):
+        """Case (a): missing_knowledge ceiling finding is DROPPED for autopilot_video."""
+        from fused_memory.reconciliation.flag_dedup import filter_contamination_ceiling_findings
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='autopilot_video is missing its contamination-ceiling guardrail memory',
+            suggested_action='Re-add the task-ID ceiling guardrail',
+        )
+        result = filter_contamination_ceiling_findings([flag], project_id='autopilot_video')
+        assert result == [], (
+            "missing_knowledge contamination-ceiling finding must be DROPPED for "
+            f"autopilot_video (ceiling retired-by-design); got {result!r}"
+        )
+
+    def test_memory_stale_ceiling_finding_dropped_for_retired_project(self):
+        """Case (a): memory_stale ceiling finding is DROPPED for autopilot_video."""
+        from fused_memory.reconciliation.flag_dedup import filter_contamination_ceiling_findings
+
+        flag = self._make_flag(
+            category='memory_stale',
+            description='the contamination ceiling guardrail memory for autopilot_video is stale',
+            suggested_action='Update the ceiling guardrail',
+        )
+        result = filter_contamination_ceiling_findings([flag], project_id='autopilot_video')
+        assert result == [], (
+            "memory_stale contamination-ceiling finding must be DROPPED for "
+            f"autopilot_video; got {result!r}"
+        )
+
+    def test_benign_finding_survives_alongside_dropped_ceiling_finding(self):
+        """Case (a): a benign finding SURVIVES while the ceiling findings are dropped."""
+        from fused_memory.reconciliation.flag_dedup import filter_contamination_ceiling_findings
+
+        ceiling_flag = self._make_flag(
+            category='missing_knowledge',
+            description='autopilot_video is missing its contamination ceiling guardrail memory',
+        )
+        stale_ceiling_flag = self._make_flag(
+            category='memory_stale',
+            description='the task-ID ceiling guardrail is stale',
+        )
+        benign_flag = self._make_flag(
+            category='missing_knowledge',
+            description='task 42 has no design doc',
+            suggested_action='Add a design doc',
+        )
+        result = filter_contamination_ceiling_findings(
+            [ceiling_flag, stale_ceiling_flag, benign_flag], project_id='autopilot_video'
+        )
+        assert result == [benign_flag], (
+            "Both ceiling findings must be DROPPED and the benign finding must SURVIVE "
+            f"for autopilot_video; got {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # filter_contamination_ceiling_findings — kept cases (category + fail-open)
+    # -----------------------------------------------------------------------
+
+    def test_ceiling_finding_kept_for_non_retired_project(self):
+        """Case (b): for non-retired 'reify' the ceiling finding SURVIVES (fail-open)."""
+        from fused_memory.reconciliation.flag_dedup import filter_contamination_ceiling_findings
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='reify is missing its contamination ceiling guardrail memory',
+        )
+        result = filter_contamination_ceiling_findings([flag], project_id='reify')
+        assert flag in result, (
+            "For non-retired project 'reify', the contamination-ceiling finding "
+            f"must pass through unchanged (fail-open); got {result!r}"
+        )
+
+    def test_systemic_pattern_ceiling_finding_kept_for_retired_project(self):
+        """Case (c): a ceiling-marker finding whose category is NOT suppressed SURVIVES.
+
+        Even for autopilot_video, a 'systemic_pattern' finding is outside the
+        {missing_knowledge, memory_stale} suppressed set and must be KEPT.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_contamination_ceiling_findings
+
+        flag = self._make_flag(
+            category='systemic_pattern',
+            description='repeated contamination ceiling guardrail churn across cycles',
+        )
+        result = filter_contamination_ceiling_findings([flag], project_id='autopilot_video')
+        assert flag in result, (
+            "systemic_pattern ceiling finding must be KEPT (category not in suppressed set) "
+            f"even for autopilot_video; got {result!r}"
+        )
+
+    def test_empty_list_returns_empty(self):
+        """Case (d): empty input → empty list."""
+        from fused_memory.reconciliation.flag_dedup import filter_contamination_ceiling_findings
+
+        result = filter_contamination_ceiling_findings([], project_id='autopilot_video')
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
 # TestAcknowledgeFlagMarkerLedger / TestAcknowledgeResolvedFlagsLedger
 # (task 2227 step-7) — acknowledge_flag_marker maps to
 # memory_service.recon_ledger.mark_addressed; RED until step-8 rewrites
