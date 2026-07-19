@@ -70,6 +70,7 @@ from pathlib import Path
 
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.models.scope import resolve_main_checkout
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _SWEEP_AGENT_ID,
     flatten_dedup_edges,
@@ -231,6 +232,38 @@ def _overrides_db_path(project_root: str) -> Path:
     return Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
 
 
+def _canonical_project_root(project_root: str) -> str:
+    """Normalize *project_root* to the canonical form the override WRITE path
+    stores rows under.
+
+    ``set_task_priority_override`` funnels ``project_root`` through
+    ``server/tools.py::_normalize_project_root`` -> ``resolve_main_checkout``
+    before BOTH opening ``scheduler_overrides.db`` and writing each row's
+    ``project_root`` column, so a persisted row's key is always the resolved
+    *main*-checkout path — never a worktree subpath, trailing-slash, or
+    symlinked spelling. This reader MUST normalize identically: a mismatched
+    ``WHERE project_root=?`` filter (or DB-file path) silently returns zero
+    rows, ``read_live_override_state`` returns ``{}``, and
+    ``select_stale_priority_override_edges`` then treats EVERY valid
+    boost/pin/TTL edge as "task absent" — the exact mass over-invalidation of
+    valid edges (an irreversible write) this module exists to prevent.
+
+    Mirrors ``_normalize_project_root``: prefer ``resolve_main_checkout`` (the
+    write path's exact normalizer — it maps any worktree subpath to its main
+    checkout, the key the row was actually written under). Falls back to
+    ``str(Path(project_root).resolve())`` when ``resolve_main_checkout``
+    cannot run (``ValueError``: the path is not inside a git working tree, or
+    ``git`` is unavailable — e.g. a hermetic temp-dir test), which still
+    canonicalizes a trailing slash, a ``.``/``..`` segment, or a symlinked
+    ancestor. Pure apart from the ``git`` subprocess ``resolve_main_checkout``
+    may spawn (cached there by resolved input path).
+    """
+    try:
+        return resolve_main_checkout(project_root)
+    except ValueError:
+        return str(Path(project_root).resolve())
+
+
 async def read_live_override_state(project_root: str) -> dict[str, dict]:
     """Read live scheduler-override state from ``scheduler_overrides.db``.
 
@@ -239,6 +272,13 @@ async def read_live_override_state(project_root: str) -> dict[str, dict]:
     live-state-source design decision) — so a task absent from the returned
     map is a positive, fail-safe "override consumed/cleared" signal rather
     than merely "not pinned".
+
+    *project_root* is first normalized via ``_canonical_project_root`` so both
+    the DB-file lookup and the ``WHERE project_root=?`` filter key on the same
+    resolved main-checkout path the override write path persisted rows under —
+    guarding against the mass over-invalidation a non-canonical root (worktree
+    subpath, trailing slash, symlink) would otherwise trigger (see that
+    helper's docstring).
 
     Returns ``{}`` when the DB file does not exist (no overrides recorded
     yet). Otherwise returns ``{str(task_id): {'boost_tier', 'pinned',
@@ -251,6 +291,7 @@ async def read_live_override_state(project_root: str) -> dict[str, dict]:
     the caller (``sweep_stale_priority_override_edges``) treats that
     best-effort — aborting the cycle no-op, self-healing next cycle.
     """
+    project_root = _canonical_project_root(project_root)
     db_path = _overrides_db_path(project_root)
     if not db_path.exists():
         return {}
@@ -261,7 +302,7 @@ async def read_live_override_state(project_root: str) -> dict[str, dict]:
         cursor = await db.execute(
             'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
             'FROM overrides WHERE project_root=?',
-            (str(project_root),),
+            (project_root,),
         )
         rows = await cursor.fetchall()
     finally:
@@ -323,10 +364,21 @@ async def sweep_stale_priority_override_edges(
 
     Returns:
         dict with int counts: ``scanned`` (edges enumerated after dedup),
-        ``candidate_edges`` (edges selected as stale), ``invalidated``
-        (successful update_edge calls), ``errors`` (caught failures).
+        ``candidate_edges`` (edges that passed the priority-override lexical
+        gate — the pre-selection candidate pool), ``stale_selected`` (that
+        subset ``select_stale_priority_override_edges`` judged stale),
+        ``invalidated`` (successful update_edge calls), ``errors`` (caught
+        failures). The scanned -> candidate_edges -> stale_selected ->
+        invalidated funnel is monotonically narrowing, so each is a distinct,
+        self-describing quantity.
     """
-    stats = {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+    stats = {
+        'scanned': 0,
+        'candidate_edges': 0,
+        'stale_selected': 0,
+        'invalidated': 0,
+        'errors': 0,
+    }
 
     if not project_root:
         return stats
@@ -358,6 +410,11 @@ async def sweep_stale_priority_override_edges(
         for edge in edges
         if extract_priority_override_task_id(edge.get('fact') or '') is not None
     ]
+    # True pre-selection candidate-pool size — set on EVERY exit path (incl.
+    # the no-candidates short-circuit and a subsequent read_live failure), so
+    # the stat always describes "priority-override edges seen", never the
+    # narrower selected-as-stale count (that is `stale_selected`, below).
+    stats['candidate_edges'] = len(candidate_edges)
 
     # No priority-override edges at all -> no live-state read needed.
     if not candidate_edges:
@@ -380,7 +437,7 @@ async def sweep_stale_priority_override_edges(
 
     invalidate_at = now or datetime.now(UTC)
     stale = select_stale_priority_override_edges(candidate_edges, live, now=invalidate_at)
-    stats['candidate_edges'] = len(stale)
+    stats['stale_selected'] = len(stale)
 
     for edge in stale:
         try:

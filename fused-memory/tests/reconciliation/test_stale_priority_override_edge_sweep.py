@@ -83,9 +83,18 @@ CREATE TABLE overrides (
 def _seed_overrides_db(project_root: Path, rows: list[dict]) -> None:
     """Create data/orchestrator/scheduler_overrides.db under *project_root*
     and INSERT *rows* via raw sqlite (each dict supplies the override
-    columns; project_root/created_at/updated_at are filled in)."""
+    columns; project_root/created_at/updated_at are filled in).
+
+    The project_root COLUMN is stored under the RESOLVED path
+    (``str(Path(project_root).resolve())``), mirroring the production write
+    path — ``set_task_priority_override`` funnels project_root through
+    ``resolve_main_checkout`` before persisting each row. This keeps the seed
+    key aligned with ``read_live_override_state``'s matching normalization
+    regardless of how the root is spelled (trailing slash, ``..`` segment) or
+    whether the temp root sits under a symlinked ``/tmp``."""
     db_path = project_root / 'data' / 'orchestrator' / 'scheduler_overrides.db'
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_root = str(Path(project_root).resolve())
     conn = sqlite3.connect(str(db_path))
     try:
         conn.executescript(_OVERRIDE_SCHEMA_DDL)
@@ -95,7 +104,7 @@ def _seed_overrides_db(project_root: Path, rows: list[dict]) -> None:
                 'pin_order, reserve_now, ttl_until, created_at, updated_at) '
                 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
-                    str(project_root),
+                    resolved_root,
                     r['task_id'],
                     r.get('boost_tier'),
                     r.get('pinned', 0),
@@ -400,6 +409,51 @@ class TestReadLiveOverrideState:
         result = await read_live_override_state(str(tmp_path))
         assert result == {}
 
+    @pytest.mark.asyncio
+    async def test_non_canonical_root_normalizes_to_seeded_key(self, tmp_path):
+        """A non-canonical-but-equivalent project_root must normalize to the
+        same key the row was written under, so the full-table read still
+        finds it.
+
+        The production write path stores every row under
+        ``resolve_main_checkout(project_root)`` (a resolved main-checkout
+        path); if this reader queried the raw, non-canonical spelling instead,
+        ``WHERE project_root=?`` would match zero rows, ``read_live_override_state``
+        would return ``{}``, and ``select_stale_priority_override_edges`` would
+        then judge EVERY valid boost/pin/TTL edge 'task absent' — a mass
+        over-invalidation of valid edges (an irreversible write). This exercises
+        the reader's matching ``_canonical_project_root`` normalization.
+        """
+        _seed_overrides_db(
+            tmp_path,
+            [{
+                'task_id': '5166',
+                'boost_tier': 'high',
+                'pinned': 1,
+                'pin_order': 1,
+                'ttl_until': None,
+            }],
+        )
+        # Same directory spelled non-canonically via a real '<child>/..' round
+        # trip: pathlib keeps the '..' verbatim (it can't collapse it without
+        # touching the filesystem), so the RAW string differs from the seeded
+        # resolved key — only resolve()-based normalization reunites them.
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        non_canonical = f'{sub}/..'
+        assert str(Path(non_canonical)) != str(Path(tmp_path).resolve()), (
+            'test premise: the non-canonical spelling must differ from the '
+            'resolved seed key, else normalization is not being exercised'
+        )
+
+        result = await read_live_override_state(non_canonical)
+
+        assert set(result.keys()) == {'5166'}, (
+            f'Non-canonical root {non_canonical!r} must normalize to the seeded '
+            f'resolved key; a mismatched WHERE project_root=? filter would return '
+            f'{{}} and drive mass over-invalidation. Got {result!r}'
+        )
+
 
 # --------------------------------------------------------------------------- #
 # sweep_stale_priority_override_edges — core behavior
@@ -462,8 +516,15 @@ class TestSweepStalePriorityOverrideEdgesCore:
 
         read_live.assert_awaited_once_with('/tmp/reify')
 
-        assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
-            f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
+        assert stats == {
+            'scanned': 2,
+            'candidate_edges': 2,
+            'stale_selected': 1,
+            'invalidated': 1,
+            'errors': 0,
+        }, (
+            'Expected both priority-override edges counted as candidates, exactly '
+            f'the one stale edge selected+invalidated, got stats={stats!r}'
         )
 
 
@@ -496,7 +557,13 @@ class TestSweepStalePriorityOverrideEdgesGuards:
             memory_service, 'test_project', '', run_id='run-1', read_live=read_live,
         )
 
-        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
+        assert stats == {
+            'scanned': 0,
+            'candidate_edges': 0,
+            'stale_selected': 0,
+            'invalidated': 0,
+            'errors': 0,
+        }
         memory_service.graphiti.get_all_valid_edges.assert_not_awaited()
         read_live.assert_not_awaited()
 
@@ -514,7 +581,13 @@ class TestSweepStalePriorityOverrideEdgesGuards:
             memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
         )
 
-        assert stats == {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
+        assert stats == {
+            'scanned': 0,
+            'candidate_edges': 0,
+            'stale_selected': 0,
+            'invalidated': 0,
+            'errors': 1,
+        }, (
             f'Expected all-zero stats with the failure tallied as an error, got {stats!r}'
         )
         read_live.assert_not_awaited()
@@ -563,8 +636,16 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
             memory_service, 'test_project', '/tmp/reify', run_id='run-1', read_live=read_live,
         )
 
-        assert stats == {'scanned': 1, 'candidate_edges': 0, 'invalidated': 0, 'errors': 1}, (
-            f'Expected the read_live failure tallied as an error with no invalidation, got {stats!r}'
+        assert stats == {
+            'scanned': 1,
+            'candidate_edges': 1,
+            'stale_selected': 0,
+            'invalidated': 0,
+            'errors': 1,
+        }, (
+            'Expected the candidate counted but the read_live failure tallied as '
+            'an error before any selection/invalidation (stale_selected stays 0), '
+            f'got {stats!r}'
         )
         memory_service.update_edge.assert_not_awaited()
 
@@ -593,7 +674,13 @@ class TestSweepStalePriorityOverrideEdgesBestEffort:
         assert memory_service.update_edge.await_count == 2, (
             'The second stale edge must still be attempted after the first update fails'
         )
-        assert stats == {'scanned': 2, 'candidate_edges': 2, 'invalidated': 1, 'errors': 1}, (
+        assert stats == {
+            'scanned': 2,
+            'candidate_edges': 2,
+            'stale_selected': 2,
+            'invalidated': 1,
+            'errors': 1,
+        }, (
             f'Expected the failed update tallied without blocking the second, got {stats!r}'
         )
 
