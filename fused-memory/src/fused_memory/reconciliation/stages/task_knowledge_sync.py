@@ -37,6 +37,7 @@ from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
+    filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
 )
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
@@ -2748,7 +2749,13 @@ class IntegrityCheck(BaseStage):
            legitimately created in a different known project via cross-project
            routing.  Records
            report.stats['phantom_task_creation_findings_dropped'] = before - after.
-        3. Calls record_task_dump_spot_check() to record a non-destructive
+        3. Applies filter_contamination_ceiling_findings() to suppress
+           false-positive missing_knowledge/memory_stale findings asserting a
+           retired Stage-1 task-ID contamination-ceiling guardrail memory is
+           missing or stale, for projects whose ceiling is retired-by-design
+           (e.g. autopilot_video; task 2818/2826).  Records
+           report.stats['contamination_ceiling_findings_dropped'] = before - after.
+        4. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -2788,6 +2795,23 @@ class IntegrityCheck(BaseStage):
             )
         else:
             report.stats['phantom_task_creation_findings_dropped'] = 0
+
+        # Layer 3 (finding-side) gate for retired-contamination-ceiling false
+        # positives (task 2818/2826): for projects whose Stage-1 task-ID
+        # contamination ceiling is retired-by-design, drop
+        # missing_knowledge/memory_stale findings asserting the (correctly absent)
+        # ceiling guardrail memory is missing or stale.  Mirrors the two gates
+        # above.
+        if report.items_flagged:
+            _before = len(report.items_flagged)
+            report.items_flagged = filter_contamination_ceiling_findings(
+                report.items_flagged, project_id=self.project_id
+            )
+            report.stats['contamination_ceiling_findings_dropped'] = (
+                _before - len(report.items_flagged)
+            )
+        else:
+            report.stats['contamination_ceiling_findings_dropped'] = 0
 
         self.record_task_dump_spot_check(report)
         return report
