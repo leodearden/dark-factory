@@ -96,11 +96,19 @@ from orchestrator.evals import snapshots as _snapshots
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.profile import EVAL_PROFILE
 from orchestrator.evals.runner import (
+    RecordingMemorySink,
     _build_eval_scheduler,
+    _EvalMcpStub,
     _StubMcpSession,
     build_eval_orch_config,
 )
 from orchestrator.mcp import verdict_tools as _verdict_tools
+from orchestrator.workflow import TaskWorkflow
+
+# The non-routable null sentinel EVAL_PROFILE pins fused_memory.url to, and the
+# production endpoint an un-isolated eval run would otherwise write into.
+_NULL_SENTINEL = 'http://127.0.0.1:1'
+_PRODUCTION = 'http://localhost:8002'
 
 # ---------------------------------------------------------------------------
 # Shared committed-diff git fixture (test_snapshots.py _git / tmp_repo
@@ -572,3 +580,57 @@ def test_b4_non_empty_committed_diff_graded(
     assert 'committed_diff_present' in prompt
     assert _ADDED_FILE in prompt
     assert '(no diff available)' not in prompt
+
+
+# ── B5: memory isolation (D8) ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_b5_memory_isolation_two_way(tmp_path: Path) -> None:
+    """B5 — default url is the null sentinel; the sink captures the real write.
+
+    Two-way: (1) with NO ``memory_endpoint``, the built eval config resolves
+    ``fused_memory.url`` to the non-routable null sentinel — never the
+    production endpoint (default isolation flows purely through the profile).
+    (2) With a ``RecordingMemorySink`` threaded via ``memory_endpoint``, the
+    REAL ``_write_completion_to_memory`` write path lands in the sink (an
+    ``add_memory`` in ``observations_and_summaries``) and the resolved url is
+    the sink, never production — so the production dark_factory write-count
+    delta stays 0. GREEN on main (ε).
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+
+    # (1) Default isolation → null sentinel, never production.
+    default_cfg = build_eval_orch_config(cfg, task, base)
+    assert default_cfg.fused_memory.url == _NULL_SENTINEL
+    assert default_cfg.fused_memory.url != _PRODUCTION
+
+    # (2) Sink override routes the REAL write path to the sink (prod delta 0).
+    with RecordingMemorySink() as sink:
+        orch_config = build_eval_orch_config(
+            cfg, task, base, memory_endpoint=sink.url,
+        )
+        assert orch_config.fused_memory.url == sink.url
+        assert orch_config.fused_memory.url != _PRODUCTION
+
+        wf = object.__new__(TaskWorkflow)
+        wf.mcp = _EvalMcpStub(orch_config.fused_memory.url)
+        wf.config = orch_config
+        wf.task = {'title': 'My task', 'description': 'does a thing'}
+        wf.plan = {
+            'analysis': 'because reasons',
+            'design_decisions': [],
+            'steps': [{'status': 'done'}, {'status': 'pending'}],
+        }
+        wf.modules = ['orchestrator/src/orchestrator/evals']
+        wf.task_id = 't'
+
+        await wf._write_completion_to_memory()
+
+        assert len(sink.writes) == 1
+        tool_name, arguments = sink.writes[0]
+        assert tool_name == 'add_memory'
+        assert arguments['category'] == 'observations_and_summaries'
+        assert arguments['project_id'] == orch_config.fused_memory.project_id
