@@ -297,7 +297,10 @@ max_turns:
   module_tagger: 30
   deep_reviewer: 100
   judge: 15
-  simple_task: 30
+  # task λ (2797) / PRD adaptive-model-routing Open-Q 4: 30→50. simple_task's
+  # 28.6% turn-cap saturation was the worst of any role; δ/2534's per-role
+  # saturation rollup is the tracked indicator if 50 overshoots.
+  simple_task: 50
 
 # Reasoning effort per role
 effort:

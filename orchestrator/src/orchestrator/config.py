@@ -187,7 +187,7 @@ class TurnsConfig(BaseModel):
     module_tagger: int = Field(default=30)
     deep_reviewer: int = Field(default=100)
     judge: int = Field(default=15)
-    simple_task: int = Field(default=30)
+    simple_task: int = Field(default=50)
 
 
 class EffortConfig(BaseModel):
