@@ -9205,6 +9205,53 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._lane_halt[ln].set()
         self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
+        # task 2788: resolve the popped-for-finalize VERIFYING request BEFORE
+        # this coroutine's first `await` below. _finalize_inflight pops its
+        # entry off self._inflight (via _inflight_popleft) BEFORE the long
+        # `await entry.verify_task` that finalizes it -- during that window
+        # the entry is off the deque (invisible to the _inflight drain a few
+        # lines down) but not yet at registry MERGING (invisible to
+        # _resolve_merging_requests too), so without this block its request
+        # Future is NEVER given a terminal outcome here. If the in-progress
+        # verify then resolves to any non-shutdown terminal during one of
+        # this coroutine's later await windows, _on_terminal's REMOVE arm
+        # deletes the durable journal record out from under it. Setting the
+        # SHUTDOWN_REASON terminal synchronously -- before any await -- lets
+        # single-threaded asyncio pre-empt that race: _on_terminal's existing
+        # KEEP guard (blocked + MERGE_WORKER_SHUTDOWN_REASON) fires
+        # deterministically, so recover_pending_merges can re-enqueue the
+        # request on the next boot.
+        _fh_entry = self._finalizing_head_entry()
+        if _fh_entry is not None:
+            _fh_req = _fh_entry.item.request
+            if not _fh_req.result.done():
+                _fh_req.result.set_result(shutdown)
+            # MQ-reliability kappa (task 2169): retire -- this entry never
+            # reaches its own FINALIZING/TERMINAL transition once stop()
+            # short-circuits it here.
+            self._retire_item(_fh_req.request_id)
+            # Tear down exactly like the _inflight drain below so nothing
+            # leaks (verify subprocess / merge worktree / host lease /
+            # speculation permit). These releases are idempotent -- an
+            # existing stop() invariant -- so a concurrent in-flight
+            # _finalize_inflight unwind (from cancelling verify_task here)
+            # racing its own finally-block releases is safe.
+            if _fh_entry.verify_task is not None and not _fh_entry.verify_task.done():
+                if _fh_entry.lease is not None:
+                    with contextlib.suppress(BaseException):
+                        await self._abort_remote_verify(_fh_entry.lease, _fh_req.task_id)
+                _fh_entry.verify_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await _fh_entry.verify_task
+            if _fh_entry.merge_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(_fh_entry.merge_wt)
+            if _fh_entry.lease is not None and self._host_allocator is not None:
+                with contextlib.suppress(BaseException):
+                    await self._host_allocator.cancel_and_release(_fh_entry.lease)
+            if _fh_entry.permit is not None:
+                self._speculation_ledger.release(_fh_entry.permit)
+
         # Drain per-lane buffers (items already removed from _queue by the merger)
         # Intentionally mutates _lane_buffers directly (not via
         # _buffer_owned_request/_pop_next_pickable) from the stop coroutine —
