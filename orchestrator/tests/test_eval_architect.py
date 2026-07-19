@@ -577,3 +577,88 @@ class TestPlanQualityReport:
             build_plan_quality_report(list(reversed(results)))
         )
         assert a == b  # deterministic (sorted rows, no wall-clock dependence)
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch — _run_single_eval routes architect candidates (step-13/14)
+#
+# The user-observable signal: `orchestrator eval` with an architect-role
+# candidate (role=='architect') routes to run_architect_eval (NOT run_eval) and
+# surfaces the per-fixture plan_quality score. An ordinary implementer config
+# still routes to run_eval, unchanged. Hermetic: both runners and config
+# resolution are patched — no live worktree, no LLM.
+# ---------------------------------------------------------------------------
+
+def _fake_eval_result(**over):
+    from orchestrator.evals.runner import EvalResult
+
+    defaults: dict = dict(
+        task_id='df_task_2605',
+        config_name='x',
+        outcome='done',
+        metrics={'composite_score': 1.0},
+        worktree_path='/tmp/wt',
+        wall_clock_ms=1000,
+    )
+    defaults.update(over)
+    return EvalResult(**defaults)
+
+
+def _dispatch_single_eval(cfg, capsys):
+    """Drive ``cli._run_single_eval`` with a resolved config, both runners patched.
+
+    ``get_config_by_name`` is patched to return ``cfg`` so the dispatch is
+    exercised purely on ``cfg.role``. Returns ``(out, run_eval, run_architect)``.
+    """
+    from orchestrator import cli
+
+    arch_result = _fake_eval_result(
+        config_name=cfg.name,
+        metrics={'role_under_test': 'architect', 'plan_quality': 0.75},
+    )
+    impl_result = _fake_eval_result(config_name=cfg.name)
+
+    mock_run_eval = AsyncMock(return_value=impl_result)
+    mock_run_arch = AsyncMock(return_value=arch_result)
+
+    with contextlib.ExitStack() as es:
+        p = es.enter_context
+        p(patch('orchestrator.evals.runner.run_eval', mock_run_eval))
+        p(patch('orchestrator.evals.runner.run_architect_eval', mock_run_arch))
+        p(patch('orchestrator.evals.configs.get_config_by_name',
+                MagicMock(return_value=cfg)))
+        cli._run_single_eval(
+            Path('/fake/task.json'), cfg.name, base_config=MagicMock(),
+        )
+    out = capsys.readouterr().out
+    return out, mock_run_eval, mock_run_arch
+
+
+class TestCliArchitectDispatch:
+    def _arch_cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    def _impl_cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig('opus-high', 'claude', 'opus', 'high')
+
+    def test_architect_config_routes_to_run_architect_eval(self, capsys):
+        _, run_eval, run_arch = _dispatch_single_eval(self._arch_cfg(), capsys)
+        run_arch.assert_called_once()
+        run_eval.assert_not_called()
+
+    def test_architect_dispatch_surfaces_plan_quality(self, capsys):
+        out, _, _ = _dispatch_single_eval(self._arch_cfg(), capsys)
+        # The per-fixture plan-quality score is echoed to the operator.
+        assert 'plan_quality' in out
+        assert '0.75' in out
+
+    def test_implementer_config_still_routes_to_run_eval(self, capsys):
+        _, run_eval, run_arch = _dispatch_single_eval(self._impl_cfg(), capsys)
+        run_eval.assert_called_once()
+        run_arch.assert_not_called()
