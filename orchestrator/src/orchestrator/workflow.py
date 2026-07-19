@@ -5295,6 +5295,7 @@ class TaskWorkflow:
                 self.plan, iteration_log, rebase_notice=rebase_notice,
                 task_id=self.task_id, wip_notice=wip_notice,
             )
+            pre_head = await self._get_head_commit()
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
             self.metrics.execute_iterations += 1
@@ -5322,7 +5323,6 @@ class TaskWorkflow:
                 if isinstance(s, dict) and s.get('status') == 'done'
             }
             newly_completed = sorted(completed_after - completed_before)
-            head_commit = await self._get_head_commit()
 
             if newly_completed:
                 step_descs = [
@@ -5340,7 +5340,7 @@ class TaskWorkflow:
                 'agent': 'implementer',
                 'steps_attempted': newly_completed,
                 'steps_completed': newly_completed,
-                'commit': head_commit,
+                **await self._iteration_commit_provenance(pre_head),
                 'summary': summary,
                 'source': 'orchestrator',
             })
