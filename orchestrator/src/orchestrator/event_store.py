@@ -124,6 +124,13 @@ class EventType(StrEnum):
     # merge_sha}.  state is one of MergeOutcome.status values, 'abandoned'
     # (cancelled future), or 'error' (unexpected exception).
     merge_finalized = 'merge_finalized'
+    # Unconditional observability of the generic merge-blocked fall-through in
+    # TaskWorkflow._submit_to_merge_queue.  Emitted BEFORE _mark_blocked and
+    # ungated by has_open_l1, so `merge_finalized state=blocked` can never again
+    # be followed by total silence when an unrelated open L1 suppresses the
+    # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
+    # {reason, category, failure_category, cause_hint}.
+    merge_blocked = 'merge_blocked'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
 

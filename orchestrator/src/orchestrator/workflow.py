@@ -7311,7 +7311,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         else:
             category = 'merge_error'
         self._write_merge_failure_review(category, result.reason)
-        return await self._mark_blocked(result.reason, merge_phase=merge_phase)
+        # Unconditional observability (task 2757; Reify 5120 RCA RC-2): emit the
+        # durable merge_blocked event BEFORE _mark_blocked and ungated by
+        # has_open_l1, so this generic fall-through can never again go
+        # `merge_finalized state=blocked` -> total silence when an unrelated open
+        # L1 suppresses the escalation at either has_open_l1 gate.  Threading the
+        # real review-category into _mark_blocked (not the default 'task_failure')
+        # also makes the signature-aware L1 dedup meaningful.
+        if self.event_store:
+            self.event_store.emit(
+                EventType.merge_blocked,
+                task_id=self.task_id, phase=self.state.value,
+                data={
+                    'reason': result.reason[:500],
+                    'category': category,
+                    'failure_category': result.failure_category,
+                    'cause_hint': result.failure_cause_hint,
+                },
+            )
+        return await self._mark_blocked(
+            result.reason, merge_phase=merge_phase, category=category,
+        )
 
     async def _spawn_main_health_fix_task(
         self,
@@ -10254,8 +10274,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 return _record(WorkflowOutcome.BLOCKED)
 
-            # Don't create a duplicate if level-1 already pending
-            if not self.escalation_queue.has_open_l1(self.task_id):
+            # Don't create a duplicate if level-1 already pending — but only a
+            # SAME-signature L1 should suppress the steward-facing L0 (task 2757):
+            # an unrelated open L1 (different category) must not silently drop a
+            # new root cause's L0.
+            if not self.escalation_queue.has_open_l1(self.task_id, category=category):
                 from escalation.models import Escalation
 
                 esc = Escalation(
@@ -10424,7 +10447,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # StewardBudgetExhausted outcome fell through from above.  Either
         # way a human should know — submit an L1 (deduped) so the task
         # isn't silently parked.
-        await self._ensure_l1_escalation_for_blocked(reason, detail or reason, category=category)
+        #
+        # skip_escalation guard (task 2757): a skip_escalation=True caller has
+        # ALREADY filed its own signature-specific L1 (train halt → wip_conflict/
+        # unmerged_state; main-health auto-heal → preexisting_main_break; architect
+        # no-plan → the promoted L0; steward re-escalation → the steward's L1).
+        # Before the terminal gate became signature-aware, the bare
+        # has_open_l1(task_id) dedup masked this fall-through for those callers
+        # (any open L1 suppressed it).  Now that _ensure_l1_escalation_for_blocked
+        # dedups on category, this default-category='task_failure' fall-through no
+        # longer matches the caller's differently-categorised L1 and would
+        # DOUBLE-file.  Respect skip_escalation here so the caller stays the sole
+        # owner of the human-facing escalation.  The generic merge-blocked path
+        # (merge_phase=True, skip_escalation unset) is unaffected — it still
+        # surfaces unconditionally, which is task 2757's whole point.
+        if not skip_escalation:
+            await self._ensure_l1_escalation_for_blocked(
+                reason, detail or reason, category=category,
+            )
 
         # Fix #2 — dismiss any still-pending L0 now that we are exiting BLOCKED.
         # The steward has finished (or never ran) and this workflow slot is
@@ -10561,7 +10601,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         if not self.escalation_queue:
             return
-        if self.escalation_queue.has_open_l1(self.task_id):
+        # Signature-aware dedup (task 2757): a NEW root cause (different category)
+        # must not be silently suppressed by an UNRELATED open L1.  This is the
+        # terminal silent-drop for the generic merge-blocked path — reached
+        # unconditionally from _mark_blocked's fall-through call.
+        if self.escalation_queue.has_open_l1(self.task_id, category=category):
             return
         from escalation.models import Escalation
 

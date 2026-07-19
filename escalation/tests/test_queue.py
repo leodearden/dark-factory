@@ -3682,3 +3682,108 @@ class TestArchiveListingMemoisation:
         assert result_after_prune is None, (
             f'Expected None after pruning but got {result_after_prune!r}'
         )
+
+
+def _make_esc_with_category(
+    esc_id: str,
+    task_id: str,
+    category: str,
+    *,
+    status: str = 'pending',
+    level: int = 1,
+) -> Escalation:
+    """An Escalation with a caller-chosen category (the top-level _make_escalation
+    hardcodes category='task_failure', so has_open_l1 signature tests need this)."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='orchestrator',
+        severity='blocking',
+        category=category,
+        summary='merge blocked',
+        level=level,
+    )
+    esc.status = status
+    return esc
+
+
+class TestHasOpenL1CategoryFilter:
+    """has_open_l1 gains an optional keyword-only `category` signature filter (task 2757).
+
+    A NEW root cause (different category) must no longer be suppressed by an
+    UNRELATED open L1; the default (no category arg) preserves exact current
+    behavior, and the existing level/status filters still apply.
+    """
+
+    def test_back_compat_no_category_arg(self, tmp_path: Path) -> None:
+        """has_open_l1(task_id) with no category is True when a pending L1 exists."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'merge_error'))
+        assert queue.has_open_l1('T') is True
+
+    def test_matching_category_is_true(self, tmp_path: Path) -> None:
+        """A pending L1 with the SAME category returns True (signature match)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'merge_error'))
+        assert queue.has_open_l1('T', category='merge_error') is True
+
+    def test_different_category_not_suppressed(self, tmp_path: Path) -> None:
+        """An UNRELATED open L1 (different category) does NOT suppress a new signature."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'merge_error'))
+        assert queue.has_open_l1('T', category='post_merge_verify') is False
+
+    def test_level0_does_not_count_as_open_l1(self, tmp_path: Path) -> None:
+        """A level-0 escalation with a matching category is not an open L1 (level filter)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'merge_error', level=0))
+        assert queue.has_open_l1('T', category='merge_error') is False
+
+    def test_resolved_l1_does_not_count(self, tmp_path: Path) -> None:
+        """A resolved level-1 escalation with a matching category is not open (status filter)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(
+            _make_esc_with_category('esc-T-1', 'T', 'merge_error', status='resolved')
+        )
+        assert queue.has_open_l1('T', category='merge_error') is False
+
+
+class TestMultipleCoOpenL1Resolution:
+    """Signature-aware dedup permits N co-open L1s per task; resolving one must
+    leave the task blocked until the others are resolved (task 2757; reviewer
+    robustness follow-up, queue-layer portion).
+
+    The bare, no-category ``has_open_l1(task_id)`` is the unblock gate: it stays
+    True while ANY pending L1 remains open, so resolving one of several co-open
+    L1s never prematurely unblocks a task that still has an open root cause.
+    (The dashboards/reapers portion of the reviewer note is out of scope for
+    this task's locked modules and left to a follow-up.)
+    """
+
+    def test_resolving_one_of_two_co_open_l1s_keeps_task_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        """Two co-open L1s of different categories; resolving one leaves the
+        bare unblock gate True until the second is also resolved."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'merge_error'))
+        queue.submit(_make_esc_with_category('esc-T-2', 'T', 'post_merge_verify'))
+
+        # Both root causes open: bare gate blocks; both signatures present.
+        assert queue.has_open_l1('T') is True
+        assert queue.has_open_l1('T', category='merge_error') is True
+        assert queue.has_open_l1('T', category='post_merge_verify') is True
+
+        # Resolve ONE of the two co-open L1s.
+        queue.resolve('esc-T-1', 'human unblocked merge_error')
+
+        # Bare unblock gate STILL True — the second L1 keeps the task blocked.
+        assert queue.has_open_l1('T') is True
+        # Its own signature is cleared, but the unrelated one still stands.
+        assert queue.has_open_l1('T', category='merge_error') is False
+        assert queue.has_open_l1('T', category='post_merge_verify') is True
+
+        # Resolve the second: only now is the task fully unblocked.
+        queue.resolve('esc-T-2', 'human unblocked post_merge_verify')
+        assert queue.has_open_l1('T') is False
+        assert queue.has_open_l1('T', category='post_merge_verify') is False
