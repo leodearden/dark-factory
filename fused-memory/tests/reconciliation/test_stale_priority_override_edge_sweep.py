@@ -37,6 +37,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -45,7 +46,19 @@ from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     is_ttl_override_fact,
     read_live_override_state,
     select_stale_priority_override_edges,
+    sweep_stale_priority_override_edges,
 )
+
+
+def _make_memory_service() -> MagicMock:
+    """MagicMock memory_service with an AsyncMock .graphiti.get_all_valid_edges
+    and .update_edge (mirrors test_stale_status_snapshot_edge_sweep.py's
+    _make_memory_service)."""
+    memory_service = MagicMock()
+    memory_service.graphiti = MagicMock()
+    memory_service.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+    memory_service.update_edge = AsyncMock()
+    return memory_service
 
 # Full scheduler_overrides.db schema (mirrors server/tools.py::_OVERRIDE_SCHEMA)
 # so the real-DB reader test exercises read_live_override_state against a
@@ -385,3 +398,69 @@ class TestReadLiveOverrideState:
         recorded yet); no crash."""
         result = await read_live_override_state(str(tmp_path))
         assert result == {}
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_priority_override_edges — core behavior
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepStalePriorityOverrideEdgesCore:
+    """sweep_stale_priority_override_edges enumerates valid edges via
+    memory_service.graphiti.get_all_valid_edges, reads live override state via
+    the injected read_live, and invalidates only the edges
+    select_stale_priority_override_edges identifies as stale.
+    """
+
+    @pytest.mark.asyncio
+    async def test_happy_path_invalidates_only_the_stale_edge(self):
+        """One stale edge (boost for task 5166, absent from the live map) +
+        one healthy edge (boost for task 999, present in the live map).
+        update_edge must be awaited exactly once, for the stale edge's uuid
+        only, with a datetime invalid_at, project_id threaded, the stable
+        agent_id, and run_id as causation_id."""
+        memory_service = _make_memory_service()
+
+        stale_edge = {
+            'uuid': 'edge-stale',
+            'fact': "Set priority override for task 5166: {'boost_tier': 'high'}",
+            'name': '',
+        }
+        healthy_edge = {
+            'uuid': 'edge-healthy',
+            'fact': "Set priority override for task 999: {'boost_tier': 'high'}",
+            'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge, healthy_edge]},
+        )
+        read_live = AsyncMock(return_value={'999': {'ttl_until': None}})
+
+        stats = await sweep_stale_priority_override_edges(
+            memory_service, 'test_project', '/tmp/reify',
+            run_id='run-1', read_live=read_live,
+        )
+
+        memory_service.update_edge.assert_awaited_once()
+        update_call = memory_service.update_edge.await_args
+        assert update_call.args[0] == 'edge-stale', (
+            f'Expected update_edge awaited for the stale edge uuid only, got {update_call!r}'
+        )
+        assert isinstance(update_call.kwargs.get('invalid_at'), datetime), (
+            'Expected update_edge called with a datetime invalid_at'
+        )
+        assert update_call.kwargs.get('project_id') == 'test_project'
+        assert update_call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator', (
+            "Expected update_edge stamped with the sweep's stable agent_id, "
+            f'got {update_call!r}'
+        )
+        assert update_call.kwargs.get('causation_id') == 'run-1', (
+            'Expected update_edge threaded the reconciliation run_id as causation_id, '
+            f'got {update_call!r}'
+        )
+
+        read_live.assert_awaited_once_with('/tmp/reify')
+
+        assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
+            f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
+        )
