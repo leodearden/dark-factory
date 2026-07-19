@@ -202,3 +202,40 @@ class TestBackstop:
         assert not (git_repo / 'data' / 'orchestrator' / 'agent-transcripts').exists()
         # Teardown still happened — the kill switch gates archival, not removal.
         assert not wt.path.exists()
+
+    async def test_archiver_error_does_not_block_teardown(self, git_repo):
+        """A non-cancellation error escaping the archiver is swallowed, never
+        raised out of cleanup_worktree — ``git worktree remove`` must proceed
+        regardless (teardown is not held hostage by a broken archiver). Drives
+        step-8's ``try/except Exception`` hardening."""
+        tid = '2786'
+        git_ops = _make_git_ops(git_repo, transcript_archive=TranscriptArchiveConfig())
+        wt = await git_ops.create_worktree(tid)
+        _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
+
+        with patch(
+            'orchestrator.git_ops.archive_task_transcripts',
+            side_effect=RuntimeError('boom'),
+        ) as mock_helper:
+            # Must NOT raise out of cleanup_worktree — the backstop is best-effort.
+            await git_ops.cleanup_worktree(wt.path, tid)
+
+        mock_helper.assert_called_once()
+        # Removal proceeded despite the archival error.
+        assert not wt.path.exists()
+
+    async def test_unwired_gitops_is_a_byte_identical_no_op(self, git_repo):
+        """A GitOps built WITHOUT the transcript_archive kwarg (default None —
+        the cli/recover/evals construction sites) never touches the archiver: the
+        backstop is inert, byte-identical to before this task. Rides the step-2
+        ``is not None`` guard."""
+        tid = '2786'
+        git_ops = _make_git_ops(git_repo)  # no transcript_archive → default None
+        wt = await git_ops.create_worktree(tid)
+        _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
+
+        with patch('orchestrator.git_ops.archive_task_transcripts') as mock_helper:
+            await git_ops.cleanup_worktree(wt.path, tid)
+
+        mock_helper.assert_not_called()
+        assert not wt.path.exists()
