@@ -210,6 +210,7 @@ def _setup_warm_lane_session(
     fresh: bool = True,
     with_transcript: bool = True,
     with_plan: bool = True,
+    with_sidecar: bool = True,
     sidecar_version: int = 2,
     resume_count: int = 0,
     lane: bool = True,
@@ -217,9 +218,14 @@ def _setup_warm_lane_session(
     """Lay down an on-disk warm lane (or cold worktree) mid-invocation.
 
     Writes ``<dir>/.task/plan.json`` (stamped w/ the real task_id + partial
-    progress, when ``with_plan``), a v1/v2 ``agent_session.json`` sidecar, and
-    — when ``with_transcript`` — the corroborating transcript under
-    ``<dir>/.task/claude-config-<sid>/...``. Returns the lane/worktree dir.
+    progress, when ``with_plan``), a v1/v2 ``agent_session.json`` sidecar (when
+    ``with_sidecar``), and — when ``with_transcript`` — the corroborating
+    transcript under ``<dir>/.task/claude-config-<sid>/...``. Returns the
+    lane/worktree dir.
+
+    ``with_sidecar=False`` models the POST-COMPLETION on-disk state (B10): the
+    plan survives but α's ``_invoke`` ``finally`` already cleared the sidecar,
+    so recovery finds a plan to recover but NO session to adopt.
 
     For a warm lane (``lane=True``) a pool is attached and the dir is named
     ``_lane-0`` (≠ the real task_id, by pool-slot design); for a cold worktree
@@ -238,10 +244,11 @@ def _setup_warm_lane_session(
         (task_dir / 'plan.json').write_text(
             json.dumps(_make_plan(steps_done, steps_total, task_id))
         )
-    (task_dir / 'agent_session.json').write_text(json.dumps(_sidecar(
-        session_id, role, task_id=task_id, fresh=fresh,
-        sidecar_version=sidecar_version, resume_count=resume_count,
-    )))
+    if with_sidecar:
+        (task_dir / 'agent_session.json').write_text(json.dumps(_sidecar(
+            session_id, role, task_id=task_id, fresh=fresh,
+            sidecar_version=sidecar_version, resume_count=resume_count,
+        )))
     if with_transcript:
         _make_transcript(task_dir, session_id)
     return wt
@@ -658,6 +665,62 @@ async def test_b2_sigkill_warm_lane_identical_to_b1(harness: Harness):
     assert cap.resume_session_id is adopted
     assert cap.resume_session_id['session_id'] == session_id
     assert cap.initial_plan is recovered_plan
+    assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+# ── B3: restart mid-architect, warm lane, no plan yet ────────────────────────
+@pytest.mark.asyncio
+async def test_b3_mid_architect_no_plan_adopts_session_lane_preserved(
+    harness: Harness,
+):
+    """B3 — a restart MID-ARCHITECT (before any plan.json was written) still
+    adopts the architect session, and at dispatch resumes it WITHOUT skipping
+    the architect (no recovered plan → ``initial_plan is None``).
+
+    Two-way: β adopts the architect session (keyed by the v2 sidecar's own
+    ``task_id``, the only identity source on a no-plan lane) with NO recovered
+    plan, and γ injects that SAME session as ``resume_session_id`` while leaving
+    ``initial_plan`` None — so the resumed invocation re-enters the architect
+    (the complete-plan-skips-architect invariant does NOT fire without a plan).
+
+    LANDED-BEHAVIOR NOTE (mirrors ω design_decision #3 for B6): the PRD-prose
+    framing "lane preserved / cleanup not called" describes the COLD-worktree
+    no-plan branch (harness.py ~2899: ``_preserved_worktrees.add`` + no
+    cleanup). A WARM LANE with no plan takes a DIFFERENT landed branch
+    (harness.py ~2877-2897): it RELEASES the lane back to the pool
+    (``cleanup_worktree`` IS called — a release, not a destroy) and never
+    touches ``_preserved_worktrees``. Crucially, session adoption is keyed by
+    the REAL task_id (the v2 sidecar's own ``task_id``), NOT the lane dir name,
+    so the resume survives the lane going back to the pool — the adoption and
+    the lane's pool membership are independent. ω asserts this landed seam
+    behavior (GREEN-on-write against merged β), not the RED-doomed cold-path
+    prose.
+    """
+    task_id, session_id = '49', 'uuid-b3-architect'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='architect', with_plan=False,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): architect session adopted; NO plan; lane released ──
+    assert task_id in harness._recovered_sessions
+    assert harness._recovered_sessions[task_id]['role'] == 'architect'
+    assert harness._recovered_sessions[task_id]['session_id'] == session_id
+    assert task_id in harness._recovered_session_config_dirs
+    assert task_id not in harness._recovered_plans  # mid-architect: no plan yet
+    # Landed warm-lane no-plan disposition: released to the pool, NOT preserved.
+    assert task_id not in harness._preserved_worktrees
+    harness.git_ops.cleanup_worktree.assert_called_once()  # type: ignore[attr-defined]
+
+    adopted = harness._recovered_sessions[task_id]
+
+    # ── INJECT side (γ): same session resumed; architect NOT skipped ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id['session_id'] == session_id
+    assert cap.initial_plan is None  # no plan → architect re-runs, not skipped
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
 
 
