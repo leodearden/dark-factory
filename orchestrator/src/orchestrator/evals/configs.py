@@ -1,6 +1,19 @@
-"""Eval configuration matrix: model/backend combinations to test."""
+"""Eval configuration matrix: model/backend combinations to test.
 
+Operators running ν's proxied Claude-format-endpoint candidates (see
+``claude_endpoint_candidates()`` below) should seed live ``config.prices``
+from ``claude_endpoint_price_table()`` (merged, not replaced) so those runs
+resolve ``cost_source == 'price_table'`` instead of falling back to
+``'unpriced_proxy'``.
+"""
+
+import logging
+import os
 from dataclasses import dataclass, field
+
+from orchestrator.config import default_price_table
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -423,8 +436,17 @@ ARCHITECT_EVAL_CONFIGS = [
 
 
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name (implementer OR architect candidates)."""
-    for cfg in [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS]:
+    """Look up an eval config by name (implementer, architect, OR ν candidates).
+
+    ν's ``claude_endpoint_candidates()`` bundles are searched LAST since they
+    are a function call (env-read-at-call) rather than a static list — cheap
+    at CLI/driver lookup frequency, and keeps this the single by-name resolver
+    for every eval config family (avoids a second, ν-only lookup path).
+    """
+    for cfg in [
+        *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
+        *claude_endpoint_candidates(),
+    ]:
         if cfg.name == name:
             return cfg
     return None
@@ -502,3 +524,138 @@ def matrix_pairs(
     exists to measure. ``len == len(arch_cfgs) * len(impl_cfgs)``. Pure.
     """
     return [(a, i) for a in arch_cfgs for i in impl_cfgs]
+
+
+# ===== Claude-format-endpoint candidate bundles (eval-revival ν / C5) =====
+#
+# Non-incumbent (harness, model) bundles: Claude Code driving a THIRD-PARTY
+# model by pointing ANTHROPIC_BASE_URL at that provider's own official
+# Anthropic-format-compatible endpoint (ANTHROPIC_AUTH_TOKEN authenticates
+# against it), while ``model`` carries the provider's OWN model id verbatim
+# (never the 'opus'/'sonnet' aliases — those only resolve against Anthropic's
+# own API). Forwarding these two env vars to the role under test is
+# production's per-role ``role_env_overrides`` mechanism (task 2460, Contract
+# C5); the eval driver already forwards a candidate's flat ``env_overrides``
+# to the one role under test (runner.py's run_eval / run_architect_eval), so
+# no runner.py change is needed here.
+
+# Official Anthropic-format base URLs (public; safe to commit). Z.AI/GLM and
+# DeepSeek match the literal already load-bearing in task 2460's
+# test_workflow_e2e.py / this PRD's reuse notes; MiniMax and Moonshot/Kimi are
+# this module's own best-effort literal (operator-adjustable, like the
+# GPU/quantization choices in VLLM_EVAL_CONFIGS above).
+GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
+DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic'
+MINIMAX_BASE_URL = 'https://api.minimax.io/anthropic'
+KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
+
+# Per-provider ANTHROPIC_AUTH_TOKEN source env var name. Never a secret
+# literal in source — the value itself is read from the operator's
+# environment at bundle-build time (see the bundle builder below).
+GLM_AUTH_TOKEN_ENV = 'ZAI_API_KEY'
+DEEPSEEK_AUTH_TOKEN_ENV = 'DEEPSEEK_API_KEY'
+MINIMAX_AUTH_TOKEN_ENV = 'MINIMAX_API_KEY'
+KIMI_AUTH_TOKEN_ENV = 'MOONSHOT_API_KEY'
+
+# Provider model ids, used verbatim as the Claude Code ``model`` value AND
+# (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
+# stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
+MINIMAX_MODEL = 'MiniMax-M2.5'
+GLM_MODEL = 'glm-5.2'
+DEEPSEEK_MODEL = 'deepseek-v4'
+KIMI_MODEL = 'kimi-latest'
+
+
+def _claude_endpoint_config(
+    name: str, model: str, *, base_url: str, auth_token_env: str,
+) -> EvalConfig:
+    """Build one non-incumbent Claude-format-endpoint candidate bundle.
+
+    Mirrors ``_vllm_config``'s env-dict builder pattern: ``ANTHROPIC_BASE_URL``
+    is the public literal *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
+    *auth_token_env* via ``os.environ.get`` at CALL time (never baked into
+    source as a secret), so an operator supplies it via the environment and a
+    test can monkeypatch it and observe the value flow through.
+
+    An unset/empty *auth_token_env* is loud, not silent: unlike
+    ``_vllm_config``'s constant ``'dummy'`` key (intentional — vLLM ignores
+    it), a missing token HERE means the run cannot authenticate against the
+    provider at all, so a WARNING is logged at build time rather than only
+    surfacing later as an opaque 401/auth error mid-run.
+    """
+    auth_token = os.environ.get(auth_token_env, '')
+    if not auth_token:
+        logger.warning(
+            "ν candidate %r: %s is not set in the environment — "
+            "ANTHROPIC_AUTH_TOKEN will be empty and the %s endpoint will "
+            "reject the request (401/auth error) once the run reaches it.",
+            name, auth_token_env, base_url,
+        )
+    return EvalConfig(
+        name=name, backend='claude', model=model, effort='high',
+        env_overrides={
+            'ANTHROPIC_BASE_URL': base_url,
+            'ANTHROPIC_AUTH_TOKEN': auth_token,
+        },
+    )
+
+
+def claude_endpoint_candidates() -> list[EvalConfig]:
+    """Incumbents (native cloud Opus/Sonnet) + the four non-incumbent bundles.
+
+    Each non-incumbent bundle is a (harness, model) candidate — Claude Code
+    driving MiniMax M2.5 / GLM-5.2 / DeepSeek V4 / Kimi via their official
+    Anthropic-format endpoint (PRD C5). ADDITIVE to :func:`ofat_candidates`:
+    the non-incumbent bundles are NOT added there, since its implementer
+    subset asserts every cloud incumbent carries no proxy ``env_overrides``
+    (test_eval_driver_configs.py) — this is a separate, additive selector for
+    Phase-4 candidate screening.
+
+    A function, not a module-level list: the four non-incumbent bundles are
+    (re)built on every call via :func:`_claude_endpoint_config`, so each reads
+    its provider's AUTH_TOKEN env var fresh rather than caching a stale/empty
+    value from import time.
+    """
+    return [
+        *_cloud_implementer_incumbents(),
+        _claude_endpoint_config(
+            'minimax-m2.5-endpoint', MINIMAX_MODEL,
+            base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'glm-5.2-endpoint', GLM_MODEL,
+            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'deepseek-v4-endpoint', DEEPSEEK_MODEL,
+            base_url=DEEPSEEK_BASE_URL, auth_token_env=DEEPSEEK_AUTH_TOKEN_ENV,
+        ),
+        _claude_endpoint_config(
+            'kimi-endpoint', KIMI_MODEL,
+            base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
+        ),
+    ]
+
+
+# Best-effort public list rates (USD per 1M tokens) as of filing —
+# operator-tunable; update alongside provider pricing changes. Keyed EXACTLY
+# by the *_MODEL constants above so collect_metrics (which keys cost on
+# config.models.implementer == EvalConfig.model) resolves cost_source ==
+# 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
+CANDIDATE_ENDPOINT_PRICES: dict[str, dict[str, float]] = {
+    MINIMAX_MODEL: {'input_per_1m': 0.30, 'output_per_1m': 1.20},
+    GLM_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.20},
+    DEEPSEEK_MODEL: {'input_per_1m': 0.28, 'output_per_1m': 0.42},
+    KIMI_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.50},
+}
+
+
+def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
+    """``default_price_table()`` merged with the ν candidate-model prices.
+
+    Lets λ's ``resolve_cost_usd`` resolve ``cost_source == 'price_table'`` for
+    a proxied ν candidate instead of falling back to ``'unpriced_proxy'``.
+    Operators should seed live ``config.prices`` from this table (merged, not
+    replaced) for proxied-endpoint cost accuracy.
+    """
+    return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
