@@ -1489,10 +1489,10 @@ class TestComputeDeliveredCheckCache:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Mirrors (f) ``test_cache_hit_does_not_reinvoke_runner`` but with a
-        FAILED check: a dep that failed on a prior tick and is now served
-        from the ``(dep, sha)`` cache-hit branch must STILL emit a hold
-        event with a meaningful (non-``None``) detail on every held tick —
-        not just the first, uncached tick."""
+        FAILED check: a dep that failed on a prior tick re-runs every sweep
+        (FAILED is never cached — REFILE of task 2782/2783) and must STILL
+        emit a hold event with a meaningful (non-``None``) detail on every
+        held tick — not just the first tick."""
         scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
         fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
         monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
@@ -1506,7 +1506,7 @@ class TestComputeDeliveredCheckCache:
 
         assert first == {'20': False}
         assert second == {'20': False}
-        assert calls == ['cap-one'], 'only ONE invocation total — the 2nd sweep is a cache hit'
+        assert calls == ['cap-one', 'cap-one'], 'FAILED re-runs every sweep, never cached'
         held = self._held_events(scheduler)
         assert len(held) == 2, 'delivered_check_gate_held must fire on EVERY held tick'
         assert scheduler._streak_delivered_hold.value('10') == 2
@@ -1523,12 +1523,14 @@ class TestComputeDeliveredCheckCache:
         self, scheduler: Scheduler, monkeypatch
     ):
         """reviewer_comprehensive amendment: a dep with TWO checks where the
-        FIRST DELIVERS and the SECOND FAILS must have its cached-False hold
+        FIRST DELIVERS and the SECOND FAILS must have its FAILED hold
         detail name the check that actually failed (cap-b) — never the
         dep's first ``delivered_checks`` entry (cap-a, which passed) — on
-        BOTH the uncached (first) sweep and a cache-hit (second) sweep at
-        the same main SHA. Guards against reconstructing the detail from
-        ``checks[0]``, which would misname a passing check as the failure.
+        BOTH the first sweep and a second sweep at the same main SHA
+        (FAILED is never cached — REFILE of task 2782/2783 — so both
+        checks actually re-run on both sweeps). Guards against
+        reconstructing the detail from ``checks[0]``, which would misname
+        a passing check as the failure.
         """
         scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
         fake_runner, calls = self._fake_runner({
@@ -1546,7 +1548,9 @@ class TestComputeDeliveredCheckCache:
 
         assert first == {'20': False}
         assert second == {'20': False}
-        assert calls == ['cap-a', 'cap-b'], 'both checks ran, but only on the uncached sweep'
+        assert calls == ['cap-a', 'cap-b', 'cap-a', 'cap-b'], (
+            'both checks re-run on EVERY sweep — FAILED is never cached'
+        )
         held = self._held_events(scheduler)
         assert len(held) == 2
         expected_detail = {'name': 'cap-b', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep'}
@@ -1555,6 +1559,71 @@ class TestComputeDeliveredCheckCache:
                 f"must name the check that actually FAILED (cap-b), not checks[0] "
                 f"(cap-a, which passed); got {data['data']['detail']!r}"
             )
+
+    # --- (i2) REFILE 2783: a transient FAILED must not wedge the gate at the
+    #     SAME main sha — it must be able to flip to DELIVERED on a later
+    #     sweep once the capability is actually observed present -----------
+
+    @pytest.mark.asyncio
+    async def test_failed_then_delivered_same_sha_flips_and_unwedges(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """REFILE of task 2782: a FAILED delivered-check result must NOT be
+        cached sticky, because — unlike DELIVERED — FAILED is not
+        monotone-safe against the OBSERVATION: a ``git grep`` can
+        transiently miss (e.g. a race with a concurrent write during the
+        merge that produced the SHA, or a read microseconds before the
+        pattern becomes visible at that ref) even though the capability is
+        actually present at that SAME main SHA. Reproduces the exact
+        recurrence shape: main does NOT advance between sweeps, and the
+        SAME dep/check pair resolves FAILED on sweep 1 and then DELIVERED
+        on sweep 2 at the identical SHA. Before this fix, sweep 2 was
+        served straight from a sticky-False cache entry (the runner never
+        re-invoked) and stayed wedged at ``{'20': False}`` forever at this
+        SHA — self-heal only ever happened once main ADVANCED. After the
+        fix, a FAILED result re-runs every sweep (symmetric with the
+        already-proven ERRORED fail-safe path below), so it can flip to
+        DELIVERED at the SAME SHA instead of staying wedged.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+
+        # The class `_fake_runner` maps check-name -> a FIXED outcome and
+        # cannot vary the outcome across calls, so this test defines its
+        # own tiny sequence-based runner: 'cap-one' resolves FAILED on the
+        # first invocation and DELIVERED on the second.
+        outcomes = [DeliveredCheckResult.FAILED, DeliveredCheckResult.DELIVERED]
+        calls: list[str] = []
+
+        async def _sequence_runner(check, *, project_root, ref='main'):
+            calls.append(check['name'])
+            return outcomes[len(calls) - 1]
+
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', _sequence_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': False}
+        assert ('20', 'sha1') not in scheduler._delivered_check_cache, (
+            'a FAILED result must NOT be cached sticky'
+        )
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}, (
+            'the gate must flip to DELIVERED, not stay wedged FAILED at the same SHA'
+        )
+        assert calls == ['cap-one', 'cap-one'], (
+            'the check must re-run on sweep 2 — it must NOT be served from a sticky-False cache'
+        )
+        assert scheduler._delivered_check_cache[('20', 'sha1')] is True, (
+            'the monotone-safe DELIVERED result IS now cached'
+        )
+        assert scheduler._streak_delivered_hold.value('10') == 0, (
+            'hold streak must clear once the dep resolves DELIVERED'
+        )
 
     # --- (j) persistently-ERRORED dep: bounded diagnostic, never backed off -
 
