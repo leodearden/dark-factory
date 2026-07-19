@@ -5862,10 +5862,12 @@ def _emit_merge_flake_suppressed(
     )
 
 
-#: Module-global consecutive-suppression counter (INV-4 storm detector).
-#: Bumped ONLY on a suppression; reset to 0 once the window (threshold) is
-#: reached and the storm escalation decision is made. A count-window detector;
-#: time-windowing is a sanctioned PRD §9 follow-up.
+#: Module-global suppression counter (INV-4 storm detector). Bumped ONLY on a
+#: suppression; reset to 0 only once the window (threshold) is reached and the
+#: storm escalation decision is made. A clean, non-suppressed merge-verify does
+#: NOT reset it, so this is a CUMULATIVE count of suppressions since the last
+#: reset — NOT a count of back-to-back (consecutive) merges. A count-window
+#: detector; time-windowing is a sanctioned PRD §9 follow-up.
 _merge_flake_suppression_streak = 0
 
 #: Suppressions per window before the born-at-L2 storm escalation fires. A
@@ -5920,17 +5922,19 @@ def _bump_suppression_streak_and_maybe_escalate(
     summary = (
         'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate '
         f'has suppressed {_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify '
-        'reds in a row'
+        'reds since the last reset'
     )
     detail = (
         f'The role=merge isolated-rerun-confirm gate (verify.'
         f'apply_merge_flake_suppression) has suppressed '
-        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} consecutive merge-verify '
-        f'failures as CPU-starvation flakes (most recent merge SHA: '
-        f'{merge_sha}, task_id: {task_id}). Each suppression means a merge-verify '
-        'red passed on isolated re-run — but a sustained streak indicates either '
-        'chronic host CPU starvation or a genuinely flaky test that is being '
-        'repeatedly masked. Investigate before the gate hides a real regression.'
+        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify failures as '
+        f'CPU-starvation flakes since the counter was last reset — a CUMULATIVE '
+        f'count, NOT necessarily back-to-back merges (a clean merge-verify does '
+        f'not reset the counter). Most recent merge SHA: {merge_sha}, task_id: '
+        f'{task_id}. Each suppression means a merge-verify red passed on isolated '
+        're-run — but a sustained rate of suppressions indicates either chronic '
+        'host CPU starvation or a genuinely flaky test that is being repeatedly '
+        'masked. Investigate before the gate hides a real regression.'
     )
     esc = Escalation(
         id=escalation_queue.make_id(sentinel),
