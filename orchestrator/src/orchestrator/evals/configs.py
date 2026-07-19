@@ -3,6 +3,8 @@
 import os
 from dataclasses import dataclass, field
 
+from orchestrator.config import default_price_table
+
 
 @dataclass
 class EvalConfig:
@@ -600,3 +602,27 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
             base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
         ),
     ]
+
+
+# Best-effort public list rates (USD per 1M tokens) as of filing —
+# operator-tunable; update alongside provider pricing changes. Keyed EXACTLY
+# by the *_MODEL constants above so collect_metrics (which keys cost on
+# config.models.implementer == EvalConfig.model) resolves cost_source ==
+# 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
+CANDIDATE_ENDPOINT_PRICES: dict[str, dict[str, float]] = {
+    MINIMAX_MODEL: {'input_per_1m': 0.30, 'output_per_1m': 1.20},
+    GLM_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.20},
+    DEEPSEEK_MODEL: {'input_per_1m': 0.28, 'output_per_1m': 0.42},
+    KIMI_MODEL: {'input_per_1m': 0.60, 'output_per_1m': 2.50},
+}
+
+
+def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
+    """``default_price_table()`` merged with the ν candidate-model prices.
+
+    Lets λ's ``resolve_cost_usd`` resolve ``cost_source == 'price_table'`` for
+    a proxied ν candidate instead of falling back to ``'unpriced_proxy'``.
+    Operators should seed live ``config.prices`` from this table (merged, not
+    replaced) for proxied-endpoint cost accuracy.
+    """
+    return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
