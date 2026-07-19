@@ -23,13 +23,21 @@ depends on ε:
 
 from __future__ import annotations
 
+import inspect
+
 import httpx
 import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.profile import EVAL_PROFILE
-from orchestrator.evals.runner import RecordingMemorySink, build_eval_orch_config
+from orchestrator.evals.runner import (
+    RecordingMemorySink,
+    _EvalMcpStub,
+    build_eval_orch_config,
+    run_eval,
+)
+from orchestrator.workflow import TaskWorkflow
 
 # The non-routable null sentinel the eval profile pins fused_memory.url to:
 # 127.0.0.1:1 gives an immediate ECONNREFUSED (fast-fail, no slow DNS/timeout)
@@ -118,3 +126,61 @@ def test_build_eval_orch_config_default_isolates_memory_off_production(tmp_path)
     assert result.fused_memory.url == _NULL_SENTINEL
     assert result.fused_memory.url != _PRODUCTION
     assert result.fused_memory.url != base.fused_memory.url
+
+
+@pytest.mark.asyncio
+async def test_memory_endpoint_override_routes_real_workflow_write_to_sink(tmp_path):
+    """A memory_endpoint override routes the REAL _write_completion_to_memory write to the sink.
+
+    Exercises the genuine workflow write path (not a re-implementation): the
+    override lands on the single ``orch_config.fused_memory.url`` leaf the writes
+    funnel through, and the real ``_write_completion_to_memory`` POST is captured
+    by the recording sink — never at production ``http://localhost:8002``.
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+
+    with RecordingMemorySink() as sink:
+        orch_config = build_eval_orch_config(cfg, task, base, memory_endpoint=sink.url)
+
+        # The override lands on the single leaf the writes funnel through
+        # (fused_memory.url → _EvalMcpStub.url → self.mcp.url).
+        assert orch_config.fused_memory.url == sink.url
+        assert _EvalMcpStub(orch_config.fused_memory.url).url == sink.url
+        assert orch_config.fused_memory.url != _PRODUCTION
+        # A sample profile field still holds — the override layers over the
+        # profile rather than replacing it wholesale.
+        assert orch_config.unblock_auto.enabled is False
+
+        # Drive the REAL workflow memory-write method against the sink, wiring
+        # only the minimal attrs _write_completion_to_memory reads.
+        wf = object.__new__(TaskWorkflow)
+        wf.mcp = _EvalMcpStub(orch_config.fused_memory.url)
+        wf.config = orch_config
+        wf.task = {'title': 'My task', 'description': 'does a thing'}
+        wf.plan = {
+            'analysis': 'because reasons',
+            'design_decisions': [],
+            'steps': [{'status': 'done'}, {'status': 'pending'}],
+        }
+        wf.modules = ['orchestrator/src/orchestrator/evals']
+        wf.task_id = 't'
+
+        await wf._write_completion_to_memory()
+
+        # The real write was captured by the sink — proving isolation covers the
+        # genuine write path, and the production write-count delta stays 0.
+        assert len(sink.writes) == 1
+        tool_name, arguments = sink.writes[0]
+        assert tool_name == 'add_memory'
+        assert arguments['category'] == 'observations_and_summaries'
+        assert arguments['project_id'] == orch_config.fused_memory.project_id
+
+
+def test_run_eval_accepts_memory_endpoint_kwarg():
+    """run_eval exposes an optional memory_endpoint it threads to build_eval_orch_config."""
+    params = inspect.signature(run_eval).parameters
+    assert 'memory_endpoint' in params
+    # Default None → the profile null-sentinel isolation stands with no wiring.
+    assert params['memory_endpoint'].default is None
