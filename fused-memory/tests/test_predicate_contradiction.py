@@ -19,12 +19,15 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.middleware.execution_class_guard import execution_class_error
 from fused_memory.reconciliation.predicate_contradiction import (
     PredicateContradictionTask,
     build_predicate_contradiction_task,
 )
+from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 # --- Shared fixtures for the builder tests ---------------------------------- #
 _CONTRADICTION = (
@@ -35,6 +38,22 @@ _FINDING_ID = '9cfd4de9-1111-4000-8000-000000000001'
 _RUN_ID = '23632bc9-2222-4000-8000-000000000002'
 _CITED = ['03a2b6d7-3333-4000-8000-000000000003', '8ae43c70-4444-4000-8000-000000000004']
 _PYTEST_ARGS = ['--pytest', 'tests/test_x.py::test_y']
+
+
+def _base_build_kwargs(**overrides):
+    """Valid baseline kwargs for build_predicate_contradiction_task; override
+    individual fields per test."""
+    kwargs = dict(
+        contradiction=_CONTRADICTION,
+        script='check.sh',
+        timeout_secs=120,
+        args=_PYTEST_ARGS,
+        finding_id=_FINDING_ID,
+        run_id=_RUN_ID,
+        cited_memory_ids=_CITED,
+    )
+    kwargs.update(overrides)
+    return kwargs
 
 # Repo root: this file is <root>/fused-memory/tests/test_predicate_contradiction.py
 _REPO_ROOT = Path(__file__).parents[2]
@@ -112,17 +131,7 @@ class TestBuildPredicateContradictionTask:
     payload passes BOTH submit-boundary guards."""
 
     def _build(self, **overrides):
-        kwargs = dict(
-            contradiction=_CONTRADICTION,
-            script='check.sh',
-            timeout_secs=120,
-            args=_PYTEST_ARGS,
-            finding_id=_FINDING_ID,
-            run_id=_RUN_ID,
-            cited_memory_ids=_CITED,
-        )
-        kwargs.update(overrides)
-        return build_predicate_contradiction_task(**kwargs)
+        return build_predicate_contradiction_task(**_base_build_kwargs(**overrides))
 
     def test_returns_predicate_contradiction_task(self):
         task = self._build()
@@ -180,3 +189,52 @@ class TestBuildPredicateContradictionTask:
         assert kwargs['task_kind'] == 'deterministic'
         assert kwargs['metadata']['execution_class'] == 'code_tdd'
         assert kwargs['title']
+
+
+class TestBuildPredicateContradictionRejections:
+    """The builder FAILS LOUD (ValueError) on an execution_class other than
+    'code_tdd', and propagates BeforeDone shape-validation failures."""
+
+    def test_execution_class_operational_rejected(self):
+        with pytest.raises(ValueError) as excinfo:
+            build_predicate_contradiction_task(
+                **_base_build_kwargs(execution_class='operational')
+            )
+        msg = str(excinfo.value).lower()
+        assert 'code_tdd' in msg
+        # The rationale must name why: operational/decision coerce to
+        # always_escalates=True, illegal for a predicate.
+        assert 'always_escalates' in msg or 'predicate' in msg
+
+    def test_execution_class_decision_rejected(self):
+        with pytest.raises(ValueError) as excinfo:
+            build_predicate_contradiction_task(
+                **_base_build_kwargs(execution_class='decision')
+            )
+        msg = str(excinfo.value).lower()
+        assert 'code_tdd' in msg
+        assert 'always_escalates' in msg or 'predicate' in msg
+
+    def test_execution_class_unknown_rejected(self):
+        # A value not even in EXECUTION_CLASSES is rejected too.
+        assert 'banana' not in EXECUTION_CLASSES
+        with pytest.raises(ValueError):
+            build_predicate_contradiction_task(**_base_build_kwargs(execution_class='banana'))
+
+    def test_empty_script_raises(self):
+        # BeforeDone(script='') fails min_length=1 — propagated as an error.
+        with pytest.raises(ValueError):
+            build_predicate_contradiction_task(**_base_build_kwargs(script=''))
+
+    def test_zero_timeout_raises(self):
+        with pytest.raises(ValueError):
+            build_predicate_contradiction_task(**_base_build_kwargs(timeout_secs=0))
+
+    def test_negative_timeout_raises(self):
+        with pytest.raises(ValueError):
+            build_predicate_contradiction_task(**_base_build_kwargs(timeout_secs=-5))
+
+    def test_happy_path_does_not_raise(self):
+        # Regression guard: the valid baseline must NOT raise.
+        task = build_predicate_contradiction_task(**_base_build_kwargs())
+        assert task.metadata['execution_class'] == 'code_tdd'
