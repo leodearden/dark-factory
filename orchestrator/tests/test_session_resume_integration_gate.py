@@ -296,6 +296,108 @@ async def _dispatch_capture(
     )
 
 
+def _seed_lane_record(
+    lifecycle: LaneLifecycle, lane: Path, *, task_id: str, branch: str | None = None,
+) -> None:
+    """Bring *lane*'s durable record to ASSIGNED:*task_id* via the legal
+    seed-up ladder (None → SEED → REGISTERED → ASSIGNED).
+
+    Cloned from test_crash_recovery.py:711-725 — mirrors
+    ``GitOps._note_assigned_via_route``'s climb. ``branch=None`` seeds a
+    branchless record, which trivially satisfies the record-driven recovery
+    path's ``rec.branch is None or …`` branch-match check regardless of what
+    ``lane_branch_checkouts()`` reports, so a real ``git worktree list`` read
+    is never load-bearing here.
+    """
+    lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+    lifecycle.transition(lane, DurableLaneState.REGISTERED, branch=branch)
+    lifecycle.transition(
+        lane, DurableLaneState.ASSIGNED, task_id=task_id, branch=branch,
+    )
+
+
+async def _make_real_git_lane(
+    harness: Harness,
+    task_id: str,
+    session_id: str,
+    *,
+    role: str = 'implementer',
+    steps_done: int = 3,
+    steps_total: int = 5,
+) -> tuple[Path, str]:
+    """Build a REAL git-initialised warm lane mid-implementer; return
+    ``(lane_dir, wip_sha)``.
+
+    Unlike ``_setup_warm_lane_session`` (which fabricates a lane via a bare
+    ``mkdir`` and so takes recovery's HEURISTIC plan path), this seeds a
+    durable ASSIGNED lane record so recovery takes the RECORD-DRIVEN adopt
+    path, AND the lane is a real git repo carrying a committed WIP so a
+    post-recovery ``git rev-parse HEAD`` proves the exact WIP sha survives the
+    recovery pass — not merely that ``cleanup_worktree`` was skipped.
+
+    Layout: ``git init -b main`` + user config + an initial commit + a WIP
+    commit. The WIP sha is captured BEFORE the on-disk ``.task`` artifacts are
+    laid down, so ``HEAD`` is the WIP commit and the (untracked) ``.task`` dir
+    is merely present on disk for recovery to read. The stamped
+    ``.task/plan.json`` (partial progress — ≥1 done step, so recovery
+    pre-loads it into ``_recovered_plans``), the v2 sidecar, and the
+    corroborating transcript mirror ``_setup_warm_lane_session``. The durable
+    record is seeded branchless so the record-driven branch-match check is
+    trivially satisfied.
+    """
+    _attach_pool(harness)
+    lane = harness.git_ops.worktree_base / '_lane-0'
+    lane.mkdir(parents=True, exist_ok=True)
+    # Real git repo: an initial commit, then a WIP commit whose sha survives.
+    await _run(['git', 'init', '-b', 'main'], cwd=lane)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=lane)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=lane)
+    (lane / 'work.py').write_text('def f():\n    return 0\n')
+    await _run(['git', 'add', '-A'], cwd=lane)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=lane)
+    (lane / 'work.py').write_text('def f():\n    return 1  # WIP mid-implementer\n')
+    await _run(['git', 'add', '-A'], cwd=lane)
+    await _run(['git', 'commit', '-m', 'WIP: mid-implementer'], cwd=lane)
+    rc, wip_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+    assert rc == 0
+    wip_sha = wip_sha.strip()
+    # On-disk .task artifacts (untracked — HEAD stays at the WIP commit).
+    task_dir = lane / '.task'
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / 'plan.json').write_text(
+        json.dumps(_make_plan(steps_done, steps_total, task_id))
+    )
+    (task_dir / 'agent_session.json').write_text(json.dumps(_sidecar(
+        session_id, role, task_id=task_id, fresh=True,
+        sidecar_version=2, resume_count=0,
+    )))
+    _make_transcript(task_dir, session_id)
+    # Durable ASSIGNED record → record-driven adopt path (branchless).
+    _seed_lane_record(
+        harness.git_ops._lane_lifecycle, lane, task_id=task_id, branch=None,
+    )
+    # Hermetic, deterministic branch-checkout read: the record is branchless so
+    # the value is irrelevant to branch_ok, but pinning it avoids depending on
+    # the host's real `git worktree list` (mirrors the record-driven recovery
+    # tests in test_crash_recovery.py, which all stub this).
+    harness.git_ops.lane_branch_checkouts = AsyncMock(return_value={})
+    return lane, wip_sha
+
+
+def _storm_queue() -> MagicMock:
+    """A stand-in escalation queue for the B8 fallback-storm test.
+
+    Mirrors test_crash_recovery.py's ``TestSessionResumeStorm._queue``:
+    ``has_open_l1`` → False (no existing L1 to dedupe against), ``make_id`` →
+    a fixed id, and a default-MagicMock ``submit`` whose ``call_count`` /
+    ``call_args`` the storm assertion inspects.
+    """
+    q = MagicMock()
+    q.has_open_l1 = MagicMock(return_value=False)
+    q.make_id = MagicMock(return_value='sr-storm')
+    return q
+
+
 # ── B1: clean SIGTERM mid-implementer, warm lane ─────────────────────────────
 @pytest.mark.asyncio
 async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
