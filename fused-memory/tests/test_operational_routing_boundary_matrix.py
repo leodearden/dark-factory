@@ -521,3 +521,46 @@ async def test_invalid_operational_mode_rejected_and_no_task_created(
     assert 'error' not in tasks_result, f'get_tasks failed unexpectedly: {tasks_result!r}'
     titles = [t.get('title') for t in tasks_result.get('tasks', [])]
     assert title not in titles, f'got {tasks_result!r}'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7 — recon source-completion: rendered Stage 1/2 system prompts
+# (matrix row 7: the epsilon directive, asserted on the ASSEMBLED prompt
+# product the recon agents actually run with — a functional artifact, not a
+# docstring/comment introspection).
+# ---------------------------------------------------------------------------
+
+
+def test_recon_stage_prompts_carry_source_completion_directives():
+    """The assembled Stage 1 and Stage 2 system prompts both carry the ε
+    source-completion directives, and the residual-filing clause correctly
+    splits by each stage's tool authority.
+
+    Stage 2 (``build_stage2_system_prompt``, ``can_file_tasks=True`` at the
+    ``render_source_completion_section`` call site in stage2.py) holds
+    ``submit_task`` and files the residual itself; Stage 1
+    (``STAGE1_SYSTEM_PROMPT``, ``can_file_tasks=False`` in stage1.py) does
+    NOT hold it (``DISALLOW_TASK_WRITES``) and must relay to Stage 2 via
+    ``flag_for_stage2`` instead. Assertions are scoped to load-bearing
+    directive TOKENS (not exact prose), per the plan's scoping rationale —
+    this mirrors the ε leaf's own rendered-prompt test and realizes the
+    PRD's row-7 signal on the actual runtime artifact the LLM receives.
+    """
+    from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+    from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+
+    stage1_prompt = STAGE1_SYSTEM_PROMPT
+    stage2_prompt = build_stage2_system_prompt('dark_factory')
+
+    for prompt in (stage1_prompt, stage2_prompt):
+        assert '## Source-Completion' in prompt, f'missing section header: {prompt!r}'
+        assert 'COMPLETE the merge inline' in prompt, f'missing inline-merge directive: {prompt!r}'
+        assert "execution_class='operational'" in prompt, f'missing execution_class guidance: {prompt!r}'
+        assert "operational_mode='gate'" in prompt, f'missing operational_mode guidance: {prompt!r}'
+
+    # Residual-clause split (can_file_tasks): each unique phrase appears in
+    # exactly the stage whose tool authority it describes.
+    assert 'file it yourself' in stage2_prompt
+    assert 'file it yourself' not in stage1_prompt
+    assert 'Relay it to Stage 2' in stage1_prompt
+    assert 'Relay it to Stage 2' not in stage2_prompt
