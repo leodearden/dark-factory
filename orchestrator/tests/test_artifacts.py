@@ -1652,3 +1652,109 @@ class TestReviewCounters:
         rec = artifacts.get_cached_verdict('tree_abc')
         assert rec is not None and rec['verdict'] == 'suggestions_only'
         assert rec['reviewer_fingerprint'] == 'FP1'
+
+
+class TestEnsureLanePlanSymlink:
+    """`ensure_lane_plan_symlink()` single-sources plan.json: the lane copy
+    `<worktree>/.task/plan.json` becomes an ABSOLUTE symlink INTO the durable
+    meta-root plan.json (`self.root / 'plan.json'`). Any residual reader of the
+    lane path then transparently resolves to the meta-root file — the esc-5205-9
+    stale-trap (a regular-file lane copy that diverges from the meta-root) is
+    impossible because the lane path IS the meta-root file. No-op in legacy
+    `meta_root=None` mode, where the lane path already IS the durable copy.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    def test_creates_absolute_symlink_to_meta_root_plan(
+        self, worktree: Path, meta_root: Path
+    ):
+        # meta_root mode: init() does NOT create <worktree>/.task (see
+        # TestMetaRootConstructor.test_init_and_write_plan_land_under_meta_root_only),
+        # so the method itself must mkdir the lane .task/ before symlinking.
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        assert not (worktree / '.task').exists()
+
+        ta.ensure_lane_plan_symlink()
+
+        lane_plan = worktree / '.task' / 'plan.json'
+        assert lane_plan.is_symlink()
+        # ABSOLUTE target pointing at the durable meta-root copy.
+        target = os.readlink(lane_plan)
+        assert os.path.isabs(target)
+        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+
+    def test_read_through_returns_meta_root_content(
+        self, worktree: Path, meta_root: Path
+    ):
+        # (b) read-through proof: write_plan lands at meta_root/plan.json;
+        # reading the lane symlink returns the same content.
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.ensure_lane_plan_symlink()
+        ta.write_plan(
+            {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
+        )
+
+        lane_plan = worktree / '.task' / 'plan.json'
+        read = json.loads(lane_plan.read_text())
+        assert read['steps'][0]['id'] == 'step-1'
+        # Same bytes as the durable meta-root copy.
+        assert read == json.loads((meta_root / 'plan.json').read_text())
+
+    def test_replaces_preplanted_regular_file(
+        self, worktree: Path, meta_root: Path
+    ):
+        # (c) the esc-5205-9 stale-trap: a pre-existing regular-FILE lane
+        # plan.json is REPLACED by the symlink.
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+
+        lane_task = worktree / '.task'
+        lane_task.mkdir(parents=True, exist_ok=True)
+        lane_plan = lane_task / 'plan.json'
+        lane_plan.write_text('{"stale": "trap"}')
+        assert lane_plan.is_file() and not lane_plan.is_symlink()
+
+        ta.ensure_lane_plan_symlink()
+
+        assert lane_plan.is_symlink()
+        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+
+    def test_idempotent(self, worktree: Path, meta_root: Path):
+        # (d) calling twice yields a symlink to the same target, no error.
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.ensure_lane_plan_symlink()
+        ta.ensure_lane_plan_symlink()
+
+        lane_plan = worktree / '.task' / 'plan.json'
+        assert lane_plan.is_symlink()
+        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+
+    def test_noop_in_legacy_meta_root_none_mode(
+        self, artifacts: TaskArtifacts, worktree: Path
+    ):
+        # (e) legacy meta_root=None mode (the `artifacts` fixture builds
+        # TaskArtifacts(worktree) with self.root == worktree/.task): a
+        # pre-existing real plan.json is left a regular FILE — no
+        # self-referential symlink is created.
+        assert artifacts.root == worktree / '.task'
+        artifacts.write_plan(
+            {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
+        )
+        lane_plan = worktree / '.task' / 'plan.json'
+        assert lane_plan.is_file() and not lane_plan.is_symlink()
+
+        artifacts.ensure_lane_plan_symlink()
+
+        # Still a regular file — no symlink, no self-reference.
+        assert lane_plan.is_file()
+        assert not lane_plan.is_symlink()
