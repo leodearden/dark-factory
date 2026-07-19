@@ -687,6 +687,55 @@ class TestModelOverridesField:
         assert 'model_overrides' not in unknown_key_fields
 
 
+class TestOperationalModeField:
+    """``TaskMetadata.operational_mode`` -- a caller-independent {gate,llm}
+    discriminator, orthogonal to execution_class (PRD operational-ask-routing
+    task alpha, decision 1). Meaningful only when execution_class='operational'
+    (consumed by task beta); recorded-but-inert otherwise.
+
+    Unlike execution_class -- validated only by a fused-memory guard that
+    exists because its rule is conditional on recon-stage caller identity
+    (logic a pydantic field validator cannot express) -- operational_mode's
+    {gate,llm}-or-absent rule is caller-independent and fully expressible as
+    a typed Literal field, so it is "recognized + validated" at this layer
+    alone, with no new fused-memory guard required.
+    """
+
+    def test_default_is_gate(self):
+        assert TaskMetadata().operational_mode == 'gate'
+
+    @pytest.mark.parametrize('value', ['gate', 'llm'])
+    def test_constructs_with_valid_values(self, value):
+        assert TaskMetadata(operational_mode=value).operational_mode == value
+
+    def test_bad_operational_mode_rejected(self):
+        with pytest.raises(ValidationError):
+            TaskMetadata(operational_mode='bogus')  # type: ignore[arg-type]
+
+    def test_model_dump_default_is_concrete_not_none(self):
+        assert TaskMetadata().model_dump()['operational_mode'] == 'gate'
+
+    @pytest.mark.parametrize('value', ['gate', 'llm'])
+    def test_parse_metadata_read_valid_value_emits_no_warnings(self, value):
+        _, warnings = parse_metadata({'operational_mode': value}, direction='read')
+        assert warnings == []
+
+    def test_parse_metadata_read_invalid_value_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'operational_mode': 'bogus'}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'operational_mode'
+        assert warnings[0].code == 'invalid_field'
+        assert model.model_dump()['operational_mode'] == 'bogus'
+
+    def test_parse_metadata_write_enforce_invalid_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'operational_mode': 'bogus'}, direction='write', enforce=True)
+
+    def test_parse_metadata_write_enforce_valid_round_trips(self):
+        model, _ = parse_metadata({'operational_mode': 'llm'}, direction='write', enforce=True)
+        assert model.operational_mode == 'llm'
+
+
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
         tm = TaskMetadata()

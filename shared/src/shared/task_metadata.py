@@ -449,6 +449,17 @@ class TaskMetadata(BaseModel):
     schema_version: int = 2
     task_kind: Literal['normal', 'deterministic'] = 'normal'
     always_escalates: bool = False
+    # Orthogonal discriminator, NOT an enum split of execution_class (PRD
+    # operational-ask-routing decision 1); meaningful only when
+    # execution_class='operational' (consumed by task β), recorded-but-inert
+    # otherwise. Mirrors execution_class's INTENT but, unlike execution_class
+    # (validated only by a fused-memory guard conditional on recon-stage
+    # caller identity — logic a pydantic field validator cannot express),
+    # operational_mode's {gate,llm}-or-absent rule is caller-independent and
+    # fully expressible as a plain typed Literal field here. The concrete
+    # 'gate' default implements absent≡gate while avoiding the None-valued
+    # model_dump noise a `| None = None` field would add to every task.
+    operational_mode: Literal['gate', 'llm'] = 'gate'
     before_done: BeforeDone | None = None
     done_provenance: DoneProvenance | None = None
     memory_hints: MemoryHints | None = None
