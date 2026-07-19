@@ -76,6 +76,7 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import re
 import subprocess
@@ -89,7 +90,9 @@ import orchestrator
 import orchestrator.scheduler
 from orchestrator import config as _config
 from orchestrator.config import OrchestratorConfig, load_config
+from orchestrator.evals import judge as _judge
 from orchestrator.evals import profile as _profile
+from orchestrator.evals import snapshots as _snapshots
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.profile import EVAL_PROFILE
 from orchestrator.evals.runner import (
@@ -503,3 +506,69 @@ async def test_b3_dispatch_literals_resolve_through_eval_scheduler(
         'Dispatched via dispatch_tool(...) in scheduler.py but NO branch in the '
         f'eval scheduler stub (D2/B9 heartbeat spam): {missing}'
     )
+
+
+# ── B4: non-empty committed diff graded end-to-end (P3 / D1) ────────────────
+
+
+def test_b4_non_empty_committed_diff_graded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B4 — the full committed diff (not '' / a placeholder) reaches the judge.
+
+    Over ``committed_diff_fixture`` (a base commit + a COMMITTED landed change
+    on an ``evals/<id>`` branch): (1) ``snapshots.get_diff(worktree,
+    base_commit)`` returns the FULL committed diff — non-empty, naming the
+    added file/line — proving the ``git diff base..HEAD`` path, NOT the removed
+    empty/uncommitted fallback (D1); (2) driving ``judge.run_judge`` with
+    ``invoke_agent`` faked (no real LLM), ``get_diff`` is invoked with the
+    fixture's ``pre_task_commit`` and the diff string embedded in the graded
+    prompt is that committed diff — never ``'{}'`` / ``'(no diff available)'``.
+
+    GREEN on main (γ threaded the base commit through every diff caller).
+    """
+    worktree, base_commit = committed_diff_fixture(tmp_path)
+
+    # (1) get_diff yields the full committed diff (git diff base..HEAD).
+    diff = asyncio.run(_snapshots.get_diff(worktree, base_commit))
+    assert diff, 'expected a non-empty committed diff vs base'
+    assert _ADDED_FILE in diff
+    assert 'committed_diff_present' in diff
+
+    # (2) The judge grades that diff. The recorder delegates to the REAL
+    # get_diff so it both records the threaded base AND returns the real
+    # committed diff into the graded prompt.
+    recorded: list[tuple[Path, str]] = []
+    real_get_diff = _snapshots.get_diff
+
+    async def _rec(worktree_path: Path, base: str) -> str:
+        recorded.append((Path(worktree_path), base))
+        return await real_get_diff(Path(worktree_path), base)
+
+    captured_prompts: list[str] = []
+    monkeypatch.setattr('orchestrator.evals.judge.get_diff', _rec)
+    monkeypatch.setattr(
+        'orchestrator.evals.judge.invoke_agent',
+        _fake_invoke_agent(captured_prompts),
+    )
+
+    result_a = {'worktree_path': str(worktree), 'config_name': 'A'}
+    result_b = {'worktree_path': str(worktree), 'config_name': 'B'}
+    task = {
+        'id': 't',
+        'name': 't',
+        'pre_task_commit': base_commit,
+        'task_definition': {'description': 'd'},
+    }
+
+    asyncio.run(_judge.run_judge(result_a, result_b, task))
+
+    # get_diff was invoked with the fixture's pre_task_commit (both contenders).
+    assert recorded
+    assert all(base == base_commit for _, base in recorded)
+    # The committed diff — never the empty/placeholder — reached the prompt.
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+    assert 'committed_diff_present' in prompt
+    assert _ADDED_FILE in prompt
+    assert '(no diff available)' not in prompt
