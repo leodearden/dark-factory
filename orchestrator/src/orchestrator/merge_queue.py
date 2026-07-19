@@ -601,8 +601,18 @@ another fix task.  Promotes to config if tuning is needed.
 
 _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
     'wip_overlap', 'pop_conflict', 'unmerged_state', 'pop_conflict_no_advance',
+    'stash_failed',
 )
 """``advance_main`` result codes that can trigger a WIP halt.
+
+``stash_failed`` (task 2758) is a shared main-checkout-hygiene fault:
+``advance_main`` could not park project_root's dirty tracked WIP, so it
+halts the queue (single escalation) instead of blocking N tasks one at a
+time.  Its membership here is a correctness requirement, not a preference —
+an ABANDONED stash_failed request must take the same "skip the halt for an
+abandoned request" early-out as ``unmerged_state``/``pop_conflict_no_advance``
+(see the abandoned-request handling below), otherwise the mapper would
+engage a halt with no workflow coroutine to own it (an orphan halt).
 
 Shared between :class:`SpeculativeMergeWorker` and the retired serial
 worker's test-local reference (see :class:`_TrainMergeHost`) to avoid
@@ -12740,7 +12750,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
                     await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                    if result in ('unmerged_state', 'pop_conflict_no_advance'):
+                    if result in (
+                        'unmerged_state', 'pop_conflict_no_advance', 'stash_failed',
+                    ):
                         self._cas_retries.pop(req.task_id, None)
                         self._gate_retries.pop(req.task_id, None)
                     return False
