@@ -92,6 +92,7 @@ def build_eval_orch_config(
     config: EvalConfig,
     task: dict,
     base_config: OrchestratorConfig | None = None,
+    memory_endpoint: str | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
@@ -109,6 +110,16 @@ def build_eval_orch_config(
         blocking issues. Eval default is 1; df_task_18 sets 2 because it
         empirically needs a second architect→implement→debug→review pass
         to clear all blockers.
+
+    ``memory_endpoint`` (ε, D8): where eval memory writes go. Left ``None``
+    (the default), the profile's non-routable null sentinel
+    (``EVAL_PROFILE['fused_memory.url']``) stands — eval memory writes can
+    never reach the production dark_factory store. A caller wanting to CAPTURE
+    the intended writes (Boundary test B5, integration gate ι, or an operator)
+    starts a ``RecordingMemorySink`` and passes its ``.url`` here; it overrides
+    only ``fused_memory.url`` (preserving ``project_id`` and every other
+    fused-memory leaf), so ``self.mcp.url`` — the single leaf every
+    ``_write_*_to_memory`` POST funnels through — becomes the sink.
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
@@ -159,9 +170,10 @@ def build_eval_orch_config(
     # inherited from `base` (via apply_eval_profile's own model_copy), so a
     # new production field can never silently regress to a pydantic default
     # in eval. apply_eval_profile(base) applies the documented EVAL_PROFILE
-    # divergences (D3/D4); the update dict below layers this run's
+    # divergences (D3/D4/D8); the update dict below layers this run's
     # legitimate per-run overrides on top.
-    return apply_eval_profile(base).model_copy(update={
+    profiled = apply_eval_profile(base)
+    update: dict[str, Any] = {
         'models': models,
         'budgets': budgets,
         'effort': effort,
@@ -175,7 +187,16 @@ def build_eval_orch_config(
         'sandbox': SandboxConfig(enabled=False),
         'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
-    })
+    }
+    # D8: an explicit recording endpoint layers over the profile's null
+    # sentinel — override only fused_memory.url (preserving project_id and
+    # every other fused-memory leaf from the profiled config). Left None, the
+    # profile null sentinel stands and eval memory writes never reach production.
+    if memory_endpoint is not None:
+        update['fused_memory'] = profiled.fused_memory.model_copy(
+            update={'url': memory_endpoint},
+        )
+    return profiled.model_copy(update=update)
 
 
 async def run_eval(
@@ -185,6 +206,7 @@ async def run_eval(
     trial: int = 1,
     timeout_override: int | None = None,
     worktree_path: Path | None = None,
+    memory_endpoint: str | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
 
@@ -193,6 +215,12 @@ async def run_eval(
     (with step statuses) is used as the initial plan, so the workflow
     naturally skips already-completed steps — useful for resuming a
     blocked eval from the reviewer phase.
+
+    *memory_endpoint* (ε, D8) is threaded straight to
+    ``build_eval_orch_config``: left ``None``, the profile's null-sentinel
+    isolation stands; pass a ``RecordingMemorySink().url`` to capture the
+    intended memory writes instead of dropping them (see
+    ``build_eval_orch_config`` for the full contract).
     """
     task = load_task(task_path)
     task_id = task['id']
@@ -213,7 +241,9 @@ async def run_eval(
         )
 
     # 2. Build orchestrator config for this eval
-    orch_config = build_eval_orch_config(config, task, base_config)
+    orch_config = build_eval_orch_config(
+        config, task, base_config, memory_endpoint=memory_endpoint,
+    )
 
     # 3. Build task assignment
     task_def = task.get('task_definition', {
