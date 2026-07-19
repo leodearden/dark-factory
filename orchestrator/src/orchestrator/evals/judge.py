@@ -361,3 +361,129 @@ def score_plan_structure(
         raise ValueError('plan-quality rubric total weight must be > 0')
     score = satisfied_weight / total_weight
     return round(min(max(score, 0.0), 1.0), 4)
+
+
+@dataclass
+class PlanQualityVerdict:
+    """Result of the LLM plan judge (eval-revival θ).
+
+    ``plan_quality`` is a ``float`` in ``[0, 1]`` when the judge scored the
+    plan, or ``None`` — the parse-failure sentinel — when the judge output could
+    not be parsed. ``run_architect_eval`` treats ``None`` as its signal to
+    degrade to the deterministic :func:`score_plan_structure` floor, so the
+    persisted ``plan_quality`` is ALWAYS a non-sentinel float even when the
+    judge fails.
+    """
+
+    plan_quality: float | None
+    per_criterion: dict[str, Any]
+    reasoning: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+PLAN_QUALITY_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'plan_quality': {'type': 'number', 'minimum': 0.0, 'maximum': 1.0},
+        'per_criterion': {'type': 'object'},
+        'reasoning': {'type': 'string'},
+    },
+    'required': ['plan_quality', 'reasoning'],
+}
+
+
+async def judge_plan_quality(
+    plan: dict,
+    reference_diff: str,
+    task: dict,
+    rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
+) -> PlanQualityVerdict:
+    """LLM plan judge: score a produced *plan* against the real landed diff.
+
+    Mirrors :func:`run_judge`'s structure — an opus judge with an
+    ``output_schema``, ``structured_output``-or-``json.loads`` parse, and a
+    defined fallback verdict on parse failure. The prompt embeds the produced
+    plan, the landed *reference_diff* (``pre_task_commit..post_task_commit``,
+    the always-available ground truth since ζ fixtures frequently carry
+    ``plan: null``), and the code-owned *rubric*'s criterion names — so the
+    semantic judge scores the SAME named structural signals
+    :func:`score_plan_structure` weights deterministically.
+
+    On any parse failure the verdict's ``plan_quality`` is ``None`` (the
+    sentinel :func:`run_architect_eval` degrades on), never a crash.
+    """
+    task_name = task.get('name', task.get('id', 'unknown'))
+    task_desc = task.get('task_definition', {}).get('description', '')
+
+    criteria_lines = '\n'.join(
+        f'- {c["name"]} (weight {c["weight"]}): {c["description"]}'
+        for c in rubric['criteria']
+    )
+    plan_json = json.dumps(plan, indent=2, default=str)
+    # Strip identifying metadata from the landed diff (bias prevention), exactly
+    # as run_judge does for the contender diffs.
+    clean_diff = _strip_metadata(reference_diff)
+
+    prompt = f"""You are evaluating the QUALITY of an implementation PLAN a \
+software architect produced for a task, BEFORE any code was written.
+
+Task: {task_name}
+Task description: {task_desc}
+
+## The architect's produced plan
+```json
+{plan_json}
+```
+
+## The change that ACTUALLY landed for this task (reference diff)
+```diff
+{clean_diff}
+```
+
+Score how well the produced PLAN anticipates the change that actually landed, \
+guided by this plan-quality rubric:
+{criteria_lines}
+
+A strong plan decomposes the landed change into coherent TDD steps, names the \
+right files, records its design decisions and code reuse, and would plausibly \
+PRODUCE the landed diff if executed. Judge the PLAN, not the diff.
+
+Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.0, ...}}, "reasoning": "..."}}"""
+
+    result = await invoke_agent(
+        prompt=prompt,
+        system_prompt=(
+            'You are an expert software architect grading an implementation '
+            'plan against the change that actually landed. Be precise and fair.'
+        ),
+        cwd=Path('/tmp'),
+        model='opus',
+        effort='max',
+        backend='claude',
+        max_budget_usd=5.0,
+        output_schema=PLAN_QUALITY_SCHEMA,
+    )
+
+    # Parse verdict — structured_output first, else json.loads(output); a
+    # missing/None/non-numeric plan_quality degrades to the None sentinel.
+    try:
+        verdict = result.structured_output or json.loads(result.output)
+        raw_quality = verdict['plan_quality']
+        plan_quality = float(raw_quality) if raw_quality is not None else None
+    except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+        logger.warning(
+            f'Plan judge produced unparseable output: {str(result.output)[:200]}'
+        )
+        return PlanQualityVerdict(
+            plan_quality=None,
+            per_criterion={},
+            reasoning='Plan judge output parse failure',
+        )
+
+    return PlanQualityVerdict(
+        plan_quality=plan_quality,
+        per_criterion=verdict.get('per_criterion', {}) or {},
+        reasoning=verdict.get('reasoning', ''),
+    )
