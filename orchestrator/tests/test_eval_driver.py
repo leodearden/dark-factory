@@ -24,6 +24,7 @@ import pytest
 
 from orchestrator.config import load_config
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.evals.runner import EvalResult
 from orchestrator.workflow import WorkflowOutcome
 
 

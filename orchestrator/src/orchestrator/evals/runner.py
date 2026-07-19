@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -823,6 +823,102 @@ async def run_eval_matrix(
         await asyncio.gather(*active, return_exceptions=True)
         raise
     return results
+
+
+async def _bounded_fanout(
+    thunks: list[Callable[[], Awaitable[EvalResult | None]]],
+    max_parallel: int | None = None,
+) -> list[EvalResult]:
+    """Run each *thunk* with bounded concurrency, returning the flattened results.
+
+    The single-sourced fan-out skeleton the μ methodology stages
+    (:func:`run_ofat_stage` / :func:`run_matrix_stage` / :func:`run_confirm_stage`)
+    share, mirroring :func:`run_eval_matrix`'s ``asyncio.wait(FIRST_COMPLETED)``
+    monitor loop EXACTLY: a non-cancel failure in one cell is logged and the
+    fan-out CONTINUES; a ``CancelledError`` (inner or external) cancels the
+    still-running siblings, awaits their teardown, and re-raises. Each thunk is a
+    zero-arg coroutine factory returning one ``EvalResult`` (or ``None`` to skip).
+    """
+    if not thunks:
+        return []
+    if max_parallel is None:
+        max_parallel = len(thunks)
+    sem = asyncio.Semaphore(max_parallel)
+
+    async def _guarded(thunk: Callable[[], Awaitable[EvalResult | None]]) -> EvalResult | None:
+        async with sem:
+            return await thunk()
+
+    active: set[asyncio.Task] = {asyncio.create_task(_guarded(t)) for t in thunks}
+    results: list[EvalResult] = []
+    try:
+        while active:
+            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            cancel_errors = _collect_cancel_errors(done)
+            if cancel_errors:
+                for ce in cancel_errors:
+                    logger.error('Eval cancelled', exc_info=ce)
+                for t in active:
+                    t.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
+                active.clear()
+                raise cancel_errors[0]
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    logger.error('Eval failed', exc_info=exc)
+                else:
+                    r = task.result()
+                    if r is not None:
+                        results.append(r)
+    except asyncio.CancelledError:
+        for t in active:
+            t.cancel()
+        await asyncio.gather(*active, return_exceptions=True)
+        raise
+    return results
+
+
+async def run_ofat_stage(
+    task_paths: list[Path],
+    candidates: list[EvalConfig],
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 1,
+    timeout_override: int | None = None,
+) -> list[EvalResult]:
+    """OFAT screen: dispatch each candidate by role over fixtures × trials (μ).
+
+    A role-dispatching fan-out over the EXISTING frozen-input executors
+    (decision 9): an implementer candidate (``role=='implementer'``) runs through
+    :func:`run_eval` (frozen plan → implementer varies, arch/reviewer pinned), an
+    architect candidate (``role=='architect'``) through :func:`run_architect_eval`
+    (live architect → downstream frozen). No new per-role machinery. Returns the
+    flattened ``EvalResult`` list across every ``(candidate, fixture, trial)``
+    cell; a failed cell is logged and skipped via :func:`_bounded_fanout`.
+    """
+    def _thunk(
+        task_path: Path, candidate: EvalConfig, trial: int,
+    ) -> Callable[[], Awaitable[EvalResult | None]]:
+        async def _run() -> EvalResult | None:
+            if candidate.role == 'architect':
+                return await run_architect_eval(
+                    task_path, candidate, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                )
+            return await run_eval(
+                task_path, candidate, base_config,
+                trial=trial, timeout_override=timeout_override,
+            )
+        return _run
+
+    thunks = [
+        _thunk(tp, candidate, trial)
+        for tp in task_paths
+        for candidate in candidates
+        for trial in range(1, trials + 1)
+    ]
+    return await _bounded_fanout(thunks, max_parallel)
 
 
 def _result_exists(task_id: str, config_name: str) -> bool:
