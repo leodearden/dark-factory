@@ -15,6 +15,9 @@ truth for pass/fail.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import subprocess
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -38,6 +41,7 @@ from orchestrator.workflow import (
     WorkflowCancelled,
     WorkflowOutcome,
     WorkflowState,
+    _meta_root_for_worktree,
 )
 
 
@@ -2512,3 +2516,71 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         outcome = await wf._await_steward_completion()
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus.DONE)
+
+
+def _init_git_repo(path: Path) -> None:
+    """Create a real git repo with one commit so `git rev-parse HEAD` succeeds
+    in the external-worktree branch of `_setup_worktree_and_artifacts`.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@e',
+        'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@e',
+    }
+    subprocess.run(['git', 'init', '-q'], cwd=path, check=True)
+    subprocess.run(['git', 'config', 'user.email', 't@e'], cwd=path, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'T'], cwd=path, check=True)
+    (path / 'seed.txt').write_text('x')
+    subprocess.run(['git', 'add', '.'], cwd=path, check=True)
+    subprocess.run(
+        ['git', 'commit', '-q', '-m', 'seed'], cwd=path, env=env, check=True,
+    )
+
+
+@pytest.mark.asyncio
+class TestSetupWiresLanePlanSymlink:
+    """`_setup_worktree_and_artifacts` single-sources plan.json: after setup,
+    the lane copy `<worktree>/.task/plan.json` is a symlink into the durable
+    meta-root plan.json (`_meta_root_for_worktree(worktree)/plan.json`). This
+    drives the REAL method via the external-worktree branch (every other test
+    fully mocks `_setup_worktree_and_artifacts`).
+    """
+
+    async def test_setup_creates_lane_plan_symlink_into_meta_root(
+        self, tmp_path: Path,
+    ):
+        worktree = tmp_path / 'wt'
+        _init_git_repo(worktree)
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        # External-worktree branch: pre-set worktree so create_worktree is
+        # skipped and `git rev-parse HEAD` (+ _worktree_external=True) runs.
+        wf.worktree = worktree
+        wf.artifacts = None  # setup builds the real meta_root-backed instance
+
+        # Non-terminal live status so the pre-empt guard passes; async stubs
+        # for the claimant/heartbeat writes setup performs.
+        wf.scheduler.get_status = AsyncMock(return_value='pending')
+        wf.scheduler.set_task_status = AsyncMock()
+        wf.scheduler.update_task = AsyncMock(return_value=True)
+        wf.scheduler.set_task_claimant = AsyncMock()
+        # Large heartbeat interval → the background loop sleeps (never fires
+        # its MagicMock-scheduler write) until we cancel it in teardown.
+        wf.config.claimant_heartbeat_interval_secs = 3600.0
+
+        try:
+            await wf._setup_worktree_and_artifacts('branch')
+
+            lane_plan = worktree / '.task' / 'plan.json'
+            assert lane_plan.is_symlink()
+            expected_meta = _meta_root_for_worktree(worktree)
+            assert lane_plan.resolve() == (expected_meta / 'plan.json').resolve()
+            # It resolves under the durable meta-root sibling, not the worktree.
+            assert str(expected_meta) in str(os.readlink(lane_plan))
+        finally:
+            hb = getattr(wf, '_claimant_heartbeat_task', None)
+            if hb is not None:
+                hb.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await hb
