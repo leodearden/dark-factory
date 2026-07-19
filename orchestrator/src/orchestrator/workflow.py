@@ -1156,9 +1156,17 @@ class TaskWorkflow:
         # first use so subsequent invocations are fresh.
         self._pending_resume_session_id: str | None = None
         self._pending_resume_role: str | None = None
+        # Cumulative adopted-resume count carried across restarts in the v2
+        # sidecar (task 2771).  β populates 'resume_count' in the recovered
+        # sidecar dict; α reads it defensively (absent → 0) and applies the +1
+        # increment at the adopted-resume point in _invoke.
+        self._pending_resume_count: int = 0
         if resume_session_id:
             self._pending_resume_session_id = resume_session_id.get('session_id')
             self._pending_resume_role = resume_session_id.get('role')
+            self._pending_resume_count = int(
+                resume_session_id.get('resume_count', 0) or 0
+            )
         # Session id stash for zero-output evidence enrichment.  Set in _invoke
         # right after session_id_val is determined; read by _capture_zero_output_evidence
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
@@ -8802,14 +8810,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ):
             session_id_val = self._pending_resume_session_id
             resume_session_id = session_id_val
+            # Adopted resume: bump the cumulative count off the recovered base,
+            # then reset it (consumed-on-first-use, mirroring the session-id/
+            # role resets below).
+            resume_count_to_write = self._pending_resume_count + 1
             self._pending_resume_session_id = None
             self._pending_resume_role = None
+            self._pending_resume_count = 0
             logger.info(
                 'Task %s [%s]: resuming prior session %s via --resume',
                 self.task_id, role.name, session_id_val,
             )
         else:
             session_id_val = str(uuid.uuid4())
+            resume_count_to_write = 0
 
         # Stash for _capture_zero_output_evidence — result.session_id is '' on
         # hard SIGKILL, so we capture the effective id here before the invocation.
@@ -8826,9 +8840,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.artifacts is not None:
             self.artifacts.write_agent_session(
                 session_id_val, role.name, datetime.now(UTC).isoformat(),
+                task_id=str(self.task_id), resume_count=resume_count_to_write,
             )
 
         started_at = datetime.now(UTC).isoformat()
+        # I1: the sidecar exists iff an invocation is in flight — cancellation
+        # is not completion.  Track whether this invocation was cancelled
+        # in-flight so the finally preserves (does not clear) its sidecar.
+        session_preserved = False
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -8882,8 +8901,38 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # merger/judge/reviewer); spawn_env is built for every role.
                 spawn_env=self._build_spawn_env(role),
             )
-        finally:
+        except asyncio.CancelledError:
+            # Cooperative cancellation of the agent invocation itself (a clean
+            # SIGTERM shutdown surfaces as CancelledError from THIS await) is an
+            # in-flight SUSPENSION, not a completion (I1).  Preserve the sidecar
+            # so crash-recovery can --resume this session after restart, and emit
+            # a structured fact at the decision point (INV-2 — fields in extra,
+            # not scraped from prose) before re-raising to propagate cooperative
+            # cancellation.  This except catches ONLY the main invoke await; a
+            # cancellation arriving later during the finally's transcript-archival
+            # await (agent already returned a result) is handled by that block's
+            # own inner except and correctly falls through to clear.  A
+            # non-CancelledError failure is an abnormal terminal end, not a
+            # resumable suspension, so it too falls through to clear — unchanged
+            # from prior behavior (the finally cleared on every exit before).
+            session_preserved = True
             if self.artifacts is not None:
+                logger.info(
+                    'Task %s [%s]: agent_session_preserved — keeping sidecar '
+                    'for crash-recovery resume of session %s',
+                    self.task_id, role.name, session_id_val,
+                    extra={
+                        'event': 'agent_session_preserved',
+                        'task_id': str(self.task_id),
+                        'session_id': session_id_val,
+                        'role': role.name,
+                    },
+                )
+            raise
+        finally:
+            # Clear ONLY on a non-preserved exit (completion or abnormal error);
+            # a cancelled-in-flight invocation keeps its sidecar for resume.
+            if self.artifacts is not None and not session_preserved:
                 self.artifacts.clear_agent_session()
             # Producer hook (task 2742, agent-transcript-archival-prd α): gzip
             # this just-finished session's transcripts to a durable archive root

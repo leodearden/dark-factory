@@ -477,9 +477,15 @@ class TestB3ResumeAcrossWall:
         assert wf.artifacts is not None
         original_write = wf.artifacts.write_agent_session
 
-        def spy_write(session_id: str, role: str, started_at: str) -> None:
+        def spy_write(
+            session_id: str, role: str, started_at: str,
+            task_id: str | None = None, resume_count: int = 0,
+        ) -> None:
             sidecar_calls.append({'session_id': session_id, 'role': role})
-            original_write(session_id, role, started_at)
+            original_write(
+                session_id, role, started_at,
+                task_id=task_id, resume_count=resume_count,
+            )
 
         wf.artifacts.write_agent_session = spy_write  # type: ignore[method-assign]
 
