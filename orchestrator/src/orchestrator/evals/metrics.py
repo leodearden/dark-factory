@@ -77,6 +77,25 @@ class EvalMetrics:
     # ``adversarial: false``, hiding the failure.
     adversarial: bool = False
 
+    # Plan-quality rubric (eval-revival θ) — the architect-eval analogues of
+    # recovery_score/adversarial above. ``plan_quality`` is a rubric DISTINCT
+    # from the base composite, populated ONLY for architect runs
+    # (role_under_test=='architect'); ``None`` is the C4 ``plan_quality | null``
+    # sentinel for non-architect (implementer) runs, kept distinct from a
+    # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to
+    # None on failure), an architect run ALWAYS emits a non-sentinel float —
+    # ``run_architect_eval`` degrades to the deterministic ``score_plan_structure``
+    # floor if the LLM plan judge fails, so None here means "not an architect
+    # run", never "architect run whose scoring failed".
+    plan_quality: float | None = None
+
+    # Which role this run put UNDER TEST (eval-revival θ / C4 role_under_test),
+    # threaded from the candidate's ``EvalConfig.role``. ``None`` for legacy
+    # runs; ``'architect'`` for an architect-eval run, ``'implementer'`` for the
+    # ordinary path. The plan-quality report keys its column on this being
+    # ``'architect'``.
+    role_under_test: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
