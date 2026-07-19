@@ -81,15 +81,15 @@ import inspect
 import logging
 import re
 import subprocess
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 import pytest
 
 import orchestrator
 import orchestrator.scheduler
-from orchestrator import config as _config
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.evals import judge as _judge
 from orchestrator.evals import profile as _profile
@@ -714,7 +714,7 @@ async def test_b7_no_unblock_auto_spawn(
     wf.task_id = 't'
     wf._background_tasks = set()
     # Wired so the spawn call site is fully REACHABLE were the guard removed.
-    wf.scheduler = None
+    wf.scheduler = None  # type: ignore[assignment]
     wf.mcp = None
     wf.usage_gate = None
     wf.cost_store = None
