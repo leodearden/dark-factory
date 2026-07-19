@@ -5226,10 +5226,12 @@ class TestCuratorMaybeRouteDeterministic:
         assert decision.action == "route_deterministic"
         assert curator._check_cache(payload_hash) is None
 
-    async def test_execution_class_operational_routes_without_substring_match(self, tmp_path):
-        """(task 2687) A candidate tagged metadata.execution_class='operational'
-        routes to route_deterministic even though it matches none of the
-        registry's substring entries."""
+    async def test_execution_class_operational_returns_none_without_substring_match(self, tmp_path):
+        """(task δ demotion) A candidate tagged metadata.execution_class='operational'
+        that matches none of the registry's substring entries returns None:
+        _maybe_route_deterministic delegates to match_candidate, which now
+        declines tagged asks (their routing is owned by the submit boundary,
+        task β — INV-5)."""
         registry = _make_operational_registry_yaml(
             tmp_path,
             title_subs=["prune_recon_cycle_summaries"],
@@ -5248,9 +5250,34 @@ class TestCuratorMaybeRouteDeterministic:
             candidate, candidate.payload_hash(),
         )
 
-        assert decision is not None
-        assert decision.action == "route_deterministic"
-        assert decision.justification.startswith("operational-ask-registry:")
+        assert decision is None
+
+    async def test_tagged_operational_matching_substring_not_routed_by_curator(self, tmp_path):
+        """(task δ INV-5, user-observable signal) With a registry whose
+        substrings the candidate ALSO matches, a tagged
+        execution_class='operational' candidate still yields None from
+        _maybe_route_deterministic — the curator does not re-route an ask the
+        submit boundary already coerced, even when the untagged substring
+        fallback would otherwise have matched."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+            execution_class="operational",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
 
     async def test_execution_class_code_tdd_does_not_route_without_substring_match(
         self, tmp_path,

@@ -421,10 +421,13 @@ class TestMatchCandidate:
 
 
 class TestMatchCandidateExecutionClassAxis:
-    """match_candidate() consults CandidateTask.execution_class (threaded from
-    metadata.execution_class) as an authoritative, wording-independent routing
-    axis, checked FIRST — before the _CODE_CHANGE_TITLE_SIGNALS guard and
-    before the title/description substring loop (task 2687).
+    """match_candidate() DEMOTES the execution_class axis (task δ): a TAGGED
+    'operational'/'decision' candidate now returns None EARLY — the submit
+    boundary (inject_operational_routing, task β) already coerced it to a
+    deterministic pure-gate, so a second coercion here would be lock-step
+    duplication (INV-5). The title/description substring loop is retained
+    only as the untagged-legacy fallback (task 2687 introduced the axis;
+    task δ narrows it so it no longer routes tagged asks).
     """
 
     def _make_entry(
@@ -454,9 +457,11 @@ class TestMatchCandidateExecutionClassAxis:
             execution_class=execution_class,
         )
 
-    def test_operational_execution_class_routes_with_no_substring_match(self):
+    def test_operational_execution_class_returns_none_with_no_substring_match(self):
         """A candidate tagged execution_class='operational' whose title/
-        description match no entry still routes."""
+        description match no entry returns None: the submit boundary
+        (inject_operational_routing, task β) already coerced this tagged ask
+        to a deterministic pure-gate, so the curator declines (INV-5)."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
 
         entry = self._make_entry()
@@ -465,11 +470,9 @@ class TestMatchCandidateExecutionClassAxis:
             description="Nothing to do with any registry entry.",
             execution_class="operational",
         )
-        result = match_candidate(candidate, [entry])
-        assert result is not None
-        assert result.name == "execution_class_operational_or_decision"
+        assert match_candidate(candidate, [entry]) is None
 
-    def test_decision_execution_class_routes_with_no_substring_match(self):
+    def test_decision_execution_class_returns_none_with_no_substring_match(self):
         """Same as above for execution_class='decision'."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
 
@@ -479,15 +482,13 @@ class TestMatchCandidateExecutionClassAxis:
             description="Nothing to do with any registry entry.",
             execution_class="decision",
         )
-        result = match_candidate(candidate, [entry])
-        assert result is not None
-        assert result.name == "execution_class_operational_or_decision"
+        assert match_candidate(candidate, [entry]) is None
 
-    def test_operational_execution_class_bypasses_code_change_title_signal(self):
-        """(bypass proof — the task-2686 motivating case) A title containing a
-        code-change signal word ("fix") with execution_class='operational' and
-        no substring match STILL routes: an explicit recon-stage declaration is
-        authoritative over incidental title wording."""
+    def test_operational_execution_class_returns_none_regardless_of_code_change_title(self):
+        """(replaces the old 'bypass' test — its premise, that the axis routes,
+        is gone) A title containing a code-change signal word ("fix") with
+        execution_class='operational' still returns None: the tagged-ask
+        demotion is unconditional (the boundary owns tagged routing)."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
 
         entry = self._make_entry()
@@ -499,12 +500,60 @@ class TestMatchCandidateExecutionClassAxis:
             description="Nothing to do with any registry entry.",
             execution_class="operational",
         )
-        result = match_candidate(candidate, [entry])
-        assert result is not None
-        assert result.name == "execution_class_operational_or_decision"
+        assert match_candidate(candidate, [entry]) is None
+
+    def test_operational_execution_class_returns_none_with_empty_entries(self):
+        """(replaces the old 'matches with empty entries' test) A tagged
+        operational candidate returns None even when entries=[] — the
+        tagged-ask demotion does not depend on any registry entry existing."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        candidate = self._make_candidate(
+            title="Restart fused-memory service",
+            description="Nothing to do with any registry entry.",
+            execution_class="operational",
+        )
+        assert match_candidate(candidate, []) is None
+
+    def test_tagged_operational_matching_substring_returns_none(self):
+        """(INV-5 double-route prevention) A tagged operational candidate whose
+        title/description ALSO satisfy a supplied entry's substrings STILL
+        returns None — the demotion returns None EARLY rather than falling
+        through to the substring loop, so the submit boundary stays the sole
+        coercion site for tagged asks."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["merge_entities", "live"],
+            desc_subs=["FalkorDB"],
+        )
+        candidate = self._make_candidate(
+            title="merge_entities against the live graph",
+            description="run against the live FalkorDB graph",
+            execution_class="operational",
+        )
+        assert match_candidate(candidate, [entry]) is None
+
+    def test_untagged_substring_match_still_routes(self):
+        """(untagged-legacy fallback intact) An UNTAGGED candidate
+        (execution_class=None) that matches a supplied entry's substrings still
+        routes to that entry — the substring loop is retained as the
+        untagged-legacy fallback below the tagged-ask early return."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["merge_entities", "live"],
+            desc_subs=["FalkorDB"],
+        )
+        candidate = self._make_candidate(
+            title="merge_entities against the live graph",
+            description="run against the live FalkorDB graph",
+            execution_class=None,
+        )
+        assert match_candidate(candidate, [entry]) is entry
 
     def test_code_tdd_execution_class_unchanged_behavior(self):
-        """execution_class='code_tdd' does not engage the axis — falls
+        """execution_class='code_tdd' does not engage the demotion — falls
         through to the pre-existing substring-only behavior (None here, since
         the fixture matches no entry)."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
@@ -519,7 +568,7 @@ class TestMatchCandidateExecutionClassAxis:
         assert result is None
 
     def test_none_execution_class_unchanged_behavior(self):
-        """execution_class=None (the default) does not engage the axis."""
+        """execution_class=None (the default) does not engage the demotion."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
 
         entry = self._make_entry()
@@ -530,20 +579,6 @@ class TestMatchCandidateExecutionClassAxis:
         )
         result = match_candidate(candidate, [entry])
         assert result is None
-
-    def test_operational_execution_class_matches_with_empty_entries(self):
-        """Pure-function independence: the axis fires even when entries=[] —
-        it does not depend on any registry entry existing."""
-        from fused_memory.middleware.operational_ask_registry import match_candidate
-
-        candidate = self._make_candidate(
-            title="Restart fused-memory service",
-            description="Nothing to do with any registry entry.",
-            execution_class="operational",
-        )
-        result = match_candidate(candidate, [])
-        assert result is not None
-        assert result.name == "execution_class_operational_or_decision"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -698,11 +733,13 @@ class TestSeedOperationalAskRegistry:
             f"+ live + FalkorDB, got {entry.name!r}"
         )
 
-    def test_task_2686_execution_class_operational_routes_despite_fix_wording(self):
-        """(task 2687 motivating case) task 2686's real title contains "fix"
-        and matches none of the shipped registry's substring entries, yet
-        execution_class='operational' must still route — the axis is
-        authoritative and wording-independent."""
+    def test_task_2686_execution_class_operational_returns_none_despite_fix_wording(self):
+        """(task δ demotion) task 2686's real title contains "fix" and matches
+        none of the shipped registry's substring entries. Post-demotion, a
+        tagged execution_class='operational' candidate returns None here — its
+        routing is now owned by the submit boundary (inject_operational_routing,
+        task β), not the curator (INV-5). The untagged sanity half still
+        returns None (unchanged)."""
         from fused_memory.middleware.operational_ask_registry import match_candidate
 
         entries = self._load_entries()
@@ -716,7 +753,7 @@ class TestSeedOperationalAskRegistry:
             "expected the untagged task-2686 candidate to match nothing"
         )
 
+        # Post-demotion: the tagged candidate ALSO returns None — the submit
+        # boundary owns tagged routing now, so the curator declines it.
         tagged = CandidateTask(title=title, execution_class="operational")
-        entry = match_candidate(tagged, entries)
-        assert entry is not None
-        assert entry.name == "execution_class_operational_or_decision"
+        assert match_candidate(tagged, entries) is None
