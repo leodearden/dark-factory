@@ -745,6 +745,72 @@ class DeliveredChecksConfig(BaseModel):
     )
 
 
+class SessionResumeConfig(BaseModel):
+    """Warm-lane session-resume guard configuration (task γ,
+    plans/warm-lane-session-resume-prd.md).
+
+    Guards the β resume injection in ``_run_slot``: a recovered agent
+    session is injected as ``--resume`` only when it is fresh, under its
+    per-task resume cap, and its transcript is corroborated on disk
+    (INV-3). Any ineligible session degrades to today's fresh dispatch
+    (I3 — never a stall, never a scheduler-visible error), emitting a
+    reason-carrying ``session_resume_fallback``/``session_resume_capped``
+    event; a per-boot run of consecutive fallbacks above
+    ``fallback_storm_threshold`` files one L1 escalation (INV-4).
+
+    ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
+    (B6), and no ``session_resume_*`` event or streak is produced.
+
+    Mirrors DeliveredChecksConfig's shape (a kill switch plus ge-bounded
+    int knobs); all four leaves are green-tier hot-reloadable via the
+    ``session_resume`` whole-submodel group in RELOADABLE_FIELDS.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable warm-lane session resume entirely — no '
+            '--resume is ever injected (B6), and the _run_slot guard emits no '
+            'session_resume_* event and feeds no fallback-storm streak.'
+        ),
+    )
+    freshness_window_secs: int = Field(
+        default=86400,
+        ge=1,
+        description=(
+            'A recovered sidecar is eligible only if (now - started_at) is '
+            'below this many seconds; a staler sidecar degrades to fresh '
+            'dispatch with a session_resume_fallback(reason=stale) event. '
+            'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
+            'absolute cap plus slack, so a sidecar is rejected only once it '
+            'clearly outlives any legitimate in-flight invocation.'
+        ),
+    )
+    max_resumes_per_task: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'A task whose sidecar resume_count has reached this cap degrades '
+            'to fresh dispatch with a session_resume_capped event (by-design '
+            'throttling — does NOT feed the fallback-storm streak). Must be '
+            '>= 1. Default 3 matches the 8h restart cadence against a '
+            'multi-day (~30h) task legitimately resuming ~3x.'
+        ),
+    )
+    fallback_storm_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive per-boot session_resume_fallback degradations '
+            '(reset to 0 on any eligible resume) before one L1 escalation is '
+            'filed (INV-4 storm escape — suspected systematic clock skew / '
+            'wiped transcripts / mass reseed). Must be >= 1. Default 5 is '
+            'above both the resume cap and ordinary collision noise, so only '
+            'systematic corroboration breakage trips it.'
+        ),
+    )
+
+
 class SpeculationProbeConfig(BaseModel):
     """Variable-depth speculative verify placement (task 2359, sibling of
     task 2340's depth telemetry).
@@ -3213,6 +3279,12 @@ class OrchestratorConfig(BaseSettings):
     # checks PRD delta). Task 2583 (epsilon) extends this sub-model further.
     delivered_checks: DeliveredChecksConfig = Field(default_factory=DeliveredChecksConfig)
 
+    # Warm-lane session-resume guard (task γ, plans/warm-lane-session-resume-prd.md).
+    # An absent stanza yields the enabled-by-default instance (default_factory
+    # suffices — no defaults.yaml edit, like delivered_checks). Read by the
+    # _run_slot eligibility guard only when a recovered session is present.
+    session_resume: SessionResumeConfig = Field(default_factory=SessionResumeConfig)
+
     # Variable-depth speculative verify placement (task 2359, sibling of task
     # 2340's depth telemetry). An absent stanza in orchestrator.yaml yields
     # the disabled-by-default instance (probe_fraction=0.0, byte-identical).
@@ -3881,6 +3953,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # swap on any retention.* change), matching the delivered_checks/psi_admission
     # whole-submodel-group precedent.
     _submodel_leaf_paths('transcript_archive', TranscriptArchiveConfig),
+    # Warm-lane session-resume guard (task γ) — a new dedicated submodel, same
+    # whole-submodel-group idiom as routing/chronic_flake above: the kill switch
+    # and all three ge-bounded knobs (freshness_window_secs / max_resumes_per_task
+    # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
+    # RELOADABLE_FIELDS edit.
+    _submodel_leaf_paths('session_resume', SessionResumeConfig),
     {
         # Steward grace
         'steward_completion_timeout',
