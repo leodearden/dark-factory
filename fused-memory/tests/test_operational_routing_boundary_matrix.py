@@ -401,3 +401,64 @@ def _inject_operational_registry(
         'fused_memory.middleware.operational_ask_registry.load_operational_registry',
         _fake_load,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 — untagged legacy ask -> curator substring fallback intact
+# (matrix row 5: the delta-retained untagged-legacy path; NOT owned by the
+# beta submit boundary, since there is no execution_class to coerce on).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
+    _real_stack, tmp_path, monkeypatch,
+):
+    """An UNTAGGED (no execution_class) submission matching a registry entry
+    is still routed to a deterministic pure gate by the curator's
+    untagged-legacy substring fallback (TaskCurator._maybe_route_deterministic),
+    entirely independent of the beta submit-boundary coercion (which never
+    fires here — inject_operational_routing is a byte-identical no-op for a
+    submission with no declared execution_class).
+
+    Unlike scenario 1, the curator is left ACTIVE (curate is NOT
+    neutralized) — this proves delta's retained substring loop still fires
+    post-boundary, short-circuiting before any LLM call
+    (task_curator.py:1261).
+    """
+    entry = OperationalAskEntry(
+        name='zeta_legacy_probe',
+        reason="ζ scenario 5: untagged-legacy operational maintenance probe",
+        title_substrings=['legacy operational maintenance'],
+        description_substrings=['dry-run then apply against a live external store'],
+    )
+    _inject_operational_registry(monkeypatch, entry)
+
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    submit_result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Zeta boundary probe: legacy operational maintenance ask',
+            'description': (
+                'Recurring housekeeping: dry-run then apply against a live '
+                'external store, zero repo files modified.'
+            ),
+        },
+    )
+    assert 'error' not in submit_result, f'submit_task failed unexpectedly: {submit_result!r}'
+    ticket = submit_result['ticket']
+
+    resolved = await server._tool_manager.call_tool(
+        'resolve_ticket',
+        {'ticket': ticket, 'project_root': root, 'timeout_seconds': 30},
+    )
+    assert resolved.get('status') == 'created', f'resolve_ticket did not create: {resolved!r}'
+    task_id = resolved['task_id']
+
+    meta = await _get_task_meta(server, root, task_id)
+
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
