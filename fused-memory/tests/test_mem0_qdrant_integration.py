@@ -23,6 +23,7 @@ VECTOR_DIM = 8  # tiny vectors for speed
 
 pytestmark = [
     qdrant_skipif(),
+    pytest.mark.integration,
     pytest.mark.timeout(30),
 ]
 
