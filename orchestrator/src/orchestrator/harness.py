@@ -24,7 +24,6 @@ from shared.cli_invoke import (
 )
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
-from shared.safe_io import load_json_or_warn
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -4359,17 +4358,25 @@ task, include it with an empty "files" list rather than omitting it.
         """Revert a stranded in-progress task to pending (REVERT_TO_PENDING applier).
 
         Returns ``'reverted'`` (status flipped to pending) or ``None`` (left
-        intact — an infra-held non-degenerate branch, or an unreadable lock
-        failing closed on a startup sweep).
+        intact — the sole remaining early-return is the infra-held
+        non-degenerate branch guard below; task 2763 removed the
+        unreadable-lock fail-closed early-return along with the worktree
+        plan.lock read that produced it).
 
         Callers only reach this on the REVERT_TO_PENDING action:
         ``TaskGroundTruth.recovery_for``'s ``live_claimant`` resolution has
         already established there is no live claimant (task 2243, W10-θ2
         step-16 — the plan.lock owner_pid liveness re-derivation formerly
         performed directly in this function is retired as redundant). This
-        function owns only the physical side effects: worktree cleanup,
-        plan.lock unlink, and the ``_recovered_plans``/``_preserved_worktrees``
-        retention bookkeeping.
+        function owns only the physical side effects: worktree cleanup, a
+        defensive plan.lock unlink, and the
+        ``_recovered_plans``/``_preserved_worktrees`` retention bookkeeping.
+        Task 2763 retired the worktree ``plan.lock`` READ that formerly
+        re-classified liveness here — moot once the durable lock moved to the
+        meta-root (the worktree lock never exists in production) and the DB
+        claimant became primary — so the applier no longer reads it and the
+        ``mid_run`` parameter, kept for caller-ABI compat, no longer gates any
+        branch.
 
         FORENSIC NOTE (task 2588 closeout, task 2623): the 2588 un-claim (an
         in-progress task reverted to pending with claimant_run_id/
@@ -4449,107 +4456,35 @@ task, include it with an empty "files" list rather than omitting it.
                 )
                 return None
 
-        if not lock_path.exists():
-            # No worktree or no lock → orphan, revert.
-            #
-            # Guard on branch WIP before reaping: a lock-less worktree whose
-            # leftover branch still carries commits beyond main (e.g. the
-            # stale-lock branch below already reaped the dir on a prior cycle
-            # and retained the branch) is a re-attach-eligible shape, not
-            # disposable orphan residue.  Reaping it here would destroy the
-            # still-registered worktree dir — including the gitignored
-            # .task/plan.json that git cannot restore — right before the next
-            # dispatch could resume it.  So RETAIN the dir instead: the next
-            # dispatch resumes it via create_worktree's registered-worktree
-            # REUSE path (git_ops.py:1557, `if worktree_path.exists()`), NOT
-            # the cold-path γ reattach guard — that guard only fires once the
-            # dir is ALREADY gone, which is precisely the shape this
-            # retention exists to avoid creating.  Reuse is also a strict
-            # improvement over a cold reattach here: it preserves
-            # .task/plan.json, which a fresh `git worktree add` (the γ
-            # reattach's mechanism) could never restore since .task/ is
-            # gitignored and never part of the git tree.
-            # `worktree_path.exists()` is checked first so the branch-WIP
-            # probe (a subprocess call) never runs when there is no dir to
-            # preserve.
-            _no_lock_branch = f'{self.git_ops.config.branch_prefix}{tid}'
-            _branch_has_wip = worktree_path.exists() and await self.git_ops._orphan_has_commits(
-                _no_lock_branch
-            )
-            if (
-                worktree_path.exists()
-                and not _branch_has_wip
-                and tid not in self._recovered_plans
-                and tid not in self._preserved_worktrees
-            ):
-                try:
-                    await self.git_ops.cleanup_worktree(worktree_path, tid)
-                except Exception:
-                    logger.warning(
-                        'Reconcile: cleanup_worktree failed for task %s'
-                        ' (no-lock); continuing',
-                        tid, exc_info=True,
-                    )
-            elif _branch_has_wip:
-                logger.info(
-                    'Reconcile: task %s no-lock but branch %s carries WIP'
-                    ' commits — retaining worktree for resume',
-                    tid, _no_lock_branch,
-                )
-            await self.scheduler.set_task_status(tid, 'pending')
-            logger.info(
-                'Reconcile: reverted task %s to pending (reason=no-lock)', tid
-            )
-            return 'reverted'
-
-        # Lock exists — parse it via the shared safe reader, then classify.
-        lock_data, lock_ok = load_json_or_warn(lock_path, default=None, on_corrupt='warn')
-        lock_usable = lock_ok and isinstance(lock_data, dict)
-
-        if not lock_usable:
-            # Unreadable or non-dict lock: we cannot read owner_pid, so we cannot
-            # confirm the owner is dead.  On the STARTUP sweep fail CLOSED — leave
-            # the worktree intact rather than risk reaping a live owner.  On a
-            # MID-RUN sweep the dispatch-table filter already excluded
-            # actively-held tasks, so a task that reached here has an exited
-            # owner; reaping is safe.
-            if not mid_run:
-                # Use ERROR (not WARNING) because the task is now stranded
-                # in-progress indefinitely and requires operator intervention:
-                # the lock cannot be read, so automated reconcile cannot
-                # determine liveness and will skip the task every cycle.
-                logger.error(
-                    'Reconcile: task %s plan.lock unreadable/corrupt'
-                    ' — cannot confirm owner is dead;'
-                    ' leaving worktree intact (fail-closed).'
-                    ' OPERATOR ACTION REQUIRED: inspect worktree and lock'
-                    ' to determine whether to reap or allow task to continue.',
-                    tid,
-                )
-                return None  # do NOT reap a possibly-live owner's worktree
-            else:
-                logger.warning(
-                    'Reconcile: task %s plan.lock unreadable/corrupt'
-                    ' during mid-run sweep; treating as stale and reaping',
-                    tid,
-                )
-        elif lock_data.get('owner_pid') is None:  # type: ignore[union-attr]
-            # Missing owner_pid: still an observability breadcrumb for which
-            # stale-lock variant triggered the cleanup below, even though the
-            # applier no longer branches on it (see docstring: liveness is
-            # the resolver's call now).
-            logger.warning(
-                'Reconcile: plan.lock for task %s has no owner_pid;'
-                ' treating as stale',
-                tid,
-            )
-
-        # Lock present — recovery_for's live_claimant has already ruled out
-        # a live claimant before dispatching REVERT_TO_PENDING here (task
-        # 2243, W10-θ2 step-16: the owner_pid liveness re-derivation formerly
-        # gating this point is retired as redundant). Clear the lock and revert.
+        # recovery_for's live_claimant has already ruled out a live claimant
+        # before dispatching REVERT_TO_PENDING here (task 2243, W10-θ2
+        # step-16). Task 2763 additionally retired the worktree plan.lock READ
+        # that formerly re-classified liveness at this point: in production the
+        # durable lock lives at the meta-root, so <worktree>/.task/plan.lock
+        # never exists and the old stale-lock branch was unreachable, and the
+        # DB claimant is the primary liveness signal (task 2243). So revert
+        # UNCONDITIONALLY — this function owns only the physical side effects:
+        # worktree cleanup, a defensive plan.lock unlink, and the
+        # _recovered_plans/_preserved_worktrees retention bookkeeping.
+        #
+        # Guard on branch WIP before reaping: a worktree whose leftover branch
+        # still carries commits beyond main is a re-attach-eligible shape, not
+        # disposable orphan residue.  Reaping it here would destroy the
+        # still-registered worktree dir — including the gitignored
+        # .task/plan.json that git cannot restore — right before the next
+        # dispatch could resume it via create_worktree's registered-worktree
+        # REUSE path (git_ops.py:1557, `if worktree_path.exists()`), NOT the
+        # cold-path γ reattach guard.  So RETAIN the dir instead.
+        # `worktree_path.exists()` is checked first so the branch-WIP probe (a
+        # subprocess call) never runs when there is no dir to preserve.
+        _no_lock_branch = f'{self.git_ops.config.branch_prefix}{tid}'
+        _branch_has_wip = worktree_path.exists() and await self.git_ops._orphan_has_commits(
+            _no_lock_branch
+        )
         if (
-            tid not in self._recovered_plans
+            worktree_path.exists()
+            and not _branch_has_wip
+            and tid not in self._recovered_plans
             and tid not in self._preserved_worktrees
         ):
             try:
@@ -4557,17 +4492,24 @@ task, include it with an empty "files" list rather than omitting it.
             except Exception:
                 logger.warning(
                     'Reconcile: cleanup_worktree failed for task %s'
-                    ' (stale-lock); continuing',
+                    ' (no-lock); continuing',
                     tid, exc_info=True,
                 )
-            with contextlib.suppress(OSError):
-                lock_path.unlink(missing_ok=True)
-        else:
-            with contextlib.suppress(OSError):
-                lock_path.unlink()
+        elif _branch_has_wip:
+            logger.info(
+                'Reconcile: task %s no-lock but branch %s carries WIP'
+                ' commits — retaining worktree for resume',
+                tid, _no_lock_branch,
+            )
+        # Defensive: clear any vestigial worktree plan.lock (the documented
+        # "plan.lock unlink" physical side-effect).  In production the durable
+        # lock lives at the meta-root, so this worktree path usually does not
+        # exist; the suppress + missing_ok keep it a harmless no-op then.
+        with contextlib.suppress(OSError):
+            lock_path.unlink(missing_ok=True)
         await self.scheduler.set_task_status(tid, 'pending')
         logger.info(
-            'Reconcile: reverted task %s to pending (reason=stale-lock)', tid
+            'Reconcile: reverted task %s to pending', tid
         )
         return 'reverted'
 
