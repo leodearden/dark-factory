@@ -659,3 +659,65 @@ def test_b6_no_mid_eval_rebase(tmp_path: Path) -> None:
 
     assert eval_cfg.rebase_before_verify is False
     assert eval_cfg.inter_iteration_rebase is False
+
+
+# ── B7: no unblock_auto dry-run spawn (D4) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_b7_no_unblock_auto_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B7 — the eval config's disabled ``unblock_auto`` suppresses the dry-run spawn.
+
+    Two-way: a fresh code-default base (production side) has
+    ``unblock_auto.enabled`` True — every blocked/timeout task would spawn an
+    autonomous ~$5 Sonnet dry-run investigation — while the eval config
+    (``build_eval_orch_config``) has it False (D4). Then the REAL workflow hook
+    is driven: a bare ``TaskWorkflow`` wired with the eval config calls
+    ``_spawn_dry_run_unblock`` and spawns ZERO background tasks — the
+    ``unblock_auto.enabled`` disabled early-return the eval profile arms.
+
+    Discriminating by construction: the guard returns BEFORE
+    ``self.scheduler``/``self.mcp`` are read at the spawn site, so wiring only
+    ``config``/``worktree`` would leave a hypothetically-removed guard to fail
+    on a masked ``AttributeError`` (caught by the method's own ``except``) and
+    still land at an empty set — a false green. So ``scheduler``/``mcp``/
+    ``usage_gate``/``cost_store`` are wired and ``run_dry_run_unblock`` is a
+    cheap no-op: with the guard gone, the real ``asyncio.create_task`` (this is
+    an async test, so a live loop is running) WOULD add a task to
+    ``_background_tasks``. The empty-set assertion therefore genuinely gates the
+    ``unblock_auto`` early-return, not an incidental error. GREEN on main (β).
+    """
+    base = _load_default_config(tmp_path)
+    assert base.unblock_auto.enabled is True
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    eval_cfg = build_eval_orch_config(cfg, task, base)
+    assert eval_cfg.unblock_auto.enabled is False
+
+    # Keep the (hypothetical) guard-removed spawn path cheap and side-effect
+    # free: create_task would schedule this no-op instead of the real ~$5
+    # dry-run investigation coroutine.
+    async def _noop_unblock(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_dry_run_unblock', _noop_unblock,
+    )
+
+    wf = object.__new__(TaskWorkflow)
+    wf.config = eval_cfg
+    wf.worktree = tmp_path            # non-None → not the worktree-None return
+    wf.task_id = 't'
+    wf._background_tasks = set()
+    # Wired so the spawn call site is fully REACHABLE were the guard removed.
+    wf.scheduler = None
+    wf.mcp = None
+    wf.usage_gate = None
+    wf.cost_store = None
+
+    wf._spawn_dry_run_unblock('blocked on x', 'detail')
+
+    assert wf._background_tasks == set()
