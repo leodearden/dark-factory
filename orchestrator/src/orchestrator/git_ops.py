@@ -1884,12 +1884,16 @@ class GitOps:
         ``thin-warm-lane.sh`` / ``warm-lane-gc.sh`` and DF's own
         :meth:`_seed_warm_lane` take (task 2685; reify PRD
         ``warm-lane-pool-cow-seeding.md`` §9.3/§9.5 inv.11), NOT the
-        divergent ``.merge_verify.lock`` (task 2306's original lock, which
-        remains solely for the laptop host verify-merge span — see
-        ``verify_cancel.merge_verify_lock_path``). Converging onto one lock
-        is what makes a reify/DF reseed, thin, or gc of the lane mutually
-        exclude with a live local verify — the flock holder-pgid rendezvous
-        below is unchanged.
+        divergent ``.merge_verify.lock`` (task 2306's original lock). As of
+        task 2830 the laptop host verify-merge CLI span ALSO holds this shared
+        lane lock as its PRIMARY; it retains ``.merge_verify.lock`` only as a
+        transitional rollout co-lock (so an in-flight OLD verify-merge still
+        mutually excludes during checkout-sync rollout — see
+        ``verify_cancel.merge_verify_lock_path``), and a post-rollout follow-up
+        drops that co-lock, leaving the CLI on the lane lock alone (matching
+        this lease). Converging onto one lock is what makes a reify/DF reseed,
+        thin, or gc of the lane mutually exclude with a live local (or laptop)
+        verify — the flock holder-pgid rendezvous below is unchanged.
 
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out), yields WITHOUT

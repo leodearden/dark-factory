@@ -22,6 +22,7 @@ from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     cancel_request,
     fire_watchdog_kill,
+    lane_lock_path,
     merge_verify_lock_path,
     pgid_file,
     read_lock_holder_pgid,
@@ -483,25 +484,44 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         finally:
             await git_ops.cleanup_merge_worktree(wt)
 
-    # Flock guard (task 2306 α): serialize the whole verify span under a
-    # laptop-side exclusive fcntl.flock when the persistent-worktree knob is
-    # on — the per-host serial invariant that _bump_host_verify_attempt_count
-    # relies on is only supplied at WORKSTATION startup, not on the laptop.
-    # Knob OFF -> fd stays None -> byte-identical back-compat (no lock).
-    fd: int | None = None
+    # Flock guard (task 2306 α; converged onto the shared lane lock in task 2830):
+    # serialize the whole verify span under a laptop-side exclusive fcntl.flock when
+    # the persistent-worktree knob is on — the per-host serial invariant that
+    # _bump_host_verify_attempt_count relies on is only supplied at WORKSTATION
+    # startup, not on the laptop.
+    #
+    # DUAL-LOCK (additive, task 2830): the PRIMARY lock is now the SHARED
+    # <lane_dir>.lock (lane_lock_path(persistent_merge_worktree_path) =
+    # <worktree_base>/_merge-verify.lock) — the SAME lock GitOps.merge_verify_lease
+    # and reify's seed/thin/gc take (task 2685) — so a laptop lane actor is mutually
+    # excluded from a live laptop verify. The divergent .merge_verify.lock
+    # (merge_verify_lock_path) is RETAINED as a transitional rollout CO-lock so an
+    # in-flight OLD verify-merge (holding only that lock, before checkout-sync ships
+    # this code) still mutually excludes during rollout; a post-rollout follow-up
+    # drops it, leaving the CLI on the lane lock alone (matching merge_verify_lease).
+    #
+    # Acquire LANE-first, then COMPAT, and write the shared holder-pgid ONLY after
+    # BOTH are held: an in-flight OLD caller wrote that holder when it took the old
+    # lock, so a NEW waiter that loses the bounded wait on the compat lock must still
+    # read the CORRECT holder (we must not clobber it). acquire_merge_verify_flock is
+    # a bounded-wait poll (returns None on timeout, never blocks), so the two-lock
+    # acquire cannot deadlock — worst case is a timeout -> contention.
+    #
+    # Knob OFF -> lane_fd/compat_fd stay None -> byte-identical back-compat (no lock).
+    lane_fd: int | None = None
+    compat_fd: int | None = None
     contention_result = None
     if config.git.persistent_merge_worktree:
         flock_wait_secs = _env_float(
             'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS', MERGE_VERIFY_FLOCK_WAIT_SECS
         )
-        fd = acquire_merge_verify_flock(
-            merge_verify_lock_path(git_ops.worktree_base), flock_wait_secs
+        # (1) PRIMARY: the shared <lane_dir>.lock (task 2830 — the fix).
+        lane_fd = acquire_merge_verify_flock(
+            lane_lock_path(git_ops.persistent_merge_worktree_path), flock_wait_secs
         )
-        if fd is not None:
-            write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
-        else:
-            # Bounded wait timed out: another verify-merge invocation holds the
-            # persistent worktree lock. Emit the distinguished contention result
+        if lane_fd is None:
+            # Bounded wait timed out: a laptop lane actor (or another verify-merge)
+            # holds the shared lane lock. Emit the distinguished contention result
             # WITHOUT ever touching the tree (no acquire_host_verify_worktree, no
             # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
             holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
@@ -510,6 +530,30 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
                 holder_pgid=holder_pgid,
                 waiter_pgid=os.getpgrp(),
             )
+        else:
+            # (2) COMPAT rollout co-lock: the divergent .merge_verify.lock, so an
+            # in-flight OLD verify-merge (holding only that lock) still mutually
+            # excludes during rollout.
+            compat_fd = acquire_merge_verify_flock(
+                merge_verify_lock_path(git_ops.worktree_base), flock_wait_secs
+            )
+            if compat_fd is None:
+                # An in-flight OLD caller holds .merge_verify.lock. Read the holder
+                # it recorded (NOT yet clobbered — we write ours only after both
+                # locks are held), emit the distinguished result, and release the
+                # already-held lane lock before bailing so the primary lock is not
+                # leaked on this fail-closed path.
+                holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
+                contention_result = make_flock_contention_result(
+                    host=socket.gethostname(),
+                    holder_pgid=holder_pgid,
+                    waiter_pgid=os.getpgrp(),
+                )
+                release_merge_verify_flock(lane_fd)
+                lane_fd = None
+            else:
+                # (3) Both locks held — now record the shared holder-pgid.
+                write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
 
     if contention_result is not None:
         # Always remove the pgid file so cancel-verify knows this run is done.
@@ -558,9 +602,14 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     finally:
-        if fd is not None:
+        # Past the contention gate lane_fd and compat_fd are both non-None (both
+        # locks held) or both None (knob off / contention already returned). Release
+        # both and clear the shared holder-pgid (task 2830 dual-lock).
+        if lane_fd is not None:
             remove_lock_holder_pgid(git_ops.worktree_base)
-            release_merge_verify_flock(fd)
+            if compat_fd is not None:
+                release_merge_verify_flock(compat_fd)
+            release_merge_verify_flock(lane_fd)
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)

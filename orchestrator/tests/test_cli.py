@@ -1298,6 +1298,10 @@ def test_verify_merge_flock_held_during_warm_run_and_released_after(tmp_path, mo
     fake_wt.mkdir()
     mock_git_ops = MagicMock()
     mock_git_ops.worktree_base = fake_worktree_base
+    # task 2830: a REAL persistent_merge_worktree_path so the CLI's lane_lock_path()
+    # computes a real file (else it TypeErrors on the MagicMock). The compat old lock
+    # is still held mid-run, so this test's old-lock probe assertions stay valid.
+    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
     mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
     mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
     monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
@@ -1464,6 +1468,12 @@ def test_verify_merge_flock_contention_emits_distinguished_result(tmp_path, monk
         fake_wt.mkdir()
         mock_git_ops = MagicMock()
         mock_git_ops.worktree_base = fake_worktree_base
+        # task 2830: a REAL persistent_merge_worktree_path so the CLI's lane acquire
+        # computes a real path. The lane lock is NOT pre-held here (only the old lock
+        # is), so the CLI acquires the lane lock, then times out on the compat old
+        # lock — surfacing holder 9191 without clobbering it (holder written only
+        # after both locks held), keeping this test's assertions valid.
+        mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
         mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
         mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
         mock_git_ops._create_merge_worktree = AsyncMock(return_value=(fake_wt, 'sha'))
