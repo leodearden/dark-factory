@@ -3774,6 +3774,48 @@ class TestCrossProcessArchiveStaleness:
             f"Expected resolved_by='steward'; got {result.resolved_by!r}"
         )
 
+    def test_reprobe_result_folded_into_memo_bounds_rescan_to_one_call(
+        self, tmp_path: Path,
+    ):
+        """A re-probe hit must be folded into the memo so a REPEATED get() for
+        the same archived-elsewhere id does not re-scan the archive every
+        call — bounding a polled server (e.g. the escalation MCP server) to
+        at most one targeted rglob per id.
+
+        RED against a step-2-only fix (re-probes on every miss without
+        folding the hit back into _archive_listing): spy.call_count would be
+        2, one per get() call.
+        """
+        queue_dir = tmp_path / 'queue'
+        server_q = EscalationQueue(queue_dir)
+        harness_q = EscalationQueue(queue_dir)
+
+        harness_q.submit(_make_escalation('esc-2799-3', task_id='2799', level=2))
+
+        # Force server_q's memo to build while esc-2799-3 is still pending.
+        assert server_q.get('esc-absent-2') is None, 'Setup: unrelated id must be absent'
+        assert server_q._archive_listing is not None, 'Setup: memo must be built by now'
+
+        harness_q.resolve('esc-2799-3', 'resolved out-of-band')
+
+        with patch.object(
+            server_q, '_iter_archive_paths', wraps=server_q._iter_archive_paths,
+        ) as spy:
+            result1 = server_q.get('esc-2799-3')
+            result2 = server_q.get('esc-2799-3')
+
+        assert result1 is not None and result1.status == 'resolved', (
+            f'First get() must find the archived-elsewhere escalation; got {result1!r}'
+        )
+        assert result2 is not None and result2.status == 'resolved', (
+            f'Second get() must find the archived-elsewhere escalation; got {result2!r}'
+        )
+        assert spy.call_count == 1, (
+            f'Expected exactly 1 _iter_archive_paths call (first get() re-probes '
+            f'and folds the id into the memo; second get() must be a cache hit) '
+            f'but got {spy.call_count}x'
+        )
+
 
 def _make_esc_with_category(
     esc_id: str,
