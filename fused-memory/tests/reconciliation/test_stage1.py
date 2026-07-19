@@ -2765,6 +2765,130 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         assert 'stale_status_snapshot_edges_scanned' not in report.stats
 
 
+class TestStalePriorityOverrideEdgeSweepWiring:
+    """MemoryConsolidator.run() must invoke sweep_stale_priority_override_edges
+    against self.memory/self.project_id/self.project_root, and surface its
+    stats as report.stats['stale_priority_override_edges_invalidated'] /
+    report.stats['stale_priority_override_edges_scanned'] (task 2781).
+
+    RED until step-14 wires sweep_stale_priority_override_edges into run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_invalidates_stale_override_edge_and_surfaces_stats(self):
+        """One stale priority-override edge (boost for task 5166, absent from
+        the live override map) + one healthy edge (boost for task 999, present
+        in the live map). run() must invalidate only the stale edge and
+        surface both stats keys."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+
+        stale_edge = {
+            'uuid': 'edge-po-stale',
+            'fact': "Set priority override for task 5166: {'boost_tier': 'high'}",
+            'name': '',
+        }
+        healthy_edge = {
+            'uuid': 'edge-po-healthy',
+            'fact': "Set priority override for task 999: {'boost_tier': 'high'}",
+            'name': '',
+        }
+        stage.memory.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [stale_edge, healthy_edge]},
+        )
+        stage.memory.update_edge = AsyncMock()
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stale_priority_override_edge_sweep.'
+                'read_live_override_state',
+                new=AsyncMock(return_value={'999': {'ttl_until': None}}),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2781-step13a',
+            )
+
+        assert report.stats.get('stale_priority_override_edges_invalidated') == 1, (
+            f"Expected report.stats['stale_priority_override_edges_invalidated'] == 1; "
+            f'got stats={report.stats!r}. '
+            'RED: sweep_stale_priority_override_edges is not yet wired into run().'
+        )
+        assert report.stats.get('stale_priority_override_edges_scanned') == 2, (
+            f"Expected report.stats['stale_priority_override_edges_scanned'] == 2; "
+            f'got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_failure_is_swallowed_and_other_stats_remain_intact(self):
+        """sweep_stale_priority_override_edges raising must not blow up run()
+        or blank other stats — mirrors the 2613 / degenerate-sweep backstop.
+
+        RED: the sweep call has no try/except yet (nor is the sweep imported
+        into memory_consolidator), so the patch target does not exist.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+
+        # The task 2613 stale-status-snapshot sweep runs immediately before the
+        # 2781 sweep and is NOT patched here, so it exercises the real
+        # orchestration. Give it an empty valid-edge set so it succeeds (0
+        # scanned) and sets its stat — that stat is the "other post-processing
+        # was untouched" proof asserted below. Without this mock the 2613 sweep
+        # itself fails on an unconfigured get_all_valid_edges and never sets it.
+        stage.memory.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        sweep_mock = AsyncMock(side_effect=RuntimeError('graphiti backend down'))
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'sweep_stale_priority_override_edges',
+                new=sweep_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2781-step13b',
+            )
+
+        assert isinstance(report, StageReport), (
+            'run() must still return a StageReport when the sweep raises. '
+            'RED: the sweep call is not yet wrapped in a best-effort try/except.'
+        )
+        assert 'stale_priority_override_edges_invalidated' not in report.stats, (
+            'A raised sweep must not leave a partial/incorrect '
+            'stale_priority_override_edges_invalidated stat'
+        )
+        assert 'stale_priority_override_edges_scanned' not in report.stats
+        # Proof other post-processing was untouched: the task 2613 sweep (which
+        # runs immediately before this one) still set its stat.
+        assert 'stale_status_snapshot_edges_scanned' in report.stats, (
+            'The task 2613 sweep must still have run and set its stat even '
+            f'though the 2781 sweep raised; got stats={report.stats!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # The former class TestMemoryConsolidatorCycleSummaryFallback (task 2366)
 # tested the LLM-era verify_cycle_summary_written / reconstruct_cycle_summary_stub

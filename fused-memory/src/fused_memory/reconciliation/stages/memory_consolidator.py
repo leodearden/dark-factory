@@ -48,6 +48,9 @@ from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _render_live_workflow_section,
 )
+from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
+    sweep_stale_priority_override_edges,
+)
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     sweep_stale_status_snapshot_edges,
 )
@@ -512,6 +515,38 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+
+        # ── Stale priority-override / pin-queue edge sweep (task 2781) ─────────
+        # Invalidate VALID (invalid_at IS NULL) priority-override / pin-queue
+        # Graphiti edges whose task is absent from live scheduler-override state
+        # (override consumed by dispatch/clear_terminal or expired-and-cleared by
+        # clear_expired) or whose TTL edge's live ttl_until has elapsed, via a
+        # deterministic direct-lookup sweep beside the task 2613 sweep above.
+        # Best-effort: a sweep failure must never abort the stage or leave a
+        # partial/incorrect stat — it is logged and swallowed, and no
+        # stale_priority_override_edges_* stat is set for this cycle.
+        try:
+            priority_override_sweep_stats = await sweep_stale_priority_override_edges(
+                self.memory, self.project_id, self.project_root,
+                run_id=run_id,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'reconciliation.stale_priority_override_edge_sweep_failed',
+                extra={
+                    'project_id': self.project_id,
+                    'run_id': run_id,
+                },
+            )
+        else:
+            report.stats['stale_priority_override_edges_invalidated'] = (
+                priority_override_sweep_stats['invalidated']
+            )
+            report.stats['stale_priority_override_edges_scanned'] = (
+                priority_override_sweep_stats['scanned']
             )
 
         # ── Deterministic per-cycle summary write (task 2229 W5-λ) ────────────
