@@ -207,12 +207,18 @@ async def verify_delivered_checks_on_main(
     Each check runs via :func:`run_delivered_check` (reused verbatim — NO
     second check runner is forked) with ``ref=main_sha`` and the injected
     *runner*, each bounded by ``asyncio.wait_for(timeout=check_timeout_secs)``.
+    The checks are evaluated CONCURRENTLY (``asyncio.gather``): they are
+    independent and this reconcile call site carries no per-tick fan-out budget
+    (unlike ``Scheduler._compute_delivered_check_cache``, which stays sequential
+    under ``max_checks_per_tick``), so wall-clock is the slowest single check
+    rather than the sum. ``gather`` preserves input order, so the FAILED
+    precedence collapse below is order-independent of scheduling.
     A hung check (the timeout-less grep kind; defense-in-depth for scripts,
     which also carry their own ``timeout_secs``) raises ``TimeoutError``, which
     is mapped to :attr:`DeliveredCheckResult.ERRORED` — the same fail-safe
     downstream handling as a runner error. ``run_delivered_check`` itself never
-    raises (a malformed descriptor degrades to ERRORED), so this loop cannot
-    raise either.
+    raises (a malformed descriptor degrades to ERRORED), so this aggregation
+    cannot raise either.
 
     Results aggregate with the SAME precedence as
     ``Scheduler._compute_delivered_check_cache`` (scheduler.py 3150-3211):
@@ -240,8 +246,9 @@ async def verify_delivered_checks_on_main(
     method could not serve, which is why this is a module-level function), and
     the harness coalesce ``redrive_member`` path (~harness.py:779).
     """
-    results: list[tuple[dict[str, Any], DeliveredCheckResult]] = []
-    for check in checks:
+    async def _run_one(
+        check: dict[str, Any],
+    ) -> tuple[dict[str, Any], DeliveredCheckResult]:
         try:
             result = await asyncio.wait_for(
                 run_delivered_check(
@@ -261,7 +268,20 @@ async def verify_delivered_checks_on_main(
                 main_sha,
             )
             result = DeliveredCheckResult.ERRORED
-        results.append((check, result))
+        return (check, result)
+
+    # Evaluate the checks CONCURRENTLY: they are independent and this reconcile
+    # call site carries no per-tick fan-out budget (unlike
+    # Scheduler._compute_delivered_check_cache, kept sequential under
+    # max_checks_per_tick), so wall-clock is the slowest single check rather
+    # than the sum of all of them. asyncio.gather PRESERVES input order, so the
+    # first-FAILED precedence collapse below is byte-identical to a sequential
+    # run; each thunk still bounds its own check with asyncio.wait_for and maps
+    # TimeoutError -> ERRORED, and run_delivered_check never raises — so gather
+    # cannot raise either (an empty checks list -> gather() -> []).
+    results: list[tuple[dict[str, Any], DeliveredCheckResult]] = list(
+        await asyncio.gather(*(_run_one(check) for check in checks))
+    )
 
     if results and all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
         return DeliveredChecksVerdict(outcome='all_delivered', main_sha=main_sha)
