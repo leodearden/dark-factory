@@ -23,8 +23,6 @@ depends on ε:
 
 from __future__ import annotations
 
-import inspect
-
 import httpx
 import pytest
 
@@ -178,9 +176,46 @@ async def test_memory_endpoint_override_routes_real_workflow_write_to_sink(tmp_p
         assert arguments['project_id'] == orch_config.fused_memory.project_id
 
 
-def test_run_eval_accepts_memory_endpoint_kwarg():
-    """run_eval exposes an optional memory_endpoint it threads to build_eval_orch_config."""
-    params = inspect.signature(run_eval).parameters
-    assert 'memory_endpoint' in params
-    # Default None → the profile null-sentinel isolation stands with no wiring.
-    assert params['memory_endpoint'].default is None
+@pytest.mark.asyncio
+async def test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config(
+    tmp_path, monkeypatch
+):
+    """run_eval threads its memory_endpoint straight into build_eval_orch_config.
+
+    A behavioral guard (not a signature lock): it captures the value
+    ``build_eval_orch_config`` actually receives at the runner's call site, then
+    short-circuits before any workflow/worktree work. Deleting the
+    ``memory_endpoint=memory_endpoint`` forward at that call site would make this
+    fail (captured would be the default ``None``). No other test covers run_eval's
+    forwarding — ``test_memory_endpoint_override_routes_real_workflow_write_to_sink``
+    exercises ``build_eval_orch_config`` directly.
+    """
+
+    class _Sentinel(Exception):
+        pass
+
+    captured: dict = {}
+
+    def _rec(config, task, base_config=None, *, memory_endpoint=None):
+        captured['memory_endpoint'] = memory_endpoint
+        raise _Sentinel
+
+    monkeypatch.setattr('orchestrator.evals.runner.build_eval_orch_config', _rec)
+    monkeypatch.setattr(
+        'orchestrator.evals.runner.load_task',
+        lambda _path: {'id': 't', 'project_root': str(tmp_path)},
+    )
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+
+    # worktree_path short-circuits create_eval_worktree, so no git op runs; the
+    # recorder raises _Sentinel to stop before any workflow/worktree work.
+    with pytest.raises(_Sentinel):
+        await run_eval(
+            tmp_path / 'task.json',
+            cfg,
+            memory_endpoint='http://127.0.0.1:54321',
+            worktree_path=tmp_path,
+        )
+
+    assert captured['memory_endpoint'] == 'http://127.0.0.1:54321'
