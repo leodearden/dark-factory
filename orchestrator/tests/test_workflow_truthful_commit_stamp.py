@@ -221,6 +221,50 @@ class TestIterationCommitProvenanceHelper:
         assert result['committed'] is False
         assert result['dirty'] is True
 
+    async def test_dirty_probe_error_is_fail_soft_and_does_not_propagate(
+        self, config, git_ops, task_assignment,
+    ):
+        """If the porcelain dirty-probe raises, the helper swallows it
+        (observability-only), records dirty:False, and never propagates the
+        exception. The ledger append must never be sunk by a
+        has_uncommitted_work failure — this pins that fail-soft contract."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+
+        pre_head = await workflow._get_head_commit()  # == current HEAD ⇒ no advance
+        # Force the porcelain probe to blow up on the no-commit path.
+        workflow.git_ops.has_uncommitted_work = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('git status --porcelain boom'),
+        )
+
+        # Must return normally (not raise) despite the probe error.
+        result = await workflow._iteration_commit_provenance(pre_head)
+
+        assert result == {'commit': None, 'committed': False, 'dirty': False}
+        # The probe was genuinely attempted — i.e. we exercised the except
+        # branch, not some path that skips the read entirely.
+        workflow.git_ops.has_uncommitted_work.assert_awaited_once()
+
+    async def test_missing_git_ops_defaults_dirty_false_without_probing(
+        self, config, git_ops, task_assignment,
+    ):
+        """With no git_ops collaborator wired (a partially-wired workflow), the
+        no-advance path must default dirty:False without attempting any probe —
+        pinning the ``git_ops is not None`` guard so a future refactor that
+        drops it is caught. (worktree stays wired so the pre/post HEAD read,
+        which uses self.worktree not git_ops, still resolves.)"""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+
+        pre_head = await workflow._get_head_commit()  # == current HEAD ⇒ no advance
+        workflow.git_ops = None  # type: ignore[assignment]
+
+        result = await workflow._iteration_commit_provenance(pre_head)
+
+        assert result == {'commit': None, 'committed': False, 'dirty': False}
+
 
 # ---------------------------------------------------------------------------
 # step-3 RED: the amend writer (_amend) — the RCA origin
