@@ -8,8 +8,11 @@ steps) is tested against a real temp git repo (the ``tmp_repo`` pattern from
 
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
 from collections import Counter
+from pathlib import Path
 
 import pytest
 from _eval_sampler_fixtures import make_candidate, rich_corpus
@@ -19,13 +22,59 @@ from orchestrator.evals.task_sampler import (
     ReferenceCapture,
     SampleResult,
     build_fixture_record,
+    capture_reference,
     classify_kind,
     classify_path,
     default_verify_commands,
+    discover_completed_tasks,
+    materialize_reference_diff,
+    pin_eval_branch,
     repo_of,
+    resolve_task_commits_from_merge,
     sample_stratified,
     stratify,
 )
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    """Run a git command in *cwd* and return stripped stdout."""
+    return subprocess.run(
+        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def merge_repo(tmp_path: Path) -> tuple[Path, str, str, str, str]:
+    """A temp repo with a real ``Merge task/777 into main`` no-ff merge commit.
+
+    Returns ``(repo, task_id, merge_sha, pre_sha, post_sha)`` where
+    ``post_sha == merge_sha`` (the landed state) and ``pre_sha == merge_sha^1``
+    (prior main / eval baseline). The task branch adds 2 lines to a.txt and a
+    new b.txt (+1), so the net ``pre..post`` diff is 2 files / 3 insertions /
+    0 deletions.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(['init', '-q', '-b', 'main'], repo)
+    _git(['config', 'user.email', 'test@example.com'], repo)
+    _git(['config', 'user.name', 'Test User'], repo)
+    _git(['config', 'commit.gpgsign', 'false'], repo)
+
+    (repo / 'a.txt').write_text('base\n')
+    _git(['add', '.'], repo)
+    _git(['commit', '-q', '-m', 'base'], repo)
+
+    _git(['checkout', '-q', '-b', 'task/777'], repo)
+    (repo / 'a.txt').write_text('base\nline2\nline3\n')
+    (repo / 'b.txt').write_text('new file\n')
+    _git(['add', '.'], repo)
+    _git(['commit', '-q', '-m', 'work on 777'], repo)
+
+    _git(['checkout', '-q', 'main'], repo)
+    _git(['merge', '--no-ff', 'task/777', '-m', 'Merge task/777 into main'], repo)
+    merge_sha = _git(['rev-parse', 'HEAD'], repo)
+    pre = _git(['rev-parse', 'HEAD^1'], repo)
+    return repo, '777', merge_sha, pre, merge_sha
 
 
 def _cand(**overrides) -> CompletedTaskCandidate:
@@ -376,3 +425,66 @@ class TestBuildFixtureRecord:
         )
         round_tripped = json.loads(json.dumps(rec))
         assert round_tripped['id'] == 'df_task_12'
+
+
+# ---------------------------------------------------------------------------
+# Git glue — merge-log discovery, commit resolution, reference capture, pin
+# ---------------------------------------------------------------------------
+
+class TestGitGlue:
+    def test_resolve_task_commits_from_merge(
+        self, merge_repo: tuple[Path, str, str, str, str]
+    ) -> None:
+        repo, _tid, merge_sha, pre, post = merge_repo
+        got_pre, got_post = asyncio.run(
+            resolve_task_commits_from_merge(repo, merge_sha)
+        )
+        assert got_pre == pre
+        assert got_post == post
+
+    def test_capture_reference_diff_stat(
+        self, merge_repo: tuple[Path, str, str, str, str]
+    ) -> None:
+        repo, _tid, _msha, pre, post = merge_repo
+        ref = asyncio.run(capture_reference(repo, pre, post))
+        assert ref.post_task_commit == post
+        assert ref.files == 2
+        assert ref.insertions == 3
+        assert ref.deletions == 0
+
+    def test_materialize_reference_diff_equals_git_diff(
+        self, merge_repo: tuple[Path, str, str, str, str]
+    ) -> None:
+        repo, _tid, _msha, pre, post = merge_repo
+        got = asyncio.run(materialize_reference_diff(repo, pre, post))
+        expected = _git(['diff', f'{pre}..{post}'], repo)
+        assert got == expected
+        # The net landed change is non-empty (the judge grades a real diff).
+        assert 'b.txt' in got
+
+    def test_pin_eval_branch_creates_and_is_idempotent(
+        self, merge_repo: tuple[Path, str, str, str, str]
+    ) -> None:
+        repo, _tid, _msha, _pre, post = merge_repo
+        branch = asyncio.run(pin_eval_branch(repo, 'df_task_777', post))
+        assert branch == 'evals/df_task_777'
+        assert _git(['rev-parse', 'evals/df_task_777'], repo) == post
+        # Second call leaves the same ref and does not raise.
+        branch2 = asyncio.run(pin_eval_branch(repo, 'df_task_777', post))
+        assert branch2 == 'evals/df_task_777'
+        assert _git(['rev-parse', 'evals/df_task_777'], repo) == post
+
+    def test_discover_completed_tasks_parses_merge_lines(
+        self, merge_repo: tuple[Path, str, str, str, str]
+    ) -> None:
+        repo, task_id, merge_sha, pre, post = merge_repo
+        cands = asyncio.run(
+            discover_completed_tasks(repo, since=None, project='dark_factory')
+        )
+        assert len(cands) == 1
+        c = cands[0]
+        assert c.task_id == task_id
+        assert c.merge_sha == merge_sha
+        assert c.post_commit == post
+        assert c.pre_commit == pre
+        assert c.project == 'dark_factory'
