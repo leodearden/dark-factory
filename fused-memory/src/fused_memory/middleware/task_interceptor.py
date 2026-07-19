@@ -51,6 +51,12 @@ from fused_memory.middleware.lock_charter_guard import (
     extract_files,
     lock_charter_error,
 )
+# NOTE: safe top-level import — operational_routing_guard has NO top-level
+# task_interceptor import (it lazily imports TaskInterceptor inside its
+# function to break the cycle), so this does not create a circular import.
+from fused_memory.middleware.operational_routing_guard import (
+    inject_operational_routing,
+)
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
     check_files_for_scope,
@@ -2202,6 +2208,18 @@ class TaskInterceptor:
         # override was supplied the metadata dict is left untouched.
         if routing_override_reason:
             metadata = self._inject_routing_override(metadata, routing_override_reason)
+
+        # Operational-routing boundary coercion (task 2802/β) — direct-path
+        # TWIN of the server/tools.py boundary coercion. Placed before the
+        # planning_mode split so this ONE call covers both the direct-normal
+        # and direct-planning_mode interceptor paths (callers that bypass
+        # tools.py). Idempotent, so for MCP-tool callers — where tools.py has
+        # already coerced before delegating — re-running here is a no-op; the
+        # twin's real job is the direct caller. Distinct from
+        # _dispatch_ticket_decision's _inject_deterministic_pure_gate call
+        # (the curator's untagged-substring route_deterministic fallback),
+        # which is a different mechanism, not this declared-tag coercion.
+        metadata = inject_operational_routing(metadata)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:
