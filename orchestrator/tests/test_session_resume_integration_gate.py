@@ -771,3 +771,38 @@ async def test_b6_kill_switch_fresh_dispatch_no_event(harness: Harness):
     assert cap.initial_plan is recovered_plan
     assert cap.emits == []
     assert _session_resume_emits(harness) == []
+
+
+# ── B7: resume cap (resume_count == max_resumes_per_task) ────────────────────
+@pytest.mark.asyncio
+async def test_b7_resume_cap_emits_capped(harness: Harness):
+    """B7 — a session that has already been resumed ``max_resumes_per_task``
+    times is adopted at boot but throttled at dispatch: ``resume_session_id``
+    is None, the recovered plan is kept, and exactly one
+    ``session_resume_capped`` event (a DISTINCT by-design-throttling signal,
+    not a corroboration ``fallback``) is emitted.
+
+    The sidecar is fresh with a present transcript so freshness and
+    corroboration both PASS — the per-task cap is the sole disqualifier,
+    isolating the ``capped`` arm (which, unlike ``stale``/``no_transcript``,
+    does NOT feed the fallback-storm streak).
+    """
+    task_id, session_id = '47', 'uuid-b7-capped'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', resume_count=3,
+    )
+    harness.config.session_resume = SessionResumeConfig(max_resumes_per_task=3)
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): session (resume_count=3) + plan recovered ──
+    assert task_id in harness._recovered_sessions
+    assert harness._recovered_sessions[task_id]['resume_count'] == 3
+    assert task_id in harness._recovered_plans
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ): capped → throttled, plan kept, capped event ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert [et for et, _ in cap.emits] == [EventType.session_resume_capped]
