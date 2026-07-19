@@ -111,3 +111,37 @@ async def test_dirty_tree_commits_and_emits_event(tmp_path):
     assert recs[0]['data']['amendment_round'] == 2
     assert recs[0]['data']['wip_sha'] == 'wipsha01'
     assert recs[0]['data']['recovery'] == 'auto_commit'
+
+
+@pytest.mark.asyncio
+async def test_clean_tree_is_noop_no_commit_no_event(tmp_path):
+    """A clean worktree is a no-op: no commit, no event, returns None.
+
+    Nothing was left uncommitted, so there is no data-loss risk to recover —
+    the guard must not manufacture an empty WIP commit or a spurious event."""
+    wf = _make_workflow(tmp_path, has_uncommitted_work=False)
+
+    sha = await wf._commit_amendment_wip(1)
+
+    assert sha is None
+    wf.git_ops.commit.assert_not_awaited()
+    assert _recovery_events(wf) == []
+    assert wf.event_store.events == []
+
+
+@pytest.mark.asyncio
+async def test_dirty_tree_with_no_event_store_commits_without_raising(tmp_path):
+    """Fire-and-forget None-guard: with ``event_store=None`` and a dirty tree,
+    the guard still commits and returns the sha without raising (mirrors the
+    ``_emit_rebase_verify_cost`` guarded-emit pattern)."""
+    wf = _make_workflow(
+        tmp_path,
+        has_uncommitted_work=True,
+        commit_sha='sha',
+        event_store=None,
+    )
+
+    sha = await wf._commit_amendment_wip(1)
+
+    assert sha == 'sha'
+    wf.git_ops.commit.assert_awaited_once()
