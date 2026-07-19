@@ -899,7 +899,9 @@ class MergeVerifyLeaseHeld(RuntimeError):
         )
 
 
-async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+async def _run(
+    cmd: list[str], cwd: Path | None = None, *, input_text: str | None = None,
+) -> tuple[int, str, str]:
     """Run an arbitrary subprocess command and return (returncode, stdout, stderr).
 
     Used throughout for git invocations and for any other subprocess call
@@ -907,6 +909,15 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     is provided but does not exist, so the caller can distinguish a deleted
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
+
+    Stdin feeding (``input_text``): when provided, the child is spawned with
+    ``stdin=PIPE`` and ``input_text.encode()`` is written to it via
+    ``communicate(input=...)``.  This is what lets callers pipe a diff into a
+    stdin-only filter such as ``git patch-id`` (see
+    :meth:`GitOps.find_equivalent_commit`).  When ``None`` (the default) the
+    behaviour is exactly as before — stdin is not piped and the child inherits
+    the parent's — so no existing caller is affected.  The capability is inert
+    unless ``input_text`` is passed.
 
     Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
     that git (and other tools) always emit English-locale diagnostics.  This is
@@ -937,6 +948,7 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd) if cwd else None,
+            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_env,
@@ -949,7 +961,9 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
             raise WorktreeMissing(cwd) from e
         raise
     try:
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await proc.communicate(
+            input=input_text.encode() if input_text is not None else None,
+        )
     except BaseException:
         # The await was interrupted (most commonly asyncio.CancelledError from
         # a caller-side asyncio.wait_for(..., timeout=...)) before the child
