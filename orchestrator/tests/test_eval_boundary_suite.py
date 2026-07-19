@@ -76,6 +76,7 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import inspect
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,7 @@ from typing import Any, Callable, Coroutine
 
 import pytest
 
+import orchestrator
 from orchestrator import config as _config
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.evals import profile as _profile
@@ -345,3 +347,76 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
     # file path, or worktree. Pins the signature so no such argument creeps in.
     params = set(inspect.signature(scoring.quality_from_review_artifact).parameters)
     assert params == {'artifact', 'plan_steps', 'debug_cycles'}
+
+
+# ── B2: factory single construction point (P2) ─────────────────────────────
+
+# ``TaskWorkflow(`` not preceded by a word char or dot — a construction call,
+# not ``build_workflow`` / ``class TaskWorkflow:`` / an attribute access. Reused
+# verbatim from test_workflow_factory.py (composed into the boundary suite).
+_CONSTRUCT_RE = re.compile(r"(?<![\w.])TaskWorkflow\(")
+_FACTORY_CALL_RE = re.compile(r"(?<![\w.])build_workflow\(")
+
+
+def _orchestrator_src_root() -> Path:
+    """Resolve ``orchestrator/src/orchestrator/`` from the imported package."""
+    return Path(orchestrator.__file__).resolve().parent
+
+
+def test_b2_factory_single_construction_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2 — a new mandatory ``TaskWorkflow`` arg breaks the single build site.
+
+    Two composed halves that together encode Invariant P2 (single-point
+    ownership); neither alone is sufficient:
+
+    (1) Runtime: replace ``orchestrator.workflow.TaskWorkflow`` with a subclass
+        whose ``__init__`` demands a NEW mandatory kwarg the factory does not
+        pass, then assert ``build_workflow(...)`` raises ``TypeError`` — proving
+        a new required ``TaskWorkflow`` param breaks the single construction
+        point, hence BOTH dispatch sites (harness.py + evals/runner.py, which
+        both route through ``build_workflow``) at once.
+    (2) Static: ``workflow.py`` is the ONLY production-source file constructing
+        ``TaskWorkflow(``, and both dispatch sites contain a ``build_workflow(``
+        call — proving there is no third bypass site.
+    """
+    from orchestrator import workflow as workflow_mod
+    from orchestrator.workflow import build_workflow
+
+    # (1) Runtime: new mandatory kwarg the factory never threads → TypeError.
+    class _NeedsExtraParam:
+        def __init__(self, *, new_required_param: object, **kwargs: object) -> None:
+            self.new_required_param = new_required_param
+
+    monkeypatch.setattr(workflow_mod, 'TaskWorkflow', _NeedsExtraParam)
+    with pytest.raises(TypeError):
+        build_workflow(
+            assignment=object(),  # type: ignore[arg-type]
+            config=object(),  # type: ignore[arg-type]
+            git_ops=object(),  # type: ignore[arg-type]
+            scheduler=object(),  # type: ignore[arg-type]
+            briefing=object(),  # type: ignore[arg-type]
+            mcp=object(),  # type: ignore[arg-type]
+        )
+
+    # (2) Static single-point (compose the existing grep-guard invariant).
+    src_root = _orchestrator_src_root()
+    offenders: set[str] = set()
+    for path in src_root.rglob('*.py'):
+        text = path.read_text(encoding='utf-8', errors='ignore')
+        for line in text.splitlines():
+            code = line.split('#', 1)[0]  # drop trailing comment
+            if _CONSTRUCT_RE.search(code):
+                offenders.add(path.relative_to(src_root).as_posix())
+                break
+    assert offenders == {'workflow.py'}, (
+        f'Direct TaskWorkflow(...) construction is only permitted in workflow.py; '
+        f'offending files: {sorted(offenders)}'
+    )
+
+    for rel in ('harness.py', 'evals/runner.py'):
+        source = (src_root / rel).read_text(encoding='utf-8')
+        assert _FACTORY_CALL_RE.search(source), (
+            f'{rel} must construct its TaskWorkflow via build_workflow('
+        )
