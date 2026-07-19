@@ -3540,13 +3540,21 @@ class TestReconcileOneStrandedDeliveredChecksGuard:
                              main_sha: str, metadata: dict) -> None:
         """Common ON_MAIN git-fallback setup for an in-progress stranded task
         whose effect IS present (so the effect-present guard passes and
-        control reaches the new delivered-checks guard)."""
+        control reaches the new delivered-checks guard).
+
+        With an active commit-citation pattern (dark-factory's default), the
+        ON_MAIN landing sha is the CITATION commit, not the raw branch tip
+        (task_ground_truth._resolve_branch_state) — so find_task_citation_commit
+        is what determines report.branch_state.sha (and thus the found_on_main
+        provenance commit), pinned here to *sha*.
+        """
         harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
         harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
             return_value={'status': 'in-progress', 'metadata': metadata},
         )
         harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
         harness.git_ops.resolve_branch_sha = AsyncMock(return_value=sha)  # type: ignore[attr-defined]
+        harness.git_ops.find_task_citation_commit = AsyncMock(return_value=sha)  # type: ignore[attr-defined]
         harness.git_ops.get_main_sha = AsyncMock(return_value=main_sha)  # type: ignore[attr-defined]
 
     # --- row 2: FAILED, in-progress -> re-dispatch (revert to pending) ------
