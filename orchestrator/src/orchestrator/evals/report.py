@@ -17,6 +17,7 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
+from .metrics import _rate
 
 if TYPE_CHECKING:
     from .runner import EvalResult
@@ -97,6 +98,34 @@ def _ratio_score(value: float, best: float) -> float:
     if best <= 0 or value <= 0:
         return 1.0
     return min(max(best / value, 0.0), 1.0)
+
+
+def build_price_table(
+    configs: list[Any], prices: dict[str, Any] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Build the C4 per-config price table ``{config_name: {role: entry}}``.
+
+    Each config's ``model`` is looked up in *prices* (a ``config.prices``-shaped
+    map; ``PriceEntry`` objects and plain ``{'input_per_1m','output_per_1m'}``
+    dicts are both accepted via :func:`_rate`). A listed model yields
+    ``{role: {'input_per_1m', 'output_per_1m'}}``; an UNLISTED model yields the
+    explicit ``{role: {'source': 'unpriced'}}`` marker — never a fabricated
+    default (loud-over-silent). Pure over ``(configs, prices)``; the caller
+    (μ / CLI) seeds *prices* from ``default_price_table()`` / ``config.prices``.
+    Config keys are inserted in sorted order so the table is byte-deterministic.
+    """
+    table: dict[str, dict[str, dict[str, Any]]] = {}
+    for config in sorted(configs, key=lambda c: c.name):
+        entry = prices.get(config.model) if prices else None
+        if entry is None:
+            role_price: dict[str, Any] = {'source': 'unpriced'}
+        else:
+            role_price = {
+                'input_per_1m': _rate(entry, 'input_per_1m'),
+                'output_per_1m': _rate(entry, 'output_per_1m'),
+            }
+        table[config.name] = {config.role: role_price}
+    return table
 
 
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:
