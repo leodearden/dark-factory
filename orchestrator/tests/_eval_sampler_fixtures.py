@@ -49,7 +49,7 @@ def make_candidate(
     into exactly ``(repo, kind, path)``.
     """
     complexity = 'simple' if path == 'simple' else 'high'
-    fields = dict(
+    fields: dict[str, object] = dict(
         task_id=str(task_id),
         project=_REPO_PROJECT[repo],
         project_root=_REPO_ROOT[repo],

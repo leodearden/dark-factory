@@ -92,7 +92,7 @@ def _cand(**overrides) -> CompletedTaskCandidate:
     Only the fields a given classifier reads matter; the rest default to
     empty so a test can name just the axis it exercises.
     """
-    base = dict(
+    base: dict[str, object] = dict(
         task_id='df_1',
         project='dark_factory',
         project_root='/home/leo/src/dark-factory',
@@ -105,7 +105,7 @@ def _cand(**overrides) -> CompletedTaskCandidate:
         merge_sha='',
     )
     base.update(overrides)
-    return CompletedTaskCandidate(**base)
+    return CompletedTaskCandidate(**base)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
