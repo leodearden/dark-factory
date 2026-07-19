@@ -75,11 +75,9 @@ via ``run_eval`` only when you want to capture the writes. See
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import inspect
 import logging
-import re
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
@@ -87,9 +85,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
+from test_workflow_factory import (
+    _CONSTRUCT_RE,
+    _FACTORY_CALL_RE,
+    _orchestrator_src_root,
+)
 
-import orchestrator
-import orchestrator.scheduler
 from orchestrator.config import OrchestratorConfig, load_config
 from orchestrator.evals import judge as _judge
 from orchestrator.evals import profile as _profile
@@ -326,6 +328,10 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
         blocking/suggestion counts → same compute_composite);
     (2) content-sensitivity — a PASS / zero-issue artifact scores strictly
         higher than the 1-blocking artifact (the score is not a constant);
+    (2b) ERROR-verdict filter — an artifact whose top-level verdict is
+        ``ERROR`` is skipped exactly as ``aggregate_reviews`` skips it (0
+        issues), so it scores as clean even when it still carries ``issues``
+        entries;
     (3) scoring reads ONLY the artifact dict + scalar knobs (no transcript /
         file-path / worktree argument) — the P4 substrate μ's driver consumes.
 
@@ -363,24 +369,36 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
     )
     assert clean_score > legacy_score
 
+    # (2b) ERROR-verdict filter — mirror ``artifacts.aggregate_reviews``: an
+    # artifact whose top-level verdict is ERROR is skipped there entirely
+    # (0 blocking / 0 suggestions), so even one still carrying ``issues``
+    # entries scores as clean here, never by its severities — guarding the
+    # single-sourcing claim in that edge case.
+    error_artifact = {**_B8_PAYLOAD, 'verdict': 'ERROR'}
+    error_score = scoring.quality_from_review_artifact(
+        error_artifact, plan_steps=plan_steps,
+    )
+    assert error_score == clean_score
+
     # (3) Reads only the artifact dict + scalar knobs — never a transcript,
-    # file path, or worktree. Pins the signature so no such argument creeps in.
+    # file path, or worktree. Assert that NEGATIVE contract (no such argument
+    # creeps in) rather than pinning the exact name set, so a cosmetic rename of
+    # a scalar knob does not false-fail with no behavioural regression.
     params = set(inspect.signature(scoring.quality_from_review_artifact).parameters)
-    assert params == {'artifact', 'plan_steps', 'debug_cycles'}
+    forbidden = ('transcript', 'worktree', 'path', 'file', 'dir')
+    leaked = {p for p in params if any(tok in p.lower() for tok in forbidden)}
+    assert not leaked, (
+        'quality_from_review_artifact must read only the artifact dict + scalar '
+        f'knobs, never a transcript/worktree/file-path argument; found: {sorted(leaked)}'
+    )
 
 
 # ── B2: factory single construction point (P2) ─────────────────────────────
 
-# ``TaskWorkflow(`` not preceded by a word char or dot — a construction call,
-# not ``build_workflow`` / ``class TaskWorkflow:`` / an attribute access. Reused
-# verbatim from test_workflow_factory.py (composed into the boundary suite).
-_CONSTRUCT_RE = re.compile(r"(?<![\w.])TaskWorkflow\(")
-_FACTORY_CALL_RE = re.compile(r"(?<![\w.])build_workflow\(")
-
-
-def _orchestrator_src_root() -> Path:
-    """Resolve ``orchestrator/src/orchestrator/`` from the imported package."""
-    return Path(orchestrator.__file__).resolve().parent
+# The single-construction-point scanner — the ``_CONSTRUCT_RE`` /
+# ``_FACTORY_CALL_RE`` regexes and ``_orchestrator_src_root`` — is IMPORTED from
+# test_workflow_factory (the ONE authoritative scanner for the P2 grep-guard
+# invariant), so a fix there propagates here instead of drifting from a copy.
 
 
 def test_b2_factory_single_construction_point(
@@ -444,31 +462,11 @@ def test_b2_factory_single_construction_point(
 
 # ── B3: dispatch-literal tripwire through the real eval scheduler (D2) ──────
 
-
-def _dispatch_tool_literals() -> set[str]:
-    """String-literal first args of every ``dispatch_tool`` call in scheduler.py.
-
-    AST scan (not regex): 6 of 7 call sites put the literal on a line separate
-    from ``dispatch_tool(``. Reuses the scanner logic from
-    test_scheduler_dispatch_literal_tripwire.py.
-    """
-    source_path = Path(orchestrator.scheduler.__file__)
-    tree = ast.parse(source_path.read_text())
-    literals: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        is_dispatch = (
-            (isinstance(func, ast.Attribute) and func.attr == 'dispatch_tool')
-            or (isinstance(func, ast.Name) and func.id == 'dispatch_tool')
-        )
-        if not is_dispatch or not node.args:
-            continue
-        first = node.args[0]
-        if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            literals.add(first.value)
-    return literals
+# ``_dispatch_tool_literals`` — the AST scanner enumerating every scheduler.py
+# ``dispatch_tool('<literal>', ...)`` first-arg — is IMPORTED from
+# test_scheduler_dispatch_literal_tripwire (the ONE authoritative scanner for
+# the D2 dispatch-literal invariant), so the tripwire there and this integration
+# variant probe the identical literal set instead of two copies that can drift.
 
 
 @pytest.mark.asyncio
