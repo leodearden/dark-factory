@@ -39,6 +39,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -416,3 +417,95 @@ class TestImplementerWriterTruthfulCommit:
         )
         assert entry['committed'] is False
         assert entry['dirty'] is True
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: the debugger writer (_verify_debugfix_loop)
+# ---------------------------------------------------------------------------
+
+
+def _failing_verify_result() -> VerifyResult:
+    return VerifyResult(
+        passed=False,
+        test_output='FAILED tests/test_x.py::test_y\n',
+        lint_output='',
+        type_output='',
+        summary='Failures: tests failed',
+        timed_out=False,
+        cause_hint='FAILED tests/test_x.py::test_y',
+        category='test_failure',
+    )
+
+
+def _passing_verify_result() -> VerifyResult:
+    return VerifyResult(
+        passed=True,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='ok',
+        timed_out=False,
+    )
+
+
+async def _make_verify_workflow(
+    git_repo: Path, task_assignment: TaskAssignment,
+) -> tuple[TaskWorkflow, TaskArtifacts, GitOps]:
+    """Real-git workflow wired to drive _verify_debugfix_loop through exactly
+    one debugger invocation: verify off-flags so the loop reaches the debugger,
+    a stubbed verify (fail → pass), and a no-op debugger _invoke."""
+    cfg = OrchestratorConfig(
+        project_root=git_repo,
+        rebase_before_verify=False,
+        escalate_preexisting_main_break=False,
+        max_verify_attempts=2,
+        # Well above the one debugger iteration so the signature-repeat guard
+        # never fires — this test is solely about the debugger writer.
+        max_failure_signature_repeat=100,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    gops = GitOps(cfg.git, cfg.project_root)
+    wt_info = await gops.create_worktree(task_assignment.task_id)
+    wt = wt_info.path
+    workflow, artifacts = _make_workflow(cfg, gops, task_assignment, wt)
+
+    workflow._run_scoped_verification_with_infra_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_failing_verify_result(), _passing_verify_result()],
+    )
+    workflow._maybe_file_chronic_flakes = AsyncMock()  # type: ignore[method-assign]
+    workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    workflow.briefing.build_debugger_prompt = AsyncMock(return_value='debug-prompt')  # type: ignore[attr-defined]
+    workflow._invoke = AsyncMock(  # no-op debugger: success, makes no commit
+        return_value=AgentResult(success=True, output=''),
+    )  # type: ignore[method-assign]
+    workflow._get_head_commit = AsyncMock(return_value='const_sha')  # type: ignore[method-assign]
+    gops.has_uncommitted_work = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    return workflow, artifacts, gops
+
+
+@pytest.mark.asyncio
+class TestDebuggerWriterTruthfulCommit:
+    async def test_debugger_no_advance_records_null_and_uncommitted(
+        self, git_repo, task_assignment,
+    ):
+        """A no-op debugger pass (HEAD unchanged) must record
+        commit:None / committed:False — not the stale constant HEAD. Fails
+        RED: the writer stamps the constant sha with no committed key."""
+        workflow, artifacts, _gops = await _make_verify_workflow(
+            git_repo, task_assignment,
+        )
+
+        outcome = await workflow._verify_debugfix_loop()
+        assert outcome == WorkflowOutcome.DONE  # fail → debug → pass
+
+        entries, _ = artifacts.read_iteration_log()
+        debug = [e for e in entries if e.get('agent') == 'debugger']
+        assert len(debug) == 1, f'expected exactly one debugger entry, got {entries}'
+        entry = debug[0]
+        assert entry['commit'] is None, (
+            f'no HEAD advance ⇒ commit must be null, got {entry.get("commit")!r}'
+        )
+        assert entry['committed'] is False
