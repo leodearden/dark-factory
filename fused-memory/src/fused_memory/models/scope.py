@@ -216,6 +216,27 @@ def read_declared_project_id(project_root: str | Path) -> str | None:
     return _to_underscore_canonical(declared)
 
 
+def resolve_project_id_for_root(project_root: str | Path) -> str:
+    """Rename-stable project_id resolver: manifest-declared id first.
+
+    Returns the id declared in ``<project_root>/dark-factory-orchestrator.yaml``
+    (via :func:`read_declared_project_id`) when present, else falls back to
+    the pure basename derivation of :func:`resolve_project_id`.  This is the
+    resolver the two registry BUILDERS
+    (:func:`build_known_projects_map` and
+    :class:`~fused_memory.middleware.project_prefix_registry.ProjectPrefixRegistry.from_roots`)
+    use so a directory rename that preserves the manifest's ``project_id``
+    re-points them to the new path under the SAME id instead of churning.
+
+    :func:`resolve_project_id` itself is intentionally left unchanged (still a
+    pure, no-I/O basename derivation) so its many hot-path callers are
+    unaffected.
+    """
+    return read_declared_project_id(project_root) or resolve_project_id(
+        str(project_root)
+    )
+
+
 def known_project_roots_from_env(
     env_var: str = KNOWN_PROJECT_ROOTS_ENV,
 ) -> list[str]:
