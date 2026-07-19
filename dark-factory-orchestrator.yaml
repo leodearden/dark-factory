@@ -171,3 +171,17 @@ merge_verify_breadth: "full"
 merge_train_former_enabled: true
 merge_train_coalesce_enabled: true
 merge_train_max_members: 3
+
+# Serialize the per-merge module fan-out to 1 (operator decision, 2026-07-19)
+# to cut merge-verify CPU oversubscription on the shared 32-core host. With
+# breadth="full", the default (4) lets ONE merge verify run up to 4 modules'
+# suites concurrently, each `pytest -n auto` = 32 workers -> up to 128 workers
+# from a single merge (4x the cores) -> starved xdist workers cross the 60s
+# wall-clock timeout, os._exit, and false-red innocent tests (the CPU-contention
+# flakiness RCA, memory project_cpu_contention_test_flakiness_rootcause_2026_07_18).
+# Setting 1 caps a merge verify to one 32-worker pool at a time; modules run
+# sequentially within the merge. Green-tier hot-reloadable (RELOADABLE_FIELDS),
+# so this is live-tunable via mcp__escalation__reload_config without a restart.
+# Trade-off: a merge's full-breadth verify is slower wall-clock (modules
+# serialized), accepted against the oversubscription-flake churn it removes.
+merge_verify_max_concurrent_modules: 1
