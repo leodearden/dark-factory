@@ -1727,6 +1727,52 @@ class TestEnsureLanePlanSymlink:
         assert lane_plan.is_symlink()
         assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
 
+    def test_replaces_broken_symlink(
+        self, worktree: Path, meta_root: Path
+    ):
+        # A pre-existing stale/broken symlink (points at a now-absent target)
+        # is REPLACED by a valid absolute symlink INTO the meta-root — exercises
+        # the `unlink` occupant-removal branch on a dangling link.
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+
+        lane_task = worktree / '.task'
+        lane_task.mkdir(parents=True, exist_ok=True)
+        lane_plan = lane_task / 'plan.json'
+        os.symlink(lane_task / 'gone.json', lane_plan)  # dangling target
+        assert lane_plan.is_symlink() and not lane_plan.exists()  # broken
+
+        ta.ensure_lane_plan_symlink()
+
+        # Retargeted at the meta-root, not left dangling at gone.json.
+        assert lane_plan.is_symlink()
+        assert os.path.isabs(os.readlink(lane_plan))
+        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+
+    def test_replaces_stray_directory(
+        self, worktree: Path, meta_root: Path
+    ):
+        # (pathological) a stray non-empty DIRECTORY at the lane plan path is
+        # rmtree'd and REPLACED by the symlink — exercises the destructive
+        # `shutil.rmtree` occupant-removal branch (a plain rmdir would raise on
+        # the non-empty dir).
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+
+        lane_task = worktree / '.task'
+        lane_task.mkdir(parents=True, exist_ok=True)
+        lane_plan = lane_task / 'plan.json'
+        lane_plan.mkdir()
+        (lane_plan / 'junk.txt').write_text('stray')  # non-empty
+        assert lane_plan.is_dir() and not lane_plan.is_symlink()
+
+        ta.ensure_lane_plan_symlink()
+
+        assert lane_plan.is_symlink()
+        assert lane_plan.resolve() == (meta_root / 'plan.json').resolve()
+
     def test_idempotent(self, worktree: Path, meta_root: Path):
         # (d) calling twice yields a symlink to the same target, no error.
         worktree.mkdir()
