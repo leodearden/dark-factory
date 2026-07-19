@@ -834,6 +834,7 @@ class MemoryService:
         """
         if timeout is None:
             timeout = _SUBCLOSE_TIMEOUT
+        start = time.monotonic()
         close_task = asyncio.ensure_future(resource.close())
         # asyncio.wait signals a budget overrun structurally (via `pending`),
         # never by raising — so a TimeoutError the resource's own close() raises
@@ -843,16 +844,29 @@ class MemoryService:
             # Budget expired: the close is still running. Cancel it and move on
             # so a hung backend can't starve the durable-flush closes that follow.
             # Data-safe: graphiti/mem0 closes only tear down sockets (writes are
-            # already durable via durable_queue / synchronous commits).
+            # already durable via durable_queue / synchronous commits). The WARNING
+            # names the label + budget so the restart journal identifies the culprit.
             close_task.cancel()
             with contextlib.suppress(BaseException):
                 await close_task
-            logger.warning('MemoryService.close: %s.close timed out', label)
+            logger.warning(
+                'MemoryService.close: %s.close exceeded %.1fs budget '
+                '(elapsed %.2fs) — cancelled to avoid starving later closes',
+                label,
+                timeout,
+                time.monotonic() - start,
+            )
             return
         try:
             close_task.result()
         except Exception:
             logger.exception('MemoryService.close: %s.close failed', label)
+        else:
+            logger.debug(
+                'MemoryService.close: %s.close completed in %.2fs',
+                label,
+                time.monotonic() - start,
+            )
 
     async def close(self) -> None:
         if self.durable_queue:
