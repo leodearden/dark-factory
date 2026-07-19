@@ -61,6 +61,7 @@ re-raised unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -329,10 +330,27 @@ async def sweep_stale_priority_override_edges(
     """
     stats = {'scanned': 0, 'candidate_edges': 0, 'invalidated': 0, 'errors': 0}
 
+    if not project_root:
+        return stats
+
     if read_live is None:
         read_live = read_live_override_state
 
-    grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+    # Enumeration is a single bulk call the rest of the cycle depends on: a
+    # failure here ends this cycle's sweep early with the stats gathered so
+    # far (self-heals next cycle). CancelledError/KeyboardInterrupt/SystemExit
+    # are never swallowed.
+    try:
+        grouped = await memory_service.graphiti.get_all_valid_edges(group_id=project_id)
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'stale_priority_override_edge_sweep: get_all_valid_edges failed for group_id=%s',
+            project_id,
+        )
+        stats['errors'] += 1
+        return stats
 
     edges = flatten_dedup_edges(grouped)
     stats['scanned'] = len(edges)
@@ -343,20 +361,46 @@ async def sweep_stale_priority_override_edges(
         if extract_priority_override_task_id(edge.get('fact') or '') is not None
     ]
 
-    live = await read_live(project_root)
+    # No priority-override edges at all -> no live-state read needed.
+    if not candidate_edges:
+        return stats
+
+    # Reading live override state is the other bulk call the invalidation
+    # decision depends on: a failure aborts this cycle no-op (self-heals next
+    # cycle). CancelledError/KeyboardInterrupt/SystemExit are never swallowed.
+    try:
+        live = await read_live(project_root)
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        log.exception(
+            'stale_priority_override_edge_sweep: read_live failed for project_root=%s',
+            project_root,
+        )
+        stats['errors'] += 1
+        return stats
 
     invalidate_at = now or datetime.now(UTC)
     stale = select_stale_priority_override_edges(candidate_edges, live, now=invalidate_at)
     stats['candidate_edges'] = len(stale)
 
     for edge in stale:
-        await memory_service.update_edge(
-            edge['uuid'],
-            invalid_at=invalidate_at,
-            project_id=project_id,
-            agent_id=_SWEEP_AGENT_ID,
-            causation_id=run_id,
-        )
-        stats['invalidated'] += 1
+        try:
+            await memory_service.update_edge(
+                edge['uuid'],
+                invalid_at=invalidate_at,
+                project_id=project_id,
+                agent_id=_SWEEP_AGENT_ID,
+                causation_id=run_id,
+            )
+            stats['invalidated'] += 1
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            log.exception(
+                'stale_priority_override_edge_sweep: update_edge failed for uuid=%s',
+                edge['uuid'],
+            )
+            stats['errors'] += 1
 
     return stats
