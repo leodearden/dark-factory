@@ -340,7 +340,11 @@ class TestBuildTaskCountSnapshotUnavailableContent:
         )
 
         assert 'UNAVAILABLE' in out or 'unavailable' in out
-        assert 'not a readable git working tree' in out
+        # A stable, semantically-load-bearing token rather than the full
+        # prose sentence -- pins "this is about git working tree
+        # readability" without locking the exact wording (amendment,
+        # task 2738 review).
+        assert 'git working tree' in out
 
     def test_content_carries_no_zeroed_numeric_census(self):
         out = build_task_count_snapshot_unavailable_content(
