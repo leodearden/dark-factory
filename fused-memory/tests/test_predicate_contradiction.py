@@ -28,6 +28,7 @@ from fused_memory.reconciliation.predicate_contradiction import (
     build_predicate_contradiction_task,
     render_predicate_contradiction_section,
 )
+from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 # --- Shared fixtures for the builder tests ---------------------------------- #
@@ -281,3 +282,17 @@ class TestRenderPredicateContradictionSection:
         lowered = text.lower()
         assert 'instead of' in lowered
         assert 'suppression' in lowered or 'mem0' in lowered
+
+
+class TestStage2PromptWiring:
+    """The rendered section is interpolated into STAGE2_SYSTEM_PROMPT so recon
+    stages that file tasks receive the guidance — mirroring how
+    render_execution_class_section() content is present in the prompt."""
+
+    def test_render_section_present_verbatim(self):
+        # Full-section faithfulness: the exact rendered text is a substring of
+        # the prompt (the drift invariant — the f-string interpolates it verbatim).
+        assert render_predicate_contradiction_section() in STAGE2_SYSTEM_PROMPT
+
+    def test_section_header_present(self):
+        assert '## Predicate Contradiction Checks' in STAGE2_SYSTEM_PROMPT
