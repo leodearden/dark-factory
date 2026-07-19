@@ -862,6 +862,126 @@ class TestSemaphoreTimeoutDeterministicDiagnosticVeto:
 
 
 # ---------------------------------------------------------------------------
+# task 2821: SEMAPHORE_TIMEOUT deterministic-TEST-VERDICT veto (gate-hole #1
+# of the reify 2026-07-19 red-main incident, /deb deb-reify-964887).
+# Generalizes the task-2748 Rust-diagnostic veto directly above: a genuine
+# flock/semaphore slot-acquisition timeout is raised by the concurrency-
+# limiter WRAPPER (reify lib_slot_acquire.sh / `flock -w`) BEFORE the wrapped
+# tool ever runs, so its output cannot ALSO carry a pytest/cargo test-runner
+# VERDICT (a "N passed, M failed" count-pair, or a FAILED line). But
+# `_LOCK_TOKEN_RE`/`_TIMEOUT_TOKEN_RE` are two independent whole-output
+# searches, so a deterministic test failure that happens to quote
+# lock/slot/semaphore source and mention "timed out" in a note satisfies both
+# and is misclassified SEMAPHORE_TIMEOUT — an INFRA_TRANSIENT_CATEGORIES
+# member — sending a deterministic test regression through the bounded
+# infra-retry loop (silently re-verified against a deterministically-red
+# gate) instead of surfacing to the debugger. Mirrors
+# TestSemaphoreTimeoutDeterministicDiagnosticVeto's shape, generalized from
+# Rust compiler/clippy diagnostics to any test-runner verdict.
+#
+# RED today: no test-verdict veto exists yet, so both goldens below still
+# satisfy the loose lock+timeout co-occurrence heuristic and classify
+# SEMAPHORE_TIMEOUT (a member of INFRA_TRANSIENT_CATEGORIES).
+# ---------------------------------------------------------------------------
+
+# pytest-shaped golden: leading-form FAILED line (pytest-report-shaped only),
+# a note mentioning the "slot" that "timed out", and pytest's bracketed
+# short-summary with the failed-before-passed order pytest actually uses.
+_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT = (
+    'FAILED tests/test_registry_drift.py::test_registry_pin - AssertionError\n'
+    'note: a stale peer that timed out may hold the slot\n'
+    '===== 6 failed, 48 passed in 12.34s =====\n'
+)
+
+# cargo-shaped golden: trailing-form FAILED line (cargo's own test-runner
+# shape), a note mentioning the "semaphore" slot that "timed out", and
+# cargo's literal "test result: FAILED. 48 passed; 6 failed; 0 ignored"
+# verdict line (passed-before-failed order — the reverse of the pytest
+# golden above, so both count-pair orders are grounded, matching the
+# incident's literal "48 passed, 6 failed").
+_SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT = (
+    'test families::non_geometry_families_disjoint ... FAILED\n'
+    'note: a peer holding the semaphore slot had timed out\n'
+    'test result: FAILED. 48 passed; 6 failed; 0 ignored\n'
+)
+
+
+class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
+    """task 2821: a deterministic pytest/cargo test-runner VERDICT must veto
+    the loose lock+timeout co-occurrence heuristic exactly like task 2748's
+    Rust-diagnostic veto — the lock/slot/semaphore and "timed out" tokens are
+    incidental to a deterministic test failure, not evidence of a genuine
+    slot-acquisition timeout (which is raised by the wrapper BEFORE the
+    wrapped tool runs, so it can never carry a pass/fail verdict)."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_pytest_verdict_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        result = _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a deterministic pytest test-verdict ("N failed, M passed" summary '
+            f'present) with incidental lock/slot/semaphore + "timed out" tokens '
+            f'must not classify infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_cargo_verdict_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        result = _classify(tool, _SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT, 1, False)
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a deterministic cargo test-verdict ("N passed; M failed" summary '
+            f'present) with incidental lock/slot/semaphore + "timed out" tokens '
+            f'must not classify infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
+    def test_pytest_verdict_leading_failed_line_is_test_failure(self, tool):
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT, 1, False)
+            == FailureCategory.TEST_FAILURE
+        )
+
+    @pytest.mark.parametrize(
+        'tool',
+        [ToolKind.PYTEST, ToolKind.OPAQUE, ToolKind.CARGO_TEST, ToolKind.CARGO_CLIPPY],
+    )
+    def test_cargo_verdict_trailing_failed_line_is_test_failure(self, tool):
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_CARGO_VERDICT_OUTPUT, 1, False)
+            == FailureCategory.TEST_FAILURE
+        )
+
+
+class TestSemaphoreTimeoutDeterministicTestVerdictVetoNegatives:
+    """Regression negatives: pure-wrapper genuine timeouts carrying no test
+    verdict must stay SEMAPHORE_TIMEOUT, both before and after the task-2821
+    veto — a veto only ever removes false-positives."""
+
+    def test_flock_output_stays_semaphore_timeout(self):
+        assert (
+            _classify(ToolKind.OPAQUE, _SEMAPHORE_TIMEOUT_FLOCK_OUTPUT, 1, False)
+            == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+    def test_slot_output_stays_semaphore_timeout(self):
+        assert (
+            _classify(ToolKind.OPAQUE, _SEMAPHORE_TIMEOUT_SLOT_OUTPUT, 1, False)
+            == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+    def test_stray_number_word_without_verdict_pair_stays_semaphore_timeout(self):
+        """A lone 'N <word>' count with no paired failed/error count must not
+        false-positive into the new verdict-pair veto."""
+        output = (
+            'Timeout after 300 seconds; 0 slots passed the wait — semaphore '
+            'slot timed out\n'
+        )
+        assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.SEMAPHORE_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
 # task 2756: broken _merge-verify worktree (unreadable/missing Cargo.lock) is
 # a HOST/ENVIRONMENT condition, not a per-tool output pattern — exactly like
 # DISK_FULL/SEMAPHORE_TIMEOUT above. Grounded in the reify 5120 RC-2 07-13
