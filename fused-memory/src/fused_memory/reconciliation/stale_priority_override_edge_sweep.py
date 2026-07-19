@@ -62,6 +62,7 @@ re-raised unchanged.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 from fused_memory.reconciliation.task_filter import TASK_REF_RE
 
@@ -147,3 +148,58 @@ def is_ttl_override_fact(fact: str) -> bool:
     Pure: no I/O, no side effects.
     """
     return bool(fact) and _TTL_OVERRIDE_FACT_RE.search(fact) is not None
+
+
+# --------------------------------------------------------------------------- #
+# select_stale_priority_override_edges — pure decision core
+# --------------------------------------------------------------------------- #
+
+
+def select_stale_priority_override_edges(
+    edges: list[dict],
+    live_overrides: dict[str, dict],
+    *,
+    now: datetime,
+) -> list[dict]:
+    """Return the subset of *edges* whose priority override is now stale.
+
+    An edge is selected (stale) iff its extracted subject task (via
+    ``extract_priority_override_task_id``) satisfies EITHER:
+    - the task is ABSENT from *live_overrides* — its override row was consumed
+      (dispatch -> ``clear_terminal``) or expired-and-cleared
+      (``clear_expired``), so the edge no longer describes any live override;
+      OR
+    - the edge is a TTL edge (``is_ttl_override_fact``) whose live row has an
+      absolute ``ttl_until`` that has already elapsed (``now >= ttl_until``).
+
+    Positively-determinable-only / conservative under-invalidation: a task
+    still present with a live override (and a null or not-yet-elapsed
+    ``ttl_until``) is never selected. A transient read gap or still-live
+    override can only UNDER-select (self-heals next cycle), never wrongly
+    retire a valid edge — the correct fail-safe bias for an irreversible
+    invalidation, mirroring 2613's invalidate-only-on-positively-terminal.
+
+    Args:
+        edges: Candidate edges (as returned by ``flatten_dedup_edges``).
+        live_overrides: ``{task_id_str: {'ttl_until': datetime | None, ...}}``
+            live override state (as returned by ``read_live_override_state``).
+        now: Tz-aware UTC instant the TTL-elapsed comparison is made against.
+
+    Pure: no I/O, no side effects.
+    """
+    selected: list[dict] = []
+    for edge in edges:
+        fact = edge.get('fact') or ''
+        tid = extract_priority_override_task_id(fact)
+        if tid is None:
+            continue
+        row = live_overrides.get(str(tid))
+        if row is None:
+            selected.append(edge)
+        elif (
+            is_ttl_override_fact(fact)
+            and row.get('ttl_until') is not None
+            and now >= row['ttl_until']
+        ):
+            selected.append(edge)
+    return selected
