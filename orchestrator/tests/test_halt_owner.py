@@ -223,6 +223,28 @@ class TestRehydrateMergeHalt:
         assert worker.halt_owner_esc_id == esc.id
         assert result == esc.id
 
+    def test_rehydrate_restores_from_stash_failed(self, harness: Harness):
+        """Single preserved level-1 stash_failed L1 restores halt+owner.
+
+        stash_failed is a main-checkout-hygiene halt category (task 2758),
+        parallel to unmerged_state: a park of project_root's dirty tracked
+        tree failed and halted the queue.  A preserved L1 of that category
+        must therefore re-own the halt across an orchestrator restart, so the
+        operator's later resolve cleanly releases it.
+        """
+        worker = _FakeMergeWorker()
+        harness._merge_worker = worker  # type: ignore[assignment]
+        queue = harness._escalation_queue
+        assert queue is not None
+
+        esc = _make_wip_esc(queue, '2758', category='stash_failed')
+
+        result = harness._rehydrate_merge_halt()
+
+        assert worker.is_wip_halted is True
+        assert worker.halt_owner_esc_id == esc.id
+        assert result == esc.id
+
     @pytest.mark.parametrize('setup', [
         'empty_queue',
         'wrong_category',
