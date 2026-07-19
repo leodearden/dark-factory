@@ -9380,6 +9380,48 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         stdout, _ = await proc.communicate()
         return stdout.decode().strip()
 
+    async def _iteration_commit_provenance(self, pre_head: str) -> dict:
+        """Compare pre/post HEAD and report truthful commit provenance for an
+        iteration-ledger entry (task 2759).
+
+        Every iteration-ledger writer (implementer / debugger / amender)
+        captures ``pre_head = await self._get_head_commit()`` immediately
+        before invoking its agent, then merges this helper's result into the
+        entry dict after the agent returns. This is the single source of truth
+        for the pre/post comparison so the three writers cannot drift.
+
+        - HEAD advanced (``post`` is truthy and ``!= pre_head``) ⇒ the agent
+          committed: return ``{'commit': post, 'committed': True}``. No
+          ``dirty`` read is performed on this happy path (avoids an extra
+          ``git status`` on the common case).
+        - HEAD unchanged ⇒ the agent's session ended before committing (died
+          mid-background-wait, amendment left uncommitted, …). Recording the
+          stale ``pre_head`` here is the reify-5164 false-provenance bug;
+          instead return ``{'commit': None, 'committed': False,
+          'dirty': <porcelain-nonempty>}`` so recovery guards can treat the
+          round as no durable work.
+
+        The ``dirty`` read reuses :meth:`GitOps.has_uncommitted_work` and is
+        fail-soft (observability-only): guarded on ``git_ops``/``worktree``
+        being present and wrapped in try/except, defaulting ``dirty=False`` on
+        any error so it never sinks the iteration loop or the ledger append.
+        """
+        post = await self._get_head_commit()
+        if post and post != pre_head:
+            return {'commit': post, 'committed': True}
+        dirty = False
+        if self.git_ops is not None and self.worktree is not None:
+            try:
+                dirty = await self.git_ops.has_uncommitted_work(self.worktree)
+            except Exception:
+                logger.warning(
+                    'Task %s: dirty-tree probe failed while stamping iteration '
+                    'provenance; recording dirty=False (observability-only)',
+                    self.task_id, exc_info=True,
+                )
+                dirty = False
+        return {'commit': None, 'committed': False, 'dirty': dirty}
+
     async def _check_branch_on_main(self) -> tuple[str, str] | None:
         """Probe whether the worktree HEAD is reachable from main.
 

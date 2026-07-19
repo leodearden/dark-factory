@@ -59,6 +59,12 @@ async def _init_repo(repo: Path) -> None:
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
     await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    # Mirror the real repo: .task/ execution metadata (written by
+    # TaskArtifacts.init here, since these harnesses construct in-worktree
+    # artifacts) is gitignored, so it never surfaces in `git status
+    # --porcelain` — exactly the invariant GitOps.has_uncommitted_work
+    # (and thus _iteration_commit_provenance's dirty read) relies on.
+    (repo / '.gitignore').write_text('.task/\n')
     (repo / 'lib.py').write_text('x = 1\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial'], cwd=repo)
