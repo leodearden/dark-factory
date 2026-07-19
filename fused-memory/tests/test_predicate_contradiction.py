@@ -19,6 +19,23 @@ import os
 import subprocess
 from pathlib import Path
 
+from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
+from fused_memory.middleware.execution_class_guard import execution_class_error
+from fused_memory.reconciliation.predicate_contradiction import (
+    PredicateContradictionTask,
+    build_predicate_contradiction_task,
+)
+
+# --- Shared fixtures for the builder tests ---------------------------------- #
+_CONTRADICTION = (
+    "Memory claims tests/test_x.py::test_y passes on main, but finding 9cfd4de9 "
+    "asserts it fails — only a live pytest run can settle this."
+)
+_FINDING_ID = '9cfd4de9-1111-4000-8000-000000000001'
+_RUN_ID = '23632bc9-2222-4000-8000-000000000002'
+_CITED = ['03a2b6d7-3333-4000-8000-000000000003', '8ae43c70-4444-4000-8000-000000000004']
+_PYTEST_ARGS = ['--pytest', 'tests/test_x.py::test_y']
+
 # Repo root: this file is <root>/fused-memory/tests/test_predicate_contradiction.py
 _REPO_ROOT = Path(__file__).parents[2]
 _SCRIPT = _REPO_ROOT / 'scripts' / 'recon_predicate_check.sh'
@@ -87,3 +104,79 @@ class TestReconPredicateCheckScript:
             text=True,
         )
         assert proc.returncode == 1, proc.stderr
+
+
+class TestBuildPredicateContradictionTask:
+    """build_predicate_contradiction_task assembles a well-formed
+    task_kind='deterministic' + before_done.kind='predicate' submission whose
+    payload passes BOTH submit-boundary guards."""
+
+    def _build(self, **overrides):
+        kwargs = dict(
+            contradiction=_CONTRADICTION,
+            script='check.sh',
+            timeout_secs=120,
+            args=_PYTEST_ARGS,
+            finding_id=_FINDING_ID,
+            run_id=_RUN_ID,
+            cited_memory_ids=_CITED,
+        )
+        kwargs.update(overrides)
+        return build_predicate_contradiction_task(**kwargs)
+
+    def test_returns_predicate_contradiction_task(self):
+        task = self._build()
+        assert isinstance(task, PredicateContradictionTask)
+        assert task.task_kind == 'deterministic'
+
+    def test_before_done_is_predicate_without_target_unit(self):
+        bd = self._build().metadata['before_done']
+        assert bd['kind'] == 'predicate'
+        assert bd['script'] == 'check.sh'
+        assert bd['args'] == _PYTEST_ARGS
+        assert bd['timeout_secs'] == 120
+        # A predicate has no unit to verify — target_unit must be absent entirely.
+        assert 'target_unit' not in bd
+
+    def test_execution_class_is_code_tdd_and_no_always_escalates(self):
+        meta = self._build().metadata
+        assert meta['execution_class'] == 'code_tdd'
+        # always_escalates=True is forbidden for a predicate; the builder never sets it.
+        assert 'always_escalates' not in meta
+
+    def test_provenance_recorded_under_x_namespace(self):
+        prov = self._build().metadata['x_recon_predicate_contradiction']
+        assert prov['contradiction'] == _CONTRADICTION
+        assert prov['finding_id'] == _FINDING_ID
+        assert prov['run_id'] == _RUN_ID
+        assert prov['cited_memory_ids'] == _CITED
+
+    def test_title_and_description_non_empty(self):
+        task = self._build()
+        assert isinstance(task.title, str) and task.title
+        assert isinstance(task.description, str) and task.description
+
+    def test_payload_passes_both_submit_guards(self, tmp_path):
+        script = tmp_path / 'check.sh'
+        script.write_text('#!/usr/bin/env bash\nexit 0\n')
+        os.chmod(script, 0o755)
+        task = self._build(script='check.sh')
+        assert (
+            deterministic_task_error('deterministic', task.metadata, str(tmp_path)) is None
+        )
+        assert (
+            execution_class_error(
+                task.metadata, 'recon-stage-task_knowledge_sync', str(tmp_path)
+            )
+            is None
+        )
+
+    def test_as_submit_task_kwargs_is_splattable(self):
+        kwargs = self._build().as_submit_task_kwargs()
+        assert isinstance(kwargs, dict)
+        allowed = {'title', 'description', 'details', 'priority', 'task_kind', 'metadata'}
+        assert set(kwargs).issubset(allowed)
+        # Load-bearing keys a submit_task call needs.
+        assert kwargs['task_kind'] == 'deterministic'
+        assert kwargs['metadata']['execution_class'] == 'code_tdd'
+        assert kwargs['title']
