@@ -4809,6 +4809,12 @@ class TaskWorkflow:
         amendment_round = (
             self.artifacts.get_amendment_rounds_total() if self.artifacts else 0
         )
+        # Consume-once scope for the single REVIEW that immediately follows an
+        # amendment (task 2750): set after a successful _amend, read+cleared at
+        # the top of the next loop pass.  A later blocking-replan/re-execute
+        # cycle produces a materially different diff, so the captured
+        # pre-amendment HEAD must never leak into that unrelated review.
+        amendment_ctx: AmendmentReviewContext | None = None
 
         while True:
             # EXECUTE
@@ -5003,7 +5009,13 @@ class TaskWorkflow:
                     )
                     review_tree_hash = None
                     review_fingerprint = None
-            reviews = await self._review()
+            # Consume-once (task 2750): this review is scoped to the amendment
+            # delta iff it immediately follows an amendment.  Read+clear the
+            # armed context now — before _review — so it applies to exactly one
+            # review and a later replan review runs unscoped.
+            used_ctx = amendment_ctx
+            amendment_ctx = None
+            reviews = await self._review(amendment_ctx=used_ctx)
             if reviews.reviewer_errors:
                 names = ', '.join(reviews.reviewer_errors)
                 return await self._mark_blocked(
@@ -5011,6 +5023,20 @@ class TaskWorkflow:
                     f'infrastructure errors after retries: {names}'
                 )
             if not reviews.has_blocking_issues:
+                # Scope a post-amendment review to the amendment delta (task
+                # 2750).  Runs FIRST inside the non-blocking arm — after the
+                # reviewer_errors early-return and outside the blocking-replan
+                # path — so it never touches the blocking safety valve: only
+                # `suggestions` is partitioned; out-of-delta suggestions are
+                # routed to the curator inside _apply_amendment_delta_scope and
+                # dropped from the verdict.  The re-arm check, the DONE-path
+                # curator routing, and the task-2749 verdict cache below then
+                # all see only in-delta suggestions.  No-op when this review
+                # does not follow an amendment (used_ctx is None).
+                if used_ctx is not None:
+                    reviews = await self._apply_amendment_delta_scope(
+                        reviews, used_ctx,
+                    )
                 # L2b: try an amendment pass before escalating suggestions.
                 # In-scope suggestions (module-lock members) are applied by
                 # the implementer directly — no architect, no new tasks.
@@ -5046,10 +5072,21 @@ class TaskWorkflow:
                                 'Task %s: archived reviews to %s',
                                 self.task_id, archive_dir.name,
                             )
+                    # Capture HEAD immediately BEFORE the amendment so
+                    # {pre_amendment_head}..HEAD is exactly the amendment delta
+                    # the next REVIEW is scoped to (task 2750).  Co-located with
+                    # the reviews-amend archive + set_review_counters above.
+                    pre_amendment_head = await self._get_head_commit()
                     amend_ok = await self._amend(in_scope, amendment_round)
                     if not amend_ok:
                         return WorkflowOutcome.ESCALATED
                     self.metrics.amendment_rounds += 1
+                    # Arm the consume-once scope for the next REVIEW pass with
+                    # the pre-amendment HEAD and the suggestions the amendment
+                    # was asked to address (task 2750).
+                    amendment_ctx = AmendmentReviewContext(
+                        pre_amendment_head, in_scope,
+                    )
                     continue  # re-loop: EXECUTE → VERIFY → REVIEW
 
                 # Cap exhausted or nothing in-scope — existing DONE path.

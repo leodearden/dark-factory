@@ -88,6 +88,10 @@ def _make_workflow(
 
     # Tree-hash source: a stable committed tree hash.
     wf.git_ops.get_head_tree_hash = AsyncMock(return_value='TREE1')
+    # Post-amendment delta source (task 2750): fail-open empty delta keeps the
+    # pre-2750 behaviour (all suggestions routed on the DONE path) so these
+    # counter/verdict tests are unaffected by delta scoping.
+    wf.git_ops.get_new_side_changed_line_ranges = AsyncMock(return_value={})
 
     # Spies on the REVIEW-branch side effects.
     wf._review = AsyncMock(

@@ -203,7 +203,8 @@ class FakeBriefing:
         return f'Fix: {failures[:100]}'
 
     async def build_reviewer_prompt(
-        self, reviewer_type: str, diff: str, context: str | None = None
+        self, reviewer_type: str, diff: str, context: str | None = None,
+        amendment_suggestions: list[dict] | None = None,
     ) -> str:
         return f'Review ({reviewer_type}): {diff[:100]}'
 
