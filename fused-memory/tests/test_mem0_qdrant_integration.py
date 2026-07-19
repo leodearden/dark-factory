@@ -13,10 +13,9 @@ import contextlib
 from typing import cast
 
 import pytest
-from _fm_helpers import QDRANT_URL, qdrant_skipif
+from _fm_helpers import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
 from qdrant_client import QdrantClient
-from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance
 
 _COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 VECTOR_DIM = 8  # tiny vectors for speed
@@ -38,13 +37,9 @@ def test_collection(worker_id):
 def qdrant(test_collection):
     """Provide a QdrantClient and clean up the test collection after each test."""
     client = QdrantClient(url=QDRANT_URL, timeout=10)
-    # Ensure clean state
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(test_collection)
-    client.create_collection(
-        collection_name=test_collection,
-        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
-    )
+    # Ensure clean state — idempotent + 409-tolerant so a prior run's swallowed
+    # teardown self-heals (delete + recreate) rather than 409-failing this run.
+    ensure_fresh_collection(client, test_collection, size=VECTOR_DIM, distance=Distance.COSINE)
     yield client
     with contextlib.suppress(Exception):
         client.delete_collection(test_collection)
