@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +15,55 @@ from orchestrator.config import TASK_META_DIRNAME
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
+
+# Sidecar schema for ``agent_session.json`` (task 2771).  v1 carried only
+# session_id/role/started_at/owner_pid; v2 adds the durable task_id binding,
+# resume_count, and this discriminator.  Every write emits the current version.
+AGENT_SESSION_SCHEMA_VERSION = 2
+
+
+@dataclass
+class AgentSession:
+    """Typed payload of the ``agent_session.json`` sidecar (schema v2).
+
+    The sidecar is written before ``_invoke`` spawns an agent subprocess and
+    marks that "an invocation is in flight" (presence ⇔ in-flight).  v2 adds
+    the durable ``task_id`` lane→task binding, a ``resume_count`` incremented
+    on each adopted ``--resume``, and a ``schema_version`` discriminator so a
+    reader can tell a pre-deploy v1 sidecar from a v2 one.  A v1 sidecar reads
+    back with legacy defaults via :meth:`from_mapping`; every write emits v2.
+    """
+
+    session_id: str
+    role: str
+    started_at: str
+    owner_pid: int
+    task_id: str | None = None
+    resume_count: int = 0
+    schema_version: int = AGENT_SESSION_SCHEMA_VERSION
+
+    @classmethod
+    def from_mapping(cls, data: dict) -> AgentSession:
+        """Build from a parsed sidecar dict, applying v1 legacy defaults.
+
+        A v1 sidecar carries none of the v2 keys: ``task_id`` defaults to
+        ``None``, ``resume_count`` to ``0``, and ``schema_version`` to ``1``
+        (a v2 sidecar reports its own persisted version).
+        """
+        return cls(
+            session_id=data.get('session_id', ''),
+            role=data.get('role', ''),
+            started_at=data.get('started_at', ''),
+            owner_pid=data.get('owner_pid', 0),
+            task_id=data.get('task_id'),
+            resume_count=int(data.get('resume_count', 0) or 0),
+            schema_version=int(data.get('schema_version', 1)),
+        )
+
+    def to_dict(self) -> dict:
+        """Serialize to the on-disk JSON mapping."""
+        return asdict(self)
+
 
 # Keys the architect LLM sometimes uses instead of the required "steps".
 _STEPS_ALIASES = ('tdd_steps', 'tdd_plan', 'implementation_steps')
@@ -873,32 +922,53 @@ class TaskArtifacts:
 
     def write_agent_session(
         self, session_id: str, role: str, started_at: str,
+        task_id: str | None = None, resume_count: int = 0,
     ) -> None:
-        """Write ``.task/agent_session.json`` with the in-flight session info."""
-        data = {
-            'session_id': session_id,
-            'role': role,
-            'started_at': started_at,
-            'owner_pid': os.getpid(),
-        }
-        self._write_json(self.root / 'agent_session.json', data)
+        """Write ``.task/agent_session.json`` with the in-flight session info.
+
+        Always emits schema v2 (:data:`AGENT_SESSION_SCHEMA_VERSION`), so a
+        pre-deploy v1 sidecar is rewritten as v2 on the next write (B11).
+        ``task_id`` is the durable lane→task binding; ``resume_count`` is the
+        cumulative adopted-resume count.
+        """
+        session = AgentSession(
+            session_id=session_id,
+            role=role,
+            started_at=started_at,
+            owner_pid=os.getpid(),
+            task_id=task_id,
+            resume_count=resume_count,
+            schema_version=AGENT_SESSION_SCHEMA_VERSION,
+        )
+        self._write_json(self.root / 'agent_session.json', session.to_dict())
 
     def clear_agent_session(self) -> None:
         """Remove ``.task/agent_session.json`` if present (idempotent)."""
         self._clear_path('agent_session.json')
 
-    def read_agent_session(self) -> dict | None:
-        """Return parsed ``.task/agent_session.json``, or ``None`` if
-        missing/corrupt.
+    def read_agent_session(self) -> AgentSession | None:
+        """Return the parsed ``.task/agent_session.json`` as a typed
+        :class:`AgentSession`, or ``None`` if missing/corrupt.
+
+        Fail-safe: a missing file, corrupt/unreadable JSON, or a present-but-
+        non-object payload all return ``None`` (the caller reads absence as
+        "no in-flight session").  A v1 sidecar (missing v2 keys) is tolerated
+        via :meth:`AgentSession.from_mapping`, which supplies legacy defaults.
         """
         path = self._read_path('agent_session.json')
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning('Corrupt agent_session.json at %s: %s', path, exc)
             return None
+        if not isinstance(data, dict):
+            logger.warning(
+                'Malformed agent_session.json at %s: not an object', path
+            )
+            return None
+        return AgentSession.from_mapping(data)
 
     # ──────────────────────────────────────────────────────────────────
     # Verdict artifacts — written by the per-worktree verdict-tools MCP
