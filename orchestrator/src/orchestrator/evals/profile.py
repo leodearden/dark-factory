@@ -51,7 +51,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, _iter_leaves
 
 # The ONLY documented divergences from a fresh load_config() — dotted leaf
 # paths matching orchestrator.config._iter_leaves's output 1:1 (e.g.
@@ -107,3 +107,33 @@ def apply_eval_profile(base: OrchestratorConfig) -> OrchestratorConfig:
     EVAL_PROFILE is inherited from *base* verbatim — the D5 fix.
     """
     return base.model_copy(update=resolve_eval_profile_update(base))
+
+
+def eval_profile_divergence(
+    base: OrchestratorConfig,
+) -> dict[str, tuple[Any, Any]]:
+    """Report every leaf where the eval config diverges from *base*.
+
+    Returns ``{dotted_leaf_path: (base_value, eval_value)}`` for every leaf
+    that ``apply_eval_profile(base)`` changes relative to *base*, keyed by the
+    same one-level dotted paths ``config._iter_leaves`` yields (the enumerator
+    ``diff_config`` and the β parity test also use) — so on a code-default
+    base the report's key set matches ``EVAL_PROFILE`` 1:1 (Invariant P1,
+    Boundary test B1).
+
+    This is the first-class, eval-side introspection the Phase-1 integration
+    gate (ι) — and operators / the μ scoring driver — assert on: a
+    machine-checkable answer to "exactly how does an eval run's config differ
+    from production, and is that set precisely the documented EVAL_PROFILE?".
+    A leaf present here but absent from ``EVAL_PROFILE`` is an undocumented
+    divergence (the D5 leak class); a documented leaf absent here is a no-op
+    profile entry. The gate (B1) trips on exactly those two conditions.
+    """
+    evaled = apply_eval_profile(base)
+    base_leaves = dict(_iter_leaves(base))
+    eval_leaves = dict(_iter_leaves(evaled))
+    return {
+        path: (base_value, eval_leaves[path])
+        for path, base_value in base_leaves.items()
+        if base_value != eval_leaves[path]
+    }
