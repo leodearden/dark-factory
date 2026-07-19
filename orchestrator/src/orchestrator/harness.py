@@ -952,6 +952,12 @@ class Harness:
             merge_spec_warm_lane_pool_size=(
                 self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
             ),
+            # Teardown-archival backstop config (task 2786, prd β): the live
+            # submodel reference (green-tier hot-reloadable enabled/root) so the
+            # cleanup_worktree backstop archives before removing a cold worktree.
+            # The 3 non-dispatch construction sites (cli/recover/evals) omit this
+            # kwarg and stay inert — byte-identical to before.
+            transcript_archive=config.transcript_archive,
         )
         # Constructor-injected callback bundle (task 2235, W10-α): all nine
         # Harness↔Scheduler hooks are wired in ONE SchedulerCallbacks(...) at

@@ -57,9 +57,10 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
 from shared.branch_names import canonical_queued_branch_name  # noqa: F401
+from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import TASK_META_DIRNAME, GitConfig
+from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
     ACQUIRE_ROUTE_TRANSITIONS,
     LANE_STATE_DIRNAME,
@@ -1200,9 +1201,18 @@ class GitOps:
         *,
         warm_lane_pool_size: int = 0,
         merge_spec_warm_lane_pool_size: int = 0,
+        transcript_archive: TranscriptArchiveConfig | None = None,
     ):
         self.config = config
         self.project_root = project_root
+        # Teardown-archival backstop config (task 2786,
+        # agent-transcript-archival-prd β).  None at the 3 non-dispatch
+        # construction sites (cli/recover/evals) so the cleanup_worktree
+        # backstop is byte-identical (inert) there; the live submodel is
+        # installed only by Harness (harness.py), which holds the full
+        # OrchestratorConfig — passing the reference (not a copy) preserves
+        # in-place green-tier hot-reload of enabled/root.
+        self.transcript_archive = transcript_archive
         self.worktree_base = (project_root / config.worktree_dir).resolve()
         # Durable per-lane lifecycle record writer (W11 gamma).  Shared by
         # acquire_warm_lane/release_warm_lane (durable ASSIGNED/RELEASED
@@ -9300,6 +9310,31 @@ class GitOps:
         ):
             await self.release_spec_lane(worktree, warm=True)
             return
+
+        # ── Teardown-archival backstop (task 2786, agent-transcript-archival-prd
+        # β) ────────────────────────────────────────────────────────────────
+        # Before the worktree (and the per-task Claude config dir INSIDE it) is
+        # destroyed, archive any still-un-archived agent transcript to the
+        # durable root OUTSIDE the worktree. This closes the abandoned-in-flight
+        # tail the producer hook (α/workflow.py _invoke) cannot: a role in-flight
+        # when the orchestrator died, whose task is reaped without a completed
+        # resume. Idempotent with the producer — same archive_root + task_id, so
+        # the helper's size/mtime skip fires (a no-op in the normal case).
+        # Reached only on COLD removals: warm/spec lanes returned above (they are
+        # retained, not removed), and branch == task_id at every cold call site,
+        # so it is the task_id the config-dir path and archive layout key on.
+        # Offloaded to a worker thread to keep the shared event loop free for the
+        # rare real-gzip path (mirrors the producer's loop-stall avoidance).
+        if self.transcript_archive is not None:
+            config_dir = worktree / '.task' / f'claude-config-{branch}'
+            archive_root = self.project_root / self.transcript_archive.root
+            await asyncio.to_thread(
+                archive_task_transcripts,
+                config_dir,
+                branch,
+                None,
+                archive_root=archive_root,
+            )
 
         full_branch = f'{self.config.branch_prefix}{branch}'
 
