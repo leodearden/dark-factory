@@ -10274,8 +10274,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
                 return _record(WorkflowOutcome.BLOCKED)
 
-            # Don't create a duplicate if level-1 already pending
-            if not self.escalation_queue.has_open_l1(self.task_id):
+            # Don't create a duplicate if level-1 already pending — but only a
+            # SAME-signature L1 should suppress the steward-facing L0 (task 2757):
+            # an unrelated open L1 (different category) must not silently drop a
+            # new root cause's L0.
+            if not self.escalation_queue.has_open_l1(self.task_id, category=category):
                 from escalation.models import Escalation
 
                 esc = Escalation(
