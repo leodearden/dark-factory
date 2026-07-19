@@ -199,3 +199,40 @@ async def test_planning_mode_operational_gate_coerces_to_pure_gate(_real_stack, 
     assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
     assert meta['always_escalates'] is True, f'got {meta!r}'
     assert 'before_done' not in meta, f'got {meta!r}'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 3 — decision -> pure gate (matrix row 1/3: decision, any mode)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_decision_coerces_to_pure_gate(_real_stack, tmp_path):
+    """A planning_mode submit declaring execution_class='decision' (no
+    operational_mode) is also coerced to a deterministic pure gate.
+
+    Confirms operational_routing_guard.inject_operational_routing maps
+    execution_class='decision' (any/absent operational_mode) to the same
+    pure-gate shape as the operational+gate case (scenario 2).
+    """
+    server, _interceptor = _real_stack
+    root = str(tmp_path / 'proj')
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Zeta boundary probe: decision ask',
+            'description': 'A judgment-call decision ask, submitted via planning_mode.',
+            'planning_mode': True,
+            'metadata': {'execution_class': 'decision'},
+        },
+    )
+    assert 'error' not in result, f'submit_task failed unexpectedly: {result!r}'
+    task_id = result['task_id']
+
+    meta = await _get_task_meta(server, root, task_id)
+
+    assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
+    assert meta['always_escalates'] is True, f'got {meta!r}'
+    assert 'before_done' not in meta, f'got {meta!r}'
