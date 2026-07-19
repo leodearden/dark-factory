@@ -23,7 +23,11 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import ReviewAggregation
 from orchestrator.config import OrchestratorConfig
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow import (
+    AmendmentReviewContext,
+    TaskWorkflow,
+    WorkflowOutcome,
+)
 
 
 def _make_workflow(*, modules: list[str], lock_depth: int = 2) -> TaskWorkflow:
@@ -288,3 +292,128 @@ class TestApplyAmendmentDeltaScope:
         assert any(rec.levelno == logging.WARNING for rec in caplog.records), (
             'fail-open must log a WARNING for audit'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2750: post-amendment review wiring in _execute_verify_review_loop
+# ---------------------------------------------------------------------------
+
+
+_PRE_AMENDMENT_SHA = 'preamendsha000000000000000000000000000000'
+_POST_AMENDMENT_SHA = 'postamendsha11111111111111111111111111111'
+
+
+def _nonblocking_reviews(suggestions: list[dict]) -> ReviewAggregation:
+    return ReviewAggregation(
+        has_blocking_issues=False,
+        blocking_issues=[],
+        suggestions=suggestions,
+        reviews={},
+        reviewer_errors=[],
+    )
+
+
+def _review_amendment_ctx(call):
+    """Extract the amendment_ctx passed to a mocked _review call (kw or pos)."""
+    if 'amendment_ctx' in call.kwargs:
+        return call.kwargs['amendment_ctx']
+    return call.args[0] if call.args else None
+
+
+def _make_loop_workflow(tmp_path, *, round0, round1, call_order):
+    """A TaskWorkflow wired to drive ONE amendment round through the loop.
+
+    Every EXECUTE/VERIFY helper is stubbed non-blocking; the task-2749
+    verdict-cache and task-2752 verify-checkpoint blocks are made inert
+    (``event_store=None`` + ``get_head_tree_hash`` → None) so the loop always
+    reaches a real REVIEW.  ``_review`` yields *round0* then *round1*;
+    ``_suggestions_in_scope`` is the real filter (modules=['src'], depth=1) so
+    a ``src/…`` suggestion in *round0* fires exactly one amendment and *round1*
+    (no in-scope suggestion) reaches DONE.
+    """
+    wf = _make_workflow(modules=['src'], lock_depth=1)
+    wf.worktree = tmp_path / 'wt'
+    wf.event_store = None  # inert task-2752 verify-checkpoint block
+
+    # artifacts: real root (no archive dirs exist → copytree skipped), counters
+    # seeded to 0 so amendment_round/review_cycle are ints, verdict cache inert.
+    wf.artifacts = MagicMock()
+    wf.artifacts.root = tmp_path
+    wf.artifacts.get_review_cycles_total.return_value = 0
+    wf.artifacts.get_amendment_rounds_total.return_value = 0
+    wf.artifacts.get_cached_verdict.return_value = None
+
+    wf.git_ops.get_head_tree_hash = AsyncMock(return_value=None)
+
+    wf._enter_phase = MagicMock()
+    wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)
+    wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)
+    wf._write_suggestions_to_memory = AsyncMock()
+    wf._route_review_suggestions_to_curator = AsyncMock()
+
+    # HEAD moves once the amendment commits, so a capture taken AFTER _amend
+    # would read _POST_AMENDMENT_SHA — the ctx must carry the PRE value.
+    state = {'amended': False}
+
+    def _head(*a, **k):
+        call_order.append('head')
+        return _POST_AMENDMENT_SHA if state['amended'] else _PRE_AMENDMENT_SHA
+
+    def _amend_impl(*a, **k):
+        call_order.append('amend')
+        state['amended'] = True
+        return True
+
+    async def _scope_passthrough(reviews, ctx):
+        return reviews
+
+    wf._get_head_commit = AsyncMock(side_effect=_head)
+    wf._amend = AsyncMock(side_effect=_amend_impl)
+    wf._apply_amendment_delta_scope = AsyncMock(side_effect=_scope_passthrough)
+    wf._review = AsyncMock(side_effect=[round0, round1])
+    return wf
+
+
+@pytest.mark.asyncio
+class TestPostAmendmentReviewWiring:
+    """`_execute_verify_review_loop` scopes the post-amendment review only."""
+
+    async def test_delta_scope_applied_once_consume_once(self, tmp_path):
+        call_order: list[str] = []
+        in_scope = _sugg('src/foo.py:15')  # normalizes to 'src' → in-scope
+        round0 = _nonblocking_reviews([in_scope])
+        round1 = _nonblocking_reviews([])  # nothing in-scope → DONE
+        wf = _make_loop_workflow(
+            tmp_path, round0=round0, round1=round1, call_order=call_order,
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        # exactly one amendment fired.
+        wf._amend.assert_awaited_once()
+
+        # (i) pre_amendment_head is captured by _get_head_commit IMMEDIATELY
+        # before _amend, so it is the pre-amendment SHA.
+        assert 'amend' in call_order
+        amend_idx = call_order.index('amend')
+        assert call_order[amend_idx - 1] == 'head', (
+            'pre_amendment_head must be captured right before _amend'
+        )
+
+        # (ii) the post-amendment (round-1) _review is called with a non-None
+        # amendment_ctx carrying the pre-amendment SHA and the round-0 in-scope
+        # suggestions; the round-0 review is NOT scoped (amendment_ctx=None).
+        assert wf._review.await_count == 2
+        assert _review_amendment_ctx(wf._review.await_args_list[0]) is None
+        review_ctx = _review_amendment_ctx(wf._review.await_args_list[1])
+        assert isinstance(review_ctx, AmendmentReviewContext)
+        assert review_ctx.pre_amendment_head == _PRE_AMENDMENT_SHA
+        assert review_ctx.amended_suggestions == [in_scope]
+
+        # (iii) _apply_amendment_delta_scope runs EXACTLY ONCE — for the
+        # round-1 post-amendment review only (round-0's used_ctx is None).
+        wf._apply_amendment_delta_scope.assert_awaited_once()
+        scope_args = wf._apply_amendment_delta_scope.await_args.args
+        assert scope_args[0] is round1  # scoped the round-1 verdict
+        assert scope_args[1] is review_ctx  # with the consume-once ctx
