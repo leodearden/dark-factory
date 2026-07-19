@@ -2059,11 +2059,18 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     harness.config.resume_after_restart = False
 
+    # Event set by slow_stage_run when it starts — ensures the cancel below
+    # fires inside run_full_cycle's protected try (not during pre-try setup),
+    # so its except-CancelledError handler (complete_run 'failed' + restore)
+    # deterministically runs regardless of host load.
+    stage_entered = asyncio.Event()
+
     # Make first stage sleep forever (simulating a long-running stage)
     async def slow_stage_run(
         events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0]
     ):
-        await asyncio.sleep(999)  # Will be cancelled by wait_for
+        stage_entered.set()
+        await asyncio.sleep(999)  # Will be cancelled by the signal-then-cancel below
         return StageReport(
             stage=_s.stage_id,
             started_at=datetime.now(UTC),
@@ -2082,12 +2089,28 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
 
-    # Run with a tight timeout to force cancellation
-    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
-        await asyncio.wait_for(
-            harness.run_full_cycle('test-project', 'buffer_size:2'),
-            timeout=0.1,
-        )
+    # Signal-then-cancel (mirrors the in-file shield test ~:2688-2712): start the
+    # cycle, wait until slow_stage_run has actually entered run_full_cycle's
+    # protected try (deterministic — no fixed timeout=0.1 that misfires under
+    # `-n auto` CPU load and cancels during unprotected setup), then cancel.
+    # Race the entry Event against outer_task so a run_full_cycle that errors
+    # before the stage is invoked fails fast instead of hanging forever.
+    outer_task = asyncio.create_task(
+        harness.run_full_cycle('test-project', 'buffer_size:2'),
+    )
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(stage_entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not stage_entered.is_set():
+        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
+        pytest.fail(f'outer_task completed before slow_stage_run was invoked: {exc}')
+
+    # Cancel while the stage is inside the protected try → CancelledError drives
+    # run_full_cycle's failed+restore handler.
+    outer_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
 
     # --- MUST-NOT-HANG COMPLETION GUARD — NOT a latency SLA ---
     # cleanup (complete_run → 'failed', restore_drained) runs in asyncio.shield()-wrapped
