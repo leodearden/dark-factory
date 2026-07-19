@@ -124,6 +124,7 @@ def harness_for_registry_run_slot() -> Harness:
     h._escalation_queue = None
     h._recovered_plans = {}
     h._recovered_sessions = {}
+    h._recovered_session_config_dirs = {}
     h._preserved_worktrees = set()
     h.event_store = None
     h.config = None   # type: ignore[assignment]
