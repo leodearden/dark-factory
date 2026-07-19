@@ -400,3 +400,54 @@ class TestResolveCostUsd:
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 2477 step-03: blend_composite — the C4 efficiency-adjusted composite
+# ---------------------------------------------------------------------------
+
+class TestBlendComposite:
+    """The C4 ``composite`` = quality blended with normalized cost + latency,
+    keeping the ``tests_pass`` HARD GATE (decision 11). PURE and additive —
+    ``compute_composite`` (the pure ``quality`` score) is untouched.
+    """
+
+    def test_default_weights_sum_to_one(self):
+        from orchestrator.evals.metrics import DEFAULT_COMPOSITE_WEIGHTS
+
+        assert sum(DEFAULT_COMPOSITE_WEIGHTS.values()) == pytest.approx(1.0)
+
+    def test_tests_fail_hard_gates_to_zero(self):
+        """The HARD GATE: tests_pass falsy → 0.0 regardless of the axes."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            1.0, 1.0, 1.0, tests_pass=False,
+        ) == 0.0
+
+    def test_weighted_blend_default_weights(self):
+        from orchestrator.evals.metrics import blend_composite
+
+        # 0.6*1.0 + 0.2*0.5 + 0.2*0.5 == 0.6 + 0.1 + 0.1 == 0.8
+        assert blend_composite(
+            1.0, 0.5, 0.5, tests_pass=True,
+        ) == pytest.approx(0.8, abs=1e-4)
+
+    def test_best_on_every_axis_is_one(self):
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            1.0, 1.0, 1.0, tests_pass=True,
+        ) == pytest.approx(1.0)
+
+    def test_result_clamped_to_unit_interval(self):
+        from orchestrator.evals.metrics import blend_composite
+
+        # Over-unit inputs clamp to 1.0 …
+        assert blend_composite(
+            2.0, 1.0, 1.0, tests_pass=True,
+        ) == 1.0
+        # … and a negative combination clamps to 0.0 (still, tests passed).
+        assert blend_composite(
+            -5.0, 0.0, 0.0, tests_pass=True,
+        ) == 0.0
