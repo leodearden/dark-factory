@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import heapq
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -404,6 +404,171 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
     no point-in-time-check exemption present — see module comment above.
     """
     return bool(LIVE_TASK_STATUS_RE.search(text)) and not POINT_IN_TIME_CHECK_RE.search(text)
+
+
+# --------------------------------------------------------------------------- #
+# Present-tense completion-claim detection (task 2824)
+# --------------------------------------------------------------------------- #
+#
+# Closes the gap left by the live-status detector (task 2628) above and the
+# Stage-2 self-check (task 2624): those lint live-status *fields* and Stage-2's
+# own *task* writes respectively, but neither cross-checks a present/past-tense
+# *completion-claim phrasing* ("task N has landed", "df N is done", "task N now
+# enforces X") against the named task's LIVE status. A recon-stage write that
+# frames a specific task as COMPLETE while that task is still non-terminal
+# (pending/in-progress/...) records a claim that is false at write time and
+# goes stale immediately.
+#
+# find_present_tense_completion_claim_task_ids is the cheap, pure, textual
+# first half: it extracts the task ids a clause frames as complete. The live
+# cross-check is layered on top by nonterminal_completion_claim_task_ids below
+# (which takes an injected status probe), so the expensive status read only
+# runs on the rare write that actually contains a completion claim.
+#
+# Detection mirrors find_conflicting_task_status_ids exactly: clause-split on
+# _CLAUSE_SPLIT_RE, extract explicit task refs per clause via TASK_REF_RE
+# ('task N'/'df N'/'#N', NOT bare digits), and tag a clause's ids when
+# PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
+# NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans stripped out. Requiring
+# the explicit task-ref anchor is what lets copula-framed completion words
+# ("task N is resolved", "task N has completed") match without firing on
+# generic prose ("the meeting resolved nothing").
+#
+# Transitive-verb caveat (task 2824 review). The anchor alone does NOT
+# disambiguate "task N resolved <object>" (a transitive verb whose object is
+# the task-ref's sibling, not a completion of the task) from "task N is
+# resolved". So the most commonly transitive-capable completion words —
+# "resolved" and "completed" — are matched ONLY in copula form (the second arm
+# of PRESENT_TENSE_COMPLETION_RE), never as bare verbs; a bare "task N resolved
+# the ambiguity" therefore does not false-fire. The bare-verb arm keeps only
+# words that read as a completion of the anchored task even without a copula
+# ("task N landed/merged/shipped"). This trades a little under-firing (bare
+# intransitive "task N resolved") for many fewer false positives, matching the
+# module's fail-open-on-under-firing philosophy.
+#
+# Clause-granularity caveat (task 2824 review). When ONE clause names several
+# task ids and still contains a completion phrase after the negated/aspirational
+# spans are stripped, ALL of that clause's ids are tagged — the detector does
+# not associate the completion phrase with the nearest ref. So "task A is done
+# and task B will land" tags BOTH A and B (the aspirational "will land" for B is
+# stripped, leaving "is done" to fire clause-wide). This over-broad tagging is
+# inherited from find_conflicting_task_status_ids; because a hit only soft-
+# blocks a recon-stage write with a rephrase hint (never corrupts data), the
+# fail-toward-blocking direction is acceptable for the rare multi-task-in-one-
+# clause completion write. Deterministic lexical matching, no thresholds, fully
+# unit-testable; fails open on under-firing like every sibling detector.
+PRESENT_TENSE_COMPLETION_RE: re.Pattern[str] = re.compile(
+    r'\b(?:'
+    # bare past-tense/participle completion words that read as a completion of
+    # the anchored task even without a copula ("task N landed"). The most
+    # commonly transitive-capable words ("resolved"/"completed") are deliberately
+    # NOT here — they match only in copula form below, so "task N resolved <obj>"
+    # does not false-fire (task 2824 review; see the module comment above).
+    r'landed|merged|shipped|'
+    # copula/auxiliary + (been/already/now/fully)* + completion word
+    r'(?:is|are|was|were|has|have|had|been)\s+(?:been\s+|already\s+|now\s+|fully\s+)*'
+    r'(?:done|complete|completed|resolved|merged|fixed|landed|shipped|closed)|'
+    # "now <verb>s" — a task described as currently, actively enforcing behaviour
+    r'now\s+(?:enforces|blocks|rejects|requires|prevents|guards|handles|'
+    r'validates|checks|gates|catches|covers|supports)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Future/aspirational framing exemption: a completion word governed by a
+# forward-looking modal ("will land", "planned to resolve", "intended to
+# enforce", "going to be merged") describes work that has NOT completed. The
+# span deliberately extends THROUGH the governed completion verb so stripping
+# it removes the completion evidence — mirroring how NEGATED_TERMINAL_RE
+# swallows its own terminal verb. The intervening run is a bounded ({0,3})
+# CLOSED filler vocabulary (not arbitrary \w+) so the modal->verb bridge can't
+# run away and over-strip a genuine completion clause elsewhere in the text.
+FUTURE_ASPIRATIONAL_RE: re.Pattern[str] = re.compile(
+    r'\b(?:will|going\s+to|plans?\s+to|planned\s+to|intends?\s+to|intended\s+to|'
+    r'aims?\s+to|meant\s+to|hopes?\s+to|expects?\s+to|scheduled\s+to|slated\s+to|'
+    r'supposed\s+to|needs?\s+to|to\s+be|should|would|shall)\b'
+    r'(?:\s+(?:be|been|get|soon|also|now|already|just|then|finally|'
+    r'eventually|not|yet|still)){0,3}'
+    r'\s+(?:land(?:ed|s|ing)?|merg(?:ed|es?|ing)|resolv(?:ed|es?|ing)|'
+    r'complet(?:ed|es?|ing)|fix(?:ed|es|ing)?|ship(?:ped|s|ping)?|'
+    r'enforc(?:ed|es?|ing)|done|close[ds]?|closing)\b',
+    re.IGNORECASE,
+)
+
+
+def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
+    """Return task ids that `text` frames as COMPLETE in present/past-completion
+    tense while naming them via an explicit task reference in the same clause.
+
+    Splits text into clauses on sentence terminators ([.;\\n!?]). Within each
+    clause, extracts explicit task references via TASK_REF_RE ('task N'/'df
+    N'/'#N', not bare digits) and tags each referenced id as a completion claim
+    when PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
+    NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans removed — so a negated
+    ("has not yet landed") or aspirational ("will land", "planned to resolve")
+    statement is NOT flagged. Returns the union across all clauses.
+
+    Purely textual — no live-status lookup (that cross-check is layered on by
+    nonterminal_completion_claim_task_ids). Pure: no I/O, no side effects.
+    Fails open on under-firing, matching every sibling detector in this module.
+
+    See the module comment above for two deliberate limitations: transitive-
+    capable verbs ("resolved"/"completed") match only in copula form (so
+    "task N resolved <object>" does not false-fire), and a single clause naming
+    several ids tags ALL of them when any completion phrase survives stripping.
+    """
+    result: set[int] = set()
+
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if not clause:
+            continue
+        ids_in_clause = {int(m) for m in TASK_REF_RE.findall(clause)}
+        if not ids_in_clause:
+            continue
+
+        de_exempted = NEGATED_TERMINAL_RE.sub(' ', clause)
+        de_exempted = FUTURE_ASPIRATIONAL_RE.sub(' ', de_exempted)
+        if PRESENT_TENSE_COMPLETION_RE.search(de_exempted):
+            result.update(ids_in_clause)
+
+    return result
+
+
+def nonterminal_completion_claim_task_ids(
+    text: str,
+    status_probe: Callable[[int], str | None],
+) -> set[int]:
+    """Return the task ids that `text` frames as complete (via
+    find_present_tense_completion_claim_task_ids) whose LIVE status — resolved
+    through the injected `status_probe` — is present AND non-terminal (not
+    done/cancelled).
+
+    The probe is the composition seam (mirroring
+    recon_claim_verification_guard.verify_attributed_claims's injected probe): a
+    Callable[[int], str | None] returning a task's current status, or None when
+    it cannot be resolved. Fails OPEN — an id is blocked only when its probed
+    status is an explicit live/active member of the closed vocabulary
+    (`ACTIVE_TASK_STATUSES`). A probe returning None (unknown/absent) OR the
+    literal 'unknown' sentinel (which a NULL/absent DB status maps to) is
+    excluded, so an unresolvable status never blocks the write. Short-circuits:
+    when the text carries no completion claim the probe is never called, keeping
+    the common path a pure in-process regex with no live-status read.
+
+    Pure and sync: no I/O of its own — every liveness lookup goes through the
+    injected probe. This makes the acceptance criterion (in-progress rejected /
+    done passes) unit-testable without the server harness.
+    """
+    named = find_present_tense_completion_claim_task_ids(text)
+    if not named:
+        return set()
+    # Positive allowlist (task 2824 review): block only on a status that is
+    # explicitly a live/active member of the closed vocabulary. Using
+    # `in ACTIVE_TASK_STATUSES` rather than `not in TERMINAL_STATUSES` means an
+    # id whose probe returns None (unknown/absent) OR the literal 'unknown'
+    # sentinel (a NULL/absent DB status maps to it) falls through as
+    # unresolvable and fails OPEN, instead of being mistaken for a non-terminal
+    # (blocking) status.
+    return {tid for tid in named if status_probe(tid) in ACTIVE_TASK_STATUSES}
 
 
 # --------------------------------------------------------------------------- #
