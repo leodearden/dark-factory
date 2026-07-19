@@ -2686,6 +2686,7 @@ task, include it with an empty "files" list rather than omitting it.
                                 ]
                                 if rec_completed:
                                     self._recovered_plans[rec.task_id] = rec_plan
+                                    self._adopt_recovered_session(entry, rec.task_id)
                                 elif rec_plan.get('_session_id'):
                                     logger.info(
                                         'Recovery: lane %s record-adopted for '
