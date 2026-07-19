@@ -412,6 +412,66 @@ def worktree_base_for(repo: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
+# create+utimensat settle helper that de-flakes the Row 5 marker-retention
+# assertion below.  Both tests inject a private mtime-reader seam
+# (_read_mtime_ns) so there is ZERO real timing -- a real-timing settle test
+# would itself be load-sensitive (fixing a flake with a flake).
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_marker_stable_returns_settled_not_intermediate(tmp_path):
+    """wait_for_marker_stable returns the SETTLED mtime, not the intermediate one.
+
+    Models GNU ``touch``'s two-syscall create->utimensat drift (task 2819):
+    the injected reader yields the intermediate create-time mtime a few
+    times, then the final settled mtime for the remainder of the scripted
+    sequence.  Uses a real tmp_path marker so the existence gate
+    (wait_for_marker) passes instantly, and interval=0 so the settle loop
+    itself burns no real wall-clock time.
+    """
+    marker = tmp_path / 'warm.marker'
+    marker.touch()
+
+    sequence = [100, 100, 100, 150, 150, 150, 150, 150, 150, 150, 150, 150]
+    calls = iter(sequence)
+
+    def fake_read_mtime_ns(_path):
+        return next(calls)
+
+    result = wait_for_marker_stable(
+        marker, interval=0, stable_reads=6, _read_mtime_ns=fake_read_mtime_ns,
+    )
+
+    assert result == 150, (
+        f'expected the settled mtime (150), not the create-time intermediate '
+        f'(100); got {result}'
+    )
+
+
+def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
+    """wait_for_marker_stable raises AssertionError if the mtime never quiets down.
+
+    An always-changing reader can never satisfy the consecutive-unchanged
+    window, so with a tiny timeout this must raise promptly rather than
+    hang or silently return an unsettled value.
+    """
+    marker = tmp_path / 'warm.marker'
+    marker.touch()
+
+    call_count = [0]
+
+    def fake_read_mtime_ns(_path):
+        call_count[0] += 1
+        return call_count[0]
+
+    with pytest.raises(AssertionError):
+        wait_for_marker_stable(
+            marker, timeout=0.05, interval=0, _read_mtime_ns=fake_read_mtime_ns,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2309 step-1 RED -- env-var test seams for remote-side timing constants
 # (PRD SS11 Q1/Q2 tunability).  Production defaults are byte-identical when
 # unset; these overrides exist ONLY so the SS9 boundary rows below can run
