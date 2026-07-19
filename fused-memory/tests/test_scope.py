@@ -287,6 +287,29 @@ class TestBuildKnownProjectsMap:
             'dark_factory': str(b.resolve()),
         }
 
+    def test_renamed_dir_registers_under_declared_manifest_id(self, tmp_path):
+        """Core guard: a directory whose basename (`solar-challenge`) differs
+        from the project_id declared in its manifest (`my_solar_challenge`)
+        registers under the DECLARED id — re-pointing the recon registry to
+        the new path under the SAME id after a rename, instead of orphaning
+        the records under the basename-derived 'solar_challenge'.
+        """
+        renamed = tmp_path / 'solar-challenge'
+        renamed.mkdir()
+        (renamed / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "my_solar_challenge"\n',
+        )
+        # Back-compat: a project that declares no id still keys by basename.
+        plain = tmp_path / 'plain-proj'
+        plain.mkdir()
+
+        result = build_known_projects_map(
+            '', extra_roots=[str(renamed), str(plain)],
+        )
+        assert result['my_solar_challenge'] == str(renamed.resolve())
+        assert 'solar_challenge' not in result
+        assert result['plain_proj'] == str(plain.resolve())
+
 
 class TestScopeCanonicalizesProjectId:
     """Scope.project_id is canonicalized at construction, so every field
