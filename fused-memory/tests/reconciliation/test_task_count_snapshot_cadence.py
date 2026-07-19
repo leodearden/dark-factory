@@ -54,10 +54,12 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
     build_stale_snapshot_finding,
     build_task_count_snapshot_content,
+    build_task_count_snapshot_unavailable_content,
     compute_snapshot_miss_streak,
     evaluate_snapshot_cadence,
     extract_snapshot_written,
 )
+from fused_memory.reconciliation.task_filter import is_count_snapshot
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:
@@ -296,6 +298,61 @@ class TestBuildTaskCountSnapshotContent:
         assert 'reify' in content
         assert '42' in content
         assert '99' in content
+
+
+class TestBuildTaskCountSnapshotUnavailableContent:
+    """build_task_count_snapshot_unavailable_content(...) -> str (task 2738).
+
+    Pure, dependency-free renderer for the UNKNOWN sentinel written by
+    ``_write_task_count_snapshot`` when a zero-count project_root is not a
+    readable git working tree -- i.e. the zero count is a false census from
+    SqliteTaskBackend.get_tasks auto-creating an empty tasks.db, not a
+    genuinely empty project. Sibling of TestBuildTaskCountSnapshotContent
+    above: no I/O, no mocks needed.
+    """
+
+    def test_content_is_non_empty_string(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert isinstance(out, str)
+        assert out
+
+    def test_content_is_not_mistaken_for_a_numeric_count_snapshot(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert is_count_snapshot(out) is False
+
+    def test_content_names_project_id_and_root(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert 'my_solar_challenge' in out
+        assert '/home/leo/src/my-solar-challenge' in out
+
+    def test_content_signals_unavailability_and_reason(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert 'UNAVAILABLE' in out or 'unavailable' in out
+        # A stable, semantically-load-bearing token rather than the full
+        # prose sentence -- pins "this is about git working tree
+        # readability" without locking the exact wording (amendment,
+        # task 2738 review).
+        assert 'git working tree' in out
+
+    def test_content_carries_no_zeroed_numeric_census(self):
+        out = build_task_count_snapshot_unavailable_content(
+            'my_solar_challenge', '/home/leo/src/my-solar-challenge',
+        )
+
+        assert '0 total' not in out
+        assert '0 done' not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1070,6 +1127,152 @@ class TestWriteTaskCountSnapshot:
         }
         assert deleted_ids == {'stale-1', 'stale-2'}
         memory_service.add_memory.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _write_task_count_snapshot -- UNKNOWN sentinel for a non-git-working-tree
+# zero-count project_root (task 2738)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteTaskCountSnapshotUnavailableSentinel:
+    """_write_task_count_snapshot writes an UNKNOWN sentinel instead of a
+    zeroed numeric record when a zero-count ``project_root`` is not a
+    readable git working tree.
+
+    ``SqliteTaskBackend.get_tasks`` auto-creates an empty ``tasks.db`` and
+    returns ``{'tasks': []}`` for ANY path (never raising), so a zero-count
+    tree at a non-git ``project_root`` (e.g. a project whose repo was
+    deleted) is a false census, indistinguishable at the data layer from a
+    genuinely empty project. The writer disambiguates via
+    ``resolve_main_checkout`` (raises ``ValueError`` iff *project_root* is
+    not inside a readable git working tree), gated ONLY on
+    ``tree.total_count == 0`` so the common non-empty path never pays the
+    git-subprocess cost.
+    """
+
+    def _taskmaster_empty(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {'tasks': []}
+        return taskmaster
+
+    def _taskmaster_non_empty(self):
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks.return_value = {
+            'tasks': [
+                {'id': 1, 'status': 'pending'},
+                {'id': 2, 'status': 'in-progress'},
+                {'id': 3, 'status': 'done'},
+                {'id': 4, 'status': 'cancelled'},
+            ],
+        }
+        return taskmaster
+
+    def _memory_service(self):
+        # Clean pool -> prune enumeration_ok=1 -> the write proceeds to
+        # add_memory so the test can inspect the persisted record (mirrors
+        # TestWriteTaskCountSnapshot.test_success_writes_once_and_returns_true).
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.add_memory.return_value = {'memory_ids': ['m1']}
+        return memory_service
+
+    @staticmethod
+    def _persisted(memory_service) -> dict:
+        """Read back the kwargs passed to the single add_memory call."""
+        return memory_service.add_memory.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_zero_count_non_git_real_tmpdir_writes_unavailable_sentinel(self, tmp_path):
+        """Faithful my_solar_challenge repro: a real non-git tmp dir drives
+        the real (unpatched) resolve_main_checkout, which raises ValueError."""
+        memory_service = self._memory_service()
+        taskmaster = self._taskmaster_empty()
+
+        result = await _write_task_count_snapshot(
+            memory_service, taskmaster, str(tmp_path), 'my_solar_challenge', 'run-1', None,
+        )
+
+        assert result is True
+        memory_service.add_memory.assert_awaited_once()
+        kwargs = self._persisted(memory_service)
+        assert kwargs['metadata']['snapshot_status'] == 'unavailable'
+        assert kwargs['metadata']['kind'] == 'task_count_snapshot'
+        assert '0 total' not in kwargs['content']
+        assert '0 done' not in kwargs['content']
+        assert is_count_snapshot(kwargs['content']) is False
+
+    @pytest.mark.asyncio
+    async def test_zero_count_non_git_patched_valueerror_writes_sentinel(self):
+        """Deterministic mirror of the real-tmpdir case above, regardless of
+        host git availability. create=True: resolve_main_checkout is not
+        yet imported into task_knowledge_sync's namespace on pre-fix code,
+        so patch must be able to install (and later remove) it either way."""
+        memory_service = self._memory_service()
+        taskmaster = self._taskmaster_empty()
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync.resolve_main_checkout',
+            side_effect=ValueError('/some/path is not inside a git working tree'),
+            create=True,
+        ):
+            result = await _write_task_count_snapshot(
+                memory_service, taskmaster, '/some/path', 'my_solar_challenge', 'run-1', None,
+            )
+
+        assert result is True
+        memory_service.add_memory.assert_awaited_once()
+        kwargs = self._persisted(memory_service)
+        assert kwargs['metadata']['snapshot_status'] == 'unavailable'
+        assert kwargs['metadata']['kind'] == 'task_count_snapshot'
+        assert '0 total' not in kwargs['content']
+        assert '0 done' not in kwargs['content']
+        assert is_count_snapshot(kwargs['content']) is False
+
+    @pytest.mark.asyncio
+    async def test_zero_count_git_project_root_writes_normal_zero_record(self):
+        """GUARD: a genuinely empty project whose root IS a readable git
+        working tree still gets its legitimate numeric zero snapshot, with
+        no snapshot_status key. True both before and after the fix."""
+        memory_service = self._memory_service()
+        taskmaster = self._taskmaster_empty()
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync.resolve_main_checkout',
+            return_value='/main/checkout',
+            create=True,
+        ):
+            result = await _write_task_count_snapshot(
+                memory_service, taskmaster, '/main/checkout/sub', 'reify', 'run-1', None,
+            )
+
+        assert result is True
+        memory_service.add_memory.assert_awaited_once()
+        kwargs = self._persisted(memory_service)
+        assert '0 total' in kwargs['content']
+        assert 'snapshot_status' not in kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_non_empty_tree_never_invokes_git_check(self):
+        """GUARD: pins the total==0 short-circuit -- a non-empty tree never
+        pays the git-subprocess cost. True both before and after the fix."""
+        memory_service = self._memory_service()
+        taskmaster = self._taskmaster_non_empty()
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync.resolve_main_checkout',
+            create=True,
+        ) as mocked_resolve:
+            result = await _write_task_count_snapshot(
+                memory_service, taskmaster, '/tmp/test', 'reify', 'run-1', None,
+            )
+
+        assert result is True
+        kwargs = self._persisted(memory_service)
+        assert '4 total' in kwargs['content']
+        assert 'snapshot_status' not in kwargs['metadata']
+        mocked_resolve.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

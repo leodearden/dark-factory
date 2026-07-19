@@ -282,3 +282,46 @@ def build_task_count_snapshot_content(
         f'{total} total, {done} done, {cancelled} cancelled, {active} active, '
         f'{other} other, highest task id {highest_task_id}.'
     )
+
+
+def build_task_count_snapshot_unavailable_content(
+    project_id: str,
+    project_root: str,
+    *,
+    as_of: str | None = None,
+) -> str:
+    """Render the UNKNOWN-sentinel content string for a task_count_snapshot write.
+
+    Pure and dependency-free — no I/O, no imports from ``stages/`` or
+    ``harness`` — mirroring :func:`build_task_count_snapshot_content`.
+
+    Used by ``_write_task_count_snapshot`` (``stages/task_knowledge_sync.py``)
+    in place of the numeric renderer when a zero-count project_root is not a
+    readable git working tree (``resolve_main_checkout`` raises
+    ``ValueError``): ``SqliteTaskBackend.get_tasks`` auto-creates an empty
+    ``tasks.db`` and returns ``{'tasks': []}`` for *any* path, so a zero
+    count there is a false census, not a genuinely empty project. The
+    caller pairs this content with ``metadata['snapshot_status'] =
+    'unavailable'`` (task 2738).
+
+    CRITICAL: the returned text must never contain a ``<digits>
+    <status-word>`` census pair (e.g. "0 total", "0 done") — such text
+    would match ``task_filter.COUNT_SNAPSHOT_RE`` and be mis-parsed as a
+    numeric snapshot line by ``is_count_snapshot``/``strip_snapshot_lines``.
+
+    Args:
+        project_id: Project the census was attempted for.
+        project_root: The project_root that failed the git-working-tree
+            check.
+        as_of: ISO date string for the cycle, or ``None`` when unknown — the
+            leading "As of {as_of}:" clause is omitted in that case.
+
+    Returns:
+        A concise, non-empty, non-numeric sentinel string.
+    """
+    prefix = f'As of {as_of}: ' if as_of else ''
+    return (
+        f'{prefix}project {project_id} task-count snapshot UNAVAILABLE — '
+        f'project_root {project_root} is not a readable git working tree; '
+        f'counts not collected this cycle.'
+    )

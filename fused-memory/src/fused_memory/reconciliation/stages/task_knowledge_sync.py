@@ -25,7 +25,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectRoot, ProjectScope
+from fused_memory.models.scope import ProjectRoot, ProjectScope, resolve_main_checkout
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
@@ -60,6 +60,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
     build_task_count_snapshot_content,
+    build_task_count_snapshot_unavailable_content,
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -1332,16 +1333,46 @@ async def _write_task_count_snapshot(
             if isinstance(run_window_start, datetime)
             else None
         )
-        content = build_task_count_snapshot_content(
-            project_id,
-            total=tree.total_count,
-            done=tree.done_count,
-            cancelled=tree.cancelled_count,
-            active=len(tree.active_tasks),
-            other=tree.other_count,
-            highest_task_id=tree.max_task_id,
-            as_of=as_of,
-        )
+        # Task 2738: SqliteTaskBackend.get_tasks auto-creates an empty
+        # tasks.db and returns {'tasks': []} for ANY project_root (never
+        # raising), so a zero-count tree at a non-git project_root (e.g. a
+        # project whose repo was deleted) is a false census, not a
+        # genuinely empty project -- indistinguishable from one at the data
+        # layer. Gate ONLY on total_count == 0 so the common non-empty path
+        # stays byte-identical and never pays the git-subprocess cost.
+        # Note: resolve_main_checkout raises ValueError for two distinct
+        # causes -- project_root not inside any git working tree, OR the
+        # `git` executable being missing from the host entirely (it wraps
+        # FileNotFoundError) -- and does not distinguish between them. On a
+        # host with no git binary, EVERY zero-count project would take this
+        # branch, including a genuinely empty git-backed one that would
+        # otherwise get its legitimate numeric "0 total" record. This repo's
+        # hosts always have git installed, so it is not a live bug here, and
+        # "unavailable" is the fail-safe direction if it ever were (loud
+        # sentinel over a silently-wrong zero census) -- but be aware the two
+        # causes are conflated should resolve_main_checkout ever need to
+        # expose them separately.
+        snapshot_unavailable = False
+        if tree.total_count == 0:
+            try:
+                resolve_main_checkout(project_root)
+            except ValueError:
+                snapshot_unavailable = True
+        if snapshot_unavailable:
+            content = build_task_count_snapshot_unavailable_content(
+                project_id, project_root, as_of=as_of,
+            )
+        else:
+            content = build_task_count_snapshot_content(
+                project_id,
+                total=tree.total_count,
+                done=tree.done_count,
+                cancelled=tree.cancelled_count,
+                active=len(tree.active_tasks),
+                other=tree.other_count,
+                highest_task_id=tree.max_task_id,
+                as_of=as_of,
+            )
         # prune_stats is ALWAYS a real dict (never None) so the write-gate
         # below can read SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY back
         # regardless of whether the caller wanted the observability stats
@@ -1363,15 +1394,18 @@ async def _write_task_count_snapshot(
                 extra={'project_id': project_id, 'run_id': run_id},
             )
             return None
+        metadata = {
+            'kind': TASK_COUNT_SNAPSHOT_KIND,
+            'stage': 'task_knowledge_sync',
+            'run_id': run_id,
+        }
+        if snapshot_unavailable:
+            metadata['snapshot_status'] = 'unavailable'
         await memory_service.add_memory(
             content=content,
             category=TASK_COUNT_SNAPSHOT_CATEGORY,
             project_id=project_id,
-            metadata={
-                'kind': TASK_COUNT_SNAPSHOT_KIND,
-                'stage': 'task_knowledge_sync',
-                'run_id': run_id,
-            },
+            metadata=metadata,
             causation_id=run_id,
             _source=_TASK_COUNT_SNAPSHOT_WRITE_SOURCE,
         )
