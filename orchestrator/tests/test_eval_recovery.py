@@ -13,19 +13,28 @@ reads ONLY a persisted artifact (P4 / boundary test B8) — never a transcript.
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.evals import runner
 from orchestrator.evals.metrics import EvalMetrics, collect_metrics
 from orchestrator.evals.scoring import (
+    _RECOVERY_DETECTORS,
     compute_recovery_score,
     plan_step_deviated,
     real_cause_addressed,
     regression_flagged,
 )
+from orchestrator.evals.task_sampler import (
+    audit_fixture_corpus,
+    stratification_counts,
+)
+
+TASKS_DIR = Path(runner.__file__).parent / 'tasks'
 
 
 # ---------------------------------------------------------------------------
@@ -421,3 +430,139 @@ class TestCollectMetricsRecoveryWiring:
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert any('df_task_bad_adv' in w for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# The 3 adversarial fixtures — schema + semantics (step-5/6)
+#
+# Loads the REAL evals/tasks/*_adv_*.json files. Each is derived from a real
+# revival-ζ parent, tagged with its adversarial TYPE and a SEPARATE recovery
+# rubric, and lives in a DISTINCT cohort so the revival-ζ audit band is
+# untouched.
+# ---------------------------------------------------------------------------
+
+_ADV_FILENAMES = [
+    'df_task_2430_adv_plan.json',
+    'df_task_2284_adv_regression.json',
+    'df_task_2339_adv_verify.json',
+]
+_ADV_TYPES = frozenset(
+    {'wrong_plan_step', 'planted_regression', 'misleading_verify_failure'}
+)
+_ETA_COHORT = 'revival-eta-adversarial'
+
+
+def _load_adv_fixtures() -> list[dict]:
+    return [runner.load_task(TASKS_DIR / name) for name in _ADV_FILENAMES]
+
+
+def _load_all_fixtures() -> list[dict]:
+    return [runner.load_task(p) for p in sorted(TASKS_DIR.glob('*.json'))]
+
+
+def _recovered_artifacts(fixture: dict) -> tuple[dict, list[dict], str]:
+    """A synthetic artifact set that SATISFIES this fixture's single-criterion
+    rubric — derived generically from the criterion's detector + params."""
+    adv = fixture['adversarial']
+    crit = adv['recovery_rubric']['criteria'][0]
+    params = crit['params']
+    if adv['type'] == 'wrong_plan_step':
+        plan = copy.deepcopy(fixture['plan'])
+        for step in plan['steps']:
+            if step.get('id') == params['step_id']:
+                step['description'] = 'the corrected approach — sentinel removed'
+        return plan, [], ''
+    if adv['type'] == 'planted_regression':
+        marker = params['markers'][0]
+        issue = {'severity': 'blocking',
+                 'description': f'reviewer flags the {marker} regression'}
+        return {}, [issue], ''
+    if adv['type'] == 'misleading_verify_failure':
+        marker = params['real_cause_markers'][0]
+        return {}, [], f'--- a/x\n+++ b/x\n+ real fix in {marker}\n'
+    raise AssertionError(adv['type'])
+
+
+def _not_recovered_artifacts(fixture: dict) -> tuple[dict, list[dict], str]:
+    """A synthetic artifact set that FAILS this fixture's rubric (score 0.0)."""
+    adv = fixture['adversarial']
+    crit = adv['recovery_rubric']['criteria'][0]
+    params = crit['params']
+    if adv['type'] == 'wrong_plan_step':
+        # The fixture's own seeded plan still carries the wrong-step sentinel.
+        return copy.deepcopy(fixture['plan']), [], ''
+    if adv['type'] == 'planted_regression':
+        return {}, [], ''  # no blocking issue names the marker
+    if adv['type'] == 'misleading_verify_failure':
+        mis = params['misleading_markers'][0]
+        return {}, [], f'--- a/t\n+++ b/t\n+ touched only {mis}\n'
+    raise AssertionError(adv['type'])
+
+
+class TestAdversarialFixtures:
+    def test_all_three_files_load(self):
+        fixtures = _load_adv_fixtures()
+        assert len(fixtures) == 3
+        for fx in fixtures:
+            assert fx.get('id')
+
+    def test_each_has_valid_adversarial_block(self):
+        for fx in _load_adv_fixtures():
+            adv = fx.get('adversarial')
+            assert isinstance(adv, dict), fx.get('id')
+            assert adv['type'] in _ADV_TYPES, adv['type']
+            # derived_from names a real revival-ζ parent present in tasks/
+            parent_path = TASKS_DIR / f'{adv["derived_from"]}.json'
+            assert parent_path.exists(), adv['derived_from']
+            parent = runner.load_task(parent_path)
+            assert parent['cohort'] == 'revival-zeta', adv['derived_from']
+            rubric = adv['recovery_rubric']
+            assert len(rubric['criteria']) >= 1
+            for crit in rubric['criteria']:
+                assert crit['detector'] in _RECOVERY_DETECTORS, crit['detector']
+
+    def test_exactly_three_distinct_types_present(self):
+        types = {fx['adversarial']['type'] for fx in _load_adv_fixtures()}
+        assert types == _ADV_TYPES
+
+    def test_cohort_is_eta_and_zeta_band_untouched(self):
+        all_fixtures = _load_all_fixtures()
+        adv = [fx for fx in all_fixtures if fx.get('cohort') == _ETA_COHORT]
+        assert len(adv) == 3
+        for fx in adv:
+            assert fx['cohort'] == _ETA_COHORT
+            assert fx['cohort'] != 'revival-zeta'
+        # The revival-ζ band audit still reports its 14-fixture band ok — the
+        # adversarial fixtures (distinct cohort) don't perturb it.
+        zeta = [fx for fx in all_fixtures if fx.get('cohort') == 'revival-zeta']
+        report = audit_fixture_corpus(zeta, ref_exists=None)
+        assert report.ok, report.failures
+        assert report.count == 14
+        # Whole-corpus stratification classifies the adversarial fixtures without
+        # raising, and counts every fixture.
+        counts = stratification_counts(all_fixtures, cohort=None)
+        assert counts.total == len(all_fixtures)
+
+    def test_wrong_plan_step_fixture_embeds_sentinel_plan(self):
+        fx = runner.load_task(TASKS_DIR / 'df_task_2430_adv_plan.json')
+        assert fx['adversarial']['type'] == 'wrong_plan_step'
+        plan = fx['plan']
+        assert plan is not None
+        assert plan.get('steps')
+        crit = fx['adversarial']['recovery_rubric']['criteria'][0]
+        wrong_marker = crit['params']['wrong_marker']
+        # The planted-wrong step carries the sentinel verbatim in the seeded plan.
+        import json as _json
+        assert wrong_marker in _json.dumps(plan)
+
+    def test_each_rubric_recovered_scores_one_not_recovered_zero(self):
+        for fx in _load_adv_fixtures():
+            rubric = fx['adversarial']['recovery_rubric']
+            r_plan, r_block, r_diff = _recovered_artifacts(fx)
+            assert compute_recovery_score(
+                rubric, plan=r_plan, blocking_issues=r_block, diff=r_diff,
+            ) == 1.0, fx['id']
+            n_plan, n_block, n_diff = _not_recovered_artifacts(fx)
+            assert compute_recovery_score(
+                rubric, plan=n_plan, blocking_issues=n_block, diff=n_diff,
+            ) == 0.0, fx['id']
