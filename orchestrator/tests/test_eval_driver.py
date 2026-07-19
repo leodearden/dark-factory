@@ -162,6 +162,115 @@ class TestBuildEvalOrchConfigJudgeOverride:
 
 
 # ---------------------------------------------------------------------------
+# step-03/04 — run_eval threads judge_config into build_eval_orch_config, and
+# when supplied RELABELS the result to the judge candidate and stamps
+# metrics['role_under_test']='judge' (mirrors run_end_to_end's end_to_end stamp).
+#
+# The implementer stays PINNED to `config` (only the judge varies); the label
+# must key on the judge candidate (not the pinned implementer, which would
+# collide both judge rows) so select_survivors groups judge runs as their own
+# OFAT axis. Boundaries mocked (the _run_end_to_end_hermetic pattern):
+# create_eval_worktree / build_workflow / collect_metrics / load_task /
+# save_result. judge_config=None → byte-identical to today.
+# ---------------------------------------------------------------------------
+
+def _judge_task(tmp_path: Path) -> dict:
+    # run_eval raises without a non-empty plan (the frozen plan it scores).
+    return {
+        'id': 'df_task_judge',
+        'project_root': str(tmp_path),
+        'pre_task_commit': 'basecommit',
+        'task_definition': {'title': 'W', 'description': 'd'},
+        'modules': ['pkg/mod.py'],
+        'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
+    }
+
+
+async def _run_eval_hermetic(
+    config: EvalConfig,
+    base,
+    task: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    judge_config: EvalConfig | None = None,
+    outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+):
+    """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
+
+    Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
+    kwargs dict build_workflow received (for asserting the threaded config).
+    """
+    from orchestrator.evals import runner
+
+    captured: dict = {}
+
+    async def fake_create_wt(*_a, **_k):
+        return Path('/fake/wt'), 'run-eval'
+
+    fake_wf = MagicMock()
+    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+
+    def fake_build_workflow(**kwargs):
+        captured['build_workflow'] = kwargs
+        return fake_wf
+
+    metrics_obj = MagicMock()
+    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
+    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_save = MagicMock()
+
+    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
+    monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
+    monkeypatch.setattr(runner, 'load_task', lambda _p: task)
+    monkeypatch.setattr(runner, 'save_result', mock_save)
+
+    result = await runner.run_eval(
+        Path('/fake/task.json'), config, base, judge_config=judge_config,
+    )
+    return result, captured
+
+
+@pytest.mark.asyncio
+class TestRunEvalJudgeConfig:
+    async def test_judge_config_threads_into_config_and_relabels(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _base_config(tmp_path)
+        impl = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
+        judge = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        result, captured = await _run_eval_hermetic(
+            impl, base, _judge_task(tmp_path), monkeypatch, judge_config=judge,
+        )
+
+        # (a) judge_config threaded into build_eval_orch_config → the judge model
+        # derives from the candidate while the implementer stays PINNED to `config`.
+        cfg = captured['build_workflow']['config']
+        assert cfg.models.judge == 'haiku'          # the judge varies
+        assert cfg.models.implementer == 'sonnet'    # implementer PINNED (NOT the judge model)
+
+        # (b) result RELABELED to the judge candidate (so per-judge composite rows
+        # don't collide on the pinned implementer name) and tagged role_under_test.
+        assert result.config_name == 'judge-haiku'
+        assert result.metrics['role_under_test'] == 'judge'
+
+    async def test_no_judge_config_is_byte_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _base_config(tmp_path)
+        impl = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
+        result, captured = await _run_eval_hermetic(
+            impl, base, _judge_task(tmp_path), monkeypatch,
+        )
+
+        # judge_config defaults None → label is the implementer config name, the
+        # judge stays the sonnet incumbent, and no role_under_test='judge' stamp.
+        assert result.config_name == 'claude-sonnet-max'
+        assert captured['build_workflow']['config'].models.judge == 'sonnet'
+        assert result.metrics.get('role_under_test') != 'judge'
+
+
+# ---------------------------------------------------------------------------
 # step-05/06 — run_end_to_end: the ONE both-live executor (architect LIVE +
 # implementer LIVE). It builds the both-live orch config
 # (build_eval_orch_config(architect_config=arch)) and constructs the workflow
