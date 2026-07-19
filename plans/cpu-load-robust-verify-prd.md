@@ -168,7 +168,12 @@ not a copy.
 
 - Narrowing `merge_verify_breadth` `full`→`scoped` (restart-only).
 - `verify_runners` remote capacity (restart-only).
-- Host-global cross-project verify admission semaphore (shared slots dir).
+- Host-global cross-project verify admission semaphore (shared slots dir) —
+  **TRIED-AND-REJECTED, not merely deferred**: under a single fair global
+  semaphore, Reify's very long (30min+ cargo) verifies starved dark_factory
+  almost entirely. The correct shape is per-project admission (current design)
+  + per-project off-hot-path serialized non-merge-blocking lanes, NOT a shared
+  global gate. Do not revisit this as an option.
 - Capping `-n` for the merge role, or lowering
   `merge_verify_max_concurrent_modules` (green-tier, but a live-tuning /
   throughput-tradeoff call the operator should make with load data, not bundled
