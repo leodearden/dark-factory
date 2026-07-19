@@ -244,6 +244,7 @@ async def run_eval(
     timeout_override: int | None = None,
     worktree_path: Path | None = None,
     memory_endpoint: str | None = None,
+    judge_config: EvalConfig | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
 
@@ -258,10 +259,27 @@ async def run_eval(
     isolation stands; pass a ``RecordingMemorySink().url`` to capture the
     intended memory writes instead of dropping them (see
     ``build_eval_orch_config`` for the full contract).
+
+    *judge_config* (eval-revival ο) is the judge OFAT knob: left ``None`` (every
+    existing caller) this is byte-identical to today — the result is labeled by
+    ``config`` and no ``role_under_test`` stamp fires. Supplied (run_ofat_stage's
+    judge branch), it (1) threads into ``build_eval_orch_config`` so ONLY the ζ
+    completion judge's model/effort derive from the candidate (the implementer
+    ``config`` stays pinned), (2) RELABELS the result to ``judge_config.name`` so
+    the persisted JSON is keyed by the judge candidate rather than the pinned
+    implementer (which would collide both judge rows), and (3) stamps
+    ``metrics['role_under_test']='judge'`` so ``select_survivors`` groups the
+    judge candidates as their own OFAT survivor axis.
     """
     task = load_task(task_path)
     task_id = task['id']
     project_root = Path(task['project_root'])
+
+    # ο: when a judge candidate is under test, the persisted result must be keyed
+    # by the JUDGE candidate — not the pinned implementer `config`, which would
+    # collide both judge rows into one — so select_survivors ranks them as their
+    # own axis. None (every existing caller) → label is config.name, unchanged.
+    result_label = judge_config.name if judge_config is not None else config.name
 
     logger.info(f'Starting eval: {task_id} × {config.name} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
@@ -280,6 +298,7 @@ async def run_eval(
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
         config, task, base_config, memory_endpoint=memory_endpoint,
+        judge_config=judge_config,
     )
 
     # 3. Build task assignment
@@ -374,10 +393,16 @@ async def run_eval(
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
         metrics_dict = {}
+    # ο: stamp the judge OFAT axis so select_survivors groups judge runs as their
+    # own survivor group (collect_metrics itself does not know which role/stage
+    # invoked it — mirrors run_end_to_end's post-collect_metrics stamp). None →
+    # no stamp fires, so every existing caller is byte-identical.
+    if judge_config is not None:
+        metrics_dict['role_under_test'] = 'judge'
 
     result = EvalResult(
         task_id=task_id,
-        config_name=config.name,
+        config_name=result_label,
         outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
         metrics=metrics_dict,
         worktree_path=str(worktree),
