@@ -982,30 +982,30 @@ class TestReconcileStrandedInProgress:
     @pytest.mark.parametrize(
         'lock_contents,task_id,expect_reverted,expect_lock_exists,warn_pattern',
         [
-            # (a) Corrupt JSON → fail-closed: do NOT revert, leave lock intact + ERROR.
-            #     An unreadable lock means we cannot confirm the owner is dead; fail-closed
-            #     = assume possibly-live and don't reap (task-1808 step-9).
-            #     ERROR (not WARNING) because the task is now stranded indefinitely
-            #     and requires operator intervention (task-1808 amend).
+            # (a) Corrupt JSON → task 2763: the applier no longer READS the
+            #     worktree lock for liveness, so a corrupt lock no longer fails
+            #     closed. recovery_for already ruled out a live claimant →
+            #     REVERT: cleanup_worktree called, task reverted, lock gone,
+            #     no ERROR.
             pytest.param(
-                'not-valid-json', 9, False, True,
-                r'(unreadable|corrupt).*leaving worktree intact',
+                'not-valid-json', 9, True, False,
+                None,
                 id='corrupt-json',
             ),
-            # (b) Missing owner_pid key → owner_pid=None via .get() → owner_alive=False
-            #     → stale-lock path: cleanup_worktree called, task reverted, lock gone
-            #     → WARNING emitted for observability (Gap 2)
+            # (b) Missing owner_pid key → reverted. Task 2763: the applier no
+            #     longer reads the lock, so the old 'no owner_pid; treating as
+            #     stale' observability WARNING is gone (warn_pattern=None); the
+            #     task still reverts (cleanup_worktree called, lock gone).
             pytest.param(
                 json.dumps({'session_id': 'test-10', 'locked_at': '2026-01-01T00:00:00+00:00'}),
-                '10', True, False, r'no owner_pid; treating as stale',
+                '10', True, False, None,
                 id='missing-owner-pid',
             ),
-            # (b2) Explicit null owner_pid → owner_pid=None → owner_alive=False
-            #      → stale-lock path: cleanup_worktree called, task reverted, lock gone
-            #      → WARNING emitted for observability (Gap 2)
+            # (b2) Explicit null owner_pid → reverted, same as (b): no warning
+            #      (applier no longer reads the lock), cleanup called, lock gone.
             pytest.param(
                 json.dumps({'session_id': 'test-16', 'locked_at': '2026-01-01T00:00:00+00:00', 'owner_pid': None}),
-                16, True, False, r'no owner_pid; treating as stale',
+                16, True, False, None,
                 id='null-owner-pid',
             ),
             # (b3) Non-numeric owner_pid → int('abc') raises ValueError
@@ -1016,12 +1016,13 @@ class TestReconcileStrandedInProgress:
                 42, True, False, None,
                 id='non-numeric-owner-pid',
             ),
-            # (e) Non-dict JSON (list) → fail-closed: do NOT revert, leave lock intact + ERROR.
-            #     Same semantics as (a): unreadable/non-dict lock cannot confirm owner is dead
-            #     (task-1808 step-9). ERROR level because task stranded indefinitely (amend).
+            # (e) Non-dict JSON (list) → task 2763: same as (a). The applier no
+            #     longer reads the lock, so a non-dict lock no longer fails
+            #     closed → REVERT: cleanup_worktree called, task reverted, lock
+            #     gone, no ERROR.
             pytest.param(
-                '["not", "an", "object"]', 14, False, True,
-                r'(unreadable|corrupt).*leaving worktree intact',
+                '["not", "an", "object"]', 14, True, False,
+                None,
                 id='non-dict-json',
             ),
             # (c) Numeric-string owner_pid of a live process → task IS reverted.
@@ -1125,22 +1126,24 @@ class TestReconcileStrandedInProgress:
         else:
             harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
-    async def test_corrupt_plan_lock_not_reaped_on_startup(
+    async def test_corrupt_plan_lock_reverted_on_startup(
         self, harness: Harness, caplog
     ):
-        """Corrupt plan.lock on startup sweep (mid_run=False) → fail-closed: do NOT reap.
+        """Corrupt worktree plan.lock on a startup sweep (mid_run=False) is now
+        REVERTED, not fail-closed.
 
-        An unreadable lock means we cannot confirm the owner is dead.  Reaping a
-        possibly-live owner's worktree is the safety-bearing failure mode; fail-closed
-        means leave the worktree intact + emit an ERROR so an operator can intervene.
-        ERROR (not WARNING) because the task is now stranded in-progress indefinitely
-        and requires manual inspection — automated reconcile will skip it every cycle.
+        Task 2763: the applier no longer READS <worktree>/.task/plan.lock for
+        liveness (the durable lock lives at the meta-root; recovery_for's
+        DB-claimant resolution already ruled out a live claimant before
+        dispatching REVERT_TO_PENDING). A corrupt worktree lock therefore no
+        longer strands the task — it reverts unconditionally, cleaning the
+        worktree and defensively unlinking the vestigial lock, with NO
+        fail-closed ERROR.
 
-        CRITICAL: get_statuses must return a NON-EMPTY dict so the resolver_failed guard
-        in _reconcile_stranded_in_progress does not abort the sweep before the lock branch.
+        CRITICAL: get_statuses must return a NON-EMPTY dict so the resolver_failed
+        guard in _reconcile_stranded_in_progress does not abort the sweep before
+        the revert.
         """
-        import logging
-
         tid = '200'
         harness.scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)  # type: ignore[attr-defined]
 
@@ -1148,32 +1151,25 @@ class TestReconcileStrandedInProgress:
         lock_dir.mkdir(parents=True)
         lock_path = lock_dir / 'plan.lock'
         lock_path.write_text('not-valid-json')
+        worktree_path = harness.git_ops.worktree_base / tid
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._reconcile_stranded_in_progress()
 
-        # Must NOT revert — cannot confirm owner is dead
-        harness.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
-        # Must NOT clean up the worktree
-        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-        # Lock file must still exist
-        assert lock_path.exists(), 'corrupt lock must be left intact (fail-closed)'
-        # An ERROR under orchestrator.harness must be emitted (task stranded indefinitely,
-        # operator action required — ERROR level signals this needs human attention).
-        import re
-        error_records = [
+        # Now reverted — a corrupt worktree lock no longer fails closed.
+        harness.scheduler.set_task_status.assert_called_once_with(tid, 'pending')  # type: ignore[attr-defined]
+        # The worktree is cleaned up (not in _recovered_plans/_preserved_worktrees).
+        harness.git_ops.cleanup_worktree.assert_called_once_with(worktree_path, tid)  # type: ignore[attr-defined]
+        # The vestigial worktree lock is defensively cleared.
+        assert not lock_path.exists()
+        # NO fail-closed ERROR — the read that produced it is gone (task 2763).
+        fail_closed = [
             r for r in caplog.records
             if r.levelno == logging.ERROR
-            and r.name == 'orchestrator.harness'
+            and re.search(r'leaving worktree intact', r.message, re.IGNORECASE)
         ]
-        assert len(error_records) >= 1, (
-            f'Expected ERROR under orchestrator.harness for corrupt plan.lock; '
-            f'got: {[(r.name, r.levelname, r.message) for r in caplog.records]}'
-        )
-        pattern = r'(unreadable|corrupt).*leaving worktree intact'
-        matching = [r for r in error_records if re.search(pattern, r.message, re.IGNORECASE)]
-        assert len(matching) >= 1, (
-            f'Expected ERROR matching {pattern!r}; got: {[r.message for r in error_records]}'
+        assert not fail_closed, (
+            f'fail-closed ERROR must be gone; got: {[r.message for r in caplog.records]}'
         )
 
     async def test_no_lock_worktree_cleaned_when_not_recovered(
@@ -1377,52 +1373,6 @@ class TestReconcileStrandedInProgress:
         assert not lock_path.exists()
         # Task must be reverted to pending
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
-
-    async def test_stale_lock_unlinked_when_cleanup_worktree_raises(
-        self, harness: Harness, monkeypatch, caplog
-    ):
-        """Stale lock must be unlinked even when cleanup_worktree raises (Gap 3).
-
-        If cleanup_worktree fails (e.g., permission error on the worktree dir),
-        the plan.lock file must still be removed before the task is reverted to
-        pending.  Without the fix, a subsequent reconcile sweep would re-encounter
-        the lock, find its owner dead again, and loop forever.
-        """
-        tid = 40
-        harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
-        monkeypatch.setattr('orchestrator.harness._pid_alive', lambda pid: False)
-
-        # Create worktree with a plan.lock referencing a synthetic dead PID
-        lock_dir = harness.git_ops.worktree_base / str(tid) / '.task'
-        lock_dir.mkdir(parents=True)
-        lock_path = lock_dir / 'plan.lock'
-        lock_path.write_text(json.dumps({
-            'session_id': f'{tid}-dead',
-            'locked_at': '2026-01-01T00:00:00+00:00',
-            'owner_pid': 99999,
-        }))
-        worktree_path = harness.git_ops.worktree_base / str(tid)
-
-        # Make cleanup_worktree raise so we exercise the except-branch
-        harness.git_ops.cleanup_worktree = AsyncMock(side_effect=OSError('boom'))  # type: ignore[attr-defined]
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await harness._reconcile_stranded_in_progress()
-
-        # cleanup_worktree must have been attempted
-        harness.git_ops.cleanup_worktree.assert_called_once_with(worktree_path, str(tid))  # type: ignore[attr-defined]
-        # Task must still be reverted to pending despite cleanup failure
-        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
-        # Lock must be gone — the unlink must happen unconditionally after cleanup
-        assert not lock_path.exists(), 'plan.lock must be unlinked even when cleanup_worktree raises'
-        # Cleanup-failure WARNING must be present in logs
-        matching = [
-            r for r in caplog.records
-            if re.search(r'cleanup_worktree failed.*40.*stale-lock', r.message, re.IGNORECASE)
-        ]
-        assert len(matching) >= 1, (
-            f'Expected cleanup-failure WARNING in harness logs, got: {[r.message for r in caplog.records]}'
-        )
 
     async def test_no_lock_branch_cleanup_worktree_raises_still_reverts(
         self, harness: Harness, caplog
