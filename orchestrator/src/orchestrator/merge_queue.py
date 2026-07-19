@@ -9221,8 +9221,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # KEEP guard (blocked + MERGE_WORKER_SHUTDOWN_REASON) fires
         # deterministically, so recover_pending_merges can re-enqueue the
         # request on the next boot.
+        #
+        # Gated strictly to that VERIFYING sub-case (verify_task not yet
+        # done): _finalizing_head_entry() also matches the FINALIZING
+        # sub-case -- verify already passed and _finalize_inflight is inside
+        # its CAS advance_main loop (_journal_landed_then_advance /
+        # _finalize_advanced_merge, well past the verify_task await). Only
+        # a genuinely in-flight verify_task means the entry is still
+        # VERIFYING; when it is already done() the entry is mid-advance (or,
+        # for the verify_task=None compat/passthrough shim, already past the
+        # point a verify could even be pending). Pre-empting a FINALIZING
+        # entry here would (a) mislabel a merge that may actually land as
+        # 'blocked'/SHUTDOWN, and (b) race _cleanup_owned_merge_worktree
+        # below against _finalize_inflight's own git subprocesses in that
+        # same worktree. Leaving it alone lets _finalize_inflight (running
+        # inside self._verifier_task) finish naturally and resolve its TRUE
+        # outcome within the `asyncio.wait(tasks_to_wait, timeout)` shutdown
+        # window a few lines down.
         _fh_entry = self._finalizing_head_entry()
-        if _fh_entry is not None:
+        if (
+            _fh_entry is not None
+            and _fh_entry.verify_task is not None
+            and not _fh_entry.verify_task.done()
+        ):
             _fh_req = _fh_entry.item.request
             if not _fh_req.result.done():
                 _fh_req.result.set_result(shutdown)
@@ -9236,13 +9257,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # existing stop() invariant -- so a concurrent in-flight
             # _finalize_inflight unwind (from cancelling verify_task here)
             # racing its own finally-block releases is safe.
-            if _fh_entry.verify_task is not None and not _fh_entry.verify_task.done():
-                if _fh_entry.lease is not None:
-                    with contextlib.suppress(BaseException):
-                        await self._abort_remote_verify(_fh_entry.lease, _fh_req.task_id)
-                _fh_entry.verify_task.cancel()
+            if _fh_entry.lease is not None:
                 with contextlib.suppress(BaseException):
-                    await _fh_entry.verify_task
+                    await self._abort_remote_verify(_fh_entry.lease, _fh_req.task_id)
+            _fh_entry.verify_task.cancel()
+            with contextlib.suppress(BaseException):
+                await _fh_entry.verify_task
             if _fh_entry.merge_wt is not None:
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(_fh_entry.merge_wt)

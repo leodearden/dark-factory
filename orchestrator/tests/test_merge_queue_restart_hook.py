@@ -32,6 +32,9 @@ from orchestrator.merge_queue import (
     MergeRequest,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_queue import (
+    _journal_landed_then_advance as _real_journal_landed_then_advance,
+)
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 
 # ---------------------------------------------------------------------------
@@ -141,6 +144,32 @@ async def _wait_for_finalizing_head(
     pytest.fail(
         f'{request_id} never reached the finalize-head verifying state; '
         f'store contents: {store.load()!r}'
+    )
+
+
+async def _wait_for_finalizing_head_mid_advance(
+    worker: SpeculativeMergeWorker,
+    request_id: str,
+) -> InflightEntry:
+    """Poll until *request_id* is the finalize head AND its verify_task has
+    already completed -- i.e. the entry is genuinely FINALIZING (inside
+    _finalize_inflight's CAS advance_main loop), not merely VERIFYING.
+
+    Bounded ~200 x 0.05s poll, mirroring _wait_for_finalizing_head.
+    """
+    for _ in range(200):
+        entry = worker._finalizing_head_entry()
+        if (
+            entry is not None
+            and entry.item.request.request_id == request_id
+            and entry.verify_task is not None
+            and entry.verify_task.done()
+        ):
+            return entry
+        await asyncio.sleep(0.05)
+    pytest.fail(
+        f'{request_id} never reached the finalize-head FINALIZING '
+        f'(mid-advance) state'
     )
 
 
@@ -824,4 +853,96 @@ async def test_verifying_merge_survives_graceful_restart_and_recovers(
     assert recovered_reqs[0].request_id == req.request_id, (
         f'Recovered wrong request; expected {req.request_id}, '
         f'got {recovered_reqs[0].request_id}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_preempt_finalizing_head_mid_advance(
+    git_ops: GitOps, config: OrchestratorConfig,
+) -> None:
+    """stop() must NOT pre-empt a finalize-head entry whose verify already
+    passed and is inside _finalize_inflight's CAS advance_main loop
+    (registry FINALIZING, verify_task already done) — only the still-
+    VERIFYING sub-case (amendment round 1) needs stop()'s pre-emption.
+
+    _finalizing_head_entry() matches both sub-cases (any non-terminal entry
+    popped off _inflight). Pre-empting a FINALIZING entry would (a) mislabel
+    a merge that actually lands as 'blocked'/SHUTDOWN, and (b) tear down its
+    merge worktree via _cleanup_owned_merge_worktree concurrently with
+    _finalize_inflight's own git subprocesses in that same worktree. Instead
+    stop() must leave it alone and let the existing
+    `asyncio.wait(tasks_to_wait, timeout)` on self._verifier_task (which
+    runs _finalize_inflight) give the advance a chance to finish naturally.
+
+    Gates _journal_landed_then_advance (called from inside the CAS advance
+    loop, well past the verify_task await) on an Event so the head reaches
+    FINALIZING — verify_task done() — before stop() runs.
+    """
+    wt = await _make_branch_with_file(
+        git_ops, 'finalize-head-advancing', 'finalize_advancing.py', 'c = 3\n',
+    )
+    req = _make_request('finalize-head-advancing', 'finalize-head-advancing', wt, config)
+    req.request_id = 'mr-fh-advancing'
+
+    advance_gate = asyncio.Event()
+
+    async def _gated_advance(*args, **kwargs):  # type: ignore[no-untyped-def]
+        await advance_gate.wait()
+        return await _real_journal_landed_then_advance(*args, **kwargs)
+
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops, queue)
+    # Generous shutdown timeout: stop() must let the real (gated) CAS advance
+    # complete naturally rather than pre-empting it — unlike the fast
+    # (0.2s) timeout used by the VERIFYING-sub-case tests above, where
+    # stop() is expected to resolve the request itself.
+    worker._shutdown_timeout = 5.0
+
+    with (
+        patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        patch('orchestrator.merge_queue._journal_landed_then_advance', _gated_advance),
+    ):
+        worker_task = asyncio.create_task(worker.run())
+        await queue.put(req)
+
+        entry = await _wait_for_finalizing_head_mid_advance(worker, req.request_id)
+        assert not req.result.done(), (
+            'sanity: the request must still be gated (mid-advance) before '
+            'stop() runs'
+        )
+        pre_stop_wt = entry.merge_wt
+        assert pre_stop_wt is not None and pre_stop_wt.exists(), (
+            'sanity: the merge worktree must still exist while the advance '
+            'is gated'
+        )
+
+        # Release the gate, then immediately call stop(): the gated
+        # _finalize_inflight coroutine cannot resume until this coroutine
+        # yields control, so stop()'s (synchronous, up to its own first
+        # await) finalize-head check runs first — mirroring the race
+        # construction in test_verifying_merge_survives_graceful_restart_
+        # and_recovers above, but here proving stop() stays hands-off.
+        advance_gate.set()
+        await worker.stop()
+        await worker_task
+
+    assert req.result.done(), 'the gated advance must eventually resolve the request'
+    outcome = req.result.result()
+    assert outcome.status == 'done', (
+        f"stop() must not mislabel a mid-advance FINALIZING entry as the "
+        f"shutdown terminal -- expected the merge's true 'done' outcome; "
+        f"got {outcome!r}"
+    )
+    assert outcome.reason != MERGE_WORKER_SHUTDOWN_REASON, (
+        f'the true outcome must not carry the shutdown reason; got {outcome!r}'
+    )
+    assert outcome.merge_sha is not None
+
+    _, post_merge_main_raw, _ = await _run(
+        ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+    )
+    assert post_merge_main_raw.strip() == outcome.merge_sha, (
+        'main must actually have advanced to the merge commit -- proof '
+        'stop() did not tear down the worktree out from under the '
+        'in-flight advance'
     )
