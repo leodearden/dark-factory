@@ -673,9 +673,9 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 #     PRD decision 14 — Claude leads the only Rust-bearing public
 #     benchmarks and open-model Rust evidence is thin, so no architect-role
 #     variant and no production wiring).
-#   - pi + Sonnet: harness-isolating control (added in a later step) — same
-#     model+effort as the claude-sonnet-max incumbent, only the backend
-#     varies, isolating harness effect from model effect.
+#   - pi + Sonnet: harness-isolating control — same model+effort as the
+#     claude-sonnet-max incumbent, only the backend varies, isolating
+#     harness effect from model effect.
 
 # Operator-adjustable best-effort literal (the GPT-5.6 "Sol" snapshot
 # codename), matching this file's MINIMAX_MODEL/GPU-literal convention: the
@@ -684,10 +684,16 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 # brittle inline string.
 CODEX_RUST_MODEL = 'gpt-5.6'
 
+# Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
+# vs claude delta attributes cleanly to harness effect rather than a model
+# swap. Concrete Anthropic model-id resolution for the pi CLI is owned by
+# the pi backend / harness-reconnect-pi spike, not this config layer — this
+# constant's job is only to declare "same model as incumbent".
+PI_CONTROL_MODEL = 'sonnet'
+
 
 def codex_pi_candidates() -> list[EvalConfig]:
-    """The ξ candidate bundles: codex Rust implementer (+ pi Sonnet control,
-    added in a later step).
+    """The two ξ candidate bundles: codex Rust implementer + pi Sonnet control.
 
     ADDITIVE, mirroring claude_endpoint_candidates() above: resolved by name
     via get_config_by_name, never added to EVAL_CONFIGS/ofat_candidates.
@@ -695,5 +701,11 @@ def codex_pi_candidates() -> list[EvalConfig]:
     return [
         EvalConfig(
             'codex-gpt5.6-sol', 'codex', CODEX_RUST_MODEL, 'xhigh', role='implementer',
+        ),
+        # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
+        # a valid _pi_thinking level) — model+effort held constant, backend
+        # varied, so any quality/cost delta attributes to harness effect.
+        EvalConfig(
+            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role='implementer',
         ),
     ]
