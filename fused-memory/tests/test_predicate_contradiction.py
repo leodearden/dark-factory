@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -42,10 +43,15 @@ _CITED = ['03a2b6d7-3333-4000-8000-000000000003', '8ae43c70-4444-4000-8000-00000
 _PYTEST_ARGS = ['--pytest', 'tests/test_x.py::test_y']
 
 
-def _base_build_kwargs(**overrides):
+def _base_build_kwargs(**overrides: Any) -> dict[str, Any]:
     """Valid baseline kwargs for build_predicate_contradiction_task; override
-    individual fields per test."""
-    kwargs = dict(
+    individual fields per test.
+
+    Return type is ``dict[str, Any]`` (not the inferred heterogeneous
+    ``str | int | list[str]`` union) so the values splat cleanly into the
+    strongly-typed keyword-only ``build_predicate_contradiction_task`` params.
+    """
+    kwargs: dict[str, Any] = dict(
         contradiction=_CONTRADICTION,
         script='check.sh',
         timeout_secs=120,
