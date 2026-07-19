@@ -220,6 +220,31 @@ class TestAddMemoryPrematureCompletionGate:
         )
         mock_service.add_memory.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_fails_open_on_unknown_sentinel_status(self):
+        """get_statuses maps a NULL/absent DB status to the literal 'unknown'
+        sentinel (its documented contract). That is neither None nor a
+        live/active status, so the gate must fail OPEN (write proceeds), NOT
+        treat 'unknown' as a blocking non-terminal status. (task 2824 review.)
+        """
+        mock_service = _allowing_service()
+        server = _server_with_statuses(mock_service, {'5252': 'unknown'})
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _COMPLETION_CONTENT,
+                'category': 'observations_and_summaries',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'premature_completion_claim_write_blocked', (
+            f"Gate must fail open on the 'unknown' sentinel status; got: {result!r}"
+        )
+        mock_service.add_memory.assert_called_once()
+
 
 class TestAddEpisodePrematureCompletionGate:
     """Write-gate: recon-stage- agents must not write a present-tense completion
@@ -299,5 +324,28 @@ class TestAddEpisodePrematureCompletionGate:
 
         assert result.get('error') != 'premature_completion_claim_write_blocked', (
             f'Gate must not fire for a non-recon agent; got: {result!r}'
+        )
+        mock_service.add_episode.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fails_open_on_unknown_sentinel_status(self):
+        """get_statuses maps a NULL/absent DB status to the literal 'unknown'
+        sentinel; the add_episode arm must fail OPEN on it (write proceeds), not
+        treat 'unknown' as a blocking non-terminal status. (task 2824 review.)
+        """
+        mock_service = _allowing_episode_service()
+        server = _server_with_statuses(mock_service, {'5252': 'unknown'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': _COMPLETION_CONTENT,
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'premature_completion_claim_write_blocked', (
+            f"Gate must fail open on the 'unknown' sentinel status; got: {result!r}"
         )
         mock_service.add_episode.assert_called_once()

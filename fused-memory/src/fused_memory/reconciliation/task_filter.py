@@ -517,11 +517,13 @@ def nonterminal_completion_claim_task_ids(
     The probe is the composition seam (mirroring
     recon_claim_verification_guard.verify_attributed_claims's injected probe): a
     Callable[[int], str | None] returning a task's current status, or None when
-    it cannot be resolved. Fails OPEN — an id whose probed status is None
-    (unknown/absent) is excluded, so an unresolvable status never blocks the
-    write. Short-circuits: when the text carries no completion claim the probe
-    is never called, keeping the common path a pure in-process regex with no
-    live-status read.
+    it cannot be resolved. Fails OPEN — an id is blocked only when its probed
+    status is an explicit live/active member of the closed vocabulary
+    (`ACTIVE_TASK_STATUSES`). A probe returning None (unknown/absent) OR the
+    literal 'unknown' sentinel (which a NULL/absent DB status maps to) is
+    excluded, so an unresolvable status never blocks the write. Short-circuits:
+    when the text carries no completion claim the probe is never called, keeping
+    the common path a pure in-process regex with no live-status read.
 
     Pure and sync: no I/O of its own — every liveness lookup goes through the
     injected probe. This makes the acceptance criterion (in-progress rejected /
@@ -530,11 +532,14 @@ def nonterminal_completion_claim_task_ids(
     named = find_present_tense_completion_claim_task_ids(text)
     if not named:
         return set()
-    return {
-        tid
-        for tid in named
-        if (status := status_probe(tid)) is not None and status not in TERMINAL_STATUSES
-    }
+    # Positive allowlist (task 2824 review): block only on a status that is
+    # explicitly a live/active member of the closed vocabulary. Using
+    # `in ACTIVE_TASK_STATUSES` rather than `not in TERMINAL_STATUSES` means an
+    # id whose probe returns None (unknown/absent) OR the literal 'unknown'
+    # sentinel (a NULL/absent DB status maps to it) falls through as
+    # unresolvable and fails OPEN, instead of being mistaken for a non-terminal
+    # (blocking) status.
+    return {tid for tid in named if status_probe(tid) in ACTIVE_TASK_STATUSES}
 
 
 # --------------------------------------------------------------------------- #

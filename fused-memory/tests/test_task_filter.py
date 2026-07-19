@@ -3929,6 +3929,24 @@ class TestNonterminalCompletionClaimTaskIds:
             nonterminal_completion_claim_task_ids(self._COMPLETION_CONTENT, probe) == set()
         ), 'Expected empty set — an unknown/absent status must fail open (not block).'
 
+    def test_allows_unknown_sentinel_string_fails_open(self):
+        """A completion-claimed id whose probed status is the literal 'unknown'
+        sentinel string (which task_interceptor.get_statuses maps a NULL/absent
+        DB status to) is NOT returned — it is neither None nor a live/active
+        status, so it must fail open exactly like a None probe. (task 2824
+        review: a positive ACTIVE_TASK_STATUSES allowlist, not `not in
+        TERMINAL`, is what keeps the sentinel from being mistaken for a blocking
+        non-terminal status.)
+        """
+        from fused_memory.reconciliation.task_filter import (
+            nonterminal_completion_claim_task_ids,
+        )
+
+        probe = self._recording_probe({5252: 'unknown'})
+        assert (
+            nonterminal_completion_claim_task_ids(self._COMPLETION_CONTENT, probe) == set()
+        ), "Expected empty set — the 'unknown' sentinel must fail open, not block."
+
     def test_short_circuits_when_no_completion_claim(self):
         """When the text carries NO completion claim (aspirational phrasing),
         the result is empty AND the status probe is never called (short-circuit

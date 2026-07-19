@@ -868,11 +868,13 @@ def create_mcp_server(
                 ids=[str(t) for t in sorted(named)],
             )
             status_map = {int(k): v for k, v in statuses.items() if str(k).isdigit()}
-            blocked = {
-                t
-                for t in named
-                if (s := status_map.get(t)) is not None and s not in TERMINAL_STATUSES
-            }
+            # Positive allowlist (task 2824 review): block only on a status that
+            # is explicitly live/active. `in ACTIVE_TASK_STATUSES` (rather than
+            # `not in TERMINAL_STATUSES`) fails OPEN on the 'unknown' sentinel a
+            # NULL/absent DB status maps to (get_statuses' documented contract) —
+            # `not in TERMINAL_STATUSES` would mistake 'unknown' for a blocking
+            # non-terminal status, contradicting this helper's fail-open promise.
+            blocked = {t for t in named if status_map.get(t) in ACTIVE_TASK_STATUSES}
         except Exception:
             logger.warning(
                 'premature-completion gate: live status lookup failed; failing open',
