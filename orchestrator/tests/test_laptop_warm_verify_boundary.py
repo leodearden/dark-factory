@@ -1100,8 +1100,12 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 
         persistent_wt = worktree_base / '_merge-verify'
         marker = persistent_wt / 'target' / 'warm.marker'
-        wait_for_marker(marker)
-        marker_mtime_before = marker.stat().st_mtime_ns
+        # Capture the baseline only AFTER the holder's touch (create +
+        # utimensat) has settled -- under full-xdist load those two syscalls
+        # can straddle a preemption, so the instant-of-appearance mtime can
+        # still drift ~tens of ms (task 2819), which would spuriously trip
+        # the retention equality assertion below.
+        marker_mtime_before = wait_for_marker_stable(marker)
 
         waiter = spawn_verify_merge(
             sha=head_sha,
