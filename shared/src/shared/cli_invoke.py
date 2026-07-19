@@ -123,7 +123,9 @@ CAP_HIT_RESUME_PROMPT = (
 CRASH_RECOVERY_RESUME_PROMPT = (
     'You were interrupted by an orchestrator restart. '
     'Re-check your working context (plan.json if present) and current '
-    'git/worktree state, then continue where you left off.'
+    'git/worktree state, then continue where you left off. '
+    'Any escalation you filed before the restart may have been auto-dismissed '
+    'as stale — re-raise it if it is still relevant.'
 )
 
 # The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
@@ -149,6 +151,7 @@ __all__ = [
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
     'read_transcript_records',
+    'transcript_exists',
 ]
 
 
@@ -311,6 +314,18 @@ def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
             f'_resolve_transcript_path: failed to glob for session {session_id} under {config_dir}'
         )
         return None
+
+
+def transcript_exists(config_dir: Path, session_id: str) -> bool:
+    """Return ``True`` iff a transcript for *session_id* exists under *config_dir*.
+
+    A public, boolean existence check wrapping :func:`_resolve_transcript_path`
+    (the version-robust glob-by-session-id locator).  Exported so cross-package
+    callers (e.g. the orchestrator's session-resume eligibility guard) get a
+    pure existence signal without importing the underscore-prefixed locator.
+    Total — never raises: any glob error or absent file yields ``False``.
+    """
+    return _resolve_transcript_path(config_dir, session_id) is not None
 
 
 def read_transcript_records(

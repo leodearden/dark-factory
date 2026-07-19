@@ -17,7 +17,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
-from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    transcript_exists,
+)
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.safe_io import load_json_or_warn
@@ -1081,6 +1085,21 @@ class Harness:
         # Claude session via --resume rather than spawning fresh.  Keyed
         # by task_id; value is the parsed sidecar dict.
         self._recovered_sessions: dict[str, dict] = {}
+        # Parallel to _recovered_sessions (task γ, session-resume guard):
+        # the claude-config dir (``<lane>/.task/claude-config-<branch>``)
+        # captured at adoption, so the _run_slot eligibility guard can
+        # RE-glob the transcript at dispatch (not adoption) — catching the
+        # B4 foreign-acquire reseed that wipes .task between boot and
+        # re-dispatch (INV-3 corroborate-before-acting). Value is the config
+        # dir path as a string. Kept separate from the adopted sidecar dict
+        # (which flows into build_workflow) to keep the resume payload clean.
+        self._recovered_session_config_dirs: dict[str, str] = {}
+        # Consecutive-per-boot session_resume_fallback streak (task γ storm
+        # escape, INV-4). Incremented on each reason-carrying fallback in
+        # _run_slot; reset to 0 on any eligible resume. When it reaches
+        # session_resume.fallback_storm_threshold, one deduped L1 is filed.
+        # Capped/disabled degradations do NOT feed it (by design).
+        self._session_resume_fallback_streak: int = 0
 
         # Usage cap gate
         self.usage_gate: UsageGate | None = (
@@ -2411,12 +2430,95 @@ task, include it with an empty "files" list rather than omitting it.
             return None
         key = str(key)
         self._recovered_sessions[key] = session_data
+        # Best-effort: stash the surviving worktree's claude-config dir so the
+        # _run_slot guard (task γ) can RE-glob the transcript at dispatch. The
+        # dir name embeds the branch (``claude-config-<branch>``), not derivable
+        # from task_id at the pre-acquire dispatch point, so *entry* — the
+        # surviving worktree, known only here — is the last place to capture it.
+        # Never raises: a missing/globless .task simply leaves no stash, which
+        # the guard treats as 'no_transcript' (fail-safe fresh dispatch, I3).
+        try:
+            config_dirs = sorted((entry / '.task').glob('claude-config-*'))
+            if config_dirs:
+                if len(config_dirs) > 1:
+                    # >1 claude-config-<branch> dir in a single surviving
+                    # worktree is abnormal: the lexically-first pick may not be
+                    # the one holding THIS session's transcript, in which case
+                    # the dispatch-time re-glob degrades to a 'no_transcript'
+                    # fresh dispatch. Warn (loud-over-silent) so that otherwise
+                    # silent missed resume is observable.
+                    logger.warning(
+                        'Recovery: %s has %d claude-config dirs %s — stashing the '
+                        'lexically-first (%s) for session %s; if it lacks the '
+                        'transcript the resume degrades to fresh dispatch',
+                        entry.name, len(config_dirs),
+                        [str(d) for d in config_dirs], config_dirs[0],
+                        session_data.get('session_id'),
+                    )
+                self._recovered_session_config_dirs[key] = str(config_dirs[0])
+        except OSError as e:
+            logger.debug(
+                'Recovery: %s config-dir glob failed (%s) — guard will treat '
+                'the recovered session as uncorroborated', entry.name, e,
+            )
         logger.info(
             'Recovery: adopting agent session for task %s (role=%s, '
             'session_id=%s) — will --resume on re-dispatch',
             key, session_data.get('role'), session_data.get('session_id'),
         )
         return key
+
+    def _session_resume_eligible(
+        self, session: dict, config_dir: str | None
+    ) -> tuple[bool, str]:
+        """Return ``(eligible, reason)`` for a recovered session (task γ).
+
+        The PRD §7 eligibility predicate, evaluated in _run_slot BEFORE the
+        β resume injection. Totally fail-safe (I3): every ambiguous or broken
+        input degrades to an ineligible ``(False, <reason>)`` so the caller
+        falls back to a fresh dispatch — this method NEVER raises.
+
+        Reasons (checked in this order):
+          - 'disabled'      — the session_resume kill switch is off (B6).
+          - 'stale'         — (now - started_at) >= freshness_window_secs, OR
+                              started_at is missing/unparseable (fail-safe).
+          - 'capped'        — resume_count >= max_resumes_per_task (B7).
+          - 'no_transcript' — no stashed config_dir, no session_id, or the
+                              transcript is absent on disk (B4 reseed/wipe).
+          - 'eligible'      — all corroboration passed; inject the session.
+        """
+        cfg = self.config.session_resume
+        if not cfg.enabled:
+            return (False, 'disabled')
+        # Freshness — any parse failure or absent started_at is 'stale'.
+        try:
+            started_at = datetime.fromisoformat(session['started_at'])
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            age_secs = (datetime.now(UTC) - started_at).total_seconds()
+            if age_secs >= cfg.freshness_window_secs:
+                return (False, 'stale')
+        except (KeyError, ValueError, TypeError):
+            return (False, 'stale')
+        # Per-task resume cap (throttling of a healthy long-running task).
+        try:
+            resume_count = int(session.get('resume_count', 0))
+        except (ValueError, TypeError):
+            resume_count = 0
+        if resume_count >= cfg.max_resumes_per_task:
+            return (False, 'capped')
+        # Transcript corroboration — RE-glob at dispatch (INV-3), so a
+        # reseed/wipe of .task between boot and re-dispatch is detected.
+        # transcript_exists is itself total (any glob error → False), so no
+        # outer try/except is needed here to uphold this method's I3 totality:
+        # a non-empty config_dir str makes Path() safe, and a missing/absent
+        # transcript degrades to the 'no_transcript' fallback below.
+        session_id = session.get('session_id')
+        if not config_dir or not session_id:
+            return (False, 'no_transcript')
+        if not transcript_exists(Path(config_dir), session_id):
+            return (False, 'no_transcript')
+        return (True, 'eligible')
 
     async def _recover_crashed_tasks(self) -> None:
         """Scan surviving worktrees and recover plans with completed work.
@@ -4641,6 +4743,14 @@ task, include it with an empty "files" list rather than omitting it.
     _POOL_STORAGE_ABSENT_SENTINEL: str = '__pool_storage_absent__'
     _POOL_STORAGE_ABSENT_ROLE: str = 'orchestrator-pool-storage-absent'
 
+    # Synthetic task_id + agent_role for the session-resume fallback-storm L1
+    # (task γ, INV-4).  PER-BOOT — one open L1 at a time, deduped via
+    # has_open_l1.  Same class-level immutability guarantees as the sentinels
+    # above.  Fires only on a RUN of consecutive genuine resume fallbacks
+    # (suspected clock skew / wiped transcripts / mass reseed).
+    _SESSION_RESUME_STORM_SENTINEL: str = '__session_resume_storm__'
+    _SESSION_RESUME_STORM_ROLE: str = 'orchestrator-harness'
+
     def _file_pool_storage_absent_escalation(self) -> None:
         """File an L1 escalation when pool storage (worktree_base) is absent.
 
@@ -4717,6 +4827,68 @@ task, include it with an empty "files" list rather than omitting it.
             logger.warning('Filed L1 pool-storage-absent escalation %s', esc.id)
         except Exception:
             logger.warning('Failed to file pool-storage-absent escalation', exc_info=True)
+
+    def _file_session_resume_storm_escalation(self) -> None:
+        """File an L1 when session-resume fallbacks storm (task γ, INV-4).
+
+        Called from the _run_slot guard once the consecutive-per-boot
+        ``_session_resume_fallback_streak`` reaches
+        ``session_resume.fallback_storm_threshold``. A single isolated
+        fallback (a lone foreign-acquire) never trips this — only a RUN does,
+        which is the signature of SYSTEMATIC corroboration breakage (clock
+        skew, wiped transcripts, mass reseed). Deduped by ``has_open_l1`` so
+        the operator sees exactly one open storm L1 at a time.
+
+        Best-effort: a missing queue (bare-Harness unit tests) or any submit
+        failure is swallowed so filing never breaks the guard path (I3).
+        """
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.has_open_l1(self._SESSION_RESUME_STORM_SENTINEL):
+                return                         # dedup: one open L1 at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            threshold = self.config.session_resume.fallback_storm_threshold
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._SESSION_RESUME_STORM_SENTINEL),
+                task_id=self._SESSION_RESUME_STORM_SENTINEL,
+                agent_role=self._SESSION_RESUME_STORM_ROLE,
+                severity='blocking',
+                category='infra_issue',
+                summary=(
+                    'Session-resume fallback storm — '
+                    f'{threshold}+ consecutive resume corroboration failures '
+                    'this boot; resume degraded to fresh dispatch for all'
+                )[:200],
+                detail=(
+                    f'{threshold} or more consecutive session-resume '
+                    'eligibility failures occurred this boot without an '
+                    'intervening successful resume. Every recovered agent '
+                    'session was rejected (stale sidecar or absent transcript) '
+                    'and degraded to a fresh dispatch — safe, but a RUN this '
+                    'long suggests a systematic cause rather than isolated '
+                    'foreign-acquires: clock skew making every sidecar look '
+                    'stale, a reseed/`git clean` wiping transcripts out from '
+                    'under adopted sessions, or a mass lane reseed.\n\n'
+                    'Fresh dispatch loses the in-flight agent context that '
+                    'resume would have preserved, so throughput/cost is '
+                    'degraded until the cause is fixed. Check host clock skew '
+                    '(NTP) and whether warm-lane reseeds are wiping '
+                    '.task/claude-config transcripts.'
+                ),
+                suggested_action=(
+                    'Investigate clock skew (NTP) and transcript-wiping '
+                    'reseeds; the streak resets on the next successful resume, '
+                    'so resolve this L1 once the underlying cause is fixed.'
+                ),
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning('Filed L1 session-resume fallback-storm escalation %s', esc.id)
+        except Exception:
+            logger.warning(
+                'Failed to file session-resume storm escalation', exc_info=True
+            )
 
     async def _resolve_pool_storage_absent_escalation(self) -> None:
         """Resolve any pending pool-storage-absent L1 (task 2099).
@@ -6018,8 +6190,64 @@ task, include it with an empty "files" list rather than omitting it.
 
             recovered_plan = self._recovered_plans.pop(assignment.task_id, None)
             recovered_session = self._recovered_sessions.pop(assignment.task_id, None)
+            recovered_config_dir = self._recovered_session_config_dirs.pop(
+                assignment.task_id, None
+            )
             # Drop any preserved-worktree marker once the slot picks the task up.
             self._preserved_worktrees.discard(assignment.task_id)
+
+            # ── γ session-resume eligibility guard (task 2774) ────────────────
+            # A recovered session is injected as --resume below ONLY when it is
+            # fresh, under its per-task resume cap, and its transcript is
+            # corroborated on disk. Any ineligible session degrades to a fresh
+            # dispatch WITH the recovered plan (I3 — never a stall, never a
+            # scheduler-visible error), emitting a reason-carrying event. The
+            # kill switch (enabled=False) degrades silently (B6). Streak
+            # bookkeeping / storm-escape is layered in by task 2774 step-6.
+            if recovered_session is not None:
+                eligible, reason = self._session_resume_eligible(
+                    recovered_session, recovered_config_dir
+                )
+                # Capture the session identity for the event BEFORE any nulling.
+                resume_event_data = {
+                    'session_id': recovered_session.get('session_id'),
+                    'role': recovered_session.get('role'),
+                }
+                if eligible:
+                    self._session_resume_fallback_streak = 0  # break any storm run
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.session_resume,
+                            task_id=assignment.task_id,
+                            data=resume_event_data,
+                        )
+                else:
+                    recovered_session = None  # fresh dispatch, recovered plan kept
+                    if reason == 'disabled':
+                        pass  # kill switch — silent, no event, no streak (B6)
+                    elif reason == 'capped':
+                        # By-design throttling — its own event, does NOT feed
+                        # the storm streak.
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.session_resume_capped,
+                                task_id=assignment.task_id,
+                                data=resume_event_data,
+                            )
+                    else:  # 'stale' / 'no_transcript' — genuine corroboration fail
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.session_resume_fallback,
+                                task_id=assignment.task_id,
+                                data={**resume_event_data, 'reason': reason},
+                            )
+                        self._session_resume_fallback_streak += 1
+                        if (
+                            self._session_resume_fallback_streak
+                            >= self.config.session_resume.fallback_storm_threshold
+                        ):
+                            self._file_session_resume_storm_escalation()
+            # ──────────────────────────────────────────────────────────────────
 
             # Build steward factory — steward starts when the workflow
             # creates its worktree (it needs the path).

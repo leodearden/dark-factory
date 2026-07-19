@@ -138,6 +138,19 @@ class EventType(StrEnum):
     task_started = 'task_started'
     task_completed = 'task_completed'
 
+    # Warm-lane session resume (task γ, plans/warm-lane-session-resume-prd.md).
+    # Emitted by the _run_slot eligibility guard, only when a recovered agent
+    # session was present for the dispatched task:
+    #   session_resume          — an eligible session was injected as --resume.
+    #   session_resume_fallback — an ineligible session degraded to fresh
+    #                             dispatch; data.reason ∈ {stale, no_transcript}.
+    #   session_resume_capped   — resume_count reached max_resumes_per_task;
+    #                             by-design throttling, degrades to fresh dispatch.
+    # (enabled=False degrades silently — no event.)
+    session_resume = 'session_resume'
+    session_resume_fallback = 'session_resume_fallback'
+    session_resume_capped = 'session_resume_capped'
+
     # Scheduler fairness
     task_skipped = 'task_skipped'
     reservation_installed = 'reservation_installed'

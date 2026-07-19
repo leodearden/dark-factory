@@ -51,6 +51,7 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
     harness._workflow_slot_tasks = {}
     harness._recovered_plans = {}
     harness._recovered_sessions = {}
+    harness._recovered_session_config_dirs = {}
     harness._preserved_worktrees = set()
     harness._terminal_cancel_counts = {}
     harness.git_ops = MagicMock()

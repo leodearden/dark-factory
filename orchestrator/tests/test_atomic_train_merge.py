@@ -1145,6 +1145,7 @@ class TestScenario6ParkPrefixDerail:
         harness._recovered_plans = {}
         harness._preserved_worktrees = set()
         harness._recovered_sessions = {}
+        harness._recovered_session_config_dirs = {}
         harness.event_store = None
 
         # Create α/β worktree dirs.

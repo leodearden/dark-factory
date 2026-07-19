@@ -132,6 +132,7 @@ def harness_for_run_slot() -> Harness:
     # run-slot supporting state
     h._recovered_plans = {}
     h._recovered_sessions = {}
+    h._recovered_session_config_dirs = {}
     h._preserved_worktrees = set()
     h.event_store = None
     # TaskWorkflow constructor kwarg sources — all None since TaskWorkflow is
