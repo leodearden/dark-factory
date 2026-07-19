@@ -751,11 +751,21 @@ def eval_cmd(
 
 
 def _load_fixture_dir(tasks_dir: Path) -> list[dict]:
-    """Load every ``*.json`` eval fixture in *tasks_dir* (empty list if absent)."""
+    """Load every ``*.json`` eval fixture in *tasks_dir* (empty list if absent).
+
+    A malformed or truncated fixture (e.g. an interrupted ``eval-sample`` write)
+    is surfaced loudly with the offending file NAMED — a clean CLI error rather
+    than an opaque ``JSONDecodeError`` traceback with no filename context.
+    """
     fixtures: list[dict] = []
     if tasks_dir.exists():
         for tp in sorted(tasks_dir.glob('*.json')):
-            fixtures.append(json.loads(tp.read_text()))
+            try:
+                fixtures.append(json.loads(tp.read_text()))
+            except json.JSONDecodeError as exc:
+                raise click.ClickException(
+                    f'malformed eval fixture {tp}: {exc}'
+                ) from exc
     return fixtures
 
 
@@ -765,14 +775,19 @@ def _load_fixture_dir(tasks_dir: Path) -> list[dict]:
 @click.option('--cohort', default=None,
               help='Scope the stratification to one cohort (e.g. revival-zeta)')
 @click.option('--audit', is_flag=True,
-              help='Also run the corpus audit (band + per-fixture completeness); '
-                   'exits non-zero on any audit failure')
+              help='Also run the corpus audit (band + per-fixture completeness) '
+                   'over ONE cohort; exits non-zero on any audit failure. '
+                   'Scopes to --cohort when given, else defaults to the '
+                   'revival-zeta band cohort — so a bare --audit never flags '
+                   'the retained legacy fixtures (band overflow / unpinned '
+                   'branches) as failures.')
 def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bool):
     """Print the eval-fixture stratification (repo×kind×path) counts.
 
     Reads only the fixtures dir — needs no orchestrator config.
     """
     from orchestrator.evals.task_sampler import (
+        DEFAULT_COHORT,
         audit_fixture_corpus,
         format_stratification_table,
         git_ref_exists,
@@ -784,10 +799,16 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
     click.echo(format_stratification_table(counts))
 
     if audit:
-        scoped = [f for f in fixtures if cohort is None or f.get('cohort') == cohort]
+        # The band [10,14] + evals/<id> branch-pin checks are revival-ζ
+        # invariants. A bare --audit over ALL cohorts would falsely fail on the
+        # retained legacy fixtures (df_task_12/13/18, reify_task_12/27): band
+        # overflow (>14 total) + missing_branch for every unpinned legacy id.
+        # So scope the audit to the requested cohort, defaulting to revival-ζ.
+        audit_cohort = cohort if cohort is not None else DEFAULT_COHORT
+        scoped = [f for f in fixtures if f.get('cohort') == audit_cohort]
         report = audit_fixture_corpus(scoped, ref_exists=git_ref_exists)
         click.echo('')
-        click.echo(f'audit: ok={report.ok} count={report.count}')
+        click.echo(f'audit ({audit_cohort}): ok={report.ok} count={report.count}')
         for failure in report.failures:
             click.echo(f'  FAIL {failure}')
         if not report.ok:

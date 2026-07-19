@@ -41,6 +41,7 @@ from orchestrator.evals.snapshots import get_diff_between_commits
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'DEFAULT_COHORT',
     'Cell',
     'CompletedTaskCandidate',
     'FixtureAuditReport',
@@ -67,6 +68,11 @@ __all__ = [
     'stratification_counts',
     'stratify',
 ]
+
+# The canonical revival-ζ cohort marker. Single-sourced here (the sampler is
+# what stamps ``cohort`` onto each cut record) so the ``eval-sample`` default
+# and the ``eval-list-fixtures --audit`` default scope can't drift apart.
+DEFAULT_COHORT = 'revival-zeta'
 
 # A stratification cell: the ``(repo, kind, path)`` 3-tuple.
 Cell = tuple[str, str, str]
@@ -594,7 +600,8 @@ async def discover_completed_tasks(
         cmd.insert(2, f'--since={since}')
     out = await _git_run(cmd, cwd=root)
 
-    candidates: list[CompletedTaskCandidate] = []
+    # First pass: parse ``(task_id, merge_sha)`` from each merge subject.
+    parsed: list[tuple[str, str]] = []
     for line in out.splitlines():
         line = line.strip()
         if not line:
@@ -603,12 +610,35 @@ async def discover_completed_tasks(
         match = _MERGE_SUBJECT_RE.search(subject)
         if not match:
             continue
-        pre = await _git_run(['git', 'rev-parse', f'{sha}^1'], cwd=root)
+        parsed.append((match.group(1), sha))
+
+    if not parsed:
+        return []
+
+    # Resolve every merge's first parent (M^1 = the eval baseline) in a SINGLE
+    # batched ``git rev-parse`` rather than one subprocess per merge: a 6-week
+    # ``--since`` window can hold hundreds of merges, and the per-commit spawn
+    # cost dominated discovery (most candidates are then discarded by
+    # sampling). ``git rev-parse`` emits one line per revision arg, in order.
+    pre_out = await _git_run(
+        ['git', 'rev-parse', *(f'{sha}^1' for _, sha in parsed)], cwd=root,
+    )
+    pre_commits = pre_out.splitlines()
+    if len(pre_commits) != len(parsed):
+        # Loud-over-silent: a mismatched line count means the zip below would
+        # silently misalign pre-commits with merges — fail instead.
+        raise RuntimeError(
+            f'discover_completed_tasks: rev-parse returned {len(pre_commits)} '
+            f'pre-commit(s) for {len(parsed)} merge(s) in {root}'
+        )
+
+    candidates: list[CompletedTaskCandidate] = []
+    for (task_id, sha), pre in zip(parsed, pre_commits, strict=True):
         candidates.append(CompletedTaskCandidate(
-            task_id=match.group(1),
+            task_id=task_id,
             project=project,
             project_root=resolved_root,
-            pre_commit=pre,
+            pre_commit=pre.strip(),
             post_commit=sha,
             merge_sha=sha,
         ))

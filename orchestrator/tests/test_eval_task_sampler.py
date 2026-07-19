@@ -35,6 +35,7 @@ from orchestrator.evals.task_sampler import (
     discover_completed_tasks,
     enrich_candidates_from_task_db,
     format_stratification_table,
+    git_ref_exists,
     materialize_reference_diff,
     pin_eval_branch,
     repo_of,
@@ -836,3 +837,146 @@ class TestEvalSampleDryRunCLI:
         # No fixture files written and no evals/* branches pinned.
         assert list(tasks_dir.glob('*.json')) == []
         assert _git(['branch', '--list', 'evals/*'], repo) == ''
+
+
+# ---------------------------------------------------------------------------
+# git_ref_exists — the production branch-presence predicate (real git)
+# ---------------------------------------------------------------------------
+
+def _bare_commit_repo(repo: Path) -> Path:
+    """Init a temp git repo with a single base commit; return its path."""
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(['init', '-q', '-b', 'main'], repo)
+    _git(['config', 'user.email', 'test@example.com'], repo)
+    _git(['config', 'user.name', 'Test User'], repo)
+    _git(['config', 'commit.gpgsign', 'false'], repo)
+    (repo / 'base.txt').write_text('base\n')
+    _git(['add', '.'], repo)
+    _git(['commit', '-q', '-m', 'base'], repo)
+    return repo
+
+
+class TestGitRefExists:
+    def test_present_ref_returns_true(self, tmp_path: Path) -> None:
+        repo = _bare_commit_repo(tmp_path / 'repo')
+        _git(['branch', 'evals/df_task_1', 'HEAD'], repo)
+        assert git_ref_exists(str(repo), 'evals/df_task_1') is True
+
+    def test_absent_ref_returns_false(self, tmp_path: Path) -> None:
+        repo = _bare_commit_repo(tmp_path / 'repo')
+        # No branch pinned -> the ref does not resolve.
+        assert git_ref_exists(str(repo), 'evals/df_task_missing') is False
+
+    def test_non_repo_returns_false_not_raises(self, tmp_path: Path) -> None:
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+        # A non-repo dir surfaces as False (a named audit failure), never a crash.
+        assert git_ref_exists(str(plain), 'evals/df_task_1') is False
+
+
+# ---------------------------------------------------------------------------
+# CLI — eval-list-fixtures --audit (real-git glue + exit-code behaviour)
+# ---------------------------------------------------------------------------
+
+def _seed_zeta_corpus(
+    tasks_dir: Path, repo_root: Path, n: int, *,
+    cohort: str = 'revival-zeta', start: int = 0,
+) -> list[str]:
+    """Seed *n* complete fixtures rooted at *repo_root*; return their ids.
+
+    Each fixture is a band-plausible ``_HEALTHY_CELLS`` cell with a plan (so its
+    ``reference`` / ``verify_outcome`` blocks are present), but its
+    ``project_root`` is rewritten to the temp *repo_root* so the CLI audit's
+    real ``git_ref_exists`` probe hits that hermetic repo rather than the live
+    checkout ``make_candidate`` hardcodes.
+
+    *start* offsets the task-id space (and thus the fixture filenames) so a
+    second cohort seeded into the same dir does NOT overwrite the first.
+    """
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    ids: list[str] = []
+    for i in range(start, start + n):
+        repo, kind, path = _HEALTHY_CELLS[i % len(_HEALTHY_CELLS)]
+        rec = _fixture(i, repo=repo, kind=kind, path=path,
+                       cohort=cohort, plan={'steps': []})
+        rec['project_root'] = str(repo_root)
+        (tasks_dir / f'{rec["id"]}.json').write_text(json.dumps(rec))
+        ids.append(rec['id'])
+    return ids
+
+
+class TestEvalListFixturesAuditCLI:
+    def test_clean_corpus_audit_exits_zero(self, tmp_path: Path) -> None:
+        repo = _bare_commit_repo(tmp_path / 'df-repo')
+        tasks_dir = tmp_path / 'tasks'
+        ids = _seed_zeta_corpus(tasks_dir, repo, 12)
+        for fid in ids:  # pin every evals/<id> branch -> clean
+            _git(['branch', f'evals/{fid}', 'HEAD'], repo)
+        result = CliRunner().invoke(
+            main, ['eval-list-fixtures', '--tasks-dir', str(tasks_dir), '--audit'],
+        )
+        assert result.exit_code == 0, result.output
+        assert 'audit (revival-zeta)' in result.output
+        assert 'ok=True' in result.output
+
+    def test_missing_branch_audit_exits_nonzero(self, tmp_path: Path) -> None:
+        repo = _bare_commit_repo(tmp_path / 'df-repo')
+        tasks_dir = tmp_path / 'tasks'
+        ids = _seed_zeta_corpus(tasks_dir, repo, 12)
+        for fid in ids[:-1]:  # leave the last id's branch UNpinned
+            _git(['branch', f'evals/{fid}', 'HEAD'], repo)
+        result = CliRunner().invoke(
+            main, ['eval-list-fixtures', '--tasks-dir', str(tasks_dir), '--audit'],
+        )
+        assert result.exit_code == 1, result.output
+        assert 'ok=False' in result.output
+        assert f'missing_branch:{ids[-1]}' in result.output
+
+    def test_band_violation_audit_exits_nonzero(self, tmp_path: Path) -> None:
+        repo = _bare_commit_repo(tmp_path / 'df-repo')
+        tasks_dir = tmp_path / 'tasks'
+        ids = _seed_zeta_corpus(tasks_dir, repo, 5)  # below the [10,14] floor
+        for fid in ids:
+            _git(['branch', f'evals/{fid}', 'HEAD'], repo)
+        result = CliRunner().invoke(
+            main, ['eval-list-fixtures', '--tasks-dir', str(tasks_dir), '--audit'],
+        )
+        assert result.exit_code == 1, result.output
+        assert any('band' in line for line in result.output.splitlines()), result.output
+
+    def test_bare_audit_ignores_retained_legacy_cohort(self, tmp_path: Path) -> None:
+        # The fix under test: a bare --audit (no --cohort) scopes to revival-ζ,
+        # so retained legacy fixtures (different cohort, no pinned branch) do
+        # NOT push the corpus out of band or trip missing_branch.
+        repo = _bare_commit_repo(tmp_path / 'df-repo')
+        tasks_dir = tmp_path / 'tasks'
+        ids = _seed_zeta_corpus(tasks_dir, repo, 12)
+        for fid in ids:
+            _git(['branch', f'evals/{fid}', 'HEAD'], repo)
+        # Add unpinned legacy-cohort fixtures (disjoint id space) alongside the
+        # clean zeta corpus.
+        _seed_zeta_corpus(tasks_dir, repo, 3, cohort='legacy-april', start=100)
+        result = CliRunner().invoke(
+            main, ['eval-list-fixtures', '--tasks-dir', str(tasks_dir), '--audit'],
+        )
+        assert result.exit_code == 0, result.output
+        assert 'audit (revival-zeta)' in result.output
+        assert 'ok=True' in result.output
+
+    def test_explicit_cohort_scopes_the_audit(self, tmp_path: Path) -> None:
+        # --cohort overrides the revival-ζ default: auditing the legacy cohort
+        # (5 fixtures, unpinned) fails band + missing_branch, not the zeta set.
+        repo = _bare_commit_repo(tmp_path / 'df-repo')
+        tasks_dir = tmp_path / 'tasks'
+        ids = _seed_zeta_corpus(tasks_dir, repo, 12)
+        for fid in ids:
+            _git(['branch', f'evals/{fid}', 'HEAD'], repo)
+        _seed_zeta_corpus(tasks_dir, repo, 5, cohort='legacy-april', start=100)
+        result = CliRunner().invoke(
+            main,
+            ['eval-list-fixtures', '--tasks-dir', str(tasks_dir),
+             '--cohort', 'legacy-april', '--audit'],
+        )
+        assert result.exit_code == 1, result.output
+        assert 'audit (legacy-april)' in result.output
+        assert any('band' in line for line in result.output.splitlines()), result.output
