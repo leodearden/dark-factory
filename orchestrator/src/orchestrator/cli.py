@@ -575,6 +575,20 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
             # holds the shared lane lock. Emit the distinguished contention result
             # WITHOUT ever touching the tree (no acquire_host_verify_worktree, no
             # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
+            #
+            # holder_pgid can legitimately be None here — a DIAGNOSTIC-only window,
+            # not a correctness gap. The shared holder is written by _run()'s
+            # build-scoped hold, NOT at this gate (see the DUAL-LOCK note above). So
+            # when the current holder is another NEW-code verify-merge that has
+            # passed its own gate, released the lane lock, and is mid-reset inside
+            # acquire_host_verify_worktree — reset_persistent_merge_worktree takes
+            # the lane lock but never writes the holder-pgid (git_ops.py) — this read
+            # returns None for that window. Mutual exclusion and the gate contract
+            # are intact; make_flock_contention_result tolerates holder_pgid=None
+            # (only the diagnostic's holder_pgid field is null). A follow-up could
+            # restore always-present holder visibility by also writing the shared
+            # holder at this gate, at the cost of extra cleanup on _run()'s fail-open
+            # (build_lane_fd is None) path.
             holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
             contention_result = make_flock_contention_result(
                 host=socket.gethostname(),
@@ -593,7 +607,8 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
                 # it recorded (NOT yet clobbered — we write ours only after both
                 # locks are held), emit the distinguished result, and release the
                 # already-held lane lock before bailing so the primary lock is not
-                # leaked on this fail-closed path.
+                # leaked on this fail-closed path. holder_pgid may also be None here
+                # (a NEW-code holder mid-reset — see the lane-timeout path above).
                 holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
                 contention_result = make_flock_contention_result(
                     host=socket.gethostname(),
