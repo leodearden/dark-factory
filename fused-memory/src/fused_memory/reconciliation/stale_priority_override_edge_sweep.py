@@ -63,6 +63,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from pathlib import Path
+
+from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.reconciliation.task_filter import TASK_REF_RE
 
@@ -203,3 +206,67 @@ def select_stale_priority_override_edges(
         ):
             selected.append(edge)
     return selected
+
+
+# --------------------------------------------------------------------------- #
+# read_live_override_state — live scheduler-override reader
+# --------------------------------------------------------------------------- #
+
+
+def _overrides_db_path(project_root: str) -> Path:
+    """Return the canonical scheduler_overrides.db path for *project_root*.
+
+    Source of truth: ``server/tools.py::_overrides_db_path`` — hand-mirrored
+    here (not imported) because importing ``server.tools`` into
+    ``reconciliation`` would create an import cycle (``server.tools`` imports
+    ``reconciliation``), and fused-memory has no orchestrator dependency.
+    """
+    return Path(project_root) / 'data' / 'orchestrator' / 'scheduler_overrides.db'
+
+
+async def read_live_override_state(project_root: str) -> dict[str, dict]:
+    """Read live scheduler-override state from ``scheduler_overrides.db``.
+
+    Reads the FULL overrides table for *project_root* — deliberately WITHOUT
+    ``get_pin_queue``'s ``pinned=1`` filter (see the module docstring's
+    live-state-source design decision) — so a task absent from the returned
+    map is a positive, fail-safe "override consumed/cleared" signal rather
+    than merely "not pinned".
+
+    Returns ``{}`` when the DB file does not exist (no overrides recorded
+    yet). Otherwise returns ``{str(task_id): {'boost_tier', 'pinned',
+    'pin_order', 'reserve_now', 'ttl_until'}}`` where ``ttl_until`` is parsed
+    to a tz-aware ``datetime`` (or ``None`` when the column is NULL).
+
+    Opens the DB via ``connect_daemon`` + ``apply_full_durability_pragmas``
+    (the same ``shared.async_sqlite_base`` plumbing ``server/tools.py`` uses),
+    closing the connection in ``finally``. May raise on a transient DB error;
+    the caller (``sweep_stale_priority_override_edges``) treats that
+    best-effort — aborting the cycle no-op, self-healing next cycle.
+    """
+    db_path = _overrides_db_path(project_root)
+    if not db_path.exists():
+        return {}
+
+    db = await connect_daemon(str(db_path))
+    try:
+        await apply_full_durability_pragmas(db, busy_timeout_ms=5000)
+        cursor = await db.execute(
+            'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+            'FROM overrides WHERE project_root=?',
+            (str(project_root),),
+        )
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+
+    live: dict[str, dict] = {}
+    for task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until in rows:
+        live[str(task_id)] = {
+            'boost_tier': boost_tier,
+            'pinned': bool(pinned),
+            'pin_order': pin_order,
+            'reserve_now': bool(reserve_now),
+            'ttl_until': datetime.fromisoformat(ttl_until) if ttl_until else None,
+        }
+    return live
