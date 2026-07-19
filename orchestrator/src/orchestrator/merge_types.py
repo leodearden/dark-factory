@@ -746,6 +746,18 @@ class MergeRequest:
     lane: Literal['normal', 'high'] = field(default='normal', kw_only=True)
     """Priority lane for this request.  'high' requests are picked before all
     'normal' requests; within a lane FIFO order is preserved."""
+    retry_failed_only: bool = field(default=False, kw_only=True)
+    """Caller-vouched flag routing this request's post-merge verify retries to
+    a failed-tests-only re-run instead of a full re-verify (PRD
+    docs/prds/verify-retry-failed-only.md task D1).
+
+    Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
+    onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
+    ``req`` inside the worker's post-merge verify retry path
+    (:func:`orchestrator.merge_queue._run_post_merge_verify`).  Default
+    ``False`` is a strict no-op — the retry-set primitive that consumes this
+    flag ships separately (reify, PRD task D2); until then every retry path
+    behaves byte-identically regardless of this value."""
 
 
 @dataclass(frozen=True)

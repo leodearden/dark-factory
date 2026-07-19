@@ -2315,6 +2315,112 @@ class TestMergeRequestDedup:
             'Registry slot should be released after merge completes'
         )
 
+    async def test_retry_failed_only_reaches_worker(self, tmp_path: Path):
+        """merge_request(retry_failed_only=True) threads the flag onto the
+        MergeRequest the worker dequeues (PRD task D1).
+
+        The background worker captures the dequeued MergeRequest so the test
+        can assert ``req.retry_failed_only is True`` — i.e. the caller-vouched
+        bool reaches the worker's retry path (``req`` is the same object
+        ``_run_post_merge_verify`` reads).
+        """
+        import asyncio
+
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def _worker():
+            req = await mq.get()
+            captured['req'] = req
+            req.result.set_result(
+                MergeOutcome('done', merge_sha='abc123', reason='test merge')
+            )
+
+        worker_task = asyncio.create_task(_worker())
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='RFO',
+                branch='RFO',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=100,
+                retry_failed_only=True,
+            ),
+            timeout=5.0,
+        )
+
+        await worker_task
+
+        assert result.get('status') == 'done', f'Expected status done, got: {result}'
+        assert 'req' in captured, 'Worker did not dequeue a MergeRequest'
+        assert captured['req'].retry_failed_only is True, (
+            'retry_failed_only=True must be threaded onto the dequeued MergeRequest'
+        )
+
+    async def test_retry_failed_only_defaults_false(self, tmp_path: Path):
+        """Omitting retry_failed_only leaves the dequeued MergeRequest's flag
+        False — the default is a strict no-op (unchanged behavior)."""
+        import asyncio
+
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def _worker():
+            req = await mq.get()
+            captured['req'] = req
+            req.result.set_result(
+                MergeOutcome('done', merge_sha='abc123', reason='test merge')
+            )
+
+        worker_task = asyncio.create_task(_worker())
+
+        await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='RFO2',
+                branch='RFO2',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=100,
+            ),
+            timeout=5.0,
+        )
+
+        await worker_task
+
+        assert 'req' in captured, 'Worker did not dequeue a MergeRequest'
+        assert captured['req'].retry_failed_only is False, (
+            'retry_failed_only must default to False on the dequeued MergeRequest'
+        )
+
     async def test_inflight_with_workflow_path_registration(self, tmp_path: Path):
         """Acceptance #1: a branch registered via the workflow-path helper is
         visible to the MCP merge_request coalesce gate.

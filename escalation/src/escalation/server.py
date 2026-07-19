@@ -1097,6 +1097,7 @@ def create_server(
         description: str = '',
         wait_secs: int = 0,
         verified_green: bool = False,
+        retry_failed_only: bool = False,
     ) -> dict[str, Any]:
         """Submit a merge request to the orchestrator merge queue.
 
@@ -1126,6 +1127,16 @@ def create_server(
         degrading to ``INDETERMINATE``.  Default ``False`` — no attribution,
         emits nothing (mirrors the orchestrator's own emission at the
         VERIFY→REVIEW transition for its own submissions).
+
+        *retry_failed_only* — set True to vouch that this request's post-merge
+        verify retries should re-run only the previously-failed tests instead
+        of a full re-verify (PRD docs/prds/verify-retry-failed-only.md task
+        D1, following the same caller-vouched-bool shape as *verified_green*
+        above).  Threaded onto the ``MergeRequest`` the worker dequeues so it
+        is visible on ``req`` inside the worker's retry path
+        (``_run_post_merge_verify``).  Default ``False`` is a strict no-op —
+        the retry-set primitive that consumes this flag ships separately
+        (reify, PRD task D2), so today every value leaves behavior unchanged.
 
         Response shapes:
         - Normal outcome: ``{status, request_id, reason, conflict_details,
@@ -1219,6 +1230,7 @@ def create_server(
             config=orch_config,
             result=future,
             snapshot_tip=resolved_tip,
+            retry_failed_only=retry_failed_only,
         )
 
         # Build a live_snapshot provider from the live worker handle so the
