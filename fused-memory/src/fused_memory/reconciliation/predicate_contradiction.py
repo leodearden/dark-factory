@@ -57,6 +57,7 @@ __all__ = [
     'PROVENANCE_METADATA_KEY',
     'PredicateContradictionTask',
     'build_predicate_contradiction_task',
+    'render_predicate_contradiction_section',
 ]
 
 # The x_-prefixed forward-compat namespace (silently allowed by parse_metadata,
@@ -227,4 +228,51 @@ def build_predicate_contradiction_task(
         priority=priority,
         task_kind='deterministic',
         metadata=metadata,
+    )
+
+
+def render_predicate_contradiction_section() -> str:
+    """Render the predicate-contradiction filing-convention prompt section
+    (task 2779), following the ``render_*`` style in ``recon_self_model.py``.
+
+    Interpolated into the Stage 2 system prompt so recon stages that file tasks
+    see WHEN to use this path, HOW to file it, the exit-code contract, and WHY
+    ``execution_class`` must be ``'code_tdd'``. The ``code_tdd`` token and the
+    forbidden-class list are single-sourced from :data:`EXECUTION_CLASSES` so
+    the rendered prose cannot drift from the guard's accepted set.
+    """
+    forbidden = ', '.join(
+        f'`{c}`' for c in EXECUTION_CLASSES if c != _REQUIRED_EXECUTION_CLASS
+    )
+    return (
+        '## Predicate Contradiction Checks\n'
+        'When a contradiction can only be settled by LIVE command execution — a '
+        'specific pytest test, a `git grep`, a `git log --grep` — do NOT settle '
+        'it with an ad-hoc Mem0 investigation note or suppression record. Those '
+        'silently age across cycles without ever being decided (the task-2643 '
+        'precedent, resolved manually over two investigation cycles). Instead of '
+        'that, file a one-off deterministic PREDICATE task that runs the check '
+        'and is decided automatically by its exit code.\n\n'
+        'HOW: build the submission with '
+        '`build_predicate_contradiction_task(...)` (module '
+        '`fused_memory.reconciliation.predicate_contradiction`) and submit its '
+        "`as_submit_task_kwargs()` — it emits a "
+        "`submit_task(task_kind='deterministic', ...)` whose "
+        "`metadata.before_done.kind='predicate'` points at a committed, "
+        'executable check script (e.g. `scripts/recon_predicate_check.sh`) and '
+        f"whose `metadata.execution_class='{_REQUIRED_EXECUTION_CLASS}'`.\n\n"
+        'EXIT-CODE CONTRACT (the runner parses the exit code only, never '
+        'stdout):\n'
+        "  - exit 0 -> task done, done_provenance.kind='deterministic-milestone'\n"
+        '  - non-zero -> born-at-L2 `milestone_check_failed` escalation + task '
+        'blocked\n\n'
+        f"WHY execution_class MUST be `{_REQUIRED_EXECUTION_CLASS}`: a "
+        "`before_done.kind='predicate'` task forbids `always_escalates=True` "
+        '(deterministic_task_guard invariant 6), but the '
+        f'{forbidden} execution classes are coerced at the submit boundary to '
+        "`task_kind='deterministic'` + `always_escalates=True` — which would "
+        f'make the predicate submission illegal. `{_REQUIRED_EXECUTION_CLASS}` '
+        'is the only class that does not trigger that coercion, so it is the '
+        'only one compatible with a recon-filed predicate task; the helper '
+        'fixes it and rejects any other value.'
     )
