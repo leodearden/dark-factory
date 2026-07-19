@@ -211,3 +211,94 @@ class TestRunEndToEnd:
 
         # (d) persisted via save_result.
         mocks['save'].assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# step-07/08 — run_ofat_stage: role-dispatching bounded-concurrency fan-out.
+#
+# OFAT reuses the EXISTING frozen-input executors (decision 9): an implementer
+# candidate (role=='implementer') dispatches to run_eval (frozen plan), an
+# architect candidate (role=='architect') to run_architect_eval (live architect,
+# downstream frozen). It is a role-dispatching fan-out, not new per-role
+# machinery. Mirrors test_runner_matrix's monkeypatch + non-cancel-continue
+# regression guard.
+# ---------------------------------------------------------------------------
+
+def _ofat_task_loader(path: Path) -> dict:
+    return {'id': path.stem, 'project_root': '/fake', 'pre_task_commit': 'x'}
+
+
+@pytest.mark.asyncio
+class TestRunOfatStage:
+    async def test_dispatches_each_candidate_by_role_over_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
+        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
+
+        eval_calls: list[tuple[str, str, int]] = []
+        arch_calls: list[tuple[str, str, int]] = []
+
+        async def fake_run_eval(task_path, config, *_a, trial=1, **_k):
+            eval_calls.append((task_path.stem, config.name, trial))
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/wt', trial=trial)
+
+        async def fake_run_arch(task_path, config, *_a, trial=1, **_k):
+            arch_calls.append((task_path.stem, config.name, trial))
+            return EvalResult(task_path.stem, config.name, 'done',
+                              {'role_under_test': 'architect'}, '/tmp/wt', trial=trial)
+
+        monkeypatch.setattr(runner, 'load_task', _ofat_task_loader)
+        monkeypatch.setattr(runner, 'run_eval', fake_run_eval)
+        monkeypatch.setattr(runner, 'run_architect_eval', fake_run_arch)
+
+        results = await runner.run_ofat_stage(
+            [t1, t2], [impl_cfg, arch_cfg], base_config=None, trials=2,
+        )
+
+        # Implementer candidate → run_eval; architect candidate → run_architect_eval.
+        assert {c[1] for c in eval_calls} == {'claude-opus-high'}
+        assert {c[1] for c in arch_calls} == {'architect-sonnet-high'}
+        # Exactly one dispatch per (fixture, trial) per candidate: 2 fixtures × 2 trials.
+        assert len(eval_calls) == 4
+        assert len(arch_calls) == 4
+        # Flattened results cover every (candidate, fixture, trial) cell.
+        assert len(results) == 2 * 2 * 2  # candidates × fixtures × trials
+
+    async def test_non_cancel_failure_in_one_cell_does_not_abort_others(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        import logging
+
+        from orchestrator.evals import runner
+
+        t_ok = tmp_path / 'df_task_ok.json'
+        t_fail = tmp_path / 'df_task_fail.json'
+        t_ok.touch()
+        t_fail.touch()
+        impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
+
+        async def fake_run_eval(task_path, config, *_a, trial=1, **_k):
+            if 'fail' in task_path.stem:
+                raise RuntimeError('boom in one cell')
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/wt', trial=trial)
+
+        monkeypatch.setattr(runner, 'load_task', _ofat_task_loader)
+        monkeypatch.setattr(runner, 'run_eval', fake_run_eval)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.evals.runner'):
+            results = await runner.run_ofat_stage(
+                [t_ok, t_fail], [impl_cfg], base_config=None, trials=1,
+            )
+
+        # The failing cell is logged and skipped; the ok cell still returns.
+        assert len(results) == 1
+        assert results[0].task_id == 'df_task_ok'
+        assert any('failed' in r.message.lower() for r in caplog.records)
