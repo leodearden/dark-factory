@@ -848,3 +848,40 @@ async def test_b8_fallback_storm_files_one_l1(harness: Harness):
     esc = harness._escalation_queue.submit.call_args.args[0]
     assert esc.level == 1
     assert 'resume' in esc.summary.lower()
+
+
+# ── B9: cold worktree, plan present — β widens the cold path too ─────────────
+@pytest.mark.asyncio
+async def test_b9_cold_worktree_plan_present_adopts_and_injects(harness: Harness):
+    """B9 — a COLD worktree (``<base>/<task_id>``, NOT a pool lane) with a plan
+    + v2 sidecar + transcript is adopted-and-injected exactly like the warm
+    lane: β widened both paths, so the cold worktree also resumes.
+
+    The dir is named after the real task_id (cold path: ``recovery_id ==
+    entry.name``) and no pool is attached, so ``is_lane`` is False and recovery
+    takes the heuristic cold branch — yet the two-way outcome is identical to
+    B1: session adopted, plan recovered, and at dispatch ``resume_session_id``
+    is the same session with the recovered plan and one ``session_resume``
+    event.
+    """
+    task_id, session_id = '48', 'uuid-b9-cold'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', lane=False,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): cold worktree adopted + plan recovered ──
+    assert task_id in harness._recovered_sessions
+    assert harness._recovered_sessions[task_id]['session_id'] == session_id
+    assert task_id in harness._recovered_plans
+    adopted = harness._recovered_sessions[task_id]
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ): same session + plan + one resume event ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id['session_id'] == session_id
+    assert cap.initial_plan is recovered_plan
+    assert [et for et, _ in cap.emits] == [EventType.session_resume]
