@@ -8675,6 +8675,11 @@ class GitOps:
                             'overwrite; halting to preserve WIP. error=%s',
                             MERGE_PARK_REF, e,
                         )
+                        # Surface the dirty tracked files that could not be
+                        # parked so _map_advance_failure can name them in the
+                        # halt escalation (task 2758) — mirrors the
+                        # _last_overlap_files side channel set above.
+                        self._last_stash_dirty_files = sorted(dirty_tracked)
                         return AdvanceOutcome('stash_failed')
                     except MergeParkError as e:
                         # git stash create / update-ref infra failure (not a
@@ -8684,6 +8689,11 @@ class GitOps:
                             '— halting merge to prevent code loss. error=%s',
                             e,
                         )
+                        # Surface the dirty tracked files that could not be
+                        # parked so _map_advance_failure can name them in the
+                        # halt escalation (task 2758) — mirrors the
+                        # _last_overlap_files side channel set above.
+                        self._last_stash_dirty_files = sorted(dirty_tracked)
                         return AdvanceOutcome('stash_failed')
                     did_park = True
                     logger.info('Parked uncommitted changes before advance_main')
