@@ -40,7 +40,7 @@ tasks:
       kind: manual
       reason: fail-soft + loud-counter is a test property (E7), not mechanically greppable
 - label: β
-  task_id: 2729
+  task_id: 2792
   title: Idempotent archival backstop at the cleanup_worktree chokepoint
   capabilities:
   - name: backstop-at-cleanup-worktree-chokepoint
