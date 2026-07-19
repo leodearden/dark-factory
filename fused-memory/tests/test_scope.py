@@ -1,5 +1,7 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,6 +10,7 @@ from fused_memory.models.scope import (
     Scope,
     build_known_projects_map,
     known_project_roots_from_env,
+    read_declared_project_id,
     resolve_project_id,
 )
 
@@ -52,6 +55,110 @@ class TestResolveProjectId:
     def test_hyphens_and_case_combined(self):
         """Hyphens replaced and lowercased."""
         assert resolve_project_id('/srv/My-Cool-App') == 'my_cool_app'
+
+
+class TestReadDeclaredProjectId:
+    """read_declared_project_id reads the manifest-declared project_id from
+    `<root>/dark-factory-orchestrator.yaml`, normalizing it with the same
+    underscore-canonical rule as resolve_project_id, and fails open (returns
+    None, never raises) on any error or absent/ill-typed key.
+
+    This is what makes project_id rename-stable: a directory whose basename
+    differs from its declared manifest id (the exact shape produced by a
+    project-dir rename) resolves to the DECLARED id, not the basename.
+    """
+
+    def _write_manifest(self, root: Path, body: str) -> None:
+        (root / 'dark-factory-orchestrator.yaml').write_text(body)
+
+    def test_declared_id_wins_over_basename(self, tmp_path):
+        """A dir named `solar-challenge` whose manifest declares
+        project_id my_solar_challenge resolves to 'my_solar_challenge'
+        (declared id), NOT the basename-derived 'solar_challenge'."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "my_solar_challenge"\n')
+        assert read_declared_project_id(str(d)) == 'my_solar_challenge'
+        # sanity: this is genuinely different from the basename derivation.
+        assert resolve_project_id(str(d)) == 'solar_challenge'
+
+    def test_accepts_path_argument(self, tmp_path):
+        """Signature is `str | Path` — a Path argument works too."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "my_solar_challenge"\n')
+        assert read_declared_project_id(d) == 'my_solar_challenge'
+
+    def test_hyphenated_declared_value_is_normalized(self, tmp_path):
+        """A hyphenated declared value normalizes with the same
+        _to_underscore_canonical rule resolve_project_id uses."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "my-solar-challenge"\n')
+        assert read_declared_project_id(str(d)) == 'my_solar_challenge'
+
+    # --- fail-open cases: each returns None, never raises ---
+
+    def test_missing_manifest_returns_none(self, tmp_path):
+        d = tmp_path / 'no-manifest'
+        d.mkdir()
+        assert read_declared_project_id(str(d)) is None
+
+    def test_missing_directory_returns_none(self, tmp_path):
+        """A project_root that does not exist at all fails open to None."""
+        assert read_declared_project_id(str(tmp_path / 'does_not_exist')) is None
+
+    def test_malformed_yaml_returns_none(self, tmp_path):
+        d = tmp_path / 'bad-yaml'
+        d.mkdir()
+        # Unclosed flow mapping — yaml.safe_load raises yaml.YAMLError.
+        self._write_manifest(d, '{ project_id: "x"\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_not_a_mapping_returns_none(self, tmp_path):
+        d = tmp_path / 'list-yaml'
+        d.mkdir()
+        # Valid YAML, but the top-level document is a list, not a mapping.
+        self._write_manifest(d, '- a\n- b\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_scalar_yaml_returns_none(self, tmp_path):
+        d = tmp_path / 'scalar-yaml'
+        d.mkdir()
+        # Valid YAML that parses to a bare scalar string, not a mapping.
+        self._write_manifest(d, 'just a scalar\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_empty_yaml_returns_none(self, tmp_path):
+        d = tmp_path / 'empty-yaml'
+        d.mkdir()
+        # Empty file → yaml.safe_load returns None (not a mapping).
+        self._write_manifest(d, '')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_no_project_id_key_returns_none(self, tmp_path):
+        d = tmp_path / 'no-key'
+        d.mkdir()
+        self._write_manifest(d, 'some_other_key: value\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_non_string_project_id_returns_none(self, tmp_path):
+        d = tmp_path / 'int-id'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: 123\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_null_project_id_returns_none(self, tmp_path):
+        d = tmp_path / 'null-id'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: null\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_empty_string_project_id_returns_none(self, tmp_path):
+        d = tmp_path / 'empty-id'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: ""\n')
+        assert read_declared_project_id(str(d)) is None
 
 
 class TestKnownProjectRootsFromEnv:
