@@ -8579,6 +8579,13 @@ task, include it with an empty "files" list rather than omitting it.
             env_overrides={'BASH_MAX_TIMEOUT_MS': bash_max_timeout_ms},
             allowed_tools=_WATCHER_ALLOWED_TOOLS,
             disallowed_tools=_WATCHER_DISALLOWED_TOOLS,
+            # Isolate this rotation's capped `escalation` connection: its server
+            # name + URL are IDENTICAL to the interactive header-less block, so
+            # under the non-strict ambient .mcp.json merge the capped block can
+            # bleed into a concurrent interactive session (task 2796, THREAD 2).
+            # --strict-mcp-config scopes the invocation to only `mcp_config`'s
+            # servers, which are complete for this read-only RCA/triage job.
+            strict_mcp_config=True,
         )
 
     def _watcher_has_actionable_l1(self) -> bool:

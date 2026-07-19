@@ -794,8 +794,15 @@ async def invoke_claude_agent(
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
+    strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
+
+    *strict_mcp_config*, when True (and an *mcp_config* is set), emits
+    ``--strict-mcp-config`` so the invocation is scoped to only *mcp_config*'s
+    servers, ignoring the ambient ``.mcp.json`` merge (task 2796, THREAD 2);
+    forwarded verbatim to ``build_claude_argv``. Default ``False`` keeps every
+    existing caller byte-identical.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
@@ -854,6 +861,7 @@ async def invoke_claude_agent(
         sandbox_wrap=sandbox_wrap,
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
+        strict_mcp_config=strict_mcp_config,
     )
 
 
@@ -1576,6 +1584,7 @@ async def _invoke_claude(
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
+    strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     cmd, temp_files = build_claude_argv(
@@ -1591,6 +1600,7 @@ async def _invoke_claude(
         effort=effort,
         resume_session_id=resume_session_id,
         session_id=session_id,
+        strict_mcp_config=strict_mcp_config,
     )
 
     # User prompt is piped via stdin to avoid ARG_MAX on large payloads

@@ -115,10 +115,16 @@ async def invoke_agent(
     startup_grace_secs: float = 120.0,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
+    strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
     Dispatches to the appropriate backend (claude, codex, gemini, pi).
+    *strict_mcp_config* (claude backend ONLY): when True, ``--strict-mcp-config``
+    is emitted alongside ``--mcp-config`` so the invocation is scoped to only
+    the servers in *mcp_config*, ignoring the ambient project ``.mcp.json``
+    merge (the recon-watch isolation pattern; task 2796, THREAD 2). The
+    codex/gemini/pi backends ignore it — ``--strict-mcp-config`` is claude-only.
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
@@ -154,6 +160,7 @@ async def invoke_agent(
             startup_grace_secs=startup_grace_secs,
             working_idle_secs=working_idle_secs,
             absolute_cap_secs=absolute_cap_secs,
+            strict_mcp_config=strict_mcp_config,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -212,11 +219,14 @@ async def _invoke_claude_with_sandbox(
     startup_grace_secs: float = 120.0,
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
+    strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
     Delegates to shared.cli_invoke for the core invocation; adds
-    orchestrator-specific sandbox wrapping.
+    orchestrator-specific sandbox wrapping. *strict_mcp_config* threads through
+    to ``build_claude_argv`` (both the sandboxed and non-sandbox sub-paths),
+    emitting ``--strict-mcp-config`` alongside ``--mcp-config`` (task 2796).
     """
     # Inject MCP_TIMEOUT into every claude agent's subprocess env so a slow,
     # hung, or incompatible stdio MCP is dropped within a bounded time and the
@@ -249,6 +259,7 @@ async def _invoke_claude_with_sandbox(
                 effort=effort,
                 resume_session_id=resume_session_id,
                 session_id=session_id,
+                strict_mcp_config=strict_mcp_config,
             )
 
             # User prompt piped via stdin to avoid ARG_MAX
@@ -299,6 +310,7 @@ async def _invoke_claude_with_sandbox(
         startup_grace_secs=startup_grace_secs,
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
+        strict_mcp_config=strict_mcp_config,
     )
 
 
