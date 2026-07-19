@@ -12,6 +12,7 @@ from fused_memory.models.scope import (
     known_project_roots_from_env,
     read_declared_project_id,
     resolve_project_id,
+    resolve_project_id_for_root,
 )
 
 
@@ -159,6 +160,38 @@ class TestReadDeclaredProjectId:
         d.mkdir()
         self._write_manifest(d, 'project_id: ""\n')
         assert read_declared_project_id(str(d)) is None
+
+
+class TestResolveProjectIdForRoot:
+    """resolve_project_id_for_root is the rename-stable resolver:
+    manifest-declared id first, pure basename derivation as the fallback."""
+
+    def test_declared_id_wins(self, tmp_path):
+        """A dir named `solar-challenge` whose manifest declares
+        project_id my_solar_challenge resolves to 'my_solar_challenge'."""
+        d = tmp_path / 'solar-challenge'
+        d.mkdir()
+        (d / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "my_solar_challenge"\n',
+        )
+        assert resolve_project_id_for_root(str(d)) == 'my_solar_challenge'
+
+    def test_basename_fallback_no_manifest(self, tmp_path):
+        """A dir with NO manifest resolves to the basename derivation,
+        identical to resolve_project_id — back-compat for every project
+        that does not declare an id."""
+        d = tmp_path / 'foo-bar'
+        d.mkdir()
+        assert resolve_project_id_for_root(str(d)) == 'foo_bar'
+        assert resolve_project_id_for_root(str(d)) == resolve_project_id(str(d))
+
+    def test_basename_fallback_manifest_without_project_id(self, tmp_path):
+        """A manifest present but lacking a project_id key still falls back
+        to the basename derivation."""
+        d = tmp_path / 'foo-bar'
+        d.mkdir()
+        (d / 'dark-factory-orchestrator.yaml').write_text('other_key: 1\n')
+        assert resolve_project_id_for_root(str(d)) == 'foo_bar'
 
 
 class TestKnownProjectRootsFromEnv:
