@@ -3816,6 +3816,81 @@ class TestCrossProcessArchiveStaleness:
             f'but got {spy.call_count}x'
         )
 
+    def test_reprobe_miss_is_negative_cached_bounds_rescan_to_one_call(
+        self, tmp_path: Path,
+    ):
+        """A re-probe MISS (a genuinely nonexistent id) must be negative-cached
+        so a REPEATED get() for that same nonexistent id does not re-scan the
+        archive every call — this is the path a polling client (or a typo'd /
+        stale / already-swept id) hits hardest, since it never becomes a
+        positive-memo cache hit.
+
+        RED against a fix that re-probes on every miss without negative
+        caching: spy.call_count would be 2, one per get() call.
+        """
+        queue_dir = tmp_path / 'queue'
+        server_q = EscalationQueue(queue_dir)
+        harness_q = EscalationQueue(queue_dir)
+
+        # Give the archive subtree real (unrelated) content so the reprobe
+        # walks a non-trivial directory, not just an existence check.
+        harness_q.submit(_make_escalation('esc-2799-4', task_id='2799', level=2))
+        harness_q.resolve('esc-2799-4', 'unrelated archived id')
+
+        # Force server_q's memo to build (finds esc-2799-4, since it was
+        # already archived by the time this scan runs).
+        assert server_q.get('esc-2799-4') is not None, 'Setup: memo build sanity check'
+
+        with patch.object(
+            server_q, '_iter_archive_paths', wraps=server_q._iter_archive_paths,
+        ) as spy:
+            result1 = server_q.get('esc-does-not-exist-anywhere')
+            result2 = server_q.get('esc-does-not-exist-anywhere')
+
+        assert result1 is None, f'Expected None for a genuinely absent id, got {result1!r}'
+        assert result2 is None, f'Expected None for a genuinely absent id, got {result2!r}'
+        assert spy.call_count == 1, (
+            f'Expected exactly 1 _iter_archive_paths call (first get() re-probes '
+            f'and negative-caches the absent id; second get() must be a '
+            f'negative-cache hit, skipping the re-probe) but got {spy.call_count}x'
+        )
+
+    def test_negative_cache_cleared_on_next_self_archival(self, tmp_path: Path):
+        """A negative-cached id must become re-probable again after THIS
+        instance performs its own next archival (_archive_resolved) — the
+        self-archival is a natural checkpoint bounding how long a negative
+        result can keep masking an id some OTHER instance archived meanwhile.
+        """
+        queue_dir = tmp_path / 'queue'
+        server_q = EscalationQueue(queue_dir)
+        harness_q = EscalationQueue(queue_dir)
+
+        # esc-2799-5 does not exist anywhere yet: server_q negative-caches it.
+        assert server_q.get('esc-2799-5') is None, 'Setup: must be absent initially'
+        assert 'esc-2799-5' in server_q._archive_negative_cache, (
+            'Setup: absent id must be negative-cached after the first miss'
+        )
+
+        # harness_q creates AND archives esc-2799-5 out of band, AFTER
+        # server_q already negative-cached it as absent.
+        harness_q.submit(_make_escalation('esc-2799-5', task_id='2799', level=2))
+        harness_q.resolve('esc-2799-5', 'resolved out-of-band after negative-cache')
+
+        # server_q performs an unrelated self-archival — this must clear the
+        # negative cache wholesale.
+        server_q.submit(_make_escalation('esc-2799-6', task_id='2799', level=2))
+        server_q.resolve('esc-2799-6', 'unrelated self-archival')
+        assert 'esc-2799-5' not in server_q._archive_negative_cache, (
+            'Expected the negative cache to be cleared by the self-archival'
+        )
+
+        # Now server_q must find esc-2799-5 (re-probe is allowed again).
+        result = server_q.get('esc-2799-5')
+        assert result is not None and result.status == 'resolved', (
+            f'Expected esc-2799-5 to be found after the negative cache was '
+            f'cleared by a self-archival, got {result!r}'
+        )
+
 
 def _make_esc_with_category(
     esc_id: str,
