@@ -191,3 +191,61 @@ def tally_adjudications(verdicts: list) -> dict[str, float]:
         'tie': tie,
         'haiku_worse_fraction': haiku_worse_fraction,
     }
+
+
+# ── decision thresholds (design decision 5) ─────────────────────────────────
+#
+# haiku is ~10x cheaper than sonnet, so F1 parity within a small band is a net
+# win. The agreement floor + opus-not-worse guard catch qualitative divergence
+# the F1 mean might hide; MIN_SAMPLES guards against deciding on too few tasks.
+# These are DESIGN parameters — the marginal band deliberately escalates to a
+# human rather than auto-flipping.
+F1_PARITY_BAND = 0.05    # PASS: mean(haiku_f1) >= mean(sonnet_f1) - this
+F1_FAIL_GAP = 0.15       # FAIL: mean(sonnet_f1) - mean(haiku_f1) > this
+AGREEMENT_FLOOR = 0.70   # PASS: mean haiku-vs-sonnet Jaccard >= this
+AGREEMENT_FAIL = 0.50    # FAIL: mean Jaccard < this
+ADJ_WORSE_PASS = 0.50    # PASS: opus not-majority-worse — haiku_worse_fraction <= this
+ADJ_WORSE_FAIL = 0.60    # FAIL: opus majority-worse — haiku_worse_fraction > this
+MIN_SAMPLES = 20         # PASS: at least this many done-with-ground-truth tasks
+
+
+def decide(summary: dict) -> str:
+    """Return ``'pass'`` / ``'marginal'`` / ``'fail'`` from a trial summary.
+
+    Consumes ``{mean_haiku_f1, mean_sonnet_f1, mean_jaccard,
+    haiku_worse_fraction, n_samples}`` and applies design decision 5:
+
+    - FAIL (checked first — any hard-fail trigger dominates): haiku F1 more than
+      ``F1_FAIL_GAP`` below sonnet, OR agreement below ``AGREEMENT_FAIL``, OR the
+      frontier judged haiku worse on a majority (> ``ADJ_WORSE_FAIL``) of decided
+      disagreements.
+    - PASS: F1 within ``F1_PARITY_BAND`` of sonnet AND agreement at/above
+      ``AGREEMENT_FLOOR`` AND frontier not-majority-worse (<= ``ADJ_WORSE_PASS``)
+      AND at least ``MIN_SAMPLES`` tasks.
+    - MARGINAL: everything else (too few samples, or any in-between band) —
+      escalate to a human.
+    """
+    haiku_f1 = summary['mean_haiku_f1']
+    sonnet_f1 = summary['mean_sonnet_f1']
+    jaccard = summary['mean_jaccard']
+    worse = summary['haiku_worse_fraction']
+    n = summary['n_samples']
+
+    # Positive gap = haiku is worse than sonnet.
+    f1_gap = sonnet_f1 - haiku_f1
+
+    # FAIL — any hard-fail trigger.
+    if f1_gap > F1_FAIL_GAP or jaccard < AGREEMENT_FAIL or worse > ADJ_WORSE_FAIL:
+        return 'fail'
+
+    # PASS — all guards clear AND enough samples.
+    if (
+        f1_gap <= F1_PARITY_BAND
+        and jaccard >= AGREEMENT_FLOOR
+        and worse <= ADJ_WORSE_PASS
+        and n >= MIN_SAMPLES
+    ):
+        return 'pass'
+
+    # Everything else → marginal → escalate to a human.
+    return 'marginal'
