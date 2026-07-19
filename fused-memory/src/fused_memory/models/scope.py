@@ -29,6 +29,7 @@ from pydantic import BaseModel, field_validator
 
 from fused_memory.utils.validation import (
     InputValidationError,
+    PathShapedProjectIdError,
     _to_underscore_canonical,
     canonicalize_project_id,
     require_project_root,
@@ -188,9 +189,14 @@ def read_declared_project_id(project_root: str | Path) -> str | None:
     of truth.
 
     Strictly **fail-open**: this NEVER raises.  A missing manifest,
-    unparseable YAML, a non-mapping document, or a missing/non-string/empty
-    ``project_id`` all return ``None`` so callers degrade to today's basename
-    derivation — mirroring :func:`build_known_projects_map`'s
+    unparseable YAML (including invalid non-UTF-8 bytes, whose
+    ``UnicodeDecodeError`` is a ``ValueError`` subclass rather than an
+    ``OSError``/``yaml.YAMLError``), a non-mapping document, a
+    missing/non-string/empty ``project_id``, or a path-shaped declared value
+    (one containing a path separator or a leading ``-``/``/`` — something
+    :func:`resolve_project_id` could never produce from a basename) all
+    return ``None`` so callers degrade to today's basename derivation —
+    mirroring :func:`build_known_projects_map`'s
     must-not-raise-during-startup contract (both registries are built once at
     process start).  A parse error is debug-logged, not surfaced.
 
@@ -202,7 +208,10 @@ def read_declared_project_id(project_root: str | Path) -> str | None:
     try:
         with open(manifest, encoding='utf-8') as fh:
             data = yaml.safe_load(fh)
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (a ValueError subclass, not an OSError/
+        # yaml.YAMLError) is raised by yaml.safe_load when the manifest holds
+        # invalid UTF-8 bytes; catch it too so the never-raise contract holds.
         logger.debug(
             'read_declared_project_id: cannot read %s: %s', manifest, exc,
         )
@@ -213,7 +222,24 @@ def read_declared_project_id(project_root: str | Path) -> str | None:
     declared = data.get('project_id')
     if not isinstance(declared, str) or not declared:
         return None
-    return _to_underscore_canonical(declared)
+    # The declared value is raw operator-supplied input, so canonicalize it
+    # through canonicalize_project_id's path-shape guard (NOT the bare
+    # _to_underscore_canonical resolve_project_id applies to an already-
+    # extracted basename): a value with a path separator or leading '-'/'/'
+    # is something resolve_project_id could never produce, so reject it and
+    # fail open to basename derivation instead of registering a nonsensical
+    # id.  canonicalize_project_id delegates to the same _to_underscore_canonical
+    # rule for every non-path-shaped value, so declared and derived ids still
+    # share one canonicalization source of truth.
+    try:
+        return canonicalize_project_id(declared)
+    except PathShapedProjectIdError as exc:
+        logger.debug(
+            'read_declared_project_id: declared project_id %r in %s is '
+            'path-shaped; ignoring (falling back to basename): %s',
+            declared, manifest, exc,
+        )
+        return None
 
 
 def resolve_project_id_for_root(project_root: str | Path) -> str:

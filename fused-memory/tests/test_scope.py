@@ -161,6 +161,39 @@ class TestReadDeclaredProjectId:
         self._write_manifest(d, 'project_id: ""\n')
         assert read_declared_project_id(str(d)) is None
 
+    def test_invalid_utf8_bytes_returns_none(self, tmp_path):
+        """A manifest containing invalid (non-UTF-8) bytes fails open to None
+        rather than letting UnicodeDecodeError — a ValueError subclass that is
+        NOT an OSError or yaml.YAMLError — escape the never-raise contract and
+        crash startup."""
+        d = tmp_path / 'bad-bytes'
+        d.mkdir()
+        # 0xff/0xfe are not valid UTF-8; yaml.safe_load raises
+        # UnicodeDecodeError while decoding the opened stream.
+        (d / 'dark-factory-orchestrator.yaml').write_bytes(
+            b'project_id: "\xff\xfe not utf-8"\n',
+        )
+        assert read_declared_project_id(str(d)) is None
+
+    def test_path_separator_in_declared_value_returns_none(self, tmp_path):
+        """A declared value containing a path separator (something
+        resolve_project_id could never produce — it extracts a basename first)
+        is rejected via canonicalize_project_id's path-shape guard, failing
+        open to None so the caller degrades to basename derivation instead of
+        registering a nonsensical slash-bearing id."""
+        d = tmp_path / 'weird'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "foo/bar"\n')
+        assert read_declared_project_id(str(d)) is None
+
+    def test_leading_dash_declared_value_returns_none(self, tmp_path):
+        """A path-shaped (leading '-', i.e. a mangled absolute path) declared
+        value is likewise rejected and fails open to None."""
+        d = tmp_path / 'weird2'
+        d.mkdir()
+        self._write_manifest(d, 'project_id: "-home-leo-src-x"\n')
+        assert read_declared_project_id(str(d)) is None
+
 
 class TestResolveProjectIdForRoot:
     """resolve_project_id_for_root is the rename-stable resolver:
@@ -191,6 +224,17 @@ class TestResolveProjectIdForRoot:
         d = tmp_path / 'foo-bar'
         d.mkdir()
         (d / 'dark-factory-orchestrator.yaml').write_text('other_key: 1\n')
+        assert resolve_project_id_for_root(str(d)) == 'foo_bar'
+
+    def test_basename_fallback_path_shaped_declared_value(self, tmp_path):
+        """A manifest whose declared id is path-shaped (rejected by
+        read_declared_project_id) falls back to the basename derivation rather
+        than propagating the nonsensical value."""
+        d = tmp_path / 'foo-bar'
+        d.mkdir()
+        (d / 'dark-factory-orchestrator.yaml').write_text(
+            'project_id: "foo/bar"\n',
+        )
         assert resolve_project_id_for_root(str(d)) == 'foo_bar'
 
 
