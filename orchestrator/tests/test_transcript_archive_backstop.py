@@ -181,3 +181,24 @@ class TestBackstop:
 
         mock_helper.assert_not_called()
         assert not wt.path.exists()
+
+    async def test_kill_switch_disabled_skips_archival(self, git_repo):
+        """``transcript_archive.enabled=False`` short-circuits the backstop
+        entirely — no helper call, no archive produced — while the worktree is
+        still removed. Mirrors the producer's ``if ta.enabled`` guard."""
+        tid = '2786'
+        git_ops = _make_git_ops(
+            git_repo, transcript_archive=TranscriptArchiveConfig(enabled=False)
+        )
+        wt = await git_ops.create_worktree(tid)
+        # An un-archived transcript exists — but a disabled config must ignore it.
+        _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
+
+        with patch('orchestrator.git_ops.archive_task_transcripts') as mock_helper:
+            await git_ops.cleanup_worktree(wt.path, tid)
+
+        mock_helper.assert_not_called()
+        # Nothing was written under the archive root at all.
+        assert not (git_repo / 'data' / 'orchestrator' / 'agent-transcripts').exists()
+        # Teardown still happened — the kill switch gates archival, not removal.
+        assert not wt.path.exists()
