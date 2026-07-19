@@ -1660,6 +1660,71 @@ class TestCloseLogsExceptions:
             )
 
 
+class TestCloseBoundsSlowSubclose:
+    """Task 2701: each sub-close is individually time-boxed so a hung
+    network-driver teardown (graphiti/mem0) cannot consume the whole
+    shutdown budget or starve the durable-flush closes that follow it."""
+
+    def _wire_resources(self, service):
+        """Wire all six sub-resources with AsyncMock close() methods and
+        return a name->mock mapping (mirrors
+        TestCloseLogsExceptions._make_resource_mocks)."""
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+
+        mock_journal = MagicMock()
+        mock_journal.close = AsyncMock()
+        service._write_journal = mock_journal
+
+        mock_buffer = MagicMock()
+        mock_buffer.close = AsyncMock()
+        service._event_buffer = mock_buffer
+
+        mock_registry = MagicMock()
+        mock_registry.close = AsyncMock()
+        service.planned_episode_registry = mock_registry
+
+        return {
+            'durable_queue': service.durable_queue,
+            'graphiti': service.graphiti,
+            'mem0': service.mem0,
+            '_write_journal': service._write_journal,
+            '_event_buffer': service._event_buffer,
+            'planned_episode_registry': service.planned_episode_registry,
+        }
+
+    @pytest.mark.asyncio
+    async def test_hung_subclose_is_bounded_and_does_not_starve_durable_flush(
+        self, service, monkeypatch
+    ):
+        """A hung graphiti.close() is time-boxed at _SUBCLOSE_TIMEOUT, so
+        close() still returns promptly AND every resource ordered after
+        graphiti (mem0, write_journal, event_buffer, registry) is still
+        closed (the durable flush is not starved)."""
+        # Small per-sub cap keeps the test fast. raising=False so the RED
+        # phase (constant not yet defined) still exercises close(), failing
+        # at the behavioural 2.0s bound rather than at patch setup.
+        monkeypatch.setattr(
+            memory_service, '_SUBCLOSE_TIMEOUT', 0.2, raising=False
+        )
+        resources = self._wire_resources(service)
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        service.graphiti.close = AsyncMock(side_effect=_hang)
+
+        # Bounded: despite graphiti hanging, close() completes far under 2.0s.
+        # Fails today (unbounded await) — wait_for raises TimeoutError.
+        await asyncio.wait_for(service.close(), timeout=2.0)
+
+        # durable_queue (ordered BEFORE graphiti) ran.
+        resources['durable_queue'].close.assert_awaited_once()
+        # Every resource ordered AFTER the hung graphiti still closed.
+        for name in ('mem0', '_write_journal', '_event_buffer', 'planned_episode_registry'):
+            resources[name].close.assert_awaited_once()
+
+
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
     async def test_graphiti_backend_remove_edge(self, mock_config):
