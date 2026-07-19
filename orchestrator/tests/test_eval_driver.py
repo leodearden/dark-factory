@@ -17,11 +17,14 @@ Step map:
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator.config import load_config
 from orchestrator.evals.configs import EvalConfig
+from orchestrator.workflow import WorkflowOutcome
 
 
 def _base_config(tmp_path: Path):
@@ -98,3 +101,113 @@ class TestBuildEvalOrchConfigArchitectOverride:
         base = _base_config(tmp_path)
         cfg = build_eval_orch_config(_impl_cfg(), {}, base)
         assert cfg.models.architect == 'opus'
+
+
+# ---------------------------------------------------------------------------
+# step-05/06 — run_end_to_end: the ONE both-live executor (architect LIVE +
+# implementer LIVE). It builds the both-live orch config
+# (build_eval_orch_config(architect_config=arch)) and constructs the workflow
+# via build_workflow(initial_plan=None) so the architect plans live and feeds
+# the live implementer — the only place the plan-style/implementer coupling
+# question exists (PRD decision 9). Boundaries mocked (test_eval_architect
+# pattern): create_eval_worktree / build_workflow / collect_metrics / load_task
+# / save_result. GitOps/scheduler/briefing/mcp construct for real (I/O-free) so
+# the config threaded into build_workflow is the genuine article we assert on.
+# ---------------------------------------------------------------------------
+
+def _e2e_task(tmp_path: Path) -> dict:
+    return {
+        'id': 'df_task_e2e',
+        'project_root': str(tmp_path),
+        'pre_task_commit': 'basecommit123',
+        'task_definition': {'title': 'Widget', 'description': 'build the widget'},
+        'modules': ['pkg/mod.py'],
+    }
+
+
+async def _run_end_to_end_hermetic(
+    arch_cfg: EvalConfig,
+    impl_cfg: EvalConfig,
+    base,
+    task: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+):
+    """Drive run_end_to_end with the worktree/workflow/metrics boundaries mocked.
+
+    Returns ``(result, captured, mocks)`` where ``captured['build_workflow']``
+    is the kwargs dict build_workflow received (for asserting config + plan).
+    """
+    from orchestrator.evals import runner
+
+    captured: dict = {}
+
+    async def fake_create_wt(*_a, **_k):
+        return Path('/fake/wt'), 'run-e2e'
+
+    fake_wf = MagicMock()
+    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+
+    def fake_build_workflow(**kwargs):
+        captured['build_workflow'] = kwargs
+        return fake_wf
+
+    metrics_obj = MagicMock()
+    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
+    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_save = MagicMock()
+
+    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
+    monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
+    monkeypatch.setattr(runner, 'load_task', lambda _p: task)
+    monkeypatch.setattr(runner, 'save_result', mock_save)
+
+    result = await runner.run_end_to_end(
+        Path('/fake/task.json'), arch_cfg, impl_cfg, base,
+    )
+    return result, captured, {'collect': mock_collect, 'save': mock_save, 'wf': fake_wf}
+
+
+@pytest.mark.asyncio
+class TestRunEndToEnd:
+    async def test_builds_both_live_config_and_live_plan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _base_config(tmp_path)
+        arch, impl = _arch_cfg(), _impl_cfg()
+        _result, captured, _ = await _run_end_to_end_hermetic(
+            arch, impl, base, _e2e_task(tmp_path), monkeypatch,
+        )
+
+        # (a) both-live orch config: architect AND implementer from the candidates.
+        kw = captured['build_workflow']
+        cfg = kw['config']
+        assert cfg.models.architect == arch.model      # architect LIVE (sonnet)
+        assert cfg.models.implementer == impl.model     # implementer LIVE (sonnet)
+        assert cfg.backends.architect == arch.backend
+
+        # (b) build_workflow gets initial_plan=None → the architect plans LIVE
+        # (NOT a frozen plan handed in like run_eval does).
+        assert kw['initial_plan'] is None
+
+    async def test_result_encodes_combo_and_tags_end_to_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _base_config(tmp_path)
+        arch, impl = _arch_cfg(), _impl_cfg()
+        result, _captured, mocks = await _run_end_to_end_hermetic(
+            arch, impl, base, _e2e_task(tmp_path), monkeypatch,
+        )
+
+        # (c) config_name encodes BOTH the architect and implementer ids.
+        assert arch.name in result.config_name
+        assert impl.name in result.config_name
+        # role_under_test stamped 'end_to_end' (distinct from implementer/architect).
+        assert result.metrics['role_under_test'] == 'end_to_end'
+        assert result.task_id == 'df_task_e2e'
+        assert result.outcome == 'done'
+
+        # (d) persisted via save_result.
+        mocks['save'].assert_called_once()
