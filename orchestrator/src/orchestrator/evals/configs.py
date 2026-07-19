@@ -11,6 +11,13 @@ class EvalConfig:
     backend: str          # 'claude' | 'codex' | 'gemini'
     model: str            # model name for that backend
     effort: str | None    # backend-specific effort/reasoning level
+    # Which ROLE this candidate puts under test (eval-revival θ / C4 OFAT
+    # methodology: each candidate varies exactly one role). Default
+    # ``'implementer'`` leaves every existing EVAL_CONFIGS entry byte-unchanged
+    # — the model/backend/effort above drive the IMPLEMENTER. ``'architect'``
+    # (ARCHITECT_EVAL_CONFIGS) reroutes them to drive the live architect in
+    # ``run_architect_eval`` instead, freezing downstream roles.
+    role: str = 'implementer'
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
     # vLLM-only pod fields (None / 0 for non-vllm or workstation configs)
@@ -399,9 +406,25 @@ FINAL_RUN_CONFIGS = [
 ALL_FINAL_CONFIG_NAMES = [c.name for c in FINAL_RUN_CONFIGS]
 
 
+# ===== Architect-role candidates (eval-revival θ) =====
+# role='architect' reroutes each candidate from the implementer path to the
+# plan-only architect eval (``run_architect_eval``): the architect runs LIVE
+# against a ζ fixture at its pre_task_commit with THIS candidate's
+# model/backend/effort, the produced plan is scored (plan_quality), and every
+# downstream role is FROZEN (decision 8: noise isolation + token savings). Per
+# the OFAT methodology, each candidate varies exactly one role — here, the
+# architect. These are the substrate the downstream μ OFAT/matrix driver
+# consumes to score the architect role.
+ARCHITECT_EVAL_CONFIGS = [
+    EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
+    EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
+    EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+]
+
+
 def get_config_by_name(name: str) -> EvalConfig | None:
-    """Look up an eval config by name."""
-    for cfg in [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS]:
+    """Look up an eval config by name (implementer OR architect candidates)."""
+    for cfg in [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS]:
         if cfg.name == name:
             return cfg
     return None
