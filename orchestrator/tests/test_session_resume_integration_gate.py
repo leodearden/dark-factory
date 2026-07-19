@@ -619,3 +619,43 @@ async def test_b1_recovery_preserves_wip_commit_and_skips_architect(
     recovered_plan = harness._recovered_plans[task_id]
     cap = await _dispatch_capture(harness, task_id)
     assert cap.initial_plan is recovered_plan
+
+
+# ── B2: SIGKILL crash mid-implementer, warm lane — uniform-scope proof ───────
+@pytest.mark.asyncio
+async def test_b2_sigkill_warm_lane_identical_to_b1(harness: Harness):
+    """B2 — a SIGKILL crash mid-implementer yields the SAME adopt+inject
+    outcome as B1's clean SIGTERM.
+
+    The mechanism keys on sidecar PRESENCE, not on how the process died: a
+    SIGKILL (the ``_invoke`` ``finally`` that clears the sidecar NEVER ran) and
+    a clean SIGTERM (α's ``agent_session_preserved`` re-writes it on the
+    CancelledError path) both leave an IDENTICAL on-disk v2 sidecar, and the
+    shutdown mode is simply not observable at recovery time — it is α's
+    concern, covered by test_workflow_agent_session_preserve.py::
+    TestPreserveOnCancellation. ω therefore proves B2 ≡ B1: session adopted,
+    config_dir stashed, plan recovered, ``resume_session_id`` is the same
+    session, and exactly one ``session_resume`` event.
+    """
+    task_id, session_id = '43', 'uuid-b2-sigkill'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β) — identical to B1 ──
+    assert task_id in harness._recovered_sessions
+    assert harness._recovered_sessions[task_id]['session_id'] == session_id
+    assert task_id in harness._recovered_session_config_dirs
+    assert task_id in harness._recovered_plans
+    harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    adopted = harness._recovered_sessions[task_id]
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ) — identical to B1 ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id['session_id'] == session_id
+    assert cap.initial_plan is recovered_plan
+    assert [et for et, _ in cap.emits] == [EventType.session_resume]
