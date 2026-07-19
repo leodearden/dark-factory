@@ -566,3 +566,71 @@ class TestAdversarialFixtures:
             assert compute_recovery_score(
                 rubric, plan=n_plan, blocking_issues=n_block, diff=n_diff,
             ) == 0.0, fx['id']
+
+
+# ---------------------------------------------------------------------------
+# recovery_score report column — additive interim surface (step-7/8)
+#
+# A distinct per-(task_id, config_name) column μ/λ consume — NOT a change to
+# the Elo build_report/format_markdown schema (the full C4 composite+recovery
+# row is owned by λ).
+# ---------------------------------------------------------------------------
+
+def _adv_result() -> object:
+    return runner.EvalResult(
+        task_id='df_task_2430_adv_plan',
+        config_name='opus-high',
+        outcome='done',
+        metrics={'recovery_score': 1.0, 'composite_score': 0.5},
+        worktree_path='/tmp/wt-adv',
+    )
+
+
+def _ordinary_result() -> object:
+    # No recovery_score key at all → the null sentinel path.
+    return runner.EvalResult(
+        task_id='df_task_1993',
+        config_name='opus-high',
+        outcome='done',
+        metrics={'composite_score': 1.0},
+        worktree_path='/tmp/wt-ord',
+    )
+
+
+class TestRecoveryReport:
+    def test_build_recovery_report_rows(self):
+        from orchestrator.evals.report import build_recovery_report
+
+        report = build_recovery_report([_adv_result(), _ordinary_result()])
+        rows = report['rows']
+        by_task = {r['task_id']: r for r in rows}
+
+        adv = by_task['df_task_2430_adv_plan']
+        assert adv['recovery_score'] == 1.0
+        assert adv['adversarial'] is True
+        assert adv['config_name'] == 'opus-high'
+
+        ordinary = by_task['df_task_1993']
+        assert ordinary['recovery_score'] is None  # null sentinel
+        assert ordinary['adversarial'] is False
+
+    def test_format_recovery_table_renders_column(self):
+        from orchestrator.evals.report import (
+            build_recovery_report,
+            format_recovery_table,
+        )
+
+        report = build_recovery_report([_adv_result(), _ordinary_result()])
+        table = format_recovery_table(report)
+        assert 'recovery_score' in table
+
+        adv_line = next(
+            ln for ln in table.splitlines() if 'df_task_2430_adv_plan' in ln
+        )
+        assert '1.0' in adv_line  # populated float for the adversarial row
+
+        ord_line = next(
+            ln for ln in table.splitlines() if 'df_task_1993' in ln
+        )
+        assert '-' in ord_line       # null sentinel rendered as '-'
+        assert '1.0' not in ord_line  # ordinary row is NOT populated
