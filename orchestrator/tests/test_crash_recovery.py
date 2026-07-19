@@ -1925,3 +1925,120 @@ class TestSessionResumeGuard:
         emits = _session_resume_emits(harness)
         assert len(emits) == 1
         assert emits[0][0] == EventType.session_resume_capped
+
+
+@pytest.mark.asyncio
+class TestSessionResumeStorm:
+    """γ fallback-storm escape (INV-4, task 2774): a per-boot RUN of
+    consecutive session_resume_fallback degradations reaching
+    fallback_storm_threshold files ONE deduped L1 escalation. The streak is
+    consecutive-per-boot (reset by any eligible resume); capped/disabled do
+    NOT feed it. Filing is best-effort — a None queue never raises (I3).
+    """
+
+    @staticmethod
+    def _stale_session(sid: str) -> dict:
+        stale = datetime.now(timezone.utc) - timedelta(seconds=2 * 86400)
+        return {
+            'session_id': sid,
+            'role': 'implementer',
+            'started_at': stale.isoformat(),
+            'resume_count': 0,
+        }
+
+    @staticmethod
+    def _queue() -> MagicMock:
+        q = MagicMock()
+        q.has_open_l1 = MagicMock(return_value=False)
+        q.make_id = MagicMock(return_value='sr-storm')
+        return q
+
+    async def test_streak_files_one_l1_at_threshold(self, harness: Harness):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
+
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert 'resume' in esc.summary.lower()
+
+    async def test_dedup_no_second_submit_when_l1_open(self, harness: Harness):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        for i in range(3):
+            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # L1 now open → further fallbacks must NOT re-submit (has_open_l1 dedup).
+        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        for i in range(3, 6):
+            await _drive_session_slot(harness, f'st{i}', self._stale_session(f'uuid-st{i}'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_streak_is_consecutive_reset_by_eligible(
+        self, harness: Harness, tmp_path: Path
+    ):
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
+        harness._escalation_queue = self._queue()
+
+        # 2 stale fallbacks (streak=2)...
+        for i in range(2):
+            await _drive_session_slot(harness, f'a{i}', self._stale_session(f'uuid-a{i}'))
+        # ...then an ELIGIBLE resume resets the streak to 0.
+        cfg = _make_transcript(tmp_path, 'uuid-ok')
+        await _drive_session_slot(
+            harness, 'ok1',
+            {
+                'session_id': 'uuid-ok', 'role': 'implementer',
+                'started_at': datetime.now(timezone.utc).isoformat(),
+                'resume_count': 0,
+            },
+            config_dir=cfg,
+        )
+        # 2 more stale after the reset → streak=2 (<3) → still no L1.
+        for i in range(2):
+            await _drive_session_slot(harness, f'b{i}', self._stale_session(f'uuid-b{i}'))
+        assert harness._escalation_queue.submit.call_count == 0
+
+        # A 3rd consecutive stale AFTER the reset reaches threshold → fires once,
+        # proving the streak resumed from 0 (consecutive, not cumulative).
+        await _drive_session_slot(harness, 'b2', self._stale_session('uuid-b2'))
+        assert harness._escalation_queue.submit.call_count == 1
+
+    async def test_capped_does_not_feed_streak(self, harness: Harness, tmp_path: Path):
+        """resume_count-capped degradations are by-design throttling and must
+        NOT count toward the storm streak (design decision, task 2774).
+        """
+        harness.config.session_resume = SessionResumeConfig(
+            fallback_storm_threshold=2, max_resumes_per_task=1,
+        )
+        harness._escalation_queue = self._queue()
+
+        # Three capped dispatches (resume_count=1 == max) — never fire the storm.
+        for i in range(3):
+            cfg = _make_transcript(tmp_path, f'uuid-cap{i}')
+            await _drive_session_slot(
+                harness, f'cap{i}',
+                {
+                    'session_id': f'uuid-cap{i}', 'role': 'implementer',
+                    'started_at': datetime.now(timezone.utc).isoformat(),
+                    'resume_count': 1,
+                },
+                config_dir=cfg,
+            )
+        assert harness._escalation_queue.submit.call_count == 0
+
+    async def test_no_escalation_queue_never_raises(self, harness: Harness):
+        """A bare harness (no escalation queue) must never raise on a fallback
+        that would otherwise trip the storm filer (fail-safe totality, I3).
+        """
+        harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=1)
+        harness._escalation_queue = None
+
+        # threshold=1 → the very first fallback trips the filer, which must
+        # early-return on the absent queue rather than raising.
+        await _drive_session_slot(harness, 'x1', self._stale_session('uuid-x1'))
