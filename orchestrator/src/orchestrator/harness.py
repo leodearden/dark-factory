@@ -2760,20 +2760,31 @@ task, include it with an empty "files" list rather than omitting it.
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
                 #
-                # For lanes: the sidecar (agent_session.json) carries
-                # session_id/role/owner_pid but NO task_id.  The in-memory
-                # assignment map is empty after a restart, so there is no way
-                # to map a sidecar-only lane back to its real task.  Storing
-                # _recovered_sessions['_lane-k'] would be dead state (dispatch
-                # keys off the real task_id) and would also wrongly shield the
-                # lane from the orphan reaper.  Release it back to the pool
-                # (cleanup_worktree routes lanes to release_warm_lane).
+                # For lanes: a v1 sidecar carries session_id/role/owner_pid
+                # but NO task_id, and the in-memory assignment map is empty
+                # after a restart, so a v1-only lane still can't be mapped
+                # back to its real task -- nothing is adopted for it.  A v2
+                # sidecar (task 2772+) DOES carry its own task_id, though, so
+                # it CAN be adopted below -- keyed by that real task_id,
+                # never by the lane dir name ('_lane-k'), which sidesteps
+                # the dead-state concern this comment used to warn about.
+                # Either way the lane itself is always released back to the
+                # pool (cleanup_worktree routes lanes to release_warm_lane)
+                # -- see the adoption call just below for the current keying
+                # behavior and its narrow orphan-reaper interaction.
                 if is_lane:
                     # Best-effort: adopt only if the sidecar is v2 (carries
                     # its own task_id) — the only identity source available
-                    # on a no-plan lane (B3). Disposition is UNCHANGED
-                    # either way: the lane is still released back to the
-                    # pool below.
+                    # on a no-plan lane (B3). Keying by the real task_id
+                    # (never the lane dir name) means the orphan reaper's
+                    # `name in self._recovered_sessions` skip (harness.py
+                    # ~3273) can only shield a worktree that happens to be
+                    # named exactly like that task_id (e.g. a stale
+                    # worktree literally named '73') -- narrow and
+                    # plausibly desired (that task's session is queued for
+                    # resume), not the lane itself. Disposition here is
+                    # UNCHANGED either way: the lane is still released back
+                    # to the pool below.
                     self._adopt_recovered_session(entry, None)
                     logger.info(
                         f'Recovery: lane {task_id} has no plan — '
