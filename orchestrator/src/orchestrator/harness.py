@@ -2440,6 +2440,21 @@ task, include it with an empty "files" list rather than omitting it.
         try:
             config_dirs = sorted((entry / '.task').glob('claude-config-*'))
             if config_dirs:
+                if len(config_dirs) > 1:
+                    # >1 claude-config-<branch> dir in a single surviving
+                    # worktree is abnormal: the lexically-first pick may not be
+                    # the one holding THIS session's transcript, in which case
+                    # the dispatch-time re-glob degrades to a 'no_transcript'
+                    # fresh dispatch. Warn (loud-over-silent) so that otherwise
+                    # silent missed resume is observable.
+                    logger.warning(
+                        'Recovery: %s has %d claude-config dirs %s — stashing the '
+                        'lexically-first (%s) for session %s; if it lacks the '
+                        'transcript the resume degrades to fresh dispatch',
+                        entry.name, len(config_dirs),
+                        [str(d) for d in config_dirs], config_dirs[0],
+                        session_data.get('session_id'),
+                    )
                 self._recovered_session_config_dirs[key] = str(config_dirs[0])
         except OSError as e:
             logger.debug(
