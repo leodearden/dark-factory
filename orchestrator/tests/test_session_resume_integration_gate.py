@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,6 +55,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.scheduler import TaskAssignment
 from orchestrator.warm_lane_pool import WarmLanePool
 from orchestrator.workflow import TaskWorkflow
 
@@ -327,6 +329,127 @@ async def test_b1_warm_lane_adopts_then_injects_same_session(harness: Harness):
     assert cap.resume_session_id['session_id'] == session_id
     assert cap.initial_plan is recovered_plan
     assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+# ── Invocation-level driver (γ → invocation seam; α sidecar rewrite) ─────────
+# Cloned from test_workflow_agent_session_preserve.py: a REAL-git TaskWorkflow
+# over a real worktree + real on-disk TaskArtifacts, driving the REAL _invoke
+# with only invoke_with_cap_retry patched. Used by B1 (journal proof), B10
+# (completion clears the sidecar) and B11 (v1→v2 rewrite on next write).
+_InvokeCapture = namedtuple(
+    '_InvokeCapture', ['kwargs', 'workflow', 'cwd', 'sidecar_midflight'],
+)
+
+
+async def _init_resume_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'lib.py').write_text('def greet(name): return name\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
+    """A hermetic OrchestratorConfig rooted at *git_repo* (transcript-archive
+    disabled so _invoke's finally hook is a no-op)."""
+    kwargs: dict = dict(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+        ),
+        transcript_archive={'enabled': False},
+    )
+    kwargs.update(overrides)
+    return OrchestratorConfig(**kwargs)
+
+
+def _resume_assignment(task_id: str) -> TaskAssignment:
+    return TaskAssignment(
+        task_id=task_id,
+        task={
+            'id': task_id, 'title': 'X', 'description': 'Y', 'status': 'pending',
+            'metadata': {'files': ['lib']}, 'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+async def _make_resumed_workflow(
+    config: OrchestratorConfig, git_ops: GitOps, task_assignment: TaskAssignment,
+    resume_session_id,
+) -> tuple[TaskWorkflow, Path]:
+    """Build a probe TaskWorkflow with a REAL on-disk TaskArtifacts + config_dir.
+
+    Mirrors test_workflow_agent_session_preserve.py:_make_workflow — direct
+    _invoke skips run()'s setup, so _config_dir is set MANUALLY at the legacy
+    ``.task`` root (the autouse meta-root fixture is deliberately un-imported).
+    """
+    wt_info = await git_ops.create_worktree(task_assignment.task_id)
+    cwd = wt_info.path
+    workflow = TaskWorkflow(
+        assignment=task_assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
+        resume_session_id=resume_session_id,
+    )
+    artifacts = TaskArtifacts(cwd)
+    artifacts.init(task_assignment.task_id, 'X', 'Y')
+    workflow.artifacts = artifacts
+    workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
+    return workflow, cwd
+
+
+async def _drive_resumed_invoke(
+    tmp_path: Path, recovered_session, role, caplog, *, task_id: str = '42',
+) -> _InvokeCapture:
+    """Feed *recovered_session* as ``resume_session_id`` into a REAL
+    ``TaskWorkflow`` and drive ``_invoke(role, 'p', cwd)`` with
+    ``invoke_with_cap_retry`` patched. Snapshots the sidecar MID-invocation
+    (the finally clears it on completion) and captures the iwcr kwargs.
+    """
+    caplog.set_level(logging.INFO)
+    sid = (recovered_session or {}).get('session_id', 'x')
+    repo = tmp_path / f'resume-repo-{sid}'
+    repo.mkdir()
+    await _init_resume_repo(repo)
+    git_ops = GitOps(
+        GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees',
+        ),
+        repo,
+    )
+    with patch.dict(os.environ, {'ORCH_CONFIG_PATH': ''}):
+        config = _config(repo)
+    assignment = _resume_assignment(task_id)
+    workflow, cwd = await _make_resumed_workflow(
+        config, git_ops, assignment, recovered_session,
+    )
+    snapshot: dict = {}
+
+    def _side_effect(**kwargs):
+        assert workflow.artifacts is not None
+        snapshot['sidecar'] = workflow.artifacts.read_agent_session()
+        return AgentResult(success=True, output='')
+
+    with patch(
+        'orchestrator.workflow.invoke_with_cap_retry',
+        new_callable=AsyncMock, side_effect=_side_effect,
+    ) as mock_iwcr:
+        await workflow._invoke(role, 'p', cwd)
+
+    return _InvokeCapture(
+        kwargs=mock_iwcr.call_args.kwargs,
+        workflow=workflow,
+        cwd=cwd,
+        sidecar_midflight=snapshot.get('sidecar'),
+    )
 
 
 # ── B1: invocation-level journal proof (γ → invocation seam) ─────────────────
