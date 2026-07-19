@@ -6854,16 +6854,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             locked_modules=list(self.modules),
             task_id=self.task_id,
         )
+        pre_head = await self._get_head_commit()
         await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
-        head_commit = await self._get_head_commit()
         self.artifacts.append_iteration_log({
             'iteration': self.metrics.execute_iterations,
             'agent': 'implementer',
             'source': 'amendment',
             'amendment_round': amendment_round,
             'suggestions_count': len(in_scope),
-            'commit': head_commit,
+            **await self._iteration_commit_provenance(pre_head),
             'summary': (
                 f'Amendment round {amendment_round} '
                 f'({len(in_scope)} suggestions)'
