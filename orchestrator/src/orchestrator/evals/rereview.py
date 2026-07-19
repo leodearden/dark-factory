@@ -9,6 +9,12 @@ values are preserved as ``legacy_sonnet_*`` fields. Original reviewer
 artifacts in ``.eval-worktrees/<task>/run-<id>/.task/reviews/`` are NOT
 touched.
 
+This module replays the LEGACY reviewer path and remains scoped to
+pre-migration (April-era) results whose artifacts live in
+``.task/reviews/``. Replaying the POST-migration reviewer instead
+requires the per-worktree verdict-tools stdio MCP server, which writes
+``.task/verdicts/<role>.json`` envelopes (see ``compare._read_review_artifacts``).
+
 Usage::
 
     python -m orchestrator.evals.rereview --enumerate

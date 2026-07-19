@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.artifacts import TaskArtifacts
 
 from .judge import _strip_metadata
 from .runner import EvalResult
@@ -127,13 +128,67 @@ def pick_best_result(results: list[EvalResult]) -> EvalResult | None:
 # Review artifact reading
 # ---------------------------------------------------------------------------
 
-def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
-    """Read review JSON files from a worktree's .task/reviews/ directory.
+def _read_reviewer_verdict_envelopes(artifacts: TaskArtifacts) -> dict[str, Any]:
+    """Read reviewer verdict envelopes from ``<root>/verdicts/reviewer*.json``.
 
-    Returns ``{reviewer_name: {verdict, issues, summary}}``.
-    Returns empty dict if the worktree or reviews dir doesn't exist.
+    Post-migration (task 2484), the reviewer's verdict/issues payload for a
+    run is written by the verdict-tools MCP server as a schema-versioned
+    envelope (``{role, schema_version, session_id, emitted_at, verdict:
+    {reviewer, verdict, issues, summary}}``) rather than a flat
+    ``.task/reviews/<name>.json`` file. This unwraps ``envelope['verdict']``
+    so callers see the same flat ``{reviewer, verdict, issues, summary}``
+    shape as the legacy reviews/ directory.
+
+    Only ``reviewer*.json`` files are considered — the verdicts/ directory
+    also holds judge/triage/merger envelopes, which are not review
+    artifacts. Missing/corrupt envelopes are skipped (``read_verdict`` is
+    corrupt-tolerant), never raised.
+
+    Returns ``{reviewer_name: {verdict, issues, summary, ...}}``. Returns
+    empty dict if the verdicts dir doesn't exist or has no reviewer files.
     """
-    reviews_dir = Path(worktree_path) / '.task' / 'reviews'
+    verdicts_dir = artifacts.root / 'verdicts'
+    if not verdicts_dir.is_dir():
+        return {}
+
+    reviews: dict[str, Any] = {}
+    for path in sorted(verdicts_dir.glob('reviewer*.json')):
+        role = path.stem
+        try:
+            envelope = artifacts.read_verdict(role)
+        except ValueError as exc:
+            # read_verdict rejects a role that doesn't match its filename
+            # charset (e.g. a stray "reviewer.foo.json" -> stem
+            # "reviewer.foo"). Verdict files are always written by
+            # write_verdict() with a regex-validated role, so this should
+            # only happen for a manually-placed/stray file — skip it like
+            # any other malformed artifact rather than aborting the read.
+            logger.warning('Skipping malformed verdict filename %s: %s', path, exc)
+            continue
+        if not envelope:
+            continue
+        payload = envelope.get('verdict')
+        if not isinstance(payload, dict):
+            logger.warning('Verdict envelope %s missing/invalid "verdict" payload', path)
+            continue
+        name = payload.get('reviewer', role)
+        reviews[name] = payload
+    return reviews
+
+
+def _read_legacy_reviews(artifacts: TaskArtifacts) -> dict[str, Any]:
+    """Read ``<root>/reviews/*.json`` directly, tolerating corrupt files.
+
+    ``TaskArtifacts.read_reviews()`` has no per-file exception handling, so
+    one corrupt/unreadable file would abort the whole read. This mirrors
+    the pre-envelope ``_read_review_artifacts`` behavior: a corrupt file is
+    skipped with a warning rather than raised, so the other reviewers in a
+    pre-migration run are still graded.
+
+    Returns ``{reviewer_name: {verdict, issues, summary}}``. Returns empty
+    dict if the reviews dir doesn't exist.
+    """
+    reviews_dir = artifacts.root / 'reviews'
     if not reviews_dir.is_dir():
         return {}
 
@@ -141,11 +196,34 @@ def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
     for path in sorted(reviews_dir.glob('*.json')):
         try:
             data = json.loads(path.read_text())
-            name = data.get('reviewer', path.stem)
-            reviews[name] = data
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning('Failed to read review %s: %s', path, e)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Failed to read review %s: %s', path, exc)
+            continue
+        reviews[data.get('reviewer', path.stem)] = data
     return reviews
+
+
+def _read_review_artifacts(worktree_path: str) -> dict[str, Any]:
+    """Read review data for a worktree, preferring the MCP verdict envelope.
+
+    Post-migration (task 2484) runs write the reviewer's verdict/issues
+    payload to ``.task/verdicts/reviewer*.json`` as a schema-versioned
+    envelope; pre-migration runs wrote it directly to
+    ``.task/reviews/*.json``. This prefers the verdict envelope when any
+    reviewer envelope is present, and falls back to the legacy reviews/
+    directory otherwise — a run is reviewed by one reviewer roster at one
+    point in time, so the two sources are never meaningfully mixed.
+
+    Returns ``{reviewer_name: {verdict, issues, summary}}``.
+    Returns empty dict if the worktree has neither artifact source.
+    """
+    artifacts = TaskArtifacts(Path(worktree_path))
+
+    reviews = _read_reviewer_verdict_envelopes(artifacts)
+    if reviews:
+        return reviews
+
+    return _read_legacy_reviews(artifacts)
 
 
 def _format_review_artifacts(reviews: dict[str, Any]) -> str:
