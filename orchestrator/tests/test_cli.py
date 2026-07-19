@@ -1858,6 +1858,149 @@ def test_verify_merge_also_holds_old_compat_lock_during_warm_run(tmp_path, monke
     release_merge_verify_flock(fd)
 
 
+def test_verify_merge_build_lane_acquire_fails_open(tmp_path, monkeypatch):
+    """Knob ON: the in-_run() BUILD lane re-acquire failing OPEN still completes (task 2830).
+
+    Pins the deliberate fail-OPEN arm of the split lane-lock lifetime (esc-2830-1,
+    mirroring ``GitOps.merge_verify_lease``): after the pre-flight gate passes and
+    releases the lane lock, ``_run()`` re-acquires the lane lock for the build only.
+    If THAT acquire times out (``build_lane_fd`` is None), the build proceeds WITHOUT
+    the lane lock and WITHOUT writing the shared holder-pgid — it does NOT raise, does
+    NOT emit a contention result, and leaves NO holder-pgid file behind. (A live lane
+    actor is already excluded by the pre-flight gate + the compat co-lock held across
+    the whole span, so proceeding unrecorded is safe.)
+
+    Forces ONLY the in-_run() lane acquire to fail (return None) by failing the SECOND
+    lane-lock acquire while leaving the pre-flight gate's FIRST lane acquire and the
+    compat acquire (a DIFFERENT path) untouched. Regresses the moment fail-open turns
+    into fail-closed (raise / contention result) or the build starts writing a holder
+    on the no-lock path.
+    """
+    import fcntl
+    import os as os_module
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_cancel import (
+        acquire_merge_verify_flock,
+        lane_lock_path,
+        merge_verify_lock_path,
+        read_lock_holder_pgid,
+        release_merge_verify_flock,
+    )
+
+    known_json = '{"passed": true, "results": []}'
+    fake_worktree_base = tmp_path / '.worktrees'
+    fake_worktree_base.mkdir()
+
+    # --- Mock GitOps: real worktree_base AND a REAL persistent_merge_worktree_path
+    # so lane_lock_path() resolves to <worktree_base>/_merge-verify.lock. ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    mock_git_ops.persistent_merge_worktree_path = fake_worktree_base / '_merge-verify'
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config: knob ON ---
+    from orchestrator.config import GitConfig, OrchestratorConfig
+    git_cfg = GitConfig(persistent_merge_worktree=True)
+    fake_config = OrchestratorConfig(project_root=tmp_path, git=git_cfg)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Force ONLY the in-_run() BUILD lane acquire to fail open (return None). ---
+    # The knob-on span acquires the LANE lock twice: (1) at the pre-flight gate (must
+    # succeed so the gate passes), then (2) inside _run() for the build (the acquire
+    # under test). The compat acquire targets a DIFFERENT path and always succeeds.
+    # Fail the 2nd lane-lock acquire onward, leaving the gate + compat acquires real.
+    real_acquire = cli_module.acquire_merge_verify_flock
+    lane_lock = lane_lock_path(mock_git_ops.persistent_merge_worktree_path)
+    lane_calls = {'n': 0}
+
+    def fake_acquire(lock_path, timeout_secs):
+        if lock_path == lane_lock:
+            lane_calls['n'] += 1
+            if lane_calls['n'] >= 2:
+                return None  # the BUILD re-acquire times out -> fail OPEN
+        return real_acquire(lock_path, timeout_secs)
+
+    monkeypatch.setattr(cli_module, 'acquire_merge_verify_flock', fake_acquire)
+
+    # --- Probe holder + lane-lock state mid-build. ---
+    mid_run = {}
+
+    def _probe_locked(lp):
+        """True iff an independent LOCK_EX|LOCK_NB on lp is denied (held)."""
+        probe_fd = os_module.open(lp, os_module.O_RDWR | os_module.O_CREAT)
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os_module.close(probe_fd)
+
+    async def fake_run_merge_verify(wt, cfg, spec, merge_sha=None):
+        mid_run['reached'] = True
+        # Fail-open: the build holds NO lane lock and wrote NO holder-pgid.
+        mid_run['lane_lock_held'] = _probe_locked(lane_lock)
+        mid_run['holder_pgid'] = read_lock_holder_pgid(fake_worktree_base)
+        return MagicMock()
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr('orchestrator.verify_runner.run_merge_verify_on_worktree', fake_run_merge_verify)
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+    ])
+
+    # Fail-OPEN contract: the verify still completes normally (exit 0, result echoed).
+    assert r.exit_code == 0, f'fail-open must exit 0; got {r.exit_code}; output={r.output!r}'
+    assert known_json in r.output, (
+        f'the build result must still be echoed on the fail-open path: {r.output!r}'
+    )
+    assert 'Error:' not in r.output, f'fail-open must NOT raise: {r.output!r}'
+
+    # The BUILD lane re-acquire was genuinely exercised and forced to None (>=2 acquires).
+    assert lane_calls['n'] >= 2, (
+        f'the in-_run build lane re-acquire was not reached: {lane_calls!r}'
+    )
+    # The build proceeded despite no lane lock, and recorded NO holder mid-run.
+    assert mid_run.get('reached') is True, 'run_merge_verify_on_worktree must still run'
+    assert mid_run.get('lane_lock_held') is False, (
+        f'fail-open: the build must hold NO lane lock: {mid_run!r}'
+    )
+    assert mid_run.get('holder_pgid') is None, (
+        f'fail-open: no shared holder-pgid may be written on the no-lock build path: {mid_run!r}'
+    )
+
+    mock_git_ops.acquire_host_verify_worktree.assert_awaited_once_with(sha)
+
+    # After the CLI returns: no holder-pgid file, both locks free (compat released,
+    # lane never held during the build).
+    assert read_lock_holder_pgid(fake_worktree_base) is None, (
+        'no holder-pgid file may exist after a fail-open run'
+    )
+    fd_lane = acquire_merge_verify_flock(lane_lock, timeout_secs=1.0)
+    assert fd_lane is not None, 'lane lock must be free after a fail-open run'
+    release_merge_verify_flock(fd_lane)
+    fd_compat = acquire_merge_verify_flock(
+        merge_verify_lock_path(fake_worktree_base), timeout_secs=1.0
+    )
+    assert fd_compat is not None, 'compat lock must be released after the CLI returns'
+    release_merge_verify_flock(fd_compat)
+
+
 # ---------------------------------------------------------------------------
 # Task 1732 step-11 — cancel-verify subcommand (CliRunner)
 # ---------------------------------------------------------------------------
