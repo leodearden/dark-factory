@@ -79,14 +79,17 @@ _GIT_ENV_ARGS = [
 ]
 
 
-def _init_tmp_git_repo(tmp_path: Path, *, sentinel: str) -> Path:
+def _init_tmp_git_repo(tmp_path: Path, *, sentinel: str, commit_msg: str = 'seed') -> Path:
     """Create a hermetic git repo under *tmp_path* containing a committed file
-    whose contents include *sentinel*. Returns the repo path."""
+    whose contents include *sentinel*, committed with *commit_msg* as the log
+    message (so --git-log-grep tests can plant a sentinel in the commit message,
+    distinct from the file-contents sentinel --git-grep matches). Returns the
+    repo path."""
     subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / 'tracked.txt').write_text(f'preamble\n{sentinel}\ntrailer\n')
     subprocess.run(['git', 'add', 'tracked.txt'], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
-        ['git', *_GIT_ENV_ARGS, 'commit', '-q', '-m', 'seed'],
+        ['git', *_GIT_ENV_ARGS, 'commit', '-q', '-m', commit_msg],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -131,6 +134,74 @@ class TestReconPredicateCheckScript:
             text=True,
         )
         assert proc.returncode == 1, proc.stderr
+
+    def test_git_log_grep_found_exits_0(self, tmp_path):
+        # --git-log-grep matches the COMMIT MESSAGE (not file contents); plant the
+        # sentinel there via commit_msg.
+        log_sentinel = 'RECON_LOG_SENTINEL_PRESENT'
+        repo = _init_tmp_git_repo(
+            tmp_path, sentinel='body-irrelevant', commit_msg=f'seed {log_sentinel}'
+        )
+        proc = subprocess.run(
+            [str(_SCRIPT), '--git-log-grep', log_sentinel],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_git_log_grep_absent_exits_1(self, tmp_path):
+        # A successful query that matches no commit is the genuine 'absent'
+        # verdict — exit 1, distinct from a runner error (exit 2).
+        repo = _init_tmp_git_repo(tmp_path, sentinel='body-irrelevant', commit_msg='seed')
+        proc = subprocess.run(
+            [str(_SCRIPT), '--git-log-grep', 'absent-6f1e2d3c-0000-4000-8000-000000000000'],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 1, proc.stderr
+
+    def test_git_log_grep_git_error_exits_2(self, tmp_path):
+        # Regression guard for the runner-error fix: running --git-log-grep where
+        # git itself errors (not a git repo) must surface as exit 2 — NEVER
+        # collapse into the exit-1 'absent' verdict, which would mischaracterize
+        # an infra failure as a real contradiction (milestone_check_failed).
+        non_repo = tmp_path / 'not_a_repo'
+        non_repo.mkdir()
+        proc = subprocess.run(
+            [str(_SCRIPT), '--git-log-grep', 'anything'],
+            cwd=non_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+
+    def test_pytest_passing_exits_0(self, tmp_path):
+        # --pytest does `exec python -m pytest "$@"`, so pytest's exit status IS
+        # the predicate verdict; a passing test file must pass 0 through.
+        (tmp_path / 'test_trivial_pass.py').write_text('def test_ok():\n    assert True\n')
+        proc = subprocess.run(
+            [str(_SCRIPT), '--pytest', 'test_trivial_pass.py', '-p', 'no:cacheprovider', '-q'],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            env={**os.environ, 'PYTEST_ADDOPTS': ''},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def test_pytest_failing_exits_nonzero(self, tmp_path):
+        # A failing test file must pass a non-zero status through (pytest returns
+        # 1 on collected-but-failed) — the mismatch -> milestone_check_failed arm.
+        (tmp_path / 'test_trivial_fail.py').write_text('def test_bad():\n    assert False\n')
+        proc = subprocess.run(
+            [str(_SCRIPT), '--pytest', 'test_trivial_fail.py', '-p', 'no:cacheprovider', '-q'],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            env={**os.environ, 'PYTEST_ADDOPTS': ''},
+        )
+        assert proc.returncode != 0, proc.stdout + proc.stderr
 
 
 class TestBuildPredicateContradictionTask:
