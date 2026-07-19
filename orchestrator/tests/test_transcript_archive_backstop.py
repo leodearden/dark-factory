@@ -239,3 +239,20 @@ class TestBackstop:
 
         mock_helper.assert_not_called()
         assert not wt.path.exists()
+
+    async def test_cancellation_propagates_not_swallowed(self, git_repo):
+        """CancelledError from the archive await must re-raise, never be
+        swallowed — cooperative cancellation (loop teardown / hard-kill) must
+        propagate. The best-effort guard's ``except Exception`` deliberately does
+        NOT catch CancelledError (a BaseException), so this pins the two clauses'
+        ordering (mirrors the producer)."""
+        tid = '2786'
+        git_ops = _make_git_ops(git_repo, transcript_archive=TranscriptArchiveConfig())
+        wt = await git_ops.create_worktree(tid)
+        _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
+
+        with patch(
+            'orchestrator.git_ops.archive_task_transcripts',
+            side_effect=asyncio.CancelledError,
+        ), pytest.raises(asyncio.CancelledError):
+            await git_ops.cleanup_worktree(wt.path, tid)

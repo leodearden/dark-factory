@@ -9334,13 +9334,37 @@ class GitOps:
             # (matching archive_root + task_id) makes any overlap idempotent.
             if config_dir.exists():
                 archive_root = self.project_root / self.transcript_archive.root
-                await asyncio.to_thread(
-                    archive_task_transcripts,
-                    config_dir,
-                    branch,
-                    None,
-                    archive_root=archive_root,
-                )
+                try:
+                    await asyncio.to_thread(
+                        archive_task_transcripts,
+                        config_dir,
+                        branch,
+                        None,
+                        archive_root=archive_root,
+                    )
+                except asyncio.CancelledError:
+                    # Cooperative cancellation (loop teardown / hard-kill)
+                    # surfaces here from the await, NOT an archival error — it
+                    # must propagate, never be swallowed (mirrors the producer,
+                    # workflow.py _invoke). CancelledError is a BaseException, so
+                    # the `except Exception` below deliberately does not catch it.
+                    raise
+                except Exception:
+                    # Best-effort: teardown must never be blocked by a broken or
+                    # contract-regressed archiver. archive_task_transcripts is
+                    # total by contract (per-file OSErrors are swallowed +
+                    # counted), but its top-level glob / Path / archive_root
+                    # construction is not individually guarded — swallow any
+                    # escaped non-cancellation error here so `git worktree remove`
+                    # still runs. Loud, not silent: logged as a structured fact.
+                    logger.warning(
+                        'Transcript archival backstop failed for task %s '
+                        '(worktree %s)',
+                        branch,
+                        worktree,
+                        exc_info=True,
+                        extra={'task_id': branch, 'worktree': str(worktree)},
+                    )
 
         full_branch = f'{self.config.branch_prefix}{branch}'
 
