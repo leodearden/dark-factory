@@ -185,3 +185,20 @@ merge_train_max_members: 3
 # Trade-off: a merge's full-breadth verify is slower wall-clock (modules
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
+
+# Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep
+# probe (operator decision, 2026-07-19). probe_fraction=0.5: half of second-slot
+# dispatch rounds target a deeper already-built speculative stack (probe_depths
+# default [2,3,5,8]) instead of the adjacent depth-1 stack, producing genuine
+# depth≥2 merge_verify records (labelled by task 2340's depth field) so
+# scripts/analyze_speculation_depth.py can print the deep P(pass|depth) curve that
+# validates/refutes N*≈20. suppress_flake_rate=0.40 lifts the thrash guard above
+# the shared host's ~0.33 per-attempt verify fail rate so the probe actually fires
+# (the 0.30 default sat at/below the flake floor and self-suppressed).
+# NOTE: 0.5 is ~5x the 2359 design-suggested bound (≤0.1); a failed deep probe
+# skips the safe depth-1 item, so this trades throughput for curve data. Green-tier
+# hot-reloadable (RELOADABLE_FIELDS) — live via mcp__escalation__reload_config, no
+# restart; probe_fraction=0.0 reverts byte-identically.
+speculation_probe:
+  probe_fraction: 0.5
+  suppress_flake_rate: 0.40
