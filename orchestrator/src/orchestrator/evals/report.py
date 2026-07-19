@@ -297,6 +297,36 @@ def build_composite_report(
     }
 
 
+def select_survivors(
+    composite_report: dict[str, Any],
+    *,
+    top_k: int,
+    roles: list[str],
+) -> dict[str, list[str]]:
+    """The top-K config names per ``role_under_test`` — the μ OFAT survivor gate.
+
+    Groups the λ :func:`build_composite_report` ``'configs'`` rows by
+    ``role_under_test``, ranks each requested role's group by DESCENDING
+    ``composite`` mean (ties broken deterministically by ascending ``config``
+    name, so the surface is byte-stable), and returns the top-``top_k`` config
+    names per role. A role with fewer than ``top_k`` rows returns all it has; a
+    requested role with no rows returns ``[]``. Pure over the report dict — the
+    OFAT screen feeds these survivors into :func:`run_matrix_stage`.
+    """
+    by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in composite_report.get('configs', []):
+        by_role[row.get('role_under_test')].append(row)
+
+    survivors: dict[str, list[str]] = {}
+    for role in roles:
+        ranked = sorted(
+            by_role.get(role, []),
+            key=lambda r: (-float(r.get('composite', 0.0) or 0.0), str(r.get('config', ''))),
+        )
+        survivors[role] = [str(r['config']) for r in ranked[:top_k]]
+    return survivors
+
+
 def compute_aggregate_ratings(state: JudgeState) -> dict[str, float]:
     """Mean Elo across tasks over the UNION of configs.
 
