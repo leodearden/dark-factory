@@ -123,7 +123,9 @@ CAP_HIT_RESUME_PROMPT = (
 CRASH_RECOVERY_RESUME_PROMPT = (
     'You were interrupted by an orchestrator restart. '
     'Re-check your working context (plan.json if present) and current '
-    'git/worktree state, then continue where you left off.'
+    'git/worktree state, then continue where you left off. '
+    'Any escalation you filed before the restart may have been auto-dismissed '
+    'as stale — re-raise it if it is still relevant.'
 )
 
 # The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
