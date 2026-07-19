@@ -874,3 +874,174 @@ class TestMapAdvanceFailureConflictMarkers:
         )
 
         halt.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailureStashFailed:
+    """_map_advance_failure must route the 'stash_failed' advance_main result
+    code to the halt-plus-single-escalation path (parallel to unmerged_state),
+    NOT the per-task 'blocked' catch-all.
+
+    ``stash_failed`` is a SHARED main-checkout-hygiene fault: parking
+    project_root's dirty tracked tree fails identically for every subsequent
+    task, so the old catch-all produced a serial fleet-wide pileup of N silent
+    per-task blocks (the 2026-07-12 reify incident, verified merge 57fe8667
+    never landed). Halting the queue collapses that to ONE loud signal owned
+    by a single escalation.
+
+    RED: today ``stash_failed`` falls through to the
+    ``not_descendant``/``contaminated`` catch-all → status 'blocked', halt
+    NOT called, and MergeOutcome has no ``dirty_files`` field.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        # Default: the _last_stash_dirty_files side channel is UNSET, so
+        # getattr(..., None) in the mapper falls back to []. Deleting the
+        # auto-vivified MagicMock attribute makes getattr return its default
+        # (a bare MagicMock would auto-vivify a truthy child, defeating `or []`).
+        del git_ops._last_stash_dirty_files
+        return git_ops
+
+    async def test_stash_failed_halts_queue(self) -> None:
+        """(a) stash_failed halts the whole queue (shared fault), with a reason
+        naming the failed park/stash of project_root WIP."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+
+        await _map_advance_failure(
+            git_ops, 'stash_failed',
+            task_id='task-stashf-a',
+            merge_commit_fallback='fallback-sha',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        halt.assert_called_once()
+        halt_reason = halt.call_args.args[0]
+        assert 'stash_failed' in halt_reason
+        assert 'park' in halt_reason.lower(), (
+            f'halt reason should name the failed park, got {halt_reason!r}'
+        )
+
+    async def test_stash_failed_status_is_stash_failed_not_blocked(self) -> None:
+        """(b) outcome.status is the distinct 'stash_failed', NOT the generic
+        catch-all 'blocked'."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'stash_failed',
+            task_id='task-stashf-b',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        assert outcome.status == 'stash_failed'
+
+    async def test_stash_failed_surfaces_dirty_files_from_side_channel(self) -> None:
+        """(c) dirty_files is populated from the git_ops._last_stash_dirty_files
+        side channel and the reason names the dirty tracked paths + task_id."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        git_ops._last_stash_dirty_files = ['a.py', 'b.py']
+
+        outcome = await _map_advance_failure(
+            git_ops, 'stash_failed',
+            task_id='task-stashf-c',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        assert outcome.dirty_files == ['a.py', 'b.py']
+        assert 'a.py' in outcome.reason and 'b.py' in outcome.reason, (
+            f'reason should name the dirty tracked paths, got {outcome.reason!r}'
+        )
+        assert 'task-stashf-c' in outcome.reason
+
+    async def test_stash_failed_without_side_channel_defaults_empty_and_halts(self) -> None:
+        """(d) with NO side-channel attr set, dirty_files defaults to [] and the
+        branch still halts (no crash on the absent getattr)."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()  # _last_stash_dirty_files deleted
+        halt = MagicMock()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'stash_failed',
+            task_id='task-stashf-d',
+            merge_commit_fallback='fallback-sha',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        assert outcome.status == 'stash_failed'
+        assert outcome.dirty_files == []
+        halt.assert_called_once()
+
+    async def test_stash_failed_pops_cas_retries(self) -> None:
+        """(e) terminal-for-this-task: the cas_retries entry is popped."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        cas_retries = {'task-stashf-e': 2}
+
+        await _map_advance_failure(
+            git_ops, 'stash_failed',
+            task_id='task-stashf-e',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries=cas_retries,
+        )
+
+        assert 'task-stashf-e' not in cas_retries
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailurePerBranchStillBlocks:
+    """Regression lock: ``not_descendant`` / ``contaminated`` remain per-task
+    'blocked' with NO queue halt. They are per-branch content problems (this
+    branch isn't a descendant of main / carries contamination) that do NOT
+    recur for other tasks, so halting the whole queue for them would wrongly
+    block unrelated healthy work. Only ``stash_failed`` (a shared main-checkout
+    fault) was promoted to the halt path — this pins that scoping decision."""
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        return git_ops
+
+    @pytest.mark.parametrize('result', ['not_descendant', 'contaminated'])
+    async def test_per_branch_failure_blocks_without_halt(self, result: str) -> None:
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        halt = MagicMock()
+        task_id = f'task-{result}'
+        cas_retries = {task_id: 1}
+
+        outcome = await _map_advance_failure(
+            git_ops, result,
+            task_id=task_id,
+            merge_commit_fallback='fallback-sha',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries=cas_retries,
+        )
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason == f'advance_main failed ({result}) for task {task_id}'
+        halt.assert_not_called()
+        assert task_id not in cas_retries

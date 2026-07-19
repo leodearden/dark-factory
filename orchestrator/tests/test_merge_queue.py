@@ -3632,16 +3632,19 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
-    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed'])
+    @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated'])
     async def test_speculative_permanent_failure_returns_blocked(
         self, git_ops: GitOps, config: OrchestratorConfig, failure_code: AdvanceResult,
     ):
-        """Permanent advance_main failure codes block without retry.
+        """Permanent per-branch advance_main failure codes block without retry.
 
         Mirrors MergeWorker.test_not_descendant_returns_blocked_immediately but
         exercises the SpeculativeMergeWorker's _verify_and_advance path (lines
         816-824 of merge_queue.py), which also cleans up merge worktree and
-        resolves the Future.  Parameterized over all three permanent codes.
+        resolves the Future.  Parameterized over the two per-branch permanent
+        codes.  ``stash_failed`` was removed (task 2758) — it is a shared
+        main-checkout fault and now HALTS the queue rather than per-task
+        blocking; see ``test_speculative_stash_failed_halts_worker`` below.
         """
         branch_name = f'sperm-{failure_code}'
         filename = f'file_sperm_{failure_code}.py'
@@ -3683,6 +3686,46 @@ class TestSpeculativeMergeWorker:
         )
         # _cas_retries should be clean
         assert branch_name not in worker._cas_retries
+
+        await worker.stop()
+        await worker_task
+
+    async def test_speculative_stash_failed_halts_worker(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """stash_failed in SpeculativeMergeWorker HALTS the queue (shared
+        main-checkout-hygiene fault) and returns the distinct 'stash_failed'
+        status carrying the dirty tracked paths — NOT a silent per-task
+        'blocked'.
+
+        Regression for the 2026-07-12 reify pileup: parking project_root's
+        dirty tracked tree fails identically for every task, so the old
+        per-task-block behaviour produced N silent blocks with no aggregate
+        signal.  Halting collapses that to one loud escalation-owning signal.
+        """
+        wt = await _make_branch_with_file(
+            git_ops, 'stashf-sw-1', 'file_stashf_sw.py', 'stashf_sw = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        async def _stash_failed(*args: Any, **kwargs: Any):
+            git_ops._last_stash_dirty_files = ['write_queue.db']
+            return AdvanceOutcome('stash_failed')
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_stash_failed),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+        ):
+            req = _make_request('stashf-sw-1', 'stashf-sw-1', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'stash_failed'
+        assert worker.is_wip_halted
+        assert outcome.dirty_files == ['write_queue.db']
 
         await worker.stop()
         await worker_task
@@ -15488,9 +15531,15 @@ class TestMapAdvanceFailure:
         halt.assert_called_once_with('advance_main: pop_conflict_no_advance')
         assert task_id not in cas_retries
 
-    @pytest.mark.parametrize('result', ['not_descendant', 'contaminated', 'stash_failed'])
+    @pytest.mark.parametrize('result', ['not_descendant', 'contaminated'])
     async def test_terminal_results_block_no_halt(self, result: str) -> None:
-        """(e) not_descendant/contaminated/stash_failed → blocked with exact reason, halt NOT called, cas_retries popped."""
+        """(e) not_descendant/contaminated → blocked with exact reason, halt NOT called, cas_retries popped.
+
+        ``stash_failed`` was removed from this parametrize (task 2758): it is a
+        SHARED main-checkout-hygiene fault and now takes the halt-plus-single-
+        escalation path instead of the per-task 'blocked' catch-all. See
+        ``TestMapAdvanceFailureStashFailed`` in test_merge_gates.py.
+        """
         from orchestrator.merge_queue import _map_advance_failure
 
         git_ops = self._make_git_ops()
