@@ -19,8 +19,8 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import (
     AllAccountsCappedException,
-    _resolve_transcript_path,
     invoke_with_cap_retry,
+    transcript_exists,
 )
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
@@ -2494,13 +2494,14 @@ task, include it with an empty "files" list rather than omitting it.
             return (False, 'capped')
         # Transcript corroboration — RE-glob at dispatch (INV-3), so a
         # reseed/wipe of .task between boot and re-dispatch is detected.
+        # transcript_exists is itself total (any glob error → False), so no
+        # outer try/except is needed here to uphold this method's I3 totality:
+        # a non-empty config_dir str makes Path() safe, and a missing/absent
+        # transcript degrades to the 'no_transcript' fallback below.
         session_id = session.get('session_id')
         if not config_dir or not session_id:
             return (False, 'no_transcript')
-        try:
-            if _resolve_transcript_path(Path(config_dir), session_id) is None:
-                return (False, 'no_transcript')
-        except Exception:  # noqa: BLE001 — totality (I3): any glob error is a fallback
+        if not transcript_exists(Path(config_dir), session_id):
             return (False, 'no_transcript')
         return (True, 'eligible')
 
