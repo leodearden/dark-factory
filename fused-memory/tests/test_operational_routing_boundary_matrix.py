@@ -462,3 +462,62 @@ async def test_untagged_legacy_ask_still_routed_by_curator_fallback(
 
     assert meta['task_kind'] == 'deterministic', f'got {meta!r}'
     assert meta['always_escalates'] is True, f'got {meta!r}'
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6 — invalid operational_mode -> ValidationError, no task created
+# (matrix row 6: the alpha write-boundary rejection, surfaced through
+# submit_task in enforce mode).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invalid_operational_mode_rejected_and_no_task_created(
+    _enforce_stack, tmp_path,
+):
+    """A planning_mode submit declaring an unrecognized ``operational_mode``
+    is rejected with a ValidationError, and no task row is created.
+
+    The β submit-boundary coercion (``inject_operational_routing``) does NOT
+    reject invalid ``operational_mode`` values by design (see its module
+    docstring: ``operational`` + any mode other than ``llm`` takes the plain
+    pure-gate branch, preserving the declared ``operational_mode`` verbatim
+    via ``_inject_deterministic_pure_gate``'s shallow copy) — rejection is
+    owned by the shared ``TaskMetadata`` ``Literal['gate', 'llm']`` enforced
+    at the backend WRITE boundary (``parse_metadata(direction='write',
+    enforce=True)``), which only an ENFORCE-mode backend
+    (``task_metadata_enforce=True``) actually raises on — the default
+    backend runs warn-only (hence ``_enforce_stack``, not ``_real_stack``,
+    here). The enforce-mode ``add_task`` raises a pydantic
+    ``ValidationError`` from inside its write transaction, which
+    ``_submit_task_planning_mode``'s exception handler wraps as
+    ``{'error': ..., 'error_type': 'ValidationError'}``
+    (task_interceptor.py:2349-2354), and the transaction rolls back before
+    any INSERT — precedent: test_task_metadata_boundary.py's
+    rolled-back-INSERT pattern (:41-63, 179-211).
+    """
+    server, _interceptor = _enforce_stack
+    root = str(tmp_path / 'proj')
+    title = 'Zeta boundary probe: invalid operational_mode'
+
+    result = await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': title,
+            'description': 'Operational ask declaring a bogus operational_mode, via planning_mode.',
+            'planning_mode': True,
+            'metadata': {
+                'execution_class': 'operational',
+                'operational_mode': 'bogus',
+            },
+        },
+    )
+    assert result.get('error_type') == 'ValidationError', f'got {result!r}'
+
+    tasks_result = await server._tool_manager.call_tool(
+        'get_tasks', {'project_root': root},
+    )
+    assert 'error' not in tasks_result, f'get_tasks failed unexpectedly: {tasks_result!r}'
+    titles = [t.get('title') for t in tasks_result.get('tasks', [])]
+    assert title not in titles, f'got {tasks_result!r}'
