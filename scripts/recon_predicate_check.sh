@@ -14,7 +14,10 @@
 #                                              (done_provenance.kind='deterministic-milestone')
 #   non-zero predicate MISMATCH / not found -> born-at-L2 milestone_check_failed
 #                                              escalation + task blocked
-#   2        usage error (unknown/missing mode)
+#   2        usage error (unknown/missing mode), OR a git runner error in
+#            --git-log-grep (bad repo / invalid pattern) — kept distinct from
+#            the exit-1 'absent' verdict so an infra failure is not misread as
+#            a real contradiction verdict
 #
 # The builder stays generic — a caller may point before_done.script at ANY
 # project-relative committed executable; this runner is the concrete reference
@@ -33,8 +36,9 @@ usage: recon_predicate_check.sh <mode> [args...]
                                     predicate holds (exit 0) iff pytest passes
   --git-grep <pattern> [-- <path>]  exit 0 iff the pattern is found in tracked
                                     files (git grep), exit 1 if absent
-  --git-log-grep <pattern>          exit 0 iff `git log --grep=<pattern>` is
-                                    non-empty, exit 1 otherwise
+  --git-log-grep <pattern>          exit 0 iff a commit message matches
+                                    <pattern> (git log --grep), exit 1 if none
+                                    match, exit 2 on a git runner error
 EOF
 }
 
@@ -60,7 +64,17 @@ case "$mode" in
         shift
         [ $# -ge 1 ] || { echo "recon_predicate_check.sh: --git-log-grep requires a <pattern>" >&2; exit 2; }
         pattern="$1"
-        if [ -n "$(git log --grep="$pattern" --oneline)" ]; then
+        # Capture `git log --grep`'s output AND exit code explicitly (mirroring
+        # the --git-grep idiom above) so a genuine git error — bad repo, invalid
+        # pattern — surfaces as exit 2 and is never collapsed into the exit-1
+        # 'absent' verdict. `git log` returns 0 even when nothing matches, so the
+        # found/absent distinction is drawn from output emptiness, not its exit.
+        out=$(git log --grep="$pattern" --oneline) && rc=0 || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "recon_predicate_check.sh: git log failed (exit $rc)" >&2
+            exit 2
+        fi
+        if [ -n "$out" ]; then
             exit 0
         else
             exit 1
