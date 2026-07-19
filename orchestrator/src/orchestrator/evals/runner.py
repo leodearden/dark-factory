@@ -94,6 +94,7 @@ def build_eval_orch_config(
     base_config: OrchestratorConfig | None = None,
     memory_endpoint: str | None = None,
     architect_config: EvalConfig | None = None,
+    judge_config: EvalConfig | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
@@ -110,6 +111,17 @@ def build_eval_orch_config(
     opus/claude/high, so an architect×implementer combo can be scored end-to-end.
     Left ``None`` (every existing caller), the architect pin is byte-identical to
     today, so the P1/B1 parity tripwire and the frozen-plan paths stay intact.
+
+    ``judge_config`` (eval-revival ο) drives the judge OFAT axis (``run_ofat_stage``
+    's judge branch via ``run_eval``): when supplied, the ζ completion judge's
+    model/effort are derived from THIS candidate instead of the hardcoded
+    sonnet/medium, so a cheaper judge (haiku) can be trialled and scored
+    indirectly through μ's composite. Only model/effort derive — ``backends.judge``
+    stays ``'claude'`` and ``budgets.judge`` stays ``0.50`` PINNED below (the judge
+    is an always-Claude read-only quality call; mirrors the architect knob, which
+    also never derives budget). Left ``None`` (every existing caller), the judge
+    pin (sonnet/medium/claude/0.50) is byte-identical to today, so the parity
+    tripwire holds.
 
     Two task-spec knobs override the defaults below:
       - ``max_execute_iterations``: hard ceiling on implementer iterations.
@@ -142,6 +154,14 @@ def build_eval_orch_config(
     architect_backend = architect_config.backend if architect_config else 'claude'
     architect_effort = (architect_config.effort or 'high') if architect_config else 'high'
 
+    # Judge pin: sonnet/medium by default (the ζ completion judge), or model/effort
+    # derived from judge_config for the judge OFAT axis (ο). Backend and budget stay
+    # PINNED below (always-Claude read-only judge — not derived). When judge_config
+    # is None both values equal the historical literal, so the config is
+    # byte-identical to today and the parity tripwire holds.
+    judge_model = judge_config.model if judge_config else 'sonnet'
+    judge_effort = (judge_config.effort or 'medium') if judge_config else 'medium'
+
     models = ModelsConfig(
         architect=architect_model,
         implementer=config.model,
@@ -149,7 +169,7 @@ def build_eval_orch_config(
         reviewer='opus',          # 1× opus comprehensive reviewer (production parity)
         merger='opus',
         module_tagger='sonnet',
-        judge='sonnet',           # ζ completion judge — read-only, small budget
+        judge=judge_model,        # ζ completion judge — read-only, small budget (ο: derivable)
     )
 
     budgets = BudgetsConfig(
@@ -169,7 +189,7 @@ def build_eval_orch_config(
         reviewer='high',           # opus reviewer at high effort (matches defaults.yaml)
         merger='high',
         module_tagger='medium',
-        judge='medium',
+        judge=judge_effort,
     )
 
     backends = BackendsConfig(
