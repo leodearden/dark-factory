@@ -5730,22 +5730,24 @@ async def confirm_merge_verify_flake_suppressible(
         # Map each node-id to its owning subproject over the given
         # module_configs + the on-disk merge worktree. Any unmapped node-id
         # fails CLOSED to red (no guessing which subproject a node-id belongs
-        # to). Mirrors confirm_main_tip_failure_is_real's existence mapping;
-        # first match by module_configs order wins.
+        # to). Mirrors confirm_main_tip_failure_is_real's existence mapping:
+        # collect EVERY candidate subproject (not just the first) so a bare
+        # relative path that happens to exist under more than one given
+        # subproject is WARN-flagged rather than silently mis-attributed to
+        # whichever prefix iterates first — which would run the isolated
+        # confirm re-run against the wrong subproject's tests.
         mc_by_prefix: dict[str, ModuleConfig] = {mc.prefix: mc for mc in module_configs}
         groups: dict[str, list[str]] = {}
         for node_id in node_ids:
             file_part = node_id.split('::', 1)[0]
-            matched: tuple[str, str] | None = None
+            candidates: list[tuple[str, str]] = []
             for mc in module_configs:
                 prefix = mc.prefix
                 if (worktree / prefix / file_part).exists():
-                    matched = (prefix, f'{prefix}/{node_id}')
-                    break
-                if file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
-                    matched = (prefix, node_id)
-                    break
-            if matched is None:
+                    candidates.append((prefix, f'{prefix}/{node_id}'))
+                elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
+                    candidates.append((prefix, node_id))
+            if not candidates:
                 logger.info(
                     'confirm_merge_verify_flake_suppressible: node-id %r did '
                     'not map to any given subproject in %s — unconfirmable, '
@@ -5753,7 +5755,16 @@ async def confirm_merge_verify_flake_suppressible(
                     node_id, worktree,
                 )
                 return None
-            matched_prefix, matched_node_id = matched
+            if len(candidates) > 1:
+                logger.warning(
+                    'confirm_merge_verify_flake_suppressible: node-id %r matched '
+                    '%d given subprojects (%s) in %s — using %r; a relative path '
+                    'shared across subprojects can mis-attribute the isolated '
+                    're-run to the wrong ModuleConfig',
+                    node_id, len(candidates), [c[0] for c in candidates],
+                    worktree, candidates[0][0],
+                )
+            matched_prefix, matched_node_id = candidates[0]
             groups.setdefault(matched_prefix, []).append(matched_node_id)
 
         # Each subproject group gets its own scoped + forced-serial +
