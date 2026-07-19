@@ -63,9 +63,12 @@ def quality_from_review_artifact(
     Contract-agnostic (P4 / B8): accepts EITHER the legacy review payload or
     the MCP verdict-tool envelope (unwrapped via
     :func:`_unwrap_verdict_envelope`), counts blocking vs suggestion issues by
-    ``severity == 'blocking'`` exactly as ``artifacts.aggregate_reviews`` does,
-    and returns ``metrics.compute_composite`` of an :class:`EvalMetrics` built
-    from those counts — so the quality formula stays single-sourced. Reads only
+    ``severity == 'blocking'`` exactly as ``artifacts.aggregate_reviews`` does
+    — including that path's ERROR filter: an artifact whose top-level
+    ``verdict`` is ``ERROR`` is skipped (0 blocking / 0 suggestions), never
+    counted by severity. It returns ``metrics.compute_composite`` of an
+    :class:`EvalMetrics` built from those counts — so the quality formula stays
+    single-sourced. Reads only
     the artifact dict plus the scalar ``plan_steps`` / ``debug_cycles`` knobs;
     it never touches a transcript, worktree, or file path.
 
@@ -75,6 +78,15 @@ def quality_from_review_artifact(
     """
     payload = _unwrap_verdict_envelope(artifact)
     issues: list[Any] = payload.get('issues', []) or []
+
+    # Mirror ``artifacts.aggregate_reviews``' ERROR filter exactly: a review
+    # whose top-level ``verdict`` is ``ERROR`` is skipped there entirely (0
+    # blocking / 0 suggestions), never counted by severity. Zero the issue list
+    # here too, so an ERROR artifact that still carried ``issues`` entries
+    # scores identically through this scorer and the aggregate path — keeping
+    # the single-sourcing claim exact.
+    if payload.get('verdict') == 'ERROR':
+        issues = []
 
     blocking = 0
     suggestions = 0
