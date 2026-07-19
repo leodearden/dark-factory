@@ -487,6 +487,35 @@ concurrent failing merge to the steward would cause an ~85 min-per-task
 livelock for every task whose verify runs against a red main."""
 
 
+TRIVIAL_PASS_MAIN_RED_REASON_PREFIX = (
+    'Trivial-pass withheld: config-only merge would advance main over a '
+    'known-red state'
+)
+"""Prefix of the ``MergeOutcome.reason`` string emitted when a config-only
+merge that short-circuited to :func:`verify._trivial_pass` (no ``.py``/``.rs``
+in the diff — ``VerifyResult.trivial is True``) is refused advancement over a
+main tip whose cached failing-id baseline is known-red (task 2823, gate-hole
+#3/3 of the reify 2026-07-19 red-main incident).
+
+A trivial pass ran NO test suite, so it is no evidence the red cleared; letting
+it CAS-advance main would persist the red. The gate keys strictly on
+``verify.trivial`` — a NON-trivial pass (the full merge suite actually ran on
+the merged tree and passed) legitimately heals a red main and is never blocked.
+It is a CACHE-ONLY peek (:func:`verify.cached_main_baseline_failing_ids`) that
+never triggers a probe on the critical path (G4, task 2564) and fails OPEN on a
+cold/unknown baseline, matching the task's "known-red" scope. Paired with
+``MergeFailureDisposition.MAIN_RED``: the break is pre-existing, not this task's
+fault, so the blocked task re-dispatches and passes once main is green again.
+
+Caveat (task 2823 amendment): that self-heal assumes some OTHER, code-touching
+merge greens main first. A config-only change that is *itself* the fix for the
+red main is deliberately NOT trusted here — a trivial pass runs no suite, so it
+can never prove the red cleared, and it will oscillate re-dispatch/block (loud,
+via MAIN_RED) until a non-trivial merge or an operator greens main. The gate
+logs a distinct WITHHELD warning so this edge is recognisable rather than read
+as routine main-red churn."""
+
+
 MAIN_HEALTH_PROBE_PENDING_NOTE = (
     'provisional: an off-critical-path main-health probe is still checking '
     'whether this failure pre-exists on bare main (task 2564); if '
@@ -2053,6 +2082,74 @@ async def _run_post_merge_verify(
             disposition=disposition,
             failure_diagnostic=failure_diagnostic,
         )
+
+    # Task 2823 (gate-hole #3/3): a config-only merge (no .py/.rs in the diff)
+    # short-circuits to verify._trivial_pass WITHOUT running any suite, so a
+    # trivial pass is NOT evidence that main is green. Refuse to CAS-advance a
+    # trivial pass over a KNOWN-red main tip (its cached failing-id baseline is
+    # non-empty) — else the red persists (the reify 2026-07-19 incident:
+    # config-only 5247/5249 landed over #5120's red main and re-persisted it).
+    #
+    # CACHE-ONLY peek (cached_main_baseline_failing_ids): never a probe on the
+    # critical path (G4, task 2564); fail OPEN when the baseline is green
+    # (empty frozenset) or cold/unknown (None), matching the task's "known-red"
+    # scope. Keyed strictly on verify.trivial: a NON-trivial pass means the
+    # full suite ran on the merged tree and passed, which legitimately heals a
+    # red main and must NOT be blocked (else main-recovery merges would stall).
+    # Mirrors the failure-path idiom above (get_main_sha in a try/except, then
+    # cached_main_baseline_failing_ids).
+    #
+    # getattr default False mirrors the VerifyResult dataclass default
+    # (verify.py: ``trivial: bool = False``): a result object lacking the field
+    # (e.g. a lightweight verify double, or a codec round-trip predating step-2)
+    # is treated as a NON-trivial pass, so the gate stays inert — the fail-open
+    # direction (a non-trivial pass legitimately heals a red main and must never
+    # be blocked). Production always returns a real VerifyResult, so this only
+    # affects stand-ins.
+    if getattr(verify, 'trivial', False):
+        try:
+            _pass_main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+        except Exception:
+            _pass_main_sha = ''
+        _known_red_ids = (
+            cached_main_baseline_failing_ids(_pass_main_sha)
+            if _pass_main_sha
+            else None
+        )
+        if _known_red_ids:
+            # Distinct operator signal (task 2823 amendment,
+            # reviewer_comprehensive robustness finding): emit a dedicated
+            # WITHHELD warning — NOT the ordinary main-red-churn line — so the
+            # config-only-fixes-red edge is recognisable in the logs. A trivial
+            # pass runs no suite, so a config-only change that is ITSELF the fix
+            # for the red main can never prove the red cleared and will
+            # oscillate re-dispatch/block here; greening main needs a
+            # code-touching (non-trivial) merge or operator action, not another
+            # config-only re-dispatch.
+            logger.warning(
+                'Task %s: trivial-pass main-red gate WITHHELD a config-only '
+                'merge from advancing main %s over a known-red baseline (%d '
+                'failing test(s): %s). A trivial pass runs no suite, so if this '
+                'config-only change is itself the fix it cannot self-heal by '
+                're-dispatch — main must be greened by a code-touching merge or '
+                'operator action first.',
+                req.task_id, _pass_main_sha, len(_known_red_ids),
+                ', '.join(sorted(_known_red_ids)[:10]),
+            )
+            # Any non-None MergeOutcome return owns merge_wt cleanup (the caller
+            # only reuses merge_wt on a None pass return) — mirrors the
+            # verify-failed path's cleanup contract above.
+            await git_ops.cleanup_merge_worktree(merge_wt)
+            return MergeOutcome(
+                'blocked',
+                reason=(
+                    f'{TRIVIAL_PASS_MAIN_RED_REASON_PREFIX} '
+                    f'(main {_pass_main_sha:.8}, {len(_known_red_ids)} '
+                    f'failing test(s)): '
+                    + ', '.join(sorted(_known_red_ids)[:10])
+                ),
+                disposition=MergeFailureDisposition.MAIN_RED,
+            )
 
     # Task μ (verify-scope-inversion-prd.md, B2): seed the per-main-SHA
     # failing-test-id baseline for free on every successful merge+full gate

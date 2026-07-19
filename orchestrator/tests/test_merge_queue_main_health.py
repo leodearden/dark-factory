@@ -1319,3 +1319,145 @@ class TestBaselineAttributionOverBlockPath:
         assert '[category: test_failure]' in outcome.reason, (
             f'expected the category suffix preserved; got {outcome.reason!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2823: config-only trivial-pass gate over _run_post_merge_verify's PASS
+# path. A config-only merge (no .py/.rs) short-circuits to verify._trivial_pass
+# WITHOUT running the suite; the pass path must refuse to advance main over a
+# KNOWN-red baseline (else the red persists — the reify 2026-07-19 incident),
+# while still letting a NON-trivial pass (full suite actually ran and passed)
+# heal a red main. Cache-ONLY peek — never a probe on the critical path (G4,
+# task 2564); fail-OPEN on a cold/unknown baseline (matches "known-red").
+#
+# SYNC mode (main_health_probe_handles=None, the file default) reaches the
+# pass-path gate identically to production DEFERRED mode. RED today: case (a)
+# both returns None (no gate) and cannot import the reason-prefix constant.
+# ---------------------------------------------------------------------------
+
+
+class TestTrivialPassMainRedGate:
+    """A trivial pass is BLOCKED over a known-red main (MAIN_RED disposition,
+    worktree cleaned up), and ONLY then: a green baseline, a cold/unknown
+    baseline, and a non-trivial pass over red all advance (return None)."""
+
+    _RED_ID = 'orchestrator/tests/test_x.py::test_foo'
+
+    @pytest.fixture(autouse=True)
+    def reset_baseline_cache(self):
+        """Clear the per-main-SHA baseline cache around each test. The file's
+        module-level autouse fixture only clears _PROBE_CACHE; the cold-cache
+        case below needs a guaranteed-empty baseline for MAIN_SHA."""
+        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
+        _BASELINE_FAILING_IDS_CACHE.clear()
+        yield
+        _BASELINE_FAILING_IDS_CACHE.clear()
+
+    def _trivial_pass(self) -> VerifyResult:
+        return VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='No source files changed — verify trivially passes',
+            trivial=True,
+        )
+
+    def _drive(
+        self,
+        tmp_path: Path,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        result: VerifyResult,
+        merge_wt: Path,
+    ) -> MergeOutcome | None:
+        req = _make_req('2823', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            new=AsyncMock(return_value=result),
+        ):
+            return asyncio.run(_drive_verify(req, merge_wt, git_ops))
+
+    def test_a_known_red_blocks_trivial_pass(self, tmp_path: Path) -> None:
+        """seed red baseline + trivial pass -> blocked/MAIN_RED, worktree cleaned."""
+        from orchestrator.merge_queue import (
+            TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
+            MergeFailureDisposition,
+        )
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+
+        seed_main_baseline(MAIN_SHA, frozenset({self._RED_ID}))
+
+        outcome = self._drive(tmp_path, git_ops, config, self._trivial_pass(), merge_wt)
+
+        assert outcome is not None, (
+            'a trivial pass over a known-red main must be blocked, not advanced'
+        )
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(TRIVIAL_PASS_MAIN_RED_REASON_PREFIX), (
+            f'expected the trivial-pass main-red reason prefix; got {outcome.reason!r}'
+        )
+        assert outcome.disposition == MergeFailureDisposition.MAIN_RED, (
+            f'a pre-existing main red must be attributed MAIN_RED; got {outcome.disposition!r}'
+        )
+        cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_awaited_with(merge_wt)
+
+    def test_b_green_baseline_advances_trivial_pass(self, tmp_path: Path) -> None:
+        """seed EMPTY (green) baseline + trivial pass -> None (advance)."""
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+
+        seed_main_baseline(MAIN_SHA, frozenset())
+
+        outcome = self._drive(tmp_path, git_ops, config, self._trivial_pass(), merge_wt)
+
+        assert outcome is None, (
+            f'a trivial pass over a KNOWN-green main must advance; got {outcome!r}'
+        )
+        cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_not_awaited()
+
+    def test_c_cold_baseline_fails_open_advances(self, tmp_path: Path) -> None:
+        """no seed (cold/unknown baseline) + trivial pass -> None (fail-open)."""
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+
+        # No seed_main_baseline: the cache is empty for MAIN_SHA (fixture cleared),
+        # so cached_main_baseline_failing_ids returns None -> fail open.
+        outcome = self._drive(tmp_path, git_ops, config, self._trivial_pass(), merge_wt)
+
+        assert outcome is None, (
+            f'a trivial pass over a COLD/unknown baseline must fail open; got {outcome!r}'
+        )
+
+    def test_d_non_trivial_pass_over_red_advances(self, tmp_path: Path) -> None:
+        """seed red baseline + NON-trivial pass -> None: a real suite pass
+        heals the red main and must NOT be blocked."""
+        from orchestrator.verify import seed_main_baseline
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+
+        seed_main_baseline(MAIN_SHA, frozenset({self._RED_ID}))
+
+        non_trivial_pass = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='full suite passed', trivial=False, failing_test_ids=[],
+        )
+
+        outcome = self._drive(tmp_path, git_ops, config, non_trivial_pass, merge_wt)
+
+        assert outcome is None, (
+            f'a NON-trivial pass (full suite ran and passed) must heal a red main, '
+            f'not be blocked; got {outcome!r}'
+        )

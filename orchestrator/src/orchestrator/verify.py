@@ -1823,6 +1823,7 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
         type_output='',
         timed_out=False,
         cause_hint='',
+        trivial=True,
     )
 
 
@@ -2558,6 +2559,18 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 2823: True IFF this result came from _trivial_pass — a config-only
+    # (no .py/.rs) merge that short-circuited verification WITHOUT running any
+    # suite. The merge worker's pass path keys on this to refuse advancing main
+    # over a known-red baseline (a trivial pass ran nothing, so it is no
+    # evidence the red cleared), while still letting a NON-trivial pass (full
+    # suite actually ran and passed) heal a red main. A plain JSON-native bool,
+    # so it round-trips through the generic codec (asdict / VerifyResult(**d))
+    # exactly like contention/plan/failing_test_ids — no allowlist to touch.
+    # Comparable (participates in __eq__): unlike the compare=False
+    # duration_secs below, it is invariant across two runs of the same logical
+    # verification.
+    trivial: bool = False
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
     # when run serially.  For a multi-module run: max across child

@@ -1966,6 +1966,61 @@ class TestVerifyResultFailingTestIds:
 
 
 # ---------------------------------------------------------------------------
+# Task 2823 step-01: VerifyResult carries an explicit `trivial: bool` marker
+# (default False), set True only by _trivial_pass. A config-only merge
+# short-circuits to _trivial_pass WITHOUT running the suite, so the merge
+# worker needs to distinguish that "trivially passed, nothing ran" outcome
+# from an OPAQUE/scoped pass that ALSO leaves failing_test_ids=None — the
+# summary string is too brittle a discriminator. The marker is a plain
+# JSON-native bool, so it round-trips losslessly through the remote/JSON
+# codec (result_to_dict=asdict / result_from_dict=VerifyResult(**d)) exactly
+# like contention/plan/failing_test_ids, with no allowlist to touch.
+#
+# RED today: the field does not exist yet, so every access below raises
+# AttributeError.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultTrivialMarker:
+    """VerifyResult.trivial defaults False and is set True by _trivial_pass,
+    surviving the remote/JSON codec round-trip.
+    """
+
+    def _make_result(self, **overrides: Any) -> VerifyResult:
+        defaults: dict[str, Any] = dict(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='x',
+        )
+        defaults.update(overrides)
+        return VerifyResult(**defaults)
+
+    def test_default_trivial_is_false(self):
+        vr = self._make_result()
+        assert vr.trivial is False
+
+    def test_trivial_pass_sets_trivial_true(self):
+        result = verify._trivial_pass('reason')
+        assert result.trivial is True
+        assert result.passed is True
+        assert result.failing_test_ids is None
+
+    def test_trivial_marker_round_trips_through_remote_codec(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        restored = result_from_dict(result_to_dict(verify._trivial_pass('r')))
+        assert restored.trivial is True
+
+    def test_default_result_round_trips_trivial_false(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        restored = result_from_dict(result_to_dict(self._make_result()))
+        assert restored.trivial is False
+
+
+# ---------------------------------------------------------------------------
 # Task μ (verify-scope-inversion-prd.md) step-07: run_verification injects
 # --junitxml into the test leg and parses the report into
 # VerifyResult.failing_test_ids — but ONLY for role=='merge',
