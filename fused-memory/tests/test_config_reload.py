@@ -12,6 +12,7 @@ not prose.
 
 from __future__ import annotations
 
+import asyncio
 import types
 from pathlib import Path
 from typing import Any
@@ -344,4 +345,42 @@ class TestReloadConfigTool:
         assert result['applied'] == {}
         assert result['config_path'] == str(bad_yaml)
         # Live config completely untouched — no apply on the load-failure path.
+        assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
+
+    @pytest.mark.asyncio
+    async def test_tool_fails_closed_on_load_timeout(self, monkeypatch):
+        """A slow / hanging config re-read is bounded by ``asyncio.wait_for``: the
+        tool returns a fail-closed 'timed out' report with the live config left
+        untouched — never blocking the event loop or half-applying a reload.
+
+        Exercises the REAL ``asyncio.wait_for`` timeout branch (distinct from the
+        invalid-config ``except Exception`` branch above) by making the thread-off
+        re-read hang and shrinking the tool's timeout so the bound trips fast and
+        deterministically.
+        """
+        svc = AsyncMock()
+        svc.config = FusedMemoryConfig()
+        flagship_before = svc.config.reconciliation.stale_run_recovery_seconds
+
+        # Replace the thread-off load with a hang (no real thread is spawned — the
+        # coroutine is cancelled cleanly by wait_for), and shrink the tool's
+        # timeout so the real asyncio.wait_for in reload_config trips quickly.
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(asyncio, 'to_thread', _hang)
+        monkeypatch.setattr('fused_memory.server.tools._RELOAD_LOAD_TIMEOUT_SECS', 0.05)
+
+        server = create_mcp_server(svc)
+        # Outer guard: if the internal wait_for were ever removed (regression),
+        # fail loudly here rather than hanging the whole test suite.
+        result = await asyncio.wait_for(
+            server._tool_manager.call_tool('reload_config', {}), timeout=5.0
+        )
+
+        assert result['reloaded'] is False
+        assert result['applied'] == {}
+        assert result['restart_required'] == {}
+        assert isinstance(result['error'], str) and 'timed out' in result['error']
+        # Live config completely untouched — no apply on the timeout path.
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
