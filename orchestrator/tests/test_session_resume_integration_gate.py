@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -132,6 +133,165 @@ def _make_plan(
     if session_id is not None:
         plan['_session_id'] = session_id
     return plan
+
+
+# ── Composition scaffolding (recover → dispatch seam) ────────────────────────
+_DispatchCapture = namedtuple(
+    '_DispatchCapture', ['resume_session_id', 'initial_plan', 'emits'],
+)
+
+
+def _attach_pool(harness: Harness, size: int = 2) -> WarmLanePool:
+    """Attach a WarmLanePool on the harness's (reassigned) worktree_base so
+    ``pool.is_lane('_lane-k')`` recognises a fabricated lane as a lane."""
+    base = harness.git_ops.worktree_base
+    base.mkdir(parents=True, exist_ok=True)
+    pool = WarmLanePool(worktree_base=base, size=size)
+    harness.git_ops.warm_lane_pool = pool
+    return pool
+
+
+def _make_transcript(base: Path, session_id: str) -> Path:
+    """Create ``<base>/claude-config-<sid>/projects/<slug>/<sid>.jsonl`` and
+    return the ``claude-config-<sid>`` dir.
+
+    Mirrors test_crash_recovery.py. Recovery globs
+    ``<entry>/.task/claude-config-*`` at boot and ``transcript_exists`` re-globs
+    ``<cfg>/projects/*/<sid>.jsonl`` at dispatch — placing the transcript under
+    the lane's ``.task/`` satisfies BOTH the boot glob and the dispatch re-glob,
+    so a composed recover→dispatch reaches ``(True, 'eligible')``.
+    """
+    cfg = base / f'claude-config-{session_id}'
+    proj = cfg / 'projects' / 'some-slug'
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
+    return cfg
+
+
+def _sidecar(
+    session_id: str, role: str, *, task_id: str, fresh: bool,
+    sidecar_version: int, resume_count: int,
+) -> dict:
+    """Build a v1 or v2 ``agent_session.json`` payload.
+
+    ``fresh=False`` back-dates ``started_at`` to 2× the freshness window so the
+    γ guard rejects it as 'stale'. A v1 sidecar carries only the legacy keys
+    (no ``task_id`` / ``resume_count`` / ``schema_version``) — the pre-deploy
+    shape (B11).
+    """
+    if fresh:
+        started_at = datetime.now(UTC).isoformat()
+    else:
+        window = SessionResumeConfig().freshness_window_secs
+        started_at = (datetime.now(UTC) - timedelta(seconds=2 * window)).isoformat()
+    payload: dict = {
+        'session_id': session_id,
+        'role': role,
+        'started_at': started_at,
+        'owner_pid': 4242,
+    }
+    if sidecar_version >= 2:
+        payload['task_id'] = task_id
+        payload['resume_count'] = resume_count
+        payload['schema_version'] = 2
+    return payload
+
+
+def _setup_warm_lane_session(
+    harness: Harness,
+    task_id: str,
+    session_id: str,
+    *,
+    role: str = 'implementer',
+    steps_done: int = 3,
+    steps_total: int = 5,
+    fresh: bool = True,
+    with_transcript: bool = True,
+    with_plan: bool = True,
+    sidecar_version: int = 2,
+    resume_count: int = 0,
+    lane: bool = True,
+) -> Path:
+    """Lay down an on-disk warm lane (or cold worktree) mid-invocation.
+
+    Writes ``<dir>/.task/plan.json`` (stamped w/ the real task_id + partial
+    progress, when ``with_plan``), a v1/v2 ``agent_session.json`` sidecar, and
+    — when ``with_transcript`` — the corroborating transcript under
+    ``<dir>/.task/claude-config-<sid>/...``. Returns the lane/worktree dir.
+
+    For a warm lane (``lane=True``) a pool is attached and the dir is named
+    ``_lane-0`` (≠ the real task_id, by pool-slot design); for a cold worktree
+    (``lane=False``, B9) the dir is named after the task_id and no pool is
+    attached.
+    """
+    base = harness.git_ops.worktree_base
+    if lane:
+        _attach_pool(harness)
+        wt = base / '_lane-0'
+    else:
+        wt = base / task_id
+    task_dir = wt / '.task'
+    task_dir.mkdir(parents=True, exist_ok=True)
+    if with_plan:
+        (task_dir / 'plan.json').write_text(
+            json.dumps(_make_plan(steps_done, steps_total, task_id))
+        )
+    (task_dir / 'agent_session.json').write_text(json.dumps(_sidecar(
+        session_id, role, task_id=task_id, fresh=fresh,
+        sidecar_version=sidecar_version, resume_count=resume_count,
+    )))
+    if with_transcript:
+        _make_transcript(task_dir, session_id)
+    return wt
+
+
+def _session_resume_emits(harness: Harness) -> list[tuple]:
+    """Return ``[(event_type, kwargs), ...]`` for every session_resume* emit.
+
+    EventType members are referenced here at CALL time (never module scope) —
+    matching the test_crash_recovery.py convention.
+    """
+    wanted = {
+        EventType.session_resume,
+        EventType.session_resume_fallback,
+        EventType.session_resume_capped,
+    }
+    out: list[tuple] = []
+    for call in harness.event_store.emit.call_args_list:  # type: ignore[attr-defined]
+        if call.args and call.args[0] in wanted:
+            out.append((call.args[0], call.kwargs))
+    return out
+
+
+async def _dispatch_capture(
+    harness: Harness, task_id: str, *, task: dict | None = None,
+) -> _DispatchCapture:
+    """Drive REAL ``_run_slot`` with ``build_workflow`` patched; capture the
+    ``resume_session_id`` / ``initial_plan`` kwargs it built + the
+    session_resume* emits.
+
+    The assignment's task dict deliberately carries no ``metadata`` key so the
+    D4 substrate gate is skipped (its predicate is key-presence).
+    """
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = task if task is not None else {'title': f'task {task_id}'}
+    sem = MagicMock()
+    sem.release = MagicMock()
+    with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+        mock_wf = AsyncMock()
+        mock_wf.run.return_value = MagicMock(value='done')
+        mock_wf.metrics = MagicMock(
+            total_cost_usd=0.0, total_duration_ms=0, agent_invocations=0,
+        )
+        MockWorkflow.return_value = mock_wf
+        await harness._run_slot(assignment, sem)
+        kwargs = MockWorkflow.call_args.kwargs
+    return _DispatchCapture(
+        resume_session_id=kwargs['resume_session_id'],
+        initial_plan=kwargs['initial_plan'],
+        emits=_session_resume_emits(harness),
+    )
 
 
 # ── B1: clean SIGTERM mid-implementer, warm lane ─────────────────────────────
