@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -340,6 +341,40 @@ class TaskArtifacts:
         """Write .task/plan.json — the structured plan."""
         plan['_schema_version'] = PLAN_SCHEMA_VERSION
         self._write_json(self.root / 'plan.json', plan)
+
+    def ensure_lane_plan_symlink(self) -> None:
+        """Single-source plan.json onto the durable meta-root copy.
+
+        Makes the lane copy ``<worktree>/.task/plan.json`` an ABSOLUTE symlink
+        to ``self.root / 'plan.json'`` (the durable meta-root plan). Any
+        residual reader of the lane path then transparently resolves to the
+        meta-root file, so the lane copy can never diverge from the meta-root —
+        the esc-5205-9 stale trap (a remediation agent appended steps to a
+        regular-FILE lane copy that ``mark_step_done`` then rejected) becomes
+        impossible because the lane path IS the meta-root file.
+
+        Idempotent and recreated each dispatch: replaces a pre-existing regular
+        file, a stale/broken symlink, or a pathological stray directory. No-op
+        in legacy ``meta_root=None`` mode, where the lane path already IS the
+        durable copy (``self.root == <worktree>/.task``) so a self-referential
+        symlink would be broken/nonsensical.
+        """
+        if self.root == self.worktree / '.task':
+            # Legacy meta_root=None mode: the lane path already IS the durable
+            # copy — a self-referential symlink would be broken/nonsensical.
+            return
+        lane_task = self.worktree / '.task'
+        # meta_root mode's init() never creates <worktree>/.task, so make it.
+        lane_task.mkdir(parents=True, exist_ok=True)
+        lane_plan = lane_task / 'plan.json'
+        # Clear any occupant: a regular file (the esc-5205-9 stale trap), a
+        # stale/broken symlink, or the pathological stray directory.
+        if lane_plan.is_symlink() or lane_plan.exists():
+            if lane_plan.is_dir() and not lane_plan.is_symlink():
+                shutil.rmtree(lane_plan)
+            else:
+                lane_plan.unlink(missing_ok=True)
+        os.symlink(self.root / 'plan.json', lane_plan)
 
     def write_blocking_dependency(
         self,
