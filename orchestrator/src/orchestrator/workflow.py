@@ -5098,6 +5098,16 @@ class TaskWorkflow:
                     if not amend_ok:
                         return WorkflowOutcome.ESCALATED
                     self.metrics.amendment_rounds += 1
+                    # Never re-enter VERIFY/REVIEW — which run on the dirty
+                    # worktree — with UNCOMMITTED amendment work: _amend invokes
+                    # the implementer but never commits, and the merge queue
+                    # lands only committed branch state, so an uncommitted
+                    # amendment could pass verify+review and reach DONE yet
+                    # silently fail to land (task 2760).  Committing the WIP here
+                    # also advances HEAD so 2750's pre_amendment_head..HEAD delta
+                    # below is exactly the amendment change instead of empty.
+                    # No-op on a clean tree.
+                    await self._commit_amendment_wip(amendment_round)
                     # Arm the consume-once scope for the next REVIEW pass with
                     # the pre-amendment HEAD and the suggestions the amendment
                     # was asked to address (task 2750).
