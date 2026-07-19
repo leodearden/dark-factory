@@ -319,8 +319,26 @@ class TaskGroundTruth:
             # bidirectional is_ancestor lineage guard tying that citation to
             # this branch. The citation — not the raw branch tip — is the
             # authoritative landing sha.
+            citation_pattern = self.git_ops.config.commit_citation_pattern
+            if citation_pattern == '':
+                # Citations EXPLICITLY disabled for this project (empty
+                # commit_citation_pattern — distinct from None, which selects
+                # the built-in default and keeps the guard active):
+                # find_task_citation_commit always returns None here (its own
+                # docstring, git_ops.py, short-circuits on ''), so the
+                # attribution guard below could never find a citation and would
+                # misclassify EVERY journal-miss ON_MAIN task — including a
+                # genuinely-landed one — as EXISTS_OFF_MAIN, revert it to
+                # pending, and re-dispatch-loop it until it re-lands. Retain the
+                # pre-2787 legacy ON_MAIN(branch tip) classification for
+                # citation-disabled projects: the same citation-disabled
+                # degradation merge_queue._commits_already_merged documents
+                # (merge_queue.py). dark-factory's default pattern is None, so
+                # this arm is inert on this repo.
+                sha = await self.git_ops.resolve_branch_sha(branch)
+                return BranchState(BranchStateKind.ON_MAIN, sha)
             citation = await self.git_ops.find_task_citation_commit(
-                tid, pattern_template=self.git_ops.config.commit_citation_pattern,
+                tid, pattern_template=citation_pattern,
             )
             if citation is not None and (
                 await self.git_ops.is_ancestor(citation, branch)
