@@ -17,6 +17,7 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
     render_execution_class_section,
+    render_source_completion_section,
 )
 
 STAGE2_SYSTEM_PROMPT = f"""\
@@ -58,6 +59,8 @@ returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 
 {render_execution_class_section()}
+
+{render_source_completion_section(can_file_tasks=True)}
 
 {render_predicate_contradiction_section()}
 

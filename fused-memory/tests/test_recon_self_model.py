@@ -283,6 +283,88 @@ class TestRenderExecutionClassSection:
 
 
 # --------------------------------------------------------------------------- #
+# render_source_completion_section (PRD plans/operational-ask-routing-prd.md task ε)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderSourceCompletionSection:
+    """render_source_completion_section(*, can_file_tasks) renders the NEW
+    source-completion brief (PRD task ε): the tool-holding recon stage COMPLETES
+    safe memory merges inline (it already holds add_memory/delete_memory/
+    merge_entities — DISALLOW_MEMORY_WRITES scopes only Stage 3) and files ONLY
+    the residual irreversible judgment call as an `operational` +
+    `operational_mode='gate'` task.
+
+    The residual-handling clause differs per stage — Stage 2 holds submit_task
+    and files the residual itself; Stage 1 lacks it (DISALLOW_TASK_WRITES) and
+    must relay it to Stage 2 — so the function is parameterized on
+    can_file_tasks rather than being one shared verbatim block.
+    """
+
+    def test_returns_non_empty_str_both_modes(self):
+        for can_file in (True, False):
+            text = m.render_source_completion_section(can_file_tasks=can_file)
+            assert isinstance(text, str), f'can_file_tasks={can_file} must return str'
+            assert text, f'can_file_tasks={can_file} must return a non-empty str'
+
+    def test_both_modes_state_safe_merge_inline_and_conservative_predicate(self):
+        """Both stages hold the memory-mutation tools, so both are told to
+        complete safe (exact/near-exact duplicate) merges INLINE and to escalate
+        only the content-losing / irreversible judgment call."""
+        for can_file in (True, False):
+            text = m.render_source_completion_section(can_file_tasks=can_file)
+            assert 'inline' in text, f'can_file_tasks={can_file} must direct inline merge'
+            assert 'duplicate' in text, f'can_file_tasks={can_file} must name the duplicate case'
+            assert 'near-exact' in text, (
+                f'can_file_tasks={can_file} must state the conservative near-exact predicate'
+            )
+            assert 'irreversible' in text, (
+                f'can_file_tasks={can_file} must reserve escalation for the irreversible call'
+            )
+
+    def test_both_modes_state_operational_gate_filing_vocabulary(self):
+        """Both stages route the residual to the operational + operational_mode='gate'
+        human gate (the metadata field delivered by prereq task α/2801). Assert the
+        full literals the function emits: bare 'operational' is a trivial substring
+        of 'operational_mode', and neither bare token distinguishes the 'gate' mode
+        from the 'llm' mode the function's own text explicitly contrasts."""
+        for can_file in (True, False):
+            text = m.render_source_completion_section(can_file_tasks=can_file)
+            assert "metadata.operational_mode='gate'" in text, (
+                f"can_file_tasks={can_file} must emit metadata.operational_mode='gate'"
+            )
+            assert "execution_class='operational'" in text, (
+                f"can_file_tasks={can_file} must emit execution_class='operational'"
+            )
+
+    def test_can_file_tasks_true_files_residual_via_submit_task(self):
+        """Stage 2 holds submit_task, so it files the residual itself."""
+        text = m.render_source_completion_section(can_file_tasks=True)
+        assert 'submit_task' in text, (
+            'the can_file_tasks=True (Stage 2) variant must file the residual via submit_task'
+        )
+
+    def test_can_file_tasks_false_relays_to_stage2_without_self_filing(self):
+        """Stage 1 lacks submit_task (DISALLOW_TASK_WRITES), so it must relay the
+        residual to Stage 2 rather than be told to file it itself — honoring the
+        loud-over-silent norm of never instructing a stage to call a tool it does
+        not hold."""
+        text = m.render_source_completion_section(can_file_tasks=False)
+        # Relays the residual to Stage 2.
+        assert 'Stage 2' in text, (
+            'the can_file_tasks=False (Stage 1) variant must relay the residual to Stage 2'
+        )
+        # Positively told it does NOT hold submit_task — never instructed to call it itself.
+        assert 'do NOT hold submit_task' in text, (
+            'the Stage 1 variant must state it does NOT hold submit_task'
+        )
+        # The Stage-2-only affirmative self-file directive must be absent here.
+        assert 'file it yourself' not in text, (
+            'the Stage 1 variant must NOT tell Stage 1 to file the residual itself'
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Invariant predicates (step-15/16)
 # --------------------------------------------------------------------------- #
 
