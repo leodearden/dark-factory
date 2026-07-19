@@ -167,17 +167,45 @@ _TEST_VERDICT_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ZERO-PASS pytest short-summary (task 2821 step-4): when every collected
+# test fails, pytest omits the "N passed" token entirely, so
+# `_TEST_VERDICT_PAIR_RE` above (which requires BOTH a passed and a
+# failed/error count) cannot match — the ONLY verdict is the bracketed
+# failure-count short-summary pytest always emits, e.g.
+# "===== 6 failed in 1.20s =====". A bare "\d+\s+failed\b" alone is NOT used
+# here (too loose — it would match an incidental "2 failed attempts" in a
+# wrapper's own log text with no test runner involved at all); this pattern
+# is anchored on pytest's own short-summary punctuation instead — either the
+# whole-line `=+ ... =+` divider banner bracketing the count (mirroring the
+# grounded, already-production-tested shape of verify.py's OWN
+# `_PYTEST_FAILURE_SUMMARY_RE`, part of the separate `_extract_cause_hint`
+# human-hint ladder this module's docstring says NOT to import from — same
+# name is deliberate here, the same cross-module duplication convention
+# `_PYTEST_INTERNALERROR_RE` above already follows, not a collision), or the
+# trailing " in <float>s" timing suffix pytest always appends as a fallback
+# anchor — so only pytest's own generated summary line can match, not an
+# incidental mention elsewhere.
+_PYTEST_FAILURE_SUMMARY_RE = re.compile(
+    r'^=+\s*\d+\s+(?:failed|errors?)\b.*=+\s*$'
+    r'|'
+    r'\b\d+\s+(?:failed|errors?)\b[^\n]{0,20}?\sin\s+[\d.]+s\b',
+    re.MULTILINE | re.IGNORECASE,
+)
+
 
 def _has_deterministic_test_verdict(output: str) -> bool:
     """True when *output* carries a real pytest/cargo test-runner VERDICT —
     a "N passed, M failed" count pair (either order, see
-    ``_TEST_VERDICT_PAIR_RE``) or a FAILED line (``_TEST_FAILURE_LEADING_RE``/
-    ``_TEST_FAILURE_TRAILING_RE``) — the single-output proxy (task 2821) that
-    the wrapped tool actually ran and reported a result, which a
-    wrapper-emitted pre-run slot/semaphore timeout can never do.
+    ``_TEST_VERDICT_PAIR_RE``), pytest's bracketed zero-pass failure-count
+    short-summary (``_PYTEST_FAILURE_SUMMARY_RE``), or a FAILED line
+    (``_TEST_FAILURE_LEADING_RE``/``_TEST_FAILURE_TRAILING_RE``) — the
+    single-output proxy (task 2821) that the wrapped tool actually ran and
+    reported a result, which a wrapper-emitted pre-run slot/semaphore
+    timeout can never do.
     """
     return bool(
         _TEST_VERDICT_PAIR_RE.search(output)
+        or _PYTEST_FAILURE_SUMMARY_RE.search(output)
         or _TEST_FAILURE_LEADING_RE.search(output)
         or _TEST_FAILURE_TRAILING_RE.search(output)
     )
