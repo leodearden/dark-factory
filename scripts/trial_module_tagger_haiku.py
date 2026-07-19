@@ -116,3 +116,78 @@ def parse_predictions(agent_result: Any) -> list[str]:
         if isinstance(entry, dict):
             files.extend(entry.get('files') or [])
     return files
+
+
+# ── frontier adjudication (D-6): opus tie-breaks haiku-vs-sonnet disagreements ─
+
+# output_schema for the opus adjudicator: a single constrained winner.
+ADJUDICATION_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'properties': {
+        'winner': {'type': 'string', 'enum': ['haiku', 'sonnet', 'tie']},
+        'reason': {'type': 'string'},
+    },
+    'required': ['winner'],
+}
+
+
+def build_adjudication_prompt(
+    task: dict,
+    haiku_files: list,
+    sonnet_files: list,
+    ground_truth: list,
+) -> str:
+    """Build the frontier-adjudication prompt for one haiku-vs-sonnet disagreement.
+
+    Mirrors the tier1 D-6 shape: present both candidate file sets and the ground
+    truth (the files the task actually touched when it landed), and ask which
+    candidate better matches. The answer is constrained to haiku/sonnet/tie by
+    ``ADJUDICATION_SCHEMA``. Pure string builder — no model call.
+    """
+    tid = str(task.get('id', ''))
+    title = task.get('title', '')
+    return f"""\
+Two models predicted which files a coding task would create or modify. Judge
+which prediction better matches the GROUND TRUTH — the files the task actually
+touched when it landed on main.
+
+# Task
+id: {tid}
+title: {title}
+
+# Ground truth files (what the task actually touched)
+{json.dumps(sorted(set(ground_truth)))}
+
+# Candidate "haiku" prediction
+{json.dumps(sorted(set(haiku_files)))}
+
+# Candidate "sonnet" prediction
+{json.dumps(sorted(set(sonnet_files)))}
+
+Which candidate better matches the ground truth? Weigh BOTH precision (no
+spurious files) and recall (no missed files). Answer with a single winner:
+"haiku" if the haiku prediction is better, "sonnet" if the sonnet prediction
+is better, or "tie" if they are equivalently good (including equally wrong).
+"""
+
+
+def tally_adjudications(verdicts: list) -> dict[str, float]:
+    """Tally frontier verdicts into head-to-head counts + a worse-fraction.
+
+    Each verdict is ``{'winner': 'haiku'|'sonnet'|'tie'}``. Returns
+    ``{haiku_better, sonnet_better, tie, haiku_worse_fraction}`` where
+    ``haiku_worse_fraction = sonnet_better / max(1, total_non_tie)`` — the share
+    of DECIDED (non-tie) disagreements the frontier judged haiku worse on. The
+    ``max(1, …)`` keeps it total (0.0 when there are no non-tie verdicts).
+    """
+    haiku_better = sum(1 for v in verdicts if v.get('winner') == 'haiku')
+    sonnet_better = sum(1 for v in verdicts if v.get('winner') == 'sonnet')
+    tie = sum(1 for v in verdicts if v.get('winner') == 'tie')
+    total_non_tie = haiku_better + sonnet_better
+    haiku_worse_fraction = sonnet_better / max(1, total_non_tie)
+    return {
+        'haiku_better': haiku_better,
+        'sonnet_better': sonnet_better,
+        'tie': tie,
+        'haiku_worse_fraction': haiku_worse_fraction,
+    }
