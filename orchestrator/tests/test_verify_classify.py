@@ -1194,6 +1194,125 @@ class TestVerifyWorktreeBrokenEnvGuardNegatives:
         assert _classify(ToolKind.OPAQUE, output, 1, False) == FailureCategory.DISK_FULL
 
 
+# ---------------------------------------------------------------------------
+# task 2831: _merge-verify restart-collateral shapes (reify merge-gate RCA,
+# 2026-07-19) — a WIDER class of broken-worktree signal than task 2756's
+# single Cargo.lock read-failure above. When the ephemeral _merge-verify
+# worktree is removed out from under a running verify, the guard/wrapper/
+# shell emits one of five documented collateral shapes, none of which are a
+# branch fault — exactly like the task-2756 Cargo.lock signature, this is a
+# HOST/ENVIRONMENT condition. Mirrors TestVerifyWorktreeBrokenEnvGuard's
+# tool-blind coverage.
+#
+# RED today: none of the five collateral patterns exist yet, so every
+# positive below falls through _classify_environmental (no ENOSPC/linker/
+# semaphore/Cargo.lock match) and per-tool dispatch (no table matches this
+# shape either) to UNKNOWN_TEST_FAILURE instead of ENV_TRANSIENT.
+# ---------------------------------------------------------------------------
+
+# shape 1: a read-failure of some OTHER tracked file (not Cargo.lock) using
+# the "couldn't" contraction — the RCA's own grounded phrasing, which the
+# existing task-2756 verb alternation (could not/cannot/can't/unable to/
+# failed to) does not yet include.
+_COLLATERAL_COULDNT_READ_OUTPUT = (
+    "error: couldn't read 'crates/core/src/lib.rs': No such file or directory\n"
+)
+
+# shape 2: the verify entrypoint script itself is gone (rc=127 lint stage,
+# <0.4s) — the worktree was removed before the lint stage's shell could even
+# exec verify.sh.
+_COLLATERAL_VERIFY_SH_MISSING_OUTPUT = './scripts/verify.sh: No such file or directory\n'
+
+# shape 3: the shell cannot write its own captured output back into the
+# (now-removed) _merge-verify worktree.
+_COLLATERAL_COULD_NOT_WRITE_OUTPUT = (
+    'bash: line 1: could not write output to /work/_merge-verify/target/out.log\n'
+)
+
+# shape 4: bash's own shell-init cwd probe fails because its cwd (inside the
+# removed worktree) no longer exists.
+_COLLATERAL_GETCWD_OUTPUT = (
+    'shell-init: error retrieving current directory: getcwd: cannot access parent '
+    'directories: No such file or directory\n'
+)
+
+# shape 5: the anticipatory marker reify emits once reify 5261 lands — see
+# plan.json's design_decisions for why this is landed ahead of reify 5261
+# (the classifier capability is delivered entirely by this task; reify 5261
+# only governs whether reify emits the marker in production).
+_COLLATERAL_INTERRUPTED_MARKER_OUTPUT = '=== INTERRUPTED (worktree removed) ===\n'
+
+_ALL_COLLATERAL_SHAPES = [
+    ('couldnt_read', _COLLATERAL_COULDNT_READ_OUTPUT),
+    ('verify_sh_missing', _COLLATERAL_VERIFY_SH_MISSING_OUTPUT),
+    ('could_not_write', _COLLATERAL_COULD_NOT_WRITE_OUTPUT),
+    ('getcwd', _COLLATERAL_GETCWD_OUTPUT),
+    ('interrupted_marker', _COLLATERAL_INTERRUPTED_MARKER_OUTPUT),
+]
+
+
+class TestMergeVerifyCollateralEnvGuard:
+    """task 2831: each of the five documented merge-verify restart-collateral
+    shapes classifies ENV_TRANSIENT — tool-blind, like the task-2756
+    Cargo.lock signature — so the merge_queue's transient-infra hold
+    (INFRA_TRANSIENT_CATEGORIES) fires instead of hard-blaming an innocent
+    branch for host-caused collateral."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    @pytest.mark.parametrize(('shape_name', 'output'), _ALL_COLLATERAL_SHAPES)
+    def test_collateral_shape_is_env_transient(self, tool, shape_name, output):
+        assert _classify(tool, output, 1, False) == FailureCategory.ENV_TRANSIENT, (
+            f'shape {shape_name!r} must classify ENV_TRANSIENT under {tool!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    @pytest.mark.parametrize(('shape_name', 'output'), _ALL_COLLATERAL_SHAPES)
+    def test_collateral_shape_is_infra_transient(self, tool, shape_name, output):
+        """Observable signal: the unit-level proxy that this output will hit
+        the merge_queue.py:1886 transient-infra gate."""
+        result = _classify(tool, output, 1, False)
+        assert result in INFRA_TRANSIENT_CATEGORIES, (
+            f'shape {shape_name!r} must be infra-transient under {tool!r}, got {result!r}'
+        )
+
+
+class TestMergeVerifyCollateralEnvGuardNegatives:
+    """Narrowness / non-regression guards for the new collateral patterns —
+    green both before and after the impl."""
+
+    def test_existing_settings_toml_read_failure_stays_non_env_transient(self):
+        """The existing DF-2756 negative sample (no ENOENT text) must stay
+        non-ENV_TRANSIENT under the new collateral patterns too — proves
+        shape-1's extended verb alternation still requires the 'No such file
+        or directory' text, not just any read-failure verb."""
+        output = 'could not read /work/_merge-verify/config/settings.toml\n'
+        result = _classify(ToolKind.OPAQUE, output, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE
+        assert result != FailureCategory.ENV_TRANSIENT
+
+    def test_bare_application_file_not_found_without_read_verb_not_env_transient(self):
+        """A bare application FileNotFoundError with no adjacent read verb
+        must not be swallowed by shape-1 — proves the pattern requires a
+        READ verb immediately preceding 'No such file or directory', not a
+        bare mention of that text anywhere in the output."""
+        output = "FileNotFoundError: [Errno 2] No such file or directory: 'fixture.json'\n"
+        result = _classify(ToolKind.PYTEST, output, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE
+        assert result != FailureCategory.ENV_TRANSIENT
+
+    def test_genuine_compile_error_mentioning_path_stays_compile_error(self):
+        """A real rustc compile fault that merely mentions a source path (the
+        same path shape-1's golden uses) must not be swallowed by the new
+        collateral patterns — proves they do not shadow genuine branch
+        faults."""
+        output = (
+            'error[E0308]: mismatched types\n'
+            '  --> crates/core/src/lib.rs:10:5\n'
+            'note: expected struct `Foo`, found struct `Bar`\n'
+        )
+        assert _classify(ToolKind.CARGO_TEST, output, 1, False) == FailureCategory.COMPILE_ERROR
+
+
 # step-9: verify._summarize_checks must thread the per-check config command
 # (test_cmd/lint_cmd/type_cmd) into classify_failure as that check's
 # ToolKind, instead of discarding tool identity (today's tool-blind
