@@ -1960,7 +1960,7 @@ def test_claim_lease_keeps_a_quiet_watchers_lease_across_a_full_slice(tmp_path: 
     # canonical slice. If a future edit lowers LEASE_HEARTBEAT_TTL back below
     # 3600s, this assertion fails loudly rather than silently re-opening the
     # gap.
-    assert sr.LEASE_HEARTBEAT_TTL > timedelta(seconds=3600)
+    assert timedelta(seconds=3600) < sr.LEASE_HEARTBEAT_TTL
 
 
 def test_claim_lease_survives_lease_vanishing_between_create_and_stat(
