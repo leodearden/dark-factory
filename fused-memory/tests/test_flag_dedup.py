@@ -5175,14 +5175,20 @@ class TestFilterContaminationCeilingFindings:
         )
         assert _is_contamination_ceiling_finding(flag) is True
 
-    def test_matcher_true_for_ceiling_guardrail_in_suggested_action(self):
-        """'ceiling guardrail' marker matches when it appears only in suggested_action."""
+    def test_matcher_true_for_marker_in_suggested_action(self):
+        """A qualified ceiling marker matches when it appears only in suggested_action.
+
+        Exercises the suggested_action scan path (empty description). Uses the
+        qualified 'contamination-ceiling guardrail' phrasing — a bare
+        '... ceiling guardrail' is deliberately NOT a marker (see
+        test_matcher_false_for_benign_ceiling_guardrail).
+        """
         from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
 
         flag = self._make_flag(
             category='missing_knowledge',
             description='',  # marker only in suggested_action
-            suggested_action='Re-add the ceiling guardrail memory for autopilot_video',
+            suggested_action='Re-add the contamination-ceiling guardrail memory for autopilot_video',
         )
         assert _is_contamination_ceiling_finding(flag) is True
 
@@ -5213,6 +5219,27 @@ class TestFilterContaminationCeilingFindings:
         assert _is_contamination_ceiling_finding(flag) is False, (
             "bare 'ceiling' must NOT match — 'per-model daily ceiling' is a legitimate, "
             "unrelated finding that must be KEPT"
+        )
+
+    def test_matcher_false_for_benign_ceiling_guardrail(self):
+        """A benign '... ceiling guardrail' finding (non-contamination) does NOT match.
+
+        Regression guard (task 2826 amendment): the markers deliberately omit a
+        bare 'ceiling guardrail' — it would over-match an unrelated 'per-model
+        daily ceiling guardrail' memory finding. Every marker pins 'ceiling' to a
+        contamination / task-ID / ID-magnitude qualifier, so this finding — which
+        carries no such qualifier — must be KEPT, not suppressed.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_contamination_ceiling_finding
+
+        flag = self._make_flag(
+            category='missing_knowledge',
+            description='autopilot_video is missing its per-model daily ceiling guardrail memory',
+            suggested_action='Re-add the per-model daily ceiling guardrail',
+        )
+        assert _is_contamination_ceiling_finding(flag) is False, (
+            "bare 'ceiling guardrail' must NOT match — 'per-model daily ceiling "
+            "guardrail' is a legitimate, unrelated finding that must be KEPT"
         )
 
     # -----------------------------------------------------------------------

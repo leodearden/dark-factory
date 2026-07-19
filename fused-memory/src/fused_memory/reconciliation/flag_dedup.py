@@ -2667,16 +2667,22 @@ _SUPPRESSED_CEILING_CATEGORIES: frozenset[str] = frozenset({
 #:
 #: NOTE: bare 'ceiling' is DELIBERATELY excluded — it is a substring of unrelated,
 #: legitimate findings (e.g. 'per-model daily ceiling', budget ceilings) that must
-#: NOT be suppressed.  The specific multi-word markers below subsume every
-#: intended phrasing while keeping the blast radius tight — exactly mirroring the
-#: bare-'count snapshot' exclusion in :data:`_TASK_COUNT_SNAPSHOT_MARKERS`.
+#: NOT be suppressed.  For the SAME reason a bare 'ceiling guardrail' marker is
+#: deliberately excluded: it would match an unrelated 'per-model daily ceiling
+#: guardrail' / 'spending ceiling guardrail' finding and wrongly suppress it.
+#: EVERY marker below therefore pins 'ceiling' to a contamination / task-ID /
+#: ID-magnitude qualifier.  The qualified '... ceiling guardrail' phrasings a
+#: Stage-3 LLM actually produces ('contamination ceiling guardrail', 'task-ID
+#: ceiling guardrail', 'ID-magnitude ceiling guardrail') are already subsumed as
+#: substrings of these qualified markers, so no separate bare-'... guardrail'
+#: marker is needed to catch them.  This keeps the blast radius tight — exactly
+#: mirroring the bare-'count snapshot' exclusion in :data:`_TASK_COUNT_SNAPSHOT_MARKERS`.
 _CONTAMINATION_CEILING_MARKERS: tuple[str, ...] = (
     'contamination ceiling',
     'contamination-ceiling',
     'task-id ceiling',
     'task id ceiling',
     'id-magnitude ceiling',
-    'ceiling guardrail',
 )
 
 
