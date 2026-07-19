@@ -241,6 +241,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     # run-slot supporting state
     h._recovered_plans = {}  # type: ignore[assignment]
     h._recovered_sessions = {}  # type: ignore[assignment]
+    h._recovered_session_config_dirs = {}  # type: ignore[assignment]
     h._preserved_worktrees = set()  # type: ignore[assignment]
     h.event_store = None  # type: ignore[assignment]
 
