@@ -8844,6 +8844,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
         started_at = datetime.now(UTC).isoformat()
+        # I1: the sidecar exists iff an invocation is in flight — cancellation
+        # is not completion.  Track whether this invocation was cancelled
+        # in-flight so the finally preserves (does not clear) its sidecar.
+        session_preserved = False
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -8897,8 +8901,38 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # merger/judge/reviewer); spawn_env is built for every role.
                 spawn_env=self._build_spawn_env(role),
             )
-        finally:
+        except asyncio.CancelledError:
+            # Cooperative cancellation of the agent invocation itself (a clean
+            # SIGTERM shutdown surfaces as CancelledError from THIS await) is an
+            # in-flight SUSPENSION, not a completion (I1).  Preserve the sidecar
+            # so crash-recovery can --resume this session after restart, and emit
+            # a structured fact at the decision point (INV-2 — fields in extra,
+            # not scraped from prose) before re-raising to propagate cooperative
+            # cancellation.  This except catches ONLY the main invoke await; a
+            # cancellation arriving later during the finally's transcript-archival
+            # await (agent already returned a result) is handled by that block's
+            # own inner except and correctly falls through to clear.  A
+            # non-CancelledError failure is an abnormal terminal end, not a
+            # resumable suspension, so it too falls through to clear — unchanged
+            # from prior behavior (the finally cleared on every exit before).
+            session_preserved = True
             if self.artifacts is not None:
+                logger.info(
+                    'Task %s [%s]: agent_session_preserved — keeping sidecar '
+                    'for crash-recovery resume of session %s',
+                    self.task_id, role.name, session_id_val,
+                    extra={
+                        'event': 'agent_session_preserved',
+                        'task_id': str(self.task_id),
+                        'session_id': session_id_val,
+                        'role': role.name,
+                    },
+                )
+            raise
+        finally:
+            # Clear ONLY on a non-preserved exit (completion or abnormal error);
+            # a cancelled-in-flight invocation keeps its sidecar for resume.
+            if self.artifacts is not None and not session_preserved:
                 self.artifacts.clear_agent_session()
             # Producer hook (task 2742, agent-transcript-archival-prd α): gzip
             # this just-finished session's transcripts to a durable archive root
