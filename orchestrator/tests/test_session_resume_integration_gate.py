@@ -995,3 +995,54 @@ async def test_b10_completion_clears_sidecar_no_adoption_next_boot(
     assert cap2.initial_plan is recovered_plan
     assert cap2.emits == []
     assert _session_resume_emits(harness) == []
+
+
+# ── B11: v1 sidecar compat — adopt via plan.json, rewrite v2 on next write ───
+@pytest.mark.asyncio
+async def test_b11_v1_sidecar_adopts_via_plan_and_rewrites_v2(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """B11 — a PRE-DEPLOY v1 sidecar (no ``task_id`` / ``schema_version``) on a
+    plan-bearing lane is still adopted (keyed via plan.json's task_id), and the
+    resumed invocation REWRITES it as v2 while preserving the prior session_id.
+
+    Two-way (consumer + producer):
+      CONSUMER (β): the v1 sidecar carries no ``task_id`` of its own, so β keys
+        the adoption off plan.json's task_id — the stored recovered dict is the
+        RAW v1 payload (session_id preserved, still NO ``task_id`` key).
+      PRODUCER (α): feeding that adopted v1 dict back in as ``resume_session_id``
+        drives a REAL ``_invoke`` that resumes the SAME session_id (not a fresh
+        uuid) and, on its next ``write_agent_session``, stamps the durable v2
+        shape — ``schema_version == 2`` and ``task_id == str(task_id)`` — so a
+        pre-deploy sidecar self-upgrades on first resume. The rewritten sidecar
+        is captured MID-FLIGHT (α's ``finally`` clears it on completion).
+    """
+    task_id, session_id = '51', 'uuid-b11-v1compat'
+
+    # ── CONSUMER (β): v1 sidecar adopted, keyed via plan.json's task_id ──
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', sidecar_version=1,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+
+    await harness._recover_crashed_tasks()
+
+    assert task_id in harness._recovered_sessions
+    adopted_v1 = harness._recovered_sessions[task_id]
+    assert adopted_v1['session_id'] == session_id
+    assert 'task_id' not in adopted_v1        # v1 payload carries no task_id
+    assert 'schema_version' not in adopted_v1  # …nor a version discriminator
+
+    # ── PRODUCER (α): resume the v1 dict → next write is v2, id preserved ──
+    cap = await _drive_resumed_invoke(
+        tmp_path, adopted_v1, IMPLEMENTER, caplog, task_id=task_id,
+    )
+    # Resumed against the PRIOR id (not a fresh uuid).
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert f'resuming prior session {session_id}' in caplog.text
+    # The next sidecar write self-upgrades v1 → v2, preserving the session id.
+    rewritten = cap.sidecar_midflight
+    assert rewritten is not None
+    assert rewritten.schema_version == 2
+    assert rewritten.task_id == str(task_id)
+    assert rewritten.session_id == session_id
