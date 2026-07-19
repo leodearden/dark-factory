@@ -78,6 +78,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -721,3 +722,53 @@ async def test_b7_no_unblock_auto_spawn(
     wf._spawn_dry_run_unblock('blocked on x', 'detail')
 
     assert wf._background_tasks == set()
+
+
+# ── B9: no set_task_claimant heartbeat warning spam (D2) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_b9_set_task_claimant_heartbeat_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B9 — a real eval ``Scheduler.set_task_claimant`` heartbeat logs ZERO warnings.
+
+    The integration variant of δ's set_task_claimant heartbeat unit test —
+    distinct in that the FULL ``build_eval_orch_config`` resolution is threaded
+    into ``_build_eval_scheduler`` (δ's unit test wires a bare
+    ``OrchestratorConfig()``): build a production ``Scheduler`` bound to the eval
+    ``_StubMcpSession`` through the ACTUAL eval entry points, then drive the same
+    status-untouching heartbeat the eval loop fires every ~60s.
+
+    ``Scheduler.set_task_claimant`` dispatches the ``set_task_claimant`` MCP tool
+    and WARNs on EITHER a raised dispatch error (an un-stubbed tool →
+    ``NotImplementedError``, swallowed best-effort) OR an ``extract_rejection``
+    non-None response. δ's stub branch returns a clean envelope
+    (``extract_rejection`` → None), so a ≥90s eval run no longer floods the log
+    with best-effort heartbeat WARNINGs (the D2/B9 spam). GREEN on main (δ).
+    """
+    base = OrchestratorConfig(project_root=tmp_path)
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    orch_config = build_eval_orch_config(cfg, task, base)
+
+    scheduler, stub = _build_eval_scheduler(orch_config, 't', ['some_module'])
+    assert isinstance(stub, _StubMcpSession)
+
+    caplog.set_level(logging.WARNING)
+    await scheduler.set_task_claimant(
+        't',
+        claimant_run_id='r1',
+        heartbeat_at='2026-01-01T00:00:00Z',
+    )
+
+    offenders = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and ('set_task_claimant' in r.getMessage() or 'unknown tool' in r.getMessage())
+    ]
+    assert not offenders, (
+        'set_task_claimant heartbeat emitted WARNING(s) (B9/D2 regression):\n'
+        + '\n'.join(offenders)
+    )
