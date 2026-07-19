@@ -5805,7 +5805,7 @@ async def confirm_merge_verify_flake_suppressible(
         return node_ids
 
     except Exception:
-        logger.debug(
+        logger.warning(
             'confirm_merge_verify_flake_suppressible: unexpected error — '
             'failing closed to red',
             exc_info=True,
