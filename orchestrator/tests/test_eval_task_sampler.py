@@ -8,6 +8,7 @@ steps) is tested against a real temp git repo (the ``tmp_repo`` pattern from
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 
 import pytest
@@ -15,9 +16,12 @@ from _eval_sampler_fixtures import make_candidate, rich_corpus
 
 from orchestrator.evals.task_sampler import (
     CompletedTaskCandidate,
+    ReferenceCapture,
     SampleResult,
+    build_fixture_record,
     classify_kind,
     classify_path,
+    default_verify_commands,
     repo_of,
     sample_stratified,
     stratify,
@@ -263,3 +267,112 @@ class TestSampleStratified:
     def test_cell_counts_match_selected(self) -> None:
         result = sample_stratified(rich_corpus(), seed=5)
         assert sum(result.cell_counts.values()) == len(result.selected)
+
+
+# ---------------------------------------------------------------------------
+# default_verify_commands — per-repo standard gate command set
+# ---------------------------------------------------------------------------
+
+class TestDefaultVerifyCommands:
+    def test_df_uses_pytest_ruff_pyright(self) -> None:
+        cmds = default_verify_commands('df')
+        assert 'pytest' in cmds['test']
+        assert 'ruff' in cmds['lint']
+        assert 'pyright' in cmds['typecheck']
+
+    def test_reify_uses_cargo_test_and_clippy(self) -> None:
+        cmds = default_verify_commands('reify')
+        assert 'cargo test' in cmds['test']
+        assert 'clippy' in cmds['lint']
+
+    def test_unknown_repo_raises_loudly(self) -> None:
+        with pytest.raises(ValueError):
+            default_verify_commands('some-other-repo')
+
+
+# ---------------------------------------------------------------------------
+# build_fixture_record — canonical fixture schema + new cohort/provenance/etc
+# ---------------------------------------------------------------------------
+
+def _ref() -> ReferenceCapture:
+    return ReferenceCapture(
+        post_task_commit='postSHA', files=2, insertions=10, deletions=3
+    )
+
+
+class TestBuildFixtureRecord:
+    def _df_candidate(self) -> CompletedTaskCandidate:
+        return make_candidate(
+            '12', repo='df', kind='bugfix', path='full',
+            title='Bug: verify.py fails on dash',
+            description='fix the shell executable',
+            modules=['orchestrator/src/orchestrator'],
+            pre_commit='preSHA', post_commit='postSHA', merge_sha='mergeSHA',
+        )
+
+    def test_canonical_schema_fields_present(self) -> None:
+        rec = build_fixture_record(
+            self._df_candidate(), _ref(), default_verify_commands('df'),
+            plan={'task_id': 'x', 'steps': []},
+            cohort='revival-zeta', sampled_at='2026-07-19T00:00:00+00:00', seed=42,
+        )
+        assert rec['id'] == 'df_task_12'
+        assert rec['name'] == 'Bug: verify.py fails on dash'
+        assert rec['project'] == 'dark-factory'
+        assert rec['project_root'] == '/home/leo/src/dark-factory'
+        assert rec['pre_task_commit'] == 'preSHA'
+        assert rec['post_task_commit'] == 'postSHA'
+        assert rec['task_definition'] == {
+            'title': 'Bug: verify.py fails on dash',
+            'description': 'fix the shell executable',
+        }
+        assert rec['modules'] == ['orchestrator/src/orchestrator']
+        assert rec['complexity'] == 'high'
+        assert 'pytest' in rec['verify_commands']['test']
+
+    def test_new_cohort_provenance_reference_and_verify_outcome(self) -> None:
+        rec = build_fixture_record(
+            self._df_candidate(), _ref(), default_verify_commands('df'),
+            plan={'task_id': 'x', 'steps': []},
+            cohort='revival-zeta', sampled_at='2026-07-19T00:00:00+00:00', seed=42,
+        )
+        assert rec['cohort'] == 'revival-zeta'
+        assert rec['provenance']['merge_sha'] == 'mergeSHA'
+        assert rec['provenance']['sampled_at'] == '2026-07-19T00:00:00+00:00'
+        assert rec['provenance']['seed'] == 42
+        assert rec['reference'] == {
+            'post_task_commit': 'postSHA',
+            'diff_stat': {'files': 2, 'insertions': 10, 'deletions': 3},
+        }
+        assert rec['verify_outcome']['source'] == 'landed'
+        assert rec['verify_outcome']['passed'] is True
+        assert rec['verify_outcome']['commands'] == default_verify_commands('df')
+
+    def test_plan_present_embedded_verbatim(self) -> None:
+        plan = {'task_id': 'x', 'steps': [{'id': 'step-1'}]}
+        rec = build_fixture_record(
+            self._df_candidate(), _ref(), default_verify_commands('df'),
+            plan=plan, cohort='c', sampled_at='t',
+        )
+        assert rec['plan'] == plan
+        assert rec['provenance']['plan_source'] == 'embedded'
+
+    def test_plan_absent_records_unavailable(self) -> None:
+        cand = make_candidate('99', repo='reify', kind='feature', path='full')
+        rec = build_fixture_record(
+            cand, _ref(), default_verify_commands('reify'),
+            plan=None, cohort='c', sampled_at='t',
+        )
+        assert rec['plan'] is None
+        assert rec['provenance']['plan_source'] == 'unavailable'
+        assert rec['id'] == 'reify_task_99'
+        assert rec['project'] == 'reify'
+
+    def test_record_is_json_serializable(self) -> None:
+        # No dataclass / non-JSON types must leak into the emitted fixture.
+        rec = build_fixture_record(
+            self._df_candidate(), _ref(), default_verify_commands('df'),
+            plan=None, cohort='c', sampled_at='t',
+        )
+        round_tripped = json.loads(json.dumps(rec))
+        assert round_tripped['id'] == 'df_task_12'
