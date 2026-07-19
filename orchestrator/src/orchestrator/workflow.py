@@ -6871,6 +6871,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Returns the WIP commit sha (or None when the worktree was clean).
         """
         assert self.worktree is not None and self.git_ops is not None
+        if not await self.git_ops.has_uncommitted_work(self.worktree):
+            # Clean tree — a benign no-op amendment left nothing uncommitted to
+            # lose.  No commit, no event (task 2760 gates purely on dirty-tree).
+            return None
         sha = await self.git_ops.commit(
             self.worktree, f'wip: amendment round {amendment_round}',
         )
