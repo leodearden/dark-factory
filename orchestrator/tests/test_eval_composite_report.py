@@ -93,3 +93,68 @@ class TestRatioScore:
 
         # A value BETTER than 'best' (best/value > 1) clamps down to 1.0.
         assert _ratio_score(0.5, 1.0) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Task 2477 step-07: build_price_table — per-config C4 price table
+# ---------------------------------------------------------------------------
+
+def _cfg(name, model, role='implementer'):
+    from orchestrator.evals.configs import EvalConfig
+
+    return EvalConfig(name=name, backend='claude', model=model, effort='high', role=role)
+
+
+class TestBuildPriceTable:
+    """{config_name: {role: {input_per_1m, output_per_1m}}} pulled from prices
+    by model — an unlisted model yields an EXPLICIT unpriced marker, never a
+    silently fabricated price.
+    """
+
+    def test_priced_configs_map_role_to_price_entry(self):
+        from orchestrator.evals.report import build_price_table
+
+        prices = {
+            'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0},
+            'model-y': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
+        }
+        configs = [
+            _cfg('cfg-a', 'model-x', role='implementer'),
+            _cfg('cfg-b', 'model-y', role='architect'),
+        ]
+        table = build_price_table(configs, prices)
+        assert table['cfg-a'] == {
+            'implementer': {'input_per_1m': 2.0, 'output_per_1m': 8.0},
+        }
+        assert table['cfg-b'] == {
+            'architect': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
+        }
+
+    def test_unlisted_model_gets_explicit_unpriced_marker(self):
+        from orchestrator.evals.report import build_price_table
+
+        prices = {'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}}
+        configs = [_cfg('cfg-z', 'unlisted-model', role='implementer')]
+        table = build_price_table(configs, prices)
+        entry = table['cfg-z']['implementer']
+        # An EXPLICIT marker, NOT a fabricated price.
+        assert 'input_per_1m' not in entry
+        assert entry.get('source') == 'unpriced'
+
+    def test_accepts_price_entry_objects(self):
+        from orchestrator.config import PriceEntry
+        from orchestrator.evals.report import build_price_table
+
+        prices = {'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)}
+        table = build_price_table([_cfg('cfg-a', 'model-x')], prices)
+        assert table['cfg-a']['implementer'] == {
+            'input_per_1m': 2.0, 'output_per_1m': 8.0,
+        }
+
+    def test_deterministic_sorted_config_keys(self):
+        from orchestrator.evals.report import build_price_table
+
+        prices = {'m': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
+        configs = [_cfg('z', 'm'), _cfg('a', 'm'), _cfg('m', 'm')]
+        table = build_price_table(configs, prices)
+        assert list(table.keys()) == ['a', 'm', 'z']
