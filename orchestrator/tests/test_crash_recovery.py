@@ -1224,6 +1224,50 @@ class TestRecordDrivenRecovery:
         harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
+    async def test_adopt_on_exact_record_git_match_also_adopts_session(
+        self, harness: Harness,
+    ):
+        """Task 2772 (B1): same ADOPT shape as
+        test_adopt_on_exact_record_git_match, but with a v2
+        agent_session.json sidecar co-located under the SAME
+        .task-meta/_lane-0 new path -- the record-driven completed-steps
+        branch (~2635) must ALSO populate _recovered_sessions, not just
+        _recovered_plans, without disturbing the pool pin.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)  # the lane dir itself (no .task/ needed)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        meta_dir = _setup_lane_meta_plan(base, '_lane-0', plan)
+        sidecar = {
+            'session_id': 'uuid-warm-b1',
+            'role': 'implementer',
+            'started_at': '2026-07-19T09:00:00+00:00',
+            'owner_pid': 4242,
+            'task_id': '42',
+            'resume_count': 0,
+            'schema_version': 2,
+        }
+        (meta_dir / 'agent_session.json').write_text(json.dumps(sidecar))
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(
+            return_value={'42': lane},
+        )
+        harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+
+        await harness._recover_crashed_tasks()
+
+        assert '42' in harness._recovered_plans
+        assert '42' in harness._recovered_sessions
+        assert harness._recovered_sessions['42']['session_id'] == 'uuid-warm-b1'
+        # Pin unchanged from the B1 baseline.
+        assert pool.assignment_for('42') == lane
+
     async def test_quarantine_on_registration_divergence(
         self, harness: Harness, caplog,
     ):
