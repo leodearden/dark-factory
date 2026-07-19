@@ -828,9 +828,13 @@ class MemoryService:
         Each close is bounded by ``timeout`` (default: the module-level
         ``_SUBCLOSE_TIMEOUT``, read at call time so it can be monkeypatched) so a
         hung network-driver teardown can neither consume the whole shutdown budget
-        nor starve the durable-flush closes that run after it. Both the timeout and
-        the generic-failure paths swallow the error so close() continues through
-        every resource.
+        nor starve the durable-flush closes that run after it. The bound applies
+        UNIFORMLY to every resource, including the durable-flush SQLite closes
+        (durable_queue/write_journal/event_buffer), not just the graphiti/mem0
+        network drivers — see the cancel-branch comment below for why hard-bounding
+        (and, on overrun, cancelling) even a durable close drops no committed data.
+        Both the timeout and the generic-failure paths swallow the error so close()
+        continues through every resource.
         """
         if timeout is None:
             timeout = _SUBCLOSE_TIMEOUT
@@ -843,9 +847,22 @@ class MemoryService:
         if pending:
             # Budget expired: the close is still running. Cancel it and move on
             # so a hung backend can't starve the durable-flush closes that follow.
-            # Data-safe: graphiti/mem0 closes only tear down sockets (writes are
-            # already durable via durable_queue / synchronous commits). The WARNING
-            # names the label + budget so the restart journal identifies the culprit.
+            # Cancelling is data-safe for EVERY resource this bounds, not only the
+            # network drivers:
+            #  * graphiti/mem0 closes only tear down sockets; their writes are
+            #    already durable via durable_queue / synchronous commits, and the
+            #    OS reclaims the sockets on process exit.
+            #  * durable_queue/write_journal/event_buffer are aiosqlite (WAL mode,
+            #    full-durability pragmas): every row commits synchronously during
+            #    normal operation, so it is durable in the WAL BEFORE close() runs.
+            #    Their close() only drains already-persisted in-flight work and runs
+            #    a best-effort wal_checkpoint(TRUNCATE) + connection close — pure
+            #    housekeeping. Cancelling abandons that compaction, never a committed
+            #    row (SQLite replays the WAL on next open); and aiosqlite's
+            #    per-connection worker thread finishes any in-flight statement rather
+            #    than tearing it mid-write.
+            # The WARNING names the label + budget so the restart journal identifies
+            # the culprit.
             close_task.cancel()
             with contextlib.suppress(BaseException):
                 await close_task

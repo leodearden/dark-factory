@@ -1761,6 +1761,59 @@ class TestCloseBoundsSlowSubclose:
         resources['_event_buffer'].close.assert_awaited_once()
         resources['planned_episode_registry'].close.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_two_hung_subcloses_each_warn_and_do_not_starve_the_rest(
+        self, service, caplog, monkeypatch
+    ):
+        """Two simultaneously-hung sub-closes (graphiti AND mem0) are each
+        independently time-boxed: close() still returns bounded, emits TWO
+        distinct WARNINGs (one per culprit, each naming its own label), and every
+        durable-flush close ordered after them still runs. Locks in the 'no single
+        backend starves the rest' invariant across MULTIPLE concurrent hangs — the
+        single-hang tests above would not catch a regression that let a second
+        backend hang unbounded or that double-cancelled one culprit."""
+        monkeypatch.setattr(
+            memory_service, '_SUBCLOSE_TIMEOUT', 0.2, raising=False
+        )
+        resources = self._wire_resources(service)
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        # Both network drivers hang. The two 0.2s caps apply sequentially
+        # (~0.4s total), still far under the 2.0s bound.
+        service.graphiti.close = AsyncMock(side_effect=_hang)
+        service.mem0.close = AsyncMock(side_effect=_hang)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service'
+        ):
+            await asyncio.wait_for(service.close(), timeout=2.0)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2, (
+            f'Expected two overrun WARNINGs (one per hung sub-close), got '
+            f'{len(warnings)}: {[r.getMessage() for r in warnings]}'
+        )
+        messages = [r.getMessage() for r in warnings]
+        # Each hung backend named in its own distinct WARNING (not one WARNING
+        # naming both, nor a doubled WARNING for a single culprit).
+        assert any('graphiti' in m for m in messages), (
+            f'Expected a WARNING naming graphiti: {messages!r}'
+        )
+        assert any('mem0' in m for m in messages), (
+            f'Expected a WARNING naming mem0: {messages!r}'
+        )
+        # Both WARNINGs carry the timeout value.
+        for m in messages:
+            assert '0.2' in m, f'WARNING must name the timeout value: {m!r}'
+
+        # durable_queue (ordered BEFORE both hangs) ran, and every durable-flush
+        # close ordered AFTER them still ran — neither hang starved the rest.
+        resources['durable_queue'].close.assert_awaited_once()
+        for name in ('_write_journal', '_event_buffer', 'planned_episode_registry'):
+            resources[name].close.assert_awaited_once()
+
 
 class TestGraphitiBackendRemoveEdge:
     @pytest.mark.asyncio
