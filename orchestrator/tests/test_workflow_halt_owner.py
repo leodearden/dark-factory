@@ -773,6 +773,7 @@ async def test_handle_stash_failed_submits_single_halt_owning_l1(
         # The handler submits + registers the owner, then awaits resolution.
         await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
 
+        assert workflow.escalation_queue is not None
         pending = workflow.escalation_queue.get_pending()
         assert len(pending) == 1, f'expected exactly one L1, got {pending!r}'
         esc = pending[0]

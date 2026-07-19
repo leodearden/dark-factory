@@ -260,6 +260,13 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue.py', '_check_post_merge_pyright'),
     ('test_merge_queue.py', '_commit_is_linear'),
     ('test_merge_queue.py', '_finalize_advanced_merge'),
+    # Consumer at merge_queue.py:12762 resolves _map_advance_failure via the
+    # merge_queue module global (imported at merge_queue.py:75), so a spy that
+    # asserts the abandoned stash_failed early-out does NOT reach the mapper
+    # must patch it at the merge_queue lookup site — patching merge_gates would
+    # install the spy off the resolution path and pass vacuously (task 2758).
+    # Same genuinely-unavoidable reach-back as test_merge_speculation.py below.
+    ('test_merge_queue.py', '_map_advance_failure'),
     ('test_merge_queue.py', '_rebase_delta_touched_overlap'),
     ('test_merge_queue.py', '_resolve_second_parent'),
     ('test_merge_queue.py', '_reverify_rebased_tree'),
