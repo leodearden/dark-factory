@@ -917,6 +917,27 @@ _SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT = (
     '===== 6 failed in 1.20s =====\n'
 )
 
+# Count-pair-ONLY goldens (review follow-up): both grounded verdict goldens
+# above ALSO contain a FAILED line, so `_TEST_FAILURE_LEADING_RE`/
+# `_TEST_FAILURE_TRAILING_RE` already satisfy `_has_deterministic_test_verdict`
+# on their own — `_TEST_VERDICT_PAIR_RE` (the "N passed, M failed" count-pair
+# matcher, the flagship marker this task adds) is never independently
+# exercised by them; it could be deleted, or either alternation order broken,
+# and every existing test would still pass. These two goldens carry ONLY a
+# bare count pair — no FAILED line, no `=====` banner (which would itself
+# satisfy `_PYTEST_FAILURE_SUMMARY_RE`), no " in <float>s" timing suffix — so
+# only `_TEST_VERDICT_PAIR_RE` can account for the veto, covering both
+# alternation orders.
+_SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_FAILED_FIRST_OUTPUT = (
+    'note: a stale peer that timed out may hold the slot\n'
+    'summary: 6 failed, 48 passed\n'
+)
+
+_SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_PASSED_FIRST_OUTPUT = (
+    'note: a peer holding the semaphore slot had timed out\n'
+    'test result: FAILED. 48 passed; 6 failed; 0 ignored\n'
+)
+
 
 class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
     """task 2821: a deterministic pytest/cargo test-runner VERDICT must veto
@@ -981,6 +1002,53 @@ class TestSemaphoreTimeoutDeterministicTestVerdictVeto:
     def test_pytest_zero_pass_verdict_is_unknown_test_failure(self, tool):
         assert (
             _classify(tool, _SEMAPHORE_TIMEOUT_PYTEST_ZERO_PASS_OUTPUT, 1, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_verdict_pair_only_failed_first_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        """Isolates `_TEST_VERDICT_PAIR_RE`'s failed-before-passed
+        alternation: no FAILED line, no bracketed banner, no timing suffix —
+        only the bare count pair can account for the veto."""
+        result = _classify(
+            tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_FAILED_FIRST_OUTPUT, 1, False
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a bare "N failed, M passed" count pair (no FAILED line, no '
+            f'banner) with incidental lock/slot/semaphore + "timed out" '
+            f'tokens must not classify infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_verdict_pair_only_passed_first_with_incidental_lock_and_timeout_tokens_is_not_infra_transient(
+        self, tool
+    ):
+        """Isolates `_TEST_VERDICT_PAIR_RE`'s passed-before-failed
+        alternation (cargo's own summary order): no per-test FAILED line, no
+        bracketed banner — only the bare count pair can account for the
+        veto."""
+        result = _classify(
+            tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_PASSED_FIRST_OUTPUT, 1, False
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a bare "N passed; M failed" count pair (no FAILED line, no '
+            f'banner) with incidental lock/slot/semaphore + "timed out" '
+            f'tokens must not classify infra-transient, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_verdict_pair_only_goldens_are_unknown_test_failure(self, tool):
+        """Pins the exact category too, not just "not infra-transient": with
+        no FAILED line present, per-tool dispatch has nothing else to match,
+        so both isolated-pair goldens fall through to UNKNOWN_TEST_FAILURE."""
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_FAILED_FIRST_OUTPUT, 1, False)
+            == FailureCategory.UNKNOWN_TEST_FAILURE
+        )
+        assert (
+            _classify(tool, _SEMAPHORE_TIMEOUT_VERDICT_PAIR_ONLY_PASSED_FIRST_OUTPUT, 1, False)
             == FailureCategory.UNKNOWN_TEST_FAILURE
         )
 
