@@ -370,3 +370,89 @@ class TestEnumerateArchiveRoots:
             agent_transcript_roots=[tmp_path / 'does-not-exist'],
         )
         assert records == []
+
+
+class TestEnumerateSessionsInRange:
+    """enumerate_sessions_in_range walks the projects tree ONCE and keeps
+    every session whose date falls in the inclusive ``[start_date, end_date]``
+    window — the single-walk O(total_files) replacement for calling
+    :func:`enumerate_sessions` once per calendar date (which re-opens each
+    file window_days times, O(window_days × files))."""
+
+    START_DATE = dt_date(2026, 7, 12)
+    END_DATE = dt_date(2026, 7, 14)
+
+    def test_inclusive_boundaries_both_kept(self, tmp_path):
+        # A session dated == start_date AND one dated == end_date are BOTH
+        # kept: the window is inclusive on both ends.
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_session(main_dir, 'at-start', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z')
+        _write_session(main_dir, 'at-end', MAIN_CWD, timestamp='2026-07-14T23:00:00.000Z')
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.path.stem for r in records} == {'at-start', 'at-end'}
+
+    def test_out_of_range_excluded(self, tmp_path):
+        # One day before start and one day after end are BOTH excluded; a
+        # mid-window session is kept.
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_session(main_dir, 'before-start', MAIN_CWD, timestamp='2026-07-11T09:00:00.000Z')
+        _write_session(main_dir, 'after-end', MAIN_CWD, timestamp='2026-07-15T09:00:00.000Z')
+        _write_session(main_dir, 'in-range', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.path.stem for r in records} == {'in-range'}
+
+    def test_aggregates_across_multiple_encoded_dirs(self, tmp_path):
+        # Mirrors TestEnumerateSessions: aggregation spans every matching
+        # encoded dir, not just the main one.
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        worktree_dir = projects_root / '-home-leo-src-dark-factory--worktrees-2573'
+        _write_session(main_dir, 'main-in-range', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z')
+        _write_session(
+            worktree_dir, 'worktree-in-range', WORKTREE_CWD, timestamp='2026-07-14T11:00:00.000Z'
+        )
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.encoded_dir for r in records} == {
+            '-home-leo-src-dark-factory',
+            '-home-leo-src-dark-factory--worktrees-2573',
+        }
+
+    def test_single_walk_opens_each_in_range_file_exactly_once(self, tmp_path, monkeypatch):
+        # Three in-range dates across the window. A spy that wraps + delegates
+        # to _session_cwd_and_date (the single gz-decompress/open point)
+        # records each path it is called with: every in-range file must be
+        # passed EXACTLY ONCE — proving the range enumerator is O(total_files),
+        # not O(window_days × files) (the per-date loop would open each file 3×).
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        _write_session(main_dir, 'day12', MAIN_CWD, timestamp='2026-07-12T09:00:00.000Z')
+        _write_session(main_dir, 'day13', MAIN_CWD, timestamp='2026-07-13T09:00:00.000Z')
+        _write_session(main_dir, 'day14', MAIN_CWD, timestamp='2026-07-14T09:00:00.000Z')
+
+        real = mod._session_cwd_and_date
+        opened = []
+
+        def spy(path):
+            opened.append(path)
+            return real(path)
+
+        monkeypatch.setattr(mod, '_session_cwd_and_date', spy)
+
+        records = mod.enumerate_sessions_in_range(
+            projects_root, [MAIN_CWD], self.START_DATE, self.END_DATE
+        )
+        assert {r.path.stem for r in records} == {'day12', 'day13', 'day14'}
+        # Exactly one open per in-range file — no per-date re-walk.
+        for stem in ('day12', 'day13', 'day14'):
+            path = main_dir / f'{stem}.jsonl'
+            assert opened.count(path) == 1, f'{stem} opened {opened.count(path)}× (want 1)'
+        # And no extra opens beyond the three in-range files.
+        assert len(opened) == 3
