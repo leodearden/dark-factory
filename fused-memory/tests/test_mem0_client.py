@@ -5,10 +5,9 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import QDRANT_URL, qdrant_skipif
+from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-from qdrant_client.models import VectorParams
 
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
@@ -463,20 +462,6 @@ def _asr_clean_collection(_asr_scope, mock_config):
     client.close()
 
 
-def _asr_collection_vector_size(collection: str) -> int:
-    """Read back the vector dimension Qdrant actually created for *collection*."""
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    try:
-        info = client.get_collection(collection)
-        vectors = info.config.params.vectors
-        assert isinstance(vectors, VectorParams), (
-            f'expected an unnamed VectorParams config, got {vectors!r}'
-        )
-        return vectors.size
-    finally:
-        client.close()
-
-
 async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     """Construct a real Mem0Backend with a stubbed constant-vector embedder.
 
@@ -492,7 +477,14 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     inst.db.add_history = lambda *a, **kw: None
 
     collection = scope.mem0_collection_name(config.mem0.collection_prefix)
-    dim = _asr_collection_vector_size(collection)
+    # Race-safe vector-dim read: under `-n auto` load the just-created
+    # collection can transiently 404 before it is durably readable, so retry
+    # the read via the shared bounded-poll helper rather than a single get.
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    try:
+        dim = await collection_vector_size(client, collection)
+    finally:
+        client.close()
     stub_vector = [0.1] * dim
     inst.embedding_model.embed = lambda *a, **kw: stub_vector
 
