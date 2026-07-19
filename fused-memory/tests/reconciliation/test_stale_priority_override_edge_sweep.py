@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     extract_priority_override_task_id,
+    is_ttl_override_fact,
 )
 
 
@@ -113,3 +114,48 @@ class TestExtractPriorityOverrideTaskId:
             )
             == 5166
         )
+
+
+# --------------------------------------------------------------------------- #
+# is_ttl_override_fact
+# --------------------------------------------------------------------------- #
+
+
+class TestIsTtlOverrideFact:
+    """is_ttl_override_fact(fact) is True iff BOTH the "priority override"
+    phrase AND a "TTL" token are present (either order, separator-tolerant),
+    mirroring memory_service._PRIORITY_OVERRIDE_TTL_FACT_RE. Requiring both
+    tokens keeps this classifier scoped to the genuinely single-valued TTL
+    scalar (never a boost/pin edge, never a bare-TTL non-override fact).
+    """
+
+    def test_ttl_form_forward_order(self):
+        """"Task 4940 priority override with a TTL of 3600s" -> True."""
+        assert is_ttl_override_fact('Task 4940 priority override with a TTL of 3600s') is True
+
+    def test_ttl_reversed_order_with_double_space_and_newline_separators(self):
+        """TTL appearing BEFORE the phrase, with a double-space separator
+        inside the phrase and a newline between the tokens -> True (either
+        order, separator-tolerant across newlines via re.S)."""
+        assert (
+            is_ttl_override_fact('TTL expiry recorded;\npriority  override still active')
+            is True
+        )
+
+    def test_boost_fact_without_ttl_is_false(self):
+        """"priority override boost tier high" -> False (no TTL token)."""
+        assert is_ttl_override_fact('priority override boost tier high') is False
+
+    def test_pin_fact_without_ttl_is_false(self):
+        """"priority override pin order 3" -> False (no TTL token)."""
+        assert is_ttl_override_fact('priority override pin order 3') is False
+
+    def test_non_override_fact_is_false(self):
+        """"Task 5 is done" -> False (neither token)."""
+        assert is_ttl_override_fact('Task 5 is done') is False
+
+    def test_ttl_token_without_phrase_is_false(self):
+        """A "TTL" token WITHOUT the "priority override" phrase -> False:
+        both tokens are required, so an unrelated TTL mention never
+        classifies as a priority-override TTL edge."""
+        assert is_ttl_override_fact('Task 7 cache entry has a TTL of 60s') is False
