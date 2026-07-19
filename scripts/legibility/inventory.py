@@ -302,6 +302,29 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     yield from sorted(matches)
 
 
+def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
+    """Return the encoded ``<enc>`` cwd dir of an archive transcript, or ``None``.
+
+    The archived fleet-transcript tree nests transcripts under
+    ``<task_id>/<enc>/<sid>.jsonl.gz`` (main) and
+    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl.gz`` (subagent), so the
+    encoded cwd directory is ``parts[1]`` of the archive-root-relative path in
+    BOTH layouts — NOT ``session_path.parent.name`` (which is ``'subagents'``
+    for the subagent variant, and would make the pre-filter drop EVERY subagent
+    transcript). Returns ``None`` when *session_path* is not under
+    *archive_root* (``relative_to`` raises ``ValueError``) or the relative path
+    has fewer than two components — a short/degenerate layout whose ``<enc>``
+    is underivable, in which case the caller does NOT pre-filter and falls back
+    to ``session_path.parent.name``, keeping :func:`is_member` the sole
+    membership authority. Never raises.
+    """
+    try:
+        parts = session_path.relative_to(archive_root).parts
+    except ValueError:
+        return None
+    return parts[1] if len(parts) >= 2 else None
+
+
 def _enumerate(
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
@@ -323,10 +346,19 @@ def _enumerate(
     (the ``shared.transcript_archive`` fleet-transcript tree, resolved via
     :func:`resolve_agent_transcript_roots`) walked recursively ALONGSIDE the
     ``~/.claude/projects`` tree — each ``*.jsonl``/``*.jsonl.gz`` under a
-    root is admitted by the same per-file membership + date filter, with the
-    encoded worktree dir taken from ``session_path.parent.name``. It
-    defaults to an empty tuple: when empty, the archive loop does not
-    execute and this walk is byte-identical to the projects-only path.
+    root is admitted by the same per-file membership + date filter. A cheap
+    encoded-``<enc>`` pre-filter — mirroring :func:`iter_project_dirs`'
+    superset pre-filter for the projects tree — skips a proven-foreign
+    archive file, one whose ``<enc>`` (:func:`_archive_enc`, the
+    archive-root-relative ``parts[1]``) does not encoded-prefix-match any
+    ``cwd_prefixes`` entry, WITHOUT opening it; :func:`is_member` on the real
+    cwd stays the SOLE membership authority (a lossy false-positive like a
+    ``-cockpit`` sibling that string-startswith the prefix falls through to
+    it), so the RESULT SET is unchanged. That same ``<enc>`` becomes the
+    record's ``encoded_dir`` (falling back to ``session_path.parent.name``
+    only when it is underivable). It defaults to an empty tuple: when empty,
+    the archive loop does not execute and this walk is byte-identical to the
+    projects-only path.
 
     The *date_ok* predicate is the ONLY thing that varies between the two
     public enumerators, so the walk itself — and its byte-parity for the
@@ -342,10 +374,25 @@ def _enumerate(
             if record is not None:
                 records.append(record)
 
+    encoded_prefixes = [encode_cwd(prefix) for prefix in cwd_prefixes]
     for archive_root in agent_transcript_roots:
-        for session_path in _iter_archive_transcripts(Path(archive_root)):
+        archive_root_path = Path(archive_root)
+        for session_path in _iter_archive_transcripts(archive_root_path):
+            enc = _archive_enc(session_path, archive_root_path)
+            # Cheap encoded-<enc> pre-filter (mirrors iter_project_dirs): skip
+            # a proven-foreign archive file WITHOUT opening it. A None enc
+            # (underivable layout) is NOT pre-filtered — is_member stays the
+            # sole authority — and lossy false-positives (a -cockpit sibling
+            # that startswith the prefix) fall through to is_member too.
+            if enc is not None and not any(
+                enc.startswith(ep) for ep in encoded_prefixes
+            ):
+                continue
             record = _build_session_record(
-                session_path, session_path.parent.name, cwd_prefixes, date_ok
+                session_path,
+                enc if enc is not None else session_path.parent.name,
+                cwd_prefixes,
+                date_ok,
             )
             if record is not None:
                 records.append(record)
