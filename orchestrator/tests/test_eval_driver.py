@@ -303,3 +303,110 @@ class TestRunOfatStage:
         assert len(results) == 1
         assert results[0].task_id == 'df_task_ok'
         assert any('failed' in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# step-09/10 — run_matrix_stage: the architect×implementer cross product.
+#
+# The matrix stage is one of the two both-live stages (matrix/confirm): it fans
+# run_end_to_end out over configs.matrix_pairs(arch_survivors, impl_survivors) ×
+# fixtures × trials — the FULL cross product, INCLUDING the same-family diagonal
+# (e.g. sonnet-arch × sonnet-impl), the pair that tests whether a plan style
+# couples to its own family's implementer (PRD decision 9). run_end_to_end is
+# monkeypatched to record (arch, impl) pairs — the ONLY both-live executor.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRunMatrixStage:
+    async def test_runs_end_to_end_over_full_cross_product_incl_diagonal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import configs, runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+
+        # 2 architect × 2 implementer survivors. The same-model/backend pairs
+        # (arch-sonnet × impl-sonnet, arch-opus × impl-opus) are the same-family
+        # diagonals the matrix must NOT skip.
+        arch_survivors = [
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+        ]
+        impl_survivors = [
+            EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high'),
+            EvalConfig('impl-opus', 'claude', 'opus', 'high'),
+        ]
+
+        e2e_calls: list[tuple[str, str, str, int]] = []
+
+        async def fake_run_end_to_end(
+            task_path, arch_config, impl_config, *_a, trial=1, **_k,
+        ):
+            e2e_calls.append(
+                (task_path.stem, arch_config.name, impl_config.name, trial)
+            )
+            return EvalResult(
+                task_path.stem, f'{arch_config.name}+{impl_config.name}',
+                'done', {'role_under_test': 'end_to_end'}, '/tmp/wt', trial=trial,
+            )
+
+        monkeypatch.setattr(runner, 'run_end_to_end', fake_run_end_to_end)
+
+        results = await runner.run_matrix_stage(
+            [t1, t2], arch_survivors, impl_survivors, base_config=None, trials=1,
+        )
+
+        # Every (arch, impl) pair from the FULL cross product is covered.
+        expected_pairs = {
+            (a.name, i.name)
+            for a, i in configs.matrix_pairs(arch_survivors, impl_survivors)
+        }
+        seen_pairs = {(c[1], c[2]) for c in e2e_calls}
+        assert seen_pairs == expected_pairs
+        # Full cross product = len(arch) × len(impl) = 4 pairs; both same-family
+        # diagonals present (NOT excluded).
+        assert ('arch-sonnet', 'impl-sonnet') in seen_pairs
+        assert ('arch-opus', 'impl-opus') in seen_pairs
+        # Exactly one run_end_to_end per (pair, fixture, trial): 4 × 2 × 1.
+        assert len(e2e_calls) == 4 * 2 * 1
+        # Flattened results cover every cell.
+        assert len(results) == 4 * 2 * 1
+        assert all(r.metrics['role_under_test'] == 'end_to_end' for r in results)
+
+    async def test_covers_pairs_across_multiple_trials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t1.touch()
+
+        arch_survivors = [
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
+        ]
+        impl_survivors = [
+            EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high'),
+            EvalConfig('impl-opus', 'claude', 'opus', 'high'),
+        ]
+
+        seen_trials: list[int] = []
+
+        async def fake_run_end_to_end(task_path, arch_config, impl_config, *_a, trial=1, **_k):
+            seen_trials.append(trial)
+            return EvalResult(
+                task_path.stem, f'{arch_config.name}+{impl_config.name}',
+                'done', {}, '/tmp/wt', trial=trial,
+            )
+
+        monkeypatch.setattr(runner, 'run_end_to_end', fake_run_end_to_end)
+
+        results = await runner.run_matrix_stage(
+            [t1], arch_survivors, impl_survivors, base_config=None, trials=3,
+        )
+
+        # 1 arch × 2 impl = 2 pairs × 1 fixture × 3 trials = 6 cells.
+        assert len(results) == 2 * 1 * 3
+        assert sorted(seen_trials) == [1, 1, 2, 2, 3, 3]
