@@ -1011,6 +1011,16 @@ def create_mcp_server(
                 'content_excerpt': content[:200],
                 'hint': _LIVE_TASK_STATUS_HINT,
             }
+        # task 2824: reject a recon-stage present-tense completion claim ("task N
+        # has landed / is done / now enforces X") naming a task whose LIVE status
+        # is still non-terminal. Episodes carry no category, so this fires on
+        # recon-stage + content + status-check alone (mirroring the 2628
+        # live-status add_episode arm). Ordered after that gate; fails open when
+        # the live status cannot be resolved.
+        if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+            premature_block = await _premature_completion_block(content, agent_id, project_id)
+            if premature_block is not None:
+                return premature_block
         causation_id, op_source, _ = _extract_causation(metadata, agent_id)
         result = await memory_service.add_episode(
             content=content,
