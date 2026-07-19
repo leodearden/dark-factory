@@ -417,6 +417,46 @@ rebase churn.
   emits the report with per-config composite, judge results, **cost, latency,
   CIs** — **non-empty diffs graded**. Depends λ, θ, η, ζ (and ι transitively).
   Modules: orchestrator/evals/{runner,compare,configs,report}.py, cli.py.
+- **ο (omicron) — judge OFAT axis** *(leaf; μ's judge-role extension —
+  added 2026-07-19 to unblock adaptive-routing κ-judge / esc-2815-2 → option A)*.
+  Widen μ's OFAT screen to the **completion-judge role** (`models.judge`) so a
+  cheaper judge can be trialled without leaving the instrument. Three additive
+  edits inside eval-revival's **own** files (this is why it lives here, not in
+  adaptive-routing — decision 11 keeps the instrument single-owned; the
+  *consumer* PRD still edits nothing):
+    1. `build_eval_orch_config` gains a **`judge_config: EvalConfig | None`**
+       override knob, structurally identical to μ's `architect_config`: when
+       `None` (every existing caller) `models.judge`/`budgets.judge`/
+       `effort.judge` are byte-identical to today, so the **P1/B1 parity
+       tripwire holds**; when supplied it derives the judge's model/effort from
+       that candidate.
+    2. `run_ofat_stage` gains a **`role=='judge'` dispatch branch** (today it
+       branches only architect vs. implementer; a judge candidate silently
+       mis-runs as implementer) — threads `judge_config` into the frozen-plan
+       `run_eval` path (the completion judge is **always-on in eval**, so it is
+       already exercised on every `run_eval`; the branch only varies *which*
+       model runs it, all other roles pinned).
+    3. `ofat_candidates()` / `configs.py` gain a **judge candidate set**
+       (`judge-sonnet` incumbent + `judge-haiku`), `role='judge'`.
+  **Scoring — deliberately NOT a new judge-verdict metric.** The completion
+  judge emits a **binary done/not-done control-flow verdict**, not a scoreable
+  finding-set, and the framework has **no native judge-verdict scorer** (the
+  eval report's "judge results" are the *pairwise Elo* `evals/judge.py`, a
+  different judge). So ο scores the judge **indirectly, through μ's existing
+  end-to-end composite**: a too-lenient judge stops iteration early → worse
+  final diff / lower composite; a too-strict one burns iterations → higher
+  cost. OFAT varies only the judge and reads the composite + cost delta over
+  the fixtures (≥3 trials, CIs) — **no labeled verdict corpus required**. A
+  *direct* verdict-agreement replay metric (mine `runs.db` for
+  judge-said-done-and-merged-clean vs. kicked-back ground truth, à la
+  reviewer_trial's FN-mining) is a **stronger future option** if the indirect
+  signal proves too noisy — but it needs an input-replayability spike and is
+  out of ο's scope. **Signal:** `orchestrator eval` (OFAT mode) with a
+  `role='judge'` candidate dispatches the completion judge on the picked model
+  and emits per-config composite + cost rows for `judge-haiku` vs.
+  `judge-sonnet`; the `judge_config=None` parity tripwire stays green.
+  Depends **μ (2478)**. Consumer: **adaptive-routing κ-judge (task 2815)**.
+  Modules: orchestrator/evals/{runner,configs}.py, orchestrator/tests.
 
 **Phase 4 — candidate bundles (cross-PRD-gated)**
 

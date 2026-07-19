@@ -115,6 +115,15 @@ retry ladder's final rung.
     (tasks ι, κ). This PRD makes NO edits to `evals/runner.py`, the benchmark
     suite, or the judge/Elo machinery. The earlier draft's "un-hardcode
     build_eval_orch_config" is withdrawn — that is eval-revival β=2466.
+    **Judge-OFAT seam addendum (2026-07-19, esc-2815-2 → option A):** κ-judge
+    (task 2815) originally hard-depended on μ (2478) for a `models.judge`
+    substitution seam that μ never built — μ's OFAT covers architect+implementer
+    only. Rather than have *this* PRD edit the instrument (which decision 11
+    forbids), the seam is added to eval-revival as **its own** new task
+    **ο (judge OFAT axis)** — a `judge_config` override knob mirroring μ's
+    `architect_config`, a `role=='judge'` dispatch branch, and a judge
+    candidate set. **This PRD still edits nothing** — the instrument stays
+    single-owned; κ-judge is re-pointed to *consume* ο. The invariant holds.
 12. **Resolution precedes prompt assembly** (tier1-prompt-optimization seam,
     its P-4): `resolve_route` runs before the role system prompt is built in
     `_invoke`, and the resolved model is available at the prompt-build point —
@@ -131,10 +140,11 @@ retry ladder's final rung.
   (eval-revival architect coverage + OFAT/confirm driver). **κ was re-scoped
   per-role 2026-07-19 (esc-2540-2 → D)** — see §κ; its deps are now per sub-task:
   **module_tagger** (task 2540) → **2534** (δ rollup / post-flip watch); **judge**
-  → **2478** (eval-revival OFAT/confirm driver — the `models.judge` substitution
-  seam) + **2486** (mcp-verdict judge contract) + **2472** (eval Phase-1 validity
-  gate, now shipped); **triage** → **2485** (mcp-verdict triage contract), gated
-  on an input-replayability spike.
+  → **ο** (eval-revival judge OFAT axis — the `models.judge` substitution seam;
+  re-pointed from 2478 per esc-2815-2 → option A, since μ built architect+
+  implementer OFAT only) + **2486** (mcp-verdict judge contract) + **2472** (eval
+  Phase-1 validity gate, now shipped); **triage** → **2485** (mcp-verdict triage
+  contract), gated on an input-replayability spike.
 - Assumed-substrate verified during authoring: `_invoke` chokepoint
   (workflow.py:7351-7359), plan shape available at selection time (workflow.py:7295),
   `retry_ledger`/typed-metadata pattern (shared/src/shared/task_metadata.py), event
@@ -155,7 +165,7 @@ Reconciled 2026-07-13 against the four sibling PRDs committed 2026-07-12
 | `plans/config-hot-reload-prd.md` (shipped) | extends | new `routing.*` config block joins green-tier `RELOADABLE_FIELDS` | this-prd | queued (task ε) |
 | `plans/author-declared-complexity-prd.md` (shipped) | extends | simple-path fallback story gains saturation stamp; declared-complexity semantics unchanged | this-prd | queued (task ν) |
 | `plans/harness-backend-reconnect-pi-prd.md` (T1=2457 **done**, T5=2460, T6=2461, pi=2463) | consumes 2461; boundary on the rest | δ consumes 2461's steward/triage CostStore rows (judge already records — do NOT re-instrument). Backend axis stays theirs: the resolver returns model/effort/budget/turns, NEVER backend; `backends.<role>` selection + provider pools + `_MODEL_COSTS`→prices are that PRD's. 2460 co-edits `_build_agent_env` (workflow.py:7304-7333) adjacent to ε — lock-serialized, no semantic overlap | each PRD its axis; **2461** owns steward/triage cost threading | δ dep wired at decompose |
-| `plans/eval-framework-revival-prd.md` (β=2466, ι=2472, ζ=2473, θ=2475, λ=2477, μ=2478, ν=2479, ξ=2480) | consumes | measurement/adoption split (decision 11): they measure, this PRD adopts. ι deps 2475+2478; κ-judge deps 2478 (the `models.judge` OFAT/confirm seam) + 2472 (validity gate) — per the 2026-07-19 per-role re-scope (esc-2540-2/D). This PRD never edits `evals/runner.py`/benchmark/judge machinery. Endpoint-swapped model bundles (per-role ANTHROPIC_BASE_URL) are their ν/ξ — a separate widening axis composing with this PRD's model axis | **eval-revival** owns the instrument; **this-prd** owns adoption flips | ι/κ deps wired at decompose |
+| `plans/eval-framework-revival-prd.md` (β=2466, ι=2472, ζ=2473, θ=2475, λ=2477, μ=2478, ν=2479, ξ=2480) | consumes | measurement/adoption split (decision 11): they measure, this PRD adopts. ι deps 2475+2478; κ-judge deps eval-revival **ο** (the `models.judge` OFAT seam — re-pointed from 2478 per esc-2815-2/A, since μ built only architect+implementer OFAT) + 2472 (validity gate) — per the 2026-07-19 per-role re-scope (esc-2540-2/D). This PRD never edits `evals/runner.py`/benchmark/judge machinery; the judge seam is eval-revival's ο, which this PRD only consumes. Endpoint-swapped model bundles (per-role ANTHROPIC_BASE_URL) are their ν/ξ — a separate widening axis composing with this PRD's model axis | **eval-revival** owns the instrument; **this-prd** owns adoption flips | ι/κ deps wired at decompose |
 | `plans/mcp-verdict-servers-prd.md` (α=2481 in-progress, β=2482, ε=2485, ζ=2486) | consumes (contract stability) | κ trials judge/triage on the POST-migration verdict-tool transport → κ-judge deps 2486, κ-triage deps 2485 (per-role re-scope 2026-07-19, esc-2540-2/D). 2482 injects verdict-tools at the `_invoke` spawn site; η co-edits steward.py near 2485 — lock-serialized | **mcp-verdict** owns the transport | κ deps wired at decompose |
 | `plans/tier1-prompt-optimization-prd.md` (loader keys artifacts on executor model; its P-4 names this PRD) | produces | invariant 9 / decision 12: `resolve_route` completes before prompt assembly; the resolved model is available to the prompt-artifact loader call site. Per-model artifact sets make a routed reviewer/curator load the right heuristics block by construction | **this-prd** owns exposing the resolved model; **tier1** owns the loader + call site | no hard dep either way (their analysis, concurred) |
 | `plans/dashboard-taskgraph-legibility-prd.md` | none | disjoint dashboard surfaces (`tab_tasks.jsx` vs δ's new cost/routing panel) | — | no seam |
@@ -363,16 +373,26 @@ Phase 3 — fleet rebalancing (survey Tier 1) + plan-shape generalization:
     (predicted files vs the files a task actually touched, recorded on every done
     task), so haiku-vs-sonnet agreement + precision/recall vs ground truth is
     self-contained: no eval framework, no 2478, no contract migration.
-  - **judge** — deferred behind the OFAT seam; deps **2478** + **2486** + **2472**.
-    OFAT single-role substitution (`models.judge` override) on the revived
-    framework over its fixtures, on the post-2486 verdict-tool contract. The
-    substitution seam is the eval-revival **OFAT/confirm driver = task 2478
-    (μ, pending)**; decision 11 forbids building it by editing `evals/runner.py`,
-    so 2478 is a hard dependency. Threshold basis: the **reviewer_trial scoring
-    precedent** (`orchestrator/src/orchestrator/evals/reviewer_trial/`) — F1 +
-    blocking_recall vs a labeled corpus, F1/$ cost efficiency,
-    adopt-if-parity-or-better-and-cheaper (coded gates recall>0.6 /
-    blocking_recall>0.5).
+  - **judge** — deferred behind the OFAT seam; deps **ο (eval-revival judge
+    OFAT axis)** + **2486** + **2472**. OFAT single-role substitution
+    (`models.judge` override) on the revived framework over its fixtures, on the
+    post-2486 verdict-tool contract. **Re-pointed 2026-07-19 (esc-2815-2 →
+    option A):** μ (task 2478, now merged) built OFAT for architect+implementer
+    only — no judge dispatch branch and no `judge_config` knob — so the
+    substitution seam does **not** exist yet. Decision 11 forbids *this* PRD
+    from adding it to `evals/runner.py`; instead eval-revival adds it as its own
+    task **ο** (judge OFAT axis: `judge_config` knob mirroring μ's
+    `architect_config` + `role=='judge'` branch + judge candidate set). κ-judge
+    now hard-deps **ο**, not 2478 directly. **Scoring basis corrected:** the
+    original **reviewer_trial F1/blocking_recall precedent does not apply** — the
+    completion judge emits a *binary done/not-done control-flow verdict*, not a
+    scoreable finding-set, and the framework has no native judge-verdict scorer.
+    κ-judge instead reads ο's **end-to-end composite non-inferiority + cost
+    delta** over the fixtures (≥3 trials, CIs): adopt `models.judge=haiku` iff
+    the end-to-end composite is non-inferior to the sonnet-judge incumbent AND
+    cheaper. (A direct verdict-agreement replay metric — mine `runs.db` for
+    judge-said-done-and-merged-clean vs. kicked-back ground truth — is a
+    stronger future option gated on an input-replayability spike, à la triage.)
   - **triage** — gated on an input-replayability spike; dep **2485**. Same
     replay-agreement method as module_tagger, on the post-2485 contract, but the
     steward's inner-triage INPUTS are not obviously persisted for offline replay
