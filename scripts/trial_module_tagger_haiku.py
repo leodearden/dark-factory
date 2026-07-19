@@ -24,6 +24,7 @@ conditional config).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.harness import _extract_tagger_entries
@@ -249,3 +250,107 @@ def decide(summary: dict) -> str:
 
     # Everything else → marginal → escalate to a human.
     return 'marginal'
+
+
+def _thresholds_dict() -> dict[str, float]:
+    """The design-decision-5 thresholds the verdict was computed against."""
+    return {
+        'F1_PARITY_BAND': F1_PARITY_BAND,
+        'F1_FAIL_GAP': F1_FAIL_GAP,
+        'AGREEMENT_FLOOR': AGREEMENT_FLOOR,
+        'AGREEMENT_FAIL': AGREEMENT_FAIL,
+        'ADJ_WORSE_PASS': ADJ_WORSE_PASS,
+        'ADJ_WORSE_FAIL': ADJ_WORSE_FAIL,
+        'MIN_SAMPLES': MIN_SAMPLES,
+    }
+
+
+@dataclass(frozen=True)
+class TrialResult:
+    """Aggregated trial outcome (what ``run_trial`` returns, what
+    ``render_report`` renders).
+
+    ``haiku`` / ``sonnet`` are per-model mean ``{precision, recall, f1}`` vs
+    ground truth; ``agreement`` is the mean symmetric haiku-vs-sonnet
+    ``{precision, recall, f1, jaccard}``; ``adjudication`` is the opus tally
+    (``tally_adjudications`` output); ``decision`` is ``decide()``'s verdict.
+    """
+    n_samples: int
+    haiku: dict
+    sonnet: dict
+    agreement: dict
+    adjudication: dict
+    decision: str
+
+
+def render_report(trial_result: TrialResult) -> str:
+    """Render *trial_result* to a committed markdown report.
+
+    Contains a haiku-vs-sonnet leaderboard, the mean agreement/Jaccard, the
+    frontier adjudication tally, the decision verdict, N, and the design
+    thresholds — plus a fenced ``json`` machine-readable summary block the act
+    step (step 16) parses for the decision + numbers.
+    """
+    tr = trial_result
+    adj = tr.adjudication
+    summary = {
+        'n_samples': tr.n_samples,
+        'haiku': tr.haiku,
+        'sonnet': tr.sonnet,
+        'agreement': tr.agreement,
+        'adjudication': tr.adjudication,
+        'decision': tr.decision,
+        'thresholds': _thresholds_dict(),
+    }
+
+    def _row(name: str, m: dict) -> str:
+        return f"| {name} | {m['precision']:.3f} | {m['recall']:.3f} | {m['f1']:.3f} |"
+
+    return f"""\
+# module_tagger haiku replay-agreement trial
+
+Task 2540 (Routing κ) — offline haiku-vs-fresh-sonnet replay over {tr.n_samples}
+historical done tasks carrying ground-truth `metadata.files`. The pass/fail
+verdict is computed by this trial (δ's rollup is only the post-flip watch).
+
+**Decision: {tr.decision.upper()}**  (N = {tr.n_samples})
+
+## Leaderboard — mean precision / recall / F1 vs ground truth
+
+| Model | Precision | Recall | F1 |
+|-------|-----------|--------|-----|
+{_row('haiku', tr.haiku)}
+{_row('sonnet', tr.sonnet)}
+
+## Haiku-vs-sonnet agreement (symmetric, mean)
+
+- Precision: {tr.agreement['precision']:.3f}
+- Recall: {tr.agreement['recall']:.3f}
+- F1: {tr.agreement['f1']:.3f}
+- Jaccard: {tr.agreement['jaccard']:.3f}
+
+## Frontier (opus) adjudication of haiku-vs-sonnet disagreements
+
+- haiku better: {adj['haiku_better']}
+- sonnet better: {adj['sonnet_better']}
+- tie: {adj['tie']}
+- haiku_worse_fraction: {adj['haiku_worse_fraction']:.3f}
+
+## Thresholds (design decision 5)
+
+| Constant | Value |
+|----------|-------|
+| F1_PARITY_BAND | {F1_PARITY_BAND} |
+| F1_FAIL_GAP | {F1_FAIL_GAP} |
+| AGREEMENT_FLOOR | {AGREEMENT_FLOOR} |
+| AGREEMENT_FAIL | {AGREEMENT_FAIL} |
+| ADJ_WORSE_PASS | {ADJ_WORSE_PASS} |
+| ADJ_WORSE_FAIL | {ADJ_WORSE_FAIL} |
+| MIN_SAMPLES | {MIN_SAMPLES} |
+
+## Machine-readable summary
+
+```json
+{json.dumps(summary, indent=2)}
+```
+"""
