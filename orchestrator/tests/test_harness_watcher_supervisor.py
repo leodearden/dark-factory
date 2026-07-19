@@ -408,6 +408,37 @@ class TestRunWatcherRotation:
         }
 
     @pytest.mark.asyncio
+    async def test_watcher_rotation_isolates_capped_connection_with_strict_mcp_config(
+        self, tmp_path: Path
+    ) -> None:
+        """The supervised rotation isolates its capped escalation connection with
+        strict_mcp_config=True, so its identical-name/URL `escalation` block
+        (carrying _WATCHER_ESCALATION_HEADERS) cannot bleed into a concurrent
+        header-less interactive session via the non-strict ambient .mcp.json
+        merge (task 2796, THREAD 2). The capped headers still ride on the
+        mcp_config — asserted via the mcp_config_json call carrying
+        _WATCHER_ESCALATION_HEADERS — while strict_mcp_config scopes the
+        invocation to ONLY that config's servers."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured.update(kwargs)
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        # The capped connection is strict-isolated ...
+        assert captured.get('strict_mcp_config') is True
+        # ... alongside the capped mcp_config that carries the watcher headers.
+        assert captured.get('mcp_config') == {'mcp': 'config-sentinel'}
+        _, mcp_kwargs = h.mcp.mcp_config_json.call_args  # type: ignore[union-attr]
+        assert mcp_kwargs.get('escalation_headers') == _WATCHER_ESCALATION_HEADERS
+
+    @pytest.mark.asyncio
     async def test_tool_restrictions_passed(self, tmp_path: Path) -> None:
         """invoke_with_cap_retry receives non-empty allowed_tools and disallowed_tools.
 
