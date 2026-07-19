@@ -105,3 +105,126 @@ class TestSelectSurvivors:
         survivors = select_survivors(report, top_k=2, roles=['implementer'])
         assert set(survivors) == {'implementer'}
         assert survivors['implementer'] == ['impl-a']
+
+
+# ---------------------------------------------------------------------------
+# step-15/16 — build_methodology_report / format_methodology_report: the μ
+# top-level artifact. It NESTS three λ build_composite_report sub-reports under
+# stage keys ('ofat'/'matrix'/'confirm') + survivors + winner + the echoed
+# price_table (inventing no new per-config schema), and renders byte-stably by
+# reusing format_composite_table per stage under a survivors/winner header.
+# ---------------------------------------------------------------------------
+
+def _res(task_id: str, config: str, role: str, composite_score: float):
+    from orchestrator.evals.runner import EvalResult
+
+    return EvalResult(
+        task_id, config, 'done',
+        {
+            'composite_score': composite_score,
+            'tests_pass': True,
+            'role_under_test': role,
+            'cost_usd': 1.0,
+            'workflow_duration_ms': 1000,
+        },
+        '/tmp/wt',
+    )
+
+
+class TestMethodologyReport:
+    def test_build_nests_three_stages_plus_survivors_winner_price(self):
+        from orchestrator.evals.report import build_methodology_report
+
+        ofat = [
+            _res('fix1', 'impl-a', 'implementer', 0.9),
+            _res('fix1', 'arch-x', 'architect', 0.8),
+        ]
+        matrix = [_res('fix1', 'arch-x+impl-a', 'end_to_end', 0.85)]
+        confirm = [_res('fix1', 'arch-x+impl-a', 'end_to_end', 0.88)]
+        price_table = {'impl-a': {'implementer': {'input_per_1m': 3.0, 'output_per_1m': 15.0}}}
+        survivors = {'implementer': ['impl-a'], 'architect': ['arch-x']}
+        winner = 'arch-x+impl-a'
+
+        report = build_methodology_report(
+            ofat, matrix, confirm,
+            price_table=price_table, survivors=survivors, winner=winner,
+        )
+
+        # Three build_composite_report sub-reports nested under the stage keys.
+        assert set(report['stages']) == {'ofat', 'matrix', 'confirm'}
+        for stage in ('ofat', 'matrix', 'confirm'):
+            sub = report['stages'][stage]
+            assert sub['aggregation'] == 'per_fixture_normalized_mean_ci'  # genuine λ report
+            assert isinstance(sub['configs'], list)
+        # ofat stage carries BOTH the implementer and the architect OFAT rows.
+        ofat_configs = {c['config'] for c in report['stages']['ofat']['configs']}
+        assert ofat_configs == {'impl-a', 'arch-x'}
+        # survivors + winner + echoed price_table at the methodology top level.
+        assert report['survivors'] == survivors
+        assert report['winner'] == winner
+        assert report['price_table'] == price_table
+
+    def test_build_is_deterministic_modulo_generated_at(self):
+        from orchestrator.evals.report import build_methodology_report
+
+        def _mk():
+            return build_methodology_report(
+                [_res('fix1', 'impl-a', 'implementer', 0.9)], [], [],
+                price_table={}, survivors={'implementer': ['impl-a']}, winner='w',
+            )
+
+        r1, r2 = _mk(), _mk()
+        # Normalize the only wall-clock fields, then require full structural equality.
+        for r in (r1, r2):
+            r['generated_at'] = 'X'
+            for sub in r['stages'].values():
+                sub['generated_at'] = 'X'
+        assert r1 == r2
+
+    def test_format_renders_stages_header_and_price(self):
+        from orchestrator.evals.report import (
+            build_methodology_report,
+            format_methodology_report,
+        )
+
+        report = build_methodology_report(
+            [_res('fix1', 'impl-a', 'implementer', 0.9)],
+            [_res('fix1', 'arch-x+impl-a', 'end_to_end', 0.85)],
+            [_res('fix1', 'arch-x+impl-a', 'end_to_end', 0.88)],
+            price_table={'impl-a': {'implementer': {'input_per_1m': 3.0, 'output_per_1m': 15.0}}},
+            survivors={'implementer': ['impl-a'], 'architect': ['arch-x']},
+            winner='arch-x+impl-a',
+        )
+
+        text = format_methodology_report(report)
+
+        # Survivors/winner header.
+        assert 'arch-x+impl-a' in text     # winner combo
+        assert 'impl-a' in text            # survivor + a config row
+        # All three stage sections labelled.
+        assert 'ofat' in text
+        assert 'matrix' in text
+        assert 'confirm' in text
+        # The price-table section is rendered.
+        assert 'price table:' in text
+
+    def test_format_is_byte_stable_across_wall_clock(self):
+        from orchestrator.evals.report import (
+            build_methodology_report,
+            format_methodology_report,
+        )
+
+        def _mk():
+            return build_methodology_report(
+                [_res('fix1', 'impl-a', 'implementer', 0.9)],
+                [_res('fix1', 'arch-x+impl-a', 'end_to_end', 0.85)],
+                [],
+                price_table={'impl-a': {'implementer': {'input_per_1m': 3.0, 'output_per_1m': 15.0}}},
+                survivors={'implementer': ['impl-a']},
+                winner='arch-x+impl-a',
+            )
+
+        # Two independently-built reports (distinct generated_at) render
+        # byte-identically: format renders no wall-clock, sorts rows/sections,
+        # and fixes float precision.
+        assert format_methodology_report(_mk()) == format_methodology_report(_mk())
