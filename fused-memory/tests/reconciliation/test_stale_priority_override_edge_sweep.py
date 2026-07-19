@@ -34,10 +34,33 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     extract_priority_override_task_id,
     is_ttl_override_fact,
+    select_stale_priority_override_edges,
 )
+
+_NOW = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+_PAST = _NOW - timedelta(hours=1)
+_FUTURE = _NOW + timedelta(hours=1)
+
+
+def _boost_edge(uuid: str = 'edge-boost-5166') -> dict:
+    return {
+        'uuid': uuid,
+        'fact': "Set priority override for task 5166: {'boost_tier': 'high'}",
+        'name': '',
+    }
+
+
+def _ttl_edge(uuid: str = 'edge-ttl-4940') -> dict:
+    return {
+        'uuid': uuid,
+        'fact': 'Task 4940 priority override with a TTL of 3600s',
+        'name': '',
+    }
 
 
 class TestExtractPriorityOverrideTaskId:
@@ -159,3 +182,83 @@ class TestIsTtlOverrideFact:
         both tokens are required, so an unrelated TTL mention never
         classifies as a priority-override TTL edge."""
         assert is_ttl_override_fact('Task 7 cache entry has a TTL of 60s') is False
+
+
+# --------------------------------------------------------------------------- #
+# select_stale_priority_override_edges — pure decision core
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectStalePriorityOverrideEdges:
+    """select_stale_priority_override_edges(edges, live_overrides, *, now) is
+    the pure decision core. An edge is selected (stale) iff its extracted
+    subject task is ABSENT from the live override map, OR the edge is a TTL
+    edge whose live ttl_until has elapsed (now >= ttl_until). A task present
+    with any live override (and a non-elapsed / null ttl) is never selected —
+    positively-determinable-only, conservative under-invalidation.
+    """
+
+    def test_boost_edge_absent_from_live_selected(self):
+        """Boost edge for 5166, absent from a live map holding other tasks ->
+        selected (the override was consumed/cleared)."""
+        edge = _boost_edge()
+        result = select_stale_priority_override_edges(
+            [edge], {'999': {'ttl_until': None}}, now=_NOW,
+        )
+        assert result == [edge]
+
+    def test_boost_edge_present_in_live_not_selected(self):
+        """Boost edge for 5166 present in the live map -> NOT selected."""
+        edge = _boost_edge()
+        result = select_stale_priority_override_edges(
+            [edge], {'5166': {'ttl_until': None}}, now=_NOW,
+        )
+        assert result == []
+
+    def test_ttl_edge_elapsed_selected(self):
+        """TTL edge for 4940 present with ttl_until in the past -> selected."""
+        edge = _ttl_edge()
+        result = select_stale_priority_override_edges(
+            [edge], {'4940': {'ttl_until': _PAST}}, now=_NOW,
+        )
+        assert result == [edge]
+
+    def test_ttl_edge_future_not_selected(self):
+        """TTL edge present with ttl_until in the future -> NOT selected."""
+        edge = _ttl_edge()
+        result = select_stale_priority_override_edges(
+            [edge], {'4940': {'ttl_until': _FUTURE}}, now=_NOW,
+        )
+        assert result == []
+
+    def test_ttl_edge_ttl_until_none_not_selected(self):
+        """TTL edge present but the live row's ttl_until is None -> NOT
+        selected (no absolute expiry to compare against)."""
+        edge = _ttl_edge()
+        result = select_stale_priority_override_edges(
+            [edge], {'4940': {'ttl_until': None}}, now=_NOW,
+        )
+        assert result == []
+
+    def test_non_override_edge_never_selected(self):
+        """A non-override edge (extractor returns None) is never selected,
+        regardless of the live map contents."""
+        edge = {'uuid': 'edge-nonoverride', 'fact': 'Task 5 is done', 'name': ''}
+        result = select_stale_priority_override_edges(
+            [edge], {'5': {'ttl_until': _PAST}}, now=_NOW,
+        )
+        assert result == []
+
+    def test_empty_live_map_candidate_selected(self):
+        """Empty live map + one candidate edge -> selected (a legitimate
+        no-overrides-at-all state — every override has been consumed)."""
+        edge = _boost_edge()
+        result = select_stale_priority_override_edges([edge], {}, now=_NOW)
+        assert result == [edge]
+
+    def test_selected_entries_carry_edge_uuid(self):
+        """Selected entries are the original edge dicts, carrying their uuid."""
+        edge = _boost_edge(uuid='edge-carries-uuid')
+        result = select_stale_priority_override_edges([edge], {}, now=_NOW)
+        assert len(result) == 1
+        assert result[0]['uuid'] == 'edge-carries-uuid'
