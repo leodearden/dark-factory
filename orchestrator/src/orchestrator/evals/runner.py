@@ -961,6 +961,45 @@ async def run_matrix_stage(
     return await _bounded_fanout(thunks, max_parallel)
 
 
+async def run_confirm_stage(
+    task_paths: list[Path],
+    arch_winner: EvalConfig,
+    impl_winner: EvalConfig,
+    base_config: OrchestratorConfig | None = None,
+    max_parallel: int | None = None,
+    trials: int = 3,
+    timeout_override: int | None = None,
+) -> list[EvalResult]:
+    """Confirmation batch: the SINGLE winning combo × N trials, both-live (μ).
+
+    The final methodology stage — one end-to-end confirmation of the winning
+    ``(arch_winner, impl_winner)`` combo (PRD decision 10). Fans
+    :func:`run_end_to_end` out over ``fixtures × trials`` for the single combo
+    via the shared :func:`_bounded_fanout` skeleton (identical cancellation /
+    error-continue semantics to the screen stages). ``trials`` defaults to 3 —
+    decision 10's statistics floor, enough repeats for a CI95 on the winner,
+    NOT the 1-trial screen default of :func:`run_ofat_stage` /
+    :func:`run_matrix_stage`. Both roles run LIVE. Returns the flattened
+    ``EvalResult`` list for the confirmation batch.
+    """
+    def _thunk(
+        task_path: Path, trial: int,
+    ) -> Callable[[], Awaitable[EvalResult | None]]:
+        async def _run() -> EvalResult | None:
+            return await run_end_to_end(
+                task_path, arch_winner, impl_winner, base_config,
+                trial=trial, timeout_override=timeout_override,
+            )
+        return _run
+
+    thunks = [
+        _thunk(tp, trial)
+        for tp in task_paths
+        for trial in range(1, trials + 1)
+    ]
+    return await _bounded_fanout(thunks, max_parallel)
+
+
 def _result_exists(task_id: str, config_name: str) -> bool:
     """Check if any result already exists for this (task, config) pair."""
     if not RESULTS_DIR.exists():
