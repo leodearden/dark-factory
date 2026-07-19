@@ -789,6 +789,41 @@ class TestShutdownWithWatchdog:
             main_mod._cancel_force_exit()
 
 
+class TestGracefulShutdownMemoryCloseBudget:
+    """Task 2701: the memory_service.close step must run under the enlarged
+    _MEMORY_CLOSE_STEP_TIMEOUT — not the flat _CLEANUP_STEP_TIMEOUT default — so
+    its six sequentially-bounded sub-closes all fit within one step budget."""
+
+    @pytest.mark.asyncio
+    async def test_memory_service_close_step_uses_memory_close_step_timeout(self):
+        import fused_memory.server.main as main_mod
+
+        memory_service = MagicMock()
+        memory_service.close = AsyncMock()
+
+        recorded: list[tuple] = []
+
+        async def _record(name, coro_factory, timeout=main_mod._CLEANUP_STEP_TIMEOUT):
+            recorded.append((name, timeout))
+
+        with patch.object(main_mod, '_run_shielded', _record):
+            await _graceful_shutdown(
+                memory_service=memory_service,
+                task_interceptor=None,
+                harness_loop_task=None,
+                recon_journal=None,
+            )
+
+        steps = dict(recorded)
+        assert 'memory_service.close' in steps, (
+            f'memory_service.close step was not dispatched: {steps}'
+        )
+        assert steps['memory_service.close'] == main_mod._MEMORY_CLOSE_STEP_TIMEOUT, (
+            'memory_service.close must run under _MEMORY_CLOSE_STEP_TIMEOUT, not the '
+            f'flat per-step default; got {steps["memory_service.close"]}'
+        )
+
+
 class TestShutdownBudgetArithmetic:
     """Survey finding D1: the bounded uvicorn graceful-shutdown wait is serialized
     BEFORE _shutdown_with_watchdog arms _FORCE_EXIT_BUDGET, so worst-case shutdown
@@ -841,6 +876,39 @@ class TestShutdownBudgetArithmetic:
             "Update the constant in fused_memory/server/main.py so the "
             "force-exit-before-SIGKILL invariant stays honest."
         )
+
+    def test_memory_close_step_budget_dominates_bounded_close(self):
+        """Task 2701 documented basis: the memory_service.close step budget must
+        exceed the flat per-step default AND dominate the worst-case bounded
+        close (6 sub-closes each ≤ _SUBCLOSE_TIMEOUT), while the force-exit and
+        systemd constants stay UNCHANGED so the schema.py _MIRROR_* guard and the
+        systemd-template parity test both remain valid.
+        """
+        import fused_memory.server.main as main_mod
+        from fused_memory.services import memory_service as ms_mod
+
+        # Enlarged relative to the flat per-step default.
+        assert main_mod._MEMORY_CLOSE_STEP_TIMEOUT > main_mod._CLEANUP_STEP_TIMEOUT
+        # Dominates the worst-case bounded close: 6 sub-closes each capped at
+        # _SUBCLOSE_TIMEOUT run sequentially inside the one step.
+        assert main_mod._MEMORY_CLOSE_STEP_TIMEOUT >= 6 * ms_mod._SUBCLOSE_TIMEOUT
+
+        # Illustrative worst-case step sum with the resized memory-close budget
+        # still fits within the force-exit budget: five flat 5s steps
+        # (drain, close, sqlite_watchdog, event_queue, journal_close)
+        # + harness_cancel(25) + memory_close.
+        worst_case_step_sum = (
+            5 * main_mod._CLEANUP_STEP_TIMEOUT
+            + main_mod._HARNESS_CANCEL_TIMEOUT
+            + main_mod._MEMORY_CLOSE_STEP_TIMEOUT
+        )
+        assert worst_case_step_sum <= main_mod._FORCE_EXIT_BUDGET
+
+        # Regression: the mirrored/parity constants are UNCHANGED so the
+        # schema.py _MIRROR_* guard and the systemd-template parity test
+        # (both outside this task's scope) stay valid.
+        assert main_mod._FORCE_EXIT_BUDGET == 75.0
+        assert main_mod._SYSTEMD_TIMEOUT_STOP_SECS == 90.0
 
 
 class _DummyASGIApp:
