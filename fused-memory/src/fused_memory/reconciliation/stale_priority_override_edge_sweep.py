@@ -113,3 +113,37 @@ def extract_priority_override_task_id(fact: str) -> int | None:
     if len(ids) != 1:
         return None
     return next(iter(ids))
+
+
+# --------------------------------------------------------------------------- #
+# is_ttl_override_fact — pure classifier
+# --------------------------------------------------------------------------- #
+
+# Requires BOTH a "priority[-\s]+override" phrase AND a "TTL" token, in either
+# order (re.I | re.S so the two tokens may be separated by newlines and the
+# phrase's own separator tolerates double spaces / newlines). Parallel matcher
+# to — source of truth — services/memory_service.py::_PRIORITY_OVERRIDE_TTL_FACT_RE
+# (the write-time under-invalidation guard). Kept as a module-local mirror
+# rather than cross-importing the private service helper into reconciliation,
+# so the TTL-fact grammar stays consistent with the write-time guard without a
+# layering violation. Requiring both tokens restricts this classifier to the
+# genuinely single-valued TTL scalar — a boost/pin edge (no "TTL" token) or a
+# bare-TTL non-override fact (no phrase) never matches.
+_TTL_OVERRIDE_FACT_RE: re.Pattern[str] = re.compile(
+    r'\bpriority[-\s]+override\b.*\bTTL\b|\bTTL\b.*\bpriority[-\s]+override\b',
+    re.I | re.S,
+)
+
+
+def is_ttl_override_fact(fact: str) -> bool:
+    """Return True iff *fact* expresses a priority-override TTL value.
+
+    Requires BOTH a ``priority[-\\s]+override`` phrase AND a ``TTL`` token
+    (case-insensitive, either order, separator-tolerant) — see
+    ``_TTL_OVERRIDE_FACT_RE``. A boost-tier or pin-order priority-override
+    fact (no ``TTL`` token) and an unrelated bare-``TTL`` fact (no phrase)
+    both return False.
+
+    Pure: no I/O, no side effects.
+    """
+    return bool(fact) and _TTL_OVERRIDE_FACT_RE.search(fact) is not None
