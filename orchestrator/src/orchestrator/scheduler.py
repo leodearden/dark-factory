@@ -541,7 +541,7 @@ def _build_delivered_check_escalation(
     ``check`` is the FAILED check's full descriptor, as authored in the
     dep's ``metadata.delivered_checks`` — looked up by name at the call
     site (:meth:`Scheduler._compute_delivered_check_cache`) rather than
-    passed in from delta's minimal ``_delivered_check_fail_detail`` shape,
+    passed in from delta's minimal per-tick ``fail_detail_by_dep`` shape,
     so the escalation can name the pattern/script/args/paths/expect that
     delta's dispatch-gate cache does not persist.
 
@@ -1565,21 +1565,17 @@ class Scheduler:
         # forcing a fresh re-evaluation rather than trusting a result that
         # predates the capability landing. Process-local — an orchestrator
         # restart is an acceptable implicit reset (mirrors every other
-        # process-local cache above).
+        # process-local cache above). Only ever holds DELIVERED=True
+        # entries (REFILE of task 2782/2783): True is monotone-safe at a
+        # fixed tree (a capability present at a SHA stays present), but
+        # FAILED is not monotone-safe against the OBSERVATION — a transient
+        # git-grep miss at the same SHA must not wedge the gate — so FAILED
+        # is deliberately never written here and is re-run every sweep (see
+        # the FAILED branch below).
         self._delivered_check_cache: dict[tuple[str, str], bool] = {}
         # The main SHA the cache above was last pruned/keyed against. None
         # before the first sweep that finds at least one checked dep.
         self._delivered_check_sha: str | None = None
-        # Parallel to _delivered_check_cache, keyed identically
-        # (dep_task_id, main_sha), but ONLY populated for cached-False
-        # (ran-and-FAILED) entries: the {name, dep_id, main_sha, kind} of
-        # the check that actually failed (reviewer_comprehensive amendment).
-        # A cache-hit on a False entry replays this stored detail instead of
-        # reconstructing from the dep's first delivered_checks entry, which
-        # would misname a later check as the failure when an earlier one in
-        # the same dep passed. Pruned in lockstep with _delivered_check_cache
-        # on SHA advance.
-        self._delivered_check_fail_detail: dict[tuple[str, str], dict] = {}
         # Per-dep_task_id count of CONSECUTIVE sweeps where at least one of
         # its checks resolved ERRORED (and none FAILED) — i.e. the dep was
         # left uncached this sweep (reviewer_comprehensive amendment).
@@ -2934,11 +2930,22 @@ class Scheduler:
         Resolves ``git rev-parse main`` (:meth:`_resolve_main_sha`) AT MOST
         ONCE, and ONLY when at least one pending task has a checked
         terminal dep — the common case (no delivered-checks tasks) pays
-        zero git cost. Results are cached persistently on
-        ``self._delivered_check_cache``, keyed ``(dep_task_id, main_sha)``;
-        when main advances, stale-SHA entries are pruned (self-heal — a
-        capability landing on main is picked up the very next tick with no
-        operator action). A per-tick budget
+        zero git cost. Only a DELIVERED (``True``) result is cached
+        persistently, on ``self._delivered_check_cache``, keyed
+        ``(dep_task_id, main_sha)`` — caching is sound there because a
+        capability present at a fixed SHA stays present (monotone-safe).
+        FAILED is deliberately NEVER cached (REFILE of task 2782/2783): a
+        ``git grep`` observation can transiently miss the same SHA (e.g. a
+        race with a concurrent write during the merge that produced it, or
+        a read microseconds before the pattern becomes visible at that
+        ref) even though the capability is actually present, so a FAILED
+        result is re-run every sweep — symmetric with the uncached ERRORED
+        fail-safe path below — letting it flip to DELIVERED at the SAME SHA
+        instead of wedging until main advances. When main DOES advance,
+        stale-SHA cache entries are additionally pruned (a second,
+        independent self-heal path — a capability landing on main is
+        picked up the very next tick with no operator action either way).
+        A per-tick budget
         (``config.delivered_checks.max_checks_per_tick``) bounds worst-case
         runner fan-out: a dep whose checks don't all complete within budget
         is left uncached (fail-safe wait, retried next tick) — EXCEPT the
@@ -2962,12 +2969,14 @@ class Scheduler:
         ``True`` has its hold streak cleared. A dependent with a dep that's
         absent from the projection this tick (errored / over-budget / not
         yet evaluated) is left untouched — pure fail-safe wait, no
-        visibility spam (mirrors row 7's "no streak bump" semantics). The
-        identity of the failed check for a cached-False dep is replayed from
-        ``self._delivered_check_fail_detail`` (keyed identically to
-        ``self._delivered_check_cache``) rather than reconstructed, so a
-        multi-check dep's hold detail always names the check that actually
-        failed, not just the dep's first ``delivered_checks`` entry.
+        visibility spam (mirrors row 7's "no streak bump" semantics). Since
+        FAILED is never cached, every FAILED dep is freshly evaluated every
+        sweep, so the identity of the check that actually failed is always
+        available fresh from the per-tick ``fail_detail_by_dep`` local
+        built in this same sweep, rather than reconstructed from the dep's
+        first ``delivered_checks`` entry — a multi-check dep's hold detail
+        always names the check that actually failed, not just its first
+        entry.
 
         A dep left uncached because at least one check ERRORED (and none
         FAILED) bumps a separate, diagnostic-only
@@ -3051,7 +3060,6 @@ class Scheduler:
             stale_keys = [k for k in self._delivered_check_cache if k[1] != main_sha]
             for key in stale_keys:
                 del self._delivered_check_cache[key]
-                self._delivered_check_fail_detail.pop(key, None)
             self._delivered_check_sha = main_sha
 
         budget = self.config.delivered_checks.max_checks_per_tick
@@ -3062,34 +3070,27 @@ class Scheduler:
         # above. Sticky for the rest of this sweep once consumed.
         first_dep_this_sweep = True
         projection: dict[str, bool] = {}
-        # Value is `dict | None`: the cache-hit replay path (below) can find
-        # no persisted detail for a cache entry predating this amendment
-        # (or any other defensive gap) and falls back to None — the
-        # hold-visibility loop and _note_delivered_hold both already accept
-        # detail=None.
+        # Value is `dict | None`: populated fresh in the FAILED branch below
+        # on every FAILED sweep (FAILED is never cached, so this is always
+        # rebuilt from this tick's actual results — see the FAILED branch).
+        # Stays `| None` defensively since the hold-visibility loop and
+        # _note_delivered_hold both already accept detail=None.
         fail_detail_by_dep: dict[str, dict | None] = {}
 
         for dep_id, dep_task in checked_deps.items():
             cache_key = (dep_id, main_sha)
             if cache_key in self._delivered_check_cache:
+                # Only the monotone-safe DELIVERED=True result is ever
+                # cached (see the FAILED branch below) — a cache hit is
+                # therefore always True, served straight from cache with no
+                # checks re-run this sweep.
                 cached = self._delivered_check_cache[cache_key]
                 projection[dep_id] = cached
-                # Cached (True or False) means this dep resolved definitively
-                # on a prior sweep at this SHA — it can no longer be in the
-                # ERRORED-uncached state, so its diagnostic error streak (if
-                # any, e.g. from an earlier episode before a fix landed) is
-                # stale.
+                # A dep resolved definitively (cached True) on a prior sweep
+                # at this SHA — it can no longer be in the ERRORED-uncached
+                # state, so its diagnostic error streak (if any, e.g. from
+                # an earlier episode before a fix landed) is stale.
                 self._delivered_check_error_streak.pop(dep_id, None)
-                if cached is False:
-                    # Steady state: this dep already FAILED on a prior tick
-                    # at this same SHA and was served straight from cache —
-                    # no checks re-ran this sweep. Replay the check that
-                    # actually failed from the persisted parallel cache
-                    # (stored alongside the uncached-FAILED branch below)
-                    # rather than reconstructing from the dep's first
-                    # delivered_checks entry, which would misname a LATER
-                    # check as the failure when an earlier one passed.
-                    fail_detail_by_dep[dep_id] = self._delivered_check_fail_detail.get(cache_key)
                 continue
 
             checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
@@ -3157,7 +3158,21 @@ class Scheduler:
             )
             if failed is not None:
                 failed_check, _r = failed
-                self._delivered_check_cache[cache_key] = False
+                # Deliberately NOT cached (REFILE of task 2782/2783): unlike
+                # DELIVERED, FAILED is not monotone-safe against the
+                # OBSERVATION — a git grep can transiently miss (a race with
+                # a concurrent write during the merge that produced this
+                # SHA, or a read microseconds before the pattern becomes
+                # visible at that ref) even though the capability is
+                # actually present at this SAME main SHA. Caching FAILED
+                # sticky would wedge the dependent at this SHA until main
+                # ADVANCES. Instead, re-run every sweep — symmetric with the
+                # uncached ERRORED fail-safe path below — so a transient
+                # miss can flip to DELIVERED on a later sweep at the same
+                # SHA. This tick's projection still holds False (the
+                # dispatch gate still withholds, and the grace streak below
+                # still advances toward the born-at-L2 escalation on a
+                # genuinely-persistent failure).
                 projection[dep_id] = False
                 detail = {
                     'name': failed_check.get('name'),
@@ -3166,10 +3181,6 @@ class Scheduler:
                     'kind': failed_check.get('kind'),
                 }
                 fail_detail_by_dep[dep_id] = detail
-                # Persist alongside the bool so a later cache-hit sweep can
-                # replay the check that actually failed (see the cache-hit
-                # branch above) instead of guessing.
-                self._delivered_check_fail_detail[cache_key] = detail
                 self._delivered_check_error_streak.pop(dep_id, None)
                 continue
 

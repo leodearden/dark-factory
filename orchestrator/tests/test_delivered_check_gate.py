@@ -1489,10 +1489,10 @@ class TestComputeDeliveredCheckCache:
         self, scheduler: Scheduler, monkeypatch
     ):
         """Mirrors (f) ``test_cache_hit_does_not_reinvoke_runner`` but with a
-        FAILED check: a dep that failed on a prior tick and is now served
-        from the ``(dep, sha)`` cache-hit branch must STILL emit a hold
-        event with a meaningful (non-``None``) detail on every held tick —
-        not just the first, uncached tick."""
+        FAILED check: a dep that failed on a prior tick re-runs every sweep
+        (FAILED is never cached — REFILE of task 2782/2783) and must STILL
+        emit a hold event with a meaningful (non-``None``) detail on every
+        held tick — not just the first tick."""
         scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
         fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
         monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
@@ -1506,7 +1506,7 @@ class TestComputeDeliveredCheckCache:
 
         assert first == {'20': False}
         assert second == {'20': False}
-        assert calls == ['cap-one'], 'only ONE invocation total — the 2nd sweep is a cache hit'
+        assert calls == ['cap-one', 'cap-one'], 'FAILED re-runs every sweep, never cached'
         held = self._held_events(scheduler)
         assert len(held) == 2, 'delivered_check_gate_held must fire on EVERY held tick'
         assert scheduler._streak_delivered_hold.value('10') == 2
@@ -1523,12 +1523,14 @@ class TestComputeDeliveredCheckCache:
         self, scheduler: Scheduler, monkeypatch
     ):
         """reviewer_comprehensive amendment: a dep with TWO checks where the
-        FIRST DELIVERS and the SECOND FAILS must have its cached-False hold
+        FIRST DELIVERS and the SECOND FAILS must have its FAILED hold
         detail name the check that actually failed (cap-b) — never the
         dep's first ``delivered_checks`` entry (cap-a, which passed) — on
-        BOTH the uncached (first) sweep and a cache-hit (second) sweep at
-        the same main SHA. Guards against reconstructing the detail from
-        ``checks[0]``, which would misname a passing check as the failure.
+        BOTH the first sweep and a second sweep at the same main SHA
+        (FAILED is never cached — REFILE of task 2782/2783 — so both
+        checks actually re-run on both sweeps). Guards against
+        reconstructing the detail from ``checks[0]``, which would misname
+        a passing check as the failure.
         """
         scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
         fake_runner, calls = self._fake_runner({
@@ -1546,7 +1548,9 @@ class TestComputeDeliveredCheckCache:
 
         assert first == {'20': False}
         assert second == {'20': False}
-        assert calls == ['cap-a', 'cap-b'], 'both checks ran, but only on the uncached sweep'
+        assert calls == ['cap-a', 'cap-b', 'cap-a', 'cap-b'], (
+            'both checks re-run on EVERY sweep — FAILED is never cached'
+        )
         held = self._held_events(scheduler)
         assert len(held) == 2
         expected_detail = {'name': 'cap-b', 'dep_id': '20', 'main_sha': 'sha1', 'kind': 'grep'}
