@@ -187,3 +187,71 @@ def test_tally_adjudications_all_sonnet_worse_fraction_one():
     t = mod.tally_adjudications([{'winner': 'sonnet'}, {'winner': 'sonnet'}])
     assert t['sonnet_better'] == 2
     assert t['haiku_worse_fraction'] == pytest.approx(1.0)
+
+
+# ── decide: pass / marginal / fail against documented thresholds ─────────────
+
+def _summary(*, haiku_f1, sonnet_f1, jaccard, worse, n):
+    return {
+        'mean_haiku_f1': haiku_f1,
+        'mean_sonnet_f1': sonnet_f1,
+        'mean_jaccard': jaccard,
+        'haiku_worse_fraction': worse,
+        'n_samples': n,
+    }
+
+
+def test_decision_thresholds_are_module_level_named_constants():
+    assert mod.F1_PARITY_BAND == pytest.approx(0.05)
+    assert mod.F1_FAIL_GAP == pytest.approx(0.15)
+    assert mod.AGREEMENT_FLOOR == pytest.approx(0.70)
+    assert mod.AGREEMENT_FAIL == pytest.approx(0.50)
+    assert mod.ADJ_WORSE_FAIL == pytest.approx(0.60)
+    assert mod.MIN_SAMPLES == 20
+
+
+def test_decide_clear_parity_high_agreement_enough_samples_is_pass():
+    s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.85, worse=0.2, n=25)
+    assert mod.decide(s) == 'pass'
+
+
+def test_decide_f1_gap_beyond_fail_gap_is_fail():
+    # sonnet_f1 - haiku_f1 = 0.30 > F1_FAIL_GAP (0.15).
+    s = _summary(haiku_f1=0.50, sonnet_f1=0.80, jaccard=0.85, worse=0.2, n=25)
+    assert mod.decide(s) == 'fail'
+
+
+def test_decide_agreement_below_fail_floor_is_fail():
+    s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.40, worse=0.2, n=25)
+    assert mod.decide(s) == 'fail'
+
+
+def test_decide_opus_majority_worse_is_fail():
+    # haiku_worse_fraction 0.70 > ADJ_WORSE_FAIL (0.60).
+    s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.85, worse=0.70, n=25)
+    assert mod.decide(s) == 'fail'
+
+
+def test_decide_too_few_samples_is_marginal():
+    # Otherwise-passing, but N < MIN_SAMPLES → marginal (escalate to human).
+    s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.85, worse=0.2, n=10)
+    assert mod.decide(s) == 'marginal'
+
+
+def test_decide_f1_in_between_band_is_marginal():
+    # gap 0.10 is between parity (0.05) and fail-gap (0.15) → marginal.
+    s = _summary(haiku_f1=0.70, sonnet_f1=0.80, jaccard=0.85, worse=0.2, n=25)
+    assert mod.decide(s) == 'marginal'
+
+
+def test_decide_agreement_in_between_band_is_marginal():
+    # jaccard 0.60 between AGREEMENT_FAIL (0.50) and AGREEMENT_FLOOR (0.70).
+    s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.60, worse=0.2, n=25)
+    assert mod.decide(s) == 'marginal'
+
+
+def test_decide_adjudication_in_between_band_is_marginal():
+    # worse 0.55 is above the 0.5 pass ceiling but not beyond the 0.60 fail
+    # floor → marginal (locks decision 5's two adjudication boundaries).
+    s = _summary(haiku_f1=0.80, sonnet_f1=0.80, jaccard=0.85, worse=0.55, n=25)
+    assert mod.decide(s) == 'marginal'
