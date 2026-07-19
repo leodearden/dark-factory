@@ -75,6 +75,14 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
 # unexpected promotion.
 _SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
 
+# Hard cap on EscalationQueue._archive_negative_cache (see _locate_path /
+# _cache_archive_negative).  A polling client hammering many distinct
+# nonexistent ids (typos, stale references, an adversarial sweep) must not
+# grow the negative cache unboundedly; past this size it is reset outright
+# rather than evicted piecemeal (simple, and negative-cache staleness is
+# already bounded by the next self-archival — see _archive_resolved).
+_ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
+
 
 def _max_severity(a: str, b: str) -> str:
     """Return the higher-urgency severity string between *a* and *b*."""
@@ -148,6 +156,13 @@ class EscalationQueue:
         # None = not yet built; dict = {dated-subdir-name: set-of-esc-id-stems}.
         # Lazy-built on first archive lookup; incrementally updated in _archive_resolved.
         self._archive_listing: dict[str, set[str]] | None = None
+        # Negative-result cache for _locate_path's cross-process re-probe: an
+        # id that a targeted re-probe confirmed genuinely absent, so repeated
+        # lookups for it don't re-rglob the archive on every call.  Cleared
+        # wholesale in _archive_resolved (this instance's next self-archival)
+        # and hard-capped at _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE.  See
+        # _locate_path / _cache_archive_negative for the full rationale.
+        self._archive_negative_cache: set[str] = set()
 
     def set_notify_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._notify_callback = callback
@@ -215,12 +230,38 @@ class EscalationQueue:
 
         Lookup order:
         1. ``queue_dir/{escalation_id}.json`` (queue root).
-        2. Archive subtree (``archive/YYYY-MM-DD/{escalation_id}.json``):
+        2. Archive subtree (``archive/YYYY-MM-DD/{escalation_id}.json``), resolved
+           via the memoised per-subdir listing:
            - If exactly one candidate: return it.
            - If multiple candidates (multi-date duplicates): emit a WARNING naming the id
              and return the newest by ``parent.name`` lexicographic order
              (YYYY-MM-DD sorts lexicographically == chronologically; non-date names fall back
              to ``''`` and are treated as oldest).
+        3. Cross-process staleness fallback: when the memoised listing yields NO
+           candidates, the memo may simply predate another ``EscalationQueue``
+           instance (e.g. a long-lived escalation-server process) archiving this
+           id — a memo miss is therefore not authoritative on its own.  A single
+           TARGETED archive re-probe (``_iter_archive_paths``) is performed
+           before concluding the id is genuinely absent (unless the id is
+           already negative-cached — see below).  A re-probe HIT is folded
+           into the memoised listing (mirroring the incremental update in
+           ``_archive_resolved``) so a subsequent lookup for the same
+           archived-elsewhere id is a cache hit — bounding the re-probe to at
+           most one targeted rglob per id per instance lifetime FOR IDS THAT
+           EVENTUALLY RESOLVE TO AN ARCHIVED FILE.
+
+        Negative caching (genuinely-absent ids): a re-probe MISS is recorded
+        in ``self._archive_negative_cache`` (see ``_cache_archive_negative``)
+        so a repeatedly-polled nonexistent id (a typo, a stale client
+        reference, an already-swept id) does not re-trigger a full archive
+        rglob on *every* call — this is the path a polling client or a bad
+        id amplifies into repeated full-archive scans if left uncached. This
+        trades a bounded staleness window (an id negative-cached here that
+        some OTHER instance archives afterward will not be found by THIS
+        instance until the cache next clears) for that protection: the cache
+        is cleared wholesale on this instance's next self-archival
+        (``_archive_resolved``) and hard-capped at
+        ``_ARCHIVE_NEGATIVE_CACHE_MAX_SIZE``.
 
         Shared by ``get()`` and ``patch_resolution_metadata()`` so that the archive
         fallback and newest-by-date selection logic live in exactly one place.
@@ -238,7 +279,21 @@ class EscalationQueue:
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
+        reprobed = False
+        if not candidates and escalation_id not in self._archive_negative_cache:
+            # The memoised listing can predate another EscalationQueue
+            # instance's archival of this id (cross-process staleness — see
+            # docstring point 3).  Do a single targeted re-probe of the
+            # archive subtree before concluding absence.  Skipped when the
+            # id is already known-absent (negative-cached) from a prior
+            # re-probe this instance lifetime.
+            candidates = list(self._iter_archive_paths(f'{escalation_id}.json'))
+            reprobed = True
         if not candidates:
+            if reprobed:
+                # Re-probe confirmed genuine absence: negative-cache it so a
+                # repeated lookup for this id doesn't re-scan the archive.
+                self._cache_archive_negative(escalation_id)
             return None
         if len(candidates) > 1:
             logger.warning(
@@ -248,7 +303,7 @@ class EscalationQueue:
             # YYYY-MM-DD sorts lexicographically == chronologically.
             # Non-YYYY-MM-DD parent names fall back to '' (treated as oldest),
             # matching the comment and ensuring valid date dirs always win.
-            return max(
+            selected = max(
                 candidates,
                 key=lambda p: (
                     p.parent.name
@@ -256,7 +311,42 @@ class EscalationQueue:
                     else ''
                 ),
             )
-        return candidates[0]
+        else:
+            selected = candidates[0]
+        if reprobed:
+            # Fold the re-probe hit into the memo so a repeated lookup for
+            # this id is a cache hit rather than a re-scan (bounds a polled
+            # server to at most one targeted rglob per archived-elsewhere id).
+            listing.setdefault(selected.parent.name, set()).add(escalation_id)
+        return selected
+
+    def _cache_archive_negative(self, escalation_id: str) -> None:
+        """Record *escalation_id* as re-probed-and-genuinely-absent.
+
+        Bounds ``_locate_path``'s re-probe cost for an id that never
+        resolves to an archived file (a typo, a stale client reference, an
+        already-swept id) to at most one targeted rglob per instance
+        lifetime *between clears* — without this, a polled server (or an
+        adversarial/buggy caller) requesting the same nonexistent id
+        repeatedly re-triggers a full ``archive_root.rglob`` on every call,
+        exactly the per-call O(archive) cost the positive memo was built to
+        eliminate.
+
+        Cleared wholesale in ``_archive_resolved`` (this instance's next
+        self-archival) so a negative-cached id that some OTHER instance
+        archives afterward is not masked indefinitely — only until this
+        instance's own next archival checkpoint.  Hard-capped at
+        ``_ARCHIVE_NEGATIVE_CACHE_MAX_SIZE``: past that size the cache is
+        reset outright (simplest bound; avoids unbounded growth from a sweep
+        of many distinct nonexistent ids without needing LRU bookkeeping).
+        """
+        if len(self._archive_negative_cache) >= _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE:
+            logger.info(
+                f'Archive negative cache exceeded {_ARCHIVE_NEGATIVE_CACHE_MAX_SIZE} '
+                'entries; resetting'
+            )
+            self._archive_negative_cache.clear()
+        self._archive_negative_cache.add(escalation_id)
 
     def get(self, escalation_id: str) -> Escalation | None:
         """Read a single escalation by ID.
@@ -270,12 +360,19 @@ class EscalationQueue:
         is lazily built on the first archive miss and incrementally updated
         by _archive_resolved() when this instance archives a new escalation.
 
-        Per-instance freshness: escalations resolved by another
+        Cross-process freshness: an escalation resolved+archived by another
         EscalationQueue instance (e.g. a concurrent process) after this
-        instance's listing was built are not visible until this instance
-        next calls _archive_resolved().  get() returns None in that window,
-        degrading gracefully rather than raising.  This is consistent with
-        the single-writer production model (one harness process per queue).
+        instance's listing was built is still found — a memo miss triggers a
+        single targeted archive re-probe in _locate_path (see its docstring)
+        rather than being treated as authoritative absence.  This closes the
+        window that previously made a just-archived-elsewhere escalation
+        appear to vanish from a long-lived instance (e.g. the escalation
+        server) until it happened to archive something itself.  A genuinely
+        nonexistent id is negative-cached after its first re-probe miss (see
+        _locate_path / _cache_archive_negative) — repeated get() calls for
+        that same nonexistent id do not re-scan the archive, at the cost of
+        a bounded staleness window that clears on this instance's next
+        self-archival.
         """
         path = self._locate_path(escalation_id)
         if path is None:
@@ -1047,6 +1144,12 @@ class EscalationQueue:
         but does not abort the resolution.
 
         Callers: resolve(), submit_resolved().
+
+        This is also the checkpoint that clears ``_archive_negative_cache``
+        (see ``_cache_archive_negative``): a self-archival is a natural
+        "state changed" signal for this instance, so it's used to bound how
+        long a negative-cached id (re-probed absent earlier) can keep
+        masking an id that some OTHER instance archived in the meantime.
         """
         path = self.queue_dir / f'{escalation_id}.json'
         try:
@@ -1057,6 +1160,8 @@ class EscalationQueue:
             # id without a full rescan.  Only update if the cache has already been built.
             if self._archive_listing is not None:
                 self._archive_listing.setdefault(archive_dir.name, set()).add(escalation_id)
+            # Clear the negative-result cache wholesale — see docstring above.
+            self._archive_negative_cache.clear()
         except OSError as exc:
             logger.warning(
                 f'Failed to archive escalation {escalation_id}: {exc}; '
