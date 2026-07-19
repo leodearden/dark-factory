@@ -505,7 +505,15 @@ It is a CACHE-ONLY peek (:func:`verify.cached_main_baseline_failing_ids`) that
 never triggers a probe on the critical path (G4, task 2564) and fails OPEN on a
 cold/unknown baseline, matching the task's "known-red" scope. Paired with
 ``MergeFailureDisposition.MAIN_RED``: the break is pre-existing, not this task's
-fault, so the blocked task simply re-dispatches and passes once main is green."""
+fault, so the blocked task re-dispatches and passes once main is green again.
+
+Caveat (task 2823 amendment): that self-heal assumes some OTHER, code-touching
+merge greens main first. A config-only change that is *itself* the fix for the
+red main is deliberately NOT trusted here — a trivial pass runs no suite, so it
+can never prove the red cleared, and it will oscillate re-dispatch/block (loud,
+via MAIN_RED) until a non-trivial merge or an operator greens main. The gate
+logs a distinct WITHHELD warning so this edge is recognisable rather than read
+as routine main-red churn."""
 
 
 MAIN_HEALTH_PROBE_PENDING_NOTE = (
@@ -2101,6 +2109,25 @@ async def _run_post_merge_verify(
             else None
         )
         if _known_red_ids:
+            # Distinct operator signal (task 2823 amendment,
+            # reviewer_comprehensive robustness finding): emit a dedicated
+            # WITHHELD warning — NOT the ordinary main-red-churn line — so the
+            # config-only-fixes-red edge is recognisable in the logs. A trivial
+            # pass runs no suite, so a config-only change that is ITSELF the fix
+            # for the red main can never prove the red cleared and will
+            # oscillate re-dispatch/block here; greening main needs a
+            # code-touching (non-trivial) merge or operator action, not another
+            # config-only re-dispatch.
+            logger.warning(
+                'Task %s: trivial-pass main-red gate WITHHELD a config-only '
+                'merge from advancing main %s over a known-red baseline (%d '
+                'failing test(s): %s). A trivial pass runs no suite, so if this '
+                'config-only change is itself the fix it cannot self-heal by '
+                're-dispatch — main must be greened by a code-touching merge or '
+                'operator action first.',
+                req.task_id, _pass_main_sha, len(_known_red_ids),
+                ', '.join(sorted(_known_red_ids)[:10]),
+            )
             # Any non-None MergeOutcome return owns merge_wt cleanup (the caller
             # only reuses merge_wt on a None pass return) — mirrors the
             # verify-failed path's cleanup contract above.
