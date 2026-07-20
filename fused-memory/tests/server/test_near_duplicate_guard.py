@@ -23,6 +23,7 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_topic_guard_clusters,
 )
 
 
@@ -222,3 +223,34 @@ class TestFindMatchingTopicCluster:
     def test_whitespace_content_returns_none(self):
         cluster = _cluster(phrases=['alpha', 'beta'], min_phrase_hits=1)
         assert find_matching_topic_cluster('   \n\t ', [cluster]) is None
+
+
+class TestResolveTopicGuardClusters:
+    """Defensive config resolver: real list from config, else empty list."""
+
+    def test_returns_config_list_when_present(self):
+        clusters = [_cluster(topic_id='topic-a'), _cluster(topic_id='topic-b')]
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_guard_clusters=clusters
+        )
+        assert resolve_topic_guard_clusters(memory_service) == clusters
+
+    def test_returns_empty_list_when_config_attr_missing(self):
+        memory_service = types.SimpleNamespace()
+        assert resolve_topic_guard_clusters(memory_service) == []
+
+    def test_returns_empty_list_when_reconciliation_is_none(self):
+        memory_service = types.SimpleNamespace(config=types.SimpleNamespace(reconciliation=None))
+        assert resolve_topic_guard_clusters(memory_service) == []
+
+    def test_returns_empty_list_when_value_is_non_list(self):
+        # An unspecced AsyncMock's attribute chain yields Mock instances, not
+        # lists — the resolver must not propagate one as a clusters list.
+        memory_service = AsyncMock()
+        assert resolve_topic_guard_clusters(memory_service) == []
+
+    def test_returns_empty_list_when_config_default_is_empty(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_guard_clusters=[]
+        )
+        assert resolve_topic_guard_clusters(memory_service) == []
