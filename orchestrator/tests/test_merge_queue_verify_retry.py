@@ -299,3 +299,173 @@ async def test_run_post_merge_verify_flag_off_is_byte_identical(tmp_path: Path) 
     assemble_mock.assert_not_awaited()
     base = build_merge_verify_spec(config, req.module_configs, None)
     assert dict(captured['spec'].verify_env) == dict(base.verify_env)
+
+
+@pytest.mark.asyncio
+async def test_run_post_merge_verify_flag_on_no_sidecar_is_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """retry_failed_only=True but NO sidecar → tolerant loader None → spec unchanged.
+
+    This is the real-world DEFAULT state until reify's α/β/γ land and write a
+    well-formed attempt-0 sidecar: the flag is on, but the tolerant loader
+    returns None, the ``if attempt0 is not None:`` guard short-circuits, and the
+    retry producer must leave ``spec.verify_env`` byte-identical to a full
+    verify.  Crucially, NEITHER ``_load_attempt0_sidecar`` NOR
+    ``_assemble_retry_verify_env`` is patched here — the None short-circuit runs
+    through the REAL loader end-to-end (the entire justification for the tolerant
+    loader), which the flag-on/valid-sidecar test cannot exercise because it
+    mocks the assembler.
+    """
+    from orchestrator import merge_queue as mq
+
+    config = OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='main'))
+    req = dataclasses.replace(
+        _make_request('r-on-nosidecar', 'task/r-on-nosidecar', tmp_path, config),
+        retry_failed_only=True,
+    )
+    git_ops = _make_git_ops_mock()
+    # NOTE: deliberately do NOT write the attempt-0 sidecar.
+
+    captured: dict[str, MergeVerifySpec] = {}
+
+    async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
+        captured['spec'] = spec
+        return _mock_verify_result(True)
+
+    with patch.object(mq, '_ensure_verify_disk_space', new=AsyncMock(return_value=None)), \
+         patch.object(mq.VerifyRunnerPool, 'dispatch', new=AsyncMock(side_effect=_fake_dispatch)):
+        outcome = await mq._run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123', runner=None,
+        )
+
+    assert outcome is None
+    # The tolerant loader short-circuited BEFORE the INV-3 tree-OID probe.
+    git_ops.get_head_tree_hash.assert_not_awaited()
+    base = build_merge_verify_spec(config, req.module_configs, None)
+    assert dict(captured['spec'].verify_env) == dict(base.verify_env)
+
+
+# ---------------------------------------------------------------------------
+# _load_attempt0_sidecar tolerant degradation (the robustness core that keeps
+# the retry path a strict no-op until reify writes a well-formed sidecar).
+# Every branch must return None WITHOUT raising — a regression that let the
+# loader raise (e.g. an over-narrow ``except``) would crash the merge-verify
+# path.  These exercise each branch directly (the wiring tests above only cover
+# the happy path indirectly).
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_sidecar(merge_wt: Path, text: str) -> Path:
+    """Write raw (possibly malformed) bytes to the attempt-0 sidecar path."""
+    d = merge_wt / _SIDECAR_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / _SIDECAR_NAME
+    path.write_text(text)
+    return path
+
+
+def _mq_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+    ]
+
+
+def test_load_attempt0_sidecar_missing_file_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(a) Absent sidecar → None, and NO warning (the common pre-reify case)."""
+    from orchestrator.merge_queue import _load_attempt0_sidecar
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        assert _load_attempt0_sidecar(tmp_path) is None
+    assert _mq_warnings(caplog) == []  # absent is silent, not a warning
+
+
+def test_load_attempt0_sidecar_invalid_json_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(b) Present but not valid JSON → None + WARNING; never raises."""
+    from orchestrator.merge_queue import _load_attempt0_sidecar
+
+    _write_raw_sidecar(tmp_path, '{not: valid json,,,')
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        assert _load_attempt0_sidecar(tmp_path) is None
+    warnings = _mq_warnings(caplog)
+    assert any('not valid JSON' in m for m in warnings), warnings
+    assert any('full verify' in m for m in warnings), warnings
+
+
+def test_load_attempt0_sidecar_missing_tree_oid_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(c) Valid JSON object but no 'tree_oid' → None + WARNING; never raises."""
+    from orchestrator.merge_queue import _load_attempt0_sidecar
+
+    _write_raw_sidecar(
+        tmp_path, json.dumps({'debug': {'planned': [], 'verdicts': {}}})
+    )
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        assert _load_attempt0_sidecar(tmp_path) is None
+    warnings = _mq_warnings(caplog)
+    assert any('tree_oid' in m for m in warnings), warnings
+
+
+def test_load_attempt0_sidecar_not_an_object_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(c-variant) Valid JSON that is not an object (a list) → None + WARNING."""
+    from orchestrator.merge_queue import _load_attempt0_sidecar
+
+    _write_raw_sidecar(tmp_path, json.dumps([1, 2, 3]))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        assert _load_attempt0_sidecar(tmp_path) is None
+    warnings = _mq_warnings(caplog)
+    assert any('not an object' in m for m in warnings), warnings
+
+
+def test_load_attempt0_sidecar_malformed_subfield_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(d) tree_oid present but a sub-field is junk → None + WARNING; never raises.
+
+    ``debug`` set to a non-dict scalar makes ``debug.get('planned')`` raise
+    AttributeError inside the field-mapping block; the malformed-fields guard
+    must catch it and degrade to full verify rather than propagate.
+    """
+    from orchestrator.merge_queue import _load_attempt0_sidecar
+
+    _write_raw_sidecar(
+        tmp_path, json.dumps({'tree_oid': 'abc123', 'debug': 12345})
+    )
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        assert _load_attempt0_sidecar(tmp_path) is None
+    warnings = _mq_warnings(caplog)
+    assert any('malformed' in m for m in warnings), warnings
+
+
+def test_load_attempt0_sidecar_valid_returns_payload(tmp_path: Path) -> None:
+    """Happy path: a well-formed sidecar parses into the _Attempt0Payload fields.
+
+    Directly validates the JSON→dataclass field mapping (planned/verdicts per
+    profile, run_all members, gui specs) that the wiring tests only exercise
+    transitively through a mocked assembler.
+    """
+    from orchestrator.merge_queue import _Attempt0Payload, _load_attempt0_sidecar
+
+    _write_attempt0_sidecar(tmp_path)  # tree_oid='deadbeef', minimal valid shape
+    payload = _load_attempt0_sidecar(tmp_path)
+
+    assert isinstance(payload, _Attempt0Payload)
+    assert payload.tree_oid == 'deadbeef'
+    assert payload.debug_planned == ['c a::x', 'c a::y']
+    assert payload.debug_verdicts == {'c a::x': 'pass'}
+    assert payload.release_planned == []
+    assert payload.release_verdicts == {}
+    assert payload.run_all_members == []
+    assert payload.gui_specs == []

@@ -320,12 +320,19 @@ class TestReachBackRouting:
 def test_merge_queue_reexports_identical_objects() -> None:
     """merge_queue re-exports the SAME objects from merge_shadow (shim identity).
 
-    Covers every one of the 20 moved names.
+    Covers every one of the 20 originally-moved names, plus the two later
+    co-located-and-re-exported pure helpers (``build_fail_fast_map`` /
+    ``did_not_pass_subset``, PRD verify-retry-failed-only D2) so the identity
+    guard extends to them — a future refactor cannot silently break their
+    re-export without this test going red.
 
     RED (pre-shim): merge_queue.py still defines its own independent copies
     of these names (the duplicate definitions left in place by the EXPAND
     step), so ``getattr(merge_queue, name) is getattr(merge_shadow, name)``
     fails for every name — two distinct objects that merely share a name.
+    (The two D2 helpers were born re-exported, never duplicated, so the RED
+    narrative applies only to the original 20; they are guarded here purely
+    forward-looking.)
     """
     import orchestrator.merge_queue as merge_queue
     import orchestrator.merge_shadow as merge_shadow
@@ -351,6 +358,11 @@ def test_merge_queue_reexports_identical_objects() -> None:
         '_run_cold_shadow_verify',
         '_run_shadow_compare',
         '_maybe_schedule_shadow_compare',
+        # PRD verify-retry-failed-only D2: born re-exported through the same
+        # shim (not part of the original EXPAND-then-shim move), guarded here
+        # so their re-export identity cannot silently regress.
+        'build_fail_fast_map',
+        'did_not_pass_subset',
     ]
 
     for name in moved_names:
