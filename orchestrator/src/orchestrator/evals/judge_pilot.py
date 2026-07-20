@@ -23,6 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .report import format_composite_table
+
 # Default names for the ο judge-OFAT candidates (configs.JUDGE_EVAL_CONFIGS).
 INCUMBENT_JUDGE = 'judge-sonnet'
 CANDIDATE_JUDGE = 'judge-haiku'
@@ -212,3 +214,61 @@ def decide_judge_adoption(
         judge_cost_delta=judge_cost_delta,
         reasons=reasons,
     )
+
+
+def _fmt_delta(value: float | None) -> str:
+    """A signed 4-dp delta cell, or ``'n/a'`` when the delta is undefined
+    (a missing row leaves ``composite_delta`` / ``cost_delta`` ``None``)."""
+    return 'n/a' if value is None else f'{value:+.4f}'
+
+
+def _yesno(value: bool) -> str:
+    return 'yes' if value else 'no'
+
+
+def format_judge_ofat_report(
+    decision: JudgeAdoptionDecision,
+    composite_report: dict[str, Any],
+) -> str:
+    """Render a judge-OFAT pilot decision as a deterministic markdown report.
+
+    A header (verdict + non_inferior/cheaper/sufficient booleans + margin +
+    incumbent/candidate + composite/cost/judge-cost deltas), the structured
+    ``reasons``, the EMBEDDED :func:`report.format_composite_table` data section
+    (so the committed report is consistent with every other eval surface and
+    stays byte-stable), and a decide-and-act footer: on ``adopt`` the recommended
+    ``models.judge`` flip; on ``marginal``/``reject`` a keep-sonnet + escalate
+    note. No wall-clock is rendered, so the same inputs render byte-identically.
+    """
+    d = decision
+    lines: list[str] = [
+        '# Judge-model OFAT pilot report',
+        '',
+        f'verdict: {d.verdict} (escalate: {_yesno(d.escalate)})',
+        f'incumbent: {d.incumbent} | candidate: {d.candidate}',
+        (
+            f'non-inferior: {_yesno(d.non_inferior)} | cheaper: {_yesno(d.cheaper)} '
+            f'| sufficient: {_yesno(d.sufficient)} | margin: {d.margin:.4f}'
+        ),
+        f'composite delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.composite_delta)}',
+        f'cost delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.cost_delta)}',
+        f'judge cost delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.judge_cost_delta)}',
+        '',
+        'reasons:',
+    ]
+    lines.extend(f'  - {reason}' for reason in d.reasons)
+    lines.append('')
+    lines.append(format_composite_table(composite_report))
+    lines.append('')
+    if d.verdict == 'adopt':
+        lines.append(
+            f'RECOMMENDATION: adopt — flip models.judge: sonnet -> haiku in '
+            f'orchestrator.yaml, reload_config, watch the δ/2534 rollup a fixed '
+            f'window for haiku judge rows, then persist to defaults.yaml.',
+        )
+    else:
+        lines.append(
+            f'RECOMMENDATION: keep models.judge=sonnet and escalate with this '
+            f'report (verdict={d.verdict}); attach it to the escalation.',
+        )
+    return '\n'.join(lines)
