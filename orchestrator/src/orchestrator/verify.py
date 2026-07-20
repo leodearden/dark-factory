@@ -3229,6 +3229,21 @@ def _resolve_concurrent_verify(
     return config.concurrent_verify
 
 
+def _resolve_sequential_lint_first(
+    config: OrchestratorConfig,
+    module_config: ModuleConfig | None,
+) -> bool:
+    """Return whether the merge-role sequential branch should run lint first.
+
+    Module override wins over top-level config.  Consulted only for the
+    merge-role sequential lint-first branch in ``run_verification`` (gated
+    additionally on ``role == 'merge'`` and ``not concurrent``).
+    """
+    if module_config is not None and module_config.sequential_lint_first is not None:
+        return module_config.sequential_lint_first
+    return config.sequential_lint_first
+
+
 def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
@@ -3561,6 +3576,14 @@ async def run_verification(
                 int(timeout), int(warm_timeout),
             )
     concurrent = _resolve_concurrent_verify(config, module_config)
+    # Merge-role fail-fast: lint first, short-circuit test+type on a lint
+    # failure.  Only meaningful on the sequential branch (never concurrent) and
+    # only for role=='merge' — task/background keep today's test→lint→type order.
+    lint_first = (
+        role == 'merge'
+        and not concurrent
+        and _resolve_sequential_lint_first(config, module_config)
+    )
     verify_env = _resolve_verify_env(config, module_config, role=role)
 
     # DF_VERIFY_ROLE is always present (injected by _resolve_verify_env); log at
@@ -3727,6 +3750,24 @@ async def run_verification(
                 _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
                 _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
             )))
+        elif lint_first:
+            # Merge-role fail-fast: run lint first; on a lint failure, short-
+            # circuit — record test+type as skipped (vacuous rc=0 passes) and
+            # let the attempt fail on the lint leg, so a lint-only-red merge
+            # skips the long test phase entirely.
+            lint_run = await _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id)
+            if lint_run.rc != 0:
+                attempt = VerifyAttempt([
+                    CheckRun.skipped('test'), lint_run, CheckRun.skipped('type'),
+                ])
+            else:
+                # Lint green: run test+type, then assemble in canonical
+                # [test, lint, type] order (not execution order) so the green-
+                # path VerifyResult and persisted artifacts stay byte-identical
+                # to the plain-sequential branch below.
+                test_run = await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id)
+                type_run = await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id)
+                attempt = VerifyAttempt([test_run, lint_run, type_run])
         else:
             attempt = VerifyAttempt([
                 await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
