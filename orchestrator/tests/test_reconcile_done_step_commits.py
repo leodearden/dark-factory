@@ -646,6 +646,63 @@ class TestReconcileDoneStepCommits:
         # The emitted key is durably persisted for cross-restart dedup.
         assert artifacts.read_emitted_step_escalations() == {('step-1', step_commit)}
 
+    async def test_cross_restart_does_not_refile_persisted_escalation(
+        self, config, git_ops, task_assignment,
+    ):
+        """CROSS-RESTART DEDUP (task 2764 — the task's observable signal): a
+        restarted orchestrator constructs a FRESH workflow with an empty
+        in-memory dedup set, so without cross-restart durability it re-files
+        every previously-filed (step, sha) pair (the reify-5205 04:33Z storm:
+        10 duplicates after a restart). After this fix, workflow2 hydrates the
+        persisted keys and files NO duplicate for a pair workflow1 already
+        escalated."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+
+        # --- workflow1: files + persists one escalation for the orphan ---
+        queue1 = MagicMock()
+        queue1.make_id.return_value = 'esc-42-1'
+        workflow1, artifacts1 = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=queue1,
+        )
+        artifacts1.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow1.plan = _write_done_step_plan(artifacts1, 'step-1', step_commit)
+
+        # Orphan step_commit, then land a WIP commit touching a DIFFERENT file
+        # — never WIP-reconciles and 2762's find_equivalent_commit returns None,
+        # so the escalation branch fires (survives the 2762 remap tier).
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'other.py').write_text('unrelated\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow1._reconcile_done_step_commits()
+        queue1.submit.assert_called_once()
+        assert artifacts1.read_emitted_step_escalations() == {('step-1', step_commit)}
+
+        # --- simulate an orchestrator RESTART: a FRESH workflow on the SAME
+        # worktree (fresh empty in-memory set). _make_workflow's init() rewrites
+        # ONLY metadata.json, leaving plan.json AND reconcile_state.json intact.
+        queue2 = MagicMock()
+        queue2.make_id.return_value = 'esc-42-2'
+        workflow2, artifacts2 = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=queue2,
+        )
+        # CRITICAL: init() dropped base_commit and _reconcile_done_step_commits
+        # no-ops when read_base_commit() is None — re-establish workflow2's view
+        # (omit this and the test false-GREENs via the no-op guard, not dedup).
+        artifacts2.update_base_commit(wt_info.base_commit)
+        workflow2.plan = artifacts2.read_plan()
+
+        await workflow2._reconcile_done_step_commits()
+        # No duplicate for the previously-persisted (step, sha) pair.
+        queue2.submit.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # step-7 RED: _execute_iterations wires the reconciler in before the WIP
