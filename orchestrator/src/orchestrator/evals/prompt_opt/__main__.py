@@ -13,6 +13,13 @@ Commands:
                             pass/regress verdict (PRD T8 / D-7). See
                             plans/tier1-prompt-optimization-runbook.md for the
                             pin -> watch canary -> unpin-on-regress flow.
+    smoke                  Run the hermetic end-to-end acceptance smoke (PRD
+                            T7): the whole reviewer prompt-opt stack (loader ->
+                            HEURISTICS -> loop -> scorer -> report) on a
+                            <=3-diff synthetic fixture corpus, with NO real
+                            LLM/DB/network. Exit 0 iff the run completes and the
+                            reviewer CONTRACT stays byte-identical -- the cheap
+                            gate that de-risks the $300-800 real loops (§8).
 
 Mirrors orchestrator/evals/reviewer_trial/__main__.py's click pattern. Both
 commands are operator-facing thin wiring over already-tested machinery
@@ -34,6 +41,7 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+from shared.prompt_artifact import default_artifacts_root
 
 from orchestrator.evals.prompt_opt.canary import (
     CanaryThresholds,
@@ -102,6 +110,13 @@ _DEFAULT_THRESHOLDS = CanaryThresholds()
 _VERDICT_EXIT_CODES = {'pass': 0, 'regress': 1, 'insufficient_data': 3}
 _VERDICT_COLORS = {'pass': 'green', 'regress': 'red', 'insufficient_data': 'yellow'}
 _USAGE_ERROR_EXIT_CODE = 2
+
+# Deterministic 2:1:7 corpus split seed for the acceptance smoke -- mirrors
+# smoke._DEFAULT_SPLIT_SEED (the task number). A local literal (like
+# _DEFAULT_SEED above) so the light `smoke` command need not import the heavy
+# smoke module -- which pulls in agents.roles + the loop engine -- just to read
+# a decorator default; the real run imports it lazily inside the command body.
+_SMOKE_DEFAULT_SPLIT_SEED = 2498
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +447,77 @@ def canary(
             )
 
     sys.exit(_VERDICT_EXIT_CODES[verdict.verdict])
+
+
+@cli.command('smoke')
+@click.option(
+    '--artifacts-root', default=lambda: str(default_artifacts_root()),
+    type=click.Path(path_type=Path),
+    help='Isolated PromptArtifactStore root to pin the smoke artifact into '
+         '(default: default_artifacts_root(); pass a throwaway/tmp root for CI). '
+         'The pinned heuristics carry the hermetic SMOKE_QUALITY sentinel, so '
+         'point this at a scratch root, never a production artifacts root.',
+)
+@click.option('--split-seed', default=_SMOKE_DEFAULT_SPLIT_SEED, type=int,
+              help='Deterministic 2:1:7 corpus split seed for the held-out TEST verdict')
+def smoke(artifacts_root: Path, split_seed: int) -> None:
+    """Run the hermetic end-to-end Tier-1 prompt-opt acceptance smoke (PRD T7).
+
+    Fully hermetic -- dependency-injects the three LLM-touching seams
+    (rollout_fn / Scorer / propose_fn), so it makes NO real LLM call and
+    touches no runs.db/tickets.db/network. Runs the REAL
+    REVIEWER_COMPREHENSIVE.prompt_spec through the REAL run_optimization_loop
+    + PromptArtifactStore loader over a <=3-diff synthetic fixture corpus,
+    pins the loop's final heuristics, resolves them back, and proves the
+    reviewer CONTRACT prefix is byte-identical.
+
+    Thin wiring over already-tested machinery (smoke.py): prints
+    format_markdown(report) plus a PASS/FAIL banner carrying the held-out
+    test_score, the provenance sidecar fields, and the CONTRACT-untouched
+    proof. Exit 0 iff the run completes AND the CONTRACT is untouched; exit 1
+    if the run raises or the CONTRACT prefix is not intact. This is the cheap
+    acceptance gate that de-risks the $300-800 real reviewer/curator loops
+    (plans/tier1-prompt-optimization-runbook.md §8).
+    """
+    # Lazy import: smoke.py pulls in agents.roles + the loop engine, so keep it
+    # out of module import so the other subcommands stay import-light.
+    from .smoke import format_markdown, run_acceptance_smoke
+
+    click.echo(click.style(
+        f'Acceptance Smoke: artifacts_root={artifacts_root} split_seed={split_seed}', bold=True,
+    ))
+    click.echo('=' * 60)
+
+    try:
+        report = asyncio.run(run_acceptance_smoke(
+            store_root=artifacts_root, split_seed=split_seed,
+        ))
+    except KeyboardInterrupt:
+        click.echo('\nInterrupted.')
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 -- surface ANY run failure as a non-zero gate
+        click.echo(click.style(
+            f'Acceptance smoke FAILED to run: {exc!r}', fg='red', bold=True,
+        ), err=True)
+        sys.exit(1)
+
+    click.echo(format_markdown(report))
+    click.echo()
+
+    prov = report.provenance
+    intact = report.contract_prefix_intact
+    color = 'green' if intact else 'red'
+    status = 'PASS' if intact else 'FAIL'
+    click.echo(click.style(
+        f'Result: {status} -- held_out_TEST_score={report.test_score:.4f} '
+        f'harness_version={prov.harness_version} optimizer_model={report.optimizer_model} '
+        f'accepted={report.accepted_count} rejected={report.rejected_count} '
+        f'CONTRACT untouched={intact} (resolved source={report.resolved_source})',
+        fg=color, bold=True,
+    ))
+    # Exit 0 only when the run completed AND the reviewer CONTRACT stayed
+    # byte-identical -- the gate the operator watches before a real run.
+    sys.exit(0 if intact else 1)
 
 
 if __name__ == '__main__':
