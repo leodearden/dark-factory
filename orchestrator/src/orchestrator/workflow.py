@@ -2477,19 +2477,36 @@ class TaskWorkflow:
                         new_files = current_files + [
                             f for f in granted if f not in current_files
                         ]
-                        new_modules = files_to_modules(new_files, self.config.lock_depth)
+                        # Fire whenever the grant actually WIDENS the file
+                        # set — not only on a module-set change. A
+                        # same-package sibling grant leaves the module set
+                        # unchanged yet still must reach plan.files /
+                        # metadata.files / _task_files, so route every real
+                        # widen through _set_task_scope. (Task 2505 reviewer
+                        # regression: the old `set(new_modules) !=
+                        # set(self.modules)` gate silently dropped a
+                        # same-module grant — plan.files was never widened.)
+                        # The `and` short-circuits so _set_task_scope only
+                        # runs on a real widen; on its False return (a genuine
+                        # cross-module lock conflict) we requeue.
                         if (
-                            set(new_modules) != set(self.modules)
+                            new_files != current_files
                             and not await self._set_task_scope(new_files)
                         ):
-                            # Lock conflict: the scheduler already
-                            # requeued the task to pending and persisted
+                            # Lock conflict on a genuine cross-module
+                            # expansion: the scheduler already requeued the
+                            # task to pending and persisted
                             # metadata.files=new_files on its own (plan.json
-                            # was widened to match by _set_task_scope
-                            # before the conflict was detected). Do NOT
-                            # resume the implementer under a lock a
-                            # sibling task still holds — requeue and let
-                            # this task redispatch once the lock frees.
+                            # was widened to match by _set_task_scope before
+                            # the conflict was detected). Do NOT resume the
+                            # implementer under a lock a sibling task still
+                            # holds — requeue and let this task redispatch
+                            # once the lock frees. new_modules is computed
+                            # HERE (only on the conflict path) so the
+                            # block_detail names the exact unavailable locks.
+                            new_modules = files_to_modules(
+                                new_files, self.config.lock_depth,
+                            )
                             additional = sorted(
                                 set(new_modules) - set(self.modules)
                             )
@@ -3424,11 +3441,34 @@ class TaskWorkflow:
         widened (matching metadata.files, which ``handle_blast_radius_expansion``
         persists on both branches) but ``self.modules`` is left unchanged and
         this returns False so the caller does NOT resume under a foreign lock.
+
+        Same-module widen (task 2505 reviewer regression): when the granted
+        file maps to a module the task already locks, ``_reconcile_scope_locks``
+        no-ops the ``handle_blast_radius_expansion`` call — which is the ONLY
+        path that persists ``metadata.files``. Without a direct persist here,
+        plan.files would be widened while metadata.files stayed behind, tripping
+        the MERGE-entry ``_check_scope_invariant`` divergence tripwire. So on a
+        successful reconcile that left ``self.modules`` UNCHANGED, persist
+        ``metadata.files=new_files`` directly (mirroring the done-metadata
+        reconcile read-modify-write). On the module-CHANGE success path and the
+        lock-CONFLICT path this is skipped — ``handle_blast_radius_expansion``
+        already persisted ``metadata.files=new_files`` on both those branches,
+        so a direct write would be a redundant double write.
         """
         assert self.artifacts is not None
         self.plan['files'] = new_files
         self.artifacts.set_plan_files(new_files, self.session_id)
-        return await self._reconcile_scope_locks(new_files)
+        modules_before = set(self.modules)
+        reconciled = await self._reconcile_scope_locks(new_files)
+        if reconciled and set(self.modules) == modules_before:
+            merged = await self._merge_fresh_metadata(
+                self.task.get('metadata') or {},
+                log_context='scope-grant files persist',
+            )
+            merged['files'] = sanitize_files_for_persist(new_files)
+            self.task['metadata'] = merged
+            await self.scheduler.update_task(self.task_id, merged)
+        return reconciled
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
