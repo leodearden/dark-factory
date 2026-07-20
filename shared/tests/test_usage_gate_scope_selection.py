@@ -232,3 +232,83 @@ class TestScopeAwareSelection:
         async with gate.invoke_slot(scope=SCOPE) as slot:
             # scope threaded into selection → leases the fable-headroom account.
             assert slot.account_name == 'b'
+
+
+# ===========================================================================
+# Step 5 — scoped failover cost event carries scope (B2 event half); the
+# general failover path stays byte-identical (S1)
+# ===========================================================================
+
+
+def _failover_calls(mock_fire):
+    """The ('failover') calls recorded by a patched _fire_cost_event mock."""
+    return [c for c in mock_fire.call_args_list if c.args[1] == 'failover']
+
+
+class TestScopedFailoverEvent:
+    """A scoped account switch fires a ``failover`` cost event whose JSON
+    details include ``scope`` (B2), while the general (scope=None) failover
+    path is byte-identical and the two trackers are independent (S1)."""
+
+    async def test_scoped_failover_event_carries_scope(self):
+        gate = make_gate(['a', 'b'], cost_store=make_mock_cost_store())
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            # 1) First scoped selection lands on A (establishes per-scope last).
+            first = await gate.before_invoke(scope=SCOPE)
+            assert first.name == 'a'
+            # 2) Scope-cap A → the next scoped selection fails over to B.
+            set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
+            second = await gate.before_invoke(scope=SCOPE)
+            assert second.name == 'b'
+
+        failovers = _failover_calls(mock_fire)
+        assert len(failovers) == 1
+        name, _event, details_json = failovers[0].args
+        assert name == 'b'
+        assert json.loads(details_json) == {'from': 'a', 'to': 'b', 'scope': SCOPE}
+
+    async def test_general_failover_event_has_no_scope_key(self):
+        gate = make_gate(['a', 'b'], cost_store=make_mock_cost_store())
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            first = await gate.before_invoke()  # scope=None → A
+            assert first.name == 'a'
+            # Account-level cap A (general) → next general selection → B.
+            gate._handle_cap_detected('r', now + timedelta(hours=1), a.token, scope=None)
+            second = await gate.before_invoke()
+            assert second.name == 'b'
+
+        failovers = _failover_calls(mock_fire)
+        assert len(failovers) == 1
+        _name, _event, details_json = failovers[0].args
+        details = json.loads(details_json)
+        assert details == {'from': 'a', 'to': 'b'}
+        assert 'scope' not in details
+
+    async def test_scoped_selection_does_not_perturb_general_tracker(self):
+        gate = make_gate(['a', 'b'], cost_store=make_mock_cost_store())
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+
+        # Establish general last-account = A via a general selection.
+        g1 = await gate.before_invoke()
+        assert g1.name == 'a'
+        assert gate._last_account_name == 'a'
+
+        # An interleaved SCOPED selection that lands on B must NOT move the
+        # general tracker off 'a' (independent trackers, S1).
+        set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
+        s1 = await gate.before_invoke(scope=SCOPE)
+        assert s1.name == 'b'
+        assert gate._last_account_name == 'a'
+
+        # A following general selection still lands on A with NO failover event.
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            g2 = await gate.before_invoke()
+            assert g2.name == 'a'
+        assert _failover_calls(mock_fire) == []
