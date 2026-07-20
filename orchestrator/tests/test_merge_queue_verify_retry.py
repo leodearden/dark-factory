@@ -15,12 +15,25 @@ Covers:
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.verify_runner import build_merge_verify_spec
+from test_merge_queue_concurrent_verify import _make_request, _mock_verify_result
+
+# The reify-written attempt-0 sidecar contract (path + schema).  reify owns the
+# authoritative schema (verify-retry-failed-only α/β/γ); this producer reads it
+# tolerantly and stays a no-op until reify lands, so these strings define the
+# DF-side expectation the loader is written against.
+_SIDECAR_SUBDIR = '.reify-verify-retry'
+_SIDECAR_NAME = 'attempt0.json'
 
 
 def _attempt0(tree_oid: str):
@@ -169,3 +182,115 @@ def test_build_retry_verify_env_empty_subsets_still_write_files(tmp_path: Path) 
     assert env['REIFY_GUI_RETRY_SPECS'] == ''
     assert env['REIFY_VERIFY_RETRY_TREE_OID'] == 'cafef00d'
     assert env['REIFY_VERIFY_RETRY_SCOPE'] == 'failed_only'
+
+
+# ---------------------------------------------------------------------------
+# _run_post_merge_verify wiring (step 9/10): guarded by req.retry_failed_only,
+# merges the assembled retry env into MergeVerifySpec.verify_env before dispatch.
+# Driven on the LOCAL path (runner=None) so task 2822's remote-green cross-check
+# block (runs ONLY when runner is not None) stays inert and the wiring is isolated.
+# ---------------------------------------------------------------------------
+
+
+def _make_git_ops_mock() -> MagicMock:
+    m = MagicMock()
+    m.get_main_sha = AsyncMock(return_value='main-sha')
+    m.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
+    m.cleanup_merge_worktree = AsyncMock()
+    m.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    m.get_head_tree_hash = AsyncMock(return_value='deadbeef')
+    return m
+
+
+def _write_attempt0_sidecar(merge_wt: Path) -> None:
+    """Write a minimal schema-valid attempt-0 sidecar so the real loader succeeds."""
+    d = merge_wt / _SIDECAR_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    (d / _SIDECAR_NAME).write_text(
+        json.dumps(
+            {
+                'tree_oid': 'deadbeef',
+                'debug': {'planned': ['c a::x', 'c a::y'], 'verdicts': {'c a::x': 'pass'}},
+                'release': {'planned': [], 'verdicts': {}},
+                'run_all_members': [],
+                'gui_specs': [],
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_post_merge_verify_wires_retry_env_when_flag_on(tmp_path: Path) -> None:
+    """retry_failed_only=True → the assembled retry env is MERGED into spec.verify_env."""
+    from orchestrator import merge_queue as mq
+
+    config = OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='main'))
+    req = dataclasses.replace(
+        _make_request('r-on', 'task/r-on', tmp_path, config), retry_failed_only=True
+    )
+    git_ops = _make_git_ops_mock()
+    _write_attempt0_sidecar(tmp_path)
+
+    retry_env = {
+        'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+        'REIFY_VERIFY_RETRY_TREE_OID': 'deadbeef',
+    }
+    captured: dict[str, object] = {}
+
+    async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
+        captured['spec'] = spec
+        return _mock_verify_result(True)
+
+    with patch.object(mq, '_ensure_verify_disk_space', new=AsyncMock(return_value=None)), \
+         patch.object(mq.VerifyRunnerPool, 'dispatch', new=AsyncMock(side_effect=_fake_dispatch)), \
+         patch.object(
+             mq, '_assemble_retry_verify_env', new=AsyncMock(return_value=retry_env)
+         ) as assemble_mock:
+        outcome = await mq._run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123', runner=None,
+        )
+
+    assert outcome is None  # verify passed
+    assemble_mock.assert_awaited_once()
+    spec = captured['spec']
+    # (1) retry env keys present — merged, not dropped.
+    for k, v in retry_env.items():
+        assert spec.verify_env[k] == v
+    # (2) pre-existing effective_verify_env keys preserved (merge, NOT replace).
+    base = build_merge_verify_spec(config, req.module_configs, None)
+    for k, v in base.verify_env.items():
+        assert spec.verify_env[k] == v
+
+
+@pytest.mark.asyncio
+async def test_run_post_merge_verify_flag_off_is_byte_identical(tmp_path: Path) -> None:
+    """retry_failed_only=False (D1 no-op parity) → assemble not called, spec unchanged."""
+    from orchestrator import merge_queue as mq
+
+    config = OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='main'))
+    req = _make_request('r-off', 'task/r-off', tmp_path, config)  # flag defaults False
+    git_ops = _make_git_ops_mock()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
+        captured['spec'] = spec
+        return _mock_verify_result(True)
+
+    with patch.object(mq, '_ensure_verify_disk_space', new=AsyncMock(return_value=None)), \
+         patch.object(mq.VerifyRunnerPool, 'dispatch', new=AsyncMock(side_effect=_fake_dispatch)), \
+         patch.object(mq, '_assemble_retry_verify_env', new=AsyncMock()) as assemble_mock:
+        outcome = await mq._run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123', runner=None,
+        )
+
+    assert outcome is None
+    assemble_mock.assert_not_awaited()
+    base = build_merge_verify_spec(config, req.module_configs, None)
+    assert dict(captured['spec'].verify_env) == dict(base.verify_env)
