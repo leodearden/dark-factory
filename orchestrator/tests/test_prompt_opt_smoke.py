@@ -358,6 +358,50 @@ class TestSmokeCli:
         # data/prompt_artifacts root — the gate never writes production state).
         assert artifacts_root.exists()
 
+    def test_bare_smoke_command_does_not_touch_production(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A BARE `smoke` invocation (NO --artifacts-root) must run to completion
+        # in an ephemeral root and can NEVER write the production artifacts root.
+        prod_dir = tmp_path / 'prod'
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(prod_dir))
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ['smoke', '--split-seed', '2498'])
+
+        # (a) exit 0: the gate still ran to completion (in an ephemeral root)
+        assert result.exit_code == 0, (
+            f'Command exited with code {result.exit_code}.\nOutput:\n{result.output}'
+            + (f'\nException: {result.exception}' if result.exception else '')
+        )
+
+        # (b) production is NOT polluted: the exact 'next real reviewer on opus'
+        # path resolves the IN-CODE baseline, not a SMOKE_QUALITY artifact
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None
+        resolved = PromptArtifactStore(prod_dir).resolve(
+            spec, _SMOKE_EXECUTOR_MODEL, _REVIEWER_PROMPT_HARNESS_VERSION
+        )
+        assert resolved.source == 'in_code'
+
+        # (c) the prod dir carries no pinned reviewer-key subtree (absent, or empty)
+        assert not prod_dir.exists() or not any(prod_dir.iterdir())
+
+    def test_smoke_command_refuses_explicit_production_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Explicitly pointing --artifacts-root AT the production root is refused:
+        # the step-14 run_acceptance_smoke ValueError guard surfaces through the
+        # CLI's except-Exception handler as a non-zero gate.
+        prod_dir = tmp_path / 'prod'
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(prod_dir))
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ['smoke', '--artifacts-root', str(default_artifacts_root())]
+        )
+        assert result.exit_code != 0
+
 
 class TestProductionRootGuard:
     """run_acceptance_smoke REFUSES to pin into the PRODUCTION artifacts root.
