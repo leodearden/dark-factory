@@ -292,3 +292,129 @@ class TestBufferOwnedRequestDuplicateDrain:
         assert worker._live_items[rid] is original, (
             'the live original must not be displaced by the twin'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-6 RED (twin-future-resolved / observability) + regression guards
+# (fresh-path / legit-requeue) — step-7 GREEN extends
+# _coalesce_reentrant_drain to resolve the twin's future + emit
+# merge_coalesced.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEventStore:
+    """Minimal fake event store (copied from test_merge_request_ledger.py /
+    test_merge_queue_multihost_wiring.py — per-file duplication convention).
+    """
+
+    def __init__(self) -> None:
+        self.emitted: list = []
+
+    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):  # noqa: ARG002
+        self.emitted.append({'event_type': event_type, 'task_id': task_id, 'data': data or {}})
+
+
+@pytest.mark.asyncio
+class TestBufferOwnedRequestFreshAndRequeueRegression:
+    """Regression guards proving the fresh-request and legit-requeue paths
+    through the step-5-restructured ``_buffer_owned_request`` still behave
+    exactly as before (task 2852 step-6(a)/(b)) — only the NEW
+    already-advanced-past-QUEUED branch changed. Both pass immediately
+    after step-5 (no RED here).
+    """
+
+    async def test_fresh_request_still_buffers_and_advances_to_lane_buffered(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        req = _make_request('fresh-task', 'fresh-branch', tmp_path, config)
+        rid = req.request_id
+
+        worker._buffer_owned_request(req)
+
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.LANE_BUFFERED
+        assert any(req in buf for buf in worker._lane_buffers.values()), (
+            'fresh request must be appended to its lane buffer'
+        )
+        assert fake_eq.submitted == []
+
+    async def test_legit_requeue_same_object_redrains_cleanly(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Mirrors test_merge_queue_lifecycle_registry.py:602-638's
+        legit-requeue re-drain: the SAME object left registered at QUEUED
+        (as ``_note_requeue`` leaves it) re-drains through
+        ``_buffer_owned_request`` without being dropped as a duplicate.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        req = _make_request('requeue-task', 'requeue-branch', tmp_path, config)
+        rid = req.request_id
+        worker._register_item(req, initial=ItemLifecycleState.QUEUED)
+
+        worker._buffer_owned_request(req)
+
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.LANE_BUFFERED
+        assert worker._live_items[rid] is req, 'the same object must not be dropped'
+        assert fake_eq.submitted == []
+
+
+@pytest.mark.asyncio
+class TestCoalescedTwinFutureAndObservability:
+    """The coalesced twin's Future is defensively resolved to a benign
+    ``already_merged`` MergeOutcome (so no hypothetical waiter hangs) and a
+    ``merge_coalesced`` observability event is emitted (task 2852
+    step-6/step-7).
+
+    RED until step-7 GREEN extends ``_coalesce_reentrant_drain`` — the
+    step-5 drop-only version resolves no future and emits no event.
+    """
+
+    async def test_twin_future_resolved_to_already_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        original = _make_request('twin-future-task', 'twin-future-branch', tmp_path, config)
+        rid = original.request_id
+        worker._register_item(original, initial=ItemLifecycleState.VERIFYING)
+        twin = _make_request(
+            'twin-future-task', 'twin-future-branch', tmp_path, config, request_id=rid,
+        )
+
+        worker._buffer_owned_request(twin)
+
+        assert twin.result.done(), 'no (hypothetical) waiter on the twin future may hang'
+        assert twin.result.result().status == 'already_merged'
+
+    async def test_twin_drain_emits_exactly_one_merge_coalesced_event(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_es = _FakeEventStore()
+        worker = _make_worker(git_ops, escalation_queue=fake_eq, event_store=fake_es)
+        original = _make_request('twin-event-task', 'twin-event-branch', tmp_path, config)
+        rid = original.request_id
+        worker._register_item(original, initial=ItemLifecycleState.VERIFYING)
+        twin = _make_request(
+            'twin-event-task', 'twin-event-branch', tmp_path, config, request_id=rid,
+        )
+
+        worker._buffer_owned_request(twin)
+
+        coalesced = [e for e in fake_es.emitted if e['event_type'] == EventType.merge_coalesced]
+        assert len(coalesced) == 1, (
+            f'expected exactly one merge_coalesced event, got: {fake_es.emitted!r}'
+        )
+        assert coalesced[0]['data']['source'] == 'duplicate_submission'
+        assert coalesced[0]['task_id'] == twin.task_id
