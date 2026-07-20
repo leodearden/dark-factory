@@ -23,7 +23,7 @@ import pydantic
 import pytest
 
 from shared.config_models import UsageCapConfig
-from shared.usage_gate import AccountState, ScopeCap
+from shared.usage_gate import AccountState, ScopeCap, scope_for
 
 
 class TestScopedCapModelsConfig:
@@ -79,3 +79,32 @@ class TestScopeCapState:
         b = AccountState(name='b', token=None)
         a.scope_caps['claude-fable-5'] = ScopeCap(capped=True)
         assert b.scope_caps == {}
+
+
+class TestScopeFor:
+    """The module-level ``scope_for(model, config)`` derivation.
+
+    Importing ``scope_for`` via an explicit ``from shared.usage_gate import
+    scope_for`` also asserts it is reachable despite being excluded from
+    ``usage_gate.__all__`` (the AccountLease precedent).
+    """
+
+    def test_scoped_model_maps_to_itself(self):
+        cfg = UsageCapConfig()
+        assert scope_for('claude-fable-5', cfg) == 'claude-fable-5'
+
+    def test_general_models_map_to_none(self):
+        cfg = UsageCapConfig()
+        assert scope_for('sonnet', cfg) is None
+        assert scope_for('opus', cfg) is None
+        assert scope_for('haiku', cfg) is None
+
+    def test_kill_switch_maps_formerly_scoped_to_none(self):
+        # B6: with scoping disabled, even a formerly-scoped model is general.
+        cfg0 = UsageCapConfig(scoped_cap_models=[])
+        assert scope_for('claude-fable-5', cfg0) is None
+
+    def test_custom_scope_list(self):
+        cfgx = UsageCapConfig(scoped_cap_models=['opus'])
+        assert scope_for('opus', cfgx) == 'opus'
+        assert scope_for('claude-fable-5', cfgx) is None
