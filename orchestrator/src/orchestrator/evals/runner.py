@@ -363,7 +363,7 @@ async def run_eval(
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
         config, task, base_config, memory_endpoint=memory_endpoint,
-        judge_config=judge_config,
+        judge_config=judge_config, worktree=worktree,
     )
 
     # 3. Build task assignment
@@ -540,6 +540,7 @@ async def run_architect_eval(
         # 2. Eval orch config (project_root / verify / profile parity).
         orch_config = build_eval_orch_config(
             config, task, base_config, memory_endpoint=memory_endpoint,
+            worktree=worktree,
         )
 
         # 3. Init artifacts so the architect has a place to write plan.json.
@@ -703,6 +704,7 @@ async def run_end_to_end(
     orch_config = build_eval_orch_config(
         impl_config, task, base_config,
         memory_endpoint=memory_endpoint, architect_config=arch_config,
+        worktree=worktree,
     )
 
     # 3. Task assignment.
