@@ -2708,6 +2708,18 @@ def _scope_tag_for(project_root: Path) -> str:
     return f'{slug}-{digest}'
 
 
+def _verify_scope_name(scope_tag: str) -> str:
+    """Build a per-project, uuid-unique transient verify-scope unit name.
+
+    Shape: ``df-verify-{scope_tag}-{uuid}.scope``.  The ``df-verify-`` prefix
+    is preserved (existing prefix matchers are unaffected); ``scope_tag`` (see
+    ``_scope_tag_for``) confines the leftover-scope startup sweep to THIS
+    project; the 12-hex uuid segment keeps concurrent verifies from colliding
+    on a unit name.
+    """
+    return f'df-verify-{scope_tag}-{uuid.uuid4().hex[:12]}.scope'
+
+
 async def _kill_cgroup_scope(unit: str) -> None:
     """Force-kill a transient systemd ``--user`` scope unit and reap its cgroup.
 
@@ -2849,6 +2861,7 @@ class _ScopeKw(TypedDict, total=False):
     """Keyword arguments for the cgroup-scope path in ``_run_cmd``."""
 
     use_cgroup_scope: bool
+    scope_tag: str
 
 
 class _ClockKw(TypedDict, total=False):
@@ -2920,6 +2933,7 @@ async def _run_cmd(
     log_path: 'Path | None' = None,
     *,
     use_cgroup_scope: bool = False,
+    scope_tag: str = '',
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
@@ -2976,7 +2990,7 @@ async def _run_cmd(
     pgid: int | None = None
     scope_unit: str | None = None
     if use_cgroup_scope and shutil.which('systemd-run') is not None:
-        scope_unit = f'df-verify-{uuid.uuid4().hex[:12]}.scope'
+        scope_unit = _verify_scope_name(scope_tag)
     # Populated by the clock-stop loop before raising TimeoutError so the except
     # handler can emit a richer message (actual wall time + which deadline fired).
     _cs_timeout_msg: list[str] = []
@@ -3772,7 +3786,12 @@ async def run_verification(
             # Pass use_cgroup_scope only when enabled so the default-off call
             # signature stays byte-identical (test doubles stub the legacy kwargs).
             _scope_kw: _ScopeKw = (
-                {'use_cgroup_scope': True} if config.verify_use_cgroup_scope else {}
+                {
+                    'use_cgroup_scope': True,
+                    'scope_tag': _scope_tag_for(config.project_root),
+                }
+                if config.verify_use_cgroup_scope
+                else {}
             )
             # Pass clock_stop only when enabled (mirrors _scope_kw pattern) so the
             # default-off call signature stays byte-identical for existing test doubles.
