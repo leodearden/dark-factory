@@ -657,6 +657,22 @@ _TASK_COUNT_SNAPSHOT_PRUNE_SOURCE = 'stage2_task_count_snapshot_prune'
 STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
 
+# Age-based GC for the legacy Mem0 stage1_flag_marker pool (task 2853).
+# Task 2406 retired the Mem0 stage1_flag_marker mirror write — markers now
+# persist only to the recon_ledger SQLite table (see _gc_recon_markers /
+# ReconLedgerStore.gc above, which reaps ledger rows only). Task 2228 W5-κ
+# deleted the prior in-cycle Mem0 sweeps for this source (_sweep_stale_flag_
+# markers, _sweep_terminal_task_flag_markers) on the assumption that the
+# ledger gc() pass fully replaced them; it does not reach Mem0, so the
+# pre-2406 Mem0 pool was left with no in-cycle collector for any project.
+# Since the write path is fully retired, every remaining Mem0
+# stage1_flag_marker record is dead weight; 14 days reuses the
+# STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention as a
+# conservative, consistent aging cutoff rather than deleting immediately.
+_STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
+STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
+_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
+
 
 async def _resolve_terminal_task_ids(
     taskmaster,
@@ -817,79 +833,104 @@ async def _gc_recon_markers(
         return 0
 
 
-async def _sweep_stale_persistence_markers(
+async def _sweep_stale_mem0_pool(
     memory_service,
     project_id: str,
     run_id: str,
     *,
-    max_age_days: int = STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS,
+    source: str,
+    gc_sweep_source: str,
+    max_age_days: int,
+    log_name: str,
     now: datetime | None = None,
     scroll_limit: int = 1000,
+    count_short_circuit: bool = False,
 ) -> int:
-    """Age-GC orphaned ``stage2_persistence_marker`` Mem0 records (task 2095).
+    """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
-    ``stage2_persistence_marker`` records are written once per surviving flag
-    per cycle by :func:`_track_flag_persistence` with no existing collector.
-    A flag that stops recurring (deleted by FIX C, or simply resolved) leaves
-    its markers orphaned; this helper closes that gap by enumerating the
-    whole pool and deleting members whose ``created_at`` is strictly older
-    than ``now - max_age_days``.
-
-    This is an AGE-ONLY sweep (task 1944 precedent, since retired for
-    ``stage1_flag_marker`` by the recon_ledger ``gc()`` pass — task 2228
-    W5-κ): it implements no cross-cycle ``fp:`` content-fingerprint
-    predicate. ``stage2_persistence_marker`` metadata is ``{source, flag_id,
-    run_id}`` with no ``task_id``/``fp:`` key, so that predicate has no
-    applicable input here.
+    Factored out of :func:`_sweep_stale_persistence_markers` and
+    :func:`_sweep_stale_mem0_flag_markers` (task 2853 amendment, reviewer
+    finding code-duplication): both were near-verbatim ~70-line copies of
+    the same enumerate -> age-filter -> gather_collect-delete ->
+    count-successes skeleton, differing only in the source filter, the
+    delete ``_source`` audit tag, and the max-age constant. A future fix to
+    the KEEP-on-uncertainty logic or the scroll-cap accounting now lands
+    once for every caller instead of needing to be replicated per source.
 
     Enumerates deterministically via ``memory_service.get_memories_by_metadata``
     (Qdrant payload-filter scroll) — NEVER semantic search, which silently
     drops low-similarity rows and is unsuitable for exhaustive GC. Members
-    with a missing or unparseable ``created_at`` are KEPT (never deleted) — a
-    fail-safe KEEP-on-uncertainty posture shared with :func:`_gc_recon_markers`'s
-    expiry/terminal-task GC.
+    with a missing or unparseable ``created_at`` are KEPT (never deleted) —
+    a fail-safe KEEP-on-uncertainty posture shared with every other marker
+    sweep in this module.
 
-    Deletes are issued best-effort in parallel via ``asyncio.gather`` with
-    ``return_exceptions=True``: individual failures log WARNING and are
-    excluded from the returned count.
+    Deletes are issued best-effort in parallel via ``gather_collect``:
+    individual failures log WARNING and are excluded from the returned
+    count.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
-            ``delete_memory``.
+            ``delete_memory`` (and, when ``count_short_circuit`` is set,
+            ``count_memories_by_metadata``).
         project_id: Project scope for enumeration and delete calls.
-        run_id: Current reconciliation run identifier used as ``causation_id``
-            in the audit journal.
-        max_age_days: Staleness cutoff in days (default
-            ``STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS`` == 14).
-        now: Reference "current time" for the cutoff calculation. Defaults to
-            ``datetime.now(UTC)``; tests inject a fixed value.
+        run_id: Current reconciliation run identifier used as
+            ``causation_id`` in the audit journal.
+        source: The ``metadata.source`` value identifying this pool.
+        gc_sweep_source: The delete ``_source`` audit tag for this pool.
+        max_age_days: Staleness cutoff in days.
+        log_name: Public caller name, interpolated into log messages so
+            WARNING lines stay attributable to the right sweep.
+        now: Reference "current time" for the cutoff calculation. Defaults
+            to ``datetime.now(UTC)``; tests inject a fixed value.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
+        count_short_circuit: When ``True``, probe
+            ``memory_service.count_memories_by_metadata`` first and return
+            ``0`` immediately on a confirmed exact-zero count — skipping the
+            larger scroll entirely. Fails OPEN: an exception, or any result
+            other than exactly ``0``, falls straight through to the normal
+            scroll path unchanged — so this can only ever skip a scroll that
+            would itself have found nothing. Intended for a pool whose write
+            path is fully retired (task 2853 review, efficiency finding),
+            where the scroll would otherwise run forever against an
+            already-empty pool; deliberately NOT used for a still-active
+            pool, where the count is almost never zero and the extra
+            round-trip would be pure overhead.
 
     Returns:
-        Number of memories successfully deleted (0 if nothing is stale, or
-        on enumeration failure).
+        Number of memories successfully deleted (0 if nothing is stale, on
+        enumeration failure, or on a confirmed-empty count short-circuit).
     """
+    if count_short_circuit:
+        try:
+            count = await memory_service.count_memories_by_metadata(
+                project_id=project_id,
+                filters={'source': source},
+            )
+        except Exception:
+            count = None
+        if count == 0:
+            return 0
+
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE},
+            filters={'source': source},
             limit=scroll_limit,
         )
     except Exception:
         logger.warning(
-            'reconciliation._sweep_stale_persistence_markers: '
-            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
-            project_id,
+            'reconciliation.%s: get_memories_by_metadata failed for project_id=%s; skipping sweep',
+            log_name, project_id,
             extra={'project_id': project_id, 'run_id': run_id},
         )
         return 0
 
     if len(members) >= scroll_limit:
         logger.warning(
-            'reconciliation._sweep_stale_persistence_markers: enumerated %d of scroll_limit=%d '
-            'stage2_persistence_marker records — scroll cap reached; older stale markers may '
-            'remain uncollected this cycle; re-run with a higher scroll_limit.',
-            len(members), scroll_limit,
+            'reconciliation.%s: enumerated %d of scroll_limit=%d %s records — scroll cap '
+            'reached; older stale markers may remain uncollected this cycle; re-run with a '
+            'higher scroll_limit.',
+            log_name, len(members), scroll_limit, source,
             extra={'project_id': project_id, 'run_id': run_id},
         )
 
@@ -929,7 +970,7 @@ async def _sweep_stale_persistence_markers(
             store='mem0',
             project_id=project_id,
             causation_id=run_id,
-            _source=_STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+            _source=gc_sweep_source,
         )
         for mid in stale_ids
     )
@@ -938,13 +979,144 @@ async def _sweep_stale_persistence_markers(
     for mid, result in zip(stale_ids, results, strict=True):
         if isinstance(result, Exception):
             logger.warning(
-                'reconciliation._sweep_stale_persistence_markers: delete failed for memory_id=%s; not counted',
-                mid,
+                'reconciliation.%s: delete failed for memory_id=%s; not counted',
+                log_name, mid,
                 extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
             )
         else:
             success_count += 1
     return success_count
+
+
+async def _sweep_stale_persistence_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    max_age_days: int = STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """Age-GC orphaned ``stage2_persistence_marker`` Mem0 records (task 2095).
+
+    ``stage2_persistence_marker`` records are written once per surviving flag
+    per cycle by :func:`_track_flag_persistence` with no existing collector.
+    A flag that stops recurring (deleted by FIX C, or simply resolved) leaves
+    its markers orphaned; this helper closes that gap by enumerating the
+    whole pool and deleting members whose ``created_at`` is strictly older
+    than ``now - max_age_days``.
+
+    This is an AGE-ONLY sweep (task 1944 precedent, since retired for
+    ``stage1_flag_marker`` by the recon_ledger ``gc()`` pass — task 2228
+    W5-κ): it implements no cross-cycle ``fp:`` content-fingerprint
+    predicate. ``stage2_persistence_marker`` metadata is ``{source, flag_id,
+    run_id}`` with no ``task_id``/``fp:`` key, so that predicate has no
+    applicable input here.
+
+    Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
+    shared enumerate -> age-filter -> gather_collect-delete -> count
+    skeleton — see that function's docstring for the fail-safe posture.
+    ``count_short_circuit`` is deliberately left off here: unlike
+    ``stage1_flag_marker`` (below), this pool's writer
+    (:func:`_track_flag_persistence`) is still active, so a zero count would
+    be a rare transient rather than the steady state, and probing for it on
+    every cycle would be pure overhead.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        max_age_days: Staleness cutoff in days (default
+            ``STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS`` == 14).
+        now: Reference "current time" for the cutoff calculation. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale, or
+        on enumeration failure).
+    """
+    return await _sweep_stale_mem0_pool(
+        memory_service,
+        project_id,
+        run_id,
+        source=_STAGE2_PERSISTENCE_MARKER_SOURCE,
+        gc_sweep_source=_STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+        max_age_days=max_age_days,
+        log_name='_sweep_stale_persistence_markers',
+        now=now,
+        scroll_limit=scroll_limit,
+    )
+
+
+async def _sweep_stale_mem0_flag_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    max_age_days: int = STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """Age-GC the legacy ``stage1_flag_marker`` Mem0 pool (task 2853).
+
+    Task 2406 retired the Mem0 ``stage1_flag_marker`` mirror write — markers
+    now persist only to the ``recon_ledger`` SQLite table, reaped by
+    :func:`_gc_recon_markers` / :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`.
+    Task 2228 W5-κ deleted the prior in-cycle Mem0 sweeps for this source
+    (the old ``_sweep_stale_flag_markers`` and
+    ``_sweep_terminal_task_flag_markers``) on the assumption that the ledger
+    ``gc()`` pass fully replaced them; ``gc()`` only reaps ledger rows, so
+    the pre-2406 Mem0 pool was left with no in-cycle collector for any
+    project — including projects other than ``dark_factory``, which is the
+    only project the operational ``sweep_orphan_flag_markers.py`` systemd
+    timer targets by default. This helper closes that gap per-project,
+    in-cycle, so every project self-heals its own legacy pool.
+
+    Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
+    shared enumerate -> age-filter -> gather_collect-delete -> count
+    skeleton, with a distinct source filter, delete ``_source`` tag, and
+    max-age constant from :func:`_sweep_stale_persistence_markers` — see
+    that function's docstring for the fail-safe posture.
+
+    Passes ``count_short_circuit=True`` (task 2853 review, efficiency
+    finding): this pool's write path is fully retired, so once the legacy
+    records age past the cutoff and are drained, every subsequent cycle
+    would otherwise re-scroll an already-empty pool forever. A cheap
+    ``count_memories_by_metadata`` probe short-circuits that steady state;
+    see :func:`_sweep_stale_mem0_pool`'s docstring for why this is safe to
+    fail open.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata``,
+            ``delete_memory``, and ``count_memories_by_metadata``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        max_age_days: Staleness cutoff in days (default
+            ``STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS`` == 14).
+        now: Reference "current time" for the cutoff calculation. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale, on
+        enumeration failure, or on a confirmed-empty count short-circuit).
+    """
+    return await _sweep_stale_mem0_pool(
+        memory_service,
+        project_id,
+        run_id,
+        source=_STAGE1_FLAG_MARKER_MEM0_SOURCE,
+        gc_sweep_source=_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+        max_age_days=max_age_days,
+        log_name='_sweep_stale_mem0_flag_markers',
+        now=now,
+        scroll_limit=scroll_limit,
+        count_short_circuit=True,
+    )
 
 
 async def _verify_task_count_snapshot_written(
@@ -2080,6 +2252,20 @@ class TaskKnowledgeSync(BaseStage):
         # cycle alongside the ledger gc() pass; explicit zero for the same
         # reason as above.
         report.stats['stale_persistence_markers_gc_swept'] = await _sweep_stale_persistence_markers(
+            self.memory, self.project_id, run_id,
+        )
+
+        # Legacy Mem0 stage1_flag_marker pool (task 2853): task 2406 retired
+        # its mirror write (markers now persist only to the recon_ledger,
+        # reaped above by _gc_recon_markers), and task 2228 W5-κ deleted the
+        # prior in-cycle Mem0 sweep for this source on the assumption that
+        # the ledger gc() pass replaced it — it does not reach Mem0, so the
+        # pre-2406 pool was left uncollected for every project (the
+        # operational sweep_orphan_flag_markers.py systemd timer only
+        # targets dark_factory by default). Runs unconditionally every cycle,
+        # per-project, so each project self-heals its own legacy pool;
+        # explicit zero for the same reason as the two GC stats above.
+        report.stats['stale_mem0_flag_markers_gc_swept'] = await _sweep_stale_mem0_flag_markers(
             self.memory, self.project_id, run_id,
         )
 
