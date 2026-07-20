@@ -13158,6 +13158,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # at DISPATCHING/QUEUED. Every path below (DROPPED/REQUEUED, RUNNER_
             # UNAVAILABLE's FINALIZING -> MERGING, FAIL/skip, PASS) already assumes
             # FINALIZING as its from-state.
+            #
+            # task 2852 (SHARPER RCA mr-99585bb8): routed through _advance_if_at
+            # instead of a hardcoded-from_state _note_transition call — a
+            # double-finalize (this hop firing twice for the same request_id,
+            # e.g. a re-entrant/duplicate finalize drive) now reads the
+            # registry's CURRENT state first. When it is already past VERIFYING
+            # (FINALIZING/MERGING/GATE_REVERIFY/TERMINAL), the second hop
+            # coalesces as a benign WARNING no-op instead of hitting
+            # IllegalLifecycleTransition and firing a
+            # merge_lifecycle_transition_rejected escalation.
             if (
                 entry.passthrough_outcome is None
                 and entry.status not in (
@@ -13165,7 +13175,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     InflightStatus.REQUEUED_PREDISPATCH,
                 )
             ):
-                self._note_transition(
+                self._advance_if_at(
                     req.request_id, ItemLifecycleState.VERIFYING,
                     ItemLifecycleState.FINALIZING, live_obj=entry,
                 )
