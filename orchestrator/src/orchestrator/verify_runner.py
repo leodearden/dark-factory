@@ -1630,6 +1630,12 @@ class VerifyRunnerPool:
                     'attempt': attempt,
                     'depth': depth,
                     'speculative': speculative,
+                    # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
+                    # retry_subset_sizes — always-present (None for a full/legacy
+                    # verify), derived from the D2 failed-only contract carried in
+                    # spec.verify_env, so a narrowed retry is never miscounted as
+                    # a full green gate.
+                    **retry_scope_event_fields(spec.verify_env),
                 },
             )
 
