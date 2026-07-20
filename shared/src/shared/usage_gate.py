@@ -716,7 +716,7 @@ class UsageGate:
             len(self._accounts),
         )
 
-    async def before_invoke(self) -> AccountLease | None:
+    async def before_invoke(self, scope: str | None = None) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
         Returns an :class:`AccountLease` snapshotting the selected account's
@@ -724,6 +724,14 @@ class UsageGate:
         any PROBING -> PROBE_IN_FLIGHT claim, so the returned lease always
         names the SAME account as its token. Returns ``None`` if no accounts
         are configured (no token override).
+
+        *scope* (PRD task γ, task 2857): when non-None (a scoped-cap model, e.g.
+        ``claude-fable-5``), selection additionally skips accounts whose
+        ``scope_caps[scope]`` is capped with a future uncap-deadline (S2), while
+        account-level CAPPED/AUTH_FAILED still dominates for every scope (S4).
+        ``scope=None`` (the general scope) is byte-identical to today (S1) —
+        the scope predicate and the scope-wait fall-through are both guarded on
+        ``scope is not None``.
         """
         # Session budget check
         if (self._config.session_budget_usd is not None
@@ -740,6 +748,15 @@ class UsageGate:
             async with self._lock:
                 for acct in self._accounts:
                     if acct.capped or acct.probe_in_flight or acct.auth_failed:
+                        continue
+                    if scope is not None and self._scope_capped_at(
+                        acct, scope, datetime.now(UTC)
+                    ):
+                        # Scope-capped for this model (S2): skip for this scope
+                        # only — the account still serves general work (S1). The
+                        # account-level skip above already dominates (S4), and
+                        # this predicate is guarded on scope is not None so the
+                        # scope=None path stays byte-identical.
                         continue
                     if acct.probing:
                         # First task claims the probe slot — others block
@@ -804,9 +821,10 @@ class UsageGate:
 
         *scope* (PRD task β) is stored on the yielded slot (``slot.scope``) and
         forwarded by ``report`` / ``detect_cap_hit`` into the cap handlers so a
-        scoped cap attributes to only this account's model-scope. β does not use
-        it for account *selection* (that is γ, task 2857) — ``before_invoke``
-        is unchanged.
+        scoped cap attributes to only this account's model-scope. It is now
+        ALSO threaded into ``before_invoke(scope=scope)`` for scope-aware
+        account *selection* (PRD task γ, task 2857): the yielded slot leases an
+        account with headroom for this scope, skipping scope-capped ones.
 
         Usage::
 
@@ -819,7 +837,7 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        lease = await self.before_invoke()
+        lease = await self.before_invoke(scope=scope)
         slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot
