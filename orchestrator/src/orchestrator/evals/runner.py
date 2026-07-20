@@ -36,7 +36,7 @@ from orchestrator.workflow import (
 from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
-from .snapshots import create_eval_worktree
+from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +230,15 @@ def build_eval_orch_config(
         'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
     }
+    # BUG 2a: pin the eval verify interpreter to the target's own
+    # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
+    # pyright` runs under the worktree's own 3.13 venv. verify_env is overlaid
+    # LAST in verify._target_subprocess_env (wins) and survives
+    # effective_verify_env, so the pin reaches every verify subprocess. Absent a
+    # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
+    pin = read_python_pin(Path(task.get('project_root', str(base.project_root))))
+    if pin is not None:
+        update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
     # D8: an explicit recording endpoint layers over the profile's null
     # sentinel — override only fused_memory.url (preserving project_id and
     # every other fused-memory leaf from the profiled config). Left None, the
