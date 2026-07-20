@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from fused_memory.models.enums import MemoryCategory, SourceStore
 
 if TYPE_CHECKING:
+    from fused_memory.config.schema import ProceduralTopicCluster
     from fused_memory.models.memory import MemoryResult
 
 # Default similarity threshold when config is absent/partial/non-numeric.
@@ -39,6 +40,19 @@ _NEAR_DUPLICATE_HINT = (
     '(see matched_memory_id/matched_excerpt). Search first and update or skip '
     'instead of writing a duplicate. If the content is genuinely distinct, '
     "override with metadata={'allow_near_duplicate': True}."
+)
+
+# Fallback hint for a topic-cluster soft-block when the matched cluster carries
+# no per-cluster ``hint``. Surfaced in the soft-block dict (and the add_memory
+# docstring / FUSED_MEMORY_INSTRUCTIONS) so the remediation is discoverable at
+# the point of rejection.
+_TOPIC_CLUSTER_DEFAULT_HINT = (
+    'This procedural_knowledge content matches a KNOWN-contradictory topic '
+    'cluster (see topic_id/matched_phrases) that is gated to a human review '
+    'task. Do NOT add another entry — search first and update/consolidate the '
+    'existing entries for this topic, or add context to the referenced human '
+    'gate task, instead of accumulating another paraphrased restatement. If the '
+    "content is genuinely distinct, override with metadata={'allow_near_duplicate': True}."
 )
 
 
@@ -71,6 +85,40 @@ def find_near_duplicate_memory(
     return max(qualifying, key=lambda r: r.relevance_score)
 
 
+def find_matching_topic_cluster(
+    content: str,
+    clusters: list[ProceduralTopicCluster],
+) -> tuple[ProceduralTopicCluster, list[str]] | None:
+    """Select the first topic cluster *content* matches by distinct-phrase count.
+
+    For each cluster in order, counts the DISTINCT ``phrases`` (compared
+    case-insensitively) that appear as substrings of *content*, and returns
+    ``(cluster, sorted matched phrases)`` for the first cluster whose distinct
+    hit count is ``>= cluster.min_phrase_hits``. A phrase repeated in *content*
+    counts once (distinct-phrase membership, not occurrence count); an empty
+    phrase is ignored (it would otherwise substring-match everything). Returns
+    ``None`` when *content* is empty, *clusters* is empty, or no cluster
+    qualifies.
+
+    Pure and synchronous — mirrors :func:`find_near_duplicate_memory`: it does
+    no I/O and no embedding round-trip, and raises nothing on empty input. This
+    deterministic matcher catches same-topic paraphrases that score below the
+    cosine near-dup threshold (task 2845).
+    """
+    if not content:
+        return None
+    content_lower = content.lower()
+    for cluster in clusters:
+        matched = {
+            phrase.lower()
+            for phrase in cluster.phrases
+            if phrase and phrase.lower() in content_lower
+        }
+        if len(matched) >= cluster.min_phrase_hits:
+            return cluster, sorted(matched)
+    return None
+
+
 def resolve_near_dup_threshold(memory_service: Any) -> float:
     """Read the near-dup similarity threshold from *memory_service*'s config.
 
@@ -98,6 +146,23 @@ def resolve_near_dup_guard_enabled(memory_service: Any) -> bool:
     if isinstance(value, bool):
         return value
     return _DEFAULT_NEAR_DUP_GUARD_ENABLED
+
+
+def resolve_topic_guard_clusters(memory_service: Any) -> list:
+    """Read the configured topic-guard clusters from *memory_service*'s config.
+
+    Same defensive ``getattr`` navigation as :func:`resolve_near_dup_threshold`
+    (via :func:`_reconciliation_attr`), returning the configured
+    ``procedural_knowledge_topic_guard_clusters`` list iff the leaf is a real
+    ``list`` — otherwise an empty list. The ``isinstance(value, list)`` guard
+    excludes a missing/``None`` config hop and any Mock attribute an unspecced
+    test double might auto-generate, so an empty return reliably means "topic
+    guard inert" (task 2845).
+    """
+    value = _reconciliation_attr(memory_service, 'procedural_knowledge_topic_guard_clusters')
+    if isinstance(value, list):
+        return value
+    return []
 
 
 def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
@@ -129,4 +194,31 @@ def build_near_duplicate_block(
         'threshold': threshold,
         'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
+    }
+
+
+def build_topic_cluster_block(
+    agent_id: str | None,
+    content: str,
+    cluster: ProceduralTopicCluster,
+    matched_phrases: list[str],
+) -> dict[str, Any]:
+    """Build the structured soft-block dict for a known-topic-cluster write.
+
+    Mirrors :func:`build_near_duplicate_block`'s flat-dict shape (``error`` /
+    ``error_type``, echoed ``agent_id`` / ``content_excerpt``, plus a
+    remediation ``hint``), but carries topic-guard-specific fields
+    (``topic_id`` / ``matched_phrases``) and a distinct ``error_type`` so the
+    two guards' agent-facing diagnostics stay cleanly separable. Uses the
+    matched cluster's ``hint`` when set, else the module default
+    (:data:`_TOPIC_CLUSTER_DEFAULT_HINT`).
+    """
+    return {
+        'error': 'procedural_knowledge_known_topic_cluster_write_blocked',
+        'error_type': 'ProceduralKnowledgeKnownTopicClusterWriteRejected',
+        'agent_id': agent_id,
+        'content_excerpt': content[:200],
+        'topic_id': cluster.topic_id,
+        'matched_phrases': matched_phrases,
+        'hint': cluster.hint or _TOPIC_CLUSTER_DEFAULT_HINT,
     }

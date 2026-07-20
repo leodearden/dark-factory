@@ -19,6 +19,7 @@ from fused_memory.config.schema import (
     GraphitiBackendConfig,
     LLMConfig,
     PathScopeAdjudicatorConfig,
+    ProceduralTopicCluster,
     QueueConfig,
     ReconciliationConfig,
     ServerConfig,
@@ -1170,3 +1171,59 @@ class TestReconciliationRejectStaleDoneEvidence:
     def test_invalid_value_rejected(self):
         with pytest.raises(ValidationError, match='reject_stale_done_evidence'):
             ReconciliationConfig(reject_stale_done_evidence='sometimes')  # type: ignore[arg-type]
+
+
+class TestProceduralTopicClusterModel:
+    """The topic-keyed cluster model that seeds the deterministic topic guard (task 2845)."""
+
+    def test_validates_well_formed_cluster(self):
+        cluster = ProceduralTopicCluster(
+            topic_id='some-topic',
+            phrases=['alpha', 'beta'],
+            hint='route to gate task 9999',
+        )
+        assert cluster.topic_id == 'some-topic'
+        assert cluster.phrases == ['alpha', 'beta']
+        assert cluster.hint == 'route to gate task 9999'
+
+    def test_min_phrase_hits_defaults_to_two(self):
+        cluster = ProceduralTopicCluster(topic_id='t', phrases=['a', 'b', 'c'])
+        assert cluster.min_phrase_hits == 2
+
+    def test_hint_defaults_to_empty_string(self):
+        cluster = ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'])
+        assert cluster.hint == ''
+
+    def test_rejects_unknown_key(self):
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(
+                topic_id='t',
+                phrases=['a', 'b'],
+                unexpected_key='boom',  # type: ignore[call-arg]
+            )
+
+    def test_rejects_min_phrase_hits_below_one(self):
+        with pytest.raises(ValidationError):
+            ProceduralTopicCluster(topic_id='t', phrases=['a', 'b'], min_phrase_hits=0)
+
+
+class TestProceduralTopicGuardClustersDefault:
+    """ReconciliationConfig seeds both known-contradictory clusters by default."""
+
+    def test_default_seeds_non_empty_clusters(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert isinstance(clusters, list)
+        assert len(clusters) >= 2
+
+    def test_default_seeds_both_known_topic_ids(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        topic_ids = {c.topic_id for c in clusters}
+        assert 'eval-worktree-plan-tools-missing' in topic_ids
+        assert 'eval-worktree-venv-shadowing' in topic_ids
+
+    def test_every_seeded_cluster_is_well_formed(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        for cluster in clusters:
+            assert isinstance(cluster, ProceduralTopicCluster)
+            assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
+            assert cluster.min_phrase_hits >= 1

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -372,6 +372,104 @@ class TaskStatusConfig(BaseModel):
 
 
 # --- Reconciliation ---
+
+class ProceduralTopicCluster(BaseModel):
+    """One known-contradictory procedural_knowledge topic for the write-time topic guard.
+
+    A cluster is matched deterministically: an incoming ``procedural_knowledge``
+    add_memory write whose (lowercased) content contains at least
+    ``min_phrase_hits`` DISTINCT ``phrases`` is soft-blocked, routing the writer
+    to consolidate/update the existing entries or add context to the human gate
+    task named in ``hint`` -- instead of accumulating another paraphrased,
+    below-cosine-threshold restatement the semantic near-dup guard cannot catch
+    (task 2845). ``extra='forbid'`` so a mistyped cluster key fails loud at config
+    load/reload, never silently matches nothing.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    topic_id: str = Field(description='Stable identifier for this topic cluster.')
+    phrases: list[str] = Field(
+        description=(
+            'Identifying substring phrases, matched case-insensitively. A write '
+            'containing >= min_phrase_hits DISTINCT phrases matches this cluster.'
+        ),
+    )
+    min_phrase_hits: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            'Number of DISTINCT phrases that must appear before a write is blocked. '
+            'Default 2 so a single incidental keyword never triggers a false block.'
+        ),
+    )
+    hint: str = Field(
+        default='',
+        description=(
+            'Optional remediation hint (e.g. the human gate task to route to). '
+            'When empty, the guard substitutes a module-default hint.'
+        ),
+    )
+
+
+def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
+    """Seed the two known-contradictory eval-worktree topic clusters (task 2845).
+
+    Both are recurring procedural_knowledge topics that grew several
+    contradictory, paraphrased entries each because every restatement scored
+    BELOW the cosine near-dup threshold. Seeding both means one fix closes this
+    task (2845, gate 2841) AND the sibling venv-shadowing cluster (gate 2844).
+    Operator-overridable / tunable via config (green-tier hot-reloadable).
+    """
+    return [
+        ProceduralTopicCluster(
+            topic_id='eval-worktree-plan-tools-missing',
+            phrases=[
+                'plan-tools',
+                'plan_tools',
+                'plan.json',
+                'eval-worktree',
+                'eval worktree',
+                'create_plan',
+                'add_plan_step',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-contradictory topic (plan-tools MCP server missing in the '
+                'eval worktree) gated to human task 2841. Do NOT add another entry '
+                '-- update/consolidate the existing entries, or add context to gate '
+                'task 2841.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='eval-worktree-venv-shadowing',
+            # Reviewer (robustness): the earlier seed paired short, generic tokens
+            # ('shadow', 'pyright', 'conftest', 'site-packages', bare '.venv') that
+            # co-occur in unrelated Python-env notes, so a genuine pyright/conftest
+            # or a plain '.venv'/'site-packages' gotcha could reach min_phrase_hits
+            # on its own and be mis-routed to gate 2844. Narrowed to eval-worktree
+            # anchors plus distinctive multi-word phrases, so a match now requires
+            # the eval-worktree context or an unambiguous venv-shadowing phrase
+            # (mirrors the more distinctive plan-tools cluster above). 'shadow' as a
+            # bare 6-char substring (fires on 'shadowing'/'overshadow'/'shadow copy')
+            # is replaced by the longer 'venv shadowing' / '.venv shadow'.
+            phrases=[
+                'eval-worktree',  # anchor; also substring-matches '.eval-worktrees'
+                'eval worktree',  # anchor (space spelling)
+                'editable install',
+                'venv shadowing',
+                '.venv shadow',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-contradictory topic (venv / editable-install shadowing in the '
+                'eval worktree) gated to human task 2844. Do NOT add another entry '
+                '-- update/consolidate the existing entries, or add context to gate '
+                'task 2844.'
+            ),
+        ),
+    ]
+
 
 class ReconciliationConfig(BaseModel):
     """Sleep mode reconciliation settings."""
@@ -875,6 +973,35 @@ class ReconciliationConfig(BaseModel):
             'Default 0.92 mirrors Mem0\'s own cited ~0.92 cosine dedup threshold. '
             'Green-tier hot-reloadable via the reload_config MCP tool (read live '
             'per add_memory by resolve_near_dup_threshold; task 2718).'
+        ),
+    )
+
+    # Write-time TOPIC-keyed cluster guard for procedural_knowledge add_memory writes
+    # (task 2845). Complements the cosine near-dup guard above: paraphrased same-topic
+    # entries score BELOW any cosine threshold that is also safe for unrelated writes,
+    # so a recurring known-contradictory topic (e.g. "plan-tools MCP server missing in
+    # the eval worktree") kept accumulating contradictory entries the cosine guard
+    # never fired on. This deterministic substring matcher targets exactly those known
+    # clusters. Same ownership note as the near-dup fields above: enforced in the
+    # server layer (server/near_duplicate_guard.py::find_matching_topic_cluster /
+    # resolve_topic_guard_clusters + the add_memory tool), colocated on
+    # ReconciliationConfig because it is the write-time counterpart to Stage-1's
+    # reactive procedural_knowledge consolidation, not because the write path runs
+    # inside reconciliation. Read live per add_memory write off the shared config
+    # object, so it satisfies the reload.py live-read reload-safety rule.
+    procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
+        default_factory=_default_topic_guard_clusters,
+        description=(
+            'Known-contradictory procedural_knowledge topic clusters. An add_memory '
+            "write whose content contains >= a cluster's min_phrase_hits distinct "
+            'phrases is soft-blocked (error_type='
+            'ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE the cosine '
+            'near-dup search. Seeded with the two known eval-worktree clusters '
+            '(gates 2841/2844); an empty list disables the topic guard. Green-tier '
+            'hot-reloadable via the reload_config MCP tool (read live per add_memory '
+            'by resolve_topic_guard_clusters in server/near_duplicate_guard.py). '
+            'Shares the procedural_knowledge_near_dup_guard_enabled kill-switch and '
+            'the recon-stage / allow_near_duplicate exemptions with the cosine guard.'
         ),
     )
 

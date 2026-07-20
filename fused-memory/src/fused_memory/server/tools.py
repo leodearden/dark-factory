@@ -71,9 +71,12 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
+    build_topic_cluster_block,
+    find_matching_topic_cluster,
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
@@ -391,9 +394,13 @@ Conventions:
 - Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
 - Before writing a procedural_knowledge memory, search first for an existing entry on the same
   workflow/gotcha and update or skip instead of writing a near-duplicate. add_memory enforces this
-  at write time: a procedural_knowledge write that matches an existing entry at high similarity is
-  soft-blocked (error_type=ProceduralKnowledgeNearDuplicateWriteRejected); override with
-  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct.
+  at write time with two guards: (1) a deterministic topic-cluster guard that soft-blocks a write
+  matching a known-contradictory topic cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected)
+  — do not add another entry; consolidate/update the existing entries or add context to the human gate
+  task named in the hint; and (2) a cosine guard that soft-blocks a write matching an existing entry at
+  high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
+  metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
+  agents are exempt from both.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -1056,12 +1063,20 @@ def create_mcp_server(
         Before writing a procedural_knowledge memory, search first for an
         existing entry covering the same workflow/gotcha and update or skip
         instead of writing a near-duplicate. procedural_knowledge writes are
-        soft-blocked at write time when they match an existing entry at high
-        similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected);
+        soft-blocked at write time by two guards: (1) a deterministic
+        topic-cluster guard that fires FIRST when the content matches a
+        known-contradictory topic cluster
+        (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do NOT
+        add another entry; consolidate/update the existing entries for that
+        topic, or add context to the human gate task named in the block's hint;
+        and (2) a cosine near-duplicate guard when the content matches an
+        existing entry at high similarity
+        (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either,
         override with metadata={'allow_near_duplicate': True} only when the
-        content is genuinely distinct. The guard only covers writes with an
+        content is genuinely distinct. Both guards only cover writes with an
         explicit category='procedural_knowledge' (a category=None write that
-        auto-classifies to procedural_knowledge is not covered) and exempts
+        auto-classifies to procedural_knowledge is not covered), share the
+        procedural_knowledge_near_dup_guard_enabled kill-switch, and exempt
         recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
         entry that is expected to closely resemble the duplicates it
         replaces, with no ordering guarantee that those duplicates are
@@ -1076,10 +1091,10 @@ def create_mcp_server(
             agent_id: Which agent is writing (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
-                      set {'allow_near_duplicate': True} to bypass the near-duplicate
-                      write guard when the content is genuinely distinct. This flag is
-                      write-time-only and is stripped before persistence — it is never
-                      stored on the resulting memory.
+                      set {'allow_near_duplicate': True} to bypass both the topic-cluster
+                      and near-duplicate write guards when the content is genuinely
+                      distinct. This flag is write-time-only and is stripped before
+                      persistence — it is never stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
@@ -1190,6 +1205,22 @@ def create_mcp_server(
             and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
+            # Deterministic topic-keyed pre-check (task 2845): if the content
+            # matches a known-contradictory topic cluster, soft-block BEFORE the
+            # cosine search. This is strictly cheaper (no embedding round-trip)
+            # and catches same-topic paraphrases the cosine guard misses. On no
+            # match (or an empty/unconfigured clusters list) fall through to the
+            # existing cosine path unchanged. Shares the allow_near_duplicate /
+            # recon-stage exemptions and the enabled kill-switch above with the
+            # cosine guard.
+            topic_clusters = resolve_topic_guard_clusters(memory_service)
+            if topic_clusters:
+                topic_match = find_matching_topic_cluster(content, topic_clusters)
+                if topic_match is not None:
+                    matched_cluster, matched_phrases = topic_match
+                    return build_topic_cluster_block(
+                        agent_id, content, matched_cluster, matched_phrases
+                    )
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 # NOTE: this is an extra semantic search round-trip (embedding +
