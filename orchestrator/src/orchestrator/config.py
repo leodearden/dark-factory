@@ -2192,6 +2192,14 @@ class OrchestratorConfig(BaseSettings):
     # out-of-scope or cap-exhausted suggestions still flow through the
     # existing escalate_suggestions path.
     max_amendment_rounds: int = Field(default=1)
+    # Gate for the fail-safe prior-round-resolution adjudication layer (task
+    # 2523): when True (default), a post-amendment re-review runs one batched
+    # LLM adjudication pass that suppresses re-emission of suggestions already
+    # SETTLED in a PRIOR amendment round, failing SAFE toward EMIT on any
+    # error / timeout / inconclusive result.  Green-tier / opt-out — set False
+    # to disable the temporal suppression entirely (the spatial task-2750
+    # amendment-delta scope is unaffected).
+    suppress_resettled_review_suggestions: bool = Field(default=True)
     # Circuit-breaker threshold for consecutive fresh-invocation zero-output
     # timeouts (timed_out=True, turns=0, cost_usd=0.0).  After this many
     # consecutive such timeouts the orchestrator fast-fails to BLOCKED with an

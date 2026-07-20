@@ -52,6 +52,7 @@ from orchestrator.agents.roles import (
     IMPLEMENTER,
     JUDGE,
     MERGER,
+    REVIEWER_COMPREHENSIVE,
     ROLES,
     SIMPLE_TASK,
     AgentRole,
@@ -637,6 +638,50 @@ def classify_rebase_cohort(
 # reviewer line-number drift so genuine delta-adjacent findings are not routed
 # away, while fresh nits far from the amendment are still filtered (task 2750).
 _AMENDMENT_DELTA_CONTEXT_LINES = 3
+
+
+# Dedicated role for the task-2523 resettled-suggestion adjudication.
+#
+# It deliberately does NOT reuse REVIEWER_COMPREHENSIVE.  That role's contract
+# (roles.py's _REVIEWER_CONTRACT_TEMPLATE) MANDATES a `submit_review_verdict`
+# tool call and explicitly forbids JSON/prose output, and the role injects the
+# `verdict_tools` MCP family — so an agent following it would emit a review
+# verdict instead of the requested `{decisions:[...]}` StructuredOutput,
+# leaving `result.structured_output` empty and the whole suppression pass
+# silently inert (fail-safe → all-emit) while still burning a reviewer-tier
+# invocation.  This adjudicator is instead a pure structured classifier: no
+# verdict tooling (empty `mcp_families`, so `_invoke` wires NO MCP config) and
+# no file/bash tools (empty `allowed_tools`, so `_invoke` passes
+# `--allowed-tools` as None and the synthetic `StructuredOutput` schema tool is
+# not gated out), driven by a system prompt that asks ONLY for the decisions
+# schema.  It borrows REVIEWER_COMPREHENSIVE's model/budget/max-turns so the
+# routing cost profile is unchanged.  Defined here rather than in
+# agents/roles.py because this amendment is scoped to workflow.py; it is a
+# local role object, never registered in the ROLES registry (an unknown role
+# name resolves safely to its `role_default` layer in routing.resolve_route).
+_RESETTLED_ADJUDICATOR_SYSTEM_PROMPT = """\
+You are a precise CLASSIFICATION JUDGE, not a code reviewer. You are given two
+lists of review suggestions — a set raised in a PRIOR amendment round of a task,
+and the CURRENT round's suggestions — and you decide, per current suggestion,
+whether it merely re-flags a concern already resolved earlier.
+
+Return your answer ONLY as the structured `{"decisions": [...]}` payload defined
+by the output schema — one entry per current suggestion index. Do NOT call
+`submit_review_verdict` or any review/verdict tool, do NOT write prose findings,
+and do NOT perform a fresh code review. Your entire job is the comparison and
+the per-index decision; the caller reads nothing but the structured output.
+"""
+
+_RESETTLED_ADJUDICATOR = AgentRole(
+    name='resettled_adjudicator',
+    system_prompt=_RESETTLED_ADJUDICATOR_SYSTEM_PROMPT,
+    allowed_tools=[],
+    disallowed_tools=[],
+    default_model=REVIEWER_COMPREHENSIVE.default_model,
+    default_budget=REVIEWER_COMPREHENSIVE.default_budget,
+    default_max_turns=REVIEWER_COMPREHENSIVE.default_max_turns,
+    mcp_families=frozenset(),
+)
 
 
 @dataclass(frozen=True)
@@ -5438,6 +5483,17 @@ class TaskWorkflow:
                     reviews = await self._apply_amendment_delta_scope(
                         reviews, used_ctx,
                     )
+                # Temporal companion to the spatial delta scope above (task
+                # 2523): drop suggestions already SETTLED in a PRIOR amendment
+                # round so they neither re-arm the loop below nor churn the
+                # DONE-path curator routing.  Composes SPATIAL(2750) →
+                # TEMPORAL(2523); no-op on a first-pass review or when no prior
+                # archive exists, and fails safe toward EMIT on any adjudication
+                # error.  Blocking issues never reach here (short-circuited by
+                # the enclosing non-blocking arm).
+                reviews = await self._suppress_resettled_suggestions(
+                    reviews, amendment_round,
+                )
                 # L2b: try an amendment pass before escalating suggestions.
                 # In-scope suggestions (module-lock members) are applied by
                 # the implementer directly — no architect, no new tasks.
@@ -7124,6 +7180,176 @@ class TaskWorkflow:
             self.task_id, len(in_delta), len(out_of_delta),
         )
         return replace(reviews, suggestions=in_delta)
+
+    async def _adjudicate_resettled(
+        self, current_list: list[dict], prior_settled: list[dict],
+    ) -> list[str]:
+        """Batched prior-round-resolution adjudication (task 2523), fail-safe to EMIT.
+
+        Runs ONE ``_RESETTLED_ADJUDICATOR`` invocation comparing *current_list*
+        (the live suggestions) against *prior_settled* (the prior-round
+        suggestion set) and returns a per-index decision list aligned to
+        *current_list*, each drawn from {``SETTLED``, ``NOT_SETTLED``,
+        ``INCONCLUSIVE``}.  The dedicated adjudicator role is used rather than
+        ``REVIEWER_COMPREHENSIVE`` on purpose: the reviewer contract mandates a
+        ``submit_review_verdict`` tool call and injects ``verdict_tools``, which
+        would starve the ``StructuredOutput`` decisions payload this method
+        depends on and render suppression silently inert (see the role's
+        definition comment above).
+
+        Fails SAFE toward ``NOT_SETTLED`` (emit) on ANY failure: a raised
+        exception, a ``None`` / non-success / timed-out result, missing or
+        unparseable ``structured_output``, an unknown decision value, or an
+        index the model omits.  Only an explicit ``settled`` maps to
+        ``SETTLED`` — mirroring the fail-safe posture of the pure
+        :func:`~orchestrator.review_suggestions.prior_round.partition_by_decisions`
+        so neither layer can silently drop a suggestion on ambiguity or failure.
+        """
+        from orchestrator.review_suggestions.prior_round import (
+            INCONCLUSIVE,
+            NOT_SETTLED,
+            SETTLED,
+            build_resettled_adjudicator_prompt,
+        )
+
+        n = len(current_list)
+        if n == 0:
+            return []
+        fail_safe = [NOT_SETTLED] * n
+        prompt = build_resettled_adjudicator_prompt(current_list, prior_settled)
+        schema = {
+            'type': 'object',
+            'properties': {
+                'decisions': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'index': {'type': 'integer'},
+                            'decision': {
+                                'type': 'string',
+                                'enum': [SETTLED, NOT_SETTLED, INCONCLUSIVE],
+                            },
+                        },
+                        'required': ['index', 'decision'],
+                    },
+                },
+            },
+            'required': ['decisions'],
+        }
+        try:
+            assert self.worktree is not None
+            result = await self._invoke(
+                _RESETTLED_ADJUDICATOR, prompt, self.worktree,
+                output_schema=schema,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: resettled adjudication invoke raised (%s); failing '
+                'safe — emitting all %d suggestion(s)', self.task_id, exc, n,
+            )
+            return fail_safe
+        if result is None or not result.success or result.timed_out:
+            logger.warning(
+                'Task %s: resettled adjudication non-success/timed-out '
+                '(success=%s timed_out=%s); failing safe — emitting all %d '
+                'suggestion(s)', self.task_id,
+                getattr(result, 'success', None),
+                getattr(result, 'timed_out', None), n,
+            )
+            return fail_safe
+        payload = result.structured_output
+        raw_decisions = (
+            payload.get('decisions') if isinstance(payload, dict) else None
+        )
+        if not isinstance(raw_decisions, list):
+            logger.warning(
+                'Task %s: resettled adjudication returned no usable decisions; '
+                'failing safe — emitting all %d suggestion(s)', self.task_id, n,
+            )
+            return fail_safe
+        allowed = {SETTLED, NOT_SETTLED, INCONCLUSIVE}
+        # Every slot defaults to NOT_SETTLED (emit); an omitted index stays so.
+        decisions = list(fail_safe)
+        for entry in raw_decisions:
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get('index')
+            # bool is an int subclass — reject it so decisions[True] can't alias.
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                continue
+            if not (0 <= idx < n):
+                continue
+            verdict = entry.get('decision')
+            decisions[idx] = verdict if verdict in allowed else NOT_SETTLED
+        settled_count = sum(1 for d in decisions if d == SETTLED)
+        logger.info(
+            'Task %s: resettled adjudication — %d/%d suggestion(s) settled',
+            self.task_id, settled_count, n,
+        )
+        return decisions
+
+    async def _suppress_resettled_suggestions(
+        self, reviews: ReviewAggregation, amendment_round: int,
+    ) -> ReviewAggregation:
+        """Suppress suggestions already SETTLED in a PRIOR amendment round (task 2523).
+
+        The TEMPORAL companion to :meth:`_apply_amendment_delta_scope` (spatial):
+        once at least one amendment round has archived a prior verdict, a
+        batched LLM adjudication (:meth:`_adjudicate_resettled`) decides which
+        of the current suggestions merely re-flag a concern the team already
+        settled, and those are dropped from the returned verdict so they neither
+        re-arm the amendment loop nor churn the DONE-path curator routing.
+
+        No-op (returns *reviews* unchanged) when the gate is off, this is a
+        first-pass review (``amendment_round < 1``), there are no suggestions,
+        the artifacts root is unavailable, or no prior-round archive exists —
+        keeping the common single-round path a cheap no-op.  Only
+        ``suggestions`` is ever filtered; ``blocking_issues`` /
+        ``has_blocking_issues`` / ``reviews`` / ``reviewer_errors`` pass through
+        untouched (blocking issues are the safety valve).  Fails SAFE: any
+        adjudication error keeps every suggestion (loud-over-silent).
+        """
+        from orchestrator.review_suggestions.prior_round import (
+            load_prior_round_suggestions,
+            partition_by_decisions,
+        )
+
+        if not self.config.suppress_resettled_review_suggestions:
+            return reviews
+        if amendment_round < 1:
+            return reviews
+        if not reviews.suggestions:
+            return reviews
+        if self.artifacts is None:
+            return reviews
+        prior = load_prior_round_suggestions(self.artifacts.root)
+        if not prior:
+            return reviews
+
+        try:
+            decisions = await self._adjudicate_resettled(
+                reviews.suggestions, prior,
+            )
+            kept, suppressed = partition_by_decisions(
+                reviews.suggestions, decisions,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: resettled suppression failed (%s); keeping all %d '
+                'suggestion(s) (fail-safe)',
+                self.task_id, exc, len(reviews.suggestions),
+            )
+            return reviews
+
+        if not suppressed:
+            return reviews
+        logger.info(
+            'Task %s: suppressed %d re-flagged suggestion(s) already settled '
+            'in a prior amendment round; %d kept',
+            self.task_id, len(suppressed), len(kept),
+        )
+        return replace(reviews, suggestions=kept)
 
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
         """Run all 5 reviewers with stagger, retry errors.
