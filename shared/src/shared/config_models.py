@@ -71,6 +71,13 @@ class UsageCapConfig(BaseModel):
         default=None,
         description='Path to shared YAML file with accounts list (overrides inline accounts)',
     )
+    scoped_cap_models: list[str] = Field(
+        default_factory=lambda: ['claude-fable-5'],
+        description=(
+            'Models tracked in a separate per-(account, model) cap scope; '
+            '[] disables scoping entirely (kill switch).'
+        ),
+    )
 
     @model_validator(mode='after')
     def _load_accounts_file(self) -> UsageCapConfig:

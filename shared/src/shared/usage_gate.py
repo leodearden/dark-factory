@@ -130,6 +130,36 @@ _LEGAL_TRANSITIONS: dict[AccountPhase, frozenset[AccountPhase]] = {
 }
 
 
+def scope_for(model: str, config: UsageCapConfig) -> str | None:
+    """Derive the cap scope a model belongs to.
+
+    Returns the model string itself when ``model`` is a scoped-cap model (it
+    gets its own per-account cap scope), else an explicit ``None`` — the general
+    scope, i.e. today's exact paths. With ``config.scoped_cap_models`` empty (the
+    kill switch) this always returns ``None``, so every model — including a
+    formerly-scoped one — falls back to the general scope (boundary B6).
+    """
+    if model in config.scoped_cap_models:
+        return model
+    return None
+
+
+@dataclass
+class ScopeCap:
+    """Per-(account, model) cap overlay — a flag+timer snapshot, NOT a phase machine.
+
+    A lightweight mirror of the account-level cap flags/timers scoped to a single
+    model (see :func:`scope_for`), lazily populated by later tasks when a scoped
+    cap is actually observed. The account-level :class:`AccountPhase` machine is
+    untouched — this is a pure overlay (PRD decision 1).
+    """
+
+    capped: bool = False
+    resets_at: datetime | None = None
+    near_cap: bool = False
+    capped_at: datetime | None = None
+
+
 @dataclass
 class AccountState:
     """Per-account cap tracking."""
@@ -149,6 +179,12 @@ class AccountState:
     # detect whether the account has re-transitioned since the lease was
     # taken — see `UsageGate.lease_is_current`.
     generation: int = 0
+
+    # Per-(account, model) cap overlay (task 2855 / PRD scope substrate).
+    # Lazily populated by later tasks when a scoped cap is observed; keys are a
+    # subset of UsageCapConfig.scoped_cap_models. Empty by default, so today's
+    # general (unscoped) paths stay byte-identical.
+    scope_caps: dict[str, ScopeCap] = field(default_factory=dict)
 
     # --- Legacy-compat boolean shim -----------------------------------
     #
