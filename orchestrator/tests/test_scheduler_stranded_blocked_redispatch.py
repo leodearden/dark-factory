@@ -386,6 +386,108 @@ class TestRedispatchStrandedBlockedParkProtection:
         scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
 
+class TestRedispatchStrandedBlockedExceptionIsolation:
+    """Task 2849: per-task exception isolation in the sweep loop.
+
+    The un-guarded ``for task in ctx.tasks:`` loop previously let ONE
+    task's write/predicate raise propagate out of the whole phase,
+    collateral-stranding every genuinely-stranded sibling that sorts AFTER
+    the raising task in ``ctx.tasks`` for that tick (and every tick after,
+    if the failure recurs). These tests pin the fix: a per-task failure
+    must be isolated (logged loudly, then skipped) so it can never abort
+    the batch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_earlier_task_write_raises_does_not_strand_later_sibling(
+        self, caplog,
+    ):
+        """An earlier-iterated sibling's ``set_task_status`` raising must not
+        prevent a later-iterated, genuinely-stranded sibling from still
+        being flipped to pending — and the failure must be logged loudly
+        (WARNING naming the failing task), not swallowed silently."""
+        import logging
+
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+
+        dep_done = {'id': '9', 'status': 'done'}
+        t_fail = _blocked_task('5234')
+        t_ok = _blocked_task('5236')
+        ctx = TickContext(
+            tasks=[dep_done, t_fail, t_ok],
+            status_map={'9': 'done'},
+            tasks_by_id={'9': dep_done, '5234': t_fail, '5236': t_ok},
+        )
+
+        async def _raise_for_5234(task_id, status):
+            if task_id == '5234':
+                raise RuntimeError('transient backend failure')
+            return None
+
+        scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_raise_for_5234
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_any_await(  # type: ignore[attr-defined]
+            '5236', 'pending'
+        )
+        warning_text = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert '5234' in warning_text, (
+            f'Expected a WARNING naming the failing task 5234; got: {warning_text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_reify_shape_self_failing_task_does_not_collateral_strand_later_sibling(
+        self,
+    ):
+        """Faithful reify-incident shape: three sibling blocked tasks share
+        identical satisfied deps (mirrors the observed 5233/5234/5235
+        cluster). The MIDDLE task's status flip raises; the EARLIER sibling
+        (5233) still flips, and — the actual defect this task fixes — the
+        LATER sibling (5235) must NOT be collateral-stranded by 5234's
+        raise."""
+        scheduler = _make_scheduler()
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+
+        dep_done = {'id': '9', 'status': 'done'}
+        t5233 = _blocked_task('5233')
+        t5234 = _blocked_task('5234')
+        t5235 = _blocked_task('5235')
+        ctx = TickContext(
+            tasks=[dep_done, t5233, t5234, t5235],
+            status_map={'9': 'done'},
+            tasks_by_id={
+                '9': dep_done, '5233': t5233, '5234': t5234, '5235': t5235,
+            },
+        )
+
+        async def _raise_for_5234(task_id, status):
+            if task_id == '5234':
+                raise RuntimeError('transient backend failure')
+            return None
+
+        scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_raise_for_5234
+        )
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_any_await(  # type: ignore[attr-defined]
+            '5233', 'pending'
+        )
+        scheduler.set_task_status.assert_any_await(  # type: ignore[attr-defined]
+            '5235', 'pending'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Harness wiring (step-11/12): the escalation queue injected into the
 # scheduler is the fail-safe consumer for mechanism 2's no-open-escalation
