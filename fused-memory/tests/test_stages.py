@@ -6719,6 +6719,83 @@ class TestSweepStaleMem0FlagMarkers:
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_skips_scroll_when_count_is_zero(self):
+        """When count_memories_by_metadata reports an exact 0, the scroll is
+        skipped entirely (task 2853 review, efficiency finding) — once the
+        legacy pool drains, this sweep must not keep re-scrolling an
+        already-empty pool every cycle forever."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
+
+        assert result == 0
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        call = memory_service.count_memories_by_metadata.call_args
+        assert call.kwargs.get('filters') == {'source': 'stage1_flag_marker'}
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_fails_open_to_scroll_on_error(self):
+        """A count_memories_by_metadata failure must fall through to the
+        normal scroll path unchanged, not skip the sweep — the short
+        circuit may only ever skip work the scroll would itself have found
+        empty, and must never mask a genuine failure or a non-empty pool."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_persistence_markers_sweep_never_probes_count(self):
+        """_sweep_stale_persistence_markers must NOT call
+        count_memories_by_metadata at all — the count short circuit is
+        scoped to the retired stage1_flag_marker pool only (task 2853
+        review): stage2_persistence_marker's writer is still active, so a
+        zero count would be a rare transient, not the steady state."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(memory_service, 'reify', run_id='r1')
+
+        assert result == 0
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+
 
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
