@@ -48,7 +48,7 @@ entries:
   - shared/src/shared/cli_invoke.py
   fix_effort: S
   known_cause_match: Escalation-resolution semantics traps (cap is by design) + feedback notes exist — but the structural gap (envelope never declared at spawn; lessons can't persist in-context) is new
-  filed_tasks: '2555, 2796'
+  filed_tasks: 2555, 2796
   origin_phase: unknown
   manifested_phase: unknown
   sightings: []
@@ -282,7 +282,20 @@ entries:
   known_cause_match: Partially matches project_id form asymmetry (root-guessing) and Stage-3 ledger gap (queued 2436/2437); the run_id-scoped flag-loss mechanism is new
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 06bcfa61-b52e-49ec-88e2-e169fc6b12c2
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Integrity stage confirmed 1 inconsistency but filed 0 findings (finding visibility loss). Also: 16 MCP write_journal operations in action log but 0 journal entries in final report — output pipeline opacity.'
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 5c0e2562-aed4-4bdc-a7b8-8dd213eb8a49
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: Flag marker acknowledgment lifecycle — zero acknowledgments across both stage-1 and stage-2 despite flag generation and marker sweeps
+    note: 'Recon run shows memory_consolidator generating 1 escalation (findings_filed: 1.0) and adding 2 memories, but downstream stages exhibit zero flag-marker acknowledgments (stage1_flag_markers_acknowledged: 0, stage2_flag_markers_acknowledged: 0). Task_knowledge_sync then performs recon_markers_gc_swept: 1, suggesting markers are being garbage-collected without proper lifecycle state acknowledgment — textbook flag-drop silencing described in the entry.'
 - id: fused-memory-api-traps
   title: 'fused-memory tool contracts lie or under-inform: destructive-by-default writes, envelope asymmetry, silent filters, unusable oversized outputs'
   severity: medium
@@ -469,3 +482,16 @@ candidates:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: Task 2719 description cites 'esc-2698-9' as the deferral-recording escalation, while Graphiti episode de985921-2f36-43cc-8165-30f5398ad5a3 (written same timestamp, describing identical event) cites 'esc-2698-10'. Suggested action requires external escalation-service lookup to adjudicate which ID is authoritative.
+- id: cand-20260719-1
+  title: Recon run produces zero journal entries despite substantive processing
+  cause: Journal output pipeline fails to surface or persist findings from multiple recon stages despite write_journal operations completing
+  area: recon output / journal lifecycle
+  first_seen: '2026-07-19'
+  disposition: pending
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 06bcfa61-b52e-49ec-88e2-e169fc6b12c2
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: Journal Entries (0 total) [] despite 99 LLM calls across 3 stages (memory_consolidator:36, task_knowledge_sync:32, integrity_check:31), 16 MCP write_journal ops, and confirmed_inconsistency=1
