@@ -339,6 +339,41 @@ def merge_retry_shadow_baseline(
     return merged
 
 
+def build_warm_shadow_results(
+    test_output: str, attempt0_verdicts: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build the warm shadow baseline from the (possibly narrowed) verify output.
+
+    Parses ``test_output`` into a per-test verdict map and, **only** when BOTH
+    the parse is non-empty AND an attempt-0 verdict map is supplied (i.e. the
+    final warm verify was a corroborated narrowed retry), unions attempt-0's
+    passes via :func:`merge_retry_shadow_baseline` so the from-scratch cold
+    shadow compare sees no phantom ``only_cold`` divergence (PRD
+    verify-retry-failed-only D4, §5.4).
+
+    An **empty parse is returned verbatim** — never unioned — so that the
+    caller's fail-closed ``_alarm_warm_shadow_unparseable`` path remains
+    reachable and an unparseable narrowed retry is never silently turned into a
+    non-empty PARTIAL baseline.  A ``None``/empty ``attempt0_verdicts`` (the
+    non-narrowed warm path) returns the parse verbatim — byte-identical to the
+    pre-D4 ``parse_per_test_results(test_output)`` behaviour.
+
+    Args:
+        test_output: Raw output from the final warm verify run.
+        attempt0_verdicts: The attempt-0 per-test verdict map, supplied only on
+            the corroborated-narrowed path; ``None``/empty on the non-narrowed
+            path.
+
+    Returns:
+        ``dict[str, str]``: the merged (attempt-0 ∪ retry) baseline on the
+        narrowed path with a non-empty parse; otherwise the plain parse.
+    """
+    retry = parse_per_test_results(test_output)
+    if retry and attempt0_verdicts:
+        return merge_retry_shadow_baseline(attempt0_verdicts, retry)
+    return retry
+
+
 # Matches cargo-nextest Summary footer lines, e.g.:
 #   Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped
 #   Summary [   0.13s]   1 test run: 1 passed, 0 failed, 0 skipped   (N==1 → singular)
