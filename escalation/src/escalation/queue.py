@@ -1085,16 +1085,22 @@ class EscalationQueue:
         """Atomically rewrite an escalation's JSON file."""
         self._atomic_write(escalation_id, escalation.to_json())
 
-    def _atomic_write(self, escalation_id: str, json_text: str) -> None:
+    def _atomic_write(self, escalation_id: str, json_text: str, *, durable: bool = False) -> None:
         """Write *json_text* atomically to ``queue_dir/{escalation_id}.json``.
 
         Thin wrapper around ``_atomic_write_path`` that constructs the target
         path from *escalation_id* and ``queue_dir``.  Always writes to the queue
         root — not the archive.
 
-        Callers: submit(), resolve(), submit_resolved(), _rewrite().
+        *durable*, when True, is forwarded to ``_atomic_write_path``'s existing
+        fsync branch (temp-file fd before rename, containing-directory fd
+        after) — the same durability guarantee ``_write_seq_counter`` already
+        uses. Defaults to False so existing callers are byte-identical.
+
+        Callers: submit() (durable=True), resolve(), submit_resolved(), _rewrite()
+        (the latter three keep the default durable=False).
         """
-        self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text)
+        self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text, durable=durable)
 
     def _atomic_write_path(self, path: Path, json_text: str, *, durable: bool = False) -> None:
         """Write *json_text* atomically to *path*.
