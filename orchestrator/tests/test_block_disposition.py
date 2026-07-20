@@ -223,6 +223,26 @@ class TestClassifyFailureKnownRows:
         assert disp.reason_prefix == 'warm_lane_soft_pressure (backpressure)'
         assert disp.category is FailureCategory.NONE
 
+    def test_warm_lane_reseed_contaminated_requeues_and_counts_against_cap(self):
+        """Reseed contamination (task 2854) is a DATA-INTEGRITY fault, not
+        transient backpressure: REQUEUE (re-acquire a DIFFERENT lane), never
+        escalates directly, but — unlike the transient DiskPressure/HardDown/
+        SoftPressure rows — DOES count against the requeue cap so a persistent
+        contamination eventually trips the requeue-cap escalation (a loud human
+        signal) instead of looping silently. Distinct reason_prefix.
+        """
+        from orchestrator.git_ops import WarmLaneReseedContaminated
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+        disp = classify_failure(
+            WarmLaneReseedContaminated('lane retained prior commits'),
+        )
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.escalate_to_human is False
+        assert disp.counts_against_requeue_cap is True
+        assert disp.reason_prefix == 'warm_lane_reseed_contaminated (data-integrity)'
+        assert disp.category is FailureCategory.NONE
+
     def test_bare_warm_lane_requeue_base_matches_old_else_branch_fallback(self):
         """Amendment (reviewer_comprehensive behavior-parity): a bare
         WarmLaneRequeue (none of the 3 named subclasses) is never raised
