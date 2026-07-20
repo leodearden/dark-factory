@@ -19,15 +19,20 @@ rather than depending on another test module's module-level helpers.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
+    WarmLaneUnavailable,
+    WorktreeInfo,
     _run,
 )
+from orchestrator.lane_lifecycle import LaneState
 
 # ---------------------------------------------------------------------------
 # Repo fixture (copied from test_lane_lifecycle_gitops.py — self-contained)
@@ -182,3 +187,106 @@ class TestReseedVerifiedCleanPredicate:
         assert await git_ops._reseed_verified_clean(
             lane, 'task/NEW', 'nonexistent-ref-deadbeefdeadbeef',
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED — acquire-path wiring (RESEED_CONTAMINATED sentinel + gate)
+# ---------------------------------------------------------------------------
+
+
+async def _contaminating_reset(lane_dir, full_branch, target_commit) -> None:
+    """Stand-in for :meth:`GitOps._reset_warm_lane` that reproduces the reify
+    incident shape: instead of resetting the lane to base, it leaves
+    *full_branch* checked out 1 commit BEYOND main (a retained prior-occupant
+    commit). The reset itself "succeeds" (never raises), so the recycle path
+    proceeds to the shared tail exactly as it would after a real — but
+    contaminated — reseed."""
+    await _run(['git', 'checkout', '-f', '-B', full_branch, 'main'], cwd=lane_dir)
+    (Path(lane_dir) / 'prior_occupant.txt').write_text('retained prior task work\n')
+    await _run(['git', 'add', '-A'], cwd=lane_dir)
+    await _run(
+        ['git', 'commit', '-m', 'retained prior-occupant commit (contamination)'],
+        cwd=lane_dir,
+    )
+
+
+@pytest.mark.asyncio
+class TestAcquireReseedContaminationGate:
+    """The fresh-reseed acquire routes (RECYCLE / CREATE_ONCE_FRESH) must
+    verify the reseed landed clean BEFORE returning a dispatchable
+    WorktreeInfo. A contaminated reseed faults to
+    ``WarmLaneUnavailable.RESEED_CONTAMINATED`` (lane released FREE, never
+    ASSIGNED) instead of dispatching onto the stale tree; a genuinely-clean
+    recycle is unaffected (no false positive)."""
+
+    async def test_contaminated_recycle_faults_and_releases_lane(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+        start_ref = await _get_head(git_repo)
+
+        # Seed the pool's only lane via a normal create-once acquire, then
+        # bare-release it back to FREE (still a registered worktree on disk) —
+        # exactly the state a recycled lane is found in by the next acquire.
+        info_old = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(info_old, WorktreeInfo), f'seed acquire failed: {info_old!r}'
+        lane = info_old.path
+        await git_ops.warm_lane_pool.release(lane)
+
+        # Force the reset-in-place recycle to leave task/NEW 1 commit over
+        # main (the incident shape) instead of resetting to base.
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch.object(
+                    git_ops, '_reset_warm_lane',
+                    AsyncMock(side_effect=_contaminating_reset),
+                ):
+            result = await git_ops.acquire_warm_lane('NEW', start_ref)
+
+        # (a) The sentinel, NOT a dispatchable WorktreeInfo.
+        assert result is WarmLaneUnavailable.RESEED_CONTAMINATED, (
+            f'Expected RESEED_CONTAMINATED sentinel; got {result!r}'
+        )
+        assert not isinstance(result, WorktreeInfo)
+
+        # (b) The lane is released back to FREE — never left ASSIGNED, so
+        # nothing is dispatched onto the stale tree.
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            'contaminated lane must be released FREE, not left ASSIGNED'
+        )
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is None or record.state is not LaneState.ASSIGNED, (
+            f'durable record must not be ASSIGNED after contamination; got {record!r}'
+        )
+
+        # (c) A WARNING naming the reseed contamination (data-integrity signal).
+        low = caplog.text.lower()
+        assert 'reseed' in low and 'contaminat' in low, (
+            f'expected a reseed-contamination WARNING; caplog:\n{caplog.text}'
+        )
+
+    async def test_clean_recycle_still_assigns_no_false_positive(
+        self, git_repo: Path,
+    ):
+        """A normal (unpatched) recycle acquire of a fresh task on a released
+        lane still lands a clean reseed → returns a WorktreeInfo with an
+        ASSIGNED durable record (the gate must not false-positive)."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+        start_ref = await _get_head(git_repo)
+
+        info_old = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(info_old, WorktreeInfo), f'seed acquire failed: {info_old!r}'
+        await git_ops.warm_lane_pool.release(info_old.path)
+
+        result = await git_ops.acquire_warm_lane('FRESH', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'a clean recycle reseed must return a WorktreeInfo; got {result!r}'
+        )
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED, (
+            f'a clean recycle must leave an ASSIGNED durable record; got {record!r}'
+        )
