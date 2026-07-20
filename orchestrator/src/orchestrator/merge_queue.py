@@ -36,6 +36,7 @@ from orchestrator.git_ops import (
     AdvanceOutcome,
     GitOps,
     MergeResult,
+    MergeVerifyLeaseContended,
     WorktreeMissing,
     _run,
 )
@@ -12752,6 +12753,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_wt=merge_wt,
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
+            )
+        except MergeVerifyLeaseContended as exc:
+            # The merge-verify lane lock stayed contended past its bounded wait,
+            # so merge_verify_lease RAISED rather than run this verify
+            # UNPROTECTED (task 2828, limb 2). This is a transient "come back
+            # later," not a verify failure — DEFER by re-queuing for a later
+            # re-verify, mirroring the operator-halt abort branch above VERBATIM
+            # (release_or_cleanup + put_nowait + on_requeued + _note_requeue +
+            # InflightStatus.REQUEUED). req.result is left PENDING and the
+            # per-task dead-verify-abort counter is untouched, so this never
+            # counts as a dead-verify abort or a 'blocked' resolution. Placed
+            # BEFORE the generic `except Exception`, which would otherwise map
+            # it to MergeOutcome('blocked'). The verify_task has already failed
+            # (the lease raised on acquire, before the verify body ran), so
+            # there is no in-flight verify to abort/cancel here.
+            logger.warning(
+                'Task %s: merge-verify lease contended (%s) — re-queuing '
+                'merge for re-verify rather than running the verify unprotected',
+                req.task_id, exc,
+            )
+            await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+            self._queue.put_nowait(req)
+            self._request_ledger.on_requeued(req.request_id)
+            self._note_requeue(req.request_id, live_obj=req)
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=None,
+                status=InflightStatus.REQUEUED,
             )
         except Exception as exc:
             logger.info(
