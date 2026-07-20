@@ -37,11 +37,10 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from shared.proc_group import scan_process_groups_under_path as _real_scan
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
-from shared.proc_group import scan_process_groups_under_path as _real_scan
-
 
 # ---------------------------------------------------------------------------
 # Helpers (mirroring test_merge_verify_lease_guard.py's GitOps fixtures and
