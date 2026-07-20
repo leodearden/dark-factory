@@ -7411,6 +7411,106 @@ class TestMergeGuardModuleConfigs:
         assert 'No source files' in result.summary
 
 
+class TestMergeBackstopModuleConfigs:
+    """Integration: the manifest-drift backstop (task 2838) wires into the
+    module_configs trivial-pass branch.
+
+    Mirrors TestMergeGuardModuleConfigs, but DELIBERATELY omits the reify guard
+    script (so _verify_pipeline_guard_requires_full_gate falls open) and
+    instead configures merge_config_only_full_gate_globs. The added config-only
+    file (orchestrator/tests/new_case.sh — .sh under a real subproject prefix,
+    so _has_source_files is False and scoped=[]) matches the configured glob;
+    an override routes to per-subproject fan-out.
+    """
+
+    def _write_case_sh(self, worktree: Path) -> None:
+        """Create orchestrator/tests/new_case.sh (config-only .sh under a subproject prefix)."""
+        tests_dir = worktree / 'orchestrator' / 'tests'
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / 'new_case.sh').write_text('#!/usr/bin/env bash\n')
+
+    def _make_config(self, tmp_path: Path, globs=None) -> OrchestratorConfig:
+        from orchestrator.config import GitConfig
+
+        kwargs = {}
+        if globs is not None:
+            kwargs['git'] = GitConfig(merge_config_only_full_gate_globs=globs)
+        return OrchestratorConfig(project_root=tmp_path, **kwargs)
+
+    def _module_configs(self) -> list[ModuleConfig]:
+        return [ModuleConfig(prefix='orchestrator', test_command='__orch_cmd__')]
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches + role='merge' + NO guard script (consult falls
+        open) → trivial-pass overridden by backstop; per-subproject fan-out runs."""
+        self._write_case_sh(tmp_path)
+        # Deliberately NO guard script → consult falls open; backstop is the
+        # sole override trigger.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*.sh']),
+                self._module_configs(),
+                task_files=['orchestrator/tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__orch_cmd__' in joined, (
+            f'Expected per-subproject fan-out command in calls; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass overridden by backstop; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_task_role_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches but role='task' (default) → trivial pass
+        preserved (backstop is role-gated to merge)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*.sh']),
+                self._module_configs(),
+                task_files=['orchestrator/tests/new_case.sh'],
+                # role='task' is the default
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run for task role; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_empty_globs_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Empty globs (default) + role='merge' + NO guard script → trivial pass
+        preserved (backward-compat no-op: backstop False, consult falls open)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),  # default empty globs
+                self._module_configs(),
+                task_files=['orchestrator/tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run with empty globs; got: {calls}'
+        assert 'No source files' in result.summary
+
+
 @pytest.mark.asyncio
 class TestRunVerificationGovernRouting:
     """Integration tests for the merge-role cpu-governance wiring in
