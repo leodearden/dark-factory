@@ -6131,6 +6131,82 @@ class TestBornAtL2GatesMergeEntry:
         assert len(pending) == 1
 
 
+class TestFormatReescalationDetail:
+    """Unit test of ``_format_reescalation_detail`` (task 2553).
+
+    Pins the rendered detail text built from the ``Escalation`` objects an
+    ``_StewardReescalated`` exception carries, so ``_mark_blocked``'s
+    ``detail=`` stops duplicating ``reason`` when the steward re-escalates
+    to a human (workflow.py:2444's ``except _StewardReescalated`` clause).
+    """
+
+    def test_single_escalation_contains_all_fields(self):
+        from escalation.models import Escalation
+
+        from orchestrator.workflow import _format_reescalation_detail
+
+        e = Escalation(
+            id='esc-x-1',
+            task_id='42',
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='Stop-the-line: critical risk',
+            detail='Born at L2 — cannot be auto-resolved by steward',
+            level=2,
+            workflow_state='verify',
+            resolution_turns=3,
+        )
+
+        result = _format_reescalation_detail([e])
+
+        assert 'esc-x-1' in result
+        assert 'Born at L2 — cannot be auto-resolved by steward' in result
+        assert 'Stop-the-line: critical risk' in result
+        assert 'verify' in result
+        assert '3' in result
+        # Detail must not be a bare copy of the summary.
+        assert result != 'Stop-the-line: critical risk'
+
+    def test_multi_escalation_renders_both(self):
+        from escalation.models import Escalation
+
+        from orchestrator.workflow import _format_reescalation_detail
+
+        e1 = Escalation(
+            id='esc-x-1',
+            task_id='42',
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='First escalation summary',
+            detail='First escalation detail text',
+            level=2,
+        )
+        e2 = Escalation(
+            id='esc-x-2',
+            task_id='42',
+            agent_role='debugger',
+            severity='urgent',
+            category='infra_issue',
+            summary='Second escalation summary',
+            detail='Second escalation detail text',
+            level=1,
+        )
+
+        result = _format_reescalation_detail([e1, e2])
+
+        assert 'esc-x-1' in result
+        assert 'First escalation detail text' in result
+        assert 'esc-x-2' in result
+        assert 'Second escalation detail text' in result
+
+    def test_empty_list_returns_empty_string(self):
+        from orchestrator.workflow import _format_reescalation_detail
+
+        assert _format_reescalation_detail([]) == ''
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestBornAtL2HaltsRunViaWaitForResolution:
