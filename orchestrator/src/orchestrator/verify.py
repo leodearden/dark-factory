@@ -4985,15 +4985,20 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                should_override = (
-                    role == 'merge'
-                    and await _verify_pipeline_guard_requires_full_gate(
+                # Cheap deterministic backstop (task 2838) OR'd first so it
+                # short-circuits the verify-pipeline-guard.sh subprocess on the
+                # merge hot path; empty globs (default) → False → expression
+                # byte-identical to the guard-only behaviour.
+                should_override = role == 'merge' and (
+                    _merge_config_only_diff_forces_full_gate(config, existing_files)
+                    or await _verify_pipeline_guard_requires_full_gate(
                         worktree, existing_files,
                     )
                 )
                 if should_override:
                     logger.info(
-                        'config-only fast-path overridden by verify-pipeline-guard'
+                        'config-only fast-path overridden by manifest-drift'
+                        ' backstop or verify-pipeline-guard'
                         ' — running full gate (no-module_configs merge path)',
                     )
                     # Fall through to the existing global run_verification path.
