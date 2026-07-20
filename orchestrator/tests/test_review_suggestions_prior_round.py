@@ -114,3 +114,52 @@ class TestLoadPriorRoundSuggestions:
         })
         result = _load()(tmp_path)
         assert [i['description'] for i in result] == ['good']
+
+
+class TestPartitionByDecisions:
+    """``partition_by_decisions(current, decisions)`` — fail-safe partition."""
+
+    @staticmethod
+    def _fn():
+        from orchestrator.review_suggestions.prior_round import (
+            partition_by_decisions,
+        )
+        return partition_by_decisions
+
+    def test_settled_is_suppressed(self):
+        """(a) A suggestion whose decision == SETTLED is suppressed."""
+        from orchestrator.review_suggestions.prior_round import (
+            NOT_SETTLED,
+            SETTLED,
+        )
+        s0 = _issue('suggestion', 's0')
+        s1 = _issue('suggestion', 's1')
+        kept, suppressed = self._fn()([s0, s1], [SETTLED, NOT_SETTLED])
+        assert kept == [s1]
+        assert suppressed == [s0]
+
+    def test_non_settled_values_keep(self):
+        """(b) NOT_SETTLED, INCONCLUSIVE, and unknown strings all keep."""
+        from orchestrator.review_suggestions.prior_round import (
+            INCONCLUSIVE,
+            NOT_SETTLED,
+        )
+        items = [_issue('suggestion', f's{i}') for i in range(3)]
+        kept, suppressed = self._fn()(
+            items, [NOT_SETTLED, INCONCLUSIVE, 'garbage_value']
+        )
+        assert kept == items
+        assert suppressed == []
+
+    def test_missing_decisions_keep_fail_safe(self):
+        """(c) Indices past the end of `decisions` are KEPT (fail-safe)."""
+        from orchestrator.review_suggestions.prior_round import SETTLED
+        items = [_issue('suggestion', f's{i}') for i in range(3)]
+        # Only the first suggestion has a decision; indices 1 and 2 are missing.
+        kept, suppressed = self._fn()(items, [SETTLED])
+        assert kept == items[1:]
+        assert suppressed == [items[0]]
+
+    def test_empty_current_returns_empty_pair(self):
+        """(d) Empty current → ([], [])."""
+        assert self._fn()([], []) == ([], [])
