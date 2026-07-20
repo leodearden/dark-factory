@@ -14,8 +14,16 @@ byte-level contract prefix, CLI exit codes) — never on docstrings/prose.
 
 from __future__ import annotations
 
-from orchestrator.evals.prompt_opt import split_corpus
-from orchestrator.evals.prompt_opt.smoke import build_fixture_corpus
+import pytest
+from shared.prompt_artifact import compose_prompt
+
+from orchestrator.evals.prompt_opt import measure_repeatability_band, split_corpus
+from orchestrator.evals.prompt_opt.smoke import (
+    _SMOKE_EXECUTOR_MODEL,
+    SmokeReviewerScorer,
+    _smoke_rollout_fn,
+    build_fixture_corpus,
+)
 
 
 class TestFixtureCorpus:
@@ -56,3 +64,100 @@ class TestFixtureCorpus:
         assert split.test, 'test split is empty'
         # exhaustive + disjoint: every item lands in exactly one split
         assert len(split.train) + len(split.selection) + len(split.test) == len(corpus)
+
+
+class TestHermeticSeams:
+    """The two LLM-free seams: the executor-model-asserting rollout_fn and the
+    verdict-vs-gold Scorer with a bounded occurrence-keyed jitter cycle."""
+
+    @pytest.mark.asyncio
+    async def test_rollout_fn_requires_executor_model_and_is_deterministic(self) -> None:
+        item = build_fixture_corpus()[0]
+        composed = compose_prompt('CONTRACT', 'HEUR SMOKE_QUALITY=0.60')
+
+        out = await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+        # derived only from (item, composed_prompt) — never invoke_agent
+        assert out == (
+            f'rollout::{item.item_id}::gold={item.gold_verdict}/{item.gold_severity}::{composed}'
+        )
+        # deterministic: identical inputs -> byte-identical rollout
+        assert out == await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+        # must ALWAYS be called with the executor model (structural guarantee)
+        with pytest.raises(AssertionError):
+            await _smoke_rollout_fn(composed, item, 'not-the-executor-model')
+
+    @pytest.mark.asyncio
+    async def test_scorer_returns_float_in_unit_interval(self) -> None:
+        scorer = SmokeReviewerScorer()
+        item = build_fixture_corpus()[0]
+        composed = compose_prompt('CONTRACT', 'HEUR SMOKE_QUALITY=0.60')
+        rollout = await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+        score = await scorer.score(item, rollout)
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    @pytest.mark.asyncio
+    async def test_agreement_scores_higher_than_disagreement(self) -> None:
+        # For a FIXED heuristics/quality, a rollout whose reported verdict
+        # AGREES with the item's gold scores strictly higher than one that
+        # disagrees.
+        scorer = SmokeReviewerScorer()
+        item = next(
+            i for i in build_fixture_corpus()
+            if i.gold_verdict == 'ISSUES_FOUND' and i.gold_severity == 'blocking'
+        )
+        composed = compose_prompt('CONTRACT', 'HEUR SMOKE_QUALITY=0.50')
+        # the hermetic rollout reports gold == item's true gold -> agreement
+        agree_rollout = await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+        # a crafted rollout reporting a DIFFERENT verdict -> disagreement (same quality)
+        disagree_rollout = agree_rollout.replace(
+            f'gold={item.gold_verdict}/{item.gold_severity}::', 'gold=PASS/None::'
+        )
+        assert disagree_rollout != agree_rollout
+        agree_score = await scorer.score(item, agree_rollout)
+        disagree_score = await scorer.score(item, disagree_rollout)
+        assert agree_score > disagree_score
+
+    @pytest.mark.asyncio
+    async def test_higher_sentinel_yields_higher_mean_score(self) -> None:
+        item = build_fixture_corpus()[0]
+
+        async def mean_score(sentinel: str, n: int = 6) -> float:
+            scorer = SmokeReviewerScorer()
+            composed = compose_prompt('CONTRACT', f'HEUR {sentinel}')
+            rollout = await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+            return sum([await scorer.score(item, rollout) for _ in range(n)]) / n
+
+        low = await mean_score('SMOKE_QUALITY=0.50')
+        high = await mean_score('SMOKE_QUALITY=0.70')
+        assert high > low
+
+    @pytest.mark.asyncio
+    async def test_absent_sentinel_defaults_to_baseline_quality(self) -> None:
+        # The REAL reviewer baseline heuristics carry no SMOKE_QUALITY sentinel
+        # -> default 0.50, so the real baseline reads as baseline quality.
+        item = build_fixture_corpus()[0]
+        scorer = SmokeReviewerScorer()
+        composed = compose_prompt('CONTRACT', 'real reviewer heuristics — no sentinel here')
+        rollout = await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+        score = await scorer.score(item, rollout)
+        # agreement path at the 0.50 default, within the +-0.03 jitter band
+        assert abs(score - 0.50) <= 0.05
+
+    @pytest.mark.asyncio
+    async def test_jitter_cycle_yields_positive_reproducible_variance_band(self) -> None:
+        item = build_fixture_corpus()[0]
+        scorer = SmokeReviewerScorer()
+        composed = compose_prompt('CONTRACT', 'HEUR SMOKE_QUALITY=0.50')
+        rollout = await _smoke_rollout_fn(composed, item, _SMOKE_EXECUTOR_MODEL)
+
+        # repeated scoring of IDENTICAL inputs disagrees by a small amount
+        repeats = [[await scorer.score(item, rollout)] for _ in range(3)]
+        flat = [batch[0] for batch in repeats]
+        assert len(set(flat)) > 1, f'jitter produced no variation: {flat}'
+        # -> a positive repeatability band (acceptance gate genuinely exercised)
+        assert measure_repeatability_band(repeats) > 0.0
+        # reproducible: a fresh scorer reproduces the same sequence byte-for-byte
+        scorer2 = SmokeReviewerScorer()
+        flat2 = [await scorer2.score(item, rollout) for _ in range(3)]
+        assert flat2 == flat
