@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 from _orch_helpers import pydantic_spec
 
 from orchestrator.agents.roles import (
+    _FOLLOWUP_FILING_INSTRUCTIONS,
     ARCHITECT,
     DEEP_REVIEWER,
     IMPLEMENTER,
@@ -144,35 +145,36 @@ class TestFollowupFilingAllowlist:
 class TestFollowupFilingPrompts:
     """ARCHITECT/IMPLEMENTER prompts must direct fire-and-forget follow-up filing.
 
-    Both prompts gain a follow-up-filing block (rendered via
+    Both prompts gain the follow-up-filing block — the single module-level
+    constant ``_FOLLOWUP_FILING_INSTRUCTIONS`` (rendered via
     ``submit_only_instructions``) telling the agent to file work discovered
     OUTSIDE its task scope as a low-priority ``submit_task`` candidate, and to
     fire-and-forget (never wait on ``resolve_ticket``) — mirroring the
     steward/deep_reviewer contract asserted in ``TestSiteWiringMinimal``.
-    Anchored on load-bearing tokens, not prose wording.
+
+    The block is asserted by exact constant membership rather than scattered
+    per-token substrings: it is refactor-proof (a benign prose reword of the
+    constant cannot break the wiring contract, only a failed/dropped append
+    can), and the constant already carries ``submit_task`` + the
+    ``Do NOT call `resolve_ticket``` guard.  A whole-prompt negative check
+    additionally guards that no positive ``resolve_ticket`` directive leaks in
+    from elsewhere.
     """
 
     def test_architect_prompt_has_followup_filing_block(self):
-        p = ARCHITECT.system_prompt
-        assert 'submit_task' in p
-        assert 'Filing follow-up work' in p
-        assert 'OUTSIDE the scope' in p
+        assert _FOLLOWUP_FILING_INSTRUCTIONS in ARCHITECT.system_prompt
 
     def test_implementer_prompt_has_followup_filing_block(self):
-        p = IMPLEMENTER.system_prompt
-        assert 'submit_task' in p
-        assert 'Filing follow-up work' in p
-        assert 'OUTSIDE the scope' in p
+        assert _FOLLOWUP_FILING_INSTRUCTIONS in IMPLEMENTER.system_prompt
 
     def test_architect_followup_is_fire_and_forget(self):
-        p = ARCHITECT.system_prompt
-        assert 'Do NOT call `resolve_ticket`' in p
-        assert 'Call `resolve_ticket`' not in p
+        # Whole-prompt negative contract: no positive resolve_ticket directive
+        # anywhere.  The "Do NOT call `resolve_ticket`" guard lives inside the
+        # constant asserted by test_architect_prompt_has_followup_filing_block.
+        assert 'Call `resolve_ticket`' not in ARCHITECT.system_prompt
 
     def test_implementer_followup_is_fire_and_forget(self):
-        p = IMPLEMENTER.system_prompt
-        assert 'Do NOT call `resolve_ticket`' in p
-        assert 'Call `resolve_ticket`' not in p
+        assert 'Call `resolve_ticket`' not in IMPLEMENTER.system_prompt
 
 
 class TestStewardSweepUp:

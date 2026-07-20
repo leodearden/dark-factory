@@ -479,3 +479,37 @@ class TestAmendmentOutOfScopeRouting:
         assert isinstance(routed, ReviewAggregation)
         assert routed.suggestions == [out_of_scope]
         assert routed.has_blocking_issues is False
+
+    async def test_identical_out_of_scope_batch_deduped_across_rounds(self):
+        """The single-slot ``_last_routed_suggestion_hash`` short-circuits an
+        immediately-repeated identical batch.
+
+        This is the round-0-out-of-scope == round-1-out-of-delta double-file
+        case the amendment loop's comment (workflow.py, source point 2) relies
+        on: round 0 files THIS round's out-of-scope complement, and a
+        subsequent post-amendment ``_apply_amendment_delta_scope`` re-routes a
+        content-equal batch as out-of-delta.  The dedup slot check sits ABOVE
+        every routing branch (curator submit, escalation-queue fallback, no-op)
+        and keys on the CONTENT hash, so two consecutive routes of content-equal
+        suggestions file the curator exactly ONCE — even when the second batch
+        is a fresh, non-identical dict object.  Exercises the REAL router (not
+        the fixture AsyncMock), driving the escalation-queue fallback arm so the
+        hash is recorded without opening a background HTTP task.
+        """
+        wf = _make_workflow(modules=['src'])
+        wf.mcp = None
+        wf.escalation_queue = MagicMock()
+        wf._escalate_suggestions = MagicMock()
+
+        # Round 0: file the out-of-scope complement (records the hash).
+        await wf._route_review_suggestions_to_curator(
+            _nonblocking_reviews([_sugg('other/bar.py:5')])
+        )
+        # Round 1: the SAME suggestion re-surfaces as a fresh (content-equal)
+        # dict — content hash matches → short-circuit → no second file.
+        await wf._route_review_suggestions_to_curator(
+            _nonblocking_reviews([_sugg('other/bar.py:5')])
+        )
+
+        # Despite two route calls, the fallback fires exactly once.
+        assert cast(MagicMock, wf._escalate_suggestions).call_count == 1
