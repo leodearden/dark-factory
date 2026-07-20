@@ -176,3 +176,59 @@ class TestScopeUncapSweep:
         expected = now + timedelta(seconds=gate._config.max_probe_interval_secs)
 
         assert gate._soonest_scope_reset(SCOPE) == expected
+
+
+# ===========================================================================
+# Step 3 — scope-aware selection (S1/S2/S4 — B1 general / B4 dominates / skip)
+# ===========================================================================
+
+
+class TestScopeAwareSelection:
+    """``before_invoke(scope=m)`` skips accounts scope-capped for m (S2) while
+    ``scope=None`` stays byte-identical (S1 / B1) and account-level CAPPED
+    dominates every scope (S4 / B4). Headroom is always present, so no wait."""
+
+    async def test_s1_b1_general_ignores_fable_scope_cap(self):
+        # One account, fable-scope-capped (future deadline) but account AVAILABLE.
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        now = datetime.now(UTC)
+        set_scope_cap(acct, resets_at=now + timedelta(hours=1), capped_at=now)
+
+        lease = await gate.before_invoke()  # scope=None
+        assert lease is not None
+        assert lease.name == 'a'  # a fable cap leaves general open (B1)
+
+    async def test_s2_scoped_selection_skips_fable_capped(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
+
+        lease = await gate.before_invoke(scope=SCOPE)
+        assert lease is not None
+        assert lease.name == 'b'  # A skipped for the fable scope (S2)
+
+    async def test_s4_b4_account_cap_dominates_every_scope(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        # Account-level CAPPED (general handler; future reset so no auto-uncap).
+        gate._handle_cap_detected(
+            'reason', datetime.now(UTC) + timedelta(hours=1), a.token, scope=None,
+        )
+        assert a.phase == AccountPhase.CAPPED
+
+        scoped = await gate.before_invoke(scope=SCOPE)
+        general = await gate.before_invoke()
+        assert scoped.name == 'b'
+        assert general.name == 'b'  # account cap dominates for every scope (S4/B4)
+
+    async def test_invoke_slot_threads_scope_into_selection(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
+
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            # scope threaded into selection → leases the fable-headroom account.
+            assert slot.account_name == 'b'
