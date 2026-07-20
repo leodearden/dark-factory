@@ -108,11 +108,26 @@ async def _run_single_reviewer(
     ``invoke_agent``. All default-off: a native Claude spec (backend='claude',
     no env/token overrides) with ``prices=None`` reproduces prior behaviour
     exactly (invoke_agent treats those defaults as today).
+
+    Raises ``RuntimeError`` if ``spec.oauth_token_env`` is set but that
+    environment variable is unset — fails loudly before dispatch rather than
+    silently resolving ``oauth_token=None`` and deferring to a confusing
+    downstream auth error inside the backend invocation.
     """
     role = build_trial_reviewer_role(spec)
     prompt = _build_reviewer_prompt(diff.diff_text)
     cwd = diff.cwd or _DEFAULT_CWD
-    oauth_token = os.environ.get(spec.oauth_token_env) if spec.oauth_token_env else None
+
+    if spec.oauth_token_env:
+        oauth_token = os.environ.get(spec.oauth_token_env)
+        if oauth_token is None:
+            raise RuntimeError(
+                f'Reviewer {spec.name!r} sets oauth_token_env={spec.oauth_token_env!r} '
+                f'but that environment variable is not set. Refusing to dispatch with a '
+                f'silently-missing oauth token.'
+            )
+    else:
+        oauth_token = None
 
     for attempt in range(1, max_retries + 1):
         try:

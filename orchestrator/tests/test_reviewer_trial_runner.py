@@ -261,3 +261,35 @@ class TestRunnerCrossFamilyThreading:
         assert kwargs['backend'] == 'claude'
         assert kwargs['oauth_token'] is None
         assert kwargs.get('prices') is None
+
+    @pytest.mark.asyncio
+    async def test_missing_oauth_token_env_fails_loudly(self, monkeypatch) -> None:
+        """A spec naming oauth_token_env whose var is unset must fail loudly
+        (and never dispatch), not silently resolve oauth_token=None and let
+        the failure surface as a confusing downstream auth error (task 2476
+        review amendment)."""
+        monkeypatch.delenv('MISSING_TOK', raising=False)
+
+        variant = VariantConfig(
+            name='xfam_missing_token',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(
+                    name='r1', model='gpt-5.4', specialization='Testing.',
+                    backend='codex',
+                    oauth_token_env='MISSING_TOK',
+                ),
+            ],
+        )
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            result = await run_panel(variant, diff, stagger_secs=0, max_retries=1)
+
+        mock_invoke.assert_not_awaited()
+        assert 'r1' not in result.reviews
+        assert len(result.errors) == 1
+        assert 'MISSING_TOK' in result.errors[0]
