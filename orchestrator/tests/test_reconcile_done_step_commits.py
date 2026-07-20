@@ -607,6 +607,45 @@ class TestReconcileDoneStepCommits:
         assert unchanged['steps'][0]['commit'] == step_commit
         escalation_queue.submit.assert_called_once()
 
+    async def test_content_mismatch_persists_emitted_escalation_key(
+        self, config, git_ops, task_assignment,
+    ):
+        """PERSIST (task 2764): on the escalation path, the emitted
+        (step_id, stale_commit) key is durably recorded in reconcile_state.json
+        (the meta-root sidecar) so a restarted workflow can hydrate it and not
+        re-file. Reuses the content-mismatch orphan setup — orphan touches
+        feature.py, WIP touches other.py, so 2762's find_equivalent_commit
+        remap returns None and the emit branch runs."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        escalation_queue = MagicMock()
+        escalation_queue.make_id.return_value = 'esc-42-1'
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt, escalation_queue=escalation_queue,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'feature.py').write_text('original implementation\n')
+        step_commit = await git_ops.commit(wt, 'feat: GREEN — step-1 implementation')
+        assert step_commit, 'Setup: expected a real commit to be made'
+
+        workflow.plan = _write_done_step_plan(artifacts, 'step-1', step_commit)
+
+        # Orphan step_commit, then land a WIP commit touching a wholly
+        # DIFFERENT file — {'feature.py'} not a subset of {'other.py'}, and a
+        # different patch-id/subject, so 2762's remap tier returns None and the
+        # escalation branch is reached.
+        await _run(['git', 'reset', '--hard', wt_info.base_commit], cwd=wt)
+        (wt / 'other.py').write_text('unrelated\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before inter-iteration rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        await workflow._reconcile_done_step_commits()
+
+        escalation_queue.submit.assert_called_once()
+        # The emitted key is durably persisted for cross-restart dedup.
+        assert artifacts.read_emitted_step_escalations() == {('step-1', step_commit)}
+
 
 # ---------------------------------------------------------------------------
 # step-7 RED: _execute_iterations wires the reconciler in before the WIP
