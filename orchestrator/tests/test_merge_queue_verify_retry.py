@@ -15,7 +15,90 @@ Covers:
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+def _attempt0(tree_oid: str):
+    """A fixture attempt-0 payload with fail-fast-cancelled tests per profile."""
+    from orchestrator.merge_queue import _Attempt0Payload
+
+    return _Attempt0Payload(
+        tree_oid=tree_oid,
+        # debug: 'c a::z' cancelled by fail-fast (absent from verdicts) → not-started
+        debug_planned=['c a::x', 'c a::y', 'c a::z'],
+        debug_verdicts={'c a::x': 'pass', 'c a::y': 'fail'},
+        # release: 'c b::q' cancelled → not-started
+        release_planned=['c b::p', 'c b::q'],
+        release_verdicts={'c b::p': 'pass'},
+        run_all_members=['mem_fail'],
+        gui_specs=['ui/x.ts'],
+    )
+
+
+def _git_ops_returning(oid: str | None):
+    git_ops = MagicMock()
+    git_ops.get_head_tree_hash = AsyncMock(return_value=oid)
+    return git_ops
+
+
+@pytest.mark.asyncio
+async def test_assemble_retry_verify_env_tree_pinned(tmp_path: Path) -> None:
+    """Case A: current tree OID matches attempt-0 → build the retry env.
+
+    The nextest filter files carry the {did-not-pass} ids (failed ∪ not-started),
+    demonstrating the soundness core end-to-end through the gate.
+    """
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('abc123')
+    req = SimpleNamespace(task_id='t-1', retry_failed_only=True)
+    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+
+    assert env is not None
+    assert env['REIFY_VERIFY_RETRY_SCOPE'] == 'failed_only'
+    assert env['REIFY_VERIFY_RETRY_TREE_OID'] == 'abc123'
+
+    debug_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG'])
+    release_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE'])
+    assert tmp_path in debug_path.parents  # written under merge_wt
+    # {did-not-pass} = failed ∪ not-started (NOT just failed).
+    assert debug_path.read_text() == 'c a::y\nc a::z'
+    assert release_path.read_text() == 'c b::q'
+    git_ops.get_head_tree_hash.assert_awaited_once_with(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_assemble_retry_verify_env_rebased_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Case B: a rebased tree (OID mismatch) → None + WARNING; defer to full verify."""
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('different-oid')
+    req = SimpleNamespace(task_id='t-2', retry_failed_only=True)
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+
+    assert env is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('full verify' in m for m in warnings), warnings
+    assert any(('rebas' in m or 'does not match' in m) for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_assemble_retry_verify_env_unknown_tree_returns_none(tmp_path: Path) -> None:
+    """Case C: get_head_tree_hash returns None → None (fail-safe full verify)."""
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning(None)
+    req = SimpleNamespace(task_id='t-3', retry_failed_only=True)
+    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+    assert env is None
 
 
 def test_build_retry_verify_env_writes_filter_files_and_env(tmp_path: Path) -> None:
