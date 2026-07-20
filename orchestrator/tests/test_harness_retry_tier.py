@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -208,3 +208,69 @@ class TestAutoEvalRedoCarriesBumpedTier:
         submitted = self._submitted_metadata(harness)
         assert submitted.get('routing') == {'routing_tier': 1}
         assert submitted['force_full_path'] is True
+
+
+class TestBumpRoutingTierById:
+    """``Harness._bump_routing_tier_by_id(task_id)``: the escalate_model by-id
+    bump (task μ, trigger 3). Fetches the task's CURRENT metadata via
+    ``scheduler.get_task`` and writes the +1 tier through
+    ``metadata_mode='merge'``; no-ops when the task is absent (a synthetic
+    sentinel id resolves to None)."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_then_bump_via_merge(self):
+        harness = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                get_task=AsyncMock(return_value={'metadata': {'routing': {'routing_tier': 0}}}),
+                update_task=AsyncMock(),
+            ),
+        )
+
+        await Harness._bump_routing_tier_by_id(harness, '42')
+
+        harness.scheduler.get_task.assert_awaited_once_with('42')
+        harness.scheduler.update_task.assert_awaited_once()
+        args, kwargs = harness.scheduler.update_task.call_args
+        assert args[0] == '42'
+        assert args[1]['routing']['routing_tier'] == 1
+        assert kwargs['metadata_mode'] == 'merge'
+
+    @pytest.mark.asyncio
+    async def test_absent_task_is_noop(self):
+        harness = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                get_task=AsyncMock(return_value=None),
+                update_task=AsyncMock(),
+            ),
+        )
+
+        await Harness._bump_routing_tier_by_id(harness, 'nope')
+
+        harness.scheduler.update_task.assert_not_awaited()
+
+
+class TestPreIncrementRoutingTier:
+    """``Harness.pre_increment_routing_tier(task_id)``: the SYNC shim the
+    (sync, off-loop) FastMCP resolve_issue worker calls. It must NOT do the
+    metadata write itself — it schedules the async ``_bump_routing_tier_by_id``
+    coroutine onto the loop via ``_schedule_coro_threadsafe`` (keeping the
+    metadata write harness-owned and on-loop)."""
+
+    def test_schedules_bump_coroutine_onto_loop(self):
+        # _bump_routing_tier_by_id + _schedule_coro_threadsafe are Mocked so no
+        # real coroutine is created (nothing to leave un-awaited) and the
+        # wiring is asserted directly: pre_increment builds the coro for the
+        # given task_id and hands it, with a label, to the loop bridge.
+        coro_sentinel = object()
+        harness = SimpleNamespace(
+            _bump_routing_tier_by_id=Mock(return_value=coro_sentinel),
+            _schedule_coro_threadsafe=Mock(),
+        )
+
+        Harness.pre_increment_routing_tier(harness, '42')
+
+        harness._bump_routing_tier_by_id.assert_called_once_with('42')
+        harness._schedule_coro_threadsafe.assert_called_once()
+        sched_args, sched_kwargs = harness._schedule_coro_threadsafe.call_args
+        assert sched_args[0] is coro_sentinel
+        assert 'label' in sched_kwargs
