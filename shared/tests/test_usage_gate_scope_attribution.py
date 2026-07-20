@@ -21,7 +21,8 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountPhase, UsageGate
+from shared.invocation_outcome import CapHit
+from shared.usage_gate import AccountPhase, InvokeSlot, UsageGate
 
 SCOPE = 'claude-fable-5'
 
@@ -264,6 +265,60 @@ class TestDetectCapHitScope:
         acct = gate._accounts[0]
 
         assert gate.detect_cap_hit('', CAP_STDERR, oauth_token=acct.token) is True
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.scope_caps == {}
+
+
+# ===========================================================================
+# Step 5 — InvokeSlot carries scope; report / detect_cap_hit ride slot.scope
+# ===========================================================================
+
+
+class TestInvokeSlotScope:
+    """The slot carries the invocation scope; ``report`` / ``detect_cap_hit``
+    forward ``slot.scope`` to the gate handlers."""
+
+    def test_ctor_carries_scope(self):
+        gate = make_gate(['a'])
+        assert InvokeSlot(gate, None, scope=SCOPE).scope == SCOPE
+
+    def test_ctor_scope_defaults_none(self):
+        gate = make_gate(['a'])
+        assert InvokeSlot(gate, None).scope is None
+
+    async def test_invoke_slot_cm_exposes_scope_and_report_is_scoped(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        target = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            assert slot.scope == SCOPE
+            slot.report(CapHit(resets_at=target, reason='x'))
+
+        sc = acct.scope_caps[SCOPE]
+        assert sc.capped is True
+        assert sc.resets_at == target
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_invoke_slot_cm_detect_cap_hit_is_scoped(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            assert slot.detect_cap_hit(CAP_STDERR, '') is True
+
+        assert acct.scope_caps[SCOPE].capped is True
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_invoke_slot_cm_no_scope_report_caps_account(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        target = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+
+        async with gate.invoke_slot() as slot:
+            assert slot.scope is None
+            slot.report(CapHit(resets_at=target, reason='x'))
 
         assert acct.phase == AccountPhase.CAPPED
         assert acct.scope_caps == {}
