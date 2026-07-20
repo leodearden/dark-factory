@@ -89,6 +89,11 @@ class MergeWorker(_WipHaltMixin):
     # one retry-after-prune is the conservative middle ground between blindly
     # blocking and looping.  Resets on any successful merge for that task.
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
+    # Budget for the separate, narrowed (failed-only) classified-infra-
+    # transient retry loop (task 2835) — see merge_queue.SpeculativeMergeWorker
+    # for the full rationale; mirrored here only so this frozen test-local
+    # _TrainMergeHost reference keeps structurally satisfying the Protocol.
+    MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int = 2
 
     def __init__(
         self,
@@ -113,6 +118,9 @@ class MergeWorker(_WipHaltMixin):
         # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
         # the timeout counter: persists across submissions, reset on success.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # Per-task narrowed (failed-only) classified-infra-transient retry
+        # counter (task 2835); see MAX_POST_MERGE_VERIFY_NARROWED_RETRIES.
+        self._post_merge_verify_narrowed_retries: dict[str, int] = {}
         # γ2 per-branch generation auto-chain counter.  Incremented on each
         # consecutive tip-advance equivalence failure; popped on a clean 'done'
         # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.

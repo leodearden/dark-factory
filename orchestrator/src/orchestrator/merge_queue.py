@@ -3930,11 +3930,17 @@ class _TrainMergeHost(Protocol):
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
     _post_merge_verify_enospc_retries: dict[str, int]
+    # Per-task NARROWED (failed-only) classified-infra-transient retry
+    # counter (task 2835) — decoupled from _post_merge_verify_enospc_retries
+    # above so an unrelated prior ENOSPC event never starves a narrowed
+    # retry's separate, larger budget.
+    _post_merge_verify_narrowed_retries: dict[str, int]
     _cas_retries: dict[str, int]
 
     # ── Class-level thresholds ────────────────────────────────────────────
     MAX_POST_MERGE_VERIFY_TIMEOUTS: int
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int
+    MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int
 
     # ── WIP halt / abandon helpers ────────────────────────────────────────
     def halt_for_wip(self, reason: str) -> None: ...
@@ -4926,6 +4932,8 @@ async def _do_train_merge(
         enospc_retries=worker._post_merge_verify_enospc_retries,
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+        max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+        narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=event_store,
         merge_sha=merge_commit,
     )
@@ -6399,6 +6407,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # escalating as transient infra.  Kept as a class attribute so tests can
     # monkeypatch it.
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
+    # Budget for the SEPARATE, narrowed (failed-only) classified-infra-
+    # transient retry loop (task 2835) — decoupled from the ENOSPC budget
+    # above so it is affordable to make larger: a narrowed retry re-runs only
+    # the did-not-pass subset (cheap per retry), unlike the ENOSPC budget
+    # which bounds a full re-verify.  Inert in production until reify writes
+    # the attempt-0 sidecar the D2 producer (_run_post_merge_verify) needs to
+    # actually narrow a retry — until then every retry_failed_only=True
+    # request still falls back to the small MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES
+    # budget.  Kept as a class attribute so tests can monkeypatch it.
+    MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int = 2
     # Poll interval (seconds) used in the _verify_and_advance abort-loop that
     # checks whether a sole-waiter detach() cancelled req.result mid-verify.
     # Default ~10 s is negligible over a 10-40 min verify; kept as a class
@@ -6644,6 +6662,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # class constant (see the Protocol above).  Persists across
         # submissions, reset on a successful CAS advance.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # Per-task NARROWED (failed-only) classified-infra-transient retry
+        # counter (task 2835) — separate budget from the ENOSPC counter
+        # above, decoupled so an earlier unrelated ENOSPC event never
+        # starves it; see MAX_POST_MERGE_VERIFY_NARROWED_RETRIES.
+        self._post_merge_verify_narrowed_retries: dict[str, int] = {}
         # γ2 per-branch generation auto-chain counter, bounded by the
         # module-level MAX_AUTO_CHAINED_GENERATIONS.  Incremented on each
         # consecutive tip-advance equivalence failure; popped on a clean
@@ -12596,6 +12619,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 enospc_retries=self._post_merge_verify_enospc_retries,
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+                narrowed_retries=self._post_merge_verify_narrowed_retries,
                 event_store=self._event_store,
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
