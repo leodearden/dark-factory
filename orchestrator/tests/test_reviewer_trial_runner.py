@@ -460,7 +460,7 @@ class TestRunnerCrossFamilyThreading:
         )
 
         with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = _make_result(structured=_make_review('r1'))
+            mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
             await run_panel(variant, diff, stagger_secs=0, prices=prices)
 
         mock_invoke.assert_awaited_once()
@@ -485,7 +485,7 @@ class TestRunnerCrossFamilyThreading:
         )
 
         with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = _make_result(structured=_make_review('r1'))
+            mock_invoke.side_effect = _make_verdict_writing_invoke(verdict='PASS')
             await run_panel(variant, diff, stagger_secs=0)
 
         mock_invoke.assert_awaited_once()
