@@ -5031,6 +5031,133 @@ class TestRemoteRunnerStreamArchival:
 
 
 # ---------------------------------------------------------------------------
+# task-2822 fix (c): TestRemoteRunnerPassSummaryArchival
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerPassSummaryArchival:
+    """RemoteRunner archives a PASSING remote merge-verify as a best-effort JSON
+    pass-summary (task 2822 fix c), closing the incident's un-auditable-laptop-scope
+    gap.  Filename mirrors the failure archivers:
+        attempt-1.remote-<safe_name>.pass-summary-<utc_ts>.json
+    capturing SCOPE (task_files + merge_verify_workspace + merge_verify_breadth from
+    the SPEC), RESULT (passed, category), and TIMING (duration_ms), plus runner name
+    and merge_sha.  A FAILING verify writes NO pass-summary (failure-only archives
+    unchanged); a missing archive_root/task_id is a best-effort no-op.
+    """
+
+    def _make_runner(self, result, *, name='leo-laptop'):
+        """RemoteRunner whose fake run returns git→(0,'','') and ssh→(0,json,'')."""
+        _it = iter([
+            (0, '', ''),                       # git push (load-bearing)
+            (0, result_to_json(result), ''),   # ssh verify
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            # ref cleanup delete push (best-effort, inside contextlib.suppress)
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        return RemoteRunner(
+            name=name,
+            ssh_host=f'{name}.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'test-id',
+        )
+
+    def _spec_with_scope(self):
+        """Spec carrying task_files + the FULL merge-gate profile (fix a fields)."""
+        return MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/mod.py', 'src/b/mod.py'),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            merge_verify_workspace=True,
+            merge_verify_breadth='full',
+        )
+
+    async def test_passing_remote_verify_writes_pass_summary(self, tmp_path):
+        """A passing remote verify writes one pass-summary JSON with scope+result+timing."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='',
+            summary='ok', category='merge_ok',
+        )
+        runner = self._make_runner(pass_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', self._spec_with_scope(), task_id='2822', archive_root=tmp_path,
+        )
+
+        # VerifyResult is returned UNCHANGED (PRD §A Invariant 5)
+        assert result == pass_result
+
+        task_dir = tmp_path / '2822'
+        assert task_dir.is_dir(), f'Expected {task_dir} to be a directory'
+
+        summaries = list(task_dir.glob('attempt-1.remote-leo-laptop.pass-summary-*.json'))
+        assert len(summaries) == 1, f'Expected 1 pass-summary, got {[f.name for f in summaries]}'
+
+        data = json.loads(summaries[0].read_text(encoding='utf-8'))
+        # identity
+        assert data['merge_sha'] == 'abc123'
+        assert data['runner'] == 'leo-laptop'
+        # RESULT
+        assert data['passed'] is True
+        assert data['category'] == 'merge_ok'
+        # TIMING
+        assert isinstance(data['duration_ms'], (int, float))
+        assert data['duration_ms'] >= 0
+        # SCOPE — sourced from the SPEC (the merge-gate profile), not the host config
+        scope = data['scope']
+        assert scope['task_files'] == ['src/a/mod.py', 'src/b/mod.py']
+        assert scope['merge_verify_workspace'] is True
+        assert scope['merge_verify_breadth'] == 'full'
+
+    async def test_failing_remote_verify_writes_no_pass_summary(self, tmp_path):
+        """A FAILING remote verify writes NO pass-summary (only the failure archives)."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', self._spec_with_scope(), task_id='2822', archive_root=tmp_path,
+        )
+        assert result == fail_result
+
+        task_dir = tmp_path / '2822'
+        pass_files = list(task_dir.glob('*.pass-summary-*.json')) if task_dir.exists() else []
+        assert pass_files == [], f'Expected no pass-summary on failure, got {pass_files}'
+
+    async def test_no_pass_summary_when_archive_root_none(self, tmp_path):
+        """archive_root=None → best-effort no-op; VerifyResult returned unchanged, no raise."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='', summary='ok',
+        )
+        runner = self._make_runner(pass_result)
+
+        result = await runner.run_merge_verify('abc123', self._spec_with_scope(), task_id='2822')
+        assert result == pass_result
+
+    async def test_no_pass_summary_when_task_id_none(self, tmp_path):
+        """task_id=None → best-effort no-op; no files written, no raise."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='', summary='ok',
+        )
+        runner = self._make_runner(pass_result)
+
+        result = await runner.run_merge_verify('abc123', self._spec_with_scope(), archive_root=tmp_path)
+        assert result == pass_result
+        assert list(tmp_path.rglob('*.pass-summary-*.json')) == []
+
+
+# ---------------------------------------------------------------------------
 # γ step-7: _default_ssh_heartbeat_run — stdin heartbeat writer for the ssh
 # dispatch child (real tiny subprocesses; no ssh spawned)
 # ---------------------------------------------------------------------------
