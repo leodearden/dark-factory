@@ -60,10 +60,18 @@ class TestBuildTrialReviewerRole:
         role = build_trial_reviewer_role(spec)
         assert isinstance(role, AgentRole)
 
-    def test_name_prefix(self) -> None:
+    def test_reviewer_identity_name(self) -> None:
+        """role.name must equal ``reviewer_{spec.name}`` (was ``trial_``-prefixed
+        pre-2493). The live verdict-tools transport's ``reviewer ==
+        --verdict-role`` identity check validates the emitted verdict's
+        ``reviewer`` field against ``role.name`` — and the frozen CONTRACT
+        instructs the agent to emit ``reviewer_{name}`` — so role.name must
+        match for the identity check to pass (mirrors production's
+        ``_reviewer_role``).
+        """
         spec = ReviewerSpec(name='my_reviewer', model='sonnet', specialization='Spec.')
         role = build_trial_reviewer_role(spec)
-        assert role.name == 'trial_my_reviewer'
+        assert role.name == 'reviewer_my_reviewer'
 
     def test_model_passthrough(self) -> None:
         for model in ('opus', 'sonnet'):
@@ -81,12 +89,39 @@ class TestBuildTrialReviewerRole:
         role = build_trial_reviewer_role(spec)
         assert 'Test coverage and quality.' in role.system_prompt
 
-    def test_system_prompt_has_json_schema(self) -> None:
+    def test_system_prompt_has_frozen_contract_tokens(self) -> None:
+        """Post-2484/2493 trial parity: built from the same reviewer
+        PromptSpec as production (roles.build_reviewer_prompt_spec), so the
+        frozen CONTRACT tokens the live verdict-tools server parses must be
+        present verbatim — the agent calls submit_review_verdict, it does
+        not emit JSON/prose (prompt parity forces transport parity).
+        """
+        spec = ReviewerSpec(name='r', model='sonnet', specialization='Some specialization text.')
+        role = build_trial_reviewer_role(spec)
+        assert 'submit_review_verdict' in role.system_prompt
+        assert '**verdict**' in role.system_prompt
+        assert '**issues**' in role.system_prompt
+        assert 'Some specialization text.' in role.system_prompt
+
+    def test_system_prompt_drops_obsolete_json_output_instruction(self) -> None:
+        """The drifted pre-2493 output-schema/pure-JSON instructions must be
+        gone: they contradict the submit_review_verdict CONTRACT and would
+        leave the agent with no way to emit a verdict via the live transport.
+        """
         spec = ReviewerSpec(name='r', model='sonnet', specialization='S.')
         role = build_trial_reviewer_role(spec)
-        assert '"verdict"' in role.system_prompt
-        assert '"issues"' in role.system_prompt
-        assert 'blocking' in role.system_prompt
+        assert 'Output pure JSON' not in role.system_prompt
+        assert 'produce a structured JSON review' not in role.system_prompt
+
+    def test_mcp_families_verdict_tools(self) -> None:
+        spec = ReviewerSpec(name='r', model='sonnet', specialization='S.')
+        role = build_trial_reviewer_role(spec)
+        assert role.mcp_families == frozenset({'verdict_tools'})
+
+    def test_allowed_tools_includes_verdict_tools(self) -> None:
+        spec = ReviewerSpec(name='r', model='sonnet', specialization='S.')
+        role = build_trial_reviewer_role(spec)
+        assert 'mcp__verdict-tools__*' in role.allowed_tools
 
     def test_read_only_tools(self) -> None:
         spec = ReviewerSpec(name='r', model='sonnet', specialization='S.')
@@ -131,7 +166,7 @@ class TestVariantDefinitions:
             for spec in variant.reviewers:
                 role = build_trial_reviewer_role(spec)
                 assert isinstance(role, AgentRole)
-                assert role.name.startswith('trial_')
+                assert role.name.startswith('reviewer_')
                 assert role.system_prompt
                 assert role.allowed_tools
 

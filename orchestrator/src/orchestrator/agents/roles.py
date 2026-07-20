@@ -4,6 +4,8 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
+from shared.prompt_artifact import PromptSpec
+
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
 # family is a property OF THE ROLE, not a decision made elsewhere by
@@ -41,6 +43,18 @@ class AgentRole:
     # Whether this role's sessions run inside the module sandbox. Replaces
     # the old `role.name in ('implementer', 'debugger')` check in _invoke().
     sandboxed: bool = False
+    # The FROZEN CONTRACT + editable HEURISTICS split (shared/prompt_artifact.py,
+    # task 2492/2494) backing this role's system_prompt, for roles that opt in
+    # (currently the reviewer role(s) — see build_reviewer_prompt_spec below).
+    # None for every other role: a pure additive opt-in with zero behavior
+    # change for roles that don't set it. Consumed by workflow.py's
+    # TaskWorkflow._resolve_role_system_prompt to resolve a live per-invocation
+    # artifact override; when None, role.system_prompt is used verbatim.
+    prompt_spec: PromptSpec | None = None
+    # The harness-version key paired with prompt_spec at resolve time (bumped
+    # whenever the paired CONTRACT changes materially, invalidating any stale
+    # pinned artifact for the old contract). None when prompt_spec is None.
+    prompt_harness_version: str | None = None
 
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).
@@ -531,10 +545,40 @@ expansion rather than trying to work around the restriction.
 )
 
 
-def _reviewer_role(name: str, specialization: str) -> AgentRole:
-    return AgentRole(
-        name=f'reviewer_{name}',
-        system_prompt=f"""\
+# ----------------------------------------------------------------------
+# Reviewer prompt CONTRACT / HEURISTICS split (task 2493, PRD
+# tier1-prompt-optimization T2 — mirrors the curator sibling, task 2494,
+# fused-memory/src/fused_memory/middleware/task_curator.py:378-524).
+#
+# _REVIEWER_CONTRACT_TEMPLATE is the FROZEN machine contract: the
+# submit_review_verdict tool-call instruction and the verdict-field schema
+# (the reviewer_{name} identity literal, and the verdict/severity enums) —
+# everything the verdict-tools server + read_verdict parse. It is
+# un-editable by construction: a pinned artifact only ever supplies the
+# heuristics argument to compose_prompt, never the contract (see
+# shared.prompt_artifact.PromptArtifactStore.resolve).
+#
+# _REVIEWER_HEURISTICS_TEMPLATE is the EDITABLE judgment guidance (the
+# blocking-vs-suggestion rules and the specialization footer) that a pinned
+# artifact may override.
+#
+# Both templates are per-role (interpolate {name}/{specialization}) and built
+# via build_reviewer_prompt_spec(name, specialization) rather than module-level
+# constants — unlike the curator's single global prompt, every reviewer role
+# has a distinct identity literal and specialization text.
+#
+# Every section's PROSE below is copied VERBATIM from the pre-split
+# _reviewer_role prompt — no instruction is reworded or dropped. The EMITTED
+# prompt is NOT byte-identical to the pre-split text though: compose_prompt()
+# (shared/prompt_artifact.py) always renders CONTRACT, then the "\n\n---\n\n"
+# separator, then HEURISTICS, which moves the "## Rules" + specialization
+# footer to the end of the prompt instead of directly following the verdict
+# schema. Treat parity as content-preservation (no instruction lost), not
+# byte-identity — see TestReviewerPromptSplit's superset test in
+# test_reviewer_prompt_split.py.
+# ----------------------------------------------------------------------
+
+_REVIEWER_CONTRACT_TEMPLATE = """\
 You are a code reviewer specializing in: **{specialization}**
 
 ## Your Task
@@ -553,7 +597,9 @@ Call `submit_review_verdict` with these fields:
   `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
   `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
+"""
 
+_REVIEWER_HEURISTICS_TEMPLATE = """\
 ## Rules
 
 1. **Be specific.** Every issue must have a file location and concrete description.
@@ -568,13 +614,42 @@ Call `submit_review_verdict` with these fields:
 4. **Read the codebase** to understand context before judging patterns or naming.
 
 ## Your Specialization: {specialization}
-""",
+"""
+
+# Bumped whenever _REVIEWER_CONTRACT_TEMPLATE changes materially, so a stale
+# per-(prompt, model, harness) pinned artifact stops resolving and falls back
+# to the (new) in-code baseline instead of pairing new heuristics with an
+# outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
+_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v1'
+
+
+def build_reviewer_prompt_spec(name: str, specialization: str) -> PromptSpec:
+    """Build the per-role reviewer :class:`PromptSpec` for (name, specialization).
+
+    Both templates interpolate ``{name}``/``{specialization}``, so — unlike
+    the curator's single global spec — every reviewer role gets its own
+    ``PromptSpec`` (``prompt_id=f'reviewer_{name}'``).
+    """
+    return PromptSpec(
+        prompt_id=f'reviewer_{name}',
+        contract=_REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization),
+        baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATE.format(specialization=specialization),
+    )
+
+
+def _reviewer_role(name: str, specialization: str) -> AgentRole:
+    spec = build_reviewer_prompt_spec(name, specialization)
+    return AgentRole(
+        name=f'reviewer_{name}',
+        system_prompt=spec.in_code_constant,
         allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS],
         disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
         default_max_turns=30,
         mcp_families=frozenset({'verdict_tools'}),
+        prompt_spec=spec,
+        prompt_harness_version=_REVIEWER_PROMPT_HARNESS_VERSION,
     )
 
 
