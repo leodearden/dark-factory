@@ -21,6 +21,8 @@ each orchestrator's sweep to its own leftovers.
 import re
 from pathlib import Path
 
+import pytest
+
 from orchestrator import verify
 
 
@@ -89,3 +91,127 @@ class TestVerifyScopeName:
         tag = 'myproj-1a2b3c4d'
         names = {verify._verify_scope_name(tag) for _ in range(20)}
         assert len(names) == 20, f'expected 20 unique scope names; got {len(names)}'
+
+
+class TestReapLeftoverVerifyScopes:
+    """``verify.reap_leftover_verify_scopes`` enumerates + reaps ONLY this
+    project's leftover verify scopes, fully fail-soft."""
+
+    @staticmethod
+    def _install_fake_exec(monkeypatch, listing: str) -> list[list[str]]:
+        """Patch ``create_subprocess_exec`` to capture argv and feed *listing*
+        to the ``list-units`` enumeration; also stub ``shutil.which`` truthy so
+        the systemctl-availability gate passes. Returns the captured-argv list.
+        """
+        captured: list[list[str]] = []
+
+        class _FakeProc:
+            def __init__(self, stdout: bytes) -> None:
+                self._stdout = stdout
+
+            async def communicate(self):
+                return (self._stdout, b'')
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            captured.append(list(args))
+            if 'list-units' in args:
+                return _FakeProc(listing.encode())
+            return _FakeProc(b'')
+
+        monkeypatch.setattr(
+            'orchestrator.verify.asyncio.create_subprocess_exec', fake_exec,
+        )
+        monkeypatch.setattr(
+            'orchestrator.verify.shutil.which', lambda name: f'/usr/bin/{name}',
+        )
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_enumeration_is_tag_scoped_and_reaps_matching_units(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(a) enumeration glob is TAG-SCOPED (cross-project safety); (b) each
+        matching unit gets kill+stop; (c) a sibling-tagged unit is defensively
+        dropped; (d) returns the reaped names."""
+        tag = verify._scope_tag_for(tmp_path)
+        unit_a = f'df-verify-{tag}-aaa111aaa111.scope'
+        unit_b = f'df-verify-{tag}-bbb222bbb222.scope'
+        # A DIFFERENTLY-tagged unit systemctl might over-return — must be dropped.
+        sibling = 'df-verify-siblingproj-99887766-ccc333ccc333.scope'
+        listing = (
+            f'{unit_a} loaded active running Verify A\n'
+            f'{unit_b} loaded active running Verify B\n'
+            f'{sibling} loaded active running Sibling verify\n'
+        )
+        captured = self._install_fake_exec(monkeypatch, listing)
+
+        reaped = await verify.reap_leftover_verify_scopes(tmp_path)
+
+        # (a) TAG-SCOPED enumeration, NOT a bare df-verify-*.scope glob.
+        enum_calls = [a for a in captured if 'list-units' in a]
+        assert len(enum_calls) == 1, captured
+        enum = enum_calls[0]
+        assert enum[:2] == ['systemctl', '--user'], enum
+        assert '--all' in enum and '--no-legend' in enum, enum
+        assert f'df-verify-{tag}-*.scope' in enum, enum
+        assert 'df-verify-*.scope' not in enum, (
+            f'enumeration must be tag-scoped, not a bare glob; got {enum}'
+        )
+        # (b) each matching unit got kill + stop (via _kill_cgroup_scope).
+        for unit in (unit_a, unit_b):
+            assert [
+                'systemctl', '--user', 'kill', '--signal=SIGKILL', unit,
+            ] in captured, unit
+            assert ['systemctl', '--user', 'stop', unit] in captured, unit
+        # (c) the sibling-tagged unit is defensively dropped — NEVER touched.
+        assert sibling not in reaped
+        assert not any(sibling in argv for argv in captured), (
+            f'sibling unit must never be passed to a kill/stop call; got {captured}'
+        )
+        # (d) returns the reaped names.
+        assert reaped == [unit_a, unit_b], reaped
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_systemctl_absent(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Fail-soft: no systemctl -> [] and no enumeration attempted."""
+        called = False
+
+        async def fake_exec(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError('must not enumerate when systemctl is absent')
+
+        monkeypatch.setattr('orchestrator.verify.shutil.which', lambda name: None)
+        monkeypatch.setattr(
+            'orchestrator.verify.asyncio.create_subprocess_exec', fake_exec,
+        )
+
+        reaped = await verify.reap_leftover_verify_scopes(tmp_path)
+
+        assert reaped == []
+        assert not called
+
+    @pytest.mark.asyncio
+    async def test_fail_soft_when_subprocess_raises(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Fail-soft: a raising subprocess yields [] and never propagates."""
+
+        async def fake_exec(*args, **kwargs):
+            raise OSError('systemctl boom')
+
+        monkeypatch.setattr(
+            'orchestrator.verify.shutil.which', lambda name: f'/usr/bin/{name}',
+        )
+        monkeypatch.setattr(
+            'orchestrator.verify.asyncio.create_subprocess_exec', fake_exec,
+        )
+
+        reaped = await verify.reap_leftover_verify_scopes(tmp_path)
+
+        assert reaped == []
