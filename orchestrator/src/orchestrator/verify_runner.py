@@ -1427,8 +1427,22 @@ def retry_scope_event_fields(verify_env: Mapping[str, str]) -> dict[str, Any]:
     """
     if verify_env.get('REIFY_VERIFY_RETRY_SCOPE') != 'failed_only':
         return {'retry_scope': None, 'retry_subset_sizes': None}
-    # Narrowed failed-only retry — per-suite subset sizes computed in step-4/6.
-    return {'retry_scope': 'failed_only', 'retry_subset_sizes': None}
+    # Narrowed failed-only retry — per-suite subset sizes.  run_all/gui come
+    # from the comma-delimited env values (count NON-EMPTY tokens to dodge the
+    # ''.split(',') == [''] pitfall so an empty subset counts 0).
+    run_all = len([t for t in verify_env.get('REIFY_RUN_ALL_MEMBER_SUBSET', '').split(',') if t])
+    gui = len([t for t in verify_env.get('REIFY_GUI_RETRY_SPECS', '').split(',') if t])
+    nextest_debug = len(Path(verify_env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG']).read_text().splitlines())
+    nextest_release = len(Path(verify_env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE']).read_text().splitlines())
+    return {
+        'retry_scope': 'failed_only',
+        'retry_subset_sizes': {
+            'run_all': run_all,
+            'gui': gui,
+            'nextest_debug': nextest_debug,
+            'nextest_release': nextest_release,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
