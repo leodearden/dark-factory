@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import shutil
 from pathlib import Path
 from uuid import uuid4
+
+from orchestrator.artifacts import TaskArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,13 @@ async def cleanup_eval_worktree(
         logger.info(f'Cleaned up eval worktree: {worktree_path}')
     except RuntimeError as e:
         logger.warning(f'Failed to cleanup worktree {worktree_path}: {e}')
+
+    # The architect eval writes plan.json to the RELOCATED .task-meta/<name>/
+    # root — a SIBLING of the worktree, so `git worktree remove` above does NOT
+    # delete it. Remove it here (best-effort, mirroring the worktree removal)
+    # so run_architect_eval — the sole caller — leaves no residue behind.
+    meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
+    shutil.rmtree(meta_root, ignore_errors=True)
 
 
 async def get_diff(worktree_path: Path, base_commit: str) -> str:
