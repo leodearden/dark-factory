@@ -7,8 +7,43 @@ from pathlib import Path
 from uuid import uuid4
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.verify import _target_subprocess_env
 
 logger = logging.getLogger(__name__)
+
+
+def read_python_pin(root: Path) -> str | None:
+    """Return the interpreter pin from ``<root>/.python-version``.
+
+    Reads the file's stripped first line (the version ``uv`` resolves), or
+    ``None`` when the file is missing or empty — the fail-safe signal to
+    inject no pin (``uv`` falls back to its normal resolution) rather than
+    guess. Derived from the target's own ``.python-version`` so the eval
+    runner stays correct across targets (df fixtures pin 3.13; other targets
+    pin whatever they use) instead of hardcoding a literal.
+    """
+    try:
+        raw = (root / '.python-version').read_text()
+    except OSError:
+        return None
+    lines = raw.splitlines()
+    if not lines:
+        return None
+    return lines[0].strip() or None
+
+
+def _eval_setup_env(worktree: Path) -> dict[str, str]:
+    """Build the env for the eval worktree's ``setup_commands`` (``uv sync``).
+
+    Scrubs the orchestrator's venv activation vars via
+    ``verify._target_subprocess_env`` — so ``uv sync`` can't corrupt the live
+    orchestrator ``.venv`` (the 2026-05-29 ghost-venv incident) — and pins the
+    interpreter to the worktree's own ``.python-version`` (via ``UV_PYTHON``)
+    when present, so setup and verify operate on the SAME worktree venv. When
+    no pin is found, injects no ``UV_PYTHON`` (fail-safe), matching BUG 2a.
+    """
+    pin = read_python_pin(worktree)
+    return _target_subprocess_env({'UV_PYTHON': pin} if pin else None)
 
 
 async def _run(cmd: list[str], cwd: Path) -> str:
@@ -64,8 +99,11 @@ async def create_eval_worktree(
 
     logger.info(f'Created eval worktree: {worktree_path} at {pre_task_commit[:10]}')
 
-    # Run setup commands to create isolated env
+    # Run setup commands to create isolated env. The env is scrubbed of the
+    # orchestrator venv and pinned to the worktree's own interpreter (BUG 2b)
+    # so `uv sync` targets <worktree>/.venv, never the live orchestrator .venv.
     if setup_commands:
+        setup_env = _eval_setup_env(worktree_path)
         for cmd_str in setup_commands:
             logger.info(f'Eval worktree setup: {cmd_str}')
             proc = await asyncio.create_subprocess_shell(
@@ -74,6 +112,7 @@ async def create_eval_worktree(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 executable='/bin/bash',
+                env=setup_env,
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
