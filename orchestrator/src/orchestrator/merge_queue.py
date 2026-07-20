@@ -7713,21 +7713,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         previously put back on ``_queue`` by a requeue site
         (:meth:`_note_requeue` — operator-halt / cascade self-requeue),
         which leaves it registered at QUEUED rather than removing it
-        (:class:`ItemLifecycle` has no deregister op). Registers only when
-        the request_id is not already tracked; an already-tracked rid skips
-        straight to the QUEUED -> LANE_BUFFERED transition below instead of
-        re-``register()``-ing, which would raise ``ValueError`` on the live
-        duplicate (:meth:`ItemLifecycle.register`'s precondition). Either
-        way, the item ends up seeded/confirmed at QUEUED then immediately
-        transitioned to LANE_BUFFERED, matching this method's own
-        postcondition (the item is now sitting in a lane buffer).
+        (:class:`ItemLifecycle` has no deregister op).
+
+        task 2852 (SHARPER RCA mr-8cafbaf0 / original incident mr-c69ca480):
+        an already-tracked rid does NOT unconditionally skip straight to the
+        QUEUED -> LANE_BUFFERED transition — that assumption is exactly what
+        the incident disproved (a duplicate/re-entrant *item*, e.g. from the
+        journal-recovery ``reconstruct_merge_request`` path, can arrive for a
+        request_id that has already advanced well past QUEUED, such as
+        VERIFYING). The registry's CURRENT state discriminates three cases:
+
+          * unregistered (``None``)   — register fresh at QUEUED, then fall
+            through.
+          * ``QUEUED`` (fresh-just-registered, OR a legit requeue left here
+            by :meth:`_note_requeue`) — fall through as-is; this is the ONLY
+            case where re-``register()``-ing would raise ``ValueError`` on
+            the live duplicate (:meth:`ItemLifecycle.register`'s
+            precondition), which is exactly why registration is skipped here.
+          * anything else (already advanced past QUEUED) — a duplicate/
+            re-entrant *item* for a request_id already deep in the pipeline.
+            Coalesced via :meth:`_coalesce_reentrant_drain` and dropped
+            BEFORE the transition, the lane-buffer append, and the journal
+            block below — never re-``register()``-ed, never buffered, never
+            re-recorded (which would otherwise clobber the live original's
+            durable journal entry under the shared request_id).
+
+        The fall-through path routes the QUEUED -> LANE_BUFFERED hop through
+        :meth:`_advance_if_at` (current is always QUEUED at that point, so it
+        always fires), matching this method's own postcondition (the item is
+        now sitting in a lane buffer).
         """
         lane = _normalize_lane(item.lane)
         self._assert_single_writer(self._merger_task, '_lane_buffers')
         rid = item.request_id
-        if self._lifecycle.current(rid) is None:
+        current = self._lifecycle.current(rid)
+        if current is not None and current != ItemLifecycleState.QUEUED:
+            self._coalesce_reentrant_drain(item, current)
+            return
+        if current is None:
             self._register_item(item, initial=ItemLifecycleState.QUEUED)
-        self._note_transition(
+        self._advance_if_at(
             rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED, live_obj=item,
         )
         self._lane_buffers[lane].append(item)
@@ -7794,6 +7819,38 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._journaled_request_ids.discard(_rid)
 
                 item.result.add_done_callback(_on_terminal)
+
+    def _coalesce_reentrant_drain(
+        self, item: MergeRequest, current_state: ItemLifecycleState,
+    ) -> None:
+        """Coalesce a duplicate/re-entrant drain of *item* onto a request_id
+        already live in the registry at *current_state* (task 2852 /
+        SHARPER RCA option B — mr-8cafbaf0, original incident mr-c69ca480).
+
+        Called by :meth:`_buffer_owned_request` BEFORE the QUEUED ->
+        LANE_BUFFERED transition, the lane-buffer append, and the
+        ``_merge_store.record``/``_on_terminal`` journal block — dropping
+        *item* here (rather than after) prevents both a divergent second
+        pipeline item under the shared request_id (which would otherwise
+        keep firing rejected transitions for the rest of the live
+        original's lifetime, exactly the reported incident) and a journal
+        clobber of the live original's durable entry under that same
+        request_id.
+
+        Logs loudly at WARNING — deliberately NOT an escalation: once
+        recognized here the divergence is HANDLED and benign, and
+        escalating would re-introduce the exact
+        ``merge_lifecycle_transition_rejected`` noise this task removes
+        (PRD design decision 4: invariants escalate loudly, degrade never —
+        satisfied here via the WARNING without silently degrading).
+        """
+        logger.warning(
+            'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
+            'merge submission for request_id=%s branch=%s; registry already at '
+            '%s. Coalescing as a benign no-op — NOT buffering a divergent '
+            'twin, NOT escalated.',
+            item.request_id, item.branch, current_state,
+        )
 
     def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
