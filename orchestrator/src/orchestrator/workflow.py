@@ -2261,6 +2261,18 @@ class TaskWorkflow:
             if recovery == WorkflowOutcome.DONE:
                 return recovery
 
+            # ── Durable merge-retry resume (task 2795) ────────────────
+            # If a merge-phase escalation was resolved via `resume`, _requeue
+            # stamped metadata.merge_retry_pending and returned REQUEUED for an
+            # in-RAM in-place retry that a restart would lose (Reify 5166). On
+            # re-dispatch, if the post-rebase worktree HEAD still matches the
+            # stamped branch_head, jump straight to the merge phase — skipping
+            # plan/execute/verify/review. Ordered AFTER the already-merged DONE
+            # guard (a landed branch wins) and BEFORE the SIMPLE_TASK/PLAN block.
+            _mrp = await self._resume_merge_retry_if_pending(branch_name)
+            if _mrp is not None:
+                return _mrp
+
             # ── Lever C: SIMPLE_TASK optimistic path ──────────────────
             # Dispatch a single Sonnet agent that explores, plans (via
             # plan-tools MCP), and implements end-to-end when the task's
@@ -2966,6 +2978,66 @@ class TaskWorkflow:
         await self._await_steward_completion()
         self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
+
+    async def _resume_merge_retry_if_pending(
+        self, branch_name: str,
+    ) -> WorkflowOutcome | None:
+        """Fast-path back to the merge phase when a durable retry obligation matches.
+
+        Reads ``metadata.merge_retry_pending`` (stamped by :meth:`_requeue`'s
+        merge_phase path when a merge-phase escalation was resolved via
+        ``resume``). If it is a dict AND the current post-rebase worktree HEAD
+        equals the stamped ``branch_head``, the resolved-and-verified branch is
+        unchanged since resolution — so clear the stamp and jump STRAIGHT to the
+        merge phase (via :meth:`_merge_and_finalise`), skipping
+        plan/execute/verify/review (zero reviewer_comprehensive; ``merge_queued``
+        is the next pipeline event, matching the observable signal).
+
+        Fail-safe fall-through to the full pipeline (returns ``None``) on a
+        missing/non-dict stamp, a rev-parse failure, or a HEAD mismatch. On a
+        mismatch it additionally clears the now-stale stamp — main advanced and
+        the branch was rebased to new SHAs, so it can never match again, and
+        resubmitting possibly-divergent code is exactly what we must avoid.
+        Clear-on-consume is idempotent and loop-safe: if the resumed merge
+        re-blocks and the steward resolves again, ``_requeue`` re-stamps a fresh
+        obligation.
+        """
+        stamp = (self.task.get('metadata') or {}).get('merge_retry_pending')
+        if not isinstance(stamp, dict):
+            return None
+        try:
+            rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
+        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+            logger.warning(
+                'Task %s: could not read worktree HEAD resolving '
+                'merge_retry_pending (%s) — running full pipeline',
+                self.task_id, exc,
+            )
+            return None
+        current_head = out.strip()
+        if rc != 0 or not current_head:
+            logger.warning(
+                'Task %s: git rev-parse HEAD failed (rc=%s) resolving '
+                'merge_retry_pending — running full pipeline',
+                self.task_id, rc,
+            )
+            return None
+        stamped_head = stamp.get('branch_head')
+        if current_head != stamped_head:
+            logger.warning(
+                'Task %s: merge_retry_pending branch_head %s != current HEAD %s '
+                '(main advanced / branch rebased) — clearing stale stamp, '
+                'running full pipeline', self.task_id, stamped_head, current_head,
+            )
+            await self._clear_merge_retry_pending()
+            return None
+        logger.info(
+            'Task %s: merge_retry_pending HEAD match (%s) — resuming straight to '
+            'merge phase, skipping plan/execute/verify/review',
+            self.task_id, current_head,
+        )
+        await self._clear_merge_retry_pending()
+        return await self._merge_and_finalise(branch_name)
 
     async def _run_merge_phase(self, branch_name: str) -> WorkflowOutcome | None:
         """Execute the MERGE phase. Returns None to fall through to SUCCESS."""
