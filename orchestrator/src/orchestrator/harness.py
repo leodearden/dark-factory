@@ -7320,6 +7320,25 @@ task, include it with an empty "files" list rather than omitting it.
             cost_store=getattr(self, 'cost_store', None),
             provenance_conflict_sink=self._provenance_conflict_sink,
         )
+
+        # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
+        # verify subtree from a PREVIOUS run still alive under the warm
+        # _merge-verify lane BEFORE scheduling the worker loop, hence before
+        # its first reset_persistent_merge_worktree can `git reset --hard` /
+        # `git clean -xfd` that tree out from under a live build.  On restart
+        # both existing guards are blind to such a survivor: the merge_verify
+        # flock died with the process and the holder-pgid lease reads stale
+        # (dead pgid → fail-OPEN).  Fail-OPEN here (mirrors the
+        # enforce_merge_liveness_margin generic-except precedent above): the
+        # barrier is best-effort, so a failure is logged and swallowed rather
+        # than aborting merge-worker startup.
+        try:
+            await self.git_ops.reap_merge_verify_survivors()
+        except Exception as e:
+            logger.warning(
+                'reap_merge_verify_survivors failed (non-fatal): %s', e,
+            )
+
         self._merge_worker_task = asyncio.create_task(
             self._merge_worker.run(), name='merge-worker',
         )
