@@ -69,6 +69,20 @@ __all__ = [
 # this module now consumes them indirectly via classify_invocation.
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
+# Robustness bound for the scoped no-freeze wait (task 2857 amendment). The
+# per-scope waiter Event is set() ONLY by the scope-uncap sweep
+# (_refresh_scope_capped), so it never wakes on an ACCOUNT-level transition —
+# most notably a PROBE_IN_FLIGHT account finishing its probe and going
+# AVAILABLE with fresh scope headroom. Because is_paused ignores
+# probe_in_flight, a scoped caller can reach that wait while the only
+# otherwise-selectable account is mid-probe; without a bound it would sleep
+# toward the full scope deadline (or max_probe_interval_secs, ~1800s) long
+# after the probe opened headroom. When such a probe is outstanding, the
+# scoped wait re-polls at most this many seconds so selection is re-checked
+# promptly (self-correcting). Deliberately a small internal responsiveness
+# constant, not an operator knob.
+_SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
+
 
 def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
     """Return True iff the probe stdout is a CLI JSON result reporting that
@@ -474,6 +488,15 @@ class UsageGate:
         self._project_id: str | None = None
         self._run_id: str | None = None
         self._last_account_name: str | None = None
+        # Per-scope wake Events for the S3 scope-wait (task 2857 / γ). Lazily
+        # populated by _scope_waiter on scope-is-not-None paths only, so every
+        # existing scope=None caller never allocates one (S1 / B6 byte-equiv).
+        self._scope_waiters: dict[str, asyncio.Event] = {}
+        # Per-scope last-selected-account tracker (task 2857 / γ) — independent
+        # of _last_account_name so scoped failover events carry scope without
+        # perturbing the general failover path (S1). Only touched on scope-is-
+        # not-None paths.
+        self._last_scope_account: dict[str, str] = {}
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
         self._shutting_down: bool = False
 
@@ -712,7 +735,7 @@ class UsageGate:
             len(self._accounts),
         )
 
-    async def before_invoke(self) -> AccountLease | None:
+    async def before_invoke(self, scope: str | None = None) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
         Returns an :class:`AccountLease` snapshotting the selected account's
@@ -720,6 +743,14 @@ class UsageGate:
         any PROBING -> PROBE_IN_FLIGHT claim, so the returned lease always
         names the SAME account as its token. Returns ``None`` if no accounts
         are configured (no token override).
+
+        *scope* (PRD task γ, task 2857): when non-None (a scoped-cap model, e.g.
+        ``claude-fable-5``), selection additionally skips accounts whose
+        ``scope_caps[scope]`` is capped with a future uncap-deadline (S2), while
+        account-level CAPPED/AUTH_FAILED still dominates for every scope (S4).
+        ``scope=None`` (the general scope) is byte-identical to today (S1) —
+        the scope predicate and the scope-wait fall-through are both guarded on
+        ``scope is not None``.
         """
         # Session budget check
         if (self._config.session_budget_usd is not None
@@ -737,6 +768,15 @@ class UsageGate:
                 for acct in self._accounts:
                     if acct.capped or acct.probe_in_flight or acct.auth_failed:
                         continue
+                    if scope is not None and self._scope_capped_at(
+                        acct, scope, datetime.now(UTC)
+                    ):
+                        # Scope-capped for this model (S2): skip for this scope
+                        # only — the account still serves general work (S1). The
+                        # account-level skip above already dominates (S4), and
+                        # this predicate is guarded on scope is not None so the
+                        # scope=None path stays byte-identical.
+                        continue
                     if acct.probing:
                         # First task claims the probe slot — others block
                         # until confirm_account_ok() or _handle_cap_detected().
@@ -748,23 +788,44 @@ class UsageGate:
                             f'single task testing',
                         )
                     logger.debug(f'Using account {acct.name}')
-                    # Failover detection: emit event if account changed.
-                    # Update _last_account_name FIRST to close the race window,
-                    # then fire the event non-blocking (fire-and-forget).
-                    if (
-                        self._last_account_name is not None
-                        and self._last_account_name != acct.name
-                    ):
-                        old_name = self._last_account_name
-                        self._last_account_name = acct.name
-                        if self._cost_store:
-                            self._fire_cost_event(
-                                acct.name,
-                                'failover',
-                                json.dumps({'from': old_name, 'to': acct.name}),
-                            )
+                    # Failover detection: emit event if account changed. The
+                    # tracker is updated FIRST to close the race window, then the
+                    # event fires non-blocking (fire-and-forget). scope=None uses
+                    # the general _last_account_name tracker (byte-identical, S1);
+                    # a scoped selection uses an INDEPENDENT per-scope tracker so
+                    # it never perturbs the general path and the event carries
+                    # `scope` (same 'failover' event name, matching β's cap_hit/
+                    # near_cap reuse).
+                    if scope is None:
+                        if (
+                            self._last_account_name is not None
+                            and self._last_account_name != acct.name
+                        ):
+                            old_name = self._last_account_name
+                            self._last_account_name = acct.name
+                            if self._cost_store:
+                                self._fire_cost_event(
+                                    acct.name,
+                                    'failover',
+                                    json.dumps({'from': old_name, 'to': acct.name}),
+                                )
+                        else:
+                            self._last_account_name = acct.name
                     else:
-                        self._last_account_name = acct.name
+                        scope_last = self._scope_last_account_map()
+                        prev = scope_last.get(scope)
+                        if prev is not None and prev != acct.name:
+                            scope_last[scope] = acct.name
+                            if self._cost_store:
+                                self._fire_cost_event(
+                                    acct.name,
+                                    'failover',
+                                    json.dumps(
+                                        {'from': prev, 'to': acct.name, 'scope': scope}
+                                    ),
+                                )
+                        else:
+                            scope_last[scope] = acct.name
                     return AccountLease(
                         name=acct.name, token=acct.token, generation=acct.generation,
                     )
@@ -773,6 +834,65 @@ class UsageGate:
             refreshed = await self._refresh_capped_accounts()
             if refreshed:
                 continue  # re-check accounts with updated flags
+
+            if scope is not None:
+                # Scope-aware no-freeze fall-through (task γ, S3/S6). The select
+                # loop found no account with headroom for THIS scope, and the
+                # account-level reset check above freed none. Clear the per-scope
+                # waiter BEFORE re-checking (clear-before-check) so a concurrent
+                # uncap's set() cannot be lost, then optimistically uncap expired
+                # scope caps; if that frees one, re-select — this is what returns
+                # the optimistically-uncapped account in ONE call (B5-return).
+                evt = self._scope_waiter(scope)
+                evt.clear()
+                if self._refresh_scope_capped(scope):
+                    continue
+                if not self.is_paused:
+                    # Fleet is NOT frozen — at least one account is generally
+                    # serviceable, only this scope is exhausted. Park on the
+                    # per-scope waiter toward the soonest scope reset (or the
+                    # max-probe ceiling when unknown) WITHOUT ever touching _open
+                    # or _paused_reason, so scope exhaustion can never freeze the
+                    # fleet (S3) nor delay a concurrent scope=None caller. On
+                    # timeout the loop re-runs the selection-time sweep. INV-4:
+                    # this always eventually returns an account rather than
+                    # blocking indefinitely, so the caller's slot.report(CapHit)
+                    # re-detection advances consecutive_cap_hits and the existing
+                    # max_cap_retries/AllAccountsCappedException bound applies; the
+                    # reactive re-cap installs a FUTURE deadline so uncaps are
+                    # spaced, not a tight spin.
+                    soonest = self._soonest_scope_reset(scope)
+                    sleep_for = (
+                        max(0.0, (soonest - datetime.now(UTC)).total_seconds())
+                        if soonest is not None
+                        else float(self._config.max_probe_interval_secs)
+                    )
+                    # Robustness (task 2857 amendment): the per-scope waiter is
+                    # set() ONLY by the scope-uncap sweep, so it does NOT wake on
+                    # an account-level transition that opens scope headroom. The
+                    # common such case is a PROBE_IN_FLIGHT account finishing its
+                    # probe and going AVAILABLE (confirm_account_ok) — is_paused
+                    # ignores probe_in_flight, so a scoped caller can park here
+                    # while the only otherwise-selectable account is mid-probe.
+                    # When a probe is outstanding, cap the park at a small
+                    # re-poll ceiling so the selection-time sweep re-runs within a
+                    # bounded delay instead of sleeping toward the full scope
+                    # deadline / max_probe_interval_secs. This still never touches
+                    # _open / _paused_reason (S3) and never tight-spins (the
+                    # ceiling is strictly positive); the pure scope-exhaustion
+                    # steady state (no probe in flight) is unchanged — it sleeps
+                    # toward the real deadline. (A bare `await self._open.wait()`
+                    # here would busy-spin: the fleet is NOT frozen precisely
+                    # because some account is generally AVAILABLE, so _open is
+                    # already set and would return at once.)
+                    if any(a.probe_in_flight for a in self._accounts):
+                        sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(evt.wait(), timeout=sleep_for)
+                    continue
+                # else: self.is_paused → the fleet is genuinely frozen (every
+                # account account-level capped/auth_failed). Fall through to the
+                # legacy _open freeze path below — nothing is serviceable.
 
             # Still all capped after fresh check — wait on global gate.
             # NOTE: this clear() is NOT redundant with _transition's centralized
@@ -800,9 +920,10 @@ class UsageGate:
 
         *scope* (PRD task β) is stored on the yielded slot (``slot.scope``) and
         forwarded by ``report`` / ``detect_cap_hit`` into the cap handlers so a
-        scoped cap attributes to only this account's model-scope. β does not use
-        it for account *selection* (that is γ, task 2857) — ``before_invoke``
-        is unchanged.
+        scoped cap attributes to only this account's model-scope. It is now
+        ALSO threaded into ``before_invoke(scope=scope)`` for scope-aware
+        account *selection* (PRD task γ, task 2857): the yielded slot leases an
+        account with headroom for this scope, skipping scope-capped ones.
 
         Usage::
 
@@ -815,7 +936,7 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        lease = await self.before_invoke()
+        lease = await self.before_invoke(scope=scope)
         slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot
@@ -902,6 +1023,170 @@ class UsageGate:
             sc = ScopeCap()
             acct.scope_caps[scope] = sc
         return sc
+
+    def _scope_waiter(self, scope: str) -> asyncio.Event:
+        """Get-or-create the per-scope wake ``asyncio.Event`` (S3 scope-wait).
+
+        Lazily populates ``self._scope_waiters`` through a getattr-default read
+        (mirroring the ``_probe_config_dirs`` / ``_shutting_down`` idiom) so a
+        ``__new__``-built test fixture that never ran ``__init__`` still works.
+        Only touched on scope-is-not-None paths, so every existing scope=None
+        caller never allocates a waiter (S1 / B6 byte-equivalence).
+        """
+        waiters = getattr(self, '_scope_waiters', None)
+        if waiters is None:
+            waiters = self._scope_waiters = {}
+        evt = waiters.get(scope)
+        if evt is None:
+            evt = waiters[scope] = asyncio.Event()
+        return evt
+
+    def _scope_last_account_map(self) -> dict[str, str]:
+        """Get-or-create the per-scope last-selected-account map (task 2857 / γ).
+
+        getattr-default read (mirroring ``_scope_waiter``) so a ``__new__``-built
+        test fixture that never ran ``__init__`` still works. Only touched on
+        scope-is-not-None paths, so the general failover path is byte-identical.
+        """
+        m = getattr(self, '_last_scope_account', None)
+        if m is None:
+            m = self._last_scope_account = {}
+        return m
+
+    def _scope_uncap_deadline(self, sc: ScopeCap) -> datetime | None:
+        """The instant a scope cap becomes optimistically uncappable (S6).
+
+        ``resets_at`` when the classifier parsed one, else the conservative
+        fixed backoff ``capped_at + max_probe_interval_secs`` — the single
+        deadline both the S6 sweep and the S3 wait consult (PRD open-Q2).
+        ``capped_at`` is always stamped by β's scoped ``_handle_cap_detected``,
+        so the deadline is computable whenever a scope cap is set; returns None
+        only for a malformed cap carrying neither field.
+        """
+        if sc.resets_at is not None:
+            return sc.resets_at
+        if sc.capped_at is not None:
+            return sc.capped_at + timedelta(seconds=self._config.max_probe_interval_secs)
+        return None
+
+    def _scope_capped_at(self, acct: AccountState, scope: str, now: datetime) -> bool:
+        """True iff *acct* is scope-capped for *scope* with an uncap deadline
+        still in the future at *now* — the authoritative admission predicate
+        shared by ``before_invoke(scope=)`` selection and
+        ``scope_capacity_snapshot`` (invariant S8).
+
+        A scope cap that is absent, already uncapped, or past its deadline is
+        NOT capping (the optimistic-uncap contract): such an account is admitted
+        for the scope. A capped cap with no computable deadline (malformed —
+        never produced by β) fails safe as still-capped.
+        """
+        sc = acct.scope_caps.get(scope)
+        if sc is None or not sc.capped:
+            return False
+        deadline = self._scope_uncap_deadline(sc)
+        if deadline is None:
+            return True
+        return now < deadline
+
+    def _refresh_scope_capped(self, scope: str) -> bool:
+        """Optimistically clear expired *scope* caps at selection time (S6).
+
+        SYNCHRONOUS by design (contains no ``await``): a no-await sweep is
+        atomic under asyncio's cooperative scheduler, so it cannot interleave
+        with a concurrent scoped ``_handle_cap_detected`` and is safe to call
+        outside ``self._lock`` — matching the module's short-critical-section
+        discipline (``scope_caps`` mutations are already not lock-protected).
+        Mirrors ``_refresh_capped_accounts`` one dimension down (per scope, not
+        per account). Wakes the per-scope waiter (S3) whenever it uncaps
+        anything so a concurrent scope-wait re-checks its select condition.
+
+        Returns True iff at least one account's scope cap was cleared.
+        """
+        now = datetime.now(UTC)
+        any_uncapped = False
+        for acct in self._accounts:
+            sc = acct.scope_caps.get(scope)
+            if sc is None or not sc.capped:
+                continue
+            deadline = self._scope_uncap_deadline(sc)
+            if deadline is not None and now >= deadline:
+                sc.capped = False
+                logger.info(
+                    f'Account {acct.name}: scope {scope!r} uncap deadline passed '
+                    f'— optimistically uncapping (S6)',
+                )
+                any_uncapped = True
+        if any_uncapped:
+            self._scope_waiter(scope).set()
+        return any_uncapped
+
+    def _soonest_scope_reset(self, scope: str) -> datetime | None:
+        """Earliest scope uncap-deadline across accounts capped for *scope*.
+
+        Mirrors ``soonest_resets_at`` for the scope dimension: the min
+        ``_scope_uncap_deadline`` across accounts whose ``scope_caps[scope]`` is
+        capped, or None when none is capped (or every capped one has no
+        computable deadline). Consulted by the S3 scope-wait to bound its sleep.
+        """
+        deadlines: list[datetime] = []
+        for acct in self._accounts:
+            sc = acct.scope_caps.get(scope)
+            if sc is None or not sc.capped:
+                continue
+            deadline = self._scope_uncap_deadline(sc)
+            if deadline is not None:
+                deadlines.append(deadline)
+        return min(deadlines) if deadlines else None
+
+    def scope_capacity_snapshot(self) -> dict[str, bool]:
+        """Advisory per-scoped-model headroom snapshot (task γ, invariant S8).
+
+        For each model in ``config.scoped_cap_models``, True iff AT LEAST ONE
+        account has headroom for that scope, where headroom ==
+        ``(not acct.capped and not acct.auth_failed) and not
+        _scope_capped_at(acct, m, now)`` — the SAME admission
+        ``before_invoke(scope=m)`` applies, so the resolver's advisory snapshot
+        (threaded by δ) agrees with the gate's authoritative invoke-time
+        predicate; a stale snapshot degrades to a scope-wait/failover rather
+        than a wrong decision. Empty when ``scoped_cap_models`` is empty (the
+        kill switch); each model False when no account is configured. Pure read
+        — no sweep, no mutation (a read caller is never surprised by an
+        optimistic-uncap side effect).
+        """
+        now = datetime.now(UTC)
+        return {
+            m: any(
+                (not acct.capped and not acct.auth_failed)
+                and not self._scope_capped_at(acct, m, now)
+                for acct in self._accounts
+            )
+            for m in self._config.scoped_cap_models
+        }
+
+    def scope_status(self) -> dict[str, dict[str, dict]]:
+        """Per-(account × scope) serialized cap state (task γ) for a future
+        digest/dashboard panel (rendering out of scope here).
+
+        Emits ``acct.name -> {model: {'capped', 'resets_at', 'near_cap',
+        'capped_at'}}`` for every account with a NON-EMPTY ``scope_caps``;
+        accounts that have observed no scoped cap/near-cap are skipped, so the
+        map reflects only genuinely-observed scope state (the lazy-population
+        contract). Datetimes render as ISO strings (JSON-ready); None passes
+        through as None. Pure read — no sweep, no mutation.
+        """
+        return {
+            acct.name: {
+                model: {
+                    'capped': sc.capped,
+                    'resets_at': sc.resets_at.isoformat() if sc.resets_at else None,
+                    'near_cap': sc.near_cap,
+                    'capped_at': sc.capped_at.isoformat() if sc.capped_at else None,
+                }
+                for model, sc in acct.scope_caps.items()
+            }
+            for acct in self._accounts
+            if acct.scope_caps
+        }
 
     def _handle_cap_detected(
         self,
