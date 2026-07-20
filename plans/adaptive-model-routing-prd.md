@@ -358,7 +358,7 @@ Phase 3 — fleet rebalancing (survey Tier 1) + plan-shape generalization:
   marginal → escalate with the report. Signal: committed decision record referencing
   the eval report + either the applied config change (reload disposition) or the filed
   escalation. Prereqs: β, δ; cross-PRD **2475**, **2478**.
-- **κ — Haiku decide-and-act pilots: judge, triage, module_tagger**
+- **κ — Haiku decide-and-act pilots: judge, module_tagger** (triage dropped 2026-07-20)
   Modules: orchestrator (defaults.yaml / config; per-role trial scripts under
   scripts/ or evals/results/ artifacts — no eval-machinery restructuring), committed
   trial reports.
@@ -499,10 +499,13 @@ time.
    construction — it is the post-flip watch and the cost side of F1/$. Per-role
    pre-flip basis: **judge** → reviewer_trial scoring precedent (F1 +
    blocking_recall vs a labeled corpus, F1/$, adopt-if-parity-or-better-and-cheaper,
-   via the 2478 OFAT seam); **triage** + **module_tagger** → replay-agreement rate
-   (haiku-vs-sonnet output agreement, frontier-adjudicated; module_tagger also vs
-   ground-truth files). The marginal band that escalates to a human is still set
-   inside each κ sub-task. See §κ.
+   via the 2478 OFAT seam); **module_tagger** → replay-agreement rate
+   (haiku-vs-sonnet output agreement, frontier-adjudicated, vs ground-truth files).
+   **triage** was to use the same replay-agreement method but was **dropped from κ
+   2026-07-20** — its `models.triage` role is dormant (0 production invocations) with
+   no replay corpus, so the pilot is unrunnable and a model flip would be inert (see
+   §κ triage bullet). The marginal band that escalates to a human is still set inside
+   each remaining κ sub-task. See §κ.
 3. **`metadata.routing` history depth** (N=5 suggested) and event payload size caps.
    Decide during γ.
 4. **Whether λ raises turns to 50 or 40**. Saturation data (28.6% at 30) supports a
