@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -254,16 +254,37 @@ class TestRequeueWiring:
 # ---------------------------------------------------------------------------
 
 
-def _wire_finalise_spies(f: _Fixture, *, merge_result):
-    """Spy _run_merge_phase and the finalise tail on the fixture's workflow."""
+@dataclass
+class _FinaliseSpies:
+    run_merge_phase: AsyncMock
+    write_completion_to_memory: AsyncMock
+    await_steward_completion: AsyncMock
+    finalise_merged_done: AsyncMock
+    enter_phase: MagicMock
+
+
+def _wire_finalise_spies(f: _Fixture, *, merge_result) -> _FinaliseSpies:
+    """Spy _run_merge_phase and the finalise tail on the fixture's workflow.
+
+    Returns the typed mock handles so assertions read them directly, rather
+    than through the workflow's real bound methods (which pyright resolves to
+    MethodType, not the assigned mock).
+    """
     wf = f.wf
-    wf._run_merge_phase = AsyncMock(return_value=merge_result)  # type: ignore[method-assign]
-    wf._write_completion_to_memory = AsyncMock()  # type: ignore[method-assign]
+    spies = _FinaliseSpies(
+        run_merge_phase=AsyncMock(return_value=merge_result),
+        write_completion_to_memory=AsyncMock(),
+        await_steward_completion=AsyncMock(),
+        finalise_merged_done=AsyncMock(return_value=WorkflowOutcome.DONE),
+        enter_phase=MagicMock(),
+    )
+    wf._run_merge_phase = spies.run_merge_phase  # type: ignore[method-assign]
+    wf._write_completion_to_memory = spies.write_completion_to_memory  # type: ignore[method-assign]
     wf._ensure_steward_started = AsyncMock()  # type: ignore[method-assign]
-    wf._await_steward_completion = AsyncMock()  # type: ignore[method-assign]
-    wf._finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
-    wf._enter_phase = MagicMock()  # type: ignore[method-assign]
-    return wf
+    wf._await_steward_completion = spies.await_steward_completion  # type: ignore[method-assign]
+    wf._finalise_merged_done = spies.finalise_merged_done  # type: ignore[method-assign]
+    wf._enter_phase = spies.enter_phase  # type: ignore[method-assign]
+    return spies
 
 
 class TestMergeAndFinalise:
@@ -272,47 +293,47 @@ class TestMergeAndFinalise:
         # (a) _run_merge_phase returns a terminal WorkflowOutcome (merge did NOT
         # succeed) → return it verbatim, never run the finalise/DONE tail.
         f = _make()
-        wf = _wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
+        spies = _wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
 
-        outcome = await wf._merge_and_finalise('task/77')
+        outcome = await f.wf._merge_and_finalise('task/77')
 
         assert outcome == WorkflowOutcome.BLOCKED
-        wf._run_merge_phase.assert_awaited_once()
-        wf._write_completion_to_memory.assert_not_awaited()
-        wf._finalise_merged_done.assert_not_awaited()
-        wf._enter_phase.assert_not_called()
+        spies.run_merge_phase.assert_awaited_once()
+        spies.write_completion_to_memory.assert_not_awaited()
+        spies.finalise_merged_done.assert_not_awaited()
+        spies.enter_phase.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_none_merge_result_runs_finalise_tail_and_returns_done(self):
         # (b) _run_merge_phase returns None (merge SUCCEEDED) → run the finalise
         # tail and return _finalise_merged_done()'s value, entering DONE.
         f = _make()
-        wf = _wire_finalise_spies(f, merge_result=None)
+        spies = _wire_finalise_spies(f, merge_result=None)
 
-        outcome = await wf._merge_and_finalise('task/77')
+        outcome = await f.wf._merge_and_finalise('task/77')
 
         assert outcome == WorkflowOutcome.DONE
-        wf._run_merge_phase.assert_awaited_once()
-        wf._write_completion_to_memory.assert_awaited_once()
-        wf._await_steward_completion.assert_awaited_once()
-        wf._enter_phase.assert_any_call(WorkflowState.DONE)
-        wf._finalise_merged_done.assert_awaited_once()
+        spies.run_merge_phase.assert_awaited_once()
+        spies.write_completion_to_memory.assert_awaited_once()
+        spies.await_steward_completion.assert_awaited_once()
+        spies.enter_phase.assert_any_call(WorkflowState.DONE)
+        spies.finalise_merged_done.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_eval_mode_skips_merge_phase_but_runs_finalise_tail(self):
         # (c) eval mode (_worktree_external=True) never merges into main, but the
         # SUCCESS/finalise tail still runs.
         f = _make()
-        wf = _wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
-        wf._worktree_external = True
+        spies = _wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
+        f.wf._worktree_external = True
 
-        outcome = await wf._merge_and_finalise('task/77')
+        outcome = await f.wf._merge_and_finalise('task/77')
 
         assert outcome == WorkflowOutcome.DONE
-        wf._run_merge_phase.assert_not_awaited()
-        wf._write_completion_to_memory.assert_awaited_once()
-        wf._enter_phase.assert_any_call(WorkflowState.DONE)
-        wf._finalise_merged_done.assert_awaited_once()
+        spies.run_merge_phase.assert_not_awaited()
+        spies.write_completion_to_memory.assert_awaited_once()
+        spies.enter_phase.assert_any_call(WorkflowState.DONE)
+        spies.finalise_merged_done.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -320,69 +341,82 @@ class TestMergeAndFinalise:
 # ---------------------------------------------------------------------------
 
 
-def _wire_resume_guard_spies(f: _Fixture):
-    """Spy _merge_and_finalise and _clear_merge_retry_pending for guard tests."""
+@dataclass
+class _ResumeGuardSpies:
+    merge_and_finalise: AsyncMock
+    clear_merge_retry_pending: AsyncMock
+
+
+def _wire_resume_guard_spies(f: _Fixture) -> _ResumeGuardSpies:
+    """Spy _merge_and_finalise and _clear_merge_retry_pending for guard tests.
+
+    Returns the typed mock handles so assertions read them directly.
+    """
     wf = f.wf
-    wf._merge_and_finalise = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
-    wf._clear_merge_retry_pending = AsyncMock()  # type: ignore[method-assign]
-    return wf
+    spies = _ResumeGuardSpies(
+        merge_and_finalise=AsyncMock(return_value=WorkflowOutcome.DONE),
+        clear_merge_retry_pending=AsyncMock(),
+    )
+    wf._merge_and_finalise = spies.merge_and_finalise  # type: ignore[method-assign]
+    wf._clear_merge_retry_pending = spies.clear_merge_retry_pending  # type: ignore[method-assign]
+    return spies
 
 
 class TestResumeGuard:
     @pytest.mark.asyncio
     async def test_no_stamp_returns_none_no_delegation_no_clear(self, monkeypatch):
         f = _make(metadata={})
-        wf = _wire_resume_guard_spies(f)
+        spies = _wire_resume_guard_spies(f)
         monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
 
-        assert await wf._resume_merge_retry_if_pending('task/77') is None
-        wf._merge_and_finalise.assert_not_awaited()
-        wf._clear_merge_retry_pending.assert_not_awaited()
+        assert await f.wf._resume_merge_retry_if_pending('task/77') is None
+        spies.merge_and_finalise.assert_not_awaited()
+        spies.clear_merge_retry_pending.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_non_dict_stamp_returns_none(self, monkeypatch):
         f = _make(metadata={'merge_retry_pending': 'not-a-dict'})
-        wf = _wire_resume_guard_spies(f)
+        spies = _wire_resume_guard_spies(f)
         monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
 
-        assert await wf._resume_merge_retry_if_pending('task/77') is None
-        wf._merge_and_finalise.assert_not_awaited()
+        assert await f.wf._resume_merge_retry_if_pending('task/77') is None
+        spies.merge_and_finalise.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_head_match_clears_then_delegates_and_returns_outcome(self, monkeypatch):
         f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
-        wf = _wire_resume_guard_spies(f)
+        spies = _wire_resume_guard_spies(f)
         monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
 
-        outcome = await wf._resume_merge_retry_if_pending('task/77')
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
 
         assert outcome == WorkflowOutcome.DONE
-        wf._clear_merge_retry_pending.assert_awaited_once()
-        wf._merge_and_finalise.assert_awaited_once_with('task/77')
+        spies.clear_merge_retry_pending.assert_awaited_once()
+        spies.merge_and_finalise.assert_awaited_once_with('task/77')
 
     @pytest.mark.asyncio
     async def test_head_mismatch_clears_stale_stamp_and_returns_none(self, monkeypatch):
         f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'OLD-SHA'}})
-        wf = _wire_resume_guard_spies(f)
+        spies = _wire_resume_guard_spies(f)
         monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
 
-        outcome = await wf._resume_merge_retry_if_pending('task/77')
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
 
         assert outcome is None
         # A mismatch clears the stale stamp (the branch moved; it can never match).
-        wf._clear_merge_retry_pending.assert_awaited_once()
-        wf._merge_and_finalise.assert_not_awaited()
+        spies.clear_merge_retry_pending.assert_awaited_once()
+        spies.merge_and_finalise.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_rev_parse_failure_returns_none_no_delegation(self, monkeypatch):
         f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
-        wf = _wire_resume_guard_spies(f)
+        spies = _wire_resume_guard_spies(f)
         monkeypatch.setattr('orchestrator.workflow._run', _fake_run(rc=1))
 
-        outcome = await wf._resume_merge_retry_if_pending('task/77')
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
 
         assert outcome is None
-        wf._merge_and_finalise.assert_not_awaited()
+        spies.merge_and_finalise.assert_not_awaited()
 
 
 class TestDrivePlacement:

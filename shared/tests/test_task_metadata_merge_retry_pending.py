@@ -42,11 +42,11 @@ class TestMergeRetryPendingModel:
 
     def test_missing_branch_head_raises(self):
         with pytest.raises(ValidationError):
-            MergeRetryPending(base_sha='b' * 40, resolved_at='2026-07-20T05:00:00+00:00')
+            MergeRetryPending(base_sha='b' * 40, resolved_at='2026-07-20T05:00:00+00:00')  # type: ignore[call-arg]
 
     def test_extra_fields_allowed_and_round_trip(self):
         # extra='allow' so a newer writer's field survives round-trip.
-        m = MergeRetryPending(x_note='keep', **_WELL_FORMED_SLICE)
+        m = MergeRetryPending(x_note='keep', **_WELL_FORMED_SLICE)  # type: ignore[call-arg]
         assert m.model_dump()['x_note'] == 'keep'
 
 
@@ -57,8 +57,8 @@ class TestMergeRetryPendingParse:
         blob = {'merge_retry_pending': dict(_WELL_FORMED_SLICE)}
         model, warnings = parse_metadata(blob, direction='read')
         # (a) typed slice attached (registered sub-model → __pydantic_extra__).
-        assert isinstance(model.merge_retry_pending, MergeRetryPending)
-        assert model.merge_retry_pending.branch_head == 'a' * 40
+        assert isinstance(model.merge_retry_pending, MergeRetryPending)  # type: ignore[attr-defined]
+        assert model.merge_retry_pending.branch_head == 'a' * 40  # type: ignore[attr-defined]
         # (a) NO unknown_key warning for this key (it is in known_fields).
         assert not any(
             w.code == 'unknown_key' and w.field == 'merge_retry_pending' for w in warnings
