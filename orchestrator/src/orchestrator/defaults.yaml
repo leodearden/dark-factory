@@ -18,6 +18,10 @@ max_review_cycles: 2
 reviewer_stagger_secs: 2.0
 max_reviewer_retries: 4
 max_amendment_rounds: 1
+# Fail-safe prior-round-resolution adjudication (task 2523): suppress
+# re-flagging of suggestions already settled in a prior amendment round.
+# Opt-out; default on.
+suppress_resettled_review_suggestions: true
 
 # Merge conflict reduction
 max_advance_attempts: 3
