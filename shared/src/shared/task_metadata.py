@@ -29,6 +29,7 @@ __all__ = [
     'DoneProvenance',
     'ExternalDep',
     'MemoryHints',
+    'MergeRetryPending',
     'Milestone',
     'RetryLedger',
     'RoutingDecisionMirror',
@@ -435,6 +436,30 @@ class RoutingState(BaseModel):
             return cls()
 
 
+class MergeRetryPending(BaseModel):
+    """``metadata.merge_retry_pending`` — a durable merge-phase resume obligation (task 2795).
+
+    Stamped by the orchestrator when a merge-phase escalation is resolved via
+    ``resume``: the in-place merge retry that ``_requeue`` performs is
+    otherwise IN-RAM ONLY (the task stays ``in-progress`` and its merge-queue
+    entry was already finalised), so a restart mid-retry silently loses the
+    "this task owes a merge resubmission" obligation (Reify 5166). Persisting
+    ``{branch_head, base_sha, resolved_at}`` lets the resume guard in
+    ``_drive`` reconstruct that obligation on re-dispatch and jump straight
+    back to the merge phase when the post-rebase worktree HEAD still equals
+    ``branch_head``.
+
+    ``extra='allow'`` matches the milestone/routing precedent so a newer
+    writer's field survives round-trip untouched (I1).
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    branch_head: str
+    base_sha: str
+    resolved_at: str
+
+
 class TaskMetadata(BaseModel):
     """The versioned ``metadata`` JSON blob carried on every task (PRD §5).
 
@@ -519,6 +544,14 @@ register_metadata_submodel('milestone', Milestone)
 # known_fields (no unknown_key census warning) and every parse_metadata
 # caller gets a validated, typed RoutingState slice.
 register_metadata_submodel('routing', RoutingState)
+
+# merge_retry_pending (task 2795): registered like milestone/routing so the
+# orchestrator's durable merge-phase-resume stamp lands in known_fields (no
+# unknown_key census warning) and is typed/validated at the fused-memory
+# write boundary — while, as a registered sub-model rather than an optional
+# `| None = None` field, staying absent from model_dump() when unset (no
+# None-noise on every task).
+register_metadata_submodel('merge_retry_pending', MergeRetryPending)
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
