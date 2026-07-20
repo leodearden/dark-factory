@@ -76,6 +76,12 @@ class FakeScheduler:
         # tests force False to simulate a sibling lock conflict).
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
         self.blast_radius_result: bool = True
+        # Scope-grant direct metadata.files persist seam (task 2505, step-18):
+        # every update_task(task_id, metadata) call is recorded here so the
+        # same-module scope-grant persist path (which writes metadata.files
+        # directly, bypassing handle_blast_radius_expansion) can be asserted.
+        # Purely additive — the existing no-op `return True` is preserved.
+        self.update_task_calls: list[tuple[str, str | dict]] = []
 
     async def set_task_status(
         self,
@@ -159,6 +165,7 @@ class FakeScheduler:
     async def update_task(
         self, task_id: str, metadata: str | dict, *, append: bool = False,
     ) -> bool:
+        self.update_task_calls.append((task_id, metadata))
         return True
 
     async def dispatch_tool(

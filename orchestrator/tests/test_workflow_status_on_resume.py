@@ -516,6 +516,91 @@ class TestStatusPreservationOnResume:
             f'Resume invocation must use IMPLEMENTER role; got {role!r}'
         )
 
+    async def test_resume_consumes_same_module_grant(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A grant for a same-package sibling of an existing plan file must
+        STILL be folded into plan.files/metadata.files on resume — task 2505
+        (reviewer regression).
+
+        The pre-fix resume-loop gate keyed on ``set(new_modules) !=
+        set(self.modules)``; for a same-module grant that set is unchanged, so
+        ``_set_task_scope`` was never called and neither plan.files nor
+        metadata.files ever reflected the grant. The fix decouples the
+        plan.files write from the module-change gate (fires whenever the file
+        set actually widens) and persists metadata.files directly when the
+        module set is unchanged.
+        """
+        # Same-package siblings: identical module set at config.lock_depth.
+        f1 = 'a/b/c/d/e.py'
+        f2 = 'a/b/c/d/f.py'
+        assert files_to_modules([f1], config.lock_depth) == files_to_modules(
+            [f1, f2], config.lock_depth,
+        ), (
+            'precondition: F1 and F2 must map to the SAME module set at '
+            f'lock_depth={config.lock_depth}'
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id, category='scope_violation')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        # Seed the plan with F1 only and the matching (single-module) lock set,
+        # so the granted sibling F2 does NOT change the module set.
+        workflow.initial_plan = {**dict(PLAN), 'files': [f1]}
+        workflow.modules = files_to_modules([f1], config.lock_depth)
+        # Granting steward — grant the same-package sibling; lock is free
+        # (blast_radius_result defaults True, though for a same-module widen no
+        # blast-radius call is expected at all).
+        workflow._steward_factory = _make_granting_steward(
+            queue, task_assignment.task_id, [f2],
+        )
+        evrl_mock, state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        outcome = (await workflow.run()).outcome
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f2 in workflow.plan['files'], (
+            f"granted same-module sibling {f2!r} must be folded into "
+            f"plan.files; got {workflow.plan['files']!r}"
+        )
+        # Module set unchanged → NO handle_blast_radius_expansion call for the
+        # grant (the reconcile no-ops when the module set doesn't change).
+        assert all(
+            f2 not in (persist_files or [])
+            for _current, _needed, persist_files in scheduler.blast_radius_calls
+        ), (
+            'a same-module grant must not trigger a blast-radius call for the '
+            f'grant; got {scheduler.blast_radius_calls!r}'
+        )
+        # metadata.files persisted DIRECTLY via update_task (blast-radius
+        # no-op'd, so the persist must come from _set_task_scope's same-module
+        # branch) — plan.files and metadata.files stay in lockstep.
+        persisted_files = [
+            md.get('files') for _tid, md in scheduler.update_task_calls
+            if isinstance(md, dict)
+        ]
+        assert any(f2 in (files or []) for files in persisted_files), (
+            'metadata.files must be persisted including the granted '
+            f'sibling {f2!r}; update_task_calls={scheduler.update_task_calls!r}'
+        )
+        assert invoke_mock.await_count >= 1, (
+            'Implementer must be resumed after the same-module grant is consumed.'
+        )
+        call_args = invoke_mock.await_args_list[0]
+        role = call_args.args[0]
+        assert getattr(role, 'name', '') == 'implementer', (
+            f'Resume invocation must use IMPLEMENTER role; got {role!r}'
+        )
+
     async def test_scope_violation_resume_granted_files_lock_conflict_requeues(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -707,6 +792,74 @@ class TestSetTaskScope:
             'persists metadata.files=new_files on its requeue branch too, '
             'so plan.files must match metadata.files even when the lock '
             'could not be acquired.'
+        )
+
+    async def test_same_module_widen_persists_plan_and_metadata_without_blast(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A grant whose file maps to a module the task already locks must
+        still persist metadata.files DIRECTLY — task 2505 (reviewer regression).
+
+        ``handle_blast_radius_expansion`` persists ``metadata.files`` ONLY on a
+        module change; a same-module widen no-ops that call. Without the
+        direct persist, plan.files would be widened while metadata.files stayed
+        behind — the exact divergence the MERGE-entry ``_check_scope_invariant``
+        tripwire is built to catch.
+        """
+        # Two files co-located in the same package: at config.lock_depth the
+        # module set is identical with or without F2 — a genuine same-module
+        # widen (self-validating precondition asserted first).
+        f1 = 'a/b/c/d/e.py'
+        f2 = 'a/b/c/d/f.py'
+        assert files_to_modules([f1], config.lock_depth) == files_to_modules(
+            [f1, f2], config.lock_depth,
+        ), (
+            'precondition: F1 and F2 must map to the SAME module set at '
+            f'lock_depth={config.lock_depth}; got '
+            f'{files_to_modules([f1], config.lock_depth)!r} vs '
+            f'{files_to_modules([f1, f2], config.lock_depth)!r}'
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        queue = EscalationQueue(tmp_path / 'queue')
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        workflow.artifacts = TaskArtifacts(wt)
+        workflow.artifacts.init(task_assignment.task_id, 'X', 'Y')
+        plan = dict(PLAN)
+        plan['files'] = [f1]
+        workflow.artifacts.write_plan(plan)
+        workflow.artifacts.stamp_plan_provenance(workflow.session_id)
+        workflow.plan = workflow.artifacts.read_plan()
+        workflow.modules = files_to_modules([f1], config.lock_depth)
+        modules_before = list(workflow.modules)
+
+        result = await workflow._set_task_scope([f1, f2])
+
+        assert result is True
+        assert workflow.modules == modules_before, (
+            'self.modules must be UNCHANGED on a same-module widen'
+        )
+        assert scheduler.blast_radius_calls == [], (
+            'a same-module widen must NOT call handle_blast_radius_expansion '
+            f'(module set unchanged); got {scheduler.blast_radius_calls!r}'
+        )
+        on_disk = workflow.artifacts.read_plan()
+        assert on_disk['files'] == [f1, f2], (
+            f'plan.json must be widened to include {f2!r}; got {on_disk["files"]!r}'
+        )
+        assert workflow.artifacts.validate_plan_owner(workflow.session_id) is True
+        persisted_files = [
+            md.get('files') for _tid, md in scheduler.update_task_calls
+            if isinstance(md, dict)
+        ]
+        assert any(f2 in (files or []) for files in persisted_files), (
+            'metadata.files must be persisted DIRECTLY (via update_task) '
+            f'including {f2!r} on a same-module widen, since '
+            'handle_blast_radius_expansion no-ops and never persists it; '
+            f'update_task_calls={scheduler.update_task_calls!r}'
         )
 
 
