@@ -195,6 +195,121 @@ class TestBuildEvalOrchConfigWorktreePin:
 
 
 # ---------------------------------------------------------------------------
+# task 2851 — call-site threading guards: each eval executor threads the eval
+# worktree it created (run_eval / run_end_to_end / run_architect_eval) into
+# build_eval_orch_config, so the verify pin above actually reads that worktree.
+#
+# Behavioral guards (not signature locks), mirroring test_eval_memory_isolation.
+# test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config: replace
+# build_eval_orch_config with a recorder that captures the `worktree` kwarg the
+# call site passed, then short-circuits before any workflow/worktree work.
+# Deleting a `worktree=worktree` forward makes captured['worktree'] default to
+# None and fails the guard.
+# ---------------------------------------------------------------------------
+
+class _Sentinel(Exception):
+    """Short-circuit sentinel: the recorder raises it after capturing worktree."""
+
+
+def _worktree_recorder(captured: dict):
+    """A build_eval_orch_config stand-in that captures `worktree` then bails.
+
+    ``**kwargs`` swallows every other forwarded argument (memory_endpoint /
+    architect_config / judge_config), so the recorder is agnostic to which
+    executor calls it — only the `worktree` thread is under test here.
+    """
+    def _rec(config, task, base_config=None, *, worktree=None, **kwargs):
+        captured['worktree'] = worktree
+        raise _Sentinel
+    return _rec
+
+
+@pytest.mark.asyncio
+class TestCallSitesThreadWorktree:
+    async def test_run_eval_threads_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        captured: dict = {}
+        monkeypatch.setattr(runner, 'build_eval_orch_config', _worktree_recorder(captured))
+        monkeypatch.setattr(
+            runner, 'load_task',
+            lambda _p: {'id': 't', 'project_root': str(tmp_path)},
+        )
+        wt = tmp_path / 'wt'
+
+        # worktree_path=wt short-circuits create_eval_worktree and binds
+        # worktree=wt; the build call is NOT inside a try, so _Sentinel propagates.
+        with pytest.raises(_Sentinel):
+            await runner.run_eval(tmp_path / 'task.json', _impl_cfg(), worktree_path=wt)
+
+        assert captured['worktree'] == wt
+
+    async def test_run_end_to_end_threads_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        captured: dict = {}
+        wt = tmp_path / 'wt'
+
+        async def fake_create_wt(*_a, **_k):
+            return wt, 'run'
+
+        # run_end_to_end binds the worktree via the runner-local create_eval_worktree.
+        monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+        monkeypatch.setattr(runner, 'build_eval_orch_config', _worktree_recorder(captured))
+        monkeypatch.setattr(
+            runner, 'load_task',
+            lambda _p: {'id': 't', 'project_root': str(tmp_path), 'pre_task_commit': 'abc'},
+        )
+
+        # The build call is BEFORE the try, so _Sentinel propagates.
+        with pytest.raises(_Sentinel):
+            await runner.run_end_to_end(tmp_path / 'task.json', _arch_cfg(), _impl_cfg())
+
+        assert captured['worktree'] == wt
+
+    async def test_run_architect_eval_threads_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+
+        captured: dict = {}
+        wt = tmp_path / 'wt'
+
+        async def fake_create_wt(*_a, **_k):
+            return wt, 'run'
+
+        async def fake_cleanup(*_a, **_k):
+            return None
+
+        def fake_judge(*_a, **_k):
+            raise RuntimeError('no cloud judge in tests')
+
+        # run_architect_eval binds the worktree via snapshots.create_eval_worktree
+        # (module attr, not the runner-local name) and, on the swallowed sentinel,
+        # scores an empty plan — patch the judge to raise so it degrades to the
+        # deterministic score_plan_structure floor (no cloud call).
+        monkeypatch.setattr('orchestrator.evals.snapshots.create_eval_worktree', fake_create_wt)
+        monkeypatch.setattr('orchestrator.evals.snapshots.cleanup_eval_worktree', fake_cleanup)
+        monkeypatch.setattr('orchestrator.evals.judge.judge_plan_quality', fake_judge)
+        monkeypatch.setattr(runner, 'build_eval_orch_config', _worktree_recorder(captured))
+        monkeypatch.setattr(runner, 'save_result', lambda _r: None)
+        monkeypatch.setattr(
+            runner, 'load_task',
+            lambda _p: {'id': 't', 'project_root': str(tmp_path), 'pre_task_commit': 'abc'},
+        )
+
+        # The build call is INSIDE `except Exception`, so the recorder's _Sentinel
+        # is swallowed; run_architect_eval returns normally (outcome='blocked').
+        await runner.run_architect_eval(tmp_path / 'task.json', _impl_cfg())
+
+        assert captured['worktree'] == wt
+
+
+# ---------------------------------------------------------------------------
 # step-01/02 — build_eval_orch_config gains an optional judge_config param.
 #
 # Default None keeps the current sonnet/medium/claude judge pin byte-identical
