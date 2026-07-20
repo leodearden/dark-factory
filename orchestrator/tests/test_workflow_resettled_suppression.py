@@ -178,6 +178,41 @@ class TestAdjudicateResettled:
         assert out == []
         wf._invoke.assert_not_awaited()
 
+    async def test_uses_dedicated_adjudicator_role_not_reviewer(self, tmp_path):
+        """Invokes the dedicated adjudicator, NOT REVIEWER_COMPREHENSIVE.
+
+        Locks in the suggestion-1 fix: reusing the comprehensive-reviewer role
+        would inject ``verdict_tools`` and a ``submit_review_verdict`` mandate,
+        starving the ``StructuredOutput`` decisions payload and leaving the
+        whole suppression pass silently inert.  The role that actually reaches
+        ``_invoke`` must therefore carry no verdict tooling and pass the
+        decisions schema.
+        """
+        from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+        from orchestrator.workflow import _RESETTLED_ADJUDICATOR
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf._invoke = AsyncMock(return_value=_result(
+            structured_output={'decisions': [{'index': 0, 'decision': 'settled'}]},
+        ))
+        await wf._adjudicate_resettled([_issue('suggestion', 'a')], [])
+
+        assert wf._invoke.await_args is not None, 'adjudicator never invoked'
+        role = wf._invoke.await_args.args[0]
+        # Identity + the specific properties that make StructuredOutput reachable.
+        assert role is _RESETTLED_ADJUDICATOR
+        assert role is not REVIEWER_COMPREHENSIVE
+        # No verdict tooling (indeed no MCP family at all), so `_invoke` wires no
+        # verdict-tools server, and an empty allowed_tools means the synthetic
+        # StructuredOutput tool is never gated out of an explicit allow-list.
+        assert role.mcp_families == frozenset()
+        assert 'verdict_tools' not in role.mcp_families
+        assert role.allowed_tools == []
+        # Not the comprehensive-reviewer contract (which mandates a verdict call).
+        assert role.system_prompt != REVIEWER_COMPREHENSIVE.system_prompt
+        # The decisions schema must ride along as output_schema.
+        assert wf._invoke.await_args.kwargs.get('output_schema') is not None
+
 
 class TestSuppressResettledSuggestions:
     """``_suppress_resettled_suggestions(reviews, amendment_round)``."""

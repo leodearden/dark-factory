@@ -640,6 +640,50 @@ def classify_rebase_cohort(
 _AMENDMENT_DELTA_CONTEXT_LINES = 3
 
 
+# Dedicated role for the task-2523 resettled-suggestion adjudication.
+#
+# It deliberately does NOT reuse REVIEWER_COMPREHENSIVE.  That role's contract
+# (roles.py's _REVIEWER_CONTRACT_TEMPLATE) MANDATES a `submit_review_verdict`
+# tool call and explicitly forbids JSON/prose output, and the role injects the
+# `verdict_tools` MCP family — so an agent following it would emit a review
+# verdict instead of the requested `{decisions:[...]}` StructuredOutput,
+# leaving `result.structured_output` empty and the whole suppression pass
+# silently inert (fail-safe → all-emit) while still burning a reviewer-tier
+# invocation.  This adjudicator is instead a pure structured classifier: no
+# verdict tooling (empty `mcp_families`, so `_invoke` wires NO MCP config) and
+# no file/bash tools (empty `allowed_tools`, so `_invoke` passes
+# `--allowed-tools` as None and the synthetic `StructuredOutput` schema tool is
+# not gated out), driven by a system prompt that asks ONLY for the decisions
+# schema.  It borrows REVIEWER_COMPREHENSIVE's model/budget/max-turns so the
+# routing cost profile is unchanged.  Defined here rather than in
+# agents/roles.py because this amendment is scoped to workflow.py; it is a
+# local role object, never registered in the ROLES registry (an unknown role
+# name resolves safely to its `role_default` layer in routing.resolve_route).
+_RESETTLED_ADJUDICATOR_SYSTEM_PROMPT = """\
+You are a precise CLASSIFICATION JUDGE, not a code reviewer. You are given two
+lists of review suggestions — a set raised in a PRIOR amendment round of a task,
+and the CURRENT round's suggestions — and you decide, per current suggestion,
+whether it merely re-flags a concern already resolved earlier.
+
+Return your answer ONLY as the structured `{"decisions": [...]}` payload defined
+by the output schema — one entry per current suggestion index. Do NOT call
+`submit_review_verdict` or any review/verdict tool, do NOT write prose findings,
+and do NOT perform a fresh code review. Your entire job is the comparison and
+the per-index decision; the caller reads nothing but the structured output.
+"""
+
+_RESETTLED_ADJUDICATOR = AgentRole(
+    name='resettled_adjudicator',
+    system_prompt=_RESETTLED_ADJUDICATOR_SYSTEM_PROMPT,
+    allowed_tools=[],
+    disallowed_tools=[],
+    default_model=REVIEWER_COMPREHENSIVE.default_model,
+    default_budget=REVIEWER_COMPREHENSIVE.default_budget,
+    default_max_turns=REVIEWER_COMPREHENSIVE.default_max_turns,
+    mcp_families=frozenset(),
+)
+
+
 @dataclass(frozen=True)
 class AmendmentReviewContext:
     """Consume-once loop state scoping ONE post-amendment review to its delta.
@@ -7142,10 +7186,16 @@ class TaskWorkflow:
     ) -> list[str]:
         """Batched prior-round-resolution adjudication (task 2523), fail-safe to EMIT.
 
-        Runs ONE ``REVIEWER_COMPREHENSIVE`` invocation comparing *current_list*
-        (the live suggestions) against *prior_settled* (the prior-round settled
-        set) and returns a per-index decision list aligned to *current_list*,
-        each drawn from {``SETTLED``, ``NOT_SETTLED``, ``INCONCLUSIVE``}.
+        Runs ONE ``_RESETTLED_ADJUDICATOR`` invocation comparing *current_list*
+        (the live suggestions) against *prior_settled* (the prior-round
+        suggestion set) and returns a per-index decision list aligned to
+        *current_list*, each drawn from {``SETTLED``, ``NOT_SETTLED``,
+        ``INCONCLUSIVE``}.  The dedicated adjudicator role is used rather than
+        ``REVIEWER_COMPREHENSIVE`` on purpose: the reviewer contract mandates a
+        ``submit_review_verdict`` tool call and injects ``verdict_tools``, which
+        would starve the ``StructuredOutput`` decisions payload this method
+        depends on and render suppression silently inert (see the role's
+        definition comment above).
 
         Fails SAFE toward ``NOT_SETTLED`` (emit) on ANY failure: a raised
         exception, a ``None`` / non-success / timed-out result, missing or
@@ -7190,7 +7240,7 @@ class TaskWorkflow:
         try:
             assert self.worktree is not None
             result = await self._invoke(
-                REVIEWER_COMPREHENSIVE, prompt, self.worktree,
+                _RESETTLED_ADJUDICATOR, prompt, self.worktree,
                 output_schema=schema,
             )
         except Exception as exc:
