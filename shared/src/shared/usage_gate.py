@@ -130,6 +130,20 @@ _LEGAL_TRANSITIONS: dict[AccountPhase, frozenset[AccountPhase]] = {
 }
 
 
+def scope_for(model: str, config: UsageCapConfig) -> str | None:
+    """Derive the cap scope a model belongs to.
+
+    Returns the model string itself when ``model`` is a scoped-cap model (it
+    gets its own per-account cap scope), else an explicit ``None`` — the general
+    scope, i.e. today's exact paths. With ``config.scoped_cap_models`` empty (the
+    kill switch) this always returns ``None``, so every model — including a
+    formerly-scoped one — falls back to the general scope (boundary B6).
+    """
+    if model in config.scoped_cap_models:
+        return model
+    return None
+
+
 @dataclass
 class ScopeCap:
     """Per-(account, model) cap overlay — a flag+timer snapshot, NOT a phase machine.
