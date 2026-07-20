@@ -5439,6 +5439,17 @@ class TaskWorkflow:
                     reviews = await self._apply_amendment_delta_scope(
                         reviews, used_ctx,
                     )
+                # Temporal companion to the spatial delta scope above (task
+                # 2523): drop suggestions already SETTLED in a PRIOR amendment
+                # round so they neither re-arm the loop below nor churn the
+                # DONE-path curator routing.  Composes SPATIAL(2750) →
+                # TEMPORAL(2523); no-op on a first-pass review or when no prior
+                # archive exists, and fails safe toward EMIT on any adjudication
+                # error.  Blocking issues never reach here (short-circuited by
+                # the enclosing non-blocking arm).
+                reviews = await self._suppress_resettled_suggestions(
+                    reviews, amendment_round,
+                )
                 # L2b: try an amendment pass before escalating suggestions.
                 # In-scope suggestions (module-lock members) are applied by
                 # the implementer directly — no architect, no new tasks.
@@ -7227,6 +7238,68 @@ class TaskWorkflow:
             self.task_id, settled_count, n,
         )
         return decisions
+
+    async def _suppress_resettled_suggestions(
+        self, reviews: ReviewAggregation, amendment_round: int,
+    ) -> ReviewAggregation:
+        """Suppress suggestions already SETTLED in a PRIOR amendment round (task 2523).
+
+        The TEMPORAL companion to :meth:`_apply_amendment_delta_scope` (spatial):
+        once at least one amendment round has archived a prior verdict, a
+        batched LLM adjudication (:meth:`_adjudicate_resettled`) decides which
+        of the current suggestions merely re-flag a concern the team already
+        settled, and those are dropped from the returned verdict so they neither
+        re-arm the amendment loop nor churn the DONE-path curator routing.
+
+        No-op (returns *reviews* unchanged) when the gate is off, this is a
+        first-pass review (``amendment_round < 1``), there are no suggestions,
+        the artifacts root is unavailable, or no prior-round archive exists —
+        keeping the common single-round path a cheap no-op.  Only
+        ``suggestions`` is ever filtered; ``blocking_issues`` /
+        ``has_blocking_issues`` / ``reviews`` / ``reviewer_errors`` pass through
+        untouched (blocking issues are the safety valve).  Fails SAFE: any
+        adjudication error keeps every suggestion (loud-over-silent).
+        """
+        from orchestrator.review_suggestions.prior_round import (
+            load_prior_round_suggestions,
+            partition_by_decisions,
+        )
+
+        if not self.config.suppress_resettled_review_suggestions:
+            return reviews
+        if amendment_round < 1:
+            return reviews
+        if not reviews.suggestions:
+            return reviews
+        if self.artifacts is None:
+            return reviews
+        prior = load_prior_round_suggestions(self.artifacts.root)
+        if not prior:
+            return reviews
+
+        try:
+            decisions = await self._adjudicate_resettled(
+                reviews.suggestions, prior,
+            )
+            kept, suppressed = partition_by_decisions(
+                reviews.suggestions, decisions,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: resettled suppression failed (%s); keeping all %d '
+                'suggestion(s) (fail-safe)',
+                self.task_id, exc, len(reviews.suggestions),
+            )
+            return reviews
+
+        if not suppressed:
+            return reviews
+        logger.info(
+            'Task %s: suppressed %d re-flagged suggestion(s) already settled '
+            'in a prior amendment round; %d kept',
+            self.task_id, len(suppressed), len(kept),
+        )
+        return replace(reviews, suggestions=kept)
 
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
         """Run all 5 reviewers with stagger, retry errors.
