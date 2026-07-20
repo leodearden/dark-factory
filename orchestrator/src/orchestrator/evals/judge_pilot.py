@@ -101,13 +101,48 @@ def decide_judge_adoption(
     * ``cheaper`` — candidate mean ``cost_usd`` < incumbent mean ``cost_usd``;
     * ``sufficient`` — both composite CIs are ``sufficient`` (n≥3).
 
-    ``verdict='adopt'`` (``escalate=False``) iff all three hold. This step-2
-    implementation only fully resolves the ADOPT path; the reject / marginal /
-    insufficient / missing-row branches are filled in by step-4.
+    ``verdict='adopt'`` (``escalate=False``) iff all three hold. Every other
+    outcome escalates with a structured ``reasons`` explanation:
+
+    * a MISSING incumbent/candidate row → ``marginal`` (loud, no ``KeyError``);
+    * a NOT-``sufficient`` composite CI (n<3 on either config) → ``marginal``
+      (we cannot conclude anything from too few trials — checked before the
+      non-inferiority verdict so an underpowered run never reads as a confident
+      reject);
+    * NOT ``non_inferior`` (and sufficient) → ``reject``;
+    * ``non_inferior`` + sufficient but NOT ``cheaper`` → ``marginal``.
     """
     by_name = {str(r.get('config')): r for r in composite_report.get('configs', [])}
-    incumbent_row = by_name[incumbent]
-    candidate_row = by_name[candidate]
+    incumbent_row = by_name.get(incumbent)
+    candidate_row = by_name.get(candidate)
+
+    # (d) Missing row → loud marginal, no KeyError, deltas undefined.
+    if incumbent_row is None or candidate_row is None:
+        missing = [
+            name
+            for name, row in ((incumbent, incumbent_row), (candidate, candidate_row))
+            if row is None
+        ]
+        return JudgeAdoptionDecision(
+            verdict='marginal',
+            escalate=True,
+            non_inferior=False,
+            cheaper=False,
+            sufficient=False,
+            margin=margin,
+            incumbent=incumbent,
+            candidate=candidate,
+            incumbent_row=incumbent_row,
+            candidate_row=candidate_row,
+            composite_delta=None,
+            cost_delta=None,
+            judge_cost_delta=None,
+            reasons=[
+                f'missing required config row(s): {", ".join(missing)} '
+                f'absent from the composite report (configs present: '
+                f'{", ".join(sorted(by_name)) or "none"}) — cannot decide',
+            ],
+        )
 
     inc_comp = _composite_mean(incumbent_row)
     cand_comp = _composite_mean(candidate_row)
@@ -117,16 +152,49 @@ def decide_judge_adoption(
 
     non_inferior = cand_lo >= inc_comp - margin
     cheaper = cand_cost < inc_cost
-    sufficient = _composite_sufficient(candidate_row) and _composite_sufficient(incumbent_row)
+    cand_sufficient = _composite_sufficient(candidate_row)
+    inc_sufficient = _composite_sufficient(incumbent_row)
+    sufficient = cand_sufficient and inc_sufficient
 
     composite_delta = cand_comp - inc_comp
     cost_delta = cand_cost - inc_cost
     judge_cost_delta = _judge_cost(candidate_row) - _judge_cost(incumbent_row)
+    threshold = inc_comp - margin
 
-    if non_inferior and cheaper and sufficient:
-        verdict, escalate = 'adopt', False
-    else:
+    reasons: list[str] = []
+    if not sufficient:
+        # (c) Too few trials on either config → cannot conclude; loud marginal.
+        underpowered = [
+            name
+            for name, ok in ((candidate, cand_sufficient), (incumbent, inc_sufficient))
+            if not ok
+        ]
         verdict, escalate = 'marginal', True
+        reasons.append(
+            f'insufficient trials (n<3) for composite CI: {", ".join(underpowered)} '
+            f'— need >=3 trials/cell to conclude; escalate for more trials',
+        )
+    elif not non_inferior:
+        # (a) Confident regression beyond the margin → reject.
+        verdict, escalate = 'reject', True
+        reasons.append(
+            f'not non-inferior: {candidate} composite CI lower bound {cand_lo:.4f} '
+            f'< {incumbent} mean {inc_comp:.4f} - margin {margin:.4f} = {threshold:.4f}',
+        )
+    elif not cheaper:
+        # (b) Non-inferior but no cost win → marginal.
+        verdict, escalate = 'marginal', True
+        reasons.append(
+            f'non-inferior (CI lo {cand_lo:.4f} >= {threshold:.4f}) but NOT cheaper: '
+            f'{candidate} cost_usd {cand_cost:.4f} >= {incumbent} cost_usd {inc_cost:.4f} '
+            f'(delta {cost_delta:+.4f})',
+        )
+    else:
+        verdict, escalate = 'adopt', False
+        reasons.append(
+            f'adopt: {candidate} non-inferior (CI lo {cand_lo:.4f} >= {threshold:.4f}) '
+            f'and cheaper (cost {cand_cost:.4f} < {inc_cost:.4f}, delta {cost_delta:+.4f})',
+        )
 
     return JudgeAdoptionDecision(
         verdict=verdict,
@@ -142,5 +210,5 @@ def decide_judge_adoption(
         composite_delta=composite_delta,
         cost_delta=cost_delta,
         judge_cost_delta=judge_cost_delta,
-        reasons=[],
+        reasons=reasons,
     )
