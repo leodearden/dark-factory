@@ -5308,3 +5308,94 @@ class TestEscalateEvidenceParam:
         esc = queue.get(result['id'])
         assert esc is not None
         assert esc.evidence == [], f"Expected evidence=[], got: {esc.evidence!r}"
+
+
+class TestResolveIssueEscalateModel:
+    """resolve_issue(escalate_model=True) pre-bumps the task's routing tier via
+    harness.pre_increment_routing_tier (task μ, trigger 3) — so the task's NEXT
+    dispatch routes one ladder rung stronger via the retry-tier-up rule.
+
+    Fires ONLY for resume/restart (the actions that lead to a next dispatch);
+    park keeps the task blocked with no re-dispatch (early return before the
+    hook), so it never bumps. Best-effort + off-loop: the write is delegated to
+    the harness (which owns the metadata write path and the loop); resolve_issue
+    stays sync.
+    """
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-em-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-em-1',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='escalate_model test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    @staticmethod
+    def _harness():
+        from unittest.mock import Mock
+        return types.SimpleNamespace(pre_increment_routing_tier=Mock())
+
+    @pytest.mark.asyncio
+    async def test_resume_with_flag_bumps(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness = self._harness()
+        server = create_server(queue, harness=harness)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed',
+            action='resume', escalate_model=True,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        harness.pre_increment_routing_tier.assert_called_once_with(esc.task_id)
+
+    @pytest.mark.asyncio
+    async def test_restart_with_flag_bumps(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness = self._harness()
+        server = create_server(queue, harness=harness)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed',
+            action='restart', escalate_model=True,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        harness.pre_increment_routing_tier.assert_called_once_with(esc.task_id)
+
+    @pytest.mark.asyncio
+    async def test_resume_without_flag_does_not_bump(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness = self._harness()
+        server = create_server(queue, harness=harness)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed',
+            action='resume', escalate_model=False,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        harness.pre_increment_routing_tier.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_park_with_flag_does_not_bump(self, tmp_path: Path):
+        """park has no next dispatch (task stays blocked) — the hook sits after
+        park's early return, so escalate_model is a no-op there."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness = self._harness()
+        server = create_server(queue, harness=harness)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='needs human',
+            action='park', escalate_model=True,
+        )
+
+        harness.pre_increment_routing_tier.assert_not_called()

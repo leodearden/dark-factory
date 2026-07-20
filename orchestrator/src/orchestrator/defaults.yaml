@@ -260,6 +260,32 @@ routing:
       set:
         model: opus
         max_turns: 120
+    # Task mu (Phase 4): retry-escalation rung. On a re-dispatch after a
+    # failed dispatch the harness bumps metadata.routing.routing_tier (gamma's
+    # harness-owned, monotonic counter), and THIS rule turns that tier>=1 into
+    # one ladder rung stronger for the task's executor roles. It is expressed
+    # entirely in the resolver's existing closed vocabulary (min_routing_tier
+    # match + a ladder-relative "+1" set.model, clamped at the ladder top by
+    # _resolve_ladder_relative), so no routing.py/config.py change is needed.
+    #
+    # Listed LAST, deliberately: first-match-wins means a large-plan retry
+    # matches large-plan-steps/large-plan-modules FIRST and keeps their opus +
+    # max_turns=120 headroom (retry-tier-up sets no max_turns). Placing it
+    # before them would strip that headroom from large-plan retries.
+    #
+    # Inert at tier 0 (min_routing_tier>=1), so the default-tier resolution is
+    # byte-equivalent to pre-mu (invariant 3) -- a fresh dispatch never matches
+    # this rule. "+1" is a fixed ONE-rung bump gated on tier>=1 (PRD boundary
+    # test 5, "one ladder step up"), NOT a per-tier climb: at the current
+    # ladder [haiku, sonnet, opus] a sonnet implementer -> opus and an
+    # already-opus architect clamps at opus. Higher rungs arrive when task xi
+    # admits claude-fable-5 to the ladder top.
+    - id: retry-tier-up
+      match:
+        role: [implementer, debugger, architect]
+        min_routing_tier: 1
+      set:
+        model: "+1"
 
 # Models per role
 models:

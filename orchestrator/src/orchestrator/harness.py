@@ -24,6 +24,7 @@ from shared.cli_invoke import (
 )
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
+from shared.task_metadata import RoutingState
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -134,6 +135,26 @@ logger = logging.getLogger(__name__)
 # constant so the value stays inside the declared module scope without
 # touching config.py / defaults.yaml.
 _REBLOCK_GUARD_THRESHOLD: int = 3
+
+
+def _bumped_routing_dump(metadata: Any, by: int = 1) -> dict[str, Any]:
+    """Return the ``metadata['routing']`` blob with ``routing_tier`` bumped by ``by``.
+
+    The single pure authority for the retry-escalation tier bump (task μ,
+    plans/adaptive-model-routing-prd.md Phase 4), reused by every bump site:
+    the terminal-failure auto-bump (``_maybe_bump_routing_tier``) and the
+    escalate_model by-id bump (``_bump_routing_tier_by_id``).
+
+    Reads via :meth:`RoutingState.from_metadata` (tolerant-degrade: a missing/
+    non-dict ``metadata`` or ``routing`` key yields a fresh ``RoutingState()``),
+    increments only ``routing_tier`` via ``model_copy`` — ``latest``/``history``/
+    ``simple_saturated`` and any ``extra`` fields ride through unchanged — and
+    serializes with ``model_dump()``. Because it only ever *adds*, the
+    harness-owned counter stays monotonic (invariant 8) even under a
+    last-write-wins ``metadata_mode='merge'`` race.
+    """
+    state = RoutingState.from_metadata(metadata if isinstance(metadata, dict) else None)
+    return state.model_copy(update={'routing_tier': state.routing_tier + by}).model_dump()
 
 # Fixed sentinel task_id for the dirty-project-root-at-startup born-at-L2
 # escalation (task 2380). Not a real task — _on_escalation only bumps a
@@ -6491,6 +6512,14 @@ task, include it with an empty "files" list rather than omitting it.
                         'Task %s: auto-eval hook failed (non-fatal): %s',
                         assignment.task_id, exc,
                     )
+                # Retry-escalation rung (task μ, trigger 1a): on a
+                # terminal-failed (BLOCKED) dispatch, bump the routing tier so
+                # the NEXT dispatch routes one ladder rung stronger via the
+                # retry-tier-up rule. Awaited (not fire-and-forget) so the
+                # bump lands before slot release and any fast re-dispatch.
+                # Self-guards on outcome; its own try/except keeps it
+                # best-effort.
+                await self._maybe_bump_routing_tier(assignment, report)
             # PRD task-status-authority C4/D4 (task 2188, omega1): clear the
             # claimant to NULL at slot release — unconditionally, for every
             # outcome (this runs even when report is None, e.g. the
@@ -6631,6 +6660,91 @@ task, include it with an empty "files" list rather than omitting it.
             if status_by_id.get(cid) in _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES
         ]
 
+    async def _maybe_bump_routing_tier(self, assignment, report: TaskReport) -> None:
+        """Bump ``metadata.routing.routing_tier`` on a terminal-failed dispatch.
+
+        Task μ (plans/adaptive-model-routing-prd.md Phase 4), trigger (1a).
+        Called from ``_run_slot``'s finally next to ``_maybe_auto_eval``, and
+        AWAITED before slot release so the bumped tier lands before any fast
+        re-dispatch (e.g. a re-pend) reads it. On the NEXT dispatch the
+        retry-tier-up rule (defaults.yaml) turns that ``tier>=1`` into one
+        ladder rung stronger for the executor role.
+
+        Fires ONLY on ``report.outcome == BLOCKED`` — the unambiguous
+        terminal-failed dispatch (boundary test 5). DONE (success, boundary
+        test 6) and REQUEUED (an in-process retry of the same work) do NOT
+        bump: there is no clean per-requeue lost-work signal here, and bumping
+        transient/no-progress requeues would burn top-tier quota against the
+        PRD's own intent (design decision).
+
+        The write goes through ``metadata_mode='merge'`` on the ``routing``
+        key alone so it never clobbers the sibling metadata or races the
+        blocked-status write; ``_bumped_routing_dump`` is read-current-then-+1,
+        so the harness-owned counter stays monotonic (invariant 8). Best-effort
+        + suppressed: a bump failure must never block slot release.
+        """
+        if report is None or report.outcome != WorkflowOutcome.BLOCKED:
+            return
+        try:
+            await self.scheduler.update_task(
+                assignment.task_id,
+                {'routing': _bumped_routing_dump(assignment.task.get('metadata'))},
+                metadata_mode='merge',
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: routing-tier bump failed (non-fatal): %s',
+                assignment.task_id, exc,
+            )
+
+    async def _bump_routing_tier_by_id(self, task_id: str) -> None:
+        """Bump ``metadata.routing.routing_tier`` for *task_id* by id.
+
+        The async worker behind ``pre_increment_routing_tier`` (task μ,
+        trigger 3 — the escalation ``escalate_model`` flag). Fetches the task's
+        CURRENT metadata via ``scheduler.get_task`` (so the read-then-+1 sees
+        the latest tier, keeping the counter monotonic — invariant 8) and
+        writes the bumped ``routing`` blob through ``metadata_mode='merge'``,
+        exactly like the terminal-failure bump. No-ops when the task is absent
+        (a synthetic/sentinel task_id resolves to None). Best-effort +
+        suppressed: an escalate_model hint must never fail the resolve.
+        """
+        try:
+            task = await self.scheduler.get_task(task_id)
+            if task is None:
+                return
+            await self.scheduler.update_task(
+                task_id,
+                {'routing': _bumped_routing_dump(task.get('metadata'))},
+                metadata_mode='merge',
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: escalate_model routing-tier bump failed (non-fatal): %s',
+                task_id, exc,
+            )
+
+    def pre_increment_routing_tier(self, task_id: str) -> None:
+        """Pre-increment a task's routing tier for its next dispatch (SYNC shim).
+
+        Called from the escalation server's ``resolve_issue`` when
+        ``escalate_model=True`` on a resume/restart — a deliberately SYNC entry
+        point, because ``resolve_issue`` runs on a FastMCP threadpool worker
+        OFF the orchestrator loop and harness code relies on it staying sync
+        (see this task's plan design decision). The escalation package must not
+        write orchestrator task metadata directly either; the harness owns both
+        the metadata write path and the loop. So this shim does NO write itself
+        — it bridges the async ``_bump_routing_tier_by_id`` coroutine onto
+        ``self._loop`` via ``_schedule_coro_threadsafe`` (mirroring the
+        auto-resume-on-resolve pattern), keeping the write harness-owned and
+        on-loop. Best-effort: the metadata write lands one dispatch late in the
+        worst case (a benign ordering race, documented as a soft hint).
+        """
+        self._schedule_coro_threadsafe(
+            self._bump_routing_tier_by_id(task_id),
+            label=f'routing-tier-preincrement-{task_id}',
+        )
+
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
     ) -> None:
@@ -6716,6 +6830,17 @@ task, include it with an empty "files" list rather than omitting it.
             'auto_eval_pair': str(original_id),
             'spawned_from': str(original_id),
             'force_full_path': True,
+            # Retry-escalation rung (task μ, trigger 1b): the redo sibling
+            # starts one tier above its parent, so its full-path executor
+            # routes a rung stronger via the retry-tier-up rule from its very
+            # first dispatch. A FRESH state at parent+1 (only the counter
+            # carries forward) — the parent's latest/history mirror entries
+            # belong to the parent's dispatches, not this new sibling.
+            # Harness-set at submit = harness-stamped, not author-supplied
+            # (invariant 8).
+            'routing': {
+                'routing_tier': RoutingState.from_metadata(task_metadata).routing_tier + 1,
+            },
             'modules': list(task_metadata.get('modules') or []),
             'files': list(task_metadata.get('files') or []),
         }

@@ -605,6 +605,7 @@ def create_server(
         resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        escalate_model: bool = False,
         terminate: Any = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
@@ -664,6 +665,20 @@ def create_server(
         change. Written only at resolution — never author-supplied
         otherwise. Not forwarded to the ``park`` action (the record stays
         open at L2, unclassified until eventually resolved).
+
+        ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
+        the action leads to a *next dispatch* (``resume`` / ``restart``), the
+        resolver best-effort pre-increments the task's
+        ``metadata.routing.routing_tier`` via
+        ``harness.pre_increment_routing_tier(rec.task_id)``, so that the next
+        dispatch routes its executor one ladder rung stronger (the
+        ``retry-tier-up`` policy rule fires at ``routing_tier >= 1``). It is a
+        soft telemetry hint: the write is delegated to the harness (which owns
+        the metadata write path and the event loop) and wrapped in try/except
+        so it can never fail the resolve. NOT applied on the ``park``
+        early-return branch (park keeps the task blocked with no re-dispatch)
+        nor for the dismiss actions (``abandon`` / ``close_only`` — no next
+        dispatch). Degrades to a no-op when no harness is wired.
 
         **Table B** (``escalation.action_effects``) is the single authority for
         action legality, consulted BEFORE any record mutation:
@@ -862,6 +877,28 @@ def create_server(
         )
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
+
+        # escalate_model (task μ, adaptive-routing trigger 3): after a
+        # SUCCESSFUL resolve of a next-dispatch action (resume/restart),
+        # best-effort pre-increment the task's routing tier so its next
+        # dispatch routes one ladder rung stronger (retry-tier-up rule).
+        # Delegated to the harness — which owns the metadata write path and
+        # the event loop — and guarded via getattr so a None/stub harness
+        # degrades gracefully; wrapped in try/except so a telemetry hiccup can
+        # never fail the resolve. Park returns early above (no bump); the
+        # dismiss actions (abandon/close_only) fall through this guard (no
+        # next dispatch to consume the bump).
+        if escalate_model and action in ('resume', 'restart') and harness is not None:
+            bump = getattr(harness, 'pre_increment_routing_tier', None)
+            if callable(bump):
+                try:
+                    bump(rec.task_id)
+                except Exception as _e:  # noqa: BLE001 — best-effort telemetry
+                    logger.warning(
+                        'escalate_model tier bump failed for task %s '
+                        '(non-fatal): %s',
+                        rec.task_id, _e,
+                    )
         return esc.to_dict()
 
     @mcp.tool()
