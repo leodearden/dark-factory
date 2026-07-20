@@ -5703,6 +5703,63 @@ class GitOps:
             return False  # branch does not exist — take the fresh path
         return await self._branch_has_commits_beyond_main(full_branch)
 
+    async def _reseed_verified_clean(
+        self, lane: Path, full_branch: str, base_ref: str,
+    ) -> bool:
+        """Whether a fresh reseed of *lane* landed clean (task 2854).
+
+        The reseed-consistency contract for the fresh-reseed acquire routes
+        (:attr:`AcquireRoute.RECYCLE` / :attr:`AcquireRoute.CREATE_ONCE_FRESH`)
+        is: the lane's checked-out branch is *full_branch*, reset to
+        *base_ref*, carrying NO retained prior-occupant commits. This
+        predicate asserts exactly that post-condition — the symmetric
+        counterpart to the rebase-collapse :class:`BranchResetError` guard
+        that already protects the reuse/reattach routes — so a lane still
+        serving a PRIOR task's tree (reify incident 2026-07-20: ``_lane-12``
+        acquired for task 5279 while its ``task/5279`` branch sat at task
+        5264's commits) is faulted BEFORE dispatch, rather than relied on the
+        downstream collapse guard to catch it late.
+
+        Returns ``True`` iff BOTH hold, measured in the lane against its live
+        HEAD (what actually gets dispatched):
+
+        1. ``git rev-parse --abbrev-ref HEAD`` == *full_branch* — the reseed
+           actually switched the checkout to the incoming task's branch (a
+           detached or foreign-branch HEAD is not a verified clean reseed).
+        2. ``git rev-list --count <base_ref>..HEAD`` parses to ``0`` — HEAD
+           carries zero commits beyond the base the lane was reset to.
+
+        **Fail-closed** (the opposite direction to
+        :meth:`_branch_has_commits_beyond_main`'s fail-safe ``True``): any
+        non-zero git rc, a detached/other-branch HEAD, or unparseable output
+        returns ``False`` — if we cannot PROVE the lane is a clean reseed we
+        must not dispatch a task onto it (a false "contaminated" costs one
+        cheap requeue onto a different lane; a false "clean" reopens the
+        data-integrity defect this closes). Checks against *base_ref* (the
+        base the lane was reset to), not a hardcoded main, so it stays
+        contract-accurate even if *base_ref* ever differs from the main ref.
+        """
+        # (1) HEAD must be on full_branch — the reseed must have switched the
+        # checkout, not left a detached or foreign (prior-occupant) branch.
+        rc, cur_branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        if rc != 0 or cur_branch.strip() != full_branch:
+            return False
+        # (2) HEAD must carry zero commits beyond base_ref (reusing the
+        # rev-list --count idiom from _branch_has_commits_beyond_main, but
+        # base-parameterized on start_ref and run in the lane against HEAD,
+        # fail-closed instead of fail-safe-True).
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--count', f'{base_ref}..HEAD'], cwd=lane,
+        )
+        if rc != 0:
+            return False
+        try:
+            return int(out.strip()) == 0
+        except ValueError:
+            return False
+
     async def _delete_branch_if_on_main(
         self, full_branch: str, *, context: str,
     ) -> None:
