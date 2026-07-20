@@ -24,8 +24,12 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
+
+if TYPE_CHECKING:
+    from .corpus import CorpusManifest
 
 _PKG_DIR = Path(__file__).parent
 _CORPUS_PATH = _PKG_DIR / 'corpus' / 'manifest.json'

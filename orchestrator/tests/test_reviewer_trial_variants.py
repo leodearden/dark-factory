@@ -5,6 +5,7 @@ from __future__ import annotations
 from orchestrator.agents.roles import AgentRole
 from orchestrator.config import default_price_table
 from orchestrator.evals.reviewer_trial.variants import (
+    _SPEC_COMPREHENSIVE,
     ALL_VARIANTS,
     REVIEWER_REFRESH_VARIANTS,
     VARIANT_A,
@@ -15,7 +16,6 @@ from orchestrator.evals.reviewer_trial.variants import (
     VARIANT_D,
     VARIANT_SONNET5_SOLO,
     ReviewerSpec,
-    _SPEC_COMPREHENSIVE,
     build_trial_reviewer_role,
 )
 
