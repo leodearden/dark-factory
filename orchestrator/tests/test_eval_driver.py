@@ -105,6 +105,46 @@ class TestBuildEvalOrchConfigArchitectOverride:
 
 
 # ---------------------------------------------------------------------------
+# task 2847 BUG 2a — build_eval_orch_config pins the eval verify interpreter to
+# the target's .python-version via verify_env['UV_PYTHON'], so `uv run
+# pytest/ruff/pyright` runs under the worktree's own 3.13 venv. Absent a
+# .python-version, no pin is injected (fail-safe).
+# ---------------------------------------------------------------------------
+
+class TestBuildEvalOrchConfigVerifyPythonPin:
+    def test_pins_uv_python_from_project_python_version(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        # The target project_root pins 3.13 (df fixtures do); base carries a
+        # pre-existing verify_env key that must survive the merge.
+        (tmp_path / '.python-version').write_text('3.13\n')
+        base = _base_config(tmp_path).model_copy(
+            update={'verify_env': {'PRESET': 'x'}},
+        )
+        task = {'project_root': str(tmp_path)}
+
+        cfg = build_eval_orch_config(_impl_cfg(), task, base)
+
+        # Base/profiled keys preserved; the pin is added and wins on conflict.
+        assert cfg.verify_env == {'PRESET': 'x', 'UV_PYTHON': '3.13'}
+
+    def test_no_pin_when_project_has_no_python_version(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        # No .python-version under project_root → inject nothing (fail-safe):
+        # verify_env is left exactly as the profiled/base value.
+        base = _base_config(tmp_path).model_copy(
+            update={'verify_env': {'PRESET': 'x'}},
+        )
+        task = {'project_root': str(tmp_path)}
+
+        cfg = build_eval_orch_config(_impl_cfg(), task, base)
+
+        assert cfg.verify_env == {'PRESET': 'x'}
+        assert 'UV_PYTHON' not in cfg.verify_env
+
+
+# ---------------------------------------------------------------------------
 # step-01/02 — build_eval_orch_config gains an optional judge_config param.
 #
 # Default None keeps the current sonnet/medium/claude judge pin byte-identical
