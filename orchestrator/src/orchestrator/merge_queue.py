@@ -7154,6 +7154,50 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
 
+    def _advance_if_at(
+        self,
+        request_id: str,
+        from_state: ItemLifecycleState,
+        to_state: ItemLifecycleState,
+        *,
+        live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+    ) -> bool:
+        """Shared re-entry-tolerant forward-hop primitive (task 2852 /
+        SHARPER RCA option B): fire ``from_state -> to_state`` for
+        *request_id* iff the registry's CURRENT state actually equals
+        *from_state*; otherwise tolerate a benign no-op instead of routing a
+        stale/hardcoded *from_state* into :meth:`_note_transition`'s
+        rejection-and-escalation path.
+
+        Mirrors :meth:`_note_requeue`'s read-``current()``-first discipline
+        (the pattern the SHARPER RCA endorses): both offender call sites —
+        ``_finalize_inflight`` (VERIFYING -> FINALIZING) and
+        ``_buffer_owned_request`` (QUEUED -> LANE_BUFFERED) — previously
+        hardcoded *from_state* and let a duplicate/re-entrant driver that
+        touches a request_id already deep in the pipeline hit
+        ``IllegalLifecycleTransition`` and fire a dedup'd
+        ``merge_lifecycle_transition_rejected`` L1 escalation. Once
+        recognized here, that divergence is HANDLED and benign, so it is
+        logged loudly at WARNING — NOT escalated (escalating would
+        re-introduce the exact noise this primitive removes).
+
+        Returns True iff the transition fired (delegated to
+        :meth:`_note_transition`, so still best-effort-loud against a
+        genuine registry/edge violation); False on the tolerated no-op —
+        the registry is left completely untouched in that case (no
+        :meth:`_note_transition` call at all).
+        """
+        current = self._lifecycle.current(request_id)
+        if current == from_state:
+            self._note_transition(request_id, from_state, to_state, live_obj=live_obj)
+            return True
+        logger.warning(
+            'ItemLifecycle: skipping re-entrant %s->%s for request_id=%s; '
+            'registry already at %s (tolerated benign no-op, NOT escalated)',
+            from_state, to_state, request_id, current,
+        )
+        return False
+
     def _entry_phase(self, entry: InflightEntry) -> str:
         """Return *entry*'s current phase, derived from the ItemLifecycle
         registry rather than a stored field (merge-queue-reliability PRD
