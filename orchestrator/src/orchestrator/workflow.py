@@ -1150,7 +1150,21 @@ class TaskWorkflow:
         # Never reset — including across _execute_iterations re-entry from
         # _replan/_amend — so the guard holds for this workflow instance's
         # whole lifetime.
+        #
+        # task 2764 — cross-restart durability: this in-memory set is
+        # process-local, so an orchestrator restart constructs a fresh, empty
+        # set and re-files every previously-filed pair. To close that gap, the
+        # emitted keys are also persisted to the meta-root
+        # (reconcile_state.json) and hydrated INTO this set on the workflow's
+        # first _reconcile_done_step_commits pass (guarded by the
+        # _loaded_persisted_step_escalations flag below), so a restarted
+        # orchestrator files at most genuinely-new pairs.
         self._unreconciled_done_step_escalations: set[tuple[str, str]] = set()
+        # False until the persisted emitted-escalation keys have been hydrated
+        # into the set above (done lazily-once at the top of
+        # _reconcile_done_step_commits, the set's sole consumer, where
+        # self.artifacts is guaranteed constructed).
+        self._loaded_persisted_step_escalations: bool = False
 
         # One-shot guard for the architect plan-tightening retry.  Set
         # True on first _try_narrow_plan call regardless of outcome so
@@ -5824,6 +5838,22 @@ class TaskWorkflow:
         diff with a different patch-id and no standalone equivalent, so the
         filename-subset signal is the only correct one there.
 
+        **Cross-restart durability (task 2764)**: the per-``(step_id,
+        stale_commit)`` dedup set is in-memory and process-local, so an
+        orchestrator restart would otherwise construct a fresh, empty set and
+        re-file every previously-filed pair (the 5205 04:33Z storm was 10 such
+        duplicates after a restart). To close that gap, each escalated key is
+        also persisted to the meta-root (``reconcile_state.json``) on the emit
+        branch, and this method hydrates those persisted keys INTO the
+        in-memory set exactly once per workflow instance (lazily at the top,
+        guarded by ``self._loaded_persisted_step_escalations``). A restarted
+        workflow therefore files at most genuinely-new pairs. This is
+        defense-in-depth behind the same-instance flood guard and the 2762
+        remap tier — the persisted store is an exact mirror of what was
+        actually escalated (append happens only on the escalation path, after
+        the ``if remapped: continue`` early-out), so hydration suppresses
+        precisely the re-files it should and nothing more.
+
         **Heuristic, not a content diff**: the match above is a
         *filename-set* subset check only — it never compares file contents
         or blob shas. A WIP commit that happens to touch a superset of the
@@ -5851,6 +5881,19 @@ class TaskWorkflow:
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return
+        # task 2764 — hydrate the persisted emitted-escalation keys into the
+        # in-memory flood guard exactly once per workflow instance (disk read
+        # guarded by the flag). This runs here — the set's sole consumer, past
+        # the None-artifacts no-op guard so self.artifacts is guaranteed
+        # constructed — so a restarted orchestrator's fresh, empty set is
+        # seeded with what a prior process already filed, and the emit-branch
+        # `if escalation_key not in self._unreconciled_done_step_escalations`
+        # check below then skips already-filed (step_id, stale_commit) pairs.
+        if not self._loaded_persisted_step_escalations:
+            self._unreconciled_done_step_escalations |= (
+                self.artifacts.read_emitted_step_escalations()
+            )
+            self._loaded_persisted_step_escalations = True
         base = self.artifacts.read_base_commit()
         if not base:
             return
