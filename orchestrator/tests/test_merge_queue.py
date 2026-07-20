@@ -14305,6 +14305,64 @@ class TestRunPostMergeVerify:
             f'Expected "[category: test_failure]" in reason; got: {result.reason!r}'
         )
 
+    async def test_narrowed_infra_budget_allows_multiple_retries(self) -> None:
+        """(task 2835 step-1) RED — a narrowed (failed-only) retry uses a
+
+        SEPARATE budget (max_narrowed/narrowed_retries) decoupled from the
+        legacy ENOSPC budget, so a budget >1 is affordable once the D2
+        producer has actually narrowed (sidecar present + tree OID
+        corroborated).  Three consecutive infra-transient results are
+        retried up to max_narrowed=3 before a fourth dispatch passes.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.retry_failed_only = True
+        merge_wt = MagicMock()
+
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue._load_attempt0_sidecar',
+                MagicMock(return_value=object()),
+            ),
+            patch(
+                'orchestrator.merge_queue._assemble_retry_verify_env',
+                AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=[
+                    _infra_category_verify_result('semaphore_timeout'),
+                    _infra_category_verify_result('semaphore_timeout'),
+                    _infra_category_verify_result('semaphore_timeout'),
+                    passing,
+                ]),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=(er := {}),
+                max_timeouts=2, max_enospc=1,
+                max_narrowed=3, narrowed_retries=(nr := {}),
+            )
+
+        assert result is None, f'expected None (verify eventually passed), got: {result!r}'
+        assert mock_verify.call_count == 4, (
+            f'expected 1 initial + 3 narrowed retries (4 total calls), got {mock_verify.call_count}'
+        )
+        assert nr[req.task_id] == 3, (
+            f'expected the separate narrowed counter to reach 3, got: {nr}'
+        )
+        assert er == {}, (
+            f'narrowed retries must stay decoupled from the shared ENOSPC budget: {er}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
