@@ -14363,6 +14363,68 @@ class TestRunPostMergeVerify:
             f'narrowed retries must stay decoupled from the shared ENOSPC budget: {er}'
         )
 
+    async def test_deterministic_red_attempt0_never_narrowed_retried(self) -> None:
+        """(task 2835 step-3) RED — INV-4 storm-escape headline: a
+
+        deterministic-red category (test_failure) must NEVER enter the
+        narrowed retry loop, even with narrowing on and a generous budget.
+        A genuine red classifies as test_failure (DF 2821's positive-
+        anchored semaphore_timeout veto) — not a member of
+        INFRA_TRANSIENT_CATEGORIES — so it takes the ordinary generic-block
+        path on the very first dispatch.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.retry_failed_only = True
+        merge_wt = MagicMock()
+
+        test_failure_result = VerifyResult(
+            passed=False,
+            test_output='FAILED tests/test_x.py::test_y',
+            lint_output='',
+            type_output='',
+            summary='tests failed',
+            category='test_failure',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue._load_attempt0_sidecar',
+                MagicMock(return_value=object()),
+            ),
+            patch(
+                'orchestrator.merge_queue._assemble_retry_verify_env',
+                AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=test_failure_result),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=(er := {}),
+                max_timeouts=2, max_enospc=1,
+                max_narrowed=3, narrowed_retries=(nr := {}),
+            )
+
+        assert result is not None
+        assert mock_verify.call_count == 1, (
+            f'a deterministic-red category must NOT be narrowed-retried even with '
+            f'narrowing on and a generous budget, got {mock_verify.call_count} calls'
+        )
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'unexpected reason: {result.reason!r}'
+        )
+        assert not result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'a genuine test_failure must NOT take the transient-infra path: {result.reason!r}'
+        )
+        assert nr == {}, f'no narrowed counter should be touched: {nr}'
+        assert er == {}, f'no ENOSPC counter should be touched: {er}'
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
