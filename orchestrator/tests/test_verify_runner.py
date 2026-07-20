@@ -1022,6 +1022,50 @@ class TestRetryScopeEventFields:
             'retry_subset_sizes': None,
         }
 
+    def test_retry_scope_event_fields_narrowed_sizes(self, tmp_path):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # Mirror _build_retry_verify_env's '\n'.join(ids) filter-file format.
+        debug_file = tmp_path / 'nextest-retry-debug.filter'
+        debug_file.write_text('\n'.join(['id::a', 'id::b', 'id::c']))  # 3 ids
+        release_file = tmp_path / 'nextest-retry-release.filter'
+        release_file.write_text('\n'.join(['id::z']))  # 1 id
+
+        verify_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+        }
+        assert retry_scope_event_fields(verify_env) == {
+            'retry_scope': 'failed_only',
+            'retry_subset_sizes': {
+                'run_all': 2,
+                'gui': 1,
+                'nextest_debug': 3,
+                'nextest_release': 1,
+            },
+        }
+
+        # Empty-subset edge: '' comma-values count 0 tokens (dodge the
+        # ''.split(',') == [''] pitfall), and a 0-byte filter file counts 0
+        # lines (dodge the ''.splitlines() == [] pitfall).
+        empty_file = tmp_path / 'nextest-retry-empty.filter'
+        empty_file.write_text('')  # 0 bytes
+        empty_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': '',
+            'REIFY_GUI_RETRY_SPECS': '',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(empty_file),
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+        }
+        result = retry_scope_event_fields(empty_env)
+        assert result['retry_scope'] == 'failed_only'
+        assert result['retry_subset_sizes']['run_all'] == 0
+        assert result['retry_subset_sizes']['gui'] == 0
+        assert result['retry_subset_sizes']['nextest_debug'] == 0
+
 
 # ---------------------------------------------------------------------------
 # Step-7: build_merge_verify_spec
