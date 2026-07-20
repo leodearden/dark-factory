@@ -270,11 +270,19 @@ class TestB1OverlapOrderedAdvance:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # (1) Spans overlap: local and laptop verifies ran simultaneously
-        assert len(spans) == 2, f'expected 2 spans, got {spans}'
-        span_local = next((s for s in spans if s.name == 'local'), None)
+        # (1) Spans overlap: the two concurrent per-task verifies (N's gated
+        #     local verify + N+1's gated remote laptop verify) ran
+        #     simultaneously.  With fix (b)'s per-land cross-check of a remote
+        #     GREEN (task 2822, verify_cross_check_remote_green=True by default),
+        #     N+1's remote PASS additionally triggers a brief LOCAL cross-check
+        #     verify before the land — so a third, short-lived 'local' span is
+        #     expected here.  Select the ORIGINAL concurrent local verify (the
+        #     gated, long-running one — earliest start) rather than the brief
+        #     cross-check, and assert IT overlaps the remote span.
+        local_spans = [s for s in spans if s.name == 'local']
         span_remote = next((s for s in spans if s.name == 'laptop'), None)
-        assert span_local is not None and span_remote is not None
+        assert local_spans and span_remote is not None, f'missing spans: {spans}'
+        span_local = min(local_spans, key=lambda s: s.start)  # gated concurrent verify
         assert _overlaps(span_local, span_remote), (
             f'Expected overlapping spans — local={span_local}, remote={span_remote}. '
             'Spans must intersect (both verifies ran simultaneously).'
