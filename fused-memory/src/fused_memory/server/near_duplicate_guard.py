@@ -42,6 +42,19 @@ _NEAR_DUPLICATE_HINT = (
     "override with metadata={'allow_near_duplicate': True}."
 )
 
+# Fallback hint for a topic-cluster soft-block when the matched cluster carries
+# no per-cluster ``hint``. Surfaced in the soft-block dict (and the add_memory
+# docstring / FUSED_MEMORY_INSTRUCTIONS) so the remediation is discoverable at
+# the point of rejection.
+_TOPIC_CLUSTER_DEFAULT_HINT = (
+    'This procedural_knowledge content matches a KNOWN-contradictory topic '
+    'cluster (see topic_id/matched_phrases) that is gated to a human review '
+    'task. Do NOT add another entry — search first and update/consolidate the '
+    'existing entries for this topic, or add context to the referenced human '
+    'gate task, instead of accumulating another paraphrased restatement. If the '
+    "content is genuinely distinct, override with metadata={'allow_near_duplicate': True}."
+)
+
 
 def find_near_duplicate_memory(
     results: list[MemoryResult],
@@ -181,4 +194,31 @@ def build_near_duplicate_block(
         'threshold': threshold,
         'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
+    }
+
+
+def build_topic_cluster_block(
+    agent_id: str | None,
+    content: str,
+    cluster: ProceduralTopicCluster,
+    matched_phrases: list[str],
+) -> dict[str, Any]:
+    """Build the structured soft-block dict for a known-topic-cluster write.
+
+    Mirrors :func:`build_near_duplicate_block`'s flat-dict shape (``error`` /
+    ``error_type``, echoed ``agent_id`` / ``content_excerpt``, plus a
+    remediation ``hint``), but carries topic-guard-specific fields
+    (``topic_id`` / ``matched_phrases``) and a distinct ``error_type`` so the
+    two guards' agent-facing diagnostics stay cleanly separable. Uses the
+    matched cluster's ``hint`` when set, else the module default
+    (:data:`_TOPIC_CLUSTER_DEFAULT_HINT`).
+    """
+    return {
+        'error': 'procedural_knowledge_known_topic_cluster_write_blocked',
+        'error_type': 'ProceduralKnowledgeKnownTopicClusterWriteRejected',
+        'agent_id': agent_id,
+        'content_excerpt': content[:200],
+        'topic_id': cluster.topic_id,
+        'matched_phrases': matched_phrases,
+        'hint': cluster.hint or _TOPIC_CLUSTER_DEFAULT_HINT,
     }
