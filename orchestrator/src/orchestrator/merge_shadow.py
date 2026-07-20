@@ -290,6 +290,55 @@ def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
     return sorted(t for t, v in fail_fast_map.items() if v != 'pass')
 
 
+# ---------------------------------------------------------------------------
+# shadow-baseline map merge (PRD verify-retry-failed-only D4, §5.4).
+# ---------------------------------------------------------------------------
+
+
+def merge_retry_shadow_baseline(
+    attempt0: Mapping[str, str], retry: Mapping[str, str]
+) -> dict[str, str]:
+    """Union attempt-0's passes with a narrowed-retry map for the warm baseline.
+
+    A narrowed {did-not-pass} merge-verify retry re-runs ONLY the tests that
+    did not pass in attempt-0, so ``retry`` (its :func:`parse_per_test_results`
+    map) is PARTIAL — it omits every test that already passed.  Storing that
+    partial map as the warm shadow baseline makes the next from-scratch FULL
+    cold shadow compare classify every attempt-0-passed test as ``only_cold``
+    → ``has_divergence`` → a phantom born-at-L2 "warm merge may be bad" alarm
+    (PRD §5.4 shadow-safe invariant: MERGE attempt-0 ∪ retry per-test maps
+    before storing the warm baseline).
+
+    Reconstruction rule:
+
+    * **Carry forward only attempt-0's PASSED tests.**  On the pass path the
+      narrowed retry re-ran every {did-not-pass} test and they all passed, so
+      overlaying ``retry`` reconstructs an all-pass full-suite baseline.
+    * **``retry`` wins on overlap** — it is the latest verdict for the tests it
+      re-ran (a did-not-pass test flipping to ``'pass'`` overwrites the stale
+      attempt-0 ``'fail'``/``'inconclusive'``).
+    * **Drop attempt-0 non-pass verdicts** absent from ``retry``.  A stray
+      ``'not-started'``/``'fail'`` surviving into the baseline would be flipped
+      by the full cold suite into a genuine-looking divergence — the exact
+      phantom this helper removes.
+
+    Neither input map is mutated.
+
+    Args:
+        attempt0: The attempt-0 per-test verdict map (parse_per_test_results-
+            style keys, values in ``{'pass', 'fail', 'inconclusive',
+            'not-started'}``).
+        retry: The (partial) narrowed-retry per-test verdict map.
+
+    Returns:
+        ``dict[str, str]``: attempt-0 passes carried forward, overlaid by the
+        fresh ``retry`` verdicts.
+    """
+    merged = {t: v for t, v in attempt0.items() if v == 'pass'}
+    merged.update(retry)
+    return merged
+
+
 # Matches cargo-nextest Summary footer lines, e.g.:
 #   Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped
 #   Summary [   0.13s]   1 test run: 1 passed, 0 failed, 0 skipped   (N==1 → singular)
