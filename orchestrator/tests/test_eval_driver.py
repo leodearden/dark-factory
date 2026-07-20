@@ -105,6 +105,172 @@ class TestBuildEvalOrchConfigArchitectOverride:
 
 
 # ---------------------------------------------------------------------------
+# step-01/02 — build_eval_orch_config gains an optional judge_config param.
+#
+# Default None keeps the current sonnet/medium/claude judge pin byte-identical
+# (every existing caller + the P1/B1 parity tripwire stay intact); a supplied
+# judge_config derives ONLY models.judge / effort.judge from the candidate for
+# the judge OFAT axis, leaving backends.judge / budgets.judge PINNED (always-
+# Claude read-only judge) and implementer/architect/reviewer untouched.
+# ---------------------------------------------------------------------------
+
+class TestBuildEvalOrchConfigJudgeOverride:
+    def test_default_none_keeps_sonnet_judge_pin(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base, judge_config=None)
+
+        # Current pin, unchanged (byte-identical parity tripwire): the completion
+        # judge stays sonnet/medium/claude at its pinned 0.50 budget.
+        assert cfg.models.judge == 'sonnet'
+        assert cfg.effort.judge == 'medium'
+        assert cfg.budgets.judge == 0.50
+        assert cfg.backends.judge == 'claude'
+        # Implementer / architect / reviewer are untouched by the judge knob.
+        assert cfg.models.implementer == 'sonnet'
+        assert cfg.models.architect == 'opus'
+        assert cfg.models.reviewer == 'opus'
+
+    def test_judge_config_overrides_judge_model_and_effort(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        # model!='sonnet' AND effort!='medium' so BOTH derived fields diverge.
+        judge = EvalConfig('judge-haiku-high', 'claude', 'haiku', 'high', role='judge')
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base, judge_config=judge)
+
+        # The judge's model/effort now derive from the candidate (judge OFAT axis).
+        assert cfg.models.judge == 'haiku'
+        assert cfg.effort.judge == 'high'
+        # Backend and budget stay PINNED (not derived) — always-Claude read-only judge.
+        assert cfg.backends.judge == 'claude'
+        assert cfg.budgets.judge == 0.50
+        # Implementer / architect / reviewer are untouched by the judge override.
+        assert cfg.models.implementer == 'sonnet'
+        assert cfg.models.architect == 'opus'
+        assert cfg.models.reviewer == 'opus'
+
+    def test_judge_config_none_backward_compatible_positionally(self, tmp_path: Path):
+        # The new param must be keyword-optional with a None default so every
+        # existing positional caller (run_eval / run_end_to_end) is intact.
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+        assert cfg.models.judge == 'sonnet'
+
+
+# ---------------------------------------------------------------------------
+# step-03/04 — run_eval threads judge_config into build_eval_orch_config, and
+# when supplied RELABELS the result to the judge candidate and stamps
+# metrics['role_under_test']='judge' (mirrors run_end_to_end's end_to_end stamp).
+#
+# The implementer stays PINNED to `config` (only the judge varies); the label
+# must key on the judge candidate (not the pinned implementer, which would
+# collide both judge rows) so select_survivors groups judge runs as their own
+# OFAT axis. Boundaries mocked (the _run_end_to_end_hermetic pattern):
+# create_eval_worktree / build_workflow / collect_metrics / load_task /
+# save_result. judge_config=None → byte-identical to today.
+# ---------------------------------------------------------------------------
+
+def _judge_task(tmp_path: Path) -> dict:
+    # run_eval raises without a non-empty plan (the frozen plan it scores).
+    return {
+        'id': 'df_task_judge',
+        'project_root': str(tmp_path),
+        'pre_task_commit': 'basecommit',
+        'task_definition': {'title': 'W', 'description': 'd'},
+        'modules': ['pkg/mod.py'],
+        'plan': {'steps': [{'id': 's1', 'status': 'pending'}]},
+    }
+
+
+async def _run_eval_hermetic(
+    config: EvalConfig,
+    base,
+    task: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    judge_config: EvalConfig | None = None,
+    outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+):
+    """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
+
+    Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
+    kwargs dict build_workflow received (for asserting the threaded config).
+    """
+    from orchestrator.evals import runner
+
+    captured: dict = {}
+
+    async def fake_create_wt(*_a, **_k):
+        return Path('/fake/wt'), 'run-eval'
+
+    fake_wf = MagicMock()
+    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+
+    def fake_build_workflow(**kwargs):
+        captured['build_workflow'] = kwargs
+        return fake_wf
+
+    metrics_obj = MagicMock()
+    metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
+    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_save = MagicMock()
+
+    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
+    monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
+    monkeypatch.setattr(runner, 'load_task', lambda _p: task)
+    monkeypatch.setattr(runner, 'save_result', mock_save)
+
+    result = await runner.run_eval(
+        Path('/fake/task.json'), config, base, judge_config=judge_config,
+    )
+    return result, captured
+
+
+@pytest.mark.asyncio
+class TestRunEvalJudgeConfig:
+    async def test_judge_config_threads_into_config_and_relabels(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _base_config(tmp_path)
+        impl = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
+        judge = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+        result, captured = await _run_eval_hermetic(
+            impl, base, _judge_task(tmp_path), monkeypatch, judge_config=judge,
+        )
+
+        # (a) judge_config threaded into build_eval_orch_config → the judge model
+        # derives from the candidate while the implementer stays PINNED to `config`.
+        cfg = captured['build_workflow']['config']
+        assert cfg.models.judge == 'haiku'          # the judge varies
+        assert cfg.models.implementer == 'sonnet'    # implementer PINNED (NOT the judge model)
+
+        # (b) result RELABELED to the judge candidate (so per-judge composite rows
+        # don't collide on the pinned implementer name) and tagged role_under_test.
+        assert result.config_name == 'judge-haiku'
+        assert result.metrics['role_under_test'] == 'judge'
+
+    async def test_no_judge_config_is_byte_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        base = _base_config(tmp_path)
+        impl = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
+        result, captured = await _run_eval_hermetic(
+            impl, base, _judge_task(tmp_path), monkeypatch,
+        )
+
+        # judge_config defaults None → label is the implementer config name, the
+        # judge stays the sonnet incumbent, and no role_under_test='judge' stamp.
+        assert result.config_name == 'claude-sonnet-max'
+        assert captured['build_workflow']['config'].models.judge == 'sonnet'
+        assert result.metrics.get('role_under_test') != 'judge'
+
+
+# ---------------------------------------------------------------------------
 # step-05/06 — run_end_to_end: the ONE both-live executor (architect LIVE +
 # implementer LIVE). It builds the both-live orch config
 # (build_eval_orch_config(architect_config=arch)) and constructs the workflow
@@ -303,6 +469,114 @@ class TestRunOfatStage:
         assert len(results) == 1
         assert results[0].task_id == 'df_task_ok'
         assert any('failed' in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# step-07/08 (task 2825) — run_ofat_stage gains a role=='judge' branch.
+#
+# A judge candidate must NOT dispatch as an implementer (the pre-ο else branch
+# would run it as config → the implementer co-varies, swamping the judge signal).
+# The judge branch dispatches to run_eval with the implementer PINNED to
+# JUDGE_OFAT_IMPLEMENTER_PIN and the judge candidate riding judge_config, so only
+# the judge varies (true OFAT). Implementer and architect paths are untouched.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRunOfatStageJudge:
+    async def test_judge_candidate_pins_implementer_and_rides_judge_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+        from orchestrator.evals.configs import JUDGE_OFAT_IMPLEMENTER_PIN
+
+        t1 = tmp_path / 'df_task_a.json'
+        t1.touch()
+        # impl_cfg deliberately != the pin so the judge branch's pin is visible.
+        impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
+        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+
+        # Records (fixture, config.name, judge_config.name|None, trial) per dispatch.
+        eval_calls: list[tuple[str, str, str | None, int]] = []
+        arch_calls: list[str] = []
+
+        async def fake_run_eval(task_path, config, *_a, trial=1, judge_config=None, **_k):
+            eval_calls.append(
+                (task_path.stem, config.name,
+                 judge_config.name if judge_config else None, trial),
+            )
+            label = judge_config.name if judge_config else config.name
+            return EvalResult(task_path.stem, label, 'done', {}, '/tmp/wt', trial=trial)
+
+        async def fake_run_arch(task_path, config, *_a, trial=1, **_k):
+            arch_calls.append(config.name)
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/wt', trial=trial)
+
+        monkeypatch.setattr(runner, 'load_task', _ofat_task_loader)
+        monkeypatch.setattr(runner, 'run_eval', fake_run_eval)
+        monkeypatch.setattr(runner, 'run_architect_eval', fake_run_arch)
+
+        results = await runner.run_ofat_stage(
+            [t1], [impl_cfg, judge_cfg], base_config=None, trials=1,
+        )
+
+        # (a) the JUDGE candidate dispatches to run_eval with the implementer PINNED
+        # to JUDGE_OFAT_IMPLEMENTER_PIN and the judge riding judge_config — NOT
+        # config=='judge-haiku' (which would co-vary the implementer).
+        judge_dispatch = [c for c in eval_calls if c[2] == 'judge-haiku']
+        assert len(judge_dispatch) == 1
+        assert judge_dispatch[0][1] == JUDGE_OFAT_IMPLEMENTER_PIN.name  # implementer pinned
+        assert judge_dispatch[0][1] != 'judge-haiku'
+
+        # (b) the IMPLEMENTER candidate dispatches to run_eval with judge_config None
+        # and config==the implementer candidate itself (unchanged else-branch).
+        impl_dispatch = [c for c in eval_calls if c[2] is None]
+        assert len(impl_dispatch) == 1
+        assert impl_dispatch[0][1] == impl_cfg.name
+
+        # (c) no architect candidate → run_architect_eval never called.
+        assert arch_calls == []
+        # (d) every (candidate, fixture, trial) cell returned a result.
+        assert len(results) == 2
+
+    async def test_mixed_roles_route_each_to_its_executor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals import runner
+        from orchestrator.evals.configs import JUDGE_OFAT_IMPLEMENTER_PIN
+
+        t1 = tmp_path / 'df_task_a.json'
+        t1.touch()
+        impl_cfg = EvalConfig('claude-opus-high', 'claude', 'opus', 'high')
+        arch_cfg = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
+        judge_cfg = EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge')
+
+        eval_calls: list[tuple[str, str | None]] = []
+        arch_calls: list[str] = []
+
+        async def fake_run_eval(task_path, config, *_a, trial=1, judge_config=None, **_k):
+            eval_calls.append((config.name, judge_config.name if judge_config else None))
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/wt', trial=trial)
+
+        async def fake_run_arch(task_path, config, *_a, trial=1, **_k):
+            arch_calls.append(config.name)
+            return EvalResult(task_path.stem, config.name, 'done',
+                              {'role_under_test': 'architect'}, '/tmp/wt', trial=trial)
+
+        monkeypatch.setattr(runner, 'load_task', _ofat_task_loader)
+        monkeypatch.setattr(runner, 'run_eval', fake_run_eval)
+        monkeypatch.setattr(runner, 'run_architect_eval', fake_run_arch)
+
+        results = await runner.run_ofat_stage(
+            [t1], [impl_cfg, arch_cfg, judge_cfg], base_config=None, trials=1,
+        )
+
+        # Architect still routes to run_architect_eval UNCHANGED (the μ path).
+        assert arch_calls == ['architect-sonnet-high']
+        # Implementer (judge_config None) and judge (pinned impl + judge_config) both
+        # go through run_eval — the judge NEVER reaches run_architect_eval.
+        assert (impl_cfg.name, None) in eval_calls
+        assert (JUDGE_OFAT_IMPLEMENTER_PIN.name, 'judge-haiku') in eval_calls
+        assert len(results) == 3
 
 
 # ---------------------------------------------------------------------------

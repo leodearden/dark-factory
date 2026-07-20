@@ -25,9 +25,9 @@ class TestOfatCandidates:
 
         candidates = ofat_candidates()
         assert candidates  # non-empty
-        # Each candidate varies exactly ONE role — either the implementer or the
-        # architect; no candidate is multi-role.
-        assert all(c.role in ('implementer', 'architect') for c in candidates)
+        # Each candidate varies exactly ONE role — the implementer, the architect,
+        # OR the judge (ο); no candidate is multi-role.
+        assert all(c.role in ('implementer', 'architect', 'judge') for c in candidates)
         # Candidate names are unique (they key results / lookup).
         names = [c.name for c in candidates]
         assert len(names) == len(set(names))
@@ -53,6 +53,61 @@ class TestOfatCandidates:
         assert arch
         assert all(c.role == 'architect' for c in arch)
         # Reuses ARCHITECT_EVAL_CONFIGS verbatim (θ substrate), never a fresh set.
+        assert {c.name for c in arch} == {c.name for c in ARCHITECT_EVAL_CONFIGS}
+
+
+class TestJudgeCandidates:
+    """The judge OFAT axis (ο): JUDGE_EVAL_CONFIGS + the pinned implementer.
+
+    role='judge' reroutes these candidates through run_ofat_stage's judge branch
+    (frozen plan, implementer pinned to JUDGE_OFAT_IMPLEMENTER_PIN), varying ONLY
+    the ζ completion judge so the composite delta isolates the judge.
+    """
+
+    def test_judge_eval_configs_shape(self):
+        from orchestrator.evals.configs import JUDGE_EVAL_CONFIGS
+
+        # Two judge candidates on the always-Claude backend (the completion judge
+        # is a read-only Claude quality call), varying ONLY the model.
+        assert len(JUDGE_EVAL_CONFIGS) == 2
+        assert all(c.role == 'judge' for c in JUDGE_EVAL_CONFIGS)
+        assert all(c.backend == 'claude' for c in JUDGE_EVAL_CONFIGS)
+        assert {c.model for c in JUDGE_EVAL_CONFIGS} == {'sonnet', 'haiku'}
+        # effort fixed at the production judge default → ONLY the model varies.
+        assert all(c.effort == 'medium' for c in JUDGE_EVAL_CONFIGS)
+        # Names are unique and carry the model they trial (they key result rows).
+        names = [c.name for c in JUDGE_EVAL_CONFIGS]
+        assert len(names) == len(set(names))
+        assert any('sonnet' in n for n in names)
+        assert any('haiku' in n for n in names)
+
+    def test_judge_ofat_implementer_pin_is_fixed_cloud_incumbent(self):
+        from orchestrator.evals.configs import JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig
+
+        # The implementer held CONSTANT while the judge varies (true OFAT): a
+        # native-cloud claude Sonnet incumbent (production implementer default),
+        # with NO proxy env_overrides (that is what marks a cloud baseline).
+        pin = JUDGE_OFAT_IMPLEMENTER_PIN
+        assert isinstance(pin, EvalConfig)
+        assert pin.role == 'implementer'
+        assert pin.backend == 'claude'
+        assert pin.model == 'sonnet'
+        assert not pin.env_overrides
+
+    def test_ofat_candidates_includes_judge_subset(self):
+        from orchestrator.evals.configs import (
+            ARCHITECT_EVAL_CONFIGS,
+            JUDGE_EVAL_CONFIGS,
+            ofat_candidates,
+        )
+
+        candidates = ofat_candidates()
+        # The judge subset is present verbatim — its own OFAT survivor axis.
+        judge = [c for c in candidates if c.role == 'judge']
+        assert {c.name for c in judge} == {c.name for c in JUDGE_EVAL_CONFIGS}
+        # ofat_candidates stays ADDITIVE: implementer + architect subsets remain.
+        assert any(c.role == 'implementer' for c in candidates)
+        arch = [c for c in candidates if c.role == 'architect']
         assert {c.name for c in arch} == {c.name for c in ARCHITECT_EVAL_CONFIGS}
 
 

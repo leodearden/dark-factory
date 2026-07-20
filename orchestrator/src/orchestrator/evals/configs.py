@@ -443,6 +443,17 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     call) rather than a static list — cheap at CLI/driver lookup frequency,
     and keeps this the single by-name resolver for every eval config family
     (avoids a second, per-selector lookup path).
+
+    ``JUDGE_EVAL_CONFIGS`` (ο) is DELIBERATELY absent from the search list —
+    unlike ``ARCHITECT_EVAL_CONFIGS``, which is standalone-runnable. Judge
+    candidates are an OFAT-only, indirectly-scored axis reachable solely via
+    ``ofat_candidates()`` → ``run_ofat_stage``'s judge branch (which pins the
+    implementer to ``JUDGE_OFAT_IMPLEMENTER_PIN`` and rides the candidate on
+    ``judge_config``). The single-eval CLI loop has no judge dispatch and would
+    mis-run a judge candidate as an implementer, so by-name resolution of a
+    judge candidate is intentionally unsupported: a lookup returns ``None``
+    ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
+    than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
     """
     for cfg in [
         *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
@@ -473,6 +484,33 @@ INCUMBENTS: dict[str, str] = {
 }
 
 
+# ===== Judge-role candidates (eval-revival ο) =====
+# role='judge' reroutes each candidate from the implementer path to
+# ``run_ofat_stage``'s judge branch: ``run_eval`` runs with the plan FROZEN and
+# the implementer PINNED to ``JUDGE_OFAT_IMPLEMENTER_PIN``, while
+# ``build_eval_orch_config`` derives ONLY the ζ completion judge's model/effort
+# from THIS candidate (backend/budget stay pinned — an always-Claude read-only
+# judge). Per the OFAT methodology each candidate varies exactly ONE role — here,
+# the judge — so the composite delta isolates it. Both at effort='medium' (the
+# production judge default) so ONLY the model varies; ``judge-sonnet`` reproduces
+# today's incumbent judge (sonnet/medium/claude/0.50) exactly. The judge is scored
+# INDIRECTLY through μ's end-to-end composite (a too-lenient judge stops iteration
+# early → worse diff; a too-strict one burns iterations → higher cost); no new
+# judge-verdict metric is added.
+JUDGE_EVAL_CONFIGS = [
+    EvalConfig('judge-sonnet', 'claude', 'sonnet', 'medium', role='judge'),
+    EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge'),
+]
+
+# The implementer held FIXED while a judge candidate varies the completion judge,
+# pinned to the Sonnet cloud incumbent (production implementer default is
+# sonnet/max per defaults.yaml) so the composite delta across judge-haiku vs
+# judge-sonnet reflects ONLY the judge (true OFAT). Passed as ``run_eval``'s
+# ``config`` in ``run_ofat_stage``'s judge branch; the varying judge rides
+# ``judge_config`` instead.
+JUDGE_OFAT_IMPLEMENTER_PIN = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
+
+
 def _cloud_implementer_incumbents() -> list[EvalConfig]:
     """The native-cloud claude Opus/Sonnet implementer baselines from EVAL_CONFIGS.
 
@@ -493,15 +531,18 @@ def _cloud_implementer_incumbents() -> list[EvalConfig]:
 
 
 def ofat_candidates() -> list[EvalConfig]:
-    """The one-role-each OFAT candidate set: implementer incumbents + architects.
+    """The one-role-each OFAT set: implementer incumbents + architects + judges.
 
     Each candidate varies exactly ONE role (PRD §μ / C4): the implementer subset
     (native-cloud Opus AND Sonnet claude incumbents — the G2 >=2-config floor,
-    driving the implementer via ``run_eval`` with the plan frozen) and the
+    driving the implementer via ``run_eval`` with the plan frozen), the
     architect subset (``ARCHITECT_EVAL_CONFIGS``, driving the architect LIVE via
-    ``run_architect_eval`` with downstream roles frozen). Pure, no I/O.
+    ``run_architect_eval`` with downstream roles frozen), and the judge subset
+    (``JUDGE_EVAL_CONFIGS`` (ο), driving the ζ completion judge via
+    ``run_ofat_stage``'s judge branch with the implementer pinned to
+    ``JUDGE_OFAT_IMPLEMENTER_PIN``). Pure, no I/O.
     """
-    return [*_cloud_implementer_incumbents(), *ARCHITECT_EVAL_CONFIGS]
+    return [*_cloud_implementer_incumbents(), *ARCHITECT_EVAL_CONFIGS, *JUDGE_EVAL_CONFIGS]
 
 
 def same_family(a: EvalConfig, b: EvalConfig) -> bool:

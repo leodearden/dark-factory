@@ -28,7 +28,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome, build_workflow
 
-from .configs import EVAL_CONFIGS, EvalConfig, matrix_pairs
+from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree
@@ -94,6 +94,7 @@ def build_eval_orch_config(
     base_config: OrchestratorConfig | None = None,
     memory_endpoint: str | None = None,
     architect_config: EvalConfig | None = None,
+    judge_config: EvalConfig | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
@@ -110,6 +111,17 @@ def build_eval_orch_config(
     opus/claude/high, so an architect×implementer combo can be scored end-to-end.
     Left ``None`` (every existing caller), the architect pin is byte-identical to
     today, so the P1/B1 parity tripwire and the frozen-plan paths stay intact.
+
+    ``judge_config`` (eval-revival ο) drives the judge OFAT axis (``run_ofat_stage``
+    's judge branch via ``run_eval``): when supplied, the ζ completion judge's
+    model/effort are derived from THIS candidate instead of the hardcoded
+    sonnet/medium, so a cheaper judge (haiku) can be trialled and scored
+    indirectly through μ's composite. Only model/effort derive — ``backends.judge``
+    stays ``'claude'`` and ``budgets.judge`` stays ``0.50`` PINNED below (the judge
+    is an always-Claude read-only quality call; mirrors the architect knob, which
+    also never derives budget). Left ``None`` (every existing caller), the judge
+    pin (sonnet/medium/claude/0.50) is byte-identical to today, so the parity
+    tripwire holds.
 
     Two task-spec knobs override the defaults below:
       - ``max_execute_iterations``: hard ceiling on implementer iterations.
@@ -142,6 +154,14 @@ def build_eval_orch_config(
     architect_backend = architect_config.backend if architect_config else 'claude'
     architect_effort = (architect_config.effort or 'high') if architect_config else 'high'
 
+    # Judge pin: sonnet/medium by default (the ζ completion judge), or model/effort
+    # derived from judge_config for the judge OFAT axis (ο). Backend and budget stay
+    # PINNED below (always-Claude read-only judge — not derived). When judge_config
+    # is None both values equal the historical literal, so the config is
+    # byte-identical to today and the parity tripwire holds.
+    judge_model = judge_config.model if judge_config else 'sonnet'
+    judge_effort = (judge_config.effort or 'medium') if judge_config else 'medium'
+
     models = ModelsConfig(
         architect=architect_model,
         implementer=config.model,
@@ -149,7 +169,7 @@ def build_eval_orch_config(
         reviewer='opus',          # 1× opus comprehensive reviewer (production parity)
         merger='opus',
         module_tagger='sonnet',
-        judge='sonnet',           # ζ completion judge — read-only, small budget
+        judge=judge_model,        # ζ completion judge — read-only, small budget (ο: derivable)
     )
 
     budgets = BudgetsConfig(
@@ -169,7 +189,7 @@ def build_eval_orch_config(
         reviewer='high',           # opus reviewer at high effort (matches defaults.yaml)
         merger='high',
         module_tagger='medium',
-        judge='medium',
+        judge=judge_effort,
     )
 
     backends = BackendsConfig(
@@ -224,6 +244,7 @@ async def run_eval(
     timeout_override: int | None = None,
     worktree_path: Path | None = None,
     memory_endpoint: str | None = None,
+    judge_config: EvalConfig | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
 
@@ -238,10 +259,27 @@ async def run_eval(
     isolation stands; pass a ``RecordingMemorySink().url`` to capture the
     intended memory writes instead of dropping them (see
     ``build_eval_orch_config`` for the full contract).
+
+    *judge_config* (eval-revival ο) is the judge OFAT knob: left ``None`` (every
+    existing caller) this is byte-identical to today — the result is labeled by
+    ``config`` and no ``role_under_test`` stamp fires. Supplied (run_ofat_stage's
+    judge branch), it (1) threads into ``build_eval_orch_config`` so ONLY the ζ
+    completion judge's model/effort derive from the candidate (the implementer
+    ``config`` stays pinned), (2) RELABELS the result to ``judge_config.name`` so
+    the persisted JSON is keyed by the judge candidate rather than the pinned
+    implementer (which would collide both judge rows), and (3) stamps
+    ``metrics['role_under_test']='judge'`` so ``select_survivors`` groups the
+    judge candidates as their own OFAT survivor axis.
     """
     task = load_task(task_path)
     task_id = task['id']
     project_root = Path(task['project_root'])
+
+    # ο: when a judge candidate is under test, the persisted result must be keyed
+    # by the JUDGE candidate — not the pinned implementer `config`, which would
+    # collide both judge rows into one — so select_survivors ranks them as their
+    # own axis. None (every existing caller) → label is config.name, unchanged.
+    result_label = judge_config.name if judge_config is not None else config.name
 
     logger.info(f'Starting eval: {task_id} × {config.name} (trial {trial})')
     start_ms = int(time.monotonic() * 1000)
@@ -260,6 +298,7 @@ async def run_eval(
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
         config, task, base_config, memory_endpoint=memory_endpoint,
+        judge_config=judge_config,
     )
 
     # 3. Build task assignment
@@ -354,10 +393,16 @@ async def run_eval(
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
         metrics_dict = {}
+    # ο: stamp the judge OFAT axis so select_survivors groups judge runs as their
+    # own survivor group (collect_metrics itself does not know which role/stage
+    # invoked it — mirrors run_end_to_end's post-collect_metrics stamp). None →
+    # no stamp fires, so every existing caller is byte-identical.
+    if judge_config is not None:
+        metrics_dict['role_under_test'] = 'judge'
 
     result = EvalResult(
         task_id=task_id,
-        config_name=config.name,
+        config_name=result_label,
         outcome=outcome.value if isinstance(outcome, WorkflowOutcome) else str(outcome),
         metrics=metrics_dict,
         worktree_path=str(worktree),
@@ -887,15 +932,19 @@ async def run_ofat_stage(
     trials: int = 1,
     timeout_override: int | None = None,
 ) -> list[EvalResult]:
-    """OFAT screen: dispatch each candidate by role over fixtures × trials (μ).
+    """OFAT screen: dispatch each candidate by role over fixtures × trials (μ/ο).
 
     A role-dispatching fan-out over the EXISTING frozen-input executors
     (decision 9): an implementer candidate (``role=='implementer'``) runs through
     :func:`run_eval` (frozen plan → implementer varies, arch/reviewer pinned), an
     architect candidate (``role=='architect'``) through :func:`run_architect_eval`
-    (live architect → downstream frozen). No new per-role machinery. Returns the
-    flattened ``EvalResult`` list across every ``(candidate, fixture, trial)``
-    cell; a failed cell is logged and skipped via :func:`_bounded_fanout`.
+    (live architect → downstream frozen), and a judge candidate (``role=='judge'``,
+    ο) through :func:`run_eval` with the implementer PINNED to
+    ``JUDGE_OFAT_IMPLEMENTER_PIN`` and the candidate riding ``judge_config`` — so
+    ONLY the ζ completion judge varies (implementer/architect/reviewer held
+    constant). No new per-role machinery. Returns the flattened ``EvalResult``
+    list across every ``(candidate, fixture, trial)`` cell; a failed cell is
+    logged and skipped via :func:`_bounded_fanout`.
     """
     def _thunk(
         task_path: Path, candidate: EvalConfig, trial: int,
@@ -905,6 +954,17 @@ async def run_ofat_stage(
                 return await run_architect_eval(
                     task_path, candidate, base_config,
                     trial=trial, timeout_override=timeout_override,
+                )
+            if candidate.role == 'judge':
+                # ο: vary ONLY the judge — pin the implementer to the fixed cloud
+                # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
+                # candidate on judge_config, so run_eval derives the ζ completion
+                # judge's model/effort while implementer/architect/reviewer stay
+                # fixed (true OFAT). run_eval relabels + stamps role_under_test.
+                return await run_eval(
+                    task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    judge_config=candidate,
                 )
             return await run_eval(
                 task_path, candidate, base_config,
