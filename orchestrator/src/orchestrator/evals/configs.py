@@ -1,10 +1,14 @@
 """Eval configuration matrix: model/backend combinations to test.
 
-Operators running ν's proxied Claude-format-endpoint candidates (see
-``claude_endpoint_candidates()`` below) should seed live ``config.prices``
-from ``claude_endpoint_price_table()`` (merged, not replaced) so those runs
-resolve ``cost_source == 'price_table'`` instead of falling back to
-``'unpriced_proxy'``.
+``build_eval_orch_config`` (evals/runner.py, task 2820) already auto-merges
+``claude_endpoint_price_table()`` into the resolved ``config.prices``
+whenever a candidate's ``env_overrides`` carries a proxied
+``ANTHROPIC_BASE_URL`` — the same signal ``claude_endpoint_candidates()``'s
+bundles below set. Manually seeding ``config.prices`` (merged, not replaced)
+is no longer required for those runs to resolve ``cost_source ==
+'price_table'`` instead of falling back to ``'unpriced_proxy'``; it remains
+a valid escape hatch (e.g. to override a rate ahead of the auto-seed, which
+always loses to an existing ``config.prices`` entry).
 """
 
 import logging
@@ -697,8 +701,11 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 
     Lets λ's ``resolve_cost_usd`` resolve ``cost_source == 'price_table'`` for
     a proxied ν candidate instead of falling back to ``'unpriced_proxy'``.
-    Operators should seed live ``config.prices`` from this table (merged, not
-    replaced) for proxied-endpoint cost accuracy.
+    ``build_eval_orch_config`` (evals/runner.py, task 2820) auto-merges this
+    table into ``config.prices`` whenever the candidate's ``env_overrides``
+    carries a proxied ``ANTHROPIC_BASE_URL``, so operators no longer need to
+    seed it manually — an existing ``config.prices`` entry still wins on
+    conflict, so a manual seed remains a valid override.
     """
     return {**default_price_table(), **CANDIDATE_ENDPOINT_PRICES}
 
