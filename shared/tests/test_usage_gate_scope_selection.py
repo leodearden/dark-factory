@@ -385,6 +385,71 @@ class TestScopeWaitNoFreeze:
 
 
 # ===========================================================================
+# Amendment (task 2857) — the S3 scope-wait re-checks selection promptly when
+# a concurrent PROBE_IN_FLIGHT account completes and opens scope headroom.
+#
+# The per-scope waiter Event is set() only by the scope-uncap sweep, so an
+# account-level transition (confirm_account_ok: PROBE_IN_FLIGHT -> AVAILABLE)
+# does NOT signal it. is_paused ignores probe_in_flight, so a scoped caller can
+# reach this wait while the only otherwise-selectable account is mid-probe.
+# The bounded re-poll ceiling (capped when a probe is outstanding) ensures the
+# caller re-runs selection within a small delay rather than sleeping toward the
+# far-future scope deadline / max_probe_interval_secs. The wait still never
+# freezes the fleet (S3).
+# ===========================================================================
+
+
+class TestScopeWaitProbeInteraction:
+    """A scoped caller parked in the S3 scope-wait while another account is
+    PROBE_IN_FLIGHT must re-check selection (and return the newly-serviceable
+    account) within the bounded re-poll ceiling once that probe completes,
+    rather than sleeping toward the far-future scope deadline. The wait never
+    clears ``_open`` nor sets a fleet pause (S3)."""
+
+    async def test_probe_completion_wakes_scoped_waiter(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        far = now + timedelta(hours=6)
+        # A: generally AVAILABLE (so _open stays set / the fleet is NOT frozen)
+        # but fable-scope-capped with a far-future deadline → no fable headroom.
+        set_scope_cap(a, resets_at=far, capped_at=now)
+        # B: mid-probe → skipped by selection AND does not count toward is_paused
+        # (which ignores probe_in_flight). B carries no scope cap, so once its
+        # probe confirms it has fable headroom.
+        b.probe_in_flight = True
+        assert a.phase == AccountPhase.AVAILABLE
+        assert b.phase == AccountPhase.PROBE_IN_FLIGHT
+
+        # Tight re-poll ceiling so the bounded wait is fast and deterministic.
+        with patch('shared.usage_gate._SCOPE_WAIT_REPOLL_CEIL_SECS', 0.05):
+            scoped_task = asyncio.create_task(gate.before_invoke(scope=SCOPE))
+            try:
+                # The scoped caller parks: no fable headroom (A scope-capped, B
+                # probing). The fleet is NOT frozen — A is generally serviceable,
+                # so _open stays set and no pause reason is recorded (S3).
+                await asyncio.sleep(0.15)
+                assert scoped_task.done() is False
+                assert gate._open.is_set() is True
+                assert gate.paused_reason == ''
+
+                # The probe confirms → B goes AVAILABLE with fable headroom. This
+                # transition does NOT signal the per-scope waiter Event, but the
+                # bounded re-poll re-runs selection and returns B.
+                gate.confirm_account_ok(b.token)
+                assert b.phase == AccountPhase.AVAILABLE
+
+                lease = await asyncio.wait_for(scoped_task, timeout=1.0)
+                assert lease is not None
+                assert lease.name == 'b'
+            finally:
+                if not scoped_task.done():
+                    scoped_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await scoped_task
+
+
+# ===========================================================================
 # Step 9 — scope_capacity_snapshot() -> dict[str, bool] (advisory; S8)
 # ===========================================================================
 

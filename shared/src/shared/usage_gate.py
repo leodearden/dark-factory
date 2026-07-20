@@ -69,6 +69,20 @@ __all__ = [
 # this module now consumes them indirectly via classify_invocation.
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
+# Robustness bound for the scoped no-freeze wait (task 2857 amendment). The
+# per-scope waiter Event is set() ONLY by the scope-uncap sweep
+# (_refresh_scope_capped), so it never wakes on an ACCOUNT-level transition —
+# most notably a PROBE_IN_FLIGHT account finishing its probe and going
+# AVAILABLE with fresh scope headroom. Because is_paused ignores
+# probe_in_flight, a scoped caller can reach that wait while the only
+# otherwise-selectable account is mid-probe; without a bound it would sleep
+# toward the full scope deadline (or max_probe_interval_secs, ~1800s) long
+# after the probe opened headroom. When such a probe is outstanding, the
+# scoped wait re-polls at most this many seconds so selection is re-checked
+# promptly (self-correcting). Deliberately a small internal responsiveness
+# constant, not an operator knob.
+_SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
+
 
 def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
     """Return True iff the probe stdout is a CLI JSON result reporting that
@@ -853,6 +867,26 @@ class UsageGate:
                         if soonest is not None
                         else float(self._config.max_probe_interval_secs)
                     )
+                    # Robustness (task 2857 amendment): the per-scope waiter is
+                    # set() ONLY by the scope-uncap sweep, so it does NOT wake on
+                    # an account-level transition that opens scope headroom. The
+                    # common such case is a PROBE_IN_FLIGHT account finishing its
+                    # probe and going AVAILABLE (confirm_account_ok) — is_paused
+                    # ignores probe_in_flight, so a scoped caller can park here
+                    # while the only otherwise-selectable account is mid-probe.
+                    # When a probe is outstanding, cap the park at a small
+                    # re-poll ceiling so the selection-time sweep re-runs within a
+                    # bounded delay instead of sleeping toward the full scope
+                    # deadline / max_probe_interval_secs. This still never touches
+                    # _open / _paused_reason (S3) and never tight-spins (the
+                    # ceiling is strictly positive); the pure scope-exhaustion
+                    # steady state (no probe in flight) is unchanged — it sleeps
+                    # toward the real deadline. (A bare `await self._open.wait()`
+                    # here would busy-spin: the fleet is NOT frozen precisely
+                    # because some account is generally AVAILABLE, so _open is
+                    # already set and would return at once.)
+                    if any(a.probe_in_flight for a in self._accounts):
+                        sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(evt.wait(), timeout=sleep_for)
                     continue
