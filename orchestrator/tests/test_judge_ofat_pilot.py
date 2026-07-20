@@ -228,3 +228,74 @@ class TestDecideNonAdopt:
         assert decision.escalate is True
         assert decision.incumbent_row is None
         assert decision.reasons
+
+
+# ---------------------------------------------------------------------------
+# step-5/6 — format_judge_ofat_report: a deterministic markdown report that
+# carries the verdict + deltas, EMBEDS report.format_composite_table verbatim
+# (so the committed trial report stays consistent with every other eval surface
+# and byte-stable), and renders the decide-and-act footer (the models.judge flip
+# on adopt; keep-sonnet + escalate otherwise).
+# ---------------------------------------------------------------------------
+
+class TestFormatReport:
+    def _adopt(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3, judge_cost=0.40),
+            _row('judge-haiku', composite=0.89, cost_usd=0.10, lo=0.88, hi=0.90, n=3, judge_cost=0.05),
+        ])
+        return decide_judge_adoption(report, margin=0.05), report
+
+    def _reject(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3),
+            _row('judge-haiku', composite=0.72, cost_usd=0.10, lo=0.70, hi=0.74, n=3),
+        ])
+        return decide_judge_adoption(report, margin=0.05), report
+
+    def test_adopt_report_has_verdict_deltas_table_and_flip_line(self):
+        from orchestrator.evals.judge_pilot import format_judge_ofat_report
+        from orchestrator.evals.report import format_composite_table
+
+        decision, report = self._adopt()
+        text = format_judge_ofat_report(decision, report)
+
+        # Verdict + non_inferior/cheaper booleans + margin.
+        assert 'adopt' in text
+        assert 'margin' in text.lower()
+        # Composite delta and cost delta are surfaced (candidate - incumbent).
+        assert 'composite delta' in text.lower()
+        assert 'cost delta' in text.lower()
+        assert f'{decision.composite_delta:+.4f}' in text
+        assert f'{decision.cost_delta:+.4f}' in text
+        # The composite table is embedded verbatim.
+        assert format_composite_table(report) in text
+        # On adopt: the recommended flip line.
+        assert 'models.judge: sonnet -> haiku' in text
+
+    def test_reject_report_renders_keep_sonnet_and_no_flip(self):
+        from orchestrator.evals.judge_pilot import format_judge_ofat_report
+        from orchestrator.evals.report import format_composite_table
+
+        decision, report = self._reject()
+        text = format_judge_ofat_report(decision, report)
+
+        assert 'reject' in text
+        # Keep-sonnet + escalate note instead of the flip.
+        assert 'keep models.judge=sonnet' in text
+        assert 'escalat' in text.lower()
+        # The adopt flip recommendation must NOT be rendered on a reject.
+        assert 'models.judge: sonnet -> haiku' not in text
+        # Table still embedded.
+        assert format_composite_table(report) in text
+
+    def test_report_is_byte_deterministic(self):
+        from orchestrator.evals.judge_pilot import format_judge_ofat_report
+
+        decision, report = self._adopt()
+        # No wall-clock in the rendered body: same inputs → byte-identical output.
+        assert format_judge_ofat_report(decision, report) == format_judge_ofat_report(decision, report)
