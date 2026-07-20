@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -654,6 +655,21 @@ class TestEmittedStepEscalations:
     def test_append_same_pair_is_idempotent(self, artifacts: TaskArtifacts):
         artifacts.append_emitted_step_escalation('step-1', 'abc123')
         artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
+
+    def test_append_same_pair_skips_redundant_write(self, artifacts: TaskArtifacts):
+        # Efficiency (task 2764 amend): a redundant append for an
+        # already-persisted pair short-circuits to a pure read and skips the
+        # disk rewrite entirely (dedup-before-write). Deterministic spy on
+        # ``_write_json`` rather than mtime (coarse fs resolution is a weak
+        # regression guard).
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        with patch.object(
+            artifacts, '_write_json', wraps=artifacts._write_json
+        ) as spy:
+            artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        spy.assert_not_called()
+        # Content is unchanged and still readable after the skipped write.
         assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
 
     def test_append_distinct_pairs_accumulate(self, artifacts: TaskArtifacts):

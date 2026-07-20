@@ -1077,10 +1077,19 @@ class TaskArtifacts:
         Read-modify-write: reads the current set via
         :meth:`read_emitted_step_escalations`, adds the pair, and rewrites
         ``reconcile_state.json`` with the keys serialized as a sorted list of
-        2-element lists (stable diffs; JSON has no set/tuple types).  Idempotent
-        — re-appending an existing pair rewrites the same content.
+        2-element lists (stable diffs; JSON has no set/tuple types).
+
+        Idempotent *without* redundant disk work (task 2764 amend): if the pair
+        is already persisted, return early and skip the rewrite entirely, so a
+        repeat append — or a caller that forgets the workflow's in-memory flood
+        guard — costs one read and no write.  This dedup-before-write preserves
+        the escalate-first-then-persist ordering: the early return fires only
+        when a prior persist already succeeded, so a genuinely-new pair (the
+        only case the caller normally reaches) is never skipped.
         """
         keys = self.read_emitted_step_escalations()
+        if (step_id, stale_commit) in keys:
+            return
         keys.add((step_id, stale_commit))
         self._write_json(
             self.root / 'reconcile_state.json',
