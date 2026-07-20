@@ -6782,6 +6782,17 @@ task, include it with an empty "files" list rather than omitting it.
             'auto_eval_pair': str(original_id),
             'spawned_from': str(original_id),
             'force_full_path': True,
+            # Retry-escalation rung (task μ, trigger 1b): the redo sibling
+            # starts one tier above its parent, so its full-path executor
+            # routes a rung stronger via the retry-tier-up rule from its very
+            # first dispatch. A FRESH state at parent+1 (only the counter
+            # carries forward) — the parent's latest/history mirror entries
+            # belong to the parent's dispatches, not this new sibling.
+            # Harness-set at submit = harness-stamped, not author-supplied
+            # (invariant 8).
+            'routing': {
+                'routing_tier': RoutingState.from_metadata(task_metadata).routing_tier + 1,
+            },
             'modules': list(task_metadata.get('modules') or []),
             'files': list(task_metadata.get('files') or []),
         }
