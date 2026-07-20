@@ -57,6 +57,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import _run_post_merge_verify, _verify_worktree_contention_sentinel
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     collect_descendants,
+    lane_lock_path,
     merge_verify_lock_path,
     pgid_file,
     read_lock_holder_pgid,
@@ -1189,3 +1190,87 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     assert esc.category == 'verify_worktree_contention'
     assert str(holder_pgid_val) in esc.detail
     assert str(waiter_pgid_val) in esc.detail
+
+
+# ---------------------------------------------------------------------------
+# Task 2830 step-4 -- the SS9 Signal at the real subprocess seam: a live
+# knob-ON verify-merge HOLDS the shared <lane_dir>.lock mid-build, so a
+# non-blocking flock probe on it from this process is DENIED.  Stronger
+# evidence than the mock-based step-1 pin (test_cli.py
+# test_verify_merge_holds_lane_lock_during_warm_run): drives the real CLI
+# span end-to-end and pins the lock PATH the split lane-lock lifetime
+# (esc-2830-1) re-acquires for the build's duration.
+# ---------------------------------------------------------------------------
+
+
+def test_live_verify_merge_holds_lane_lock_real_subprocess(tmp_path):
+    """SS9 Signal: a live knob-ON verify-merge holds the SHARED lane lock mid-build (task 2830).
+
+    The task's Signal, at the REAL subprocess seam: spawn a real knob-ON
+    ``orchestrator verify-merge`` with a sleeper build, poll until it is genuinely
+    mid-build (the sleeper's marker inside the persistent ``_merge-verify`` worktree
+    appears), then from THIS test process take a non-blocking exclusive flock on
+    ``lane_lock_path(persistent_merge_worktree_path)`` = ``<worktree_base>/
+    _merge-verify.lock`` -- the SAME lock reify's seed/thin/gc and
+    ``GitOps.merge_verify_lease`` take (task 2685) -- and assert it is DENIED
+    (BlockingIOError). This confirms the live CLI span is the holder of the LANE lock
+    during the build, so a laptop lane actor (reseed/thin/gc) is mutually excluded from
+    a live laptop verify -- closing the divergence DF 2685 left for the remote host and
+    that the two remote-twin incidents (reify 5034/5187) turned on.
+
+    With the split lane-lock lifetime (esc-2830-1) the lane lock is re-acquired for the
+    build's duration inside ``_run()`` (AFTER ``acquire_host_verify_worktree``'s own
+    reset has released it), and the shared holder-pgid is written before the build
+    runs. The sleeper's ``touch`` executes inside that build-scoped hold, so the
+    marker's existence implies the lock is already held and the holder-pgid recorded.
+
+    Stronger than the mock-based step-1 pin
+    (``test_verify_merge_holds_lane_lock_during_warm_run``): it drives the real CLI span
+    end-to-end (no monkeypatched ``acquire_host_verify_worktree`` / ``run_merge_verify_``
+    ``on_worktree``), so it pins the lock path the production code actually computes and
+    holds.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    worktree_base = worktree_base_for(repo)
+    worktree_base.mkdir(parents=True, exist_ok=True)
+
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
+
+    # No --request-id -> the stdin watchdog is never armed, so the sleeper holder
+    # stays alive until we kill it in the finally (mirrors the env-override probe
+    # test's spawn shape, test_flock_wait_env_override_speeds_up_contention_result).
+    holder = spawn_verify_merge(sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file)
+    try:
+        persistent_wt = worktree_base / '_merge-verify'
+        marker = persistent_wt / 'target' / 'warm.marker'
+        # Poll until the sleeper build is genuinely mid-run. The build-scoped lane-lock
+        # hold is acquired (and the holder-pgid written) BEFORE the build runs, so the
+        # marker's appearance implies the lane lock is currently held -- no race.
+        wait_for_marker(marker)
+
+        # THE SIGNAL: a non-blocking exclusive flock on the shared lane lock from this
+        # (independent) process must be DENIED while the live CLI span holds it.
+        lane_lock = lane_lock_path(persistent_wt)
+        probe_fd = os.open(lane_lock, os.O_RDWR | os.O_CREAT)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe_fd)
+
+        # Corroboration: the build-scoped hold records the shared holder-pgid, so a
+        # live positive int (not a stale/absent file) confirms the live CLI owns the
+        # lane lock right now.
+        holder_pgid = read_lock_holder_pgid(worktree_base)
+        assert isinstance(holder_pgid, int) and holder_pgid > 0, (
+            f'the live CLI must record a positive shared holder-pgid while holding the '
+            f'lane lock mid-build, got {holder_pgid!r}'
+        )
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
+        if holder.stdin is not None:
+            with contextlib.suppress(OSError):
+                holder.stdin.close()
