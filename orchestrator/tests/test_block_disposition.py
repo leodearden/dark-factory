@@ -348,6 +348,25 @@ class TestBD2Completeness:
             f'{[t.__qualname__ for t in missing]}'
         )
 
+    def test_merge_verify_lease_contended_requeues_without_counting_against_cap(self):
+        """MergeVerifyLeaseContended (task 2828) has an EXPLICIT REQUEUE row,
+        mirroring MergeVerifyLeaseHeld: a contended lease is a transient "come
+        back later" — REQUEUE, never escalates, never counts against the
+        requeue cap. Uses ``_lookup_disposition`` (the type-keyed table read)
+        directly, so it pins the row regardless of classify_failure's
+        OSError-branch precedence."""
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import RequeueKind, _lookup_disposition
+        disp = _lookup_disposition(MergeVerifyLeaseContended)
+        assert disp is not None, (
+            'MergeVerifyLeaseContended must have an explicit disposition row'
+        )
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False
+        assert disp.escalate_to_human is False
+        assert disp.category is FailureCategory.NONE
+
     def test_a_brand_new_exception_type_has_no_row_but_still_classifies(self):
         # A synthetic type with no table row proves the completeness check
         # above is meaningful: it FAILS for an unrecognized type rather than

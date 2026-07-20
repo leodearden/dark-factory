@@ -57,6 +57,11 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
 from shared.branch_names import canonical_queued_branch_name  # noqa: F401
+from shared.proc_group import (
+    reap_process_groups,
+    scan_process_groups_under_path,
+    snapshot_process_group,
+)
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.artifacts import TaskArtifacts
@@ -244,13 +249,25 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
 PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 
 # Bounded-wait timeout (seconds) for GitOps.merge_verify_lease()'s
-# acquire_merge_verify_flock() call (task 2315, BUG 1). A LOCAL constant
-# rather than importing cli.MERGE_VERIFY_FLOCK_WAIT_SECS: cli.py imports
-# GitOps, so a git_ops -> cli import would be architecturally backwards.
-# Mirrors cli.py:53's default (env-overridable there via
-# ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS — this constant is git_ops' own,
-# independently defaulted copy of the same value, not env-overridable here).
-_MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
+# acquire_merge_verify_flock() call (task 2315, BUG 1; raised 10s -> 300s in
+# task 2828). The lease now RAISES MergeVerifyLeaseContended (deferring the
+# dispatch) instead of yielding unprotected on timeout, so this is the window
+# a starting verify patiently blocks for the lane lock before it gives up and
+# requeues. 300s (5 min) is <0.5% overhead on a 1--2h verify, yet comfortably
+# outlasts every SHORT legitimate holder (a reseed/thin/gc/reset — seconds to
+# low minutes) so they never force a needless requeue, while a genuinely long
+# contender (another 1--2h verify) times out and correctly defers. The acquire
+# runs OFF the event loop via asyncio.to_thread (see merge_verify_lease), so a
+# minutes-long poll never freezes the orchestrator.
+#
+# A LOCAL constant rather than importing cli.MERGE_VERIFY_FLOCK_WAIT_SECS:
+# cli.py imports GitOps, so a git_ops -> cli import would be architecturally
+# backwards. Distinct from cli.py's own env-overridable
+# MERGE_VERIFY_FLOCK_WAIT_SECS (the laptop host lane — task 2828 out of scope).
+# A plain module constant (no config knob, no env override), monkeypatchable
+# in tests via the module global, mirroring the sibling
+# _SEED_WARM_LANE_LOCK_WAIT_SECS below.
+_MERGE_VERIFY_LEASE_WAIT_SECS: float = 300.0
 
 # Bounded-wait timeout (seconds) for GitOps._seed_warm_lane()'s outer
 # <lane_dir>.lock flock -x (task 2599 amendment). Seeding runs on the
@@ -262,7 +279,7 @@ _MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
 # 30s gives generous headroom over normal (even slow-disk) durations while
 # still turning a wedged holder into a diagnosable, bounded failure instead
 # of a silent, unbounded one. A plain module constant, no config knob and no
-# env override — mirrors _MERGE_VERIFY_FLOCK_WAIT_SECS's own
+# env override — mirrors _MERGE_VERIFY_LEASE_WAIT_SECS's own
 # independently-defaulted, non-overridable copy above, and keeps this fix
 # inside git_ops.py rather than reaching into config.py's green/red
 # reload-tier surface for what is a narrow, self-contained safety margin.
@@ -272,7 +289,7 @@ _MERGE_VERIFY_FLOCK_WAIT_SECS: float = 10.0
 # an int stringifies to an unambiguous whole-second literal ("30") rather
 # than a fractional one ("30.0"). Fractional `-w` parses fine on current
 # util-linux, but this is the only place in git_ops.py that hands a
-# CLI-parsed wait value to `flock` itself (`_MERGE_VERIFY_FLOCK_WAIT_SECS`
+# CLI-parsed wait value to `flock` itself (`_MERGE_VERIFY_LEASE_WAIT_SECS`
 # is only ever passed to an in-process helper, never a CLI arg) — no reason
 # to lean on fractional-timeout CLI parsing for what is a whole-second value.
 _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
@@ -896,6 +913,35 @@ class MergeVerifyLeaseHeld(RuntimeError):
             f'Refusing to reset persistent merge worktree {warm_path}: '
             f'merge-verify lease is held by a different live process '
             f'(holder pgid={holder_pgid}, self pgid={os.getpgrp()})'
+        )
+
+
+class MergeVerifyLeaseContended(RuntimeError):
+    """Raised by :meth:`GitOps.merge_verify_lease` when the merge-verify flock
+    stays contended past its bounded wait (task 2828, limb 2).
+
+    Before this task, a contended flock (``acquire_merge_verify_flock``'s
+    bounded wait timing out) made ``merge_verify_lease`` yield WITHOUT
+    recording a lease — the local verify then ran 1--2h fully UNPROTECTED, so
+    a concurrent reseed/thin/gc could clobber its working tree mid-run. The
+    lease now RAISES this instead, propagating cleanly out of
+    ``_run_post_merge_verify``'s ``AsyncExitStack`` to the merge worker's
+    requeue seam so the dispatch is DEFERRED (requeued to try again later),
+    never run unprotected.
+
+    Modeled on :class:`MergeVerifyLeaseHeld` (a RuntimeError carrying lock
+    context). Its workflow_types disposition row (REQUEUE,
+    ``counts_against_requeue_cap=False``) mirrors MergeVerifyLeaseHeld's — a
+    contended lease is a transient "come back later," not a task failure.
+    """
+
+    def __init__(self, lock_path: Path, wait_secs: float):
+        self.lock_path = lock_path
+        self.wait_secs = wait_secs
+        super().__init__(
+            f'merge-verify lane lock {lock_path} still contended after a '
+            f'{wait_secs}s bounded wait — deferring this dispatch rather than '
+            f'running the verify unprotected'
         )
 
 
@@ -1896,23 +1942,34 @@ class GitOps:
         verify — the flock holder-pgid rendezvous below is unchanged.
 
         On a contended flock (the bounded wait in
-        :func:`acquire_merge_verify_flock` times out), yields WITHOUT
-        recording a lease — logs a WARNING and proceeds unrecorded, so a
-        contended lease can never deadlock a verify. The bounded-wait
-        flock remains the primary cross-process serialization; this lease
-        is defense-in-depth on top of it for the DF-side teardown/GC
-        actors.
+        :func:`acquire_merge_verify_flock` times out after
+        ``_MERGE_VERIFY_LEASE_WAIT_SECS``), RAISES
+        :class:`MergeVerifyLeaseContended` so the caller DEFERS/requeues the
+        dispatch rather than running the verify unprotected (task 2828, limb
+        2) — the old behaviour yielded without a lease, letting a 1--2h verify
+        race a concurrent reseed/thin/gc clobber. The acquire runs OFF the
+        event loop via :func:`asyncio.to_thread`, because the now-minutes-long
+        synchronous poll would otherwise freeze the orchestrator (mirroring
+        :meth:`reset_persistent_merge_worktree`'s off-thread acquire). The
+        bounded-wait flock remains the primary cross-process serialization;
+        this lease is defense-in-depth on top of it for the DF-side
+        teardown/GC actors.
         """
         lock_path = lane_lock_path(self.persistent_merge_worktree_path)
-        fd = acquire_merge_verify_flock(lock_path, _MERGE_VERIFY_FLOCK_WAIT_SECS)
+        # Acquire OFF the event loop: the bounded wait is now minutes
+        # (_MERGE_VERIFY_LEASE_WAIT_SECS) and acquire_merge_verify_flock is a
+        # synchronous time.sleep poll, so an inline call would freeze the whole
+        # orchestrator. Mirrors reset_persistent_merge_worktree's
+        # asyncio.to_thread(acquire_merge_verify_flock, ...) precedent.
+        fd = await asyncio.to_thread(
+            acquire_merge_verify_flock, lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS,
+        )
         if fd is None:
-            logger.warning(
-                'merge_verify_lease: flock contended (bounded wait timed '
-                'out) at %s — proceeding WITHOUT recording a lease',
-                lock_path,
-            )
-            yield
-            return
+            # Contended past the bounded wait: RAISE so the dispatch is
+            # DEFERRED/requeued rather than run unprotected (task 2828, limb
+            # 2). The old path yielded without a lease here, letting a 1--2h
+            # verify race a concurrent reseed/thin/gc clobber.
+            raise MergeVerifyLeaseContended(lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS)
         write_lock_holder_pgid(self.worktree_base, os.getpgrp())
         try:
             yield
@@ -7737,6 +7794,104 @@ class GitOps:
 
         # Warm path: reset the fixed worktree in place (invariants 1+4).
         return await self.reset_persistent_merge_worktree(merge_sha)
+
+    async def reap_merge_verify_survivors(self, *, grace_secs: float = 5.0) -> bool:
+        """One-time STARTUP SURVIVOR BARRIER for the warm ``_merge-verify`` lane
+        (task 2828, limb 1 — the restart-collateral clobber).
+
+        On orchestrator restart the merge_verify flock dies with the process
+        and the holder-pgid lease goes stale (its pgid is dead →
+        :meth:`_merge_verify_lease_active` is fail-OPEN → False).  But the
+        PREVIOUS run's verify subtree (bash → cargo → rustc, ``setsid``'d /
+        reparented to init) can still be ALIVE under
+        :attr:`persistent_merge_worktree_path`.  The merge worker's first
+        :meth:`reset_persistent_merge_worktree` then ``git reset --hard`` +
+        ``git clean -xfd``s that tree, clobbering the live build out from
+        under itself — BOTH existing guards are blind to such a survivor (the
+        flock holder and the lease pgid both died with the parent).
+
+        This barrier scans /proc for process groups whose cwd / an open fd /
+        an mmap'd path falls at-or-under the ``_merge-verify`` subtree and
+        reaps them (SIGTERM → bounded wait → SIGKILL) BEFORE the worker loop
+        starts, hence before that first reset can run.  The Harness invokes it
+        once from :meth:`Harness._start_merge_worker`, immediately before
+        creating the merge-worker task.
+
+        Scope + fail-open: confined to the LOCAL in-process lane
+        (``git.persistent_merge_worktree`` on); best-effort reap of same-user
+        orphans (SIGKILL essentially always succeeds).  Our OWN process group
+        is excluded (``exclude_pgids``) so the barrier never signals itself.
+        On the rare non-clearable residual it returns ``False`` and logs a
+        loud ERROR (surfacing, not silencing, the hazard) rather than crashing
+        startup — the caller treats the barrier as best-effort.  The blocking
+        /proc scan + reap runs off the event loop via :func:`asyncio.to_thread`
+        so it never stalls other coroutines.
+
+        Returns:
+            ``True`` when the lane is clear (knob off, nothing found, or every
+            survivor reaped); ``False`` when a residual group is still alive
+            after the reap.
+        """
+        if not self.config.persistent_merge_worktree:
+            # Knob off — no fixed warm lane to protect (nothing to scan/reap).
+            return True
+
+        root = str(self.persistent_merge_worktree_path)
+        own_pgid = os.getpgrp()
+
+        def _scan_reap_rescan() -> tuple[
+            set[int], dict[int, str], dict[int, str], set[int]
+        ]:
+            found = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({own_pgid}),
+            )
+            if not found:
+                return set(), {}, {}, set()
+            # task 2828 amend (reviewer_comprehensive, robustness): snapshot each
+            # group's member processes (pid / comm / cmdline) WHILE THEY ARE
+            # STILL ALIVE — before the reap below — so the WARNING identifies
+            # exactly what was killed.  The reap targets any same-user group by
+            # PATH signal (cwd / fd / mmap under the lane), NOT by toolchain
+            # comm, so it can also catch an operator's interactive shell or
+            # debugger cwd'd under the lane mid-incident; logging the cmdline
+            # lets them tell after the fact that their own session was the
+            # casualty (snapshot_process_group never raises).
+            snapshots = {pgid: snapshot_process_group(pgid) for pgid in found}
+            outcomes = reap_process_groups(found, grace_secs=grace_secs)
+            remaining = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({own_pgid}),
+            )
+            return found, snapshots, outcomes, remaining
+
+        found, snapshots, outcomes, remaining = await asyncio.to_thread(
+            _scan_reap_rescan
+        )
+
+        if not found:
+            return True
+
+        logger.warning(
+            'reap_merge_verify_survivors: found %d orphaned process group(s) '
+            '%s under the warm merge-verify lane %s (a previous-run verify '
+            'subtree survived restart); reap outcomes=%s. Reaped process '
+            'group details (pid/comm/cmdline captured pre-reap, so an operator '
+            'can identify a same-user session caught by the path-based reap):'
+            '\n%s',
+            len(found), sorted(found), root, outcomes,
+            '\n'.join(snapshots[pgid] for pgid in sorted(snapshots)),
+        )
+
+        if remaining:
+            logger.error(
+                'reap_merge_verify_survivors: %d process group(s) %s STILL '
+                'alive under %s after reap — the first '
+                'reset_persistent_merge_worktree may clobber a live tree '
+                '(fail-open: this barrier is best-effort)',
+                len(remaining), sorted(remaining), root,
+            )
+            return False
+
+        return True
 
     async def reset_persistent_merge_worktree(self, merge_commit: str) -> Path:
         """Create or reset-in-place the persistent warm merge-verify worktree.

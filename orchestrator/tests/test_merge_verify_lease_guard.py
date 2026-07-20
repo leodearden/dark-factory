@@ -101,6 +101,73 @@ class TestMergeVerifyLeaseContextManager:
         )
         assert read_lock_holder_pgid(git_ops.worktree_base) is None
 
+    async def test_contended_flock_raises_and_records_no_lease(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A contended flock (bounded wait times out) RAISES
+        MergeVerifyLeaseContended and records NO lease.
+
+        The verify must then be DEFERRED/requeued by the caller, never run
+        unprotected — this is task 2828's limb-2 fix, replacing the old
+        yield-without-a-lease path that let a 1--2h verify run fully exposed
+        to a concurrent reseed/thin/gc clobber.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        # Simulate acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None).
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock',
+            lambda *a, **k: None,
+        )
+
+        entered = False
+        with pytest.raises(MergeVerifyLeaseContended):
+            async with git_ops.merge_verify_lease():
+                entered = True  # body must never run
+
+        assert not entered, 'lease body must NOT run on a contended flock'
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+            'no holder-pgid may be recorded when the lease is refused'
+        )
+        assert git_ops._merge_verify_lease_active() is False
+
+    async def test_flock_acquire_runs_off_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The (now minutes-long) bounded-wait flock acquire must run OFF the
+        event loop via asyncio.to_thread, never inline on it.
+
+        A synchronous minutes-long poll on the loop would freeze the whole
+        orchestrator; we prove off-thread execution by asserting the acquire
+        ran on a DIFFERENT thread than the event-loop thread.
+        """
+        import threading  # noqa: PLC0415
+
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        main_thread_id = threading.get_ident()
+        seen: dict[str, int] = {}
+
+        def record_thread(*_a, **_k):
+            seen['thread_id'] = threading.get_ident()
+            return None  # timeout -> contended (keeps this a single-path test)
+
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock', record_thread,
+        )
+
+        with pytest.raises(MergeVerifyLeaseContended):
+            async with git_ops.merge_verify_lease():
+                pass
+
+        assert seen.get('thread_id') is not None, 'acquire was never invoked'
+        assert seen['thread_id'] != main_thread_id, (
+            'acquire_merge_verify_flock must run off the event-loop thread '
+            '(asyncio.to_thread), not inline on it'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Real-git fixtures (mirroring test_git_ops.py's TestPersistentMergeWorktree)
