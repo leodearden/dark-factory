@@ -23,13 +23,20 @@ conditional config).
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from orchestrator.harness import _extract_tagger_entries
 from orchestrator.module_charter import sanitize_files_for_persist
-from orchestrator.module_tagger_prompt import build_tagger_prompt
+from orchestrator.module_tagger_prompt import (
+    TAGGER_SCHEMA,
+    TAGGER_SYSTEM_PROMPT,
+    build_tagger_prompt,
+)
 
 
 def set_scores(predicted: list, gold: list) -> dict[str, float]:
@@ -354,3 +361,354 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
 {json.dumps(summary, indent=2)}
 ```
 """
+
+
+# ── run_trial: deterministic end-to-end orchestration (unit-tested core) ─────
+
+
+def _eligible_for_trial(task: dict) -> bool:
+    """Whether *task* is a valid trial sample.
+
+    Eligible iff it carries a non-empty ground-truth ``metadata.files`` set AND
+    is NOT a deterministic task. Deterministic tasks carry no worktree and no
+    code (CLAUDE.md "Deterministic task kind"), so a file-lock prediction is
+    meaningless for them — the exact exclusion ``harness._tag_task_modules``
+    applies. Empty-``files`` tasks (docs-only / no-op) give degenerate
+    precision/recall and are dropped. Status filtering to ``done`` is the
+    loader's job (see ``load_done_tasks``), not this predicate's.
+    """
+    meta = task.get('metadata') or {}
+    if meta.get('task_kind') == 'deterministic':
+        return False
+    return bool(meta.get('files') or [])
+
+
+def _mean_metrics(scores: list, keys: tuple) -> dict[str, float]:
+    """Mean of each metric key across a list of ``set_scores`` dicts.
+
+    Empty input yields 0.0 for every key (total — no ZeroDivision). run_trial
+    filters to eligible tasks first, so an empty list only arises with zero
+    eligible samples, where N < MIN_SAMPLES makes the verdict marginal anyway.
+    """
+    if not scores:
+        return {k: 0.0 for k in keys}
+    return {k: sum(s[k] for s in scores) / len(scores) for k in keys}
+
+
+def run_trial(
+    tasks: list,
+    top_level_dirs: list,
+    invoke_fn,
+    adjudicate_fn,
+) -> TrialResult:
+    """Drive the whole offline trial deterministically over *tasks*.
+
+    *invoke_fn* is ``(faithful_prompt, model) -> AgentResult`` and is called
+    once per eligible task for each of ``'haiku'`` and ``'sonnet'`` with the
+    byte-identical production prompt (``faithful_prompt_for``). *adjudicate_fn*
+    is ``(adjudication_prompt) -> {'winner': 'haiku'|'sonnet'|'tie'}`` and is
+    called ONLY on haiku-vs-sonnet disagreements, compared on the sanitized
+    (production-lock) file set — the same set scoring runs on.
+
+    Both model seams are injected so this core is unit-testable with fakes;
+    ``main()`` wires the live haiku/sonnet/opus ``invoke_agent``. Returns a
+    ``TrialResult`` carrying per-model mean precision/recall/F1 vs ground truth,
+    the mean symmetric haiku-vs-sonnet agreement, the opus tally, ``n_samples``,
+    and ``decide()``'s verdict.
+    """
+    eligible = [t for t in tasks if _eligible_for_trial(t)]
+
+    haiku_scores: list = []
+    sonnet_scores: list = []
+    agreement_scores: list = []
+    verdicts: list = []
+
+    for task in eligible:
+        gold = (task.get('metadata') or {}).get('files') or []
+        prompt = faithful_prompt_for(task, top_level_dirs)
+
+        haiku_files = parse_predictions(invoke_fn(prompt, 'haiku'))
+        sonnet_files = parse_predictions(invoke_fn(prompt, 'sonnet'))
+
+        # (a) precision/recall/F1 vs ground truth per model; (b) symmetric
+        # haiku-vs-sonnet agreement. set_scores sanitizes both sides.
+        haiku_scores.append(set_scores(haiku_files, gold))
+        sonnet_scores.append(set_scores(sonnet_files, gold))
+        agreement_scores.append(set_scores(haiku_files, sonnet_files))
+
+        # Frontier-adjudicate ONLY genuine disagreements — compared on the
+        # sanitized (production-lock) set, so a difference that sanitizes away
+        # is not counted as a disagreement.
+        haiku_set = set(sanitize_files_for_persist(list(haiku_files)))
+        sonnet_set = set(sanitize_files_for_persist(list(sonnet_files)))
+        if haiku_set != sonnet_set:
+            verdicts.append(adjudicate_fn(
+                build_adjudication_prompt(task, haiku_files, sonnet_files, gold)
+            ))
+
+    n_samples = len(eligible)
+    haiku = _mean_metrics(haiku_scores, ('precision', 'recall', 'f1'))
+    sonnet = _mean_metrics(sonnet_scores, ('precision', 'recall', 'f1'))
+    agreement = _mean_metrics(
+        agreement_scores, ('precision', 'recall', 'f1', 'jaccard'),
+    )
+    adjudication = tally_adjudications(verdicts)
+
+    decision = decide({
+        'mean_haiku_f1': haiku['f1'],
+        'mean_sonnet_f1': sonnet['f1'],
+        'mean_jaccard': agreement['jaccard'],
+        'haiku_worse_fraction': adjudication['haiku_worse_fraction'],
+        'n_samples': n_samples,
+    })
+
+    return TrialResult(
+        n_samples=n_samples,
+        haiku=haiku,
+        sonnet=sonnet,
+        agreement=agreement,
+        adjudication=adjudication,
+        decision=decision,
+    )
+
+
+# ── live wiring (impl-only; not unit-tested — real models + task DB) ─────────
+#
+# run_trial is SYNC (its unit-tested contract), while invoke_agent and the task
+# read are async. main() bridges with ``asyncio.run()`` per call: main() itself
+# is sync, so each call spins up and tears down its own loop with no running
+# loop to nest inside — the most robust bridge for invoke_agent's subprocess
+# transports, and fine for an offline batch. httpx / invoke_agent are imported
+# lazily inside these helpers so the tested core keeps a minimal, dependency-
+# light import surface (the ``shared`` pytest env need not carry them).
+
+PROJECT_ROOT = Path('/home/leo/src/dark-factory')
+FUSED_MEMORY_URL = 'http://127.0.0.1:8002'
+REPORT_REL_PATH = 'plans/module-tagger-haiku-trial-report.md'
+
+
+def _flatten_tasks(tasks_payload: Any) -> list[dict]:
+    """Flatten a get_tasks payload (with nested subtasks) into a flat list."""
+    out: list[dict] = []
+
+    def _walk(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for t in items:
+            if isinstance(t, dict):
+                out.append(t)
+                _walk(t.get('subtasks') or [])
+
+    if isinstance(tasks_payload, dict):
+        _walk(tasks_payload.get('tasks'))
+    return out
+
+
+class _FusedMemoryClient:
+    """Minimal read-only HTTP/JSON-RPC client for the fused-memory MCP server.
+
+    Mirrors ``scripts/migrate_metadata_modules_to_files.py``'s client (the
+    established script→server read pattern), condensed to the single read-only
+    ``get_tasks`` call this trial needs. httpx is imported lazily so importing
+    this module (for the unit-tested core) does not require httpx.
+    """
+
+    def __init__(self, server_url: str):
+        self._url = server_url.rstrip('/')
+        self._client: Any = None
+        self._session_id: str | None = None
+
+    async def __aenter__(self) -> _FusedMemoryClient:
+        import httpx
+        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._session_id = uuid.uuid4().hex
+        await self._post({
+            'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+            'params': {
+                'protocolVersion': '2024-11-05',
+                'clientInfo': {'name': 'module-tagger-trial', 'version': '1.0'},
+                'capabilities': {},
+            },
+        })
+        await self._post({
+            'jsonrpc': '2.0', 'method': 'notifications/initialized', 'params': {},
+        })
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+
+    async def _post(self, payload: dict) -> dict:
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+            'mcp-session-id': self._session_id or '',
+        }
+        resp = await self._client.post(
+            f'{self._url}/mcp/', json=payload, headers=headers,
+        )
+        resp.raise_for_status()
+        # 202 Accepted (notifications) returns no body.
+        if resp.status_code == 202 or not resp.content:
+            return {}
+        if 'text/event-stream' in resp.headers.get('content-type', ''):
+            for line in resp.text.splitlines():
+                if line.startswith('data:'):
+                    return json.loads(line[5:].strip())
+            raise RuntimeError(f'no SSE data line: {resp.text[:200]}')
+        return resp.json()
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        result = await self._post({
+            'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': 'tools/call',
+            'params': {'name': name, 'arguments': arguments},
+        })
+        if 'error' in result:
+            raise RuntimeError(f'{name} failed: {result["error"]}')
+        content = result.get('result', {})
+        if 'structuredContent' in content:
+            return content['structuredContent']
+        for entry in content.get('content', []) or []:
+            if entry.get('type') == 'text':
+                try:
+                    return json.loads(entry['text'])
+                except json.JSONDecodeError:
+                    return {'_raw': entry['text']}
+        return content
+
+
+async def load_done_tasks(
+    project_root: Path, server_url: str = FUSED_MEMORY_URL,
+) -> list[dict]:
+    """Read DONE tasks carrying non-empty ground-truth ``metadata.files``.
+
+    Read-only ``get_tasks`` against the running fused-memory server. Ground
+    truth is the done task's already-reconciled ``metadata.files`` (the actual
+    merge-diff files; ``TaskWorkflow._reconcile_metadata_files_for_done``).
+    Deterministic tasks are dropped later by ``run_trial`` (``_eligible_for_trial``).
+    """
+    async with _FusedMemoryClient(server_url) as client:
+        payload = await client.call_tool(
+            'get_tasks',
+            {'project_root': str(project_root), 'with_subtasks': True},
+        )
+    done: list[dict] = []
+    for t in _flatten_tasks(payload):
+        if str(t.get('status', '')) != 'done':
+            continue
+        meta = t.get('metadata') or {}
+        if meta.get('files'):
+            done.append(t)
+    return done
+
+
+def current_top_level_dirs(project_root: Path) -> list[str]:
+    """Current top-level dir listing — mirrors ``harness._tag_task_modules``."""
+    try:
+        return sorted(
+            p.name for p in project_root.iterdir()
+            if p.is_dir() and not p.name.startswith('.')
+        )
+    except OSError:
+        return []
+
+
+async def _live_invoke(prompt: str, model: str, project_root: Path) -> Any:
+    """Live tagger replay for one (prompt, model) via real ``invoke_agent``.
+
+    Faithful "at the call site": byte-identical production prompt + schema +
+    system prompt; only the model is forced (haiku vs sonnet head-to-head), and
+    ``effort='low'`` is applied SYMMETRICALLY to both so the comparison stays
+    fair. ``allowed_tools=[]`` — the tagger only emits structured output.
+    """
+    from orchestrator.agents.invoke import invoke_agent
+    return await invoke_agent(
+        prompt=prompt,
+        system_prompt=TAGGER_SYSTEM_PROMPT,
+        cwd=project_root,
+        model=model,
+        output_schema=TAGGER_SCHEMA,
+        allowed_tools=[],
+        effort='low',
+        max_turns=2,
+        max_budget_usd=0.50,
+    )
+
+
+async def _live_adjudicate(prompt: str, project_root: Path) -> dict:
+    """Frontier (opus) adjudication for one haiku-vs-sonnet disagreement.
+
+    Returns ``{'winner': 'haiku'|'sonnet'|'tie'}`` — fail-safe to ``'tie'`` on a
+    missing / out-of-enum opus payload so a flaky judgement never crashes the
+    run (a tie is the neutral outcome for ``tally_adjudications``).
+    """
+    from orchestrator.agents.invoke import invoke_agent
+    result = await invoke_agent(
+        prompt=prompt,
+        system_prompt=(
+            'You are an impartial adjudicator comparing two file-prediction '
+            'candidates against ground truth. Answer with a single winner.'
+        ),
+        cwd=project_root,
+        model='opus',
+        output_schema=ADJUDICATION_SCHEMA,
+        allowed_tools=[],
+        effort='low',
+        max_turns=2,
+        max_budget_usd=1.0,
+    )
+    payload = getattr(result, 'structured_output', None) or {}
+    winner = payload.get('winner')
+    if winner not in ('haiku', 'sonnet', 'tie'):
+        winner = 'tie'
+    return {'winner': winner}
+
+
+def main() -> int:
+    """Run the live trial and write the markdown report (impl-only).
+
+    Loads done tasks (read-only), replays haiku vs fresh sonnet at the call
+    site, opus-adjudicates disagreements, computes the pass/marginal/fail
+    verdict, and writes ``render_report`` to
+    ``plans/module-tagger-haiku-trial-report.md``. The conditional config flip /
+    escalation is step 16, not this entrypoint.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='module_tagger haiku replay-agreement trial (task 2540)',
+    )
+    parser.add_argument('--project-root', default=str(PROJECT_ROOT))
+    parser.add_argument('--server-url', default=FUSED_MEMORY_URL)
+    parser.add_argument('--out', default=None,
+                        help='report path (default: <project_root>/' + REPORT_REL_PATH + ')')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='cap eligible samples (smoke runs only)')
+    args = parser.parse_args()
+
+    project_root = Path(args.project_root)
+    out_path = Path(args.out) if args.out else project_root / REPORT_REL_PATH
+
+    tasks = asyncio.run(load_done_tasks(project_root, args.server_url))
+    if args.limit is not None:
+        tasks = [t for t in tasks if _eligible_for_trial(t)][: args.limit]
+    dirs = current_top_level_dirs(project_root)
+
+    def invoke_fn(prompt: str, model: str) -> Any:
+        return asyncio.run(_live_invoke(prompt, model, project_root))
+
+    def adjudicate_fn(prompt: str) -> dict:
+        return asyncio.run(_live_adjudicate(prompt, project_root))
+
+    result = run_trial(tasks, dirs, invoke_fn, adjudicate_fn)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_report(result))
+    print(f'Trial complete: decision={result.decision} '
+          f'N={result.n_samples} → {out_path}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
