@@ -18,11 +18,13 @@ RED (step-3) until ``_bumped_routing_dump`` exists in ``orchestrator.harness``.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness, _bumped_routing_dump
 from orchestrator.workflow import WorkflowOutcome
 
@@ -144,3 +146,65 @@ class TestMaybeBumpRoutingTier:
         await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
 
         harness.scheduler.update_task.assert_not_awaited()
+
+
+class TestAutoEvalRedoCarriesBumpedTier:
+    """``_maybe_auto_eval``'s redo sibling starts at ``parent_tier + 1`` (task
+    μ, trigger 1b): the redo carries a FRESH routing state
+    (``{'routing_tier': parent+1}``, NOT a copy of the parent's decision
+    history) alongside the existing ``force_full_path=True``. Harness-set at
+    submit time = harness-stamped, not author-supplied (invariant 8).
+
+    Uses a real Harness so ``_extract_task_id`` / ``git_ops`` are genuine; the
+    budget + prior-redo lookups are stubbed and ``dispatch_tool`` returns ``{}``
+    so ``_maybe_auto_eval`` returns right after capturing the submit_task call.
+    """
+
+    def _harness(self, tmp_path: Path) -> Harness:
+        harness = Harness(OrchestratorConfig(project_root=tmp_path))
+        # Budget OK + no prior redos → straight through to submit_task.
+        harness._auto_eval_budget_used_24h = AsyncMock(return_value=0.0)
+        harness._find_prior_auto_eval_redos = AsyncMock(return_value=[])
+        # submit_task capture; {} → _extract_task_id None → early return before
+        # any further dispatch_tool call, so call_args_list[0] IS submit_task.
+        harness.scheduler.dispatch_tool = AsyncMock(return_value={})
+        return harness
+
+    @staticmethod
+    def _assignment(routing_tier: int | None):
+        routing = {} if routing_tier is None else {'routing': {'routing_tier': routing_tier}}
+        return SimpleNamespace(
+            task={
+                'metadata': {'optimistic_path': 'lever-b', **routing},
+                'title': 'do the thing',
+                'priority': 'medium',
+            },
+            task_id='7',
+        )
+
+    def _submitted_metadata(self, harness: Harness) -> dict:
+        call = harness.scheduler.dispatch_tool.call_args_list[0]
+        assert call.args[0] == 'submit_task'
+        return call.args[1]['metadata']
+
+    @pytest.mark.asyncio
+    async def test_redo_carries_parent_tier_plus_one(self, tmp_path: Path):
+        harness = self._harness(tmp_path)
+        report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED, block_phase='verify')
+
+        await harness._maybe_auto_eval(self._assignment(routing_tier=2), report)
+
+        submitted = self._submitted_metadata(harness)
+        assert submitted.get('routing') == {'routing_tier': 3}
+        assert submitted['force_full_path'] is True
+
+    @pytest.mark.asyncio
+    async def test_redo_from_parent_without_routing_starts_at_tier_one(self, tmp_path: Path):
+        harness = self._harness(tmp_path)
+        report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED, block_phase='verify')
+
+        await harness._maybe_auto_eval(self._assignment(routing_tier=None), report)
+
+        submitted = self._submitted_metadata(harness)
+        assert submitted.get('routing') == {'routing_tier': 1}
+        assert submitted['force_full_path'] is True
