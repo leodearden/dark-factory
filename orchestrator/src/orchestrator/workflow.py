@@ -10777,6 +10777,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             f'escalation, reset to pending for re-scheduling'
                         )
                     else:
+                        # merge_phase=True: the caller retries the merge
+                        # in-place while the task stays in-progress (no
+                        # scheduler re-dispatch), so nothing durable records
+                        # the obligation. Stamp metadata.merge_retry_pending
+                        # (best-effort) so a restart mid-retry can reconstruct
+                        # it via _resume_merge_retry_if_pending (Reify 5166).
+                        await self._stamp_merge_retry_pending()
                         logger.info(
                             f'Task {self.task_id}: steward resolved blocking '
                             f'escalation, caller will retry merge in-place'
