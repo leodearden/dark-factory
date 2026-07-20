@@ -80,6 +80,12 @@ retry ladder's final rung.
    machinery, `defaults.yaml` cost-ceiling block). Per-(account,model) cap-state rework
    in the UsageGate is explicitly out of scope — a fable cap-hit CAPs the whole account
    (existing semantics), which the ceiling + failover make survivable.
+   **Addendum 2026-07-20:** both premises are superseded — Leo confirmed all pool
+   accounts have fable access at 50% of token spend each, and the cap-state deferral
+   is **lifted**, owned by `plans/usage-gate-model-scoped-caps-prd.md` (scope-aware
+   per-account caps + separate fable failover). ξ (task 2544) is amended to dep that
+   PRD's integration gate + the ratification gate of
+   `plans/fable-architect-eval-admission-prd.md`; admission is Leo-ratified.
 5. **Plan-shape-derived routing now; architect hint later**: policy conditions read what
    the plan already exposes (`step_count`, module footprint — generalizing the existing
    Rust heuristic to any language). An explicit architect difficulty-hint plan-tool
@@ -393,20 +399,31 @@ Phase 3 — fleet rebalancing (survey Tier 1) + plan-shape generalization:
     cheaper. (A direct verdict-agreement replay metric — mine `runs.db` for
     judge-said-done-and-merged-clean vs. kicked-back ground truth — is a
     stronger future option gated on an input-replayability spike, à la triage.)
-  - **triage** — gated on an input-replayability spike; dep **2485**. Same
-    replay-agreement method as module_tagger, on the post-2485 contract, but the
-    steward's inner-triage INPUTS are not obviously persisted for offline replay
-    (`data/escalations/` is escalation-*watcher* output, a different role). First
-    step is a spike confirming the inner-triage inputs are reconstructable; if
-    not, bootstrap input logging or drop triage from κ.
+  - **triage** — **DROPPED from κ 2026-07-20 (Leo-authorized).** The
+    input-replayability spike (`plans/routing-kappa-triage-replayability-spike-report.md`)
+    found the pilot both unrunnable and inert. `models.triage` / `role='triage'`
+    governs a *single* call site — `steward._pre_triage_suggestions` (`steward.py:706-860`),
+    fired only on `category='review_suggestions'` escalations ≥10 suggestions — and that
+    site has **0 invocations across 15,645** in `runs.db` (window 2026-04-09..07-20): it
+    has never fired. Production routes review suggestions to the **curator**
+    (`_route_review_suggestions_to_curator`, `workflow.py:5350`), so the
+    `review_suggestions`-escalation path that would feed triage is a dead
+    `self.mcp is None` fallback (`_escalate_suggestions`, no live caller) — exactly **1**
+    such record persisted (`esc-508-96`, 2026-04-07, pre-curator) across 2,468
+    escalations. No replay corpus exists, and flipping the model would re-model a role
+    that never runs (zero account-pool relief); bootstrapping input logging is futile at
+    a site that never fires. Sub-task **task 2816 cancelled**. *Was:* gated on an
+    input-replayability spike; dep 2485; same replay-agreement method as module_tagger.
+    *(Live successor target, out of κ's orchestrator-routing scope: the **curator**'s own
+    model config in fused-memory — not orchestrator `models.triage`.)*
 
   Per-role decide-and-act unchanged: pass → flip that role to haiku on
   dark_factory via hot-reload, watch δ's rollup a fixed window, then defaults.yaml;
   fail/marginal → committed report + escalate. Signal (per sub-task): committed
   trial report + applied flip visible in reload disposition + δ rollup rows
-  showing haiku invocations for the flipped role. Prereqs: δ=**2534** (all three);
-  judge additionally **2478** + **2486** + **2472**; triage additionally **2485**
-  + the spike.
+  showing haiku invocations for the flipped role. Prereqs: δ=**2534** (both
+  remaining roles); judge additionally **2478** + **2486** + **2472**. (triage
+  **dropped from κ 2026-07-20** — task 2816 cancelled; see the triage bullet above.)
 - **λ — simple_task tuning**
   Modules: orchestrator (defaults.yaml / config). Turns 30→50 + budget via α's now-live
   fields; saturation-rate metric (from δ) becomes the tracked indicator. Signal:
@@ -462,7 +479,8 @@ time.
   config price table — all owned by `plans/harness-backend-reconnect-pi-prd.md`;
   endpoint-swapped model bundles by eval-revival ν=2479/ξ=2480. The resolver never
   returns a backend.
-- Per-(account,model) UsageGate cap states (fable cap = whole-account CAP stands).
+- Per-(account,model) UsageGate cap states — **deferral lifted 2026-07-20**: owned by
+  `plans/usage-gate-model-scoped-caps-prd.md` (see decision 4 addendum).
 - Implementer-saturation → automatic architect decomposition (decomposition machinery,
   not routing; separate PRD if wanted).
 - Curation-time LLM routing in the TaskCurator (survey caution: prior automatic

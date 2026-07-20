@@ -457,6 +457,19 @@ rebase churn.
   `judge-sonnet`; the `judge_config=None` parity tripwire stays green.
   Depends **μ (2478)**. Consumer: **adaptive-routing κ-judge (task 2815)**.
   Modules: orchestrator/evals/{runner,configs}.py, orchestrator/tests.
+- **π (pi) — architect-fable OFAT candidate** *(leaf; instrument extension —
+  added 2026-07-20 by paired edit, the ο precedent, to serve
+  `plans/fable-architect-eval-admission-prd.md`)*. Add
+  `EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high',
+  role='architect')` to `ARCHITECT_EVAL_CONFIGS` (configs.py) + a test pinning
+  the candidate set — existing candidates byte-unchanged; the architect OFAT
+  dispatch branch (θ/μ) already handles any `role='architect'` candidate, so
+  this is config-only. An `architect-fable-max` variant is a tactical add if
+  the consumer's screen shows effort sensitivity. **Signal:**
+  `ofat_candidates()` lists the fable candidate; config tests green.
+  Depends **μ (2478)**. Consumer: the fable-architect-eval-admission PRD's
+  campaign gate (τ1). Modules: orchestrator/evals/configs.py,
+  orchestrator/tests.
 
 **Phase 4 — candidate bundles (cross-PRD-gated)**
 
