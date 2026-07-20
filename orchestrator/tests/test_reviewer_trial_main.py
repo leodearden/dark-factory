@@ -11,11 +11,45 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from click.testing import CliRunner
 
-from orchestrator.evals.reviewer_trial.__main__ import cli
+from orchestrator.evals.reviewer_trial.__main__ import _select_original_corpus, cli
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
 from orchestrator.evals.reviewer_trial.mining import AuditReport
 from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
+
+
+class TestSelectOriginalCorpus:
+    """_select_original_corpus keeps the original hand-authored (non-mined)
+    diffs and drops the mined ones (task 2476: refresh the original 15)."""
+
+    def test_keeps_only_non_mined_diffs(self) -> None:
+        manifest = CorpusManifest(
+            version='2.0',
+            split_seed='seed-xyz',
+            diffs=[
+                CorpusDiff(diff_id='syn_1', language='python', source='synthetic',
+                           diff_text='', description='s1', ground_truth=[]),
+                CorpusDiff(diff_id='syn_2', language='rust', source='synthetic',
+                           diff_text='', description='s2', ground_truth=[]),
+                CorpusDiff(diff_id='rw_1', language='typescript', source='real_world',
+                           diff_text='', description='rw1', ground_truth=[]),
+                CorpusDiff(diff_id='mined_1', language='python', source='mined',
+                           diff_text='', description='m1', ground_truth=[]),
+                CorpusDiff(diff_id='mined_2', language='python', source='mined',
+                           diff_text='', description='m2', ground_truth=[]),
+            ],
+        )
+
+        selected = _select_original_corpus(manifest)
+
+        assert isinstance(selected, CorpusManifest)
+        # Exactly the three non-mined diffs, diff_ids preserved.
+        assert {d.diff_id for d in selected.diffs} == {'syn_1', 'syn_2', 'rw_1'}
+        assert all(d.source in ('synthetic', 'real_world') for d in selected.diffs)
+        assert not any(d.source == 'mined' for d in selected.diffs)
+        # version/split_seed carried over from the source manifest.
+        assert selected.version == '2.0'
+        assert selected.split_seed == 'seed-xyz'
 
 
 class TestCorpusSanityCostDisplay:
