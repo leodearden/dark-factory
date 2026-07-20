@@ -12582,6 +12582,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _warm_results: dict[str, str] = {}
         _is_warm_path = False
         _warm_capture: list[VerifyResult] = []
+        # PRD verify-retry-failed-only D4 (§5.4): attempt-0 verdict sink populated
+        # by _run_post_merge_verify ONLY on a corroborated narrowed retry; unioned
+        # into the warm shadow baseline below (build_warm_shadow_results) so a
+        # PARTIAL narrowed-retry map never triggers a phantom only_cold divergence.
+        _attempt0_shadow: dict[str, str] = {}
         _spec_warm: bool = False  # set when acquire_spec_lane returns warm=True
 
         try:
@@ -12651,6 +12656,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 event_store=self._event_store,
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
+                shadow_baseline_sink=_attempt0_shadow if _is_warm_path else None,
                 quarantine=self._runner_quarantine,
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
@@ -12968,7 +12974,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'passed=True)'
             )
             if _warm_capture:
-                _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                # PRD verify-retry-failed-only D4 (§5.4): union the attempt-0
+                # verdict map (populated on a corroborated narrowed retry) with
+                # the (possibly PARTIAL) narrowed warm output before storing the
+                # warm shadow baseline.  An empty _attempt0_shadow → parse-only
+                # (byte-identical to the non-narrowed path); an EMPTY parse is
+                # returned verbatim so the unparseable alarm below stays reachable.
+                _warm_results = build_warm_shadow_results(
+                    _warm_capture[0].test_output or '', _attempt0_shadow
+                )
                 if not _warm_results and req.config.git.warm_verify_shadow_compare:
                     _alarm_warm_shadow_unparseable(
                         self._escalation_queue,
