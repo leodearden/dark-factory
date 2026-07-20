@@ -474,6 +474,10 @@ class UsageGate:
         self._project_id: str | None = None
         self._run_id: str | None = None
         self._last_account_name: str | None = None
+        # Per-scope wake Events for the S3 scope-wait (task 2857 / γ). Lazily
+        # populated by _scope_waiter on scope-is-not-None paths only, so every
+        # existing scope=None caller never allocates one (S1 / B6 byte-equiv).
+        self._scope_waiters: dict[str, asyncio.Event] = {}
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
         self._shutting_down: bool = False
 
@@ -902,6 +906,108 @@ class UsageGate:
             sc = ScopeCap()
             acct.scope_caps[scope] = sc
         return sc
+
+    def _scope_waiter(self, scope: str) -> asyncio.Event:
+        """Get-or-create the per-scope wake ``asyncio.Event`` (S3 scope-wait).
+
+        Lazily populates ``self._scope_waiters`` through a getattr-default read
+        (mirroring the ``_probe_config_dirs`` / ``_shutting_down`` idiom) so a
+        ``__new__``-built test fixture that never ran ``__init__`` still works.
+        Only touched on scope-is-not-None paths, so every existing scope=None
+        caller never allocates a waiter (S1 / B6 byte-equivalence).
+        """
+        waiters = getattr(self, '_scope_waiters', None)
+        if waiters is None:
+            waiters = self._scope_waiters = {}
+        evt = waiters.get(scope)
+        if evt is None:
+            evt = waiters[scope] = asyncio.Event()
+        return evt
+
+    def _scope_uncap_deadline(self, sc: ScopeCap) -> datetime | None:
+        """The instant a scope cap becomes optimistically uncappable (S6).
+
+        ``resets_at`` when the classifier parsed one, else the conservative
+        fixed backoff ``capped_at + max_probe_interval_secs`` — the single
+        deadline both the S6 sweep and the S3 wait consult (PRD open-Q2).
+        ``capped_at`` is always stamped by β's scoped ``_handle_cap_detected``,
+        so the deadline is computable whenever a scope cap is set; returns None
+        only for a malformed cap carrying neither field.
+        """
+        if sc.resets_at is not None:
+            return sc.resets_at
+        if sc.capped_at is not None:
+            return sc.capped_at + timedelta(seconds=self._config.max_probe_interval_secs)
+        return None
+
+    def _scope_capped_at(self, acct: AccountState, scope: str, now: datetime) -> bool:
+        """True iff *acct* is scope-capped for *scope* with an uncap deadline
+        still in the future at *now* — the authoritative admission predicate
+        shared by ``before_invoke(scope=)`` selection and
+        ``scope_capacity_snapshot`` (invariant S8).
+
+        A scope cap that is absent, already uncapped, or past its deadline is
+        NOT capping (the optimistic-uncap contract): such an account is admitted
+        for the scope. A capped cap with no computable deadline (malformed —
+        never produced by β) fails safe as still-capped.
+        """
+        sc = acct.scope_caps.get(scope)
+        if sc is None or not sc.capped:
+            return False
+        deadline = self._scope_uncap_deadline(sc)
+        if deadline is None:
+            return True
+        return now < deadline
+
+    def _refresh_scope_capped(self, scope: str) -> bool:
+        """Optimistically clear expired *scope* caps at selection time (S6).
+
+        SYNCHRONOUS by design (contains no ``await``): a no-await sweep is
+        atomic under asyncio's cooperative scheduler, so it cannot interleave
+        with a concurrent scoped ``_handle_cap_detected`` and is safe to call
+        outside ``self._lock`` — matching the module's short-critical-section
+        discipline (``scope_caps`` mutations are already not lock-protected).
+        Mirrors ``_refresh_capped_accounts`` one dimension down (per scope, not
+        per account). Wakes the per-scope waiter (S3) whenever it uncaps
+        anything so a concurrent scope-wait re-checks its select condition.
+
+        Returns True iff at least one account's scope cap was cleared.
+        """
+        now = datetime.now(UTC)
+        any_uncapped = False
+        for acct in self._accounts:
+            sc = acct.scope_caps.get(scope)
+            if sc is None or not sc.capped:
+                continue
+            deadline = self._scope_uncap_deadline(sc)
+            if deadline is not None and now >= deadline:
+                sc.capped = False
+                logger.info(
+                    f'Account {acct.name}: scope {scope!r} uncap deadline passed '
+                    f'— optimistically uncapping (S6)',
+                )
+                any_uncapped = True
+        if any_uncapped:
+            self._scope_waiter(scope).set()
+        return any_uncapped
+
+    def _soonest_scope_reset(self, scope: str) -> datetime | None:
+        """Earliest scope uncap-deadline across accounts capped for *scope*.
+
+        Mirrors ``soonest_resets_at`` for the scope dimension: the min
+        ``_scope_uncap_deadline`` across accounts whose ``scope_caps[scope]`` is
+        capped, or None when none is capped (or every capped one has no
+        computable deadline). Consulted by the S3 scope-wait to bound its sleep.
+        """
+        deadlines: list[datetime] = []
+        for acct in self._accounts:
+            sc = acct.scope_caps.get(scope)
+            if sc is None or not sc.capped:
+                continue
+            deadline = self._scope_uncap_deadline(sc)
+            if deadline is not None:
+                deadlines.append(deadline)
+        return min(deadlines) if deadlines else None
 
     def _handle_cap_detected(
         self,
