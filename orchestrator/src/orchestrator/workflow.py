@@ -2458,25 +2458,12 @@ class TaskWorkflow:
                     return outcome
                 break
 
-            # MERGE (skip for eval mode — no merge into main)
-            if not self._worktree_external:
-                _merge_result = await self._run_merge_phase(branch_name)
-                if _merge_result is not None:
-                    return _merge_result
-
-            # SUCCESS — write completion knowledge (best-effort after merge)
-            try:
-                await self._write_completion_to_memory()
-            except Exception as e:
-                logger.warning(
-                    f'Task {self.task_id}: completion memory write failed '
-                    f'(non-fatal): {e}'
-                )
-            # Wait for steward to finish any pending work (suggestion triage, etc.)
-            await self._ensure_steward_started()
-            await self._await_steward_completion()
-            self._enter_phase(WorkflowState.DONE)
-            return await self._finalise_merged_done()
+            # MERGE + SUCCESS/finalise tail — extracted into _merge_and_finalise
+            # (task 2795) so the merge-retry resume guard can reuse it. Always
+            # returns a WorkflowOutcome (a terminal merge outcome verbatim, or
+            # the finalise-DONE outcome on merge success), so _drive never
+            # mistakes a merge success for a fall-through to PLAN.
+            return await self._merge_and_finalise(branch_name)
 
         except WorkflowCancelled:
             # W9-θ: a small handful of call sites inside this try block
@@ -2945,6 +2932,40 @@ class TaskWorkflow:
                         f'with status {last_status_row!r} (task {self.task_id})'
                     )
         return report
+
+    async def _merge_and_finalise(self, branch_name: str) -> WorkflowOutcome:
+        """Run the MERGE phase and, on success, the SUCCESS/finalise tail.
+
+        The extracted ``_drive`` MERGE+SUCCESS tail (task 2795), shared by the
+        normal pipeline tail and :meth:`_resume_merge_retry_if_pending`.
+        :meth:`_run_merge_phase` returns ``None`` on merge SUCCESS (signalling
+        the caller to finalise) or a terminal :class:`WorkflowOutcome` on a
+        block/requeue. This helper maps a ``None`` result to the finalise-DONE
+        path and returns a terminal outcome verbatim, so it ALWAYS returns a
+        :class:`WorkflowOutcome` — letting the resume guard call one method that
+        can never return ``None`` (a ``None`` would make ``_drive`` fall through
+        to PLAN). Eval mode (``self._worktree_external``) skips the merge into
+        main but still runs the finalise tail, exactly as the inline tail did.
+        """
+        # MERGE (skip for eval mode — no merge into main)
+        if not self._worktree_external:
+            _merge_result = await self._run_merge_phase(branch_name)
+            if _merge_result is not None:
+                return _merge_result
+
+        # SUCCESS — write completion knowledge (best-effort after merge)
+        try:
+            await self._write_completion_to_memory()
+        except Exception as e:
+            logger.warning(
+                f'Task {self.task_id}: completion memory write failed '
+                f'(non-fatal): {e}'
+            )
+        # Wait for steward to finish any pending work (suggestion triage, etc.)
+        await self._ensure_steward_started()
+        await self._await_steward_completion()
+        self._enter_phase(WorkflowState.DONE)
+        return await self._finalise_merged_done()
 
     async def _run_merge_phase(self, branch_name: str) -> WorkflowOutcome | None:
         """Execute the MERGE phase. Returns None to fall through to SUCCESS."""
