@@ -4034,3 +4034,50 @@ class TestAtomicWriteDurability:
             f'Expected 0 fsync calls when durable is omitted (default), '
             f'got {fsync_spy2.call_count}'
         )
+
+
+class TestSubmitDurability:
+    """submit() must persist a just-filed record at least as durably as the
+    per-task seq counter that names it (queue.py:1198-1205,
+    _write_seq_counter, durable=True) — closing the window where a
+    born-at-L2 gate escalation (the task 2841/2842/2844 vanished shape)
+    could be dropped by a crash/power-loss/restart landing between the
+    non-durable rename and the next fsync checkpoint, while the durable
+    seq counter and the orchestrator's gate_escalated_at stamp survived.
+    """
+
+    def test_submit_persists_born_at_l2_record_durably(self, tmp_path: Path):
+        """A pure-gate-shaped L2 escalation (mirrors vanished esc-2842-1) is
+        fsync-flushed to stable storage during submit(), and a FRESH
+        EscalationQueue instance over the same directory observes it as
+        pending — proving the record is durable, not merely atomically
+        renamed.
+
+        RED after step-2: submit() still calls _atomic_write() with the
+        default durable=False, so 0 fsyncs fire here. A durably-issued seq
+        counter must never outlive a non-durably-written record it names.
+        Note: submit() takes a pre-built id and does not call make_id(), so
+        no counter fsyncs pollute this count.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        esc = _make_escalation('esc-2842-1', task_id='2842', level=2)
+
+        with patch('escalation.queue.os.fsync', wraps=os.fsync) as fsync_spy:
+            queue.submit(esc)
+
+        assert fsync_spy.call_count >= 2, (
+            f'Expected >=2 fsync calls (temp-file fd + dir fd) during submit(), '
+            f'got {fsync_spy.call_count}'
+        )
+
+        # A fresh instance (simulating a separate process / post-restart
+        # observer such as the escalation server) must see the record as
+        # pending — it was durably flushed, not just renamed in a since-lost
+        # page-cache write.
+        fresh_queue = EscalationQueue(queue_dir)
+        pending_ids = {e.id for e in fresh_queue.get_pending()}
+        assert 'esc-2842-1' in pending_ids
+
+        by_task = fresh_queue.get_by_task('2842', status='pending')
+        assert [e.id for e in by_task] == ['esc-2842-1']
