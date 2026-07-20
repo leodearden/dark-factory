@@ -7663,6 +7663,153 @@ class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
         assert report.stats['stale_persistence_markers_gc_swept'] == 0
 
 
+class TestTaskKnowledgeSyncStaleMem0FlagMarkersGcSweptStat:
+    """TaskKnowledgeSync.run() sets report.stats['stale_mem0_flag_markers_gc_swept']
+    after super().run() (task 2853).
+
+    Monkeypatches the module-level _sweep_stale_mem0_flag_markers helper
+    rather than arranging real Mem0 stage1_flag_marker state — the helper's
+    own behavior is covered exhaustively by TestSweepStaleMem0FlagMarkers;
+    these tests verify only that run() calls it and threads its count into
+    report.stats. Also patches the two sibling GC helpers (_gc_recon_markers,
+    _sweep_stale_persistence_markers) purely for hermetic isolation — this
+    class's assertions are about the NEW stat only, but the three GC passes
+    run back-to-back in run() and an unpatched real _gc_recon_markers would
+    otherwise touch memory_service.recon_ledger/taskmaster attributes this
+    fixture does not configure.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_stale_mem0_flag_markers_gc_swept_stat_set_after_run(self, mock_deps):
+        """run() calls _sweep_stale_mem0_flag_markers(self.memory, self.project_id,
+        run_id) exactly once and injects its return value into
+        report.stats['stale_mem0_flag_markers_gc_swept'], coexisting with the
+        two sibling GC stats (neither overwrites the other)."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=5),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=4),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=7),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stale_mem0_flag_markers_gc_swept') == 7
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run',
+        )
+
+        # The three GC passes are independent and all run every cycle — none
+        # overwrites another in report.stats.
+        assert report.stats.get('recon_markers_gc_swept') == 5
+        assert report.stats.get('stale_persistence_markers_gc_swept') == 4
+
+    @pytest.mark.asyncio
+    async def test_stale_mem0_flag_markers_gc_swept_stat_explicit_zero(self, mock_deps):
+        """When nothing is stale, the stat is 0 — explicitly set, not absent — so
+        downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'stale_mem0_flag_markers_gc_swept' in report.stats
+        assert report.stats['stale_mem0_flag_markers_gc_swept'] == 0
+
+
 class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
     """TaskKnowledgeSync.run() sets report.stats['stale_missing_run_id_markers'] after super().run()."""
 
