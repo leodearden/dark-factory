@@ -7843,6 +7843,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``merge_lifecycle_transition_rejected`` noise this task removes
         (PRD design decision 4: invariants escalate loudly, degrade never —
         satisfied here via the WARNING without silently degrading).
+
+        Also, defensively:
+
+          * resolves *item*'s ``result`` Future (if not already done) to a
+            benign ``MergeOutcome(status='already_merged')`` so no
+            (hypothetical) waiter on the twin's future hangs forever — the
+            confirmed journal-recovery twin has a fresh, unobserved future,
+            so this is robustness, not a correctness dependency; and
+          * emits a ``merge_coalesced`` observability event
+            (``source='duplicate_submission'``) via the shared
+            :func:`_emit_merge_coalesced` helper, None-safe when this
+            worker has no ``_event_store`` wired.
         """
         logger.warning(
             'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
@@ -7851,6 +7863,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'twin, NOT escalated.',
             item.request_id, item.branch, current_state,
         )
+        if not item.result.done():
+            item.result.set_result(
+                MergeOutcome(
+                    status='already_merged',
+                    reason=(
+                        'duplicate/re-entrant merge submission coalesced onto '
+                        'in-flight/landed request'
+                    ),
+                ),
+            )
+        _emit_merge_coalesced(self._event_store, item, source='duplicate_submission', eta=None)
 
     def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
