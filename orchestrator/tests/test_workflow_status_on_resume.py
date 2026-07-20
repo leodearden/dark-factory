@@ -892,13 +892,25 @@ class TestCheckScopeInvariant:
     async def test_divergent_plan_and_metadata_files_escalates(
         self, config, git_ops, task_assignment, tmp_path,
     ):
+        # A genuine cross-MODULE divergence must escalate. At lock_depth=2 the
+        # top-level files 'a.py' and 'b.py' normalize to DISTINCT modules, so
+        # {'a.py','b.py'} != {'a.py'} at module granularity too — the tripwire
+        # (now module-granular, task 2505 reviewer amendment) still fires.
+        plan_files = ['a.py', 'b.py']
+        metadata_files = ['a.py']
+        assert files_to_modules(plan_files, config.lock_depth) != files_to_modules(
+            metadata_files, config.lock_depth,
+        ), (
+            'precondition: this test must exercise a genuine cross-MODULE '
+            f'divergence at lock_depth={config.lock_depth}'
+        )
         workflow, scheduler, queue = self._build(
             config, git_ops, task_assignment, tmp_path,
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
+        workflow.plan = {'files': plan_files}
         scheduler.task_data[task_assignment.task_id] = {
             'id': task_assignment.task_id,
-            'metadata': {'files': ['a.py']},
+            'metadata': {'files': metadata_files},
         }
 
         await workflow._check_scope_invariant()
@@ -908,6 +920,52 @@ class TestCheckScopeInvariant:
         assert infra_issues, (
             'expected an infra_issue escalation for the plan/metadata files '
             f'divergence; pending escalations: {pending!r}'
+        )
+
+    async def test_same_module_file_divergence_no_escalation(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A same-module file-level difference must NOT escalate — task 2505
+        reviewer amendment (false-positive fix).
+
+        ``metadata.files`` is only persisted by ``handle_blast_radius_expansion``,
+        which no-ops when the module set is unchanged, so the normal architect
+        widen — author declares ``a/b/c/d/e.py``; architect plans that plus the
+        same-package ``a/b/c/d/f.py`` — legitimately leaves plan.files and
+        metadata.files differing at file level while the LOCK-MODULE sets (and
+        thus the locks and the merge) agree. The MERGE-entry tripwire must not
+        fire a blocking infra_issue for that benign case. This FAILS under the
+        old file-granularity comparison (which would escalate) and passes under
+        the module-granularity comparison.
+        """
+        plan_files = ['a/b/c/d/e.py', 'a/b/c/d/f.py']
+        metadata_files = ['a/b/c/d/e.py']
+        # Self-validating precondition: genuinely same-module but file-divergent.
+        assert files_to_modules(plan_files, config.lock_depth) == files_to_modules(
+            metadata_files, config.lock_depth,
+        ), (
+            'precondition: F-set must map to the SAME module set at '
+            f'lock_depth={config.lock_depth}'
+        )
+        assert set(plan_files) != set(metadata_files), (
+            'precondition: the file lists must genuinely differ (else this '
+            'would collapse into the consistent-files case)'
+        )
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        scheduler.task_data[task_assignment.task_id] = {
+            'id': task_assignment.task_id,
+            'metadata': {'files': metadata_files},
+        }
+
+        await workflow._check_scope_invariant()
+
+        assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
+            'a benign same-module file addition (locks unaffected) must NOT '
+            'fire the blocking infra_issue tripwire — comparison is at '
+            'lock-module granularity, not file granularity'
         )
 
     async def test_consistent_plan_and_metadata_files_no_escalation(

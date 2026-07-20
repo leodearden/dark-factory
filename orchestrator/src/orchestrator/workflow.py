@@ -10569,15 +10569,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
     async def _check_scope_invariant(self) -> None:
-        """Tripwire (task 2505): warn + escalate if ``plan.files`` diverges
-        from ``metadata.files`` at MERGE entry.
+        """Tripwire (task 2505): warn + escalate if ``plan.files`` and
+        ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
 
         The scope-reconciliation choke point (``_reconcile_scope_locks`` /
-        ``_set_task_scope``) is meant to keep ``plan.files`` and
-        ``metadata.files`` in lockstep on every path that changes either.
-        This surfaces a divergence loudly (the project's
-        loud-over-silent-degradation norm) rather than letting scope drift
-        ship silently into a merge.
+        ``_set_task_scope``) keeps ``plan.files`` and ``metadata.files`` in
+        lockstep on every path that changes either. This surfaces a genuine
+        divergence loudly (the project's loud-over-silent-degradation norm)
+        rather than letting scope drift ship silently into a merge.
+
+        Compared at MODULE (lock) granularity, NOT file granularity. Locks —
+        the only thing ``metadata.files`` functionally drives — are
+        module-granular (``files_to_modules`` at ``lock_depth``), and
+        ``metadata.files`` is only ever persisted by the scheduler's
+        ``handle_blast_radius_expansion``, which no-ops (never persists)
+        whenever the derived module set is unchanged. So a benign same-module
+        file addition by the architect (author declares ``pkg/a.py``; the
+        architect plans ``pkg/a.py`` + same-package ``pkg/b.py``) legitimately
+        leaves the two file lists differing while the module sets — and thus
+        the locks and the merge — agree. A file-granularity comparison would
+        false-escalate that common architect widen with a blocking
+        ``infra_issue`` that routes to a human even though nothing is wrong;
+        only a MODULE-set divergence (a real lock/scope-reconciliation bug) is
+        escalation-worthy. The stronger file-level equality is still maintained
+        by construction on the resume/grant path (``_set_task_scope`` persists
+        ``metadata.files`` directly), so nothing is lost there.
 
         Fail-safe: an unreadable task (``self.scheduler.get_task`` returns
         ``None`` — e.g. a transient backend hiccup) is treated as "cannot
@@ -10587,14 +10603,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         fresh_task = await self.scheduler.get_task(self.task_id)
         if fresh_task is None:
             return
-        plan_files = set(sanitize_files_for_persist(self.plan.get('files', [])))
-        metadata_files = set((fresh_task.get('metadata') or {}).get('files') or [])
-        if plan_files == metadata_files:
+        plan_files = sanitize_files_for_persist(self.plan.get('files', []))
+        metadata_files = list((fresh_task.get('metadata') or {}).get('files') or [])
+        plan_modules = set(files_to_modules(plan_files, self.config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, self.config.lock_depth)
+        )
+        if plan_modules == metadata_modules:
             return
         logger.warning(
-            'Task %s: plan.files/metadata.files divergence detected at '
-            'MERGE entry — plan.files=%s, metadata.files=%s',
-            self.task_id, sorted(plan_files), sorted(metadata_files),
+            'Task %s: plan.files/metadata.files LOCK-MODULE divergence detected '
+            'at MERGE entry — plan modules=%s (files=%s), metadata modules=%s '
+            '(files=%s)',
+            self.task_id, sorted(plan_modules), sorted(plan_files),
+            sorted(metadata_modules), sorted(metadata_files),
         )
         self._escalate_scope_invariant_violation(
             sorted(plan_files), sorted(metadata_files),
@@ -10611,10 +10633,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'plan.files/metadata.files divergence detected for task {self.task_id}'
         )
         detail = (
-            f'plan.files={plan_files} but metadata.files={metadata_files}. '
-            f'The scope-reconciliation choke point (_reconcile_scope_locks/'
-            f'_set_task_scope) should keep these in lockstep on every path '
-            f'that changes either.'
+            f'plan.files={plan_files} but metadata.files={metadata_files} — '
+            f'these derive DIFFERENT lock-module sets at lock_depth='
+            f'{self.config.lock_depth} (a benign same-module file delta does '
+            f'NOT reach here). The scope-reconciliation choke point '
+            f'(_reconcile_scope_locks/_set_task_scope) should keep the module '
+            f'sets in lockstep on every path that changes either.'
         )
         logger.error(f'Task {self.task_id}: {summary}')
 
