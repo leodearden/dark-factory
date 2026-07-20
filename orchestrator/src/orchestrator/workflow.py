@@ -5515,6 +5515,38 @@ class TaskWorkflow:
                         self.task_id, amendment_round,
                         len(in_scope), len(reviews.suggestions),
                     )
+                    # Task 2640 (source point 2): file THIS round's out-of-scope
+                    # complement to the curator at the source, BEFORE _amend, so a
+                    # follow-up skipped as out-of-scope is captured deterministically
+                    # even if the in-scope amendment below escalates.  The residual
+                    # drop task 2750 does not deterministically close: 2750 only
+                    # recovers these downstream IF the post-amendment re-review
+                    # repeats them as out-of-delta.  Object-identity complement:
+                    # _suggestions_in_scope returns the SAME dict objects it
+                    # filtered, so an id()-difference is exact and order-preserving
+                    # and cannot mis-drop a genuinely out-of-scope suggestion that is
+                    # content-equal to an in-scope one (a value-based `not in`
+                    # could).  Mirrors _apply_amendment_delta_scope's out-of-delta
+                    # routing — parent linkage (spawned_from), priority=low, verbatim
+                    # description, no-mcp fallback, and the in-task
+                    # _last_routed_suggestion_hash dedup all come from the shared
+                    # method (the dedup also absorbs the round-0-out-of-scope ==
+                    # round-1-out-of-delta double-file case).
+                    in_scope_ids = {id(x) for x in in_scope}
+                    out_of_scope = [
+                        s for s in reviews.suggestions
+                        if id(s) not in in_scope_ids
+                    ]
+                    if out_of_scope:
+                        await self._route_review_suggestions_to_curator(
+                            ReviewAggregation(
+                                has_blocking_issues=False,
+                                blocking_issues=[],
+                                suggestions=out_of_scope,
+                                reviews={},
+                                reviewer_errors=[],
+                            )
+                        )
                     # Archive pre-amendment reviews so post-mortem can compare
                     if self.artifacts:
                         import shutil
