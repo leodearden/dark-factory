@@ -4646,8 +4646,10 @@ class TestRemoteRunnerStderrArchival:
         assert stderr_files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
 
     # step-3 negative cases
-    async def test_passing_result_writes_no_file(self, tmp_path):
-        """Passing remote verify: ssh_stderr noise is NOT archived (failure-only contract)."""
+    async def test_passing_result_writes_no_stderr_log(self, tmp_path):
+        """Passing remote verify: ssh_stderr noise is NOT archived as a .stderr.log
+        (failure-only contract).  Task 2822 fix (c) now writes a pass-summary on the
+        pass path, but the failure-specific .stderr.log must never appear."""
         pass_result = VerifyResult(
             passed=True, test_output='', lint_output='', type_output='', summary='ok',
         )
@@ -4672,9 +4674,17 @@ class TestRemoteRunnerStderrArchival:
 
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
 
-        # No file should have been written
         task_dir = tmp_path / '1920'
-        assert not task_dir.exists(), f'Expected no archive dir, found {list(task_dir.iterdir()) if task_dir.exists() else "nothing"}'
+        entries = sorted(p.name for p in task_dir.iterdir()) if task_dir.exists() else []
+        # The failure-specific .stderr.log must NOT be written on a pass...
+        assert not any(n.endswith('.stderr.log') for n in entries), (
+            f'Expected no .stderr.log on pass, got {entries}'
+        )
+        # ...only the task 2822 fix (c) pass-summary appears (exactly one artifact).
+        assert entries == [n for n in entries if '.pass-summary-' in n], (
+            f'Expected only pass-summary artifacts on pass, got {entries}'
+        )
+        assert len(entries) == 1, f'Expected exactly 1 pass-summary, got {entries}'
 
     async def test_whitespace_only_stderr_writes_no_file(self, tmp_path):
         """Failed verify with whitespace-only ssh_stderr → NO .stderr.log written (strip guard).
@@ -4848,8 +4858,10 @@ class TestRemoteRunnerStreamArchival:
         assert 'commands' in summary, 'Summary missing commands'
 
     # (c) passing result → no archive dir
-    async def test_passing_result_writes_no_files(self, tmp_path):
-        """Passing remote verify (passed=True) → no archive dir written."""
+    async def test_passing_result_writes_no_stream_files(self, tmp_path):
+        """Passing remote verify (passed=True) → no failure stream logs / summary.
+        Task 2822 fix (c) writes a pass-summary on the pass path, but the
+        failure-specific stream .log files and summary-*.json must never appear."""
         pass_result = VerifyResult(
             passed=True, test_output='all tests pass', lint_output='clean', type_output='no errors',
             summary='ok', category='',
@@ -4873,7 +4885,16 @@ class TestRemoteRunnerStreamArchival:
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
 
         task_dir = tmp_path / '1921'
-        assert not task_dir.exists(), f'Expected no archive dir for passing result, got {task_dir}'
+        entries = sorted(p.name for p in task_dir.iterdir()) if task_dir.exists() else []
+        # No failure stream .log files and no failure summary-*.json on a pass...
+        assert not any(n.endswith('.log') for n in entries), (
+            f'Expected no failure stream .log on pass, got {entries}'
+        )
+        # ...only the task 2822 fix (c) pass-summary appears (exactly one artifact).
+        assert entries == [n for n in entries if '.pass-summary-' in n], (
+            f'Expected only pass-summary artifacts on pass, got {entries}'
+        )
+        assert len(entries) == 1, f'Expected exactly 1 pass-summary, got {entries}'
 
     # (d) failure with all-empty streams → no file and no summary
     async def test_all_empty_streams_failure_writes_nothing(self, tmp_path):
