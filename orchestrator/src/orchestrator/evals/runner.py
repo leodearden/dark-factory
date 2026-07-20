@@ -26,7 +26,12 @@ from orchestrator.config import (
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.workflow import WorkflowOutcome, _meta_root_for_worktree, build_workflow
+from orchestrator.workflow import (
+    WorkflowOutcome,
+    _inject_plan_tools_mcp,
+    _meta_root_for_worktree,
+    build_workflow,
+)
 
 from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
@@ -478,7 +483,11 @@ async def run_architect_eval(
         )
 
         # 3. Init artifacts so the architect has a place to write plan.json.
-        artifacts = TaskArtifacts(worktree)
+        #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
+        #    injected plan-tools server writes to (BUG 1: writer==reader), so
+        #    read_plan() below picks up what the architect's plan-tools calls
+        #    persisted, exactly like real dispatch.
+        artifacts = TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
         task_def = task.get('task_definition', {})
         artifacts.init(
             task_id,
@@ -491,6 +500,11 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = BriefingAssembler(orch_config)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
+        # Wire plan-tools MCP via the SAME production seam real dispatch uses
+        # (workflow._invoke): relocated meta_root + direct-interpreter launch.
+        # strict_mcp_config stays default False so the ambient .mcp.json
+        # escalation/fused-memory servers still merge, mirroring _invoke.
+        mcp_config = _inject_plan_tools_mcp(None, worktree)
         result = await asyncio.wait_for(
             invoke_agent(
                 prompt=prompt,
@@ -504,6 +518,7 @@ async def run_architect_eval(
                 effort=config.effort or 'high',
                 backend=config.backend,
                 env_overrides=config.env_overrides or None,
+                mcp_config=mcp_config,
             ),
             timeout=timeout_minutes * 60,
         )
