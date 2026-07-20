@@ -114,6 +114,27 @@ class TestDiffConfig:
         assert d.restart_required == {}
         assert d.unchanged > 0
 
+    def test_topic_guard_clusters_leaf_is_green_tier_applied_candidate(self):
+        """The topic-guard clusters leaf is green-tier (task 2845): a changed value
+        buckets as an applied_candidate, NOT restart_required — the whole
+        list[ProceduralTopicCluster] is compared as ONE atomic leaf, mirroring the
+        sibling near-dup knobs' hot-reload coverage."""
+        path = 'reconciliation.procedural_knowledge_topic_guard_clusters'
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.reconciliation.procedural_knowledge_topic_guard_clusters
+        assert old, 'default must seed a non-empty clusters list'
+        # Operator clears the clusters -> a differing value on the same leaf.
+        object.__setattr__(fresh.reconciliation, 'procedural_knowledge_topic_guard_clusters', [])
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': old, 'new': []}
+        assert path not in d.restart_required
+
 
 class TestDiffConfigOptionalSubmodels:
     """diff_config / apply_reload tolerate an OPTIONAL submodel field toggling
