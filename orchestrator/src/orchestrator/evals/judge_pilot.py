@@ -21,9 +21,12 @@ and unit-testable on synthetic composite dicts.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .report import format_composite_table
+from .report import build_composite_report, format_composite_table
+
+if TYPE_CHECKING:
+    from .runner import EvalResult
 
 # Default names for the ο judge-OFAT candidates (configs.JUDGE_EVAL_CONFIGS).
 INCUMBENT_JUDGE = 'judge-sonnet'
@@ -214,6 +217,42 @@ def decide_judge_adoption(
         judge_cost_delta=judge_cost_delta,
         reasons=reasons,
     )
+
+
+def select_judge_results(results: list[EvalResult]) -> list[EvalResult]:
+    """Keep only the judge-OFAT rows (``metrics['role_under_test'] == 'judge'``).
+
+    The ο judge branch stamps ``role_under_test='judge'`` on each judge-candidate
+    ``EvalResult``; every other row (implementer / architect / end_to_end) is
+    dropped. Filtering BEFORE :func:`report.build_composite_report` matters for
+    correctness, not just tidiness: a stray non-judge row sharing a fixture would
+    otherwise shift that fixture's cost/latency normalization floor and distort
+    the judge composites. Pure over *results*, order-preserving.
+    """
+    return [r for r in results if r.metrics.get('role_under_test') == 'judge']
+
+
+def analyze_judge_ofat(
+    results: list[EvalResult],
+    *,
+    incumbent: str = INCUMBENT_JUDGE,
+    candidate: str = CANDIDATE_JUDGE,
+    margin: float = DEFAULT_NON_INFERIORITY_MARGIN,
+) -> tuple[JudgeAdoptionDecision, dict[str, Any]]:
+    """Filter → composite → decide: the full judge-OFAT analysis over *results*.
+
+    Filters to judge rows (:func:`select_judge_results`), builds the λ
+    :func:`report.build_composite_report` over them, runs
+    :func:`decide_judge_adoption`, and returns ``(decision, composite_report)`` so
+    the caller can both act on the verdict and render the embedded table. Consumes
+    ο's seam wholesale — invents no new per-config schema.
+    """
+    judge_results = select_judge_results(results)
+    composite_report = build_composite_report(judge_results)
+    decision = decide_judge_adoption(
+        composite_report, incumbent=incumbent, candidate=candidate, margin=margin,
+    )
+    return decision, composite_report
 
 
 def _fmt_delta(value: float | None) -> str:
