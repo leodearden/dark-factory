@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -227,6 +228,66 @@ def parse_per_test_results(test_output: str) -> dict[str, str]:
             test_path, status = m.group(1), m.group(2)
             result[test_path] = _classify_test_status(status)
     return result
+
+
+# ---------------------------------------------------------------------------
+# {did-not-pass} retry-subset construction (PRD verify-retry-failed-only D2).
+# ---------------------------------------------------------------------------
+
+
+def build_fail_fast_map(
+    planned: Iterable[str], verdicts: Mapping[str, str]
+) -> dict[str, str]:
+    """Annotate the authoritative attempt-0 plan with per-test verdicts.
+
+    ``planned`` is the attempt-0 nextest plan/list — the authoritative full
+    set of test ids that a from-scratch (non-fail-fast) run would execute.
+    ``verdicts`` is :func:`parse_per_test_results` output, which contains ONLY
+    the tests that actually RAN (a failing attempt-0 under nextest fail-fast
+    cancels the not-yet-started tests, so they never appear).
+
+    A test in ``planned`` but absent from ``verdicts`` was cancelled by
+    fail-fast and is annotated ``'not-started'``.  Keys present in ``verdicts``
+    but not in ``planned`` are ignored — ``planned`` is authoritative.
+
+    The result is the complete fail-fast map consumed by
+    :func:`did_not_pass_subset` to build the sound retry subset.
+
+    Args:
+        planned: The attempt-0 plan/list of every planned test id.
+        verdicts: Per-test verdicts for the tests that ran, as returned by
+            :func:`parse_per_test_results`.
+
+    Returns:
+        ``dict`` mapping every planned test id to its verdict, with
+        fail-fast-cancelled tests annotated ``'not-started'``.
+    """
+    return {t: verdicts.get(t, 'not-started') for t in planned}
+
+
+def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
+    """Return the sorted {did-not-pass} retry subset from a fail-fast map.
+
+    Selects every test whose verdict is not ``'pass'`` — i.e. the union of
+    ``'fail'`` ∪ ``'not-started'`` ∪ ``'inconclusive'`` verdicts.  On a
+    tree-pinned retry (no new tests) this set equals ``{all planned − passed}``.
+
+    A failed-**only** filter (verdict ``== 'fail'``) is **unsound** under
+    nextest fail-fast: a failing attempt-0 CANCELS the not-yet-started tests,
+    so they are absent from :func:`parse_per_test_results` output and appear as
+    ``'not-started'`` in the fail-fast map (see :func:`build_fail_fast_map`).
+    They MUST re-run — a failed-only filter would silently never do so.
+
+    Args:
+        fail_fast_map: Per-test verdict map (typically from
+            :func:`build_fail_fast_map`) with values in ``{'pass', 'fail',
+            'not-started', 'inconclusive'}``.
+
+    Returns:
+        Sorted list of test ids whose verdict is not ``'pass'``.  Empty list
+        when every test passed.
+    """
+    return sorted(t for t, v in fail_fast_map.items() if v != 'pass')
 
 
 # Matches cargo-nextest Summary footer lines, e.g.:

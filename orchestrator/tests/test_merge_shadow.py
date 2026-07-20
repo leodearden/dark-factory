@@ -320,12 +320,19 @@ class TestReachBackRouting:
 def test_merge_queue_reexports_identical_objects() -> None:
     """merge_queue re-exports the SAME objects from merge_shadow (shim identity).
 
-    Covers every one of the 20 moved names.
+    Covers every one of the 20 originally-moved names, plus the two later
+    co-located-and-re-exported pure helpers (``build_fail_fast_map`` /
+    ``did_not_pass_subset``, PRD verify-retry-failed-only D2) so the identity
+    guard extends to them — a future refactor cannot silently break their
+    re-export without this test going red.
 
     RED (pre-shim): merge_queue.py still defines its own independent copies
     of these names (the duplicate definitions left in place by the EXPAND
     step), so ``getattr(merge_queue, name) is getattr(merge_shadow, name)``
     fails for every name — two distinct objects that merely share a name.
+    (The two D2 helpers were born re-exported, never duplicated, so the RED
+    narrative applies only to the original 20; they are guarded here purely
+    forward-looking.)
     """
     import orchestrator.merge_queue as merge_queue
     import orchestrator.merge_shadow as merge_shadow
@@ -351,6 +358,11 @@ def test_merge_queue_reexports_identical_objects() -> None:
         '_run_cold_shadow_verify',
         '_run_shadow_compare',
         '_maybe_schedule_shadow_compare',
+        # PRD verify-retry-failed-only D2: born re-exported through the same
+        # shim (not part of the original EXPAND-then-shim move), guarded here
+        # so their re-export identity cannot silently regress.
+        'build_fail_fast_map',
+        'did_not_pass_subset',
     ]
 
     for name in moved_names:
@@ -360,3 +372,85 @@ def test_merge_queue_reexports_identical_objects() -> None:
             f'{name}: orchestrator.merge_queue.{name} and '
             f'orchestrator.merge_shadow.{name} must be the identical object'
         )
+
+
+# ---------------------------------------------------------------------------
+# {did-not-pass} retry-subset construction (PRD verify-retry-failed-only D2).
+#
+# The core user-observable signal of the failed-only merge-verify retry: under
+# nextest fail-fast a failing attempt-0 CANCELS the not-yet-started tests, which
+# are ABSENT from parse_per_test_results output.  The sound retry subset is
+# therefore {did-not-pass} = failed ∪ not-started ∪ inconclusive, NOT {failed}.
+# ---------------------------------------------------------------------------
+
+
+def test_did_not_pass_subset_includes_non_pass_verdicts() -> None:
+    """did_not_pass_subset selects every non-'pass' verdict, sorted.
+
+    The subset MUST include not-started (fail-fast-cancelled) and inconclusive
+    tests, not only the 'fail' entry — a failed-only filter would be unsound
+    under nextest fail-fast.
+    """
+    from orchestrator.merge_shadow import did_not_pass_subset
+
+    fail_fast_map = {
+        'crate a::x': 'pass',
+        'crate a::y': 'fail',
+        'crate a::z': 'not-started',
+        'crate a::w': 'inconclusive',
+    }
+    # sorted; failed ∪ not-started ∪ inconclusive — NOT just the 'fail' entry.
+    assert did_not_pass_subset(fail_fast_map) == [
+        'crate a::w',
+        'crate a::y',
+        'crate a::z',
+    ]
+
+
+def test_did_not_pass_subset_all_pass_is_empty() -> None:
+    """An all-'pass' fail-fast map yields the empty subset (nothing to retry)."""
+    from orchestrator.merge_shadow import did_not_pass_subset
+
+    assert did_not_pass_subset({'a::x': 'pass', 'a::y': 'pass'}) == []
+
+
+def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
+    """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
+
+    A test present in ``planned`` but absent from ``verdicts`` was cancelled by
+    nextest fail-fast and is annotated ``'not-started'`` — the crux of the
+    soundness core.  ``planned`` is authoritative: a verdict key not in
+    ``planned`` is ignored.
+    """
+    from orchestrator.merge_shadow import build_fail_fast_map
+
+    planned = ['crate a::x', 'crate a::y', 'crate a::z']
+    # As produced by parse_per_test_results on attempt-0 output: 'crate a::z'
+    # was cancelled by fail-fast and is ABSENT.  'crate a::stale' is a verdict
+    # for a test NOT in the plan and must be ignored.
+    verdicts = {
+        'crate a::x': 'pass',
+        'crate a::y': 'fail',
+        'crate a::stale': 'pass',
+    }
+    assert build_fail_fast_map(planned, verdicts) == {
+        'crate a::x': 'pass',
+        'crate a::y': 'fail',
+        'crate a::z': 'not-started',
+    }
+
+
+def test_build_fail_fast_map_then_subset_retains_not_started() -> None:
+    """End-to-end: the {did-not-pass} subset retains the fail-fast-cancelled test.
+
+    A raw failed-only view would drop 'crate a::z'; feeding the fail-fast map
+    through did_not_pass_subset keeps it (soundness).
+    """
+    from orchestrator.merge_shadow import build_fail_fast_map, did_not_pass_subset
+
+    planned = ['crate a::x', 'crate a::y', 'crate a::z']
+    verdicts = {'crate a::x': 'pass', 'crate a::y': 'fail'}
+    assert did_not_pass_subset(build_fail_fast_map(planned, verdicts)) == [
+        'crate a::y',
+        'crate a::z',
+    ]

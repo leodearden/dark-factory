@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import json
 import logging
 import math
 import os
@@ -120,6 +121,8 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     _save_shadow_compare_state,
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
+    build_fail_fast_map,
+    did_not_pass_subset,
     diff_per_test_results,
     parse_per_test_results,
 )
@@ -1579,6 +1582,232 @@ def _spawn_main_health_probe(
 _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 
 
+# ---------------------------------------------------------------------------
+# Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-only D2).
+#
+# When ``MergeRequest.retry_failed_only`` is set (D1, task 2833), this
+# orchestrator produces the retry contract that reify's verify.sh (α/β/γ)
+# consumes.  These REIFY_VERIFY_RETRY_* / REIFY_RUN_ALL_MEMBER_SUBSET /
+# REIFY_GUI_RETRY_SPECS env keys are BRAND NEW — this producer defines them:
+#
+#   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG    absolute path to a newline
+#   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE  file of EXACT {did-not-pass}
+#                                                   nextest ids for that cargo
+#                                                   profile (one id per line).
+#                                                   Files (not env values) because
+#                                                   a subset can be thousands of
+#                                                   ids — too large for an env.
+#   REIFY_RUN_ALL_MEMBER_SUBSET   comma-delimited {failed run_all members}.
+#   REIFY_GUI_RETRY_SPECS         comma-delimited {failed gui spec files}.
+#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID; reify
+#                                 corroborates it (belt-and-suspenders with the
+#                                 orchestrator's own tree-OID gate, INV-3).
+#   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
+#
+# The whole dict is merged into MergeVerifySpec.verify_env (the channel already
+# shipped to reify's remote runner AND threaded into local ModuleConfig.verify_env),
+# so no new transport is introduced.  The filter files are written into merge_wt,
+# the shared persistent merge-verify lane reify's verify.sh reads.
+# ---------------------------------------------------------------------------
+
+# Subdir under merge_wt holding the per-profile nextest filter files.
+_RETRY_FILTER_SUBDIR = '.reify-verify-retry'
+
+
+def _build_retry_verify_env(
+    *,
+    nextest_subset_debug: list[str],
+    nextest_subset_release: list[str],
+    run_all_members: list[str],
+    gui_specs: list[str],
+    tree_oid: str,
+    filter_dir: Path,
+) -> dict[str, str]:
+    """Write the per-profile nextest filter files and build the REIFY_* env dict.
+
+    Writes ``nextest-retry-debug.filter`` / ``nextest-retry-release.filter`` (one
+    exact test id per line, deterministic order preserved from the passed lists)
+    into ``filter_dir/.reify-verify-retry`` and returns the env dict documented
+    in the module comment above.  ``run_all_members`` and ``gui_specs`` ship as
+    comma-delimited env values; the nextest subsets ship as file paths.
+
+    Args:
+        nextest_subset_debug: {did-not-pass} nextest ids for the debug profile.
+        nextest_subset_release: {did-not-pass} nextest ids for the release profile.
+        run_all_members: {failed} run_all member ids (pass-through, not transformed).
+        gui_specs: {failed} gui spec files (pass-through, not transformed).
+        tree_oid: attempt-0-pinned content-tree OID (REIFY_VERIFY_RETRY_TREE_OID).
+        filter_dir: directory the filter files are written under (the merge_wt).
+
+    Returns:
+        The REIFY_VERIFY_RETRY_* env dict to merge into MergeVerifySpec.verify_env.
+    """
+    retry_dir = Path(filter_dir) / _RETRY_FILTER_SUBDIR
+    retry_dir.mkdir(parents=True, exist_ok=True)
+
+    debug_file = retry_dir / 'nextest-retry-debug.filter'
+    release_file = retry_dir / 'nextest-retry-release.filter'
+    debug_file.write_text('\n'.join(nextest_subset_debug))
+    release_file.write_text('\n'.join(nextest_subset_release))
+
+    return {
+        'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+        'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+        'REIFY_RUN_ALL_MEMBER_SUBSET': ','.join(run_all_members),
+        'REIFY_GUI_RETRY_SPECS': ','.join(gui_specs),
+        'REIFY_VERIFY_RETRY_TREE_OID': tree_oid,
+        'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class _Attempt0Payload:
+    """Injected attempt-0 result the failed-only retry is constructed from.
+
+    Read at the ``_run_post_merge_verify`` wiring boundary from the reify-written
+    attempt-0 sidecar under ``merge_wt`` (the sidecar SCHEMA is owned by the
+    cross-project reify α/β/γ tasks; the DF reader degrades tolerantly when it is
+    absent/malformed — the whole retry path stays a no-op until reify lands).
+    Passing it as an explicit parameter keeps the subset/env/gate logic pure and
+    fully unit-testable with fixtures, independent of the sidecar.
+
+    Fields:
+        tree_oid: attempt-0-pinned content-tree OID (``git rev-parse HEAD^{tree}``)
+            the retry is corroborated against (INV-3).
+        debug_planned / debug_verdicts: the debug-profile nextest plan/list
+            (authoritative full set) and the parsed attempt-0 verdicts
+            (RUN tests only) — combined via :func:`build_fail_fast_map`.
+        release_planned / release_verdicts: same, for the release profile.
+        run_all_members: {failed} run_all member ids (pass-through).
+        gui_specs: {failed} gui spec files (pass-through).
+    """
+
+    tree_oid: str
+    debug_planned: list[str]
+    debug_verdicts: dict[str, str]
+    release_planned: list[str]
+    release_verdicts: dict[str, str]
+    run_all_members: list[str]
+    gui_specs: list[str]
+
+
+async def _assemble_retry_verify_env(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_wt: Path,
+    attempt0: _Attempt0Payload,
+) -> dict[str, str] | None:
+    """INV-3 tree-OID corroboration gate → the retry env, or None for full verify.
+
+    Corroborates the CURRENT merge-tree OID (``git_ops.get_head_tree_hash``)
+    against the attempt-0-pinned OID before trusting the cached did-not-pass set.
+    A rebased tree (mismatch) or an unreadable OID (None) fails safe: log a
+    WARNING and return None so the caller leaves the spec untouched and the
+    existing ``_reverify_rebased_tree`` (M4) route runs a FULL re-verify.
+
+    On a match, builds the per-profile {did-not-pass} nextest subsets via
+    :func:`build_fail_fast_map` → :func:`did_not_pass_subset`, passes the failed
+    run_all members / gui specs through unchanged, and delegates to
+    :func:`_build_retry_verify_env` to write the filter files and env dict.
+
+    Args:
+        git_ops: GitOps for the current-tree-OID probe.
+        req: the merge request (for ``task_id`` in log lines).
+        merge_wt: the merge worktree — both the tree-OID probe target and the
+            filter-file directory.
+        attempt0: the injected attempt-0 payload.
+
+    Returns:
+        The REIFY_VERIFY_RETRY_* env dict on a corroborated tree, else None.
+    """
+    current = await git_ops.get_head_tree_hash(merge_wt)
+    if current is None or current != attempt0.tree_oid:
+        logger.warning(
+            'Task %s: retry tree OID %r does not match attempt-0 %r '
+            '(rebased or unknown tree) — falling back to full verify '
+            '(M4 _reverify_rebased_tree route)',
+            req.task_id, current, attempt0.tree_oid,
+        )
+        return None
+
+    debug_subset = did_not_pass_subset(
+        build_fail_fast_map(attempt0.debug_planned, attempt0.debug_verdicts)
+    )
+    release_subset = did_not_pass_subset(
+        build_fail_fast_map(attempt0.release_planned, attempt0.release_verdicts)
+    )
+    return _build_retry_verify_env(
+        nextest_subset_debug=debug_subset,
+        nextest_subset_release=release_subset,
+        run_all_members=list(attempt0.run_all_members),
+        gui_specs=list(attempt0.gui_specs),
+        tree_oid=current,
+        filter_dir=merge_wt,
+    )
+
+
+# reify writes the attempt-0 sidecar here (under the same .reify-verify-retry
+# subdir the filter files land in).  reify owns the authoritative schema (the
+# verify-retry-failed-only α/β/γ tasks); this DF reader is deliberately tolerant
+# and the whole retry path stays a no-op until reify lands and writes one.
+_ATTEMPT0_SIDECAR_NAME = 'attempt0.json'
+
+
+def _load_attempt0_sidecar(merge_wt: Path) -> _Attempt0Payload | None:
+    """Tolerantly load the reify-written attempt-0 sidecar under ``merge_wt``.
+
+    Returns the parsed :class:`_Attempt0Payload`, or None (leaving the caller to
+    run a full verify) when the sidecar is absent, unreadable, malformed, or
+    missing the required ``tree_oid`` — never raises.  This tolerant degradation
+    is what keeps the failed-only retry a strict no-op until reify's α/β/γ land.
+
+    Expected JSON shape (reify-owned, read defensively)::
+
+        {"tree_oid": "<oid>",
+         "debug":   {"planned": [...], "verdicts": {...}},
+         "release": {"planned": [...], "verdicts": {...}},
+         "run_all_members": [...],
+         "gui_specs": [...]}
+    """
+    path = Path(merge_wt) / _RETRY_FILTER_SUBDIR / _ATTEMPT0_SIDECAR_NAME
+    try:
+        raw = path.read_text()
+    except OSError:
+        # Absent sidecar is the common (pre-reify) case — no warning, just no-op.
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            'attempt-0 sidecar at %s is not valid JSON (%s) — full verify', path, exc,
+        )
+        return None
+    if not isinstance(data, dict) or 'tree_oid' not in data:
+        logger.warning(
+            'attempt-0 sidecar at %s missing tree_oid / not an object — full verify',
+            path,
+        )
+        return None
+    try:
+        debug = data.get('debug') or {}
+        release = data.get('release') or {}
+        return _Attempt0Payload(
+            tree_oid=str(data['tree_oid']),
+            debug_planned=list(debug.get('planned') or []),
+            debug_verdicts=dict(debug.get('verdicts') or {}),
+            release_planned=list(release.get('planned') or []),
+            release_verdicts=dict(release.get('verdicts') or {}),
+            run_all_members=list(data.get('run_all_members') or []),
+            gui_specs=list(data.get('gui_specs') or []),
+        )
+    except (TypeError, ValueError, AttributeError) as exc:
+        logger.warning(
+            'attempt-0 sidecar at %s has malformed fields (%s) — full verify',
+            path, exc,
+        )
+        return None
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1716,6 +1945,28 @@ async def _run_post_merge_verify(
             task_files_tuple = tuple(derived)
 
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+
+    # Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-only D2).
+    # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off / legacy
+    # path is byte-identical (D1's strict no-op guarantee preserved).  Reads the
+    # reify-written attempt-0 sidecar tolerantly (missing/malformed → None → leave
+    # spec untouched), corroborates the merge tree OID (INV-3), and on success
+    # MERGES the REIFY_VERIFY_RETRY_* env into spec.verify_env via
+    # dataclasses.replace.  A rebased/unknown tree returns None from
+    # _assemble_retry_verify_env → full verify via the existing
+    # _reverify_rebased_tree (M4) route.  NOTE (task 2822): injecting into `spec`
+    # here means the merged verify_env flows into BOTH the primary pool.dispatch
+    # below AND task 2822's post-dispatch remote-green cross-check re-verify (which
+    # reuses this same `spec`) — correct and desired: a failed-only retry's local
+    # trust-anchor cross-check should scope to the same {did-not-pass} subset.
+    if req.retry_failed_only:
+        attempt0 = _load_attempt0_sidecar(merge_wt)
+        if attempt0 is not None:
+            retry_env = await _assemble_retry_verify_env(git_ops, req, merge_wt, attempt0)
+            if retry_env is not None:
+                spec = dataclasses.replace(
+                    spec, verify_env={**spec.verify_env, **retry_env}
+                )
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
