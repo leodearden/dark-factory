@@ -17,7 +17,10 @@ from unittest.mock import MagicMock
 from _orch_helpers import pydantic_spec
 
 from orchestrator.agents.roles import (
+    _FOLLOWUP_FILING_INSTRUCTIONS,
+    ARCHITECT,
     DEEP_REVIEWER,
+    IMPLEMENTER,
     STEWARD,
     submit_only_instructions,
     submit_resolve_instructions,
@@ -115,6 +118,85 @@ class TestAllowlists:
 
     def test_deep_reviewer_does_not_have_add_task(self):
         assert 'mcp__fused-memory__add_task' not in DEEP_REVIEWER.allowed_tools
+
+
+# ---------------------------------------------------------------------------
+# Task 2640 — Source 1: architect/implementer follow-up filing at the source
+# ---------------------------------------------------------------------------
+
+
+class TestFollowupFilingAllowlist:
+    """ARCHITECT and IMPLEMENTER must be able to file follow-up task candidates.
+
+    Both roles gain ``mcp__fused-memory__submit_task`` so an agent that
+    discovers follow-up work OUTSIDE its task scope can file it at the source
+    (fire-and-forget) instead of relying on the lossy orphan-reaper backstop.
+    Both already declare the ``orchestrator`` MCP family, so this is a pure
+    allowlist widening — no ``mcp_families`` change.
+    """
+
+    def test_architect_has_submit_task(self):
+        assert 'mcp__fused-memory__submit_task' in ARCHITECT.allowed_tools
+
+    def test_implementer_has_submit_task(self):
+        assert 'mcp__fused-memory__submit_task' in IMPLEMENTER.allowed_tools
+
+
+class TestFollowupFilingPrompts:
+    """ARCHITECT/IMPLEMENTER prompts must direct fire-and-forget follow-up filing.
+
+    Both prompts gain the follow-up-filing block — the single module-level
+    constant ``_FOLLOWUP_FILING_INSTRUCTIONS`` (rendered via
+    ``submit_only_instructions``) telling the agent to file work discovered
+    OUTSIDE its task scope as a low-priority ``submit_task`` candidate, and to
+    fire-and-forget (never wait on ``resolve_ticket``) — mirroring the
+    steward/deep_reviewer contract asserted in ``TestSiteWiringMinimal``.
+
+    The block is asserted by exact constant membership rather than scattered
+    per-token substrings: it is refactor-proof (a benign prose reword of the
+    constant cannot break the wiring contract, only a failed/dropped append
+    can), and the constant already carries ``submit_task`` + the
+    ``Do NOT call `resolve_ticket``` guard.  A whole-prompt negative check
+    additionally guards that no positive ``resolve_ticket`` directive leaks in
+    from elsewhere.
+    """
+
+    def test_architect_prompt_has_followup_filing_block(self):
+        assert _FOLLOWUP_FILING_INSTRUCTIONS in ARCHITECT.system_prompt
+
+    def test_implementer_prompt_has_followup_filing_block(self):
+        assert _FOLLOWUP_FILING_INSTRUCTIONS in IMPLEMENTER.system_prompt
+
+    def test_architect_followup_is_fire_and_forget(self):
+        # Whole-prompt negative contract: no positive resolve_ticket directive
+        # anywhere.  The "Do NOT call `resolve_ticket`" guard lives inside the
+        # constant asserted by test_architect_prompt_has_followup_filing_block.
+        assert 'Call `resolve_ticket`' not in ARCHITECT.system_prompt
+
+    def test_implementer_followup_is_fire_and_forget(self):
+        assert 'Call `resolve_ticket`' not in IMPLEMENTER.system_prompt
+
+
+class TestStewardSweepUp:
+    """STEWARD prompt must carry the workflow-end info-note sweep-up (Source 3).
+
+    Before exit the steward enumerates its own still-open info-notes via
+    ``get_pending_escalations``, files each work-describing one as a task
+    candidate (``submit_task``), and closes it via ``resolve_issue``.  Anchored
+    on the distinctive section tokens, plus the filing/closing tool names.
+    """
+
+    def test_steward_prompt_has_workflow_end_sweepup_section(self):
+        p = STEWARD.system_prompt
+        assert 'Workflow-end sweep-up' in p
+        assert 'info-note' in p
+
+    def test_steward_sweepup_enumerates_and_files_and_closes(self):
+        p = STEWARD.system_prompt
+        # Enumerate own open notes, file candidates, close the swept note.
+        assert 'get_pending_escalations' in p
+        assert 'submit_task' in p
+        assert 'resolve_issue' in p
 
 
 # ---------------------------------------------------------------------------

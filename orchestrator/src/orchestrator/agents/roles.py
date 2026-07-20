@@ -398,7 +398,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -471,7 +471,7 @@ expansion rather than trying to work around the restriction.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -970,6 +970,52 @@ def submit_only_instructions(
     return textwrap.indent(raw, caller_indent)
 
 
+# Task 2640 — Source 1: file follow-up work discovered OUTSIDE the current task's
+# scope as a task candidate AT THE SOURCE (fire-and-forget submit_task), instead
+# of relying on the lossy orphan-reaper → auto-watcher backstop (18% conversion
+# on cleanup_needed/design_concern).  Rendered via submit_only_instructions so it
+# stays consistent with the steward / deep_reviewer fire-and-forget filing sites
+# (NO resolve_ticket wait — a budget/turn-capped architect or implementer must
+# never block on the curator).  Defined HERE, after submit_only_instructions, and
+# appended to ARCHITECT / IMPLEMENTER below via `+=`, because both roles are
+# declared earlier in the module than this helper (Python definition order); the
+# `+=` is the same additive composition as the `+ _ESCALATION_INSTRUCTIONS`
+# chain in each role literal, just applied post-construction.  ROLES (built far
+# below) references the same objects, so the append is visible through it too.
+_FOLLOWUP_FILING_INSTRUCTIONS = """
+## Filing follow-up work
+
+While working you may notice follow-up work discovered OUTSIDE the scope of your
+assigned task — a latent bug in an adjacent module, missing test coverage, a
+cleanup/refactor you should not do here. Do NOT silently drop it, and do NOT do
+it inline (that expands your scope). File it at the source as a low-priority task
+candidate so it is captured deterministically instead of left for a downstream
+reaper to maybe recover:
+""" + submit_only_instructions(
+    '{"source": "agent-followup", "spawn_context": "agent_followup",\n'
+    '"spawned_from": "<this task id>", "files": ["path/to/file-or-dir", ...],\n'
+    '"escalation_id": "agent-followup-<this task id>",\n'
+    '"suggestion_hash": "<stable hash of the follow-up>"}',
+    outcome_target='iteration log',
+    step_label='1',
+    extra_submit_guidance=(
+        "Only file work that is OUTSIDE this task's scope — never in-scope plan\n"
+        "steps you can just do. Use priority `low` unless the work is clearly more\n"
+        "urgent. The `description` must stand alone WITHOUT your session context:\n"
+        "name this task's id, the escalation id if one exists, the concrete file\n"
+        "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
+        "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
+        "A pure observation with no work item goes to `escalate_info` instead; when\n"
+        "something is BOTH an observation and a work item, do both. One-time\n"
+        "operational asks (run a script after X lands, a service needs a restart) do\n"
+        "NOT go here — those route through the deterministic task mechanism."
+    ),
+)
+
+ARCHITECT.system_prompt = ARCHITECT.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
+IMPLEMENTER.system_prompt = IMPLEMENTER.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
@@ -1185,6 +1231,33 @@ for this kind too (post-3092 phantom-done hardening, 2026-05-09).
 - Never mark `done` because the orchestrator looks stuck or a verify phase
   failed in confusing ways. If neither of the two paths above applies,
   re-escalate to L1 instead.
+
+## Workflow-end sweep-up
+
+Before exit — once you have handled every blocking escalation and review-
+suggestion batch for this workflow — do a final sweep-up so follow-up work is
+never stranded in an open info-note. Call `get_pending_escalations` and, for
+each of YOUR OWN still-open info-notes (non-blocking observations filed via
+`escalate_info`) that DESCRIBES follow-up WORK rather than a pure observation,
+convert it into a task candidate and then close it:
+""" + submit_only_instructions(
+    '{"source": "steward-sweepup", "spawn_context": "steward-sweepup",\n'
+    '"spawned_from": "<originating task id>", "files": [...],\n'
+    '"escalation_id": "<the info-note id>", "suggestion_hash": "<stable hash of the note>"}',
+    outcome_target='resolve_issue summary',
+    step_label='a',
+    extra_submit_guidance=(
+        'Use the file paths named in the info-note for `files`, and the originating\n'
+        'task id (in the note detail) for `spawned_from`. `escalation_id` (the\n'
+        'info-note id) and `suggestion_hash` (the R4 idempotency keys) MUST be\n'
+        'present so a re-swept note dedupes instead of double-filing.'
+    ),
+    caller_indent='   ',
+) + """
+   b. Then close the swept info-note via `resolve_issue`, citing the submitted
+      ticket id (or the created/combined task id) so the same note is not swept
+      again on a later session. An info-note that describes NO actionable work
+      is left as-is — only work-describing notes become candidates.
 """ + _ESCALATION_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
