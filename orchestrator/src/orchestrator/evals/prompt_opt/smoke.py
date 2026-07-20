@@ -26,9 +26,16 @@ held-out TEST verdict via the REAL engine is only achievable with >=10 items.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from typing import Any
 
-__all__ = ['FixtureItem', 'build_fixture_corpus']
+__all__ = ['FixtureItem', 'SmokeReviewerScorer', 'build_fixture_corpus']
+
+# Hermetic labels for the two models the loop threads through (never real API
+# ids that would bill): the reviewer executor and the frontier optimizer.
+_SMOKE_EXECUTOR_MODEL = 'opus'
+_SMOKE_OPTIMIZER_MODEL = 'frontier-opt'
 
 
 # ---------------------------------------------------------------------------
@@ -126,3 +133,101 @@ def build_fixture_corpus(*, replicas: int = 4) -> list[FixtureItem]:
                 )
             )
     return items
+
+
+# ---------------------------------------------------------------------------
+# Hermetic seams: the executor-model-asserting rollout_fn and the
+# verdict-vs-gold Scorer. Both are deterministic and touch no invoke_agent /
+# DB / network. They mirror test_prompt_opt_engine.py's PROVEN fixture shape
+# (a quality mark + a +-0.03 occurrence-keyed jitter cycle) so the acceptance
+# arithmetic (baseline 0.50 -> candidate 0.70, band ~0.06, delta ~0.20 > band
+# -> accepted) is grounded in an already-passing test, not a guessed threshold.
+# ---------------------------------------------------------------------------
+
+# The optimizer emits an improved heuristics block carrying this sentinel; the
+# rollout/scorer parse it out of the composed prompt. Default 0.50 when absent,
+# so the REAL reviewer baseline (which has no sentinel) reads as baseline quality.
+_SMOKE_QUALITY_RE = re.compile(r'SMOKE_QUALITY=([0-9.]+)')
+_DEFAULT_QUALITY = 0.50
+# +-0.03 jitter cycle (D-5: the reviewer scorer is a noisy matcher) — bounded,
+# deterministic, and cyclic so a positive repeatability band is measured.
+_JITTER_CYCLE = (0.03, -0.03)
+# Scale applied when the reviewer's REPORTED verdict disagrees with gold —
+# strictly < 1 so agreement always scores strictly higher at equal quality.
+_DISAGREEMENT_SCALE = 0.5
+# Parses the reviewer's reported gold token out of a rollout string emitted by
+# _smoke_rollout_fn ("...::gold=<verdict>/<severity>::<composed_prompt>").
+_ROLLOUT_GOLD_RE = re.compile(r'::gold=(.*?)::')
+
+
+def _quality_of(text: str, default: float = _DEFAULT_QUALITY) -> float:
+    """The SMOKE_QUALITY sentinel embedded in *text*, or *default* when absent."""
+    match = _SMOKE_QUALITY_RE.search(text)
+    if match is None:
+        return default
+    return float(match.group(1))
+
+
+def _clamp_unit(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+async def _smoke_rollout_fn(composed_prompt: str, item: Any, model: str) -> str:
+    """The hermetic RolloutFn: always executor_model, echoes (item gold, composed).
+
+    Standing in for a real executor call, the 'rollout' deterministically
+    encodes the item's gold verdict (what a perfect reviewer would report) and
+    the composed prompt (which carries the heuristics SMOKE_QUALITY) — enough
+    for :class:`SmokeReviewerScorer` to recover both the agreement signal and a
+    stable per-(item, heuristics) occurrence key. Never touches invoke_agent.
+
+    Asserts ``model == _SMOKE_EXECUTOR_MODEL`` so every acceptance decision is
+    structurally guaranteed to be scored on the ACTUAL executor model, never
+    the optimizer (the engine always calls this with ``executor_model``).
+    """
+    assert model == _SMOKE_EXECUTOR_MODEL, (
+        f'_smoke_rollout_fn must ALWAYS be called with the executor model '
+        f'{_SMOKE_EXECUTOR_MODEL!r}, got {model!r}'
+    )
+    return (
+        f'rollout::{item.item_id}::gold={item.gold_verdict}/{item.gold_severity}'
+        f'::{composed_prompt}'
+    )
+
+
+class SmokeReviewerScorer:
+    """Deterministic Scorer: verdict-vs-gold agreement scaled by SMOKE_QUALITY
+    plus a bounded occurrence-keyed jitter cycle (implements the Scorer Protocol).
+
+    ``score(item, rollout)`` grades the executor OUTPUT the way the real
+    reviewer scorer will — did the reviewer's REPORTED verdict (parsed from the
+    rollout) match the item's TRUE gold? — scaled by the heuristics quality
+    mark, then perturbed by a small reproducible jitter so repeated scoring of
+    identical inputs disagrees by a bounded, positive amount (a positive
+    repeatability band). Every distinct rollout string gets its own occurrence
+    counter, so repeat N of that exact pair always draws the same jitter —
+    fully deterministic, no real randomness (mirrors _FakeScorer).
+    """
+
+    def __init__(self) -> None:
+        self._occurrence_counts: dict[str, int] = {}
+
+    async def score(self, item: Any, rollout: Any) -> float:
+        rollout_text = str(rollout)
+        # heuristics quality (0.50 default when the sentinel is absent)
+        quality = _quality_of(rollout_text)
+        # the reviewer's REPORTED verdict vs the item's TRUE gold
+        reported = self._reported_gold(rollout_text)
+        truth = f'{item.gold_verdict}/{item.gold_severity}'
+        agreement_scale = 1.0 if reported == truth else _DISAGREEMENT_SCALE
+        base = quality * agreement_scale
+        # bounded, reproducible per-(item, heuristics) jitter cycle
+        count = self._occurrence_counts.get(rollout_text, 0)
+        self._occurrence_counts[rollout_text] = count + 1
+        jitter = _JITTER_CYCLE[count % len(_JITTER_CYCLE)]
+        return _clamp_unit(base + jitter)
+
+    @staticmethod
+    def _reported_gold(rollout_text: str) -> str | None:
+        match = _ROLLOUT_GOLD_RE.search(rollout_text)
+        return match.group(1) if match is not None else None
