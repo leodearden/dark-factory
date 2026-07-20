@@ -7090,11 +7090,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            churn for a host that recovers in the same cycle it would have tripped
            the time-based threshold.
 
-        **Correctness invariant**: hosts quarantined by :class:`DriftDetector`
-        for verdict divergence are intentionally skipped — they are in the
-        allocator quarantine but absent from ``self._runner_unavailable``.
-        Clearing them on mere SSH reachability would bypass the drift parity
-        gate (Invariant 5).
+        **Correctness invariant**: hosts quarantined for verdict divergence —
+        by :class:`DriftDetector`'s sampled parity check OR by the land-time
+        per-land cross-check in :func:`_run_post_merge_verify` (task 2822 fix
+        b, which adds ``runner.name`` to the same worker-owned
+        ``_runner_quarantine`` set) — are intentionally skipped: they are in
+        the allocator quarantine but absent from ``self._runner_unavailable``.
+        Clearing either on mere SSH reachability would bypass the verdict
+        parity gate (Invariant 5); both stay quarantined until an operator
+        re-proves the host and clears it explicitly.
 
         Per-host exceptions are caught so one host's failure cannot abort the
         sweep for the remaining hosts.
