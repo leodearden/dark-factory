@@ -14,11 +14,15 @@ byte-level contract prefix, CLI exit codes) — never on docstrings/prose.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+from click.testing import CliRunner
 from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
 
 from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
 from orchestrator.evals.prompt_opt import measure_repeatability_band, split_corpus
+from orchestrator.evals.prompt_opt.__main__ import cli
 from orchestrator.evals.prompt_opt.smoke import (
     _SMOKE_EXECUTOR_MODEL,
     _SMOKE_OPTIMIZER_MODEL,
@@ -308,3 +312,43 @@ class TestContractImmutabilityEndToEnd:
 
         # (c) the REAL reviewer identity literal still occurs in the contract prefix
         assert 'reviewer_comprehensive' in contract_prefix
+
+
+class TestSmokeCli:
+    """The operator-facing `smoke` subcommand — the runnable acceptance gate.
+
+    Fully hermetic: no real LLM, no runs.db/tickets.db, no network. It runs
+    the whole stack into an ISOLATED artifacts root and exits 0, printing the
+    held-out TEST verdict, the provenance sidecar fields, and the
+    CONTRACT-untouched proof (mirrors the reviewer_trial __main__ CliRunner
+    convention)."""
+
+    def test_smoke_command_passes_and_reports_the_gate(self, tmp_path: Path) -> None:
+        artifacts_root = tmp_path / 'artifacts'
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ['smoke', '--artifacts-root', str(artifacts_root), '--split-seed', '2498'],
+        )
+
+        # exit 0: the fully hermetic gate ran to completion and the CONTRACT
+        # stayed byte-identical (no real LLM/DB/network was ever touched).
+        assert result.exit_code == 0, (
+            f'Command exited with code {result.exit_code}.\nOutput:\n{result.output}'
+            + (f'\nException: {result.exception}' if result.exception else '')
+        )
+
+        # (a) held-out TEST verdict present (a test_score line)
+        assert 'held_out_TEST_score' in result.output
+
+        # (b) provenance sidecar fields: harness_version (reviewer-v1) + optimizer_model
+        assert _REVIEWER_PROMPT_HARNESS_VERSION in result.output
+        assert _SMOKE_OPTIMIZER_MODEL in result.output
+
+        # (c) an explicit 'CONTRACT untouched' / prefix-intact proof line
+        assert 'CONTRACT untouched' in result.output
+
+        # the CLI actually threaded --artifacts-root through to store_root and
+        # pinned the smoke artifact THERE (proving isolation from the real
+        # data/prompt_artifacts root — the gate never writes production state).
+        assert artifacts_root.exists()
