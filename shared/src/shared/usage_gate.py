@@ -821,6 +821,45 @@ class UsageGate:
             if refreshed:
                 continue  # re-check accounts with updated flags
 
+            if scope is not None:
+                # Scope-aware no-freeze fall-through (task γ, S3/S6). The select
+                # loop found no account with headroom for THIS scope, and the
+                # account-level reset check above freed none. Clear the per-scope
+                # waiter BEFORE re-checking (clear-before-check) so a concurrent
+                # uncap's set() cannot be lost, then optimistically uncap expired
+                # scope caps; if that frees one, re-select — this is what returns
+                # the optimistically-uncapped account in ONE call (B5-return).
+                evt = self._scope_waiter(scope)
+                evt.clear()
+                if self._refresh_scope_capped(scope):
+                    continue
+                if not self.is_paused:
+                    # Fleet is NOT frozen — at least one account is generally
+                    # serviceable, only this scope is exhausted. Park on the
+                    # per-scope waiter toward the soonest scope reset (or the
+                    # max-probe ceiling when unknown) WITHOUT ever touching _open
+                    # or _paused_reason, so scope exhaustion can never freeze the
+                    # fleet (S3) nor delay a concurrent scope=None caller. On
+                    # timeout the loop re-runs the selection-time sweep. INV-4:
+                    # this always eventually returns an account rather than
+                    # blocking indefinitely, so the caller's slot.report(CapHit)
+                    # re-detection advances consecutive_cap_hits and the existing
+                    # max_cap_retries/AllAccountsCappedException bound applies; the
+                    # reactive re-cap installs a FUTURE deadline so uncaps are
+                    # spaced, not a tight spin.
+                    soonest = self._soonest_scope_reset(scope)
+                    sleep_for = (
+                        max(0.0, (soonest - datetime.now(UTC)).total_seconds())
+                        if soonest is not None
+                        else float(self._config.max_probe_interval_secs)
+                    )
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(evt.wait(), timeout=sleep_for)
+                    continue
+                # else: self.is_paused → the fleet is genuinely frozen (every
+                # account account-level capped/auth_failed). Fall through to the
+                # legacy _open freeze path below — nothing is serviceable.
+
             # Still all capped after fresh check — wait on global gate.
             # NOTE: this clear() is NOT redundant with _transition's centralized
             # recompute, despite _transition being the sole writer of every
