@@ -1694,6 +1694,16 @@ class Harness:
             # fail-soft, so a reaper fault can never break startup.
             await self._run_interactive_worktree_reaper_pass()
 
+            # 1c1h. Unconditional leftover verify-scope (df-verify-{tag}-*.scope)
+            # crash-safety sweep (task 2829; companion to reify enabling
+            # verify_use_cgroup_scope). A crash/SIGKILL can strand a transient
+            # verify scope whose cgroup subtree keeps running; this reaps ONLY
+            # this project's tag-scoped leftovers. Placed beside the interactive
+            # reaper so it inherits the same ordering guarantee — it runs before
+            # scheduler.finish_startup() and the first acquire_next, i.e. before
+            # first dispatch, on every boot. The pass is itself fail-soft.
+            await self._run_leftover_verify_scope_reaper_pass()
+
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
                 hours, rem = divmod(delay_secs, 3600)
@@ -5656,6 +5666,58 @@ task, include it with an empty "files" list rather than omitting it.
         except Exception as exc:
             logger.error(
                 'Interactive-worktree reaper pass failed: %s: %s',
+                type(exc).__name__,
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Leftover verify-scope (df-verify-{tag}-*.scope) crash-safety reaper —
+    # task 2829 (companion to reify enabling verify_use_cgroup_scope)
+    # ------------------------------------------------------------------
+
+    async def _run_leftover_verify_scope_reaper_pass(self) -> None:
+        """Sweep THIS project's leftover ``df-verify-{tag}-*.scope`` verify
+        scopes once at startup (crash recovery).
+
+        Companion to reify flipping ``verify_use_cgroup_scope: true``: a
+        crash/SIGKILL of a prior incarnation can strand a transient verify
+        scope whose cgroup subtree (bash → cargo → rustc) keeps running.
+        Delegates unconditionally to the fail-soft
+        ``verify.reap_leftover_verify_scopes(project_root)``, which enumerates
+        ONLY this project's TAG-SCOPED scopes (cross-project safety in the
+        shared per-user ``systemctl --user`` session) and reaps each via
+        ``_kill_cgroup_scope``.
+
+        Logs one INFO line naming each reaped unit plus a summary INFO line
+        with the count when at least one was reaped; logs at DEBUG when none,
+        to avoid boot-log noise. Wrapped in a belt-and-suspenders try/except
+        logging a bounded ``logger.error`` (NOT ``logger.exception``, matching
+        the interactive reaper's bounded-log rationale) so a systemd/reaper
+        fault can never break the startup sequence that calls this directly.
+
+        Called once unconditionally at ``run()`` startup, adjacent to the
+        interactive-worktree reaper, before the first dispatch.
+        """
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+
+        try:
+            reaped = await verify_mod.reap_leftover_verify_scopes(
+                self.config.project_root,
+            )
+            for unit in reaped:
+                logger.info('Reaped leftover verify scope: %s', unit)
+            if reaped:
+                logger.info(
+                    'Verify-scope reaper: reaped %d leftover df-verify '
+                    'scope(s): %s',
+                    len(reaped),
+                    ', '.join(reaped),
+                )
+            else:
+                logger.debug('Verify-scope reaper: no leftover scopes reaped')
+        except Exception as exc:
+            logger.error(
+                'Verify-scope reaper pass failed: %s: %s',
                 type(exc).__name__,
                 exc,
             )
