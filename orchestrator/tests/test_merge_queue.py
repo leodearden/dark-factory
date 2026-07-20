@@ -14491,6 +14491,53 @@ class TestRunPostMergeVerify:
             f'not the transient-infra hold: {result.reason!r}'
         )
 
+    async def test_flag_on_without_narrowing_keeps_legacy_enospc_budget(self) -> None:
+        """(task 2835 step-7) RED — locks the "strict no-op until reify
+
+        lands" invariant: the larger narrowed budget is gated on ACTUAL
+        narrowing (the D2 producer applying retry_env), not on the raw
+        req.retry_failed_only flag. With the flag on but NO sidecar written
+        (the real tolerant _load_attempt0_sidecar returns None against a
+        bare MagicMock merge_wt), narrowed stays False and the retry must
+        still use the small legacy enospc_retries/max_enospc budget even
+        though a generous max_narrowed=5 is supplied.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.retry_failed_only = True
+        merge_wt = MagicMock()
+
+        infra_result = _infra_category_verify_result('semaphore_timeout')
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=infra_result),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=(er := {}),
+                max_timeouts=2, max_enospc=1,
+                max_narrowed=5, narrowed_retries=(nr := {}),
+            )
+
+        assert result is not None
+        assert mock_verify.call_count == 2, (
+            f'expected only the legacy single ENOSPC-budget retry (2 total calls), '
+            f'NOT 6 from max_narrowed=5, got {mock_verify.call_count} calls'
+        )
+        assert er.get(req.task_id) == 1, (
+            f'expected the legacy enospc_retries counter used, got: {er}'
+        )
+        assert nr == {}, f'narrowed counter must stay untouched: {nr}'
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected the persistent transient-infra hold, got: {result.reason!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
