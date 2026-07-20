@@ -350,6 +350,97 @@ async def test_run_post_merge_verify_flag_on_no_sidecar_is_byte_identical(
 
 
 # ---------------------------------------------------------------------------
+# shadow_baseline_sink out-param (PRD verify-retry-failed-only D4, §5.4): on the
+# corroborated-narrowed path _run_post_merge_verify copies the attempt-0
+# debug ∪ release verdict map into a caller-supplied sink dict, so
+# _run_inflight_verify can union it with the PARTIAL narrowed warm output before
+# storing the warm shadow baseline (else the full cold shadow compare flags every
+# attempt-0-passed test as only_cold → phantom born-at-L2 divergence).  Populated
+# ONLY when the narrow actually applied (assemble → non-None); left untouched on
+# every non-narrowed path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_post_merge_verify_populates_shadow_baseline_sink_when_narrowed(
+    tmp_path: Path,
+) -> None:
+    """Narrowed retry → attempt-0 debug∪release verdicts land in shadow_baseline_sink."""
+    from orchestrator import merge_queue as mq
+
+    config = OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='main'))
+    req = dataclasses.replace(
+        _make_request('r-sink-on', 'task/r-sink-on', tmp_path, config),
+        retry_failed_only=True,
+    )
+    git_ops = _make_git_ops_mock()
+    # debug.verdicts={'c a::x':'pass'}, release.verdicts={} → sink == {'c a::x':'pass'}.
+    _write_attempt0_sidecar(tmp_path)
+
+    retry_env = {'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}
+    sink: dict[str, str] = {}
+
+    async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
+        return _mock_verify_result(True)
+
+    with patch.object(mq, '_ensure_verify_disk_space', new=AsyncMock(return_value=None)), \
+         patch.object(mq.VerifyRunnerPool, 'dispatch', new=AsyncMock(side_effect=_fake_dispatch)), \
+         patch.object(
+             mq, '_assemble_retry_verify_env', new=AsyncMock(return_value=retry_env)
+         ):
+        outcome = await mq._run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123', runner=None,
+            shadow_baseline_sink=sink,
+        )
+
+    assert outcome is None
+    assert sink == {'c a::x': 'pass'}
+
+
+@pytest.mark.asyncio
+async def test_run_post_merge_verify_leaves_sink_empty_when_not_narrowed(
+    tmp_path: Path,
+) -> None:
+    """assemble → None (uncorroborated/rebased tree) → sink stays EMPTY.
+
+    The sink is the narrowed-decision's mirror: a full re-verify (assemble
+    returned None so ``narrowed`` stays False) must NOT seed a stale attempt-0
+    baseline, which would ADD phantom tests → false only_warm divergence.
+    """
+    from orchestrator import merge_queue as mq
+
+    config = OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='main'))
+    req = dataclasses.replace(
+        _make_request('r-sink-off', 'task/r-sink-off', tmp_path, config),
+        retry_failed_only=True,
+    )
+    git_ops = _make_git_ops_mock()
+    _write_attempt0_sidecar(tmp_path)  # sidecar present, but assemble → None below.
+
+    sink: dict[str, str] = {}
+
+    async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
+        return _mock_verify_result(True)
+
+    with patch.object(mq, '_ensure_verify_disk_space', new=AsyncMock(return_value=None)), \
+         patch.object(mq.VerifyRunnerPool, 'dispatch', new=AsyncMock(side_effect=_fake_dispatch)), \
+         patch.object(mq, '_assemble_retry_verify_env', new=AsyncMock(return_value=None)):
+        outcome = await mq._run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123', runner=None,
+            shadow_baseline_sink=sink,
+        )
+
+    assert outcome is None
+    assert sink == {}
+
+
+# ---------------------------------------------------------------------------
 # _load_attempt0_sidecar tolerant degradation (the robustness core that keeps
 # the retry path a strict no-op until reify writes a well-formed sidecar).
 # Every branch must return None WITHOUT raising — a regression that let the
