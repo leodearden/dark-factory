@@ -430,3 +430,69 @@ class TestScopeCapacitySnapshot:
         # Generally available, but the sole account has no fable headroom.
         assert acct.phase == AccountPhase.AVAILABLE
         assert gate.scope_capacity_snapshot()[SCOPE] is False
+
+
+# ===========================================================================
+# Step 11 — scope_status() per-(account × scope) serialized read API
+# ===========================================================================
+
+
+class TestScopeStatus:
+    """``scope_status()`` serializes per-(account × scope) cap state for a
+    future digest/dashboard — ISO-string datetimes, None passed through, and
+    only accounts with an observed scope cap included. Pure read."""
+
+    def test_populated_scope_cap_serialized(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        resets = datetime(2026, 7, 20, 18, 0, tzinfo=UTC)
+        capped_at = datetime(2026, 7, 20, 17, 0, tzinfo=UTC)
+        set_scope_cap(acct, capped=True, resets_at=resets, near_cap=True,
+                      capped_at=capped_at)
+
+        assert gate.scope_status()['a'][SCOPE] == {
+            'capped': True,
+            'resets_at': resets.isoformat(),
+            'near_cap': True,
+            'capped_at': capped_at.isoformat(),
+        }
+
+    def test_none_datetimes_passed_through(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        set_scope_cap(acct, capped=True, resets_at=None, near_cap=False,
+                      capped_at=None)
+
+        assert gate.scope_status()['a'][SCOPE] == {
+            'capped': True,
+            'resets_at': None,
+            'near_cap': False,
+            'capped_at': None,
+        }
+
+    def test_accounts_with_empty_scope_caps_omitted(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        set_scope_cap(a)  # a observes a scope cap; b has none
+
+        status = gate.scope_status()
+        assert 'a' in status
+        assert 'b' not in status
+
+    def test_empty_gate_returns_empty(self):
+        gate = make_gate(['a'])
+        assert gate.scope_status() == {}
+
+    def test_multiple_scopes_and_accounts_roundtrip(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        set_scope_cap(a, 'claude-fable-5', capped=True)
+        set_scope_cap(b, 'other-model', capped=False, near_cap=True)
+
+        status = gate.scope_status()
+        assert set(status) == {'a', 'b'}
+        assert set(status['a']) == {'claude-fable-5'}
+        assert set(status['b']) == {'other-model'}
+        assert status['a']['claude-fable-5']['capped'] is True
+        assert status['b']['other-model']['near_cap'] is True
+        assert status['b']['other-model']['capped'] is False
