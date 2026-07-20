@@ -239,3 +239,56 @@ class TestAdvanceIfAt:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
         assert rid in warnings[0].message
+
+
+# ---------------------------------------------------------------------------
+# step-4 RED / step-5 GREEN: _buffer_owned_request duplicate/twin-drain
+# (SHARPER-RCA offender #2 + original incident mr-c69ca480)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBufferOwnedRequestDuplicateDrain:
+    """``_buffer_owned_request`` (SHARPER-RCA offender #2, mr-8cafbaf0 — and
+    the original incident mr-c69ca480): draining a DISTINCT ``MergeRequest``
+    object that shares its request_id with an item already live in the
+    registry at a non-QUEUED state (e.g. VERIFYING) is a duplicate/re-entrant
+    submission — mirroring the journal-recovery ``reconstruct_merge_request``
+    path that produced the original incident's twin. It must coalesce as a
+    benign no-op: no escalation, no divergent second pipeline item buffered
+    under the shared request_id, and the live original left untouched.
+
+    RED until step-5 GREEN restructures ``_buffer_owned_request`` with the
+    registry-state three-way discrimination + ``_coalesce_reentrant_drain``.
+    """
+
+    async def test_twin_drain_does_not_escalate_or_buffer_and_leaves_original_live(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+
+        original = _make_request('mr-twin-task', 'mr-twin-branch', tmp_path, config)
+        rid = original.request_id
+        worker._register_item(original, initial=ItemLifecycleState.VERIFYING)
+
+        twin = _make_request(
+            'mr-twin-task', 'mr-twin-branch', tmp_path, config, request_id=rid,
+        )
+        assert twin is not original, 'twin must be a DISTINCT object sharing the request_id'
+
+        worker._buffer_owned_request(twin)
+
+        assert fake_eq.submitted == [], (
+            f'a recognized duplicate/re-entrant drain must not escalate: {fake_eq.submitted!r}'
+        )
+        for lane, buf in worker._lane_buffers.items():
+            assert twin not in buf, f'twin must not be buffered in lane {lane!r}: {buf!r}'
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING, (
+            'registry must be untouched by the coalesced duplicate'
+        )
+        assert worker._live_items[rid] is original, (
+            'the live original must not be displaced by the twin'
+        )
