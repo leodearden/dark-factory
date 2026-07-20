@@ -2965,6 +2965,14 @@ class TaskWorkflow:
             if _merge_result is not None:
                 return _merge_result
 
+        # Merge SUCCEEDED — discharge any durable merge-retry obligation. On the
+        # normal resolve→in-place-retry→success path _requeue's stamp is otherwise
+        # never cleared (the resume guard's clear fires only on a restart
+        # re-dispatch), so a DONE task would keep a stale merge_retry_pending.
+        # Clearing here keeps the stamp/clear lifecycle symmetric; it is an
+        # idempotent no-op when nothing was ever stamped (the common case).
+        await self._clear_merge_retry_pending()
+
         # SUCCESS — write completion knowledge (best-effort after merge)
         try:
             await self._write_completion_to_memory()
@@ -4625,14 +4633,22 @@ class TaskWorkflow:
 
         Called by :meth:`_resume_merge_retry_if_pending` on consume — both on a
         HEAD match (before delegating to the merge phase) and on a HEAD mismatch
-        (the stamp can never match again once the branch moved). Uses the
-        full-dict :meth:`_merge_fresh_metadata` + ``scheduler.update_task(
-        metadata=...)`` pattern because only a full-dict write can REMOVE a key
-        (an append-merge can add but not delete). A persistence failure must
-        never crash the resume path; a subsequent re-block re-stamps a fresh
-        obligation, so a lost clear is self-healing.
+        (the stamp can never match again once the branch moved) — and by
+        :meth:`_merge_and_finalise` on merge SUCCESS, so the happy-path
+        stamp/clear lifecycle is symmetric (a merged/DONE task carries no stale
+        ``merge_retry_pending``). Uses the full-dict :meth:`_merge_fresh_metadata`
+        + ``scheduler.update_task(metadata=...)`` pattern because only a full-dict
+        write can REMOVE a key (an append-merge can add but not delete). A
+        persistence failure must never crash the resume path; a subsequent
+        re-block re-stamps a fresh obligation, so a lost clear is self-healing.
+
+        Idempotent no-op when no stamp is present: returns immediately without a
+        fresh-metadata read or backend write, so it is cheap and safe to call
+        unconditionally on every merge success (the common case never stamped).
         """
         metadata = self.task.get('metadata') or {}
+        if 'merge_retry_pending' not in metadata:
+            return
         fresh = await self._merge_fresh_metadata(
             metadata, log_context='merge_retry_pending clear',
         )

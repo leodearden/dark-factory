@@ -185,6 +185,21 @@ class TestStampClearHelpers:
         await f.wf._clear_merge_retry_pending()
         assert 'merge_retry_pending' not in f.wf.task['metadata']
 
+    @pytest.mark.asyncio
+    async def test_clear_is_noop_when_no_stamp_present(self):
+        # Amendment (reviewer robustness): the clear helper must be a cheap
+        # idempotent no-op — no fresh-metadata read, no backend write — when
+        # nothing was ever stamped, so it is safe to call unconditionally on
+        # every merge success (the common case never stamped).
+        f = _make(metadata={'retry_ledger': {'x': 1}})
+
+        await f.wf._clear_merge_retry_pending()
+
+        f.update_task.assert_not_awaited()
+        f.scheduler.get_task.assert_not_awaited()
+        # Metadata is left untouched.
+        assert f.wf.task['metadata'] == {'retry_ledger': {'x': 1}}
+
 
 # ---------------------------------------------------------------------------
 # step-5: _requeue wiring — merge_phase=True stamps, merge_phase=False does not
@@ -334,6 +349,39 @@ class TestMergeAndFinalise:
         spies.write_completion_to_memory.assert_awaited_once()
         spies.enter_phase.assert_any_call(WorkflowState.DONE)
         spies.finalise_merged_done.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_merge_success_discharges_present_merge_retry_pending_stamp(self):
+        # Amendment (reviewer robustness): on the normal resolve→in-place-retry→
+        # success path _requeue's stamp is otherwise never cleared (the resume
+        # guard's clear fires only on a RESTART re-dispatch). _merge_and_finalise
+        # must discharge it on merge SUCCESS so a DONE task carries no stale
+        # merge_retry_pending. (real _clear_merge_retry_pending runs — not spied.)
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP), 'retry_ledger': {'x': 1}})
+        spies = _wire_finalise_spies(f, merge_result=None)
+
+        outcome = await f.wf._merge_and_finalise('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        spies.finalise_merged_done.assert_awaited_once()
+        # Stamp discharged from both in-memory and persisted metadata; siblings kept.
+        assert 'merge_retry_pending' not in f.wf.task['metadata']
+        assert f.wf.task['metadata']['retry_ledger'] == {'x': 1}
+        persisted = _persisted_metadata(f.update_task)
+        assert 'merge_retry_pending' not in persisted
+
+    @pytest.mark.asyncio
+    async def test_merge_success_without_stamp_makes_no_clear_write(self):
+        # Mirror: the unstamped common case triggers no backend write from the
+        # clear-on-success call (the no-op guard holds inside _merge_and_finalise).
+        f = _make()
+        spies = _wire_finalise_spies(f, merge_result=None)
+
+        outcome = await f.wf._merge_and_finalise('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        spies.finalise_merged_done.assert_awaited_once()
+        f.update_task.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
