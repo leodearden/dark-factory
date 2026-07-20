@@ -14425,6 +14425,72 @@ class TestRunPostMergeVerify:
         assert nr == {}, f'no narrowed counter should be touched: {nr}'
         assert er == {}, f'no ENOSPC counter should be touched: {er}'
 
+    async def test_narrowed_retry_stops_on_midflight_deterministic_red(self) -> None:
+        """(task 2835 step-5) RED — the narrowed retry loop stops the instant
+
+        a retry's fresh category is no longer infra-transient, even though
+        budget remains and the result is still not passing. Attempt-0 is a
+        retryable infra-transient (enters the loop); the first narrowed
+        retry flips to a deterministic red (test_failure) — the loop must
+        NOT keep consuming budget up to max_narrowed=3 just because
+        verify.passed stayed False.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.retry_failed_only = True
+        merge_wt = MagicMock()
+
+        test_failure_result = VerifyResult(
+            passed=False,
+            test_output='FAILED tests/test_x.py::test_y',
+            lint_output='',
+            type_output='',
+            summary='tests failed',
+            category='test_failure',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue._load_attempt0_sidecar',
+                MagicMock(return_value=object()),
+            ),
+            patch(
+                'orchestrator.merge_queue._assemble_retry_verify_env',
+                AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=[
+                    _infra_category_verify_result('semaphore_timeout'),
+                    test_failure_result,
+                ]),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                max_narrowed=3, narrowed_retries=(nr := {}),
+            )
+
+        assert result is not None
+        assert mock_verify.call_count == 2, (
+            f'expected exactly one narrowed retry (attempt-0 + 1 retry), then the loop '
+            f'stops because the category is no longer infra-transient, got '
+            f'{mock_verify.call_count} calls'
+        )
+        assert nr[req.task_id] == 1, f'expected the narrowed counter at 1, got: {nr}'
+        assert result.reason.startswith('Post-merge verification failed:'), (
+            f'unexpected reason: {result.reason!r}'
+        )
+        assert not result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'the surfaced deterministic red must take the generic-block path, '
+            f'not the transient-infra hold: {result.reason!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
