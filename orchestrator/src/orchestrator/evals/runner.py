@@ -26,7 +26,7 @@ from orchestrator.config import (
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.workflow import WorkflowOutcome, build_workflow
+from orchestrator.workflow import WorkflowOutcome, _meta_root_for_worktree, build_workflow
 
 from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
@@ -249,10 +249,10 @@ async def run_eval(
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW.
 
     When *worktree_path* is provided, the eval reuses an existing worktree
-    instead of creating a fresh one.  The worktree's ``.task/plan.json``
-    (with step statuses) is used as the initial plan, so the workflow
-    naturally skips already-completed steps — useful for resuming a
-    blocked eval from the reviewer phase.
+    instead of creating a fresh one.  The relocated
+    ``.task-meta/<name>/plan.json`` (with step statuses) is used as the
+    initial plan, so the workflow naturally skips already-completed steps —
+    useful for resuming a blocked eval from the reviewer phase.
 
     *memory_endpoint* (ε, D8) is threaded straight to
     ``build_eval_orch_config``: left ``None``, the profile's null-sentinel
@@ -322,18 +322,7 @@ async def run_eval(
 
     # 5. Load plan — from existing worktree state or task JSON
     if worktree_path is not None:
-        import json as _json
-        existing_plan_path = worktree / '.task' / 'plan.json'
-        if existing_plan_path.exists():
-            initial_plan = _json.loads(existing_plan_path.read_text())
-            done = sum(1 for s in initial_plan.get('steps', []) if s.get('status') == 'done')
-            logger.info(
-                f'Using existing plan from worktree '
-                f'({done}/{len(initial_plan.get("steps", []))} steps done)'
-            )
-        else:
-            initial_plan = task.get('plan')
-            logger.info('No existing plan in worktree — using task JSON plan')
+        initial_plan = _resume_plan_from_worktree(worktree, task)
     else:
         initial_plan = task.get('plan')
     if not initial_plan:
@@ -1058,6 +1047,27 @@ async def run_confirm_stage(
         for trial in range(1, trials + 1)
     ]
     return await _bounded_fanout(thunks, max_parallel)
+
+
+def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
+    """Load the initial plan for a --worktree resume run.
+
+    Reads the RELOCATED plan.json at ``_meta_root_for_worktree(worktree)/plan.json``.
+    Production TaskWorkflow moved plan.json out of the legacy ``<worktree>/.task/``
+    to the sibling ``.task-meta/<name>/`` root (W11 / task 2258); reading the
+    stale legacy path silently missed and discarded completed-step progress on
+    resume (D1 drift, task 2812). Falls back to the frozen ``task['plan']`` only
+    when the relocated file is absent.
+    """
+    existing_plan_path = _meta_root_for_worktree(worktree) / 'plan.json'
+    if existing_plan_path.exists():
+        initial_plan = json.loads(existing_plan_path.read_text())
+        steps = initial_plan.get('steps', [])
+        done = sum(1 for s in steps if s.get('status') == 'done')
+        logger.info(f'Using existing plan from worktree ({done}/{len(steps)} steps done)')
+        return initial_plan
+    logger.info('No existing plan in worktree — using task JSON plan')
+    return task.get('plan')
 
 
 def _result_exists(task_id: str, config_name: str) -> bool:
