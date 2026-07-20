@@ -1,0 +1,100 @@
+# Machine-readable twin of usage-gate-model-scoped-caps-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py). task_id stamped by commit_planning.
+prd: plans/usage-gate-model-scoped-caps-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Scope substrate: scoped_cap_models config + ScopeCap state + scope_for derivation"
+    capabilities:
+      - name: "usage-cap-config-extensible"
+        binding: "capability→producer (wired) — grep:shared/src/shared/config_models.py:25 class UsageCapConfig"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "scoped_cap_models"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "account-state-extensible"
+        binding: "capability→producer (wired) — grep:shared/src/shared/usage_gate.py:133 AccountState dataclass"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "additive dataclass field; presence covered by the scoped_cap_models grep above + α's tests"
+  - label: "β"
+    task_id: null
+    title: "Scope-aware cap attribution (thread scope through InvokeSlot/report)"
+    capabilities:
+      - name: "model-in-scope-at-slot-acquisition"
+        binding: "capability→producer (wired) — grep:shared/src/shared/cli_invoke.py:968 model extracted before invoke_slot at :1104"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "scope_for"
+          paths: ["shared/src/shared/cli_invoke.py"]
+          expect: present
+      - name: "caphit-report-seam"
+        binding: "capability→producer (wired) — grep:shared/src/shared/usage_gate.py:367 report dispatches CapHit to _handle_cap_detected"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "scoped-attribution correctness is a test property (account phase untouched on scoped CapHit)"
+  - label: "γ"
+    task_id: null
+    title: "Scope-aware selection, waiting, uncap + scope_capacity_snapshot read API"
+    capabilities:
+      - name: "before-invoke-selection-loop"
+        binding: "capability→producer (wired) — grep:shared/src/shared/usage_gate.py:680 account-iteration predicate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "scope_capacity_snapshot"
+          paths: ["shared/src/shared/usage_gate.py"]
+          expect: present
+      - name: "retry-bound-storm-escape"
+        binding: "capability→producer (wired) — grep:shared/src/shared/cli_invoke.py:995 cap-wait guard (AllAccountsCappedException); scoped re-caps feed the same counters (INV-4)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "counter-feeding is a test property, not greppable"
+  - label: "δ"
+    task_id: null
+    title: "Resolver model-capacity fail-safe check + _invoke snapshot threading"
+    capabilities:
+      - name: "resolver-fail-safe-layer-skip"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/routing.py model-ceiling-exhausted layer-skip mechanics (task 2535)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "model-capacity-exhausted"
+          paths: ["orchestrator/src/orchestrator/routing.py"]
+          expect: present
+      - name: "invoke-chokepoint-threading"
+        binding: "capability→producer (wired) — TaskWorkflow._invoke adopts resolve_route (task 2535, landed)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "snapshot threading is exercised by δ's own tests + ε's B7"
+  - label: "ε"
+    task_id: null
+    title: "Scope integration gate — B+H boundary suite B1–B8"
+    capabilities:
+      - name: "boundary-suite-producers-upstream"
+        binding: "DAG-direction — all legs produced upstream (α state, β attribution, γ selection/wait, δ resolver); fake invoke_fn seam wired (invoke_with_cap_retry)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task IS the check suite; its signal is the green B1–B8 matrix"
+  - label: "ζ"
+    task_id: null
+    title: "Docs + operator surface for model-scoped caps"
+    capabilities:
+      - name: "claude-md-routing-section"
+        binding: "capability→producer (wired) — CLAUDE.md Model Routing section + skills/orchestrate reload section exist to extend"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "scoped_cap_models"
+          paths: ["CLAUDE.md"]
+          expect: present

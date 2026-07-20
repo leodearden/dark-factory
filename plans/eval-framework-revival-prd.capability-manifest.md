@@ -165,3 +165,19 @@ may add `κ depends λ` to make the cost column non-sentinel. Not a FAIL.
 μ wired; add the cross-PRD deps to harness-reconnect-pi's env-forwarding /
 codex / pi tasks **once those exist**, then flip ν/ξ to pending in a follow-up.
 Surface this split in the decompose hand-back.
+
+## π — architect-fable OFAT candidate (paired edit 2026-07-20)
+
+Added by `plans/fable-architect-eval-admission-prd.md`'s authoring session (the
+ο precedent — instrument edits stay in eval-revival's lane). Bindings:
+
+- `architect-eval-configs-list` → **PASS (wired)** — `ARCHITECT_EVAL_CONFIGS`
+  (`orchestrator/src/orchestrator/evals/configs.py:435`), consumed by
+  `ofat_candidates()` (`:549`).
+- `architect-ofat-dispatch-branch` → **PASS (wired)** — `run_ofat_stage`'s
+  architect branch (task 2478 landed) handles any `role='architect'` candidate;
+  π is config-only.
+
+Machine-readable sidecar (PRD-derived path, new as of this edit):
+`plans/eval-framework-revival-prd.capability-manifest.yaml` — carries π only;
+earlier tasks predate the sidecar convention.

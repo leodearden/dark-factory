@@ -1,0 +1,60 @@
+# Machine-readable twin of fable-architect-eval-admission-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py). task_id stamped by commit_planning.
+# Task π is in eval-revival's lane — see
+# plans/eval-framework-revival-prd.capability-manifest.yaml (PRD-derived sidecar paths).
+prd: plans/fable-architect-eval-admission-prd.md
+schema_version: 1
+tasks:
+  - label: "τ1"
+    task_id: null
+    title: "Hard-subset fable-architect campaign gate (deterministic pure gate)"
+    capabilities:
+      - name: "eval-ofat-tasks-dir"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/cli.py:1297 eval-ofat --tasks-dir/--trials"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gate task's deliverable is an escalation lifecycle + result artifacts, not repo state"
+      - name: "eval-bootstrap-smoke-gate"
+        binding: "capability→producer (wired) — task 2847 done on main (scripts/eval_bootstrap_smoke.sh, found_on_main 8c8eeef745)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "eval_bootstrap_smoke"
+          paths: ["scripts/"]
+          expect: present
+      - name: "architect-fable-candidate"
+        binding: "producer:task-π upstream (eval-revival lane; wired dep)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "π's own delivered_check (architect-fable grep) covers it on the producer"
+  - label: "τ2"
+    task_id: null
+    title: "Committed fable-architect eval decision record"
+    capabilities:
+      - name: "campaign-artifacts-readable"
+        binding: "producer:task-τ1 upstream (wired dep) — result JSONs + composite tables under evals/results/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fable-architect-eval-decision"
+          paths: ["plans/"]
+          expect: present
+  - label: "τ3"
+    task_id: null
+    title: "Fable admission ratification gate (deterministic pure gate)"
+    capabilities:
+      - name: "decision-record"
+        binding: "producer:task-τ2 upstream (wired dep)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "ratification is a human escalation resolution, not repo state"
+      - name: "scope-safe-failover"
+        binding: "producer:usage-gate-model-scoped-caps-prd ε upstream (wired in-project dep)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "ε's boundary suite is the check; its own manifest covers it"

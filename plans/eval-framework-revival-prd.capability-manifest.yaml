@@ -1,0 +1,28 @@
+# Machine-readable sidecar for plans/eval-framework-revival-prd.md
+# Created 2026-07-20 for the paired-edit task π (architect-fable OFAT candidate,
+# added by plans/fable-architect-eval-admission-prd.md's authoring session —
+# the ο precedent). Earlier eval-revival tasks predate the sidecar convention;
+# their bindings live in the hand-named .md manifest only.
+# Schema: plans/capability-delivered-checks-prd.md §Contract
+# (shared/src/shared/capability_manifest.py). task_id stamped by commit_planning.
+prd: plans/eval-framework-revival-prd.md
+schema_version: 1
+tasks:
+  - label: "π"
+    task_id: null
+    title: "architect-fable OFAT candidate config"
+    capabilities:
+      - name: "architect-eval-configs-list"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/evals/configs.py:435 ARCHITECT_EVAL_CONFIGS, consumed by ofat_candidates() at :549"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "architect-fable"
+          paths: ["orchestrator/src/orchestrator/evals/configs.py"]
+          expect: present
+      - name: "architect-ofat-dispatch-branch"
+        binding: "capability→producer (wired) — run_ofat_stage architect branch (task 2478 landed; handles any role='architect' candidate)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "dispatch-branch generality is exercised by π's test over ofat_candidates()"
