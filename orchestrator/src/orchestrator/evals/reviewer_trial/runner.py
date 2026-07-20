@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -95,14 +96,38 @@ async def _run_single_reviewer(
     spec: ReviewerSpec,
     diff: CorpusDiff,
     max_retries: int = 2,
+    prices: dict | None = None,
 ) -> tuple[str, dict | None, float]:
     """Run a single reviewer against a diff.
 
     Returns (reviewer_name, review_dict_or_None, cost_usd).
+
+    Threads the spec's cross-family dispatch fields (``backend``,
+    ``env_overrides``, and an ``os.environ``-resolved ``oauth_token`` from
+    ``spec.oauth_token_env``) plus an optional *prices* table into
+    ``invoke_agent``. All default-off: a native Claude spec (backend='claude',
+    no env/token overrides) with ``prices=None`` reproduces prior behaviour
+    exactly (invoke_agent treats those defaults as today).
+
+    Raises ``RuntimeError`` if ``spec.oauth_token_env`` is set but that
+    environment variable is unset — fails loudly before dispatch rather than
+    silently resolving ``oauth_token=None`` and deferring to a confusing
+    downstream auth error inside the backend invocation.
     """
     role = build_trial_reviewer_role(spec)
     prompt = _build_reviewer_prompt(diff.diff_text)
     cwd = diff.cwd or _DEFAULT_CWD
+
+    if spec.oauth_token_env:
+        oauth_token = os.environ.get(spec.oauth_token_env)
+        if oauth_token is None:
+            raise RuntimeError(
+                f'Reviewer {spec.name!r} sets oauth_token_env={spec.oauth_token_env!r} '
+                f'but that environment variable is not set. Refusing to dispatch with a '
+                f'silently-missing oauth token.'
+            )
+    else:
+        oauth_token = None
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -117,6 +142,10 @@ async def _run_single_reviewer(
                 disallowed_tools=role.disallowed_tools,
                 output_schema=REVIEW_SCHEMA,
                 effort=spec.effort,
+                backend=spec.backend,
+                env_overrides=spec.env_overrides,
+                oauth_token=oauth_token,
+                prices=prices,
             )
 
             cost = result.cost_usd
@@ -165,10 +194,14 @@ async def run_panel(
     corpus_diff: CorpusDiff,
     stagger_secs: float = 2.0,
     max_retries: int = 2,
+    prices: dict | None = None,
 ) -> PanelRunResult:
     """Run one panel variant against one corpus diff.
 
     Launches reviewers with a stagger delay to avoid thundering herd.
+
+    *prices* (default-off) is threaded to each reviewer's ``invoke_agent``
+    call so non-native-cost backends (codex/gemini) price their cost from it.
     """
     start = time.monotonic()
     reviews: dict[str, dict] = {}
@@ -181,7 +214,7 @@ async def run_panel(
         if i > 0 and stagger_secs > 0:
             await asyncio.sleep(stagger_secs)
         task = asyncio.create_task(
-            _run_single_reviewer(spec, corpus_diff, max_retries=max_retries),
+            _run_single_reviewer(spec, corpus_diff, max_retries=max_retries, prices=prices),
             name=f'{variant.name}__{spec.name}__{corpus_diff.diff_id}',
         )
         tasks.append(task)
@@ -215,10 +248,14 @@ async def run_trial(
     variants: list[VariantConfig],
     corpus: CorpusManifest,
     max_parallel_panels: int = 3,
+    prices: dict | None = None,
 ) -> list[PanelRunResult]:
     """Run all (variant x diff) pairs with bounded concurrency.
 
     Persists results incrementally to the results/ directory.
+
+    *prices* (default-off) is threaded through to each ``run_panel`` call so
+    cross-family (codex/gemini) reviewers get a non-sentinel cost column.
     """
     _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_parallel_panels)
@@ -245,7 +282,7 @@ async def run_trial(
                     pass  # Re-run if result file is corrupt
 
             logger.info('Running %s against %s', variant.name, diff.diff_id)
-            result = await run_panel(variant, diff)
+            result = await run_panel(variant, diff, prices=prices)
 
             # Persist incrementally
             result_path.write_text(json.dumps(asdict(result), indent=2))

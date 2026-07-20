@@ -199,3 +199,97 @@ class TestRunPanel:
 
         assert 'r1' in result.reviews
         assert result.reviews['r1']['verdict'] == 'ISSUES_FOUND'
+
+
+class TestRunnerCrossFamilyThreading:
+    """runner threads spec.backend/env_overrides + os.environ-resolved
+    oauth_token + a prices table into invoke_agent (task 2476)."""
+
+    @pytest.mark.asyncio
+    async def test_cross_family_kwargs_threaded(self, monkeypatch) -> None:
+        monkeypatch.setenv('TOK', 'secret')
+        prices = {'gpt-5.4': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
+
+        variant = VariantConfig(
+            name='xfam_variant',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(
+                    name='r1', model='gpt-5.4', specialization='Testing.',
+                    backend='codex',
+                    env_overrides={'ANTHROPIC_BASE_URL': 'https://x'},
+                    oauth_token_env='TOK',
+                ),
+            ],
+        )
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(structured=_make_review('r1'))
+            await run_panel(variant, diff, stagger_secs=0, prices=prices)
+
+        mock_invoke.assert_awaited_once()
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['backend'] == 'codex'
+        assert kwargs['env_overrides'] == {'ANTHROPIC_BASE_URL': 'https://x'}
+        assert kwargs['oauth_token'] == 'secret'
+        assert kwargs['prices'] == prices
+
+    @pytest.mark.asyncio
+    async def test_default_claude_backend_no_token_no_prices(self) -> None:
+        variant = VariantConfig(
+            name='claude_variant',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(name='r1', model='sonnet', specialization='Testing.'),
+            ],
+        )
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(structured=_make_review('r1'))
+            await run_panel(variant, diff, stagger_secs=0)
+
+        mock_invoke.assert_awaited_once()
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['backend'] == 'claude'
+        assert kwargs['oauth_token'] is None
+        assert kwargs.get('prices') is None
+
+    @pytest.mark.asyncio
+    async def test_missing_oauth_token_env_fails_loudly(self, monkeypatch) -> None:
+        """A spec naming oauth_token_env whose var is unset must fail loudly
+        (and never dispatch), not silently resolve oauth_token=None and let
+        the failure surface as a confusing downstream auth error (task 2476
+        review amendment)."""
+        monkeypatch.delenv('MISSING_TOK', raising=False)
+
+        variant = VariantConfig(
+            name='xfam_missing_token',
+            description='Test',
+            reviewers=[
+                ReviewerSpec(
+                    name='r1', model='gpt-5.4', specialization='Testing.',
+                    backend='codex',
+                    oauth_token_env='MISSING_TOK',
+                ),
+            ],
+        )
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            result = await run_panel(variant, diff, stagger_secs=0, max_retries=1)
+
+        mock_invoke.assert_not_awaited()
+        assert 'r1' not in result.reviews
+        assert len(result.errors) == 1
+        assert 'MISSING_TOK' in result.errors[0]

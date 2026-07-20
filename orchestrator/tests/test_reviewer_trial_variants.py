@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from orchestrator.agents.roles import AgentRole
+from orchestrator.config import default_price_table
 from orchestrator.evals.reviewer_trial.variants import (
+    _SPEC_COMPREHENSIVE,
     ALL_VARIANTS,
+    REVIEWER_REFRESH_VARIANTS,
     VARIANT_A,
     VARIANT_B,
     VARIANT_BASELINE,
     VARIANT_C,
+    VARIANT_CROSS_FAMILY,
     VARIANT_D,
+    VARIANT_SONNET5_SOLO,
     ReviewerSpec,
     build_trial_reviewer_role,
 )
@@ -24,6 +29,29 @@ class TestReviewerSpec:
     def test_custom_budget(self) -> None:
         spec = ReviewerSpec(name='test', model='opus', specialization='Testing.', budget=5.0)
         assert spec.budget == 5.0
+
+    def test_cross_family_field_defaults(self) -> None:
+        """A default spec is a native Claude reviewer: backend='claude',
+        no env overrides, no oauth-token env var (keeps every existing
+        spec byte-identical)."""
+        spec = ReviewerSpec(name='test', model='sonnet', specialization='Testing.')
+        assert spec.backend == 'claude'
+        assert spec.env_overrides is None
+        assert spec.oauth_token_env is None
+
+    def test_cross_family_fields_carry_values(self) -> None:
+        """A spec built with cross-family fields carries them verbatim."""
+        spec = ReviewerSpec(
+            name='xfam',
+            model='gpt-5.4',
+            specialization='Testing.',
+            backend='codex',
+            env_overrides={'ANTHROPIC_BASE_URL': 'https://x'},
+            oauth_token_env='TOK',
+        )
+        assert spec.backend == 'codex'
+        assert spec.env_overrides == {'ANTHROPIC_BASE_URL': 'https://x'}
+        assert spec.oauth_token_env == 'TOK'
 
 
 class TestBuildTrialReviewerRole:
@@ -117,3 +145,36 @@ class TestVariantDefinitions:
         for variant in ALL_VARIANTS:
             assert variant.description
             assert variant.name
+
+
+class TestRefreshVariants:
+    """The eval-revival κ refresh set: 1×Opus incumbent vs Sonnet-5 vs cross-family."""
+
+    def test_sonnet5_solo_single_comprehensive_sonnet(self) -> None:
+        assert len(VARIANT_SONNET5_SOLO.reviewers) == 1
+        reviewer = VARIANT_SONNET5_SOLO.reviewers[0]
+        assert reviewer.model == 'sonnet'
+        assert reviewer.specialization == _SPEC_COMPREHENSIVE
+
+    def test_cross_family_single_priced_non_claude(self) -> None:
+        assert len(VARIANT_CROSS_FAMILY.reviewers) == 1
+        reviewer = VARIANT_CROSS_FAMILY.reviewers[0]
+        # A non-Claude backend so its cost comes from the price table...
+        assert reviewer.backend != 'claude'
+        # ...and its model must be priced (non-sentinel cost by construction).
+        assert reviewer.model in default_price_table()
+        assert reviewer.specialization == _SPEC_COMPREHENSIVE
+
+    def test_refresh_set_order_and_incumbent(self) -> None:
+        assert REVIEWER_REFRESH_VARIANTS == [
+            VARIANT_A,
+            VARIANT_SONNET5_SOLO,
+            VARIANT_CROSS_FAMILY,
+        ]
+        # The incumbent (first) is the 1×Opus generalist.
+        assert REVIEWER_REFRESH_VARIANTS[0].reviewers[0].model == 'opus'
+
+    def test_refresh_variants_not_in_all_variants(self) -> None:
+        """Keeps `full`/`sweep` (which run ALL_VARIANTS) byte-identical."""
+        assert VARIANT_SONNET5_SOLO not in ALL_VARIANTS
+        assert VARIANT_CROSS_FAMILY not in ALL_VARIANTS

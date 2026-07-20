@@ -19,10 +19,14 @@ class ReviewerSpec:
     """Specification for a single reviewer in a trial panel."""
 
     name: str
-    model: str                 # "opus" | "sonnet"
+    model: str                 # "opus" | "sonnet" | cross-family model id (e.g. "gpt-5.4")
     specialization: str        # combined specialization prompt text
     budget: float = 2.0
     effort: str = 'high'
+    # Cross-family dispatch (default-off keeps every existing spec byte-identical):
+    backend: str = 'claude'                        # 'claude' | 'codex' | 'gemini'
+    env_overrides: dict[str, str] | None = None    # merged into the invoke_agent subprocess env
+    oauth_token_env: str | None = None             # env var whose value becomes invoke_agent's oauth_token
 
 
 @dataclass
@@ -320,3 +324,47 @@ ALL_VARIANTS = [VARIANT_BASELINE, VARIANT_A, VARIANT_B, VARIANT_C, VARIANT_D]
 
 # Effort sweep — 1x opus at different thinking levels (variant_a is 'high')
 EFFORT_SWEEP_VARIANTS = [VARIANT_A_MEDIUM, VARIANT_A, VARIANT_A_MAX]
+
+
+# ---------------------------------------------------------------------------
+# Eval-revival κ refresh set (task 2476, PRD decision 13)
+#
+# Isolate the MODEL as the sole independent variable: each candidate mirrors
+# VARIANT_A's single comprehensive-generalist structure (effort='high',
+# budget=5.0, _SPEC_COMPREHENSIVE), swapping ONLY model/backend, so quality
+# and cost deltas are attributable to the model rather than panel shape. The
+# incumbent is VARIANT_A itself (the Apr-8 trial winner + production reviewer).
+# Deliberately NOT added to ALL_VARIANTS so `full`/`sweep` stay unchanged.
+# ---------------------------------------------------------------------------
+
+VARIANT_SONNET5_SOLO = VariantConfig(
+    name='variant_sonnet5_solo',
+    description='1x sonnet generalist (Sonnet 5) — model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='sonnet',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=5.0,
+            effort='high',
+        ),
+    ],
+)
+
+VARIANT_CROSS_FAMILY = VariantConfig(
+    name='variant_cross_family',
+    description='1x codex generalist (gpt-5.4) — cross-family model swap vs the 1x opus incumbent',
+    reviewers=[
+        ReviewerSpec(
+            name='comprehensive_reviewer',
+            model='gpt-5.4',
+            specialization=_SPEC_COMPREHENSIVE,
+            budget=5.0,
+            effort='high',
+            backend='codex',
+        ),
+    ],
+)
+
+# Refresh leaderboard order: 1×Opus incumbent first, then the two candidates.
+REVIEWER_REFRESH_VARIANTS = [VARIANT_A, VARIANT_SONNET5_SOLO, VARIANT_CROSS_FAMILY]
