@@ -275,10 +275,77 @@ _VERIFY_ENV_BROKEN_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# Merge-verify restart-collateral shapes (task 2831) — a WIDER class of
+# broken-worktree signal than the single Cargo.lock read-failure above.
+# Grounded in the reify merge-gate RCA (2026-07-19): when the ephemeral
+# _merge-verify worktree is removed out from under a running verify, the
+# guard/wrapper/shell emits one of these five shapes. Each carries its own
+# worktree-removal-specific anchor (see the per-pattern comments) so a
+# genuine branch fault that merely mentions a missing file is not swept into
+# ENV_TRANSIENT — mirroring the Cargo.lock pattern's read-verb-adjacent-to-
+# lockfile-token discipline above.
+
+# shape 1: a read-failure of some OTHER tracked file (not Cargo.lock).
+# Reuses/extends the Cargo.lock pattern's read-verb alternation with the
+# "couldn't" contraction (the RCA's own grounded phrasing:
+# "couldn't read 'crates/core/src/lib.rs': No such file or directory"),
+# requiring the verb immediately adjacent to "read" and "No such file or
+# directory" on the same line — a bare application FileNotFoundError with
+# no adjacent read verb (e.g. "FileNotFoundError: [Errno 2] No such file
+# or directory: 'fixture.json'") does not match. Kept as its own named
+# pattern (not folded into the list below) because it alone needs the
+# rustc-diagnostic veto immediately below (task 2831 review).
+_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE = re.compile(
+    r"^.*\b(?:could not|cannot|can[’']t|unable to|failed to|couldn[’']t)\s+read\b.*"
+    r"\bNo such file or directory\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Veto for shape 1 (task 2831 review): rustc emits this EXACT phrasing —
+# "error: couldn't read <path>: No such file or directory" — for a genuine
+# branch fault too, e.g. a `#[path = "..."]` attribute pointing at a file the
+# branch forgot to add. That diagnostic is textually indistinguishable from
+# guard-script worktree-removal collateral on the "couldn't read" line alone,
+# but rustc (unlike a shell/guard script) always accompanies ANY
+# location-tied diagnostic with its stable span-pointer rendering, e.g.
+# " --> src/lib.rs:3:1" — so requiring the ABSENCE of that rendering anywhere
+# in *output* lets the genuine compiler fault fall through to per-tool
+# dispatch instead of being swallowed as host collateral. Mirrors this
+# module's existing clippy::/error[E\d+]: SEMAPHORE_TIMEOUT veto style below.
+_RUSTC_DIAGNOSTIC_SPAN_RE = re.compile(r'-->\s*\S+:\d+:\d+', re.MULTILINE)
+
+_VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
+    # shape 2: the verify entrypoint script itself is gone (rc=127 lint
+    # stage, <0.4s) — "./scripts/verify.sh: No such file or directory".
+    # Anchored on a path-boundary (start-of-line or preceding '/') immediately
+    # before 'verify.sh' so an unrelated 'smoke-verify.sh'-style script name
+    # cannot false-positive.
+    re.compile(r'(?:^|/)verify\.sh: No such file or directory', re.MULTILINE),
+    # shape 3: the shell cannot write its captured output back into the
+    # (now-removed) _merge-verify worktree — anchored on the `_merge-verify`
+    # path token co-occurring with the "could not write output to" phrase so
+    # a generic "could not write output to" (some other destination) does not
+    # false-positive.
+    re.compile(r'could not write output to.*_merge-verify', re.MULTILINE),
+    # shape 4: bash's own shell-init cwd probe fails because its cwd (inside
+    # the removed worktree) no longer exists — anchored on the full
+    # "error retrieving current directory: getcwd:" phrase bash emits, not a
+    # bare 'getcwd' mention (which could appear in unrelated code/log text).
+    re.compile(
+        r'error retrieving current directory:\s*getcwd:',
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    # shape 5: the anticipatory marker reify emits once reify 5261 lands (see
+    # this module's classify_failure docstring / plan.json design_decisions
+    # for why this is landed ahead of reify 5261). Line-anchored on the
+    # literal marker text.
+    re.compile(r'^=== INTERRUPTED \(worktree removed\) ===', re.MULTILINE),
+]
+
 
 def _classify_environmental(output: str) -> FailureCategory | None:
-    """Tool-blind host-infrastructure guard: DISK_FULL / SEMAPHORE_TIMEOUT /
-    ENV_TRANSIENT (broken ``_merge-verify`` worktree).
+    """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
+    ``_merge-verify`` worktree, incl. restart collateral) / SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -286,6 +353,23 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     per-tool table is the right home for them. Returns ``None`` (the caller
     proceeds to per-tool dispatch) when none of these conditions is grounded
     in *output*.
+
+    ORDERING (task 2831 reorder — more-specific root cause wins on
+    co-occurrence): DISK_FULL (ENOSPC/linker) is checked FIRST, then the
+    broken-``_merge-verify``-worktree ENV_TRANSIENT checks (task 2756's
+    Cargo.lock signature + task 2831's restart-collateral shapes), and ONLY
+    THEN the looser SEMAPHORE_TIMEOUT lock+timeout heuristic. Broken-worktree
+    collateral is a more-specific root cause than the loose lock+timeout
+    heuristic, so it wins over SEMAPHORE_TIMEOUT (see
+    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore`` — a replayed
+    wrapper lock/timeout line co-occurring with collateral shapes classifies
+    ENV_TRANSIENT, not SEMAPHORE_TIMEOUT); DISK_FULL/ENOSPC remains the
+    most-specific root cause and stays first (see
+    ``test_enospc_with_unreadable_lock_stays_disk_full`` and
+    ``test_enospc_with_collateral_stays_disk_full``). Before task 2831, the
+    broken-worktree checks ran AFTER the semaphore arm; they are reordered
+    ahead of it here because a removed verify worktree is never a genuine
+    slot/lock-acquisition timeout co-occurrence.
 
     SEMAPHORE_TIMEOUT deterministic-diagnostic veto (task 2748): a genuine
     slot/lock-acquisition timeout is raised by the concurrency-limiter
@@ -296,8 +380,10 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     incidental to a deterministic lint/compile failure, so this returns
     ``None`` instead of ``SEMAPHORE_TIMEOUT`` and defers to per-tool
     dispatch. Applies ONLY to the SEMAPHORE_TIMEOUT arm — DISK_FULL's ENOSPC
-    markers are specific enough (and checked first) that a compile/lint
-    failure caused by a genuinely full disk must stay DISK_FULL.
+    markers and the broken-worktree ENV_TRANSIENT checks (below) are more
+    specific and checked first, so a compile/lint failure caused by a
+    genuinely full disk or a removed worktree stays DISK_FULL/ENV_TRANSIENT
+    respectively.
 
     SEMAPHORE_TIMEOUT deterministic-TEST-VERDICT veto (task 2821, reify
     2026-07-19 red-main incident, /deb deb-reify-964887): generalizes the
@@ -332,23 +418,71 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ENV_TRANSIENT — broken verify worktree (task 2756): a malformed
     ``_merge-verify`` worktree (e.g. an unreadable or missing ``Cargo.lock``)
     is a property of the HOST/environment, not of whichever guard script or
-    tool happened to trip over it, so it is checked LAST here — after the
-    more specific ENOSPC/linker/semaphore checks, so a co-occurring disk-full
+    tool happened to trip over it, so it is checked immediately after the
+    more specific ENOSPC/linker DISK_FULL checks — a co-occurring disk-full
     still wins as the more specific root cause (see
-    ``test_enospc_with_unreadable_lock_stays_disk_full``) — and wins over
-    per-tool dispatch regardless of ``ToolKind``. This source is DISTINCT
-    from the pytest-scoped shared-venv ``_ENV_TRANSIENT_PATTERNS`` below
-    (different grounded patterns mapping to the same ``ENV_TRANSIENT``
-    category, exactly like how ``DISK_FULL`` above is produced by this same
-    tool-blind guard rather than any per-tool table) — this does not violate
-    Invariant C1, which forbids duplicating the SAME pattern across per-tool
-    tables, not a category being reachable from more than one guard.
+    ``test_enospc_with_unreadable_lock_stays_disk_full``) — but BEFORE the
+    looser SEMAPHORE_TIMEOUT lock+timeout heuristic (task 2831 reorder — see
+    the ORDERING note above) — and wins over per-tool dispatch regardless of
+    ``ToolKind``. This source is DISTINCT from the pytest-scoped shared-venv
+    ``_ENV_TRANSIENT_PATTERNS`` below (different grounded patterns mapping to
+    the same ``ENV_TRANSIENT`` category, exactly like how ``DISK_FULL`` above
+    is produced by this same tool-blind guard rather than any per-tool
+    table) — this does not violate Invariant C1, which forbids duplicating
+    the SAME pattern across per-tool tables, not a category being reachable
+    from more than one guard.
+
+    ENV_TRANSIENT — merge-verify restart collateral (task 2831): a WIDER
+    class of the same broken-``_merge-verify``-worktree host condition,
+    grounded in the reify merge-gate RCA (2026-07-19) — five documented
+    shapes (``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``) emitted when the
+    ephemeral worktree is removed out from under a running verify: a
+    read-failure of some other tracked file, a missing ``verify.sh``
+    entrypoint, a failure to write captured output back into the worktree, a
+    shell-init ``getcwd`` failure, and the anticipatory ``=== INTERRUPTED
+    (worktree removed) ===`` marker (reify 5261). Checked alongside the
+    ``_VERIFY_ENV_BROKEN_RE`` Cargo.lock check immediately above, with the
+    identical ordering placement (see the ORDERING note above): after
+    DISK_FULL/ENOSPC, before SEMAPHORE_TIMEOUT.
+
+    Shape-1 rustc-diagnostic veto (task 2831 review): the shape-1 read-failure
+    text — "couldn't read <path>: No such file or directory" — is also
+    rustc's OWN verbatim wording for a genuine branch fault (a
+    ``#[path = "..."]`` attribute pointing at a file the branch forgot to
+    add), so shape-1 alone additionally requires the ABSENCE of a rustc/
+    clippy diagnostic span-pointer line (``_RUSTC_DIAGNOSTIC_SPAN_RE``, e.g.
+    " --> src/lib.rs:3:1") anywhere in *output* — rustc always renders that
+    span alongside a location-tied diagnostic, but a guard/shell script's
+    worktree-removal read failure never does. Shapes 2-5 need no such veto:
+    their anchors (the ``verify.sh`` entrypoint token, the ``_merge-verify``
+    path token, bash's ``getcwd`` phrase, and the literal INTERRUPTED marker)
+    are not plausible rustc/clippy output.
+
+    Known gap (task 2831 review, narrower successor to the task-2748/2821 gap
+    above): the rustc-diagnostic veto only disambiguates rustc's OWN
+    "couldn't read" phrasing. A non-rustc tool or guard script that happens
+    to emit the identical "<read verb> ... No such file or directory" text
+    for a genuine branch-caused missing file (not caused by worktree removal)
+    is still indistinguishable from host collateral by text alone and would
+    still misclassify ENV_TRANSIENT — closing that fully general case would
+    need a positive worktree-removal anchor on shape-1 itself, which is not
+    grounded in any observed sample today (see plan.json's grounding
+    discipline note); left as a residual, accepted gap until a real
+    grounded false-positive sample of that shape is observed.
     """
     lower = output.lower()
     if any(marker in lower for marker in _ENOSPC_MARKERS):
         return FailureCategory.DISK_FULL
     if _LINKER_CONTEXT_RE.search(output) and _LINKER_SIGNAL_RE.search(output):
         return FailureCategory.DISK_FULL
+    if _VERIFY_ENV_BROKEN_RE.search(output):
+        return FailureCategory.ENV_TRANSIENT
+    if _VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE.search(
+        output
+    ) and not _RUSTC_DIAGNOSTIC_SPAN_RE.search(output):
+        return FailureCategory.ENV_TRANSIENT
+    if any(pattern.search(output) for pattern in _VERIFY_WORKTREE_COLLATERAL_PATTERNS):
+        return FailureCategory.ENV_TRANSIENT
     if (
         _LOCK_TOKEN_RE.search(output)
         and _TIMEOUT_TOKEN_RE.search(output)
@@ -357,8 +491,6 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         and not _has_deterministic_test_verdict(output)
     ):
         return FailureCategory.SEMAPHORE_TIMEOUT
-    if _VERIFY_ENV_BROKEN_RE.search(output):
-        return FailureCategory.ENV_TRANSIENT
     return None
 
 
