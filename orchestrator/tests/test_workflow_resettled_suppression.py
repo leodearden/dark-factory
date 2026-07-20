@@ -287,6 +287,9 @@ class TestSuppressResettledSuggestions:
         )
         reviews = self._agg([s0, s1], blocking=[blk], has_blocking=True)
         out = await wf._suppress_resettled_suggestions(reviews, 1)
+        assert wf._adjudicate_resettled.await_args is not None, (
+            'adjudicator was never awaited'
+        )
         passed_current = wf._adjudicate_resettled.await_args.args[0]
         assert passed_current == [s0, s1]
         assert blk not in passed_current
