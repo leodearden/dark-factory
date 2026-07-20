@@ -105,6 +105,8 @@ class TestDecideAdopt:
         assert decision.non_inferior is True
         assert decision.cheaper is True
         # The two rows are exposed for the report renderer / operator.
+        assert decision.incumbent_row is not None
+        assert decision.candidate_row is not None
         assert decision.incumbent_row['config'] == 'judge-sonnet'
         assert decision.candidate_row['config'] == 'judge-haiku'
         assert decision.incumbent == 'judge-sonnet'

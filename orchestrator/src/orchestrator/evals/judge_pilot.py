@@ -301,9 +301,9 @@ def format_judge_ofat_report(
     lines.append('')
     if d.verdict == 'adopt':
         lines.append(
-            f'RECOMMENDATION: adopt — flip models.judge: sonnet -> haiku in '
-            f'orchestrator.yaml, reload_config, watch the δ/2534 rollup a fixed '
-            f'window for haiku judge rows, then persist to defaults.yaml.',
+            'RECOMMENDATION: adopt — flip models.judge: sonnet -> haiku in '
+            'orchestrator.yaml, reload_config, watch the δ/2534 rollup a fixed '
+            'window for haiku judge rows, then persist to defaults.yaml.',
         )
     else:
         lines.append(
