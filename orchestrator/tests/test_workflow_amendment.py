@@ -429,3 +429,53 @@ class TestPostAmendmentReviewWiring:
         scope_args = scope_mock.await_args.args
         assert scope_args[0] is round1  # scoped the round-1 verdict
         assert scope_args[1] is review_ctx  # with the consume-once ctx
+
+
+# ---------------------------------------------------------------------------
+# task 2640 — Source 2: amendment out-of-scope complement routed at the source
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAmendmentOutOfScopeRouting:
+    """`_execute_verify_review_loop` files THIS round's out-of-scope complement.
+
+    When an amendment fires, the in-scope suggestions are applied by ``_amend``
+    but the out-of-scope complement of the SAME round's suggestions was
+    previously dropped (task 2750 only recovered it downstream IF a re-review
+    repeated it as out-of-delta).  Task 2640 files that complement to the
+    curator deterministically, at the source, BEFORE ``_amend`` — so follow-up
+    work is captured even if the in-scope amendment later escalates.
+    """
+
+    async def test_out_of_scope_complement_routed_once_to_curator(self, tmp_path):
+        call_order: list[str] = []
+        in_scope = _sugg('src/foo.py:15')       # normalizes to 'src' → in-scope
+        out_of_scope = _sugg('other/bar.py:5')  # 'other' → out of scope
+        round0 = _nonblocking_reviews([in_scope, out_of_scope])
+        round1 = _nonblocking_reviews([])        # nothing in-scope → DONE
+        wf = _make_loop_workflow(
+            tmp_path, round0=round0, round1=round1, call_order=call_order,
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+
+        # The in-scope suggestion drives exactly one amendment; only it is
+        # passed to _amend (the out-of-scope one is NOT amended).
+        amend_mock = cast(AsyncMock, wf._amend)
+        amend_mock.assert_awaited_once()
+        assert amend_mock.await_args is not None
+        assert amend_mock.await_args.args[0] == [in_scope]
+
+        # The out-of-scope complement is routed to the curator EXACTLY ONCE, as
+        # a non-blocking ReviewAggregation carrying only that suggestion (parent
+        # linkage / priority / dedup all come from _route_review_suggestions_to_curator).
+        route_mock = cast(AsyncMock, wf._route_review_suggestions_to_curator)
+        route_mock.assert_awaited_once()
+        assert route_mock.await_args is not None
+        routed = route_mock.await_args.args[0]
+        assert isinstance(routed, ReviewAggregation)
+        assert routed.suggestions == [out_of_scope]
+        assert routed.has_blocking_issues is False
