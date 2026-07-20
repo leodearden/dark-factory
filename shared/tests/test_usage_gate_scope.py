@@ -48,7 +48,7 @@ class TestScopedCapModelsConfig:
     def test_rejects_non_list(self):
         # An int is unambiguously not a list[str] — pydantic must reject it.
         with pytest.raises(pydantic.ValidationError):
-            UsageCapConfig(scoped_cap_models=123)
+            UsageCapConfig(scoped_cap_models=123)  # type: ignore[arg-type]
 
 
 class TestScopeCapState:
