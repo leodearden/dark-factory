@@ -18,6 +18,7 @@ session, so a bare-glob ``df-verify-*.scope`` sweep would reap a sibling
 project's LIVE in-flight verify scope. Embedding a per-project tag confines
 each orchestrator's sweep to its own leftovers.
 """
+import logging
 import re
 from pathlib import Path
 
@@ -173,6 +174,64 @@ class TestReapLeftoverVerifyScopes:
         )
         # (d) returns the reaped names.
         assert reaped == [unit_a, unit_b], reaped
+
+    @pytest.mark.asyncio
+    async def test_surviving_scope_is_not_reported_and_is_warned(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """A scope still ACTIVE after the reap attempt is CONFIRMED not gone:
+        it is NOT returned as reaped and is surfaced loudly at WARNING, rather
+        than being silently over-reported as reaped (a best-effort
+        ``_kill_cgroup_scope`` can leave a genuinely un-killable scope alive)."""
+        tag = verify._scope_tag_for(tmp_path)
+        dead = f'df-verify-{tag}-dead000dead0.scope'
+        alive = f'df-verify-{tag}-alive0alive0.scope'
+        listing = (
+            f'{dead} loaded active running Verify dead\n'
+            f'{alive} loaded active running Verify alive\n'
+        )
+
+        class _FakeProc:
+            def __init__(self, stdout: bytes) -> None:
+                self._stdout = stdout
+
+            async def communicate(self):
+                return (self._stdout, b'')
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            if 'list-units' in args:
+                return _FakeProc(listing.encode())
+            if 'is-active' in args:
+                # `alive` stays active (the reap did not take); `dead` is gone.
+                return _FakeProc(b'active\n' if args[-1] == alive else b'inactive\n')
+            return _FakeProc(b'')  # kill / stop
+
+        monkeypatch.setattr(
+            'orchestrator.verify.asyncio.create_subprocess_exec', fake_exec,
+        )
+        monkeypatch.setattr(
+            'orchestrator.verify.shutil.which', lambda name: f'/usr/bin/{name}',
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            reaped = await verify.reap_leftover_verify_scopes(tmp_path)
+
+        # Only the CONFIRMED-gone scope is reported reaped.
+        assert reaped == [dead], reaped
+        assert alive not in reaped
+        # The survivor is surfaced loudly; the reaped one is not warned about.
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(alive in m for m in warnings), (
+            f'expected a WARNING naming the surviving scope {alive!r}; got {warnings}'
+        )
+        assert all(dead not in m for m in warnings), (
+            f'a confirmed-reaped scope must not be warned about; got {warnings}'
+        )
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_systemctl_absent(

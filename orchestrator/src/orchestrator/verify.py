@@ -2743,6 +2743,31 @@ async def _kill_cgroup_scope(unit: str) -> None:
                 await asyncio.wait_for(p.wait(), 10)
 
 
+async def _scope_is_gone(unit: str) -> bool:
+    """Best-effort liveness probe: ``True`` iff ``systemctl --user is-active``
+    reports *unit* is no longer active (``inactive`` / ``failed`` / unknown),
+    ``False`` if it is still ``active`` (or mid-transition).
+
+    Used by :func:`reap_leftover_verify_scopes` to CONFIRM a reap rather than
+    assume it: :func:`_kill_cgroup_scope` is best-effort and can leave a
+    genuinely un-killable scope alive, so a startup crash-recovery sweep must
+    verify before it reports a scope reaped.  Fully fail-soft — if the probe
+    itself cannot be run (systemctl absent, timeout, manager fault) it returns
+    ``True`` (assume gone) so the sweep degrades no worse than the previous
+    unconditional behaviour and a systemd fault never blocks startup.
+    """
+    with contextlib.suppress(Exception):
+        p = await asyncio.create_subprocess_exec(
+            'systemctl', '--user', 'is-active', unit,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(p.communicate(), 10)
+        state = out.decode('utf-8', 'replace').strip() if out else ''
+        return state not in ('active', 'activating', 'deactivating')
+    return True
+
+
 async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     """Stop THIS project's leftover transient verify-scope units at startup.
 
@@ -2750,7 +2775,10 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     ``df-verify-{tag}-{uuid}.scope`` whose processes keep running (the
     controller died but the scope's cgroup subtree — bash → cargo → rustc —
     lives on).  Run once before the first dispatch, this sweep enumerates and
-    reaps ONLY this project's leftovers, returning the reaped unit names.
+    reaps ONLY this project's leftovers, returning the names of the scopes
+    CONFIRMED gone after the reap.  A scope that survives the reap attempt (a
+    genuinely un-killable, still-``active`` unit) is NOT returned and is logged
+    loudly at WARNING, rather than being silently over-reported as reaped.
 
     Cross-project safety: every ``orchestrator-*.service`` unit shares ONE
     per-user ``systemctl --user`` session, so ``df-verify-*.scope`` is a single
@@ -2782,6 +2810,7 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
         listing = out.decode('utf-8', 'replace') if out else ''
     keep = re.compile(rf'^df-verify-{re.escape(tag)}-.*\.scope$')
     reaped: list[str] = []
+    survivors: list[str] = []
     for line in listing.splitlines():
         parts = line.split()
         if not parts:
@@ -2791,9 +2820,24 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
         # regardless of any surprise in systemctl glob semantics.
         if not keep.match(unit):
             continue
-        with contextlib.suppress(Exception):
-            await _kill_cgroup_scope(unit)
-        reaped.append(unit)
+        # `_kill_cgroup_scope` already suppresses every systemctl failure
+        # internally and never raises an Exception, so no outer suppress is
+        # needed here (it would be dead code).  CONFIRM the reap before
+        # reporting it: a best-effort kill can leave a genuinely un-killable
+        # scope alive, so only count a unit as reaped once it is verified gone
+        # and surface any survivor LOUDLY instead of over-reporting success.
+        await _kill_cgroup_scope(unit)
+        if await _scope_is_gone(unit):
+            reaped.append(unit)
+        else:
+            survivors.append(unit)
+    if survivors:
+        logger.warning(
+            'Verify-scope reaper: %d leftover scope(s) survived the reap '
+            'attempt and are STILL ACTIVE (manual cleanup may be needed): %s',
+            len(survivors),
+            ', '.join(survivors),
+        )
     return reaped
 
 
