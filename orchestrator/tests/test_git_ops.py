@@ -7511,6 +7511,37 @@ class TestCreateWorktreeWarmLaneRouting:
             f'Cold dir {cold_path} must NOT be created on pool exhaustion'
         )
 
+    async def test_reseed_contaminated_raises_no_cold_fallback(
+        self, git_repo: Path,
+    ):
+        """A RESEED_CONTAMINATED acquire (task 2854) maps to
+        WarmLaneReseedContaminated (a WarmLaneRequeue) so the task requeues to
+        re-acquire a DIFFERENT lane — NOT a generic RuntimeError, and NOT a
+        cold-path fall-through onto the contaminated content."""
+        from unittest.mock import AsyncMock
+
+        from orchestrator.git_ops import (
+            WarmLaneReseedContaminated,
+            WarmLaneUnavailable,
+        )
+        await _add_warm_lane_scripts(git_repo)
+        config = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False, warm_lane_pool=True,
+        )
+        git_ops = GitOps(config, git_repo, warm_lane_pool_size=1)
+
+        cold_path = git_ops.worktree_base / 'B'
+        with patch.object(
+            git_ops, 'acquire_warm_lane',
+            AsyncMock(return_value=WarmLaneUnavailable.RESEED_CONTAMINATED),
+        ):
+            with pytest.raises(WarmLaneReseedContaminated):
+                await git_ops.create_worktree('B')
+        assert not cold_path.exists(), (
+            f'Cold dir {cold_path} must NOT be created on reseed contamination'
+        )
+
     async def test_knob_off_cold_path_unchanged(
         self, git_ops: GitOps,
     ):
