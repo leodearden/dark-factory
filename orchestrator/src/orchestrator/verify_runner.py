@@ -1397,6 +1397,41 @@ def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# merge_verify event honesty — retry-scope fields (task 2837, PRD D5)
+# ---------------------------------------------------------------------------
+
+
+def retry_scope_event_fields(verify_env: Mapping[str, str]) -> dict[str, Any]:
+    """Derive the merge_verify event's retry-scope fields from ``verify_env``.
+
+    Source-of-truth rationale (task 2837, PRD verify-retry-failed-only §D5):
+    the authoritative record of whether a post-merge verify ran under the D2
+    failed-only NARROWED retry contract is ``spec.verify_env`` — the env the
+    orchestrator ITSELF built and shipped to reify (merge_queue.
+    _build_retry_verify_env) — NOT a reify stdout marker (no such marker exists
+    or is parsed anywhere in the tree, and VerifyResult carries no retry-scope
+    field).  Recording the orchestrator-selected scope keeps the event honest
+    (INV-2 structured-facts-at-failure) and deterministically GREENable without
+    a cross-project reify capability.
+
+    Returns a dict with two ALWAYS-present keys (mirroring the depth/speculative
+    always-present convention, task 2340) so the survey's runtime mining
+    (milestone 5254) reads a uniform ``data.get('retry_scope')`` with no
+    per-event schema branching:
+      - ``retry_scope``: ``None`` for a full/legacy verify (no
+        REIFY_VERIFY_RETRY_SCOPE='failed_only'); ``'failed_only'`` for a
+        narrowed retry.  ``None`` is unambiguously "full green gate", so a
+        narrowed retry is never miscounted as one.
+      - ``retry_subset_sizes``: ``None`` unless narrowed; otherwise a nested
+        dict of the per-suite subset sizes.
+    """
+    if verify_env.get('REIFY_VERIFY_RETRY_SCOPE') != 'failed_only':
+        return {'retry_scope': None, 'retry_subset_sizes': None}
+    # Narrowed failed-only retry — per-suite subset sizes computed in step-4/6.
+    return {'retry_scope': 'failed_only', 'retry_subset_sizes': None}
+
+
+# ---------------------------------------------------------------------------
 # VerifyRunnerPool
 # ---------------------------------------------------------------------------
 
