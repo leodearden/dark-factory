@@ -1818,6 +1818,8 @@ async def _run_post_merge_verify(
     enospc_retries: dict[str, int],
     max_timeouts: int,
     max_enospc: int,
+    max_narrowed: int = 1,
+    narrowed_retries: dict[str, int] | None = None,
     event_store: EventStore | None = None,
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
@@ -1847,6 +1849,20 @@ async def _run_post_merge_verify(
     ``'Verification error: ...'`` outcome.
 
     Args:
+        max_narrowed: Budget for the classified-infra-transient retry loop
+            (task 2835) when this call's failed-only retry was actually
+            NARROWED (the D2 producer merged ``retry_env`` — see
+            ``narrowed`` below).  Default ``1`` matches the legacy
+            single-retry behaviour, so every existing caller that omits
+            this param is byte-identical.  A non-narrowed retry (flag off,
+            or flag on but no sidecar yet) always uses ``max_enospc``
+            instead, regardless of this value.
+        narrowed_retries: Per-task counter dict for the narrowed budget
+            above, mirroring ``enospc_retries`` but DECOUPLED from it (an
+            earlier ENOSPC event never starves a narrowed retry, and vice
+            versa).  ``None`` (default) is normalized to a fresh, throwaway
+            ``{}`` local to this call — existing callers that omit this
+            param keep their legacy behaviour.
         on_result: Optional callback invoked with the final :class:`~orchestrator.verify.VerifyResult`
             BEFORE the pass/fail branch — additive, default ``None`` keeps
             every existing call site byte-identical.  Used by
@@ -1917,6 +1933,13 @@ async def _run_post_merge_verify(
             *merge_base_sha*; see above.  Both must be non-``None`` for
             classification to run.
     """
+    # Normalize the narrowed-budget counter dict once up front (task 2835):
+    # None (the default for every unmigrated caller) becomes a fresh,
+    # throwaway {} local to this call — mirrors how enospc_retries is always
+    # caller-supplied but keeps this one optional without a mutable default.
+    if narrowed_retries is None:
+        narrowed_retries = {}
+
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
     # infra rather than entering a doomed multi-minute ENOSPC build.
@@ -1960,6 +1983,12 @@ async def _run_post_merge_verify(
     # below AND task 2822's post-dispatch remote-green cross-check re-verify (which
     # reuses this same `spec`) — correct and desired: a failed-only retry's local
     # trust-anchor cross-check should scope to the same {did-not-pass} subset.
+    # narrowed (task 2835) tracks whether THIS call actually applied a
+    # narrowed retry_env below — the ONLY correct gate for the larger
+    # max_narrowed budget later.  req.retry_failed_only alone is NOT enough:
+    # until reify writes the attempt-0 sidecar, a flag-on retry is still a
+    # FULL re-verify and must keep the small legacy max_enospc budget.
+    narrowed = False
     if req.retry_failed_only:
         attempt0 = _load_attempt0_sidecar(merge_wt)
         if attempt0 is not None:
@@ -1968,6 +1997,7 @@ async def _run_post_merge_verify(
                 spec = dataclasses.replace(
                     spec, verify_env={**spec.verify_env, **retry_env}
                 )
+                narrowed = True
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
@@ -2090,16 +2120,37 @@ async def _run_post_merge_verify(
         # retry chance (see test_classified_infra_transient_zero_retry_after_
         # shared_budget_exhausted in test_merge_queue.py).
         elif not verify.passed and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
-            prior_infra = enospc_retries.get(req.task_id, 0)
-            if prior_infra < max_enospc:
-                enospc_retries[req.task_id] = prior_infra + 1
+            # task 2835: a NARROWED (failed-only) retry — this call's D2
+            # producer actually merged retry_env, above — earns its own
+            # SEPARATE, larger budget (max_narrowed/narrowed_retries),
+            # decoupled from the legacy enospc_retries/max_enospc budget so
+            # an unrelated prior ENOSPC event can never starve it.  A
+            # non-narrowed retry (flag off, or flag on but no sidecar yet)
+            # keeps sharing the legacy budget, byte-identical to before this
+            # task (both are 1 in production today, so this loop performs
+            # exactly one retry either way until reify's sidecar lands).
+            retries, budget = (
+                (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
+            )
+            # The loop condition RE-CHECKS infra-category membership on every
+            # iteration (INV-4 storm-escape): a retry whose fresh category
+            # flips to a deterministic red (e.g. test_failure) exits
+            # immediately regardless of remaining budget, and falls through
+            # to the generic-block path below — never the transient-infra
+            # hold, never another retry.
+            while (
+                not verify.passed
+                and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES
+                and retries.get(req.task_id, 0) < budget
+            ):
+                retries[req.task_id] = retries.get(req.task_id, 0) + 1
                 logger.warning(
                     'Task %s: post-merge verify classified infra-transient '
-                    '(category=%s); retrying verify once',
-                    req.task_id, verify.category,
+                    '(category=%s); retrying verify (attempt=%d, budget=%d, narrowed=%s)',
+                    req.task_id, verify.category, retries[req.task_id], budget, narrowed,
                 )
                 verify = await pool.dispatch(
-                    merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
+                    merge_sha, spec, attempt=retries[req.task_id], depth=depth, speculative=speculative,
                 )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
@@ -3879,11 +3930,17 @@ class _TrainMergeHost(Protocol):
     # ── Per-task counters (mutated by shared helpers) ─────────────────────
     _post_merge_verify_timeouts: dict[str, int]
     _post_merge_verify_enospc_retries: dict[str, int]
+    # Per-task NARROWED (failed-only) classified-infra-transient retry
+    # counter (task 2835) — decoupled from _post_merge_verify_enospc_retries
+    # above so an unrelated prior ENOSPC event never starves a narrowed
+    # retry's separate, larger budget.
+    _post_merge_verify_narrowed_retries: dict[str, int]
     _cas_retries: dict[str, int]
 
     # ── Class-level thresholds ────────────────────────────────────────────
     MAX_POST_MERGE_VERIFY_TIMEOUTS: int
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int
+    MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int
 
     # ── WIP halt / abandon helpers ────────────────────────────────────────
     def halt_for_wip(self, reason: str) -> None: ...
@@ -4875,6 +4932,8 @@ async def _do_train_merge(
         enospc_retries=worker._post_merge_verify_enospc_retries,
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+        max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+        narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=event_store,
         merge_sha=merge_commit,
     )
@@ -6348,6 +6407,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # escalating as transient infra.  Kept as a class attribute so tests can
     # monkeypatch it.
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
+    # Budget for the SEPARATE, narrowed (failed-only) classified-infra-
+    # transient retry loop (task 2835) — decoupled from the ENOSPC budget
+    # above so it is affordable to make larger: a narrowed retry re-runs only
+    # the did-not-pass subset (cheap per retry), unlike the ENOSPC budget
+    # which bounds a full re-verify.  Inert in production until reify writes
+    # the attempt-0 sidecar the D2 producer (_run_post_merge_verify) needs to
+    # actually narrow a retry — until then every retry_failed_only=True
+    # request still falls back to the small MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES
+    # budget.  Kept as a class attribute so tests can monkeypatch it.
+    MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int = 2
     # Poll interval (seconds) used in the _verify_and_advance abort-loop that
     # checks whether a sole-waiter detach() cancelled req.result mid-verify.
     # Default ~10 s is negligible over a 10-40 min verify; kept as a class
@@ -6593,6 +6662,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # class constant (see the Protocol above).  Persists across
         # submissions, reset on a successful CAS advance.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
+        # Per-task NARROWED (failed-only) classified-infra-transient retry
+        # counter (task 2835) — separate budget from the ENOSPC counter
+        # above, decoupled so an earlier unrelated ENOSPC event never
+        # starves it; see MAX_POST_MERGE_VERIFY_NARROWED_RETRIES.
+        self._post_merge_verify_narrowed_retries: dict[str, int] = {}
         # γ2 per-branch generation auto-chain counter, bounded by the
         # module-level MAX_AUTO_CHAINED_GENERATIONS.  Incremented on each
         # consecutive tip-advance equivalence failure; popped on a clean
@@ -12545,6 +12619,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 enospc_retries=self._post_merge_verify_enospc_retries,
                 max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
                 max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+                max_narrowed=self.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
+                narrowed_retries=self._post_merge_verify_narrowed_retries,
                 event_store=self._event_store,
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
