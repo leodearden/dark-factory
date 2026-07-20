@@ -87,6 +87,27 @@ def _load_corpus():
     return CorpusManifest.load(_CORPUS_PATH)
 
 
+def _select_original_corpus(manifest: CorpusManifest) -> CorpusManifest:
+    """Return a new manifest of just the original hand-authored (non-mined) diffs.
+
+    Task 2495's FN-mining grew the on-disk manifest to 53 diffs (12 synthetic
+    + 3 real_world + 38 mined). The eval-revival κ refresh (task 2476) is
+    scoped to the original NON-mined 15 (source in {synthetic, real_world}) to
+    stay apples-to-apples with the Apr-8 1×Opus trial and to bound live-run
+    cost. version/split_seed are carried over unchanged.
+    """
+    from .corpus import CorpusManifest
+
+    return CorpusManifest(
+        diffs=[
+            *manifest.filter_by_source('synthetic'),
+            *manifest.filter_by_source('real_world'),
+        ],
+        version=manifest.version,
+        split_seed=manifest.split_seed,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI group
 # ---------------------------------------------------------------------------
