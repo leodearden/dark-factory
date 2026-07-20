@@ -326,3 +326,31 @@ async def test_blast_radius_expansion_invoked_when_files_grow(tmp_path: Path):
     outcome = await f.wf._run_simple_task()
     assert outcome == WorkflowOutcome.PLANNED
     f.handle_blast_radius_expansion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_should_run_simple_task_true_for_clean_simple_task(tmp_path: Path):
+    """The extracted SIMPLE_TASK gate returns True for a clean author-declared
+    simple task: no initial_plan, simple_task_enabled, no auto_eval_redo /
+    force_full_path / hard-blocker, and NOT saturated."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={'complexity': 'simple'},
+    )
+    f.wf.initial_plan = None
+
+    assert f.wf._should_run_simple_task() is True
+
+
+@pytest.mark.asyncio
+async def test_should_run_simple_task_false_when_saturated(tmp_path: Path):
+    """Once ``metadata.routing.simple_saturated`` is stamped (task ν), the gate
+    returns False even for an otherwise-clean simple task — the demonstrated-
+    wrong label is not re-trusted, so the full architect path runs."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={'complexity': 'simple', 'routing': {'simple_saturated': True}},
+    )
+    f.wf.initial_plan = None
+
+    assert f.wf._should_run_simple_task() is False
