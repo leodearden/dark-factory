@@ -2381,9 +2381,11 @@ class TestInvokeFnParameter:
         detect_calls: list[str] = []
         orig_detect = gate.detect_cap_hit
 
-        def spy(stderr, result_text, backend='claude', oauth_token=None):
+        def spy(stderr, result_text, backend='claude', oauth_token=None, scope=None):
             detect_calls.append(backend)
-            return orig_detect(stderr, result_text, backend, oauth_token=oauth_token)
+            return orig_detect(
+                stderr, result_text, backend, oauth_token=oauth_token, scope=scope,
+            )
 
         gate.detect_cap_hit = spy  # type: ignore[assignment]
 

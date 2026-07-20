@@ -297,12 +297,23 @@ class InvokeSlot:
         # any other exit: __aexit__ calls release_probe_slot
     """
 
-    __slots__ = ('_gate', 'lease', '_settled')
+    __slots__ = ('_gate', 'lease', '_settled', 'scope')
 
-    def __init__(self, gate: UsageGate, lease: AccountLease | None) -> None:
+    def __init__(
+        self,
+        gate: UsageGate,
+        lease: AccountLease | None,
+        scope: str | None = None,
+    ) -> None:
         self._gate = gate
         self.lease = lease
         self._settled = False
+        # Cap scope for this invocation (PRD task β): the invoked model when it
+        # is a scoped-cap model, else None (the general scope). `report` /
+        # `detect_cap_hit` forward it to the gate's cap handlers so a scoped
+        # CapHit attributes to only this account's model-scope. β does NOT use
+        # it for account selection — that is γ (task 2857).
+        self.scope = scope
 
     @property
     def token(self) -> str | None:
@@ -326,9 +337,13 @@ class InvokeSlot:
         output: str,
         backend: str = 'claude',
     ) -> bool:
-        """Proxy to ``UsageGate.detect_cap_hit``; auto-settles on True."""
+        """Proxy to ``UsageGate.detect_cap_hit``; auto-settles on True.
+
+        Forwards ``self.scope`` (PRD task β) so a scoped cap detected here
+        attributes to only this account's model-scope.
+        """
         hit = self._gate.detect_cap_hit(
-            stderr, output, backend, oauth_token=self.token,
+            stderr, output, backend, oauth_token=self.token, scope=self.scope,
         )
         if hit:
             self._settled = True
@@ -367,12 +382,14 @@ class InvokeSlot:
         - OK -> ``confirm_account_ok`` (PROBE_IN_FLIGHT -> AVAILABLE; clears
           ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
           stays a caller concern (``confirm()`` / ``on_agent_complete``).
-        - CapHit -> ``_handle_cap_detected`` (-> CAPPED).
+        - CapHit -> ``_handle_cap_detected`` (-> CAPPED), forwarding
+          ``self.scope`` (PRD task β): a scoped cap attributes to only this
+          account's model-scope and leaves the account phase AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
-          guard).
-        - NearCap -> ``_handle_near_cap_warning`` (annotation only), then
-          ``release_probe_slot``.
+          guard). Scope-blind.
+        - NearCap -> ``_handle_near_cap_warning`` (annotation only, forwarding
+          ``self.scope``), then ``release_probe_slot``.
         - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
           ``release_probe_slot`` only; no phase change.
 
@@ -401,11 +418,13 @@ class InvokeSlot:
             if isinstance(outcome, OK):
                 self._gate.confirm_account_ok(token)
             elif isinstance(outcome, CapHit):
-                self._gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                self._gate._handle_cap_detected(
+                    outcome.reason, outcome.resets_at, token, scope=self.scope,
+                )
             elif isinstance(outcome, AuthFailed):
                 self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
             elif isinstance(outcome, NearCap):
-                self._gate._handle_near_cap_warning(outcome.reason, token)
+                self._gate._handle_near_cap_warning(outcome.reason, token, scope=self.scope)
                 self._gate.release_probe_slot(token)
             else:
                 self._gate.release_probe_slot(token)
@@ -771,13 +790,19 @@ class UsageGate:
             await self._open.wait()
 
     @contextlib.asynccontextmanager
-    async def invoke_slot(self):
+    async def invoke_slot(self, scope: str | None = None):
         """Acquire an account slot, releasing the probe lock on any exit path.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
         (returning True) nor :meth:`~InvokeSlot.confirm` was called,
         ``release_probe_slot`` runs as a safety net.
+
+        *scope* (PRD task β) is stored on the yielded slot (``slot.scope``) and
+        forwarded by ``report`` / ``detect_cap_hit`` into the cap handlers so a
+        scoped cap attributes to only this account's model-scope. β does not use
+        it for account *selection* (that is γ, task 2857) — ``before_invoke``
+        is unchanged.
 
         Usage::
 
@@ -791,7 +816,7 @@ class UsageGate:
                 # any other exit path (continue, exception): auto-released
         """
         lease = await self.before_invoke()
-        slot = InvokeSlot(self, lease)
+        slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot
         finally:
