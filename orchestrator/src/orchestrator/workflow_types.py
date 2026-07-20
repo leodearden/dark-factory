@@ -237,6 +237,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         InteractiveWorktreeLimitError,
         MergeParkContentionError,
         MergeParkError,
+        MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
         WarmLaneDiskPressure,
         WarmLanePoolExhausted,
@@ -426,6 +427,19 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='merge_verify_lease_held',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # A contended merge-verify lease (task 2828) is transient "come back
+        # later," identical in shape to MergeVerifyLeaseHeld above: REQUEUE,
+        # never escalates, never counts against the requeue cap. Raised by
+        # GitOps.merge_verify_lease and requeued by the merge worker's
+        # _run_inflight_verify (BD-2 forces this explicit row).
+        MergeVerifyLeaseContended: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='merge_verify_lease_contended',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         IllegalTransitionError: BlockDisposition(
