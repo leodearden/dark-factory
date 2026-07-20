@@ -45,6 +45,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # (server/near_duplicate_guard.py), same live-read path as the guard flag
     # above — reload-safe for the same reason.
     'reconciliation.procedural_knowledge_near_dup_threshold',
+    # Read live per add_memory write by resolve_topic_guard_clusters
+    # (server/near_duplicate_guard.py) off the shared
+    # memory_service.config.reconciliation object — the resolver re-reads the
+    # list on every call, so an in-place reload adds/tunes topic clusters
+    # without a restart. Same live-read reload-safety path as the two near-dup
+    # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
+    # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
+    'reconciliation.procedural_knowledge_topic_guard_clusters',
 })
 
 
