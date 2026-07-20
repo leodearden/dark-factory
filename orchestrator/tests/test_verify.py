@@ -7039,6 +7039,78 @@ exit 0
         assert result is False
 
 
+class TestMergeConfigOnlyDiffForcesFullGate:
+    """Unit tests for the pure _merge_config_only_diff_forces_full_gate helper.
+
+    The deterministic dark-factory-side manifest-drift backstop (task 2838):
+    True iff any changed file matches any configured glob via
+    fnmatch.fnmatchcase (case-sensitive, OS-independent). Empty globs (the
+    default) → False in O(1), leaving the config-only fast-path unchanged.
+    """
+
+    def _config(self, globs):
+        from orchestrator.config import GitConfig
+
+        return OrchestratorConfig(
+            git=GitConfig(merge_config_only_full_gate_globs=globs),
+        )
+
+    def test_empty_globs_default_config_returns_false(self):
+        """Default OrchestratorConfig (empty globs) → False regardless of files."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = OrchestratorConfig()
+        assert config.git.merge_config_only_full_gate_globs == []
+        # Even a name that WOULD match a glob returns False when no globs set.
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/tests/new_case.sh'],
+        ) is False
+
+    def test_changed_file_matches_configured_glob_returns_true(self):
+        """A changed file matching a configured glob → True."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['*tests/*'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/tests/new_case.sh'],
+        ) is True
+
+    def test_globs_configured_but_no_file_matches_returns_false(self):
+        """Globs configured but no changed file matches → False."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['*tests/*', 'infra/*.sh'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/src/orchestrator/config.yaml', 'README.md'],
+        ) is False
+
+    def test_multiple_globs_only_second_matches_returns_true(self):
+        """Multiple globs, only the second matches → True."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['infra/*.sh', '*tests/*'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/tests/new_case.sh'],
+        ) is True
+
+    def test_empty_changed_files_with_globs_returns_false(self):
+        """Empty changed_files with non-empty globs → False."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['*tests/*'])
+        assert _merge_config_only_diff_forces_full_gate(config, []) is False
+
+    def test_fnmatchcase_is_case_sensitive(self):
+        """fnmatchcase: glob 'infra/*.SH' does NOT match 'infra/foo.sh'
+        (pin OS-independent case-sensitive behaviour)."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['infra/*.SH'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['infra/foo.sh'],
+        ) is False
+
+
 class TestMergeGuardNoModuleConfigs:
     """Integration: guard wires into the no-module_configs trivial-pass branch.
 
@@ -7148,6 +7220,150 @@ class TestMergeGuardNoModuleConfigs:
         assert 'No source files' in result.summary
 
 
+class TestMergeBackstopNoModuleConfigs:
+    """Integration: the manifest-drift backstop (task 2838) wires into the
+    no-module_configs trivial-pass branch.
+
+    Mirrors TestMergeGuardNoModuleConfigs, but DELIBERATELY omits the reify
+    guard script (so _verify_pipeline_guard_requires_full_gate falls open) and
+    instead configures merge_config_only_full_gate_globs, isolating the
+    deterministic backstop as the sole override trigger. The added config-only
+    file (tests/new_case.sh — .sh, so _has_source_files is False) matches the
+    configured glob.
+    """
+
+    def _write_case_sh(self, worktree: Path) -> None:
+        """Create tests/new_case.sh (config-only .sh under a manifest-relevant path)."""
+        tests_dir = worktree / 'tests'
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / 'new_case.sh').write_text('#!/usr/bin/env bash\n')
+
+    def _make_config(self, tmp_path: Path, globs=None) -> OrchestratorConfig:
+        from orchestrator.config import GitConfig
+
+        kwargs = {}
+        if globs is not None:
+            kwargs['git'] = GitConfig(merge_config_only_full_gate_globs=globs)
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__scope_all_cmd__',
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches + role='merge' + NO guard script (consult falls
+        open) → trivial-pass overridden by the backstop; global test command runs."""
+        self._write_case_sh(tmp_path)
+        # Deliberately NO guard script → _verify_pipeline_guard_requires_full_gate
+        # falls open; the backstop is the sole override trigger.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*']),
+                [],
+                task_files=['tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected full-gate test command in calls; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass overridden by backstop; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_task_role_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches but role='task' (default) → trivial pass
+        preserved (backstop is role-gated to merge)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*']),
+                [],
+                task_files=['tests/new_case.sh'],
+                # role='task' is the default
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run for task role; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_empty_globs_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Empty globs (default) + role='merge' + NO guard script → trivial pass
+        preserved (backward-compat no-op: backstop False, consult falls open)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),  # default empty globs
+                [],
+                task_files=['tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run with empty globs; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_deleted_matching_file_merge_overrides_trivial_pass(
+        self, tmp_path: Path, guard_spy,
+    ):
+        """A DELETED manifest-relevant path forces the full gate too (reviewer
+        amendment, task 2838).
+
+        The deleted file (tests/deleted_case.sh) is present in task_files but
+        NOT on disk, so it is excluded from existing_files; a present,
+        non-source, non-matching config file (scripts/deploy.sh) keeps
+        existing_files non-empty, mirroring a realistic config-only diff.
+        role='merge', NO guard script (consult falls open) → the backstop still
+        overrides the trivial pass, because removing a file a manifest
+        enumerates shifts the manifest just as an addition does.
+        """
+        # Present, non-matching, non-source file → lands in existing_files.
+        scripts_dir = tmp_path / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / 'deploy.sh').write_text('#!/usr/bin/env bash\n')
+        # tests/deleted_case.sh deliberately NOT created → it is a deletion.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*']),
+                [],
+                task_files=['scripts/deploy.sh', 'tests/deleted_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            'Expected full-gate command when a manifest-relevant file is'
+            f' DELETED; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            'Expected trivial-pass overridden by backstop on deletion; got'
+            f' summary: {result.summary!r}'
+        )
+
+
 class TestMergeGuardModuleConfigs:
     """Integration: guard wires into the module_configs trivial-pass branch.
 
@@ -7236,6 +7452,151 @@ class TestMergeGuardModuleConfigs:
         assert result.passed
         assert calls == [], f'No commands should run when guard absent; got: {calls}'
         assert 'No source files' in result.summary
+
+
+class TestMergeBackstopModuleConfigs:
+    """Integration: the manifest-drift backstop (task 2838) wires into the
+    module_configs trivial-pass branch.
+
+    Mirrors TestMergeGuardModuleConfigs, but DELIBERATELY omits the reify guard
+    script (so _verify_pipeline_guard_requires_full_gate falls open) and
+    instead configures merge_config_only_full_gate_globs. The added config-only
+    file (orchestrator/tests/new_case.sh — .sh under a real subproject prefix,
+    so _has_source_files is False and scoped=[]) matches the configured glob;
+    an override routes to per-subproject fan-out.
+    """
+
+    def _write_case_sh(self, worktree: Path) -> None:
+        """Create orchestrator/tests/new_case.sh (config-only .sh under a subproject prefix)."""
+        tests_dir = worktree / 'orchestrator' / 'tests'
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / 'new_case.sh').write_text('#!/usr/bin/env bash\n')
+
+    def _make_config(self, tmp_path: Path, globs=None) -> OrchestratorConfig:
+        from orchestrator.config import GitConfig
+
+        kwargs = {}
+        if globs is not None:
+            kwargs['git'] = GitConfig(merge_config_only_full_gate_globs=globs)
+        return OrchestratorConfig(project_root=tmp_path, **kwargs)
+
+    def _module_configs(self) -> list[ModuleConfig]:
+        return [ModuleConfig(prefix='orchestrator', test_command='__orch_cmd__')]
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches + role='merge' + NO guard script (consult falls
+        open) → trivial-pass overridden by backstop; per-subproject fan-out runs."""
+        self._write_case_sh(tmp_path)
+        # Deliberately NO guard script → consult falls open; backstop is the
+        # sole override trigger.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*.sh']),
+                self._module_configs(),
+                task_files=['orchestrator/tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__orch_cmd__' in joined, (
+            f'Expected per-subproject fan-out command in calls; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass overridden by backstop; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_task_role_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches but role='task' (default) → trivial pass
+        preserved (backstop is role-gated to merge)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*.sh']),
+                self._module_configs(),
+                task_files=['orchestrator/tests/new_case.sh'],
+                # role='task' is the default
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run for task role; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_empty_globs_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Empty globs (default) + role='merge' + NO guard script → trivial pass
+        preserved (backward-compat no-op: backstop False, consult falls open)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),  # default empty globs
+                self._module_configs(),
+                task_files=['orchestrator/tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run with empty globs; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_deleted_matching_file_merge_overrides_trivial_pass(
+        self, tmp_path: Path, guard_spy,
+    ):
+        """A DELETED manifest-relevant path forces the full gate too (reviewer
+        amendment, task 2838).
+
+        The deleted file (orchestrator/tests/deleted_case.sh) is in task_files
+        but NOT on disk (excluded from existing_files); a present, non-source,
+        non-matching .sh under the same subproject prefix keeps existing_files
+        non-empty. role='merge', NO guard script → the backstop overrides the
+        trivial pass and per-subproject fan-out runs, because a deletion can
+        shift a manifest just as an addition can.
+        """
+        # Present, non-matching, non-source file under the subproject prefix.
+        scripts_dir = tmp_path / 'orchestrator' / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / 'deploy.sh').write_text('#!/usr/bin/env bash\n')
+        # orchestrator/tests/deleted_case.sh deliberately NOT created → deletion.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*.sh']),
+                self._module_configs(),
+                task_files=[
+                    'orchestrator/scripts/deploy.sh',
+                    'orchestrator/tests/deleted_case.sh',
+                ],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__orch_cmd__' in joined, (
+            'Expected per-subproject fan-out when a manifest-relevant file is'
+            f' DELETED; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            'Expected trivial-pass overridden by backstop on deletion; got'
+            f' summary: {result.summary!r}'
+        )
 
 
 @pytest.mark.asyncio

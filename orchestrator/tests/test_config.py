@@ -209,6 +209,42 @@ class TestDefaults:
         config2 = OrchestratorConfig(git=GitConfig(load_bearing_oracle_cmd=cmd))
         assert config2.git.load_bearing_oracle_cmd == cmd
 
+    def test_merge_config_only_full_gate_globs_defaults_empty(self):
+        """GitConfig.merge_config_only_full_gate_globs defaults to [] — the
+        manifest-drift backstop (task 2838) is a clean opt-in no-op until a
+        project declares its manifest-relevant globs (empty -> backstop
+        disabled, config-only fast-path unchanged)."""
+        from orchestrator.config import GitConfig
+
+        cfg = GitConfig()
+        assert cfg.merge_config_only_full_gate_globs == []
+
+    def test_merge_config_only_full_gate_globs_round_trips_list(self):
+        """An explicit list[str] of fnmatch globs round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        globs = ['*tests/*', 'infra/*.sh', '*.manifest']
+        cfg = GitConfig(merge_config_only_full_gate_globs=globs)
+        assert cfg.merge_config_only_full_gate_globs == globs
+
+    def test_merge_config_only_full_gate_globs_exposed_on_orchestrator_config_git(
+        self, monkeypatch, tmp_path,
+    ):
+        """OrchestratorConfig exposes the knob at
+        config.git.merge_config_only_full_gate_globs (default [])."""
+        from orchestrator.config import GitConfig
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.git.merge_config_only_full_gate_globs == []
+
+        globs = ['*tests/*', 'infra/*.sh']
+        config2 = OrchestratorConfig(
+            git=GitConfig(merge_config_only_full_gate_globs=globs),
+        )
+        assert config2.git.merge_config_only_full_gate_globs == globs
+
     def test_load_bearing_oracle_timeout_secs_defaults_60(self):
         """GitConfig.load_bearing_oracle_timeout_secs defaults to 60.0 —
         bounds the load-bearing oracle subprocess (task 2382) so a hung

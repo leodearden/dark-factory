@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import errno
+import fnmatch
 import json
 import logging
 import os
@@ -1863,6 +1864,47 @@ async def _verify_pipeline_guard_requires_full_gate(
             worktree, exc_info=True,
         )
         return False
+
+
+def _merge_config_only_diff_forces_full_gate(
+    config: OrchestratorConfig,
+    changed_files: list[str],
+) -> bool:
+    """Return True iff a config-only diff touches a manifest-relevant glob.
+
+    The deterministic dark-factory-side manifest-drift backstop (task 2838),
+    the local complement to the async remote
+    ``_verify_pipeline_guard_requires_full_gate`` consult above.  A merge-role
+    config-only (no .py/.rs) diff whose files match any configured glob forces
+    the full per-subproject verify gate EVEN WHEN the reify
+    verify-pipeline-guard.sh consult falls open — closing the fail-open
+    residual that let a config-only diff CAS-advance a new manifest-drift RED
+    onto main (incident deb-reify-964887, tasks 5247/5249).
+
+    Pure and synchronous (no subprocess, no git), so it cannot wedge the merge
+    pipeline and is trivially unit-testable.  Uses ``fnmatch.fnmatchcase`` —
+    case-sensitive and OS-independent (unlike ``fnmatch.fnmatch``, which
+    normalizes case per-OS); shell-glob ``*`` crosses ``/``, an intentional,
+    safe over-approximation (over-forcing the full gate is the safe direction,
+    under-forcing is the bug being closed).  The call sites pass the FULL
+    changed set (``task_files``) — added, modified, AND deleted paths — a safe
+    over-approximation of "adds files that shift the manifest": a modification
+    to a classification/manifest file shifts it too, and so does a DELETION of
+    a file the manifest enumerates (deleted paths are absent from the on-disk
+    ``existing_files`` the reify consult receives, so matching ``task_files``
+    here is what closes the deletion residual — reviewer amendment, task 2838).
+
+    Empty globs (the default,
+    ``config.git.merge_config_only_full_gate_globs``) short-circuit to False in
+    O(1), leaving the config-only fast-path byte-identical for dark-factory's
+    own merges and non-reify projects.
+    """
+    globs = config.git.merge_config_only_full_gate_globs
+    if not globs:
+        return False
+    return any(
+        fnmatch.fnmatchcase(f, g) for f in changed_files for g in globs
+    )
 
 
 def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
@@ -4817,15 +4859,27 @@ async def run_scoped_verification(
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
                     if not _has_source_files(existing_files):
-                        should_override = (
-                            role == 'merge'
-                            and await _verify_pipeline_guard_requires_full_gate(
+                        # Cheap deterministic backstop (task 2838) OR'd first so
+                        # it short-circuits the verify-pipeline-guard.sh
+                        # subprocess on the merge hot path; empty globs (default)
+                        # → False → expression byte-identical to guard-only.
+                        # The backstop matches the FULL changed set (task_files)
+                        # — including DELETED manifest-relevant paths, which are
+                        # absent from existing_files — because removing a file a
+                        # manifest enumerates shifts the manifest just as adding
+                        # one does (reviewer amendment, task 2838). The reify
+                        # consult keeps its existing on-disk existing_files
+                        # contract.
+                        should_override = role == 'merge' and (
+                            _merge_config_only_diff_forces_full_gate(config, task_files)
+                            or await _verify_pipeline_guard_requires_full_gate(
                                 worktree, existing_files,
                             )
                         )
                         if should_override:
                             logger.info(
-                                'config-only fast-path overridden by verify-pipeline-guard'
+                                'config-only fast-path overridden by manifest-drift'
+                                ' backstop or verify-pipeline-guard'
                                 ' — running full gate (module_configs merge path)',
                             )
                             # Fall through to per-subproject fan-out below.
@@ -4946,15 +5000,26 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                should_override = (
-                    role == 'merge'
-                    and await _verify_pipeline_guard_requires_full_gate(
+                # Cheap deterministic backstop (task 2838) OR'd first so it
+                # short-circuits the verify-pipeline-guard.sh subprocess on the
+                # merge hot path; empty globs (default) → False → expression
+                # byte-identical to the guard-only behaviour.
+                # The backstop matches the FULL changed set (task_files) —
+                # including DELETED manifest-relevant paths, which are absent
+                # from existing_files — because removing a file a manifest
+                # enumerates shifts the manifest just as adding one does
+                # (reviewer amendment, task 2838). The reify consult keeps its
+                # existing on-disk existing_files contract.
+                should_override = role == 'merge' and (
+                    _merge_config_only_diff_forces_full_gate(config, task_files)
+                    or await _verify_pipeline_guard_requires_full_gate(
                         worktree, existing_files,
                     )
                 )
                 if should_override:
                     logger.info(
-                        'config-only fast-path overridden by verify-pipeline-guard'
+                        'config-only fast-path overridden by manifest-drift'
+                        ' backstop or verify-pipeline-guard'
                         ' — running full gate (no-module_configs merge path)',
                     )
                     # Fall through to the existing global run_verification path.
