@@ -280,6 +280,61 @@ async def test_simple_task_max_turns_stamps_saturated(tmp_path: Path):
     # _invoke is stubbed so no _record_routing_decision write intervenes —
     # the stamp is the sole routing write.
     assert stamp_calls[0].args[0] == f.wf.task_id
+    # The persistence-independent in-memory flip is what makes the very next
+    # in-dispatch _should_run_simple_task read return False — assert it landed
+    # regardless of the (here-succeeding) scheduler write.
+    assert f.wf.task['metadata']['routing']['simple_saturated'] is True
+
+
+@pytest.mark.asyncio
+async def test_simple_task_max_turns_in_memory_stamp_survives_write_failure(
+    tmp_path: Path,
+):
+    """The saturation stamp is best-effort: when the merge-mode scheduler write
+    raises, ``_run_simple_task`` still returns REQUEUED (the exception is
+    swallowed inside ``_stamp_simple_saturated``, never propagated to crash the
+    fall-through to the architect) AND the persistence-independent in-memory
+    ``self.task['metadata']['routing']['simple_saturated']`` flip still lands —
+    so the very next in-dispatch gate read observes the retired label (task ν)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        invoke_outcome=_make_result(
+            success=False, subtype='error_max_turns', output='',
+        ),
+    )
+    # On the max_turns failure path the ONLY update_task call is the stamp
+    # write, so a blanket side_effect targets exactly that write.
+    f.update_task.side_effect = RuntimeError('scheduler write failed')
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    assert f.wf.task['metadata']['routing']['simple_saturated'] is True
+
+
+@pytest.mark.asyncio
+async def test_simple_task_max_turns_already_saturated_no_double_write(
+    tmp_path: Path,
+):
+    """``_stamp_simple_saturated`` is idempotent: when the task is ALREADY
+    saturated, a fresh max_turns failure early-returns before touching the
+    scheduler — no double merge-write occurs — and the pre-existing in-memory
+    flag is preserved (task ν)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={'routing': {'simple_saturated': True}},
+        invoke_outcome=_make_result(
+            success=False, subtype='error_max_turns', output='',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    # Idempotent early-return: no scheduler write at all on this failure path.
+    f.update_task.assert_not_awaited()
+    assert not _saturation_stamp_calls(f.update_task)
+    assert f.wf.task['metadata']['routing']['simple_saturated'] is True
 
 
 @pytest.mark.asyncio
