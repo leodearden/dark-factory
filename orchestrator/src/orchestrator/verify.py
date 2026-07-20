@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import errno
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -2673,6 +2674,38 @@ class VerifyResult:
         if self.type_output and 'error' in self.type_output.lower():
             sections.append(f'## Type Errors\n\n```\n{self.type_output[-2000:]}\n```')
         return '\n\n'.join(sections) if sections else self.summary
+
+
+def _scope_tag_for(project_root: Path) -> str:
+    """Derive a deterministic, systemd-name-safe per-project scope tag.
+
+    All ``orchestrator-*.service`` units (reify, dark-factory, know-live, …)
+    run the SAME orchestrator package under ONE shared ``systemctl --user``
+    session, so ``df-verify-*.scope`` is a single per-user namespace shared
+    across projects.  Embedding this tag in the verify-scope unit name
+    (``df-verify-{tag}-{uuid}.scope``) lets each orchestrator's startup sweep
+    reap ONLY its own leftovers — a bare-glob sweep would reap a sibling
+    project's LIVE in-flight verify scope during a rolling fleet restart.
+
+    The tag is ``{basename-slug}-{path-hash}``:
+
+    - the ``project_root`` basename, lowercased and sanitized to ``[a-z0-9-]``
+      (operator-legible), bounded in length to keep the total unit name within
+      systemd's limit; and
+    - the first 8 hex chars of ``sha1(str(resolved_path))`` so two projects
+      that share a basename but live at different absolute paths still get
+      distinct tags (collision-resistant disambiguation).
+
+    Pure and deterministic: the same ``project_root`` always yields the same
+    tag, so a fresh boot reaps its dead predecessor's same-tagged scopes.
+    """
+    resolved = Path(project_root).resolve()
+    slug = re.sub(r'[^a-z0-9-]+', '-', resolved.name.lower()).strip('-')
+    # Bound the slug so the whole df-verify-{slug}-{hash}-{uuid}.scope name
+    # stays well within systemd's unit-name length limit.
+    slug = slug[:32] or 'proj'
+    digest = hashlib.sha1(str(resolved).encode()).hexdigest()[:8]
+    return f'{slug}-{digest}'
 
 
 async def _kill_cgroup_scope(unit: str) -> None:
