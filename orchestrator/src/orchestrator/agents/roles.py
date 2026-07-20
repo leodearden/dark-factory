@@ -398,7 +398,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -471,7 +471,7 @@ expansion rather than trying to work around the restriction.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
