@@ -212,3 +212,20 @@ class TestBuildResettledAdjudicatorPrompt:
         assert SETTLED in prompt
         assert NOT_SETTLED in prompt
         assert INCONCLUSIVE in prompt
+
+    def test_prior_block_not_presented_as_all_settled(self):
+        """(d) The prior block is framed as possibly-DEFERRED, not all settled.
+
+        The archive is a copy of the pre-amendment ``reviews/`` dir, which mixes
+        genuinely-resolved concerns with ones merely deferred to a follow-up and
+        still open.  The prompt must warn the adjudicator of this so a re-flag of
+        a still-open deferred concern is not classified SETTLED (task 2523
+        correctness fix — data-flow/guidance assertion, not fixed prose).
+        """
+        prompt = self._fn()(
+            [_issue('suggestion', 'c')], [_issue('suggestion', 'p')]
+        ).lower()
+        # The distinguishing concept (deferred / still-open) must be present so
+        # the adjudicator does not treat every prior suggestion as resolved.
+        assert 'deferred' in prompt
+        assert 'resolved' in prompt
