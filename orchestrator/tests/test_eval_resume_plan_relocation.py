@@ -53,6 +53,7 @@ def test_relocated_plan_preserves_progress(tmp_path: Path) -> None:
 
     result = _resume_plan_from_worktree(worktree, task)
 
+    assert result is not None
     assert result == relocated_plan
     assert result != frozen_sentinel
     done = sum(1 for s in result['steps'] if s.get('status') == 'done')
