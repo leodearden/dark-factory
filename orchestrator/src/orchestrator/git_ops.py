@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
 from shared.branch_names import canonical_queued_branch_name  # noqa: F401
+from shared.proc_group import reap_process_groups, scan_process_groups_under_path
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.artifacts import TaskArtifacts
@@ -7789,6 +7790,86 @@ class GitOps:
 
         # Warm path: reset the fixed worktree in place (invariants 1+4).
         return await self.reset_persistent_merge_worktree(merge_sha)
+
+    async def reap_merge_verify_survivors(self, *, grace_secs: float = 5.0) -> bool:
+        """One-time STARTUP SURVIVOR BARRIER for the warm ``_merge-verify`` lane
+        (task 2828, limb 1 — the restart-collateral clobber).
+
+        On orchestrator restart the merge_verify flock dies with the process
+        and the holder-pgid lease goes stale (its pgid is dead →
+        :meth:`_merge_verify_lease_active` is fail-OPEN → False).  But the
+        PREVIOUS run's verify subtree (bash → cargo → rustc, ``setsid``'d /
+        reparented to init) can still be ALIVE under
+        :attr:`persistent_merge_worktree_path`.  The merge worker's first
+        :meth:`reset_persistent_merge_worktree` then ``git reset --hard`` +
+        ``git clean -xfd``s that tree, clobbering the live build out from
+        under itself — BOTH existing guards are blind to such a survivor (the
+        flock holder and the lease pgid both died with the parent).
+
+        This barrier scans /proc for process groups whose cwd / an open fd /
+        an mmap'd path falls at-or-under the ``_merge-verify`` subtree and
+        reaps them (SIGTERM → bounded wait → SIGKILL) BEFORE the worker loop
+        starts, hence before that first reset can run.  The Harness invokes it
+        once from :meth:`Harness._start_merge_worker`, immediately before
+        creating the merge-worker task.
+
+        Scope + fail-open: confined to the LOCAL in-process lane
+        (``git.persistent_merge_worktree`` on); best-effort reap of same-user
+        orphans (SIGKILL essentially always succeeds).  Our OWN process group
+        is excluded (``exclude_pgids``) so the barrier never signals itself.
+        On the rare non-clearable residual it returns ``False`` and logs a
+        loud ERROR (surfacing, not silencing, the hazard) rather than crashing
+        startup — the caller treats the barrier as best-effort.  The blocking
+        /proc scan + reap runs off the event loop via :func:`asyncio.to_thread`
+        so it never stalls other coroutines.
+
+        Returns:
+            ``True`` when the lane is clear (knob off, nothing found, or every
+            survivor reaped); ``False`` when a residual group is still alive
+            after the reap.
+        """
+        if not self.config.persistent_merge_worktree:
+            # Knob off — no fixed warm lane to protect (nothing to scan/reap).
+            return True
+
+        root = str(self.persistent_merge_worktree_path)
+        own_pgid = os.getpgrp()
+
+        def _scan_reap_rescan() -> tuple[set[int], dict[int, str], set[int]]:
+            found = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({own_pgid}),
+            )
+            if not found:
+                return set(), {}, set()
+            outcomes = reap_process_groups(found, grace_secs=grace_secs)
+            remaining = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({own_pgid}),
+            )
+            return found, outcomes, remaining
+
+        found, outcomes, remaining = await asyncio.to_thread(_scan_reap_rescan)
+
+        if not found:
+            return True
+
+        logger.warning(
+            'reap_merge_verify_survivors: found %d orphaned process group(s) '
+            '%s under the warm merge-verify lane %s (a previous-run verify '
+            'subtree survived restart); reap outcomes=%s',
+            len(found), sorted(found), root, outcomes,
+        )
+
+        if remaining:
+            logger.error(
+                'reap_merge_verify_survivors: %d process group(s) %s STILL '
+                'alive under %s after reap — the first '
+                'reset_persistent_merge_worktree may clobber a live tree '
+                '(fail-open: this barrier is best-effort)',
+                len(remaining), sorted(remaining), root,
+            )
+            return False
+
+        return True
 
     async def reset_persistent_merge_worktree(self, merge_commit: str) -> Path:
         """Create or reset-in-place the persistent warm merge-verify worktree.
