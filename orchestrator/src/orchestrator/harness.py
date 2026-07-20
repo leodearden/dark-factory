@@ -6512,6 +6512,14 @@ task, include it with an empty "files" list rather than omitting it.
                         'Task %s: auto-eval hook failed (non-fatal): %s',
                         assignment.task_id, exc,
                     )
+                # Retry-escalation rung (task μ, trigger 1a): on a
+                # terminal-failed (BLOCKED) dispatch, bump the routing tier so
+                # the NEXT dispatch routes one ladder rung stronger via the
+                # retry-tier-up rule. Awaited (not fire-and-forget) so the
+                # bump lands before slot release and any fast re-dispatch.
+                # Self-guards on outcome; its own try/except keeps it
+                # best-effort.
+                await self._maybe_bump_routing_tier(assignment, report)
             # PRD task-status-authority C4/D4 (task 2188, omega1): clear the
             # claimant to NULL at slot release — unconditionally, for every
             # outcome (this runs even when report is None, e.g. the
@@ -6651,6 +6659,43 @@ task, include it with an empty "files" list rather than omitting it.
             cid for cid in candidate_ids
             if status_by_id.get(cid) in _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES
         ]
+
+    async def _maybe_bump_routing_tier(self, assignment, report: TaskReport) -> None:
+        """Bump ``metadata.routing.routing_tier`` on a terminal-failed dispatch.
+
+        Task μ (plans/adaptive-model-routing-prd.md Phase 4), trigger (1a).
+        Called from ``_run_slot``'s finally next to ``_maybe_auto_eval``, and
+        AWAITED before slot release so the bumped tier lands before any fast
+        re-dispatch (e.g. a re-pend) reads it. On the NEXT dispatch the
+        retry-tier-up rule (defaults.yaml) turns that ``tier>=1`` into one
+        ladder rung stronger for the executor role.
+
+        Fires ONLY on ``report.outcome == BLOCKED`` — the unambiguous
+        terminal-failed dispatch (boundary test 5). DONE (success, boundary
+        test 6) and REQUEUED (an in-process retry of the same work) do NOT
+        bump: there is no clean per-requeue lost-work signal here, and bumping
+        transient/no-progress requeues would burn top-tier quota against the
+        PRD's own intent (design decision).
+
+        The write goes through ``metadata_mode='merge'`` on the ``routing``
+        key alone so it never clobbers the sibling metadata or races the
+        blocked-status write; ``_bumped_routing_dump`` is read-current-then-+1,
+        so the harness-owned counter stays monotonic (invariant 8). Best-effort
+        + suppressed: a bump failure must never block slot release.
+        """
+        if report is None or report.outcome != WorkflowOutcome.BLOCKED:
+            return
+        try:
+            await self.scheduler.update_task(
+                assignment.task_id,
+                {'routing': _bumped_routing_dump(assignment.task.get('metadata'))},
+                metadata_mode='merge',
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: routing-tier bump failed (non-fatal): %s',
+                assignment.task_id, exc,
+            )
 
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
