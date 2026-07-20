@@ -29,7 +29,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -233,6 +233,36 @@ def parse_per_test_results(test_output: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # {did-not-pass} retry-subset construction (PRD verify-retry-failed-only D2).
 # ---------------------------------------------------------------------------
+
+
+def build_fail_fast_map(
+    planned: Iterable[str], verdicts: Mapping[str, str]
+) -> dict[str, str]:
+    """Annotate the authoritative attempt-0 plan with per-test verdicts.
+
+    ``planned`` is the attempt-0 nextest plan/list — the authoritative full
+    set of test ids that a from-scratch (non-fail-fast) run would execute.
+    ``verdicts`` is :func:`parse_per_test_results` output, which contains ONLY
+    the tests that actually RAN (a failing attempt-0 under nextest fail-fast
+    cancels the not-yet-started tests, so they never appear).
+
+    A test in ``planned`` but absent from ``verdicts`` was cancelled by
+    fail-fast and is annotated ``'not-started'``.  Keys present in ``verdicts``
+    but not in ``planned`` are ignored — ``planned`` is authoritative.
+
+    The result is the complete fail-fast map consumed by
+    :func:`did_not_pass_subset` to build the sound retry subset.
+
+    Args:
+        planned: The attempt-0 plan/list of every planned test id.
+        verdicts: Per-test verdicts for the tests that ran, as returned by
+            :func:`parse_per_test_results`.
+
+    Returns:
+        ``dict`` mapping every planned test id to its verdict, with
+        fail-fast-cancelled tests annotated ``'not-started'``.
+    """
+    return {t: verdicts.get(t, 'not-started') for t in planned}
 
 
 def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
