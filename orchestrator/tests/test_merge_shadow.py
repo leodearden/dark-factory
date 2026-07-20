@@ -360,3 +360,43 @@ def test_merge_queue_reexports_identical_objects() -> None:
             f'{name}: orchestrator.merge_queue.{name} and '
             f'orchestrator.merge_shadow.{name} must be the identical object'
         )
+
+
+# ---------------------------------------------------------------------------
+# {did-not-pass} retry-subset construction (PRD verify-retry-failed-only D2).
+#
+# The core user-observable signal of the failed-only merge-verify retry: under
+# nextest fail-fast a failing attempt-0 CANCELS the not-yet-started tests, which
+# are ABSENT from parse_per_test_results output.  The sound retry subset is
+# therefore {did-not-pass} = failed ∪ not-started ∪ inconclusive, NOT {failed}.
+# ---------------------------------------------------------------------------
+
+
+def test_did_not_pass_subset_includes_non_pass_verdicts() -> None:
+    """did_not_pass_subset selects every non-'pass' verdict, sorted.
+
+    The subset MUST include not-started (fail-fast-cancelled) and inconclusive
+    tests, not only the 'fail' entry — a failed-only filter would be unsound
+    under nextest fail-fast.
+    """
+    from orchestrator.merge_shadow import did_not_pass_subset
+
+    fail_fast_map = {
+        'crate a::x': 'pass',
+        'crate a::y': 'fail',
+        'crate a::z': 'not-started',
+        'crate a::w': 'inconclusive',
+    }
+    # sorted; failed ∪ not-started ∪ inconclusive — NOT just the 'fail' entry.
+    assert did_not_pass_subset(fail_fast_map) == [
+        'crate a::w',
+        'crate a::y',
+        'crate a::z',
+    ]
+
+
+def test_did_not_pass_subset_all_pass_is_empty() -> None:
+    """An all-'pass' fail-fast map yields the empty subset (nothing to retry)."""
+    from orchestrator.merge_shadow import did_not_pass_subset
+
+    assert did_not_pass_subset({'a::x': 'pass', 'a::y': 'pass'}) == []
