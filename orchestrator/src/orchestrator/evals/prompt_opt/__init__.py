@@ -33,6 +33,11 @@ from orchestrator.evals.prompt_opt.curator_scorer import CuratorActionScorer
 from orchestrator.evals.prompt_opt.engine import LoopResult, run_optimization_loop
 from orchestrator.evals.prompt_opt.optimizer import propose_heuristics_edit
 from orchestrator.evals.prompt_opt.scorer import ProposeFn, RolloutFn, ScoredItem, Scorer
+from orchestrator.evals.prompt_opt.smoke import (
+    AcceptanceReport,
+    build_fixture_corpus,
+    run_acceptance_smoke,
+)
 from orchestrator.evals.prompt_opt.splits import CorpusSplit, split_corpus
 from orchestrator.evals.prompt_opt.variance import (
     AcceptanceRecord,
@@ -44,6 +49,7 @@ from orchestrator.evals.prompt_opt.variance import (
 
 __all__ = [
     'AcceptanceRecord',
+    'AcceptanceReport',
     'AuditReport',
     'CanaryThresholds',
     'CanaryVerdict',
@@ -60,6 +66,7 @@ __all__ = [
     'WindowMetrics',
     'audit_curator_corpus',
     'build_curator_corpus',
+    'build_fixture_corpus',
     'compare_windows',
     'compute_window_metrics',
     'evaluate_acceptance',
@@ -69,6 +76,7 @@ __all__ = [
     'propose_curator_label_frontier',
     'propose_heuristics_edit',
     'read_curator_decisions',
+    'run_acceptance_smoke',
     'run_canary',
     'run_optimization_loop',
     'select_spot_check_subset',
