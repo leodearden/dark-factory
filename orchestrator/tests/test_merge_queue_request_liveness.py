@@ -1477,3 +1477,95 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             'coast must start a fresh episode (REQUEUED), not immediately '
             'resolve blocked'
         )
+
+
+@pytest.mark.asyncio
+class TestContendedLeaseDefers:
+    """A contended merge-verify lease DEFERS (requeues), never blocks
+    (task 2828, limb 2 / step-05/06).
+
+    When ``merge_verify_lease`` raises MergeVerifyLeaseContended (its bounded
+    wait timed out rather than yield a verify unprotected), the exception
+    surfaces at ``verify_task.result()`` inside ``_run_inflight_verify``.
+    Today the generic ``except Exception`` maps that to
+    MergeOutcome('blocked'); step-06 adds an ``except MergeVerifyLeaseContended``
+    clause BEFORE it that requeues the item exactly like the operator-halt
+    abort — req.result left pending, per-task retry counters untouched.
+    """
+
+    async def test_contended_lease_requeues_and_leaves_result_pending(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        async def _lease_contended_verify(*_args: object, **_kwargs: object) -> object:
+            # The lease acquire timed out; merge_verify_lease raised before the
+            # verify body ran. Surfaces at verify_task.result() in
+            # _run_inflight_verify exactly as the real lease would.
+            raise MergeVerifyLeaseContended(
+                Path('/x/_merge-verify.lock'), 300.0,
+            )
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'lease-contended-a', 'lca.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        # Pre-seed the per-task dead-verify-abort counter with a sentinel so we
+        # can prove the contended-lease requeue neither increments NOR pops it
+        # (unlike the generic 'blocked' path, which pops it).
+        worker._inflight_dead_verify_aborts[req.task_id] = 2
+
+        with (
+            patch(
+                'orchestrator.merge_queue._run_post_merge_verify',
+                _lease_contended_verify,
+            ),
+            patch.object(
+                worker, '_note_requeue', wraps=worker._note_requeue,
+            ) as spy_note,
+            patch.object(
+                worker, '_release_or_cleanup', wraps=worker._release_or_cleanup,
+            ) as spy_release,
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=5.0,
+            )
+
+        # DEFER, not block:
+        assert result.status == InflightStatus.REQUEUED, (
+            f'a contended lease must REQUEUE, got status={result.status!r}'
+        )
+        assert result.outcome is None, 'requeue must carry no MergeOutcome'
+        assert result.merge_wt is None, 'merge_wt must be released on requeue'
+        assert not req.result.done(), (
+            'req.result must be left PENDING (deferred), never resolved to blocked'
+        )
+
+        # Same requeue mechanics as the operator-halt block:
+        assert not q.empty(), 'the request must be re-dispatched onto _queue'
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request '
+            'never ages out'
+        )
+        spy_release.assert_called_once()
+        spy_note.assert_called_once()
+
+        # Per-task retry counter untouched (neither incremented nor popped).
+        assert worker._inflight_dead_verify_aborts.get(req.task_id) == 2, (
+            'the contended-lease requeue must leave the per-task '
+            'dead-verify-abort counter untouched'
+        )
