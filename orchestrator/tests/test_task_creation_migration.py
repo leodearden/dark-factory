@@ -17,7 +17,9 @@ from unittest.mock import MagicMock
 from _orch_helpers import pydantic_spec
 
 from orchestrator.agents.roles import (
+    ARCHITECT,
     DEEP_REVIEWER,
+    IMPLEMENTER,
     STEWARD,
     submit_only_instructions,
     submit_resolve_instructions,
@@ -115,6 +117,28 @@ class TestAllowlists:
 
     def test_deep_reviewer_does_not_have_add_task(self):
         assert 'mcp__fused-memory__add_task' not in DEEP_REVIEWER.allowed_tools
+
+
+# ---------------------------------------------------------------------------
+# Task 2640 — Source 1: architect/implementer follow-up filing at the source
+# ---------------------------------------------------------------------------
+
+
+class TestFollowupFilingAllowlist:
+    """ARCHITECT and IMPLEMENTER must be able to file follow-up task candidates.
+
+    Both roles gain ``mcp__fused-memory__submit_task`` so an agent that
+    discovers follow-up work OUTSIDE its task scope can file it at the source
+    (fire-and-forget) instead of relying on the lossy orphan-reaper backstop.
+    Both already declare the ``orchestrator`` MCP family, so this is a pure
+    allowlist widening — no ``mcp_families`` change.
+    """
+
+    def test_architect_has_submit_task(self):
+        assert 'mcp__fused-memory__submit_task' in ARCHITECT.allowed_tools
+
+    def test_implementer_has_submit_task(self):
+        assert 'mcp__fused-memory__submit_task' in IMPLEMENTER.allowed_tools
 
 
 # ---------------------------------------------------------------------------
