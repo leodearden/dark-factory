@@ -6413,6 +6413,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 2) for fast, deterministic
     # coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS monkeypatch convention.
     MAX_INFLIGHT_DEAD_VERIFY_ABORTS: int = 3
+    # task 2828 amend (reviewer_comprehensive, robustness): after this many
+    # CONSECUTIVE contended-lease requeues for the same task_id, the per-requeue
+    # WARNING rises to an ERROR naming the streak length. A contended-lease
+    # requeue is a fail-safe REQUEUE (escalate_to_human=False,
+    # counts_against_requeue_cap=False), so a genuinely long / wedged lane holder
+    # would otherwise defer this task's verify at the ~300s bounded-wait cadence
+    # indefinitely with no operator-visible signal beyond the per-tick WARNING.
+    # 5 requeues is ~25 min of continuous contention — well past any short
+    # legitimate holder (reseed/thin/gc/reset), so it reliably marks a pathology.
+    # Cleared whenever a verify actually runs to a result for that task, so the
+    # streak counts only UNBROKEN contention.  Kept as a class attribute so tests
+    # can monkeypatch it small (mirrors MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
+    CONTENDED_LEASE_REQUEUE_WARN_STREAK: int = 5
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -6594,6 +6607,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # an unbounded busy-loop.  Cleared on a successful verify for that
         # task so a later transient hang starts counting fresh.
         self._inflight_dead_verify_aborts: dict[str, int] = {}
+        # task 2828 amend (reviewer_comprehensive, robustness): per-task
+        # consecutive contended-lease requeue counter.  Incremented each time
+        # merge_verify_lease raises MergeVerifyLeaseContended and the item is
+        # DEFERRED (limb 2); once it reaches CONTENDED_LEASE_REQUEUE_WARN_STREAK
+        # the per-requeue WARNING rises to an ERROR naming the streak, so a
+        # long-running / wedged lane holder becomes operator-visible instead of
+        # looping silently at the ~300s bounded-wait cadence.  Popped whenever a
+        # verify actually runs to a result for that task, so it measures only
+        # UNBROKEN contention (unlike the requeue itself, which never counts
+        # against the requeue cap and never escalates on its own).
+        self._contended_lease_requeues: dict[str, int] = {}
         # Speculation-depth cap: one permit consumed by the Merger when it
         # prefetches a speculative item; released by the Verifier when it drains
         # that speculative item.  Symmetric accounting: acquire=prefetch,
@@ -12768,11 +12792,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # it to MergeOutcome('blocked'). The verify_task has already failed
             # (the lease raised on acquire, before the verify body ran), so
             # there is no in-flight verify to abort/cancel here.
-            logger.warning(
-                'Task %s: merge-verify lease contended (%s) — re-queuing '
-                'merge for re-verify rather than running the verify unprotected',
-                req.task_id, exc,
-            )
+            # task 2828 amend (reviewer_comprehensive, robustness): count the
+            # UNBROKEN contended-lease requeue streak for this task and RAISE the
+            # log severity once it crosses CONTENDED_LEASE_REQUEUE_WARN_STREAK, so
+            # a long-running / wedged lane holder (which would otherwise defer
+            # this verify at the ~wait_secs cadence forever — never escalating,
+            # never counting against the requeue cap) becomes operator-visible.
+            _contended_streak = self._contended_lease_requeues.get(req.task_id, 0) + 1
+            self._contended_lease_requeues[req.task_id] = _contended_streak
+            if _contended_streak >= self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+                logger.error(
+                    'Task %s: merge-verify lease contended (%s) — DEFERRED %d '
+                    'times in a row (~%.0f min of continuous contention). A '
+                    'long-running or wedged lane holder is blocking this verify; '
+                    're-queuing again rather than running unprotected. If this '
+                    'persists, inspect the merge-verify lane lock holder.',
+                    req.task_id, exc, _contended_streak,
+                    _contended_streak * getattr(exc, 'wait_secs', 0.0) / 60.0,
+                )
+            else:
+                logger.warning(
+                    'Task %s: merge-verify lease contended (%s) — re-queuing '
+                    'merge for re-verify rather than running the verify '
+                    'unprotected (consecutive contended-lease requeue #%d)',
+                    req.task_id, exc, _contended_streak,
+                )
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
             self._queue.put_nowait(req)
             self._request_ledger.on_requeued(req.request_id)
@@ -12794,6 +12838,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # cannot linger for a task_id that exits via this path (mirrors
             # the abandoned/DROPPED and busy-loop-capped exit paths).
             self._inflight_dead_verify_aborts.pop(req.task_id, None)
+            # task 2828 amend: terminal 'blocked' exit — drop any contended-lease
+            # streak so it never lingers stale for a task that will not re-verify.
+            self._contended_lease_requeues.pop(req.task_id, None)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
@@ -12808,6 +12855,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # toward MAX_INFLIGHT_DEAD_VERIFY_ABORTS even though a verify
         # genuinely ran to completion in between.
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
+        # task 2828 amend: the verify actually RAN (lease was acquired), so any
+        # prior contended-lease requeue streak for this task is broken — reset it.
+        self._contended_lease_requeues.pop(req.task_id, None)
 
         if out is None:
             logger.info(
