@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from fused_memory.models.enums import MemoryCategory, SourceStore
 
 if TYPE_CHECKING:
+    from fused_memory.config.schema import ProceduralTopicCluster
     from fused_memory.models.memory import MemoryResult
 
 # Default similarity threshold when config is absent/partial/non-numeric.
@@ -69,6 +70,40 @@ def find_near_duplicate_memory(
     if not qualifying:
         return None
     return max(qualifying, key=lambda r: r.relevance_score)
+
+
+def find_matching_topic_cluster(
+    content: str,
+    clusters: list[ProceduralTopicCluster],
+) -> tuple[ProceduralTopicCluster, list[str]] | None:
+    """Select the first topic cluster *content* matches by distinct-phrase count.
+
+    For each cluster in order, counts the DISTINCT ``phrases`` (compared
+    case-insensitively) that appear as substrings of *content*, and returns
+    ``(cluster, sorted matched phrases)`` for the first cluster whose distinct
+    hit count is ``>= cluster.min_phrase_hits``. A phrase repeated in *content*
+    counts once (distinct-phrase membership, not occurrence count); an empty
+    phrase is ignored (it would otherwise substring-match everything). Returns
+    ``None`` when *content* is empty, *clusters* is empty, or no cluster
+    qualifies.
+
+    Pure and synchronous — mirrors :func:`find_near_duplicate_memory`: it does
+    no I/O and no embedding round-trip, and raises nothing on empty input. This
+    deterministic matcher catches same-topic paraphrases that score below the
+    cosine near-dup threshold (task 2845).
+    """
+    if not content:
+        return None
+    content_lower = content.lower()
+    for cluster in clusters:
+        matched = {
+            phrase.lower()
+            for phrase in cluster.phrases
+            if phrase and phrase.lower() in content_lower
+        }
+        if len(matched) >= cluster.min_phrase_hits:
+            return cluster, sorted(matched)
+    return None
 
 
 def resolve_near_dup_threshold(memory_service: Any) -> float:
