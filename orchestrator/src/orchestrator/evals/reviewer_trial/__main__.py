@@ -1006,5 +1006,84 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
         sys.exit(130)
 
 
+# ---------------------------------------------------------------------------
+# Eval-revival refresh: 1x opus incumbent vs Sonnet-5 vs cross-family,
+# scored on the original (non-mined) 15-diff corpus (task 2476)
+# ---------------------------------------------------------------------------
+
+@cli.command('refresh')
+@click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
+@click.option('--stagger', default=2.0, type=float)
+@click.option('--report-dir', default=None, type=click.Path(path_type=Path),
+              help='Directory for report output (default: results/)')
+def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> None:
+    """Eval-revival refresh: 1x opus incumbent vs a Sonnet-5 and a
+    cross-family single-generalist candidate, ranked on quality (F1) AND
+    cost over the original hand-authored (non-mined) 15-diff corpus.
+
+    Bypasses the FN-mined diffs added by task 2495 so the comparison stays
+    apples-to-apples with the Apr-8 1x Opus trial and bounds live-run cost.
+    """
+
+    async def _run() -> int:
+        from orchestrator.config import default_price_table
+
+        from .report import build_trial_report, format_markdown, save_report
+        from .runner import run_trial
+        from .scorer import score_panel_run
+        from .variants import REVIEWER_REFRESH_VARIANTS
+
+        corpus = _select_original_corpus(_load_corpus())
+        prices = default_price_table()
+
+        click.echo(click.style(
+            f'Eval-Revival Refresh: {len(REVIEWER_REFRESH_VARIANTS)} variants x {len(corpus.diffs)} diffs',
+            bold=True,
+        ))
+        click.echo('=' * 60)
+        for v in REVIEWER_REFRESH_VARIANTS:
+            click.echo(f'  {v.name:20s} {v.description} ({len(v.reviewers)} reviewers)')
+        click.echo()
+
+        click.echo('Running panels...')
+        results = await run_trial(
+            REVIEWER_REFRESH_VARIANTS, corpus, max_parallel_panels=max_parallel, prices=prices,
+        )
+        click.echo(f'  Completed {len(results)} panel runs.')
+
+        click.echo('\nScoring results...')
+        scores = []
+        for result in results:
+            diff = corpus.get_diff(result.diff_id)
+            if diff is None:
+                continue
+            score = await score_panel_run(result, diff)
+            scores.append(score)
+            click.echo(
+                f'  {result.variant_name:20s} x {result.diff_id:<25s} '
+                f'F1={score.f1:.3f} BR={score.blocking_recall:.3f}'
+            )
+
+        # Build and save report
+        report = build_trial_report(scores, REVIEWER_REFRESH_VARIANTS, corpus)
+        out_dir = report_dir or _RESULTS_DIR
+        report_path = save_report(report, out_dir / 'refresh_report')
+
+        # Print the full markdown report
+        click.echo()
+        click.echo(format_markdown(report))
+        click.echo(f'\nReport saved to: {report_path}')
+
+        total_cost = sum(r.total_cost_usd for r in results)
+        click.echo(f'Total panel cost: ${total_cost:.2f}')
+        return 0
+
+    try:
+        sys.exit(asyncio.run(_run()))
+    except KeyboardInterrupt:
+        click.echo('\nInterrupted.')
+        sys.exit(130)
+
+
 if __name__ == '__main__':
     cli()
