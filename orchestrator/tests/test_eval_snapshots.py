@@ -57,6 +57,16 @@ def test_read_python_pin_absent_returns_none(tmp_path):
     assert read_python_pin(tmp_path) is None
 
 
+def test_read_python_pin_non_utf8_returns_none(tmp_path):
+    # A garbled (non-UTF-8) .python-version must fail SAFE to None rather than
+    # let UnicodeDecodeError (a ValueError, not an OSError) escape the helper
+    # and abort the eval — read_python_pin advertises a fail-safe contract.
+    from orchestrator.evals.snapshots import read_python_pin
+
+    (tmp_path / '.python-version').write_bytes(b'\xff\xfe3.13')
+    assert read_python_pin(tmp_path) is None
+
+
 def test_eval_setup_env_scrubs_venv_and_pins_python(tmp_path, monkeypatch):
     from orchestrator.evals.snapshots import _eval_setup_env
 

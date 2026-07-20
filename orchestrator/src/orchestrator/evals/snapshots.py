@@ -16,15 +16,22 @@ def read_python_pin(root: Path) -> str | None:
     """Return the interpreter pin from ``<root>/.python-version``.
 
     Reads the file's stripped first line (the version ``uv`` resolves), or
-    ``None`` when the file is missing or empty — the fail-safe signal to
-    inject no pin (``uv`` falls back to its normal resolution) rather than
-    guess. Derived from the target's own ``.python-version`` so the eval
-    runner stays correct across targets (df fixtures pin 3.13; other targets
-    pin whatever they use) instead of hardcoding a literal.
+    ``None`` when the file is missing, empty, or unreadable — the fail-safe
+    signal to inject no pin (``uv`` falls back to its normal resolution)
+    rather than guess. Derived from the target's own ``.python-version`` so
+    the eval runner stays correct across targets (df fixtures pin 3.13; other
+    targets pin whatever they use) instead of hardcoding a literal.
+
+    Fail-safe on a garbled file: a missing/unreadable file (``OSError``) OR a
+    non-UTF-8, undecodable one (``UnicodeDecodeError`` — a ``ValueError``, so
+    it would otherwise escape a bare ``except OSError``) both return ``None``
+    instead of propagating out of this fail-safe helper and aborting the eval.
+    The read is pinned to UTF-8 so the decode outcome is deterministic across
+    locales (``.python-version`` is canonical ASCII).
     """
     try:
-        raw = (root / '.python-version').read_text()
-    except OSError:
+        raw = (root / '.python-version').read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
         return None
     lines = raw.splitlines()
     if not lines:
