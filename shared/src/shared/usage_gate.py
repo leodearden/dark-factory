@@ -478,6 +478,11 @@ class UsageGate:
         # populated by _scope_waiter on scope-is-not-None paths only, so every
         # existing scope=None caller never allocates one (S1 / B6 byte-equiv).
         self._scope_waiters: dict[str, asyncio.Event] = {}
+        # Per-scope last-selected-account tracker (task 2857 / γ) — independent
+        # of _last_account_name so scoped failover events carry scope without
+        # perturbing the general failover path (S1). Only touched on scope-is-
+        # not-None paths.
+        self._last_scope_account: dict[str, str] = {}
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
         self._shutting_down: bool = False
 
@@ -769,23 +774,44 @@ class UsageGate:
                             f'single task testing',
                         )
                     logger.debug(f'Using account {acct.name}')
-                    # Failover detection: emit event if account changed.
-                    # Update _last_account_name FIRST to close the race window,
-                    # then fire the event non-blocking (fire-and-forget).
-                    if (
-                        self._last_account_name is not None
-                        and self._last_account_name != acct.name
-                    ):
-                        old_name = self._last_account_name
-                        self._last_account_name = acct.name
-                        if self._cost_store:
-                            self._fire_cost_event(
-                                acct.name,
-                                'failover',
-                                json.dumps({'from': old_name, 'to': acct.name}),
-                            )
+                    # Failover detection: emit event if account changed. The
+                    # tracker is updated FIRST to close the race window, then the
+                    # event fires non-blocking (fire-and-forget). scope=None uses
+                    # the general _last_account_name tracker (byte-identical, S1);
+                    # a scoped selection uses an INDEPENDENT per-scope tracker so
+                    # it never perturbs the general path and the event carries
+                    # `scope` (same 'failover' event name, matching β's cap_hit/
+                    # near_cap reuse).
+                    if scope is None:
+                        if (
+                            self._last_account_name is not None
+                            and self._last_account_name != acct.name
+                        ):
+                            old_name = self._last_account_name
+                            self._last_account_name = acct.name
+                            if self._cost_store:
+                                self._fire_cost_event(
+                                    acct.name,
+                                    'failover',
+                                    json.dumps({'from': old_name, 'to': acct.name}),
+                                )
+                        else:
+                            self._last_account_name = acct.name
                     else:
-                        self._last_account_name = acct.name
+                        scope_last = self._scope_last_account_map()
+                        prev = scope_last.get(scope)
+                        if prev is not None and prev != acct.name:
+                            scope_last[scope] = acct.name
+                            if self._cost_store:
+                                self._fire_cost_event(
+                                    acct.name,
+                                    'failover',
+                                    json.dumps(
+                                        {'from': prev, 'to': acct.name, 'scope': scope}
+                                    ),
+                                )
+                        else:
+                            scope_last[scope] = acct.name
                     return AccountLease(
                         name=acct.name, token=acct.token, generation=acct.generation,
                     )
@@ -941,6 +967,18 @@ class UsageGate:
         if evt is None:
             evt = waiters[scope] = asyncio.Event()
         return evt
+
+    def _scope_last_account_map(self) -> dict[str, str]:
+        """Get-or-create the per-scope last-selected-account map (task 2857 / γ).
+
+        getattr-default read (mirroring ``_scope_waiter``) so a ``__new__``-built
+        test fixture that never ran ``__init__`` still works. Only touched on
+        scope-is-not-None paths, so the general failover path is byte-identical.
+        """
+        m = getattr(self, '_last_scope_account', None)
+        if m is None:
+            m = self._last_scope_account = {}
+        return m
 
     def _scope_uncap_deadline(self, sc: ScopeCap) -> datetime | None:
         """The instant a scope cap becomes optimistically uncappable (S6).
