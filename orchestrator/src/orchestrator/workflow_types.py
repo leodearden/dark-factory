@@ -243,6 +243,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WarmLanePoolExhausted,
         WarmLanePoolHardDown,
         WarmLaneRequeue,
+        WarmLaneReseedContaminated,
         WarmLaneSoftPressure,
         WorktreeConflictError,
         WorktreeMissing,
@@ -351,6 +352,22 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='warm_lane_soft_pressure (backpressure)',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Reseed contamination (task 2854): a fresh-reseed acquire left the
+        # lane carrying a prior occupant's commits — a DATA-INTEGRITY defect,
+        # not transient backpressure. REQUEUE (re-acquire a DIFFERENT lane),
+        # but counts_against_requeue_cap=True (unlike the transient
+        # DiskPressure/HardDown/SoftPressure rows) so a persistent/pathological
+        # contamination eventually trips the requeue-cap escalation — a loud
+        # human signal — instead of requeuing forever silently. Distinctive
+        # reason_prefix gives operators a greppable data-integrity signal.
+        WarmLaneReseedContaminated: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=True,
+            reason_prefix='warm_lane_reseed_contaminated (data-integrity)',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── Verify-infra / worktree-conflict (escalate straight to human) ──
