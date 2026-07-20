@@ -2429,14 +2429,7 @@ class TaskWorkflow:
             # any failure (no plan written, unactionable artifact, no steps
             # marked done).  metadata.force_full_path is the hard escape
             # that always forces the full path.
-            from orchestrator.agents.triage import is_declared_simple_task
-            if (
-                not self.initial_plan
-                and self.config.simple_task_enabled
-                and not (self.task.get('metadata') or {}).get('auto_eval_redo')
-                and not (self.task.get('metadata') or {}).get('force_full_path')
-                and is_declared_simple_task(self.task)
-            ):
+            if self._should_run_simple_task():
                 self._enter_phase(WorkflowState.PLAN)
                 simple_outcome = await self._run_simple_task()
                 if simple_outcome == WorkflowOutcome.PLANNED:
@@ -4177,6 +4170,35 @@ class TaskWorkflow:
             self.task_id, current_main[:12],
         )
         return WorkflowOutcome.PLANNED
+
+    def _should_run_simple_task(self) -> bool:
+        """Whether this dispatch should take the Lever C SIMPLE_TASK path.
+
+        Extracted verbatim from the inline gate in ``_drive`` — a
+        behaviour-preserving refactor that makes the gate unit-testable —
+        plus ONE new AND term for task ν: ``not
+        RoutingState.from_metadata(metadata).simple_saturated``.
+
+        The pre-existing conditions are unchanged: no ``initial_plan`` (not
+        eval mode), ``simple_task_enabled``, and the RUNTIME dispatch vetoes
+        ``auto_eval_redo`` / ``force_full_path``, plus the author-declaration
+        predicate ``is_declared_simple_task``. ``simple_saturated`` joins the
+        runtime vetoes here (NOT inside ``is_declared_simple_task``, which its
+        own docstring keeps a pure author-declaration predicate): once a
+        SIMPLE_TASK dispatch has demonstrably exhausted its turn cap
+        (``_stamp_simple_saturated``), the "simple" label is retired and every
+        subsequent dispatch takes the full architect path.
+        """
+        from orchestrator.agents.triage import is_declared_simple_task
+        metadata = self.task.get('metadata') or {}
+        return (
+            not self.initial_plan
+            and self.config.simple_task_enabled
+            and not metadata.get('auto_eval_redo')
+            and not metadata.get('force_full_path')
+            and is_declared_simple_task(self.task)
+            and not RoutingState.from_metadata(metadata).simple_saturated
+        )
 
     async def _run_simple_task(self) -> WorkflowOutcome:
         """Lever C — single-agent simple-task path.
