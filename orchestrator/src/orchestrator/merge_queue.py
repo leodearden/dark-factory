@@ -1581,6 +1581,84 @@ def _spawn_main_health_probe(
 _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 
 
+# ---------------------------------------------------------------------------
+# Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-only D2).
+#
+# When ``MergeRequest.retry_failed_only`` is set (D1, task 2833), this
+# orchestrator produces the retry contract that reify's verify.sh (α/β/γ)
+# consumes.  These REIFY_VERIFY_RETRY_* / REIFY_RUN_ALL_MEMBER_SUBSET /
+# REIFY_GUI_RETRY_SPECS env keys are BRAND NEW — this producer defines them:
+#
+#   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG    absolute path to a newline
+#   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE  file of EXACT {did-not-pass}
+#                                                   nextest ids for that cargo
+#                                                   profile (one id per line).
+#                                                   Files (not env values) because
+#                                                   a subset can be thousands of
+#                                                   ids — too large for an env.
+#   REIFY_RUN_ALL_MEMBER_SUBSET   comma-delimited {failed run_all members}.
+#   REIFY_GUI_RETRY_SPECS         comma-delimited {failed gui spec files}.
+#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID; reify
+#                                 corroborates it (belt-and-suspenders with the
+#                                 orchestrator's own tree-OID gate, INV-3).
+#   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
+#
+# The whole dict is merged into MergeVerifySpec.verify_env (the channel already
+# shipped to reify's remote runner AND threaded into local ModuleConfig.verify_env),
+# so no new transport is introduced.  The filter files are written into merge_wt,
+# the shared persistent merge-verify lane reify's verify.sh reads.
+# ---------------------------------------------------------------------------
+
+# Subdir under merge_wt holding the per-profile nextest filter files.
+_RETRY_FILTER_SUBDIR = '.reify-verify-retry'
+
+
+def _build_retry_verify_env(
+    *,
+    nextest_subset_debug: list[str],
+    nextest_subset_release: list[str],
+    run_all_members: list[str],
+    gui_specs: list[str],
+    tree_oid: str,
+    filter_dir: Path,
+) -> dict[str, str]:
+    """Write the per-profile nextest filter files and build the REIFY_* env dict.
+
+    Writes ``nextest-retry-debug.filter`` / ``nextest-retry-release.filter`` (one
+    exact test id per line, deterministic order preserved from the passed lists)
+    into ``filter_dir/.reify-verify-retry`` and returns the env dict documented
+    in the module comment above.  ``run_all_members`` and ``gui_specs`` ship as
+    comma-delimited env values; the nextest subsets ship as file paths.
+
+    Args:
+        nextest_subset_debug: {did-not-pass} nextest ids for the debug profile.
+        nextest_subset_release: {did-not-pass} nextest ids for the release profile.
+        run_all_members: {failed} run_all member ids (pass-through, not transformed).
+        gui_specs: {failed} gui spec files (pass-through, not transformed).
+        tree_oid: attempt-0-pinned content-tree OID (REIFY_VERIFY_RETRY_TREE_OID).
+        filter_dir: directory the filter files are written under (the merge_wt).
+
+    Returns:
+        The REIFY_VERIFY_RETRY_* env dict to merge into MergeVerifySpec.verify_env.
+    """
+    retry_dir = Path(filter_dir) / _RETRY_FILTER_SUBDIR
+    retry_dir.mkdir(parents=True, exist_ok=True)
+
+    debug_file = retry_dir / 'nextest-retry-debug.filter'
+    release_file = retry_dir / 'nextest-retry-release.filter'
+    debug_file.write_text('\n'.join(nextest_subset_debug))
+    release_file.write_text('\n'.join(nextest_subset_release))
+
+    return {
+        'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+        'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+        'REIFY_RUN_ALL_MEMBER_SUBSET': ','.join(run_all_members),
+        'REIFY_GUI_RETRY_SPECS': ','.join(gui_specs),
+        'REIFY_VERIFY_RETRY_TREE_OID': tree_oid,
+        'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+    }
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
