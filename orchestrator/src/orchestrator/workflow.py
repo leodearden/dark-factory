@@ -2522,9 +2522,10 @@ class TaskWorkflow:
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     try:
                         resolution = await self._wait_for_resolution()
-                    except _StewardReescalated:
+                    except _StewardReescalated as reesc:
                         return await self._mark_blocked(
                             'Steward re-escalated to human',
+                            detail=_format_reescalation_detail(reesc.escalations),
                             skip_escalation=True,
                         )
                     # If branch is already on main AND has genuine prior
