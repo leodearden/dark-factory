@@ -454,3 +454,66 @@ def test_build_fail_fast_map_then_subset_retains_not_started() -> None:
         'crate a::y',
         'crate a::z',
     ]
+
+
+# ---------------------------------------------------------------------------
+# shadow-baseline map merge (PRD verify-retry-failed-only D4, §5.4).
+#
+# A narrowed {did-not-pass} merge-verify retry re-runs ONLY the tests that did
+# not pass in attempt-0, so its per-test map is PARTIAL — it omits every test
+# that already passed.  Storing that partial map as the warm shadow baseline
+# makes the next FULL cold shadow compare classify every attempt-0-passed test
+# as only_cold → phantom born-at-L2 divergence alarm.  merge_retry_shadow_baseline
+# unions attempt-0's passes with the fresh retry map so the baseline is whole.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_retry_shadow_baseline_carries_forward_and_retry_overwrites() -> None:
+    """attempt-0 passes carry forward; retry wins on overlap (did-not-pass→pass).
+
+    A,B passed in attempt-0 and are absent from the narrowed retry map — they
+    must reappear in the merged baseline (else the full cold suite flags them
+    only_cold → phantom divergence).  C did-not-pass in attempt-0 and the fresh
+    retry pass is the latest verdict, so it overwrites C's attempt-0 'fail'.
+    """
+    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+
+    attempt0 = {'A': 'pass', 'B': 'pass', 'C': 'fail'}
+    retry = {'C': 'pass'}
+    assert merge_retry_shadow_baseline(attempt0, retry) == {
+        'A': 'pass',
+        'B': 'pass',
+        'C': 'pass',
+    }
+
+
+def test_merge_retry_shadow_baseline_retry_precedence_over_inconclusive() -> None:
+    """retry verdict wins on overlap even over an attempt-0 'inconclusive'."""
+    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+
+    attempt0 = {'A': 'pass', 'C': 'inconclusive'}
+    retry = {'C': 'pass'}
+    assert merge_retry_shadow_baseline(attempt0, retry) == {'A': 'pass', 'C': 'pass'}
+
+
+def test_merge_retry_shadow_baseline_drops_attempt0_non_pass_absent_from_retry() -> None:
+    """attempt-0 non-pass verdicts NOT re-run by the retry are dropped, not carried.
+
+    A stray 'fail'/'not-started' surviving into the baseline would be flipped by
+    the full cold suite into a genuine-looking divergence — the exact phantom
+    this helper exists to remove.  Only attempt-0 PASSES are carried forward.
+    """
+    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+
+    assert merge_retry_shadow_baseline({'A': 'pass', 'C': 'fail'}, {}) == {'A': 'pass'}
+
+
+def test_merge_retry_shadow_baseline_does_not_mutate_inputs() -> None:
+    """The input maps are treated as read-only (no in-place mutation)."""
+    from orchestrator.merge_shadow import merge_retry_shadow_baseline
+
+    attempt0 = {'A': 'pass', 'C': 'fail'}
+    retry = {'C': 'pass'}
+    merge_retry_shadow_baseline(attempt0, retry)
+    assert attempt0 == {'A': 'pass', 'C': 'fail'}
+    assert retry == {'C': 'pass'}
