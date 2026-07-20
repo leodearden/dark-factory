@@ -135,6 +135,23 @@ def resolve_near_dup_guard_enabled(memory_service: Any) -> bool:
     return _DEFAULT_NEAR_DUP_GUARD_ENABLED
 
 
+def resolve_topic_guard_clusters(memory_service: Any) -> list:
+    """Read the configured topic-guard clusters from *memory_service*'s config.
+
+    Same defensive ``getattr`` navigation as :func:`resolve_near_dup_threshold`
+    (via :func:`_reconciliation_attr`), returning the configured
+    ``procedural_knowledge_topic_guard_clusters`` list iff the leaf is a real
+    ``list`` — otherwise an empty list. The ``isinstance(value, list)`` guard
+    excludes a missing/``None`` config hop and any Mock attribute an unspecced
+    test double might auto-generate, so an empty return reliably means "topic
+    guard inert" (task 2845).
+    """
+    value = _reconciliation_attr(memory_service, 'procedural_knowledge_topic_guard_clusters')
+    if isinstance(value, list):
+        return value
+    return []
+
+
 def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
     config = getattr(memory_service, 'config', None)
     reconciliation = getattr(config, 'reconciliation', None)
