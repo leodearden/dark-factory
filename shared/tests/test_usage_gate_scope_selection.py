@@ -33,8 +33,6 @@ import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountPhase, ScopeCap, UsageGate
 
@@ -222,6 +220,8 @@ class TestScopeAwareSelection:
 
         scoped = await gate.before_invoke(scope=SCOPE)
         general = await gate.before_invoke()
+        assert scoped is not None
+        assert general is not None
         assert scoped.name == 'b'
         assert general.name == 'b'  # account cap dominates for every scope (S4/B4)
 
@@ -260,10 +260,12 @@ class TestScopedFailoverEvent:
         with patch.object(gate, '_fire_cost_event') as mock_fire:
             # 1) First scoped selection lands on A (establishes per-scope last).
             first = await gate.before_invoke(scope=SCOPE)
+            assert first is not None
             assert first.name == 'a'
             # 2) Scope-cap A → the next scoped selection fails over to B.
             set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
             second = await gate.before_invoke(scope=SCOPE)
+            assert second is not None
             assert second.name == 'b'
 
         failovers = _failover_calls(mock_fire)
@@ -279,10 +281,12 @@ class TestScopedFailoverEvent:
 
         with patch.object(gate, '_fire_cost_event') as mock_fire:
             first = await gate.before_invoke()  # scope=None → A
+            assert first is not None
             assert first.name == 'a'
             # Account-level cap A (general) → next general selection → B.
             gate._handle_cap_detected('r', now + timedelta(hours=1), a.token, scope=None)
             second = await gate.before_invoke()
+            assert second is not None
             assert second.name == 'b'
 
         failovers = _failover_calls(mock_fire)
@@ -299,6 +303,7 @@ class TestScopedFailoverEvent:
 
         # Establish general last-account = A via a general selection.
         g1 = await gate.before_invoke()
+        assert g1 is not None
         assert g1.name == 'a'
         assert gate._last_account_name == 'a'
 
@@ -306,12 +311,14 @@ class TestScopedFailoverEvent:
         # general tracker off 'a' (independent trackers, S1).
         set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
         s1 = await gate.before_invoke(scope=SCOPE)
+        assert s1 is not None
         assert s1.name == 'b'
         assert gate._last_account_name == 'a'
 
         # A following general selection still lands on A with NO failover event.
         with patch.object(gate, '_fire_cost_event') as mock_fire:
             g2 = await gate.before_invoke()
+            assert g2 is not None
             assert g2.name == 'a'
         assert _failover_calls(mock_fire) == []
 
