@@ -299,3 +299,65 @@ class TestFormatReport:
         decision, report = self._adopt()
         # No wall-clock in the rendered body: same inputs → byte-identical output.
         assert format_judge_ofat_report(decision, report) == format_judge_ofat_report(decision, report)
+
+
+# ---------------------------------------------------------------------------
+# step-7/8 — analyze_judge_ofat / select_judge_results: the end-to-end glue over
+# REAL EvalResults. select_judge_results drops every non-judge row (so a stray
+# implementer result never pollutes the per-fixture cost/latency normalization);
+# analyze_judge_ofat filters → build_composite_report → decide_judge_adoption.
+# ---------------------------------------------------------------------------
+
+def _jres(task_id: str, config: str, role: str, *, quality: float, cost_usd: float, duration_ms: int = 1000):
+    from orchestrator.evals.runner import EvalResult
+
+    return EvalResult(
+        task_id, config, 'done',
+        {
+            'composite_score': quality,
+            'tests_pass': True,
+            'role_under_test': role,
+            'cost_usd': cost_usd,
+            'workflow_duration_ms': duration_ms,
+        },
+        '/tmp/wt',
+    )
+
+
+class TestAnalyzeJudgeOfat:
+    def _results(self):
+        # 3 fixtures × {judge-sonnet, judge-haiku}, identical quality/latency so
+        # the ONLY axis that moves is cost: haiku is cheaper (0.5 < 1.0) → its
+        # per-fixture normalized composite is HIGHER → clean adopt. n=3 per config
+        # → both composite CIs sufficient.
+        results = []
+        for fx in ('fix1', 'fix2', 'fix3'):
+            results.append(_jres(fx, 'judge-sonnet', 'judge', quality=0.9, cost_usd=1.0))
+            results.append(_jres(fx, 'judge-haiku', 'judge', quality=0.9, cost_usd=0.5))
+        # A non-judge implementer result that MUST be filtered out. Its very low
+        # cost would drag the fix1 normalization floor if it leaked into the
+        # composite — so its exclusion is observable, not cosmetic.
+        results.append(_jres('fix1', 'impl-x', 'implementer', quality=0.9, cost_usd=0.1))
+        return results
+
+    def test_select_judge_results_drops_non_judge_rows(self):
+        from orchestrator.evals.judge_pilot import select_judge_results
+
+        judge_only = select_judge_results(self._results())
+
+        assert {r.config_name for r in judge_only} == {'judge-sonnet', 'judge-haiku'}
+        assert all(r.metrics['role_under_test'] == 'judge' for r in judge_only)
+        assert len(judge_only) == 6  # 3 fixtures × 2 judge configs; impl-x dropped
+
+    def test_analyze_filters_builds_and_decides_adopt(self):
+        from orchestrator.evals.judge_pilot import analyze_judge_ofat
+
+        decision, report = analyze_judge_ofat(self._results(), margin=0.05)
+
+        # Only the two judge configs make it into the composite report.
+        assert {r['config'] for r in report['configs']} == {'judge-sonnet', 'judge-haiku'}
+        assert report['aggregation'] == 'per_fixture_normalized_mean_ci'
+        # Cheaper-but-equal-quality haiku → adopt.
+        assert decision.verdict == 'adopt'
+        assert decision.escalate is False
+        assert decision.cheaper is True
