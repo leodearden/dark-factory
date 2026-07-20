@@ -26,6 +26,8 @@ unmodified (S1 / B6 byte-equivalence).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -312,3 +314,64 @@ class TestScopedFailoverEvent:
             g2 = await gate.before_invoke()
             assert g2.name == 'a'
         assert _failover_calls(mock_fire) == []
+
+
+# ===========================================================================
+# Step 7 — S3 no-freeze wait (B3) + optimistic-uncap-returns-in-one-call (B5)
+# ===========================================================================
+
+
+class TestScopeWaitNoFreeze:
+    """When every account is scope-capped for m but generally available, the
+    scoped waiter parks WITHOUT freezing the fleet (S3/B3); a past-deadline
+    scope cap is optimistically uncapped so the scoped call returns in one
+    invocation (B5-return). All waits are bounded so RED surfaces as a
+    failure/timeout, never an infinite hang."""
+
+    async def test_s3_b3_scope_exhaustion_never_freezes_fleet(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        far = now + timedelta(hours=6)
+        # Both fable-scope-capped (far-future deadline) but generally AVAILABLE.
+        set_scope_cap(a, resets_at=far, capped_at=now)
+        set_scope_cap(b, resets_at=far, capped_at=now)
+        assert a.phase == AccountPhase.AVAILABLE
+        assert b.phase == AccountPhase.AVAILABLE
+
+        scoped_task = asyncio.create_task(gate.before_invoke(scope=SCOPE))
+        try:
+            # Let the scoped selection reach its (scope-local) wait.
+            await asyncio.sleep(0.05)
+
+            # Scope exhaustion must NOT freeze the fleet.
+            assert gate._open.is_set() is True
+            assert gate.paused_reason == ''
+            # The scoped caller is parked (no fable headroom), not returned.
+            assert scoped_task.done() is False
+
+            # A concurrent GENERAL caller is served immediately (not delayed by
+            # the scoped wait).
+            general = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+            assert general is not None
+            assert general.name in ('a', 'b')
+        finally:
+            scoped_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scoped_task
+
+    async def test_b5_optimistic_uncap_returns_in_one_call(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        # A's fable cap deadline is in the PAST → optimistically uncapped.
+        set_scope_cap(a, resets_at=now - timedelta(seconds=5),
+                      capped_at=now - timedelta(hours=1))
+        # B's fable cap is still in the future.
+        set_scope_cap(b, resets_at=now + timedelta(hours=6), capped_at=now)
+
+        lease = await asyncio.wait_for(
+            gate.before_invoke(scope=SCOPE), timeout=1.0
+        )
+        assert lease is not None
+        assert lease.name == 'a'  # returned in one call (no wait, no timeout)
