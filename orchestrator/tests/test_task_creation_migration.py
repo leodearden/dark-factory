@@ -175,6 +175,28 @@ class TestFollowupFilingPrompts:
         assert 'Call `resolve_ticket`' not in p
 
 
+class TestStewardSweepUp:
+    """STEWARD prompt must carry the workflow-end info-note sweep-up (Source 3).
+
+    Before exit the steward enumerates its own still-open info-notes via
+    ``get_pending_escalations``, files each work-describing one as a task
+    candidate (``submit_task``), and closes it via ``resolve_issue``.  Anchored
+    on the distinctive section tokens, plus the filing/closing tool names.
+    """
+
+    def test_steward_prompt_has_workflow_end_sweepup_section(self):
+        p = STEWARD.system_prompt
+        assert 'Workflow-end sweep-up' in p
+        assert 'info-note' in p
+
+    def test_steward_sweepup_enumerates_and_files_and_closes(self):
+        p = STEWARD.system_prompt
+        # Enumerate own open notes, file candidates, close the swept note.
+        assert 'get_pending_escalations' in p
+        assert 'submit_task' in p
+        assert 'resolve_issue' in p
+
+
 # ---------------------------------------------------------------------------
 # Site-wiring test: ReviewCheckpoint._build_prompt (site 4)
 # ---------------------------------------------------------------------------
