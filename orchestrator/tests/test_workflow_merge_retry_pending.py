@@ -184,3 +184,66 @@ class TestStampClearHelpers:
         # Must not propagate the update_task failure.
         await f.wf._clear_merge_retry_pending()
         assert 'merge_retry_pending' not in f.wf.task['metadata']
+
+
+# ---------------------------------------------------------------------------
+# step-5: _requeue wiring — merge_phase=True stamps, merge_phase=False does not
+# ---------------------------------------------------------------------------
+
+
+async def _drive_requeue_via_mark_blocked(f: _Fixture, *, merge_phase: bool) -> WorkflowOutcome:
+    """Drive _mark_blocked to the StewardResolved _requeue path with a spy stamp.
+
+    Wires a truthy steward whose completion resolves to StewardResolved so the
+    nested _requeue() closure runs, and spies _stamp_merge_retry_pending so the
+    test can assert whether the merge_phase branch stamped. The escalation-queue
+    filing and (for merge_phase=False) the BLOCKED status transition + dry-run
+    spawn are stubbed to no-ops so only the requeue branch is under test.
+    """
+    wf = f.wf
+    f.queue.has_open_l1 = MagicMock(return_value=False)
+    f.queue.make_id = MagicMock(return_value='esc-1')
+    f.queue.submit = MagicMock()
+
+    wf._ensure_steward_started = AsyncMock()  # type: ignore[method-assign]
+    wf._steward = MagicMock()  # truthy → the `if self._steward:` branch runs
+    wf._await_steward_completion = AsyncMock(  # type: ignore[method-assign]
+        return_value=StewardResolved(resolution_text='resolved'),
+    )
+    # merge_phase=False path transitions state + spawns a dry-run; stub both so
+    # the test stays focused on the requeue branch (and avoids state-machine
+    # transition constraints in this minimal fixture).
+    wf._enter_phase = MagicMock()  # type: ignore[method-assign]
+    wf._spawn_dry_run_unblock = MagicMock()  # type: ignore[method-assign]
+
+    return await wf._mark_blocked(
+        reason='merge verification failed',
+        merge_phase=merge_phase,
+        category='merge_error',
+    )
+
+
+class TestRequeueWiring:
+    @pytest.mark.asyncio
+    async def test_merge_phase_requeue_stamps_exactly_once_before_requeued(self):
+        f = _make()
+        stamp_spy = AsyncMock()
+        f.wf._stamp_merge_retry_pending = stamp_spy  # type: ignore[method-assign]
+
+        outcome = await _drive_requeue_via_mark_blocked(f, merge_phase=True)
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        stamp_spy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_merge_phase_requeue_does_not_stamp(self):
+        f = _make()
+        stamp_spy = AsyncMock()
+        f.wf._stamp_merge_retry_pending = stamp_spy  # type: ignore[method-assign]
+
+        outcome = await _drive_requeue_via_mark_blocked(f, merge_phase=False)
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        stamp_spy.assert_not_awaited()
+        # The non-merge_phase requeue durably re-pends through the scheduler.
+        f.scheduler.set_task_status.assert_any_await(f.wf.task_id, 'pending')
