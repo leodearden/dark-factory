@@ -81,6 +81,22 @@ class EventType(StrEnum):
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
     merge_attempt = 'merge_attempt'
+    # The merge worker's POST-rebase verify verdict (task_id-keyed).  data:
+    # {runner, merge_sha, passed, duration_ms, attempt, depth, speculative}
+    # (depth/speculative always-present, None when absent — task 2340), PLUS
+    # two always-present retry-scope keys (task 2837, PRD verify-retry-
+    # failed-only D5) derived from spec.verify_env — the D2 failed-only retry
+    # contract the orchestrator ITSELF built and shipped to reify, NOT a reify
+    # stdout marker:
+    #   retry_scope        None | 'failed_only'.  None is unambiguously a full
+    #                      green gate; 'failed_only' is a D2-narrowed retry.
+    #   retry_subset_sizes None (full/legacy verify) | the per-suite subset
+    #                      sizes {run_all, gui, nextest_debug, nextest_release}
+    #                      (nextest_* are None if their filter file is absent/
+    #                      unreadable — INV-2 honest degrade, never a crash).
+    # Both keys are ALWAYS present (None when not narrowed) so the survey's
+    # runtime mining (milestone 5254) reads a uniform data.get('retry_scope')
+    # and can NEVER miscount a narrowed retry as a full green gate.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a

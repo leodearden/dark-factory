@@ -993,6 +993,187 @@ class TestVerifyRunnerPool:
         result = await bare_pool.dispatch('abc123', _make_spec())
         assert result.passed is True
 
+    async def test_dispatch_emits_retry_scope_for_narrowed_verify(self, tmp_path):
+        """task 2837 (PRD D5): a narrowed failed-only post-merge verify carries
+        retry_scope='failed_only' + per-suite subset sizes into the merge_verify
+        event data (so the survey never miscounts it as a full green gate),
+        while a plain full/legacy verify carries None for both keys; the
+        pre-existing keys are present/unchanged in either case."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool([fake_runner], event_store=event_store, task_id='t-42')
+
+        # (a) Narrowed case: two real nextest filter files of 2 and 0 ids.
+        debug_file = tmp_path / 'nextest-retry-debug.filter'
+        debug_file.write_text('\n'.join(['id::a', 'id::b']))  # 2 ids
+        release_file = tmp_path / 'nextest-retry-release.filter'
+        release_file.write_text('')  # 0 ids (0-byte)
+        narrowed_spec = dataclasses.replace(
+            _make_spec(),
+            verify_env={
+                'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+                'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1',
+                'REIFY_GUI_RETRY_SPECS': '',
+                'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+                'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+            },
+        )
+        await pool.dispatch('sha-narrow', narrowed_spec, attempt=1, depth=3, speculative=False)
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['retry_scope'] == 'failed_only'
+        assert data['retry_subset_sizes'] == {
+            'run_all': 1,
+            'gui': 0,
+            'nextest_debug': 2,
+            'nextest_release': 0,
+        }
+        # Pre-existing keys still present/unchanged.
+        assert data['runner'] == 'local'
+        assert data['merge_sha'] == 'sha-narrow'
+        assert data['passed'] is True
+        assert data['attempt'] == 1
+        assert 'duration_ms' in data
+        assert data['depth'] == 3
+        assert data['speculative'] is False
+
+        # (b) Legacy None-safe case: plain _make_spec() (verify_env={}).
+        await pool.dispatch('sha-full', _make_spec())
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['retry_scope'] is None
+        assert data['retry_subset_sizes'] is None
+
+
+# ---------------------------------------------------------------------------
+# retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
+# ---------------------------------------------------------------------------
+
+
+class TestRetryScopeEventFields:
+    """retry_scope_event_fields derives the merge_verify event's retry_scope +
+    per-suite subset sizes from spec.verify_env (the D2 failed-only contract).
+
+    A full/legacy verify (no REIFY_VERIFY_RETRY_SCOPE='failed_only') carries no
+    scope signal, so the survey's runtime mining never miscounts a narrowed
+    retry as a full green gate (PRD verify-retry-failed-only §4.4/§5.6, INV-2).
+    """
+
+    def test_retry_scope_event_fields_absent_when_not_failed_only(self):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # (a) empty verify_env — the common full/legacy verify.
+        assert retry_scope_event_fields({}) == {
+            'retry_scope': None,
+            'retry_subset_sizes': None,
+        }
+        # (b) some other/legacy REIFY_VERIFY_RETRY_SCOPE value — still no signal.
+        assert retry_scope_event_fields({'REIFY_VERIFY_RETRY_SCOPE': 'full'}) == {
+            'retry_scope': None,
+            'retry_subset_sizes': None,
+        }
+
+    def test_retry_scope_event_fields_narrowed_sizes(self, tmp_path):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # Mirror _build_retry_verify_env's '\n'.join(ids) filter-file format.
+        debug_file = tmp_path / 'nextest-retry-debug.filter'
+        debug_file.write_text('\n'.join(['id::a', 'id::b', 'id::c']))  # 3 ids
+        release_file = tmp_path / 'nextest-retry-release.filter'
+        release_file.write_text('\n'.join(['id::z']))  # 1 id
+
+        verify_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+        }
+        assert retry_scope_event_fields(verify_env) == {
+            'retry_scope': 'failed_only',
+            'retry_subset_sizes': {
+                'run_all': 2,
+                'gui': 1,
+                'nextest_debug': 3,
+                'nextest_release': 1,
+            },
+        }
+
+        # Empty-subset edge: '' comma-values count 0 tokens (dodge the
+        # ''.split(',') == [''] pitfall), and a 0-byte filter file counts 0
+        # lines (dodge the ''.splitlines() == [] pitfall).
+        empty_file = tmp_path / 'nextest-retry-empty.filter'
+        empty_file.write_text('')  # 0 bytes
+        empty_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': '',
+            'REIFY_GUI_RETRY_SPECS': '',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(empty_file),
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+        }
+        result = retry_scope_event_fields(empty_env)
+        assert result['retry_scope'] == 'failed_only'
+        assert result['retry_subset_sizes']['run_all'] == 0
+        assert result['retry_subset_sizes']['gui'] == 0
+        assert result['retry_subset_sizes']['nextest_debug'] == 0
+
+    def test_retry_scope_event_fields_nextest_read_degrades_honestly(self, tmp_path):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # Narrowed verify_env, but the debug filter path is MISSING and the
+        # release key is entirely ABSENT — INV-2 honest degrade to None (never a
+        # crash), while the comma-delimited run_all/gui still compute correctly.
+        verify_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(tmp_path / 'missing.filter'),
+            # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
+        }
+        result = retry_scope_event_fields(verify_env)
+        assert result['retry_scope'] == 'failed_only'
+        sizes = result['retry_subset_sizes']
+        assert sizes['nextest_debug'] is None   # unreadable path → None
+        assert sizes['nextest_release'] is None  # absent key → None
+        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['gui'] == 1
+
+    def test_retry_scope_event_fields_nextest_non_utf8_degrades_honestly(self, tmp_path):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # A filter file with non-UTF-8 bytes makes Path.read_text() raise
+        # UnicodeDecodeError — a ValueError subclass, NOT an OSError.  Per INV-2
+        # the read must still degrade to None rather than propagate and abort the
+        # whole merge_verify event emission (amend: reviewer robustness note).
+        bad_file = tmp_path / 'nextest-retry-nonutf8.filter'
+        bad_file.write_bytes(b'\x80\x81\x82')  # invalid UTF-8 (lone continuation bytes)
+        verify_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(bad_file),
+            # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
+        }
+        result = retry_scope_event_fields(verify_env)
+        assert result['retry_scope'] == 'failed_only'
+        sizes = result['retry_subset_sizes']
+        assert sizes['nextest_debug'] is None   # undecodable file → None (no crash)
+        assert sizes['nextest_release'] is None  # absent key → None
+        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['gui'] == 1
+
 
 # ---------------------------------------------------------------------------
 # Step-7: build_merge_verify_spec
