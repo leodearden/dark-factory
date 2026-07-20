@@ -133,3 +133,36 @@ class TestResolveRoleSystemPromptNoSpec:
         result = workflow._resolve_role_system_prompt(role, 'opus')
 
         assert result == 'VERBATIM PROMPT TEXT'
+
+
+class TestResolveRoleSystemPromptLazyStore:
+    """The lazy-construction arm (prompt_store=None -> build
+    PromptArtifactStore(default_artifacts_root())) is the PRODUCTION path:
+    production never injects a store, only tests do. Every other test here
+    injects a store, so without this test the lazy build +
+    default_artifacts_root() resolution + the lazy-init assignment go
+    unexercised, and a regression in that wiring would pass all other tests.
+    """
+
+    def test_lazy_builds_store_from_default_root_and_returns_baseline(
+        self, tmp_path, monkeypatch,
+    ):
+        # Point default_artifacts_root() at a fresh (nonexistent, so nothing
+        # pinned) dir via the documented env override the lazy-init log line
+        # names, so this test never touches the real repo artifacts tree.
+        artifacts_root = tmp_path / 'prompt_artifacts'
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(artifacts_root))
+
+        workflow = _make_workflow(tmp_path=tmp_path)  # prompt_store defaults to None
+        assert workflow._prompt_store is None  # premise: production injects nothing
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None  # premise: the reviewer role opts in
+
+        result = workflow._resolve_role_system_prompt(REVIEWER_COMPREHENSIVE, 'opus')
+
+        # Nothing pinned in the fresh root -> fail-safe to the in-code baseline.
+        assert result == spec.in_code_constant
+        # The first call lazily populated self._prompt_store from
+        # default_artifacts_root() (which honored the env override).
+        assert workflow._prompt_store is not None
+        assert workflow._prompt_store.root == artifacts_root
