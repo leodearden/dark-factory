@@ -313,3 +313,96 @@ class TestMergeAndFinalise:
         wf._write_completion_to_memory.assert_awaited_once()
         wf._enter_phase.assert_any_call(WorkflowState.DONE)
         wf._finalise_merged_done.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# step-9: _resume_merge_retry_if_pending guard + _drive placement
+# ---------------------------------------------------------------------------
+
+
+def _wire_resume_guard_spies(f: _Fixture):
+    """Spy _merge_and_finalise and _clear_merge_retry_pending for guard tests."""
+    wf = f.wf
+    wf._merge_and_finalise = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+    wf._clear_merge_retry_pending = AsyncMock()  # type: ignore[method-assign]
+    return wf
+
+
+class TestResumeGuard:
+    @pytest.mark.asyncio
+    async def test_no_stamp_returns_none_no_delegation_no_clear(self, monkeypatch):
+        f = _make(metadata={})
+        wf = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+
+        assert await wf._resume_merge_retry_if_pending('task/77') is None
+        wf._merge_and_finalise.assert_not_awaited()
+        wf._clear_merge_retry_pending.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_dict_stamp_returns_none(self, monkeypatch):
+        f = _make(metadata={'merge_retry_pending': 'not-a-dict'})
+        wf = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+
+        assert await wf._resume_merge_retry_if_pending('task/77') is None
+        wf._merge_and_finalise.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_head_match_clears_then_delegates_and_returns_outcome(self, monkeypatch):
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        wf = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+
+        outcome = await wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        wf._clear_merge_retry_pending.assert_awaited_once()
+        wf._merge_and_finalise.assert_awaited_once_with('task/77')
+
+    @pytest.mark.asyncio
+    async def test_head_mismatch_clears_stale_stamp_and_returns_none(self, monkeypatch):
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'OLD-SHA'}})
+        wf = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+
+        outcome = await wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        # A mismatch clears the stale stamp (the branch moved; it can never match).
+        wf._clear_merge_retry_pending.assert_awaited_once()
+        wf._merge_and_finalise.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rev_parse_failure_returns_none_no_delegation(self, monkeypatch):
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        wf = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(rc=1))
+
+        outcome = await wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        wf._merge_and_finalise.assert_not_awaited()
+
+
+class TestDrivePlacement:
+    @pytest.mark.asyncio
+    async def test_drive_returns_guard_outcome_without_invoking_plan(self):
+        f = _make(metadata={})
+        wf = f.wf
+        # Stub setup so _drive reaches the guard with worktree/artifacts intact.
+        wf._setup_worktree_and_artifacts = AsyncMock()  # type: ignore[method-assign]
+        wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        guard = AsyncMock(return_value=WorkflowOutcome.DONE)
+        wf._resume_merge_retry_if_pending = guard  # type: ignore[method-assign]
+        plan_spy = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._plan = plan_spy  # type: ignore[method-assign]
+        wf._enter_phase = MagicMock()  # type: ignore[method-assign]
+
+        outcome = await wf._drive()
+
+        # The resume guard short-circuits the pipeline: _drive returns its
+        # outcome and never runs PLAN (zero architect/implementer/reviewer).
+        assert outcome == WorkflowOutcome.DONE
+        guard.assert_awaited_once()
+        plan_spy.assert_not_awaited()
