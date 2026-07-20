@@ -993,6 +993,69 @@ class TestVerifyRunnerPool:
         result = await bare_pool.dispatch('abc123', _make_spec())
         assert result.passed is True
 
+    async def test_dispatch_emits_retry_scope_for_narrowed_verify(self, tmp_path):
+        """task 2837 (PRD D5): a narrowed failed-only post-merge verify carries
+        retry_scope='failed_only' + per-suite subset sizes into the merge_verify
+        event data (so the survey never miscounts it as a full green gate),
+        while a plain full/legacy verify carries None for both keys; the
+        pre-existing keys are present/unchanged in either case."""
+        from orchestrator.event_store import EventType
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        fake_runner = MagicMock(spec=VerifyRunner)
+        fake_runner.name = 'local'
+        fake_runner.is_local = True
+        fake_runner.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool([fake_runner], event_store=event_store, task_id='t-42')
+
+        # (a) Narrowed case: two real nextest filter files of 2 and 0 ids.
+        debug_file = tmp_path / 'nextest-retry-debug.filter'
+        debug_file.write_text('\n'.join(['id::a', 'id::b']))  # 2 ids
+        release_file = tmp_path / 'nextest-retry-release.filter'
+        release_file.write_text('')  # 0 ids (0-byte)
+        narrowed_spec = dataclasses.replace(
+            _make_spec(),
+            verify_env={
+                'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+                'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1',
+                'REIFY_GUI_RETRY_SPECS': '',
+                'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
+                'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
+            },
+        )
+        await pool.dispatch('sha-narrow', narrowed_spec, attempt=1, depth=3, speculative=False)
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['retry_scope'] == 'failed_only'
+        assert data['retry_subset_sizes'] == {
+            'run_all': 1,
+            'gui': 0,
+            'nextest_debug': 2,
+            'nextest_release': 0,
+        }
+        # Pre-existing keys still present/unchanged.
+        assert data['runner'] == 'local'
+        assert data['merge_sha'] == 'sha-narrow'
+        assert data['passed'] is True
+        assert data['attempt'] == 1
+        assert 'duration_ms' in data
+        assert data['depth'] == 3
+        assert data['speculative'] is False
+
+        # (b) Legacy None-safe case: plain _make_spec() (verify_env={}).
+        await pool.dispatch('sha-full', _make_spec())
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        data = kwargs['data']
+        assert data['retry_scope'] is None
+        assert data['retry_subset_sizes'] is None
+
 
 # ---------------------------------------------------------------------------
 # retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
