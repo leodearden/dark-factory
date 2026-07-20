@@ -37,6 +37,7 @@ import asyncio
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -451,16 +452,18 @@ def canary(
 
 @cli.command('smoke')
 @click.option(
-    '--artifacts-root', default=lambda: str(default_artifacts_root()),
+    '--artifacts-root', default=None,
     type=click.Path(path_type=Path),
-    help='Isolated PromptArtifactStore root to pin the smoke artifact into '
-         '(default: default_artifacts_root(); pass a throwaway/tmp root for CI). '
-         'The pinned heuristics carry the hermetic SMOKE_QUALITY sentinel, so '
-         'point this at a scratch root, never a production artifacts root.',
+    help='PromptArtifactStore root to pin the smoke artifact into. Default: an '
+         'ephemeral throwaway temp dir (auto-removed on exit), so a bare run can '
+         'never touch production. The pinned heuristics carry the hermetic '
+         'SMOKE_QUALITY sentinel, so pointing this at the production artifacts '
+         'root is REFUSED (non-zero exit); pass an isolated scratch root only '
+         'if you want the artifact to persist for a ship->rollback rehearsal.',
 )
 @click.option('--split-seed', default=_SMOKE_DEFAULT_SPLIT_SEED, type=int,
               help='Deterministic 2:1:7 corpus split seed for the held-out TEST verdict')
-def smoke(artifacts_root: Path, split_seed: int) -> None:
+def smoke(artifacts_root: Path | None, split_seed: int) -> None:
     """Run the hermetic end-to-end Tier-1 prompt-opt acceptance smoke (PRD T7).
 
     Fully hermetic -- dependency-injects the three LLM-touching seams
@@ -483,41 +486,57 @@ def smoke(artifacts_root: Path, split_seed: int) -> None:
     # out of module import so the other subcommands stay import-light.
     from .smoke import format_markdown, run_acceptance_smoke
 
-    click.echo(click.style(
-        f'Acceptance Smoke: artifacts_root={artifacts_root} split_seed={split_seed}', bold=True,
-    ))
-    click.echo('=' * 60)
-
-    try:
-        report = asyncio.run(run_acceptance_smoke(
-            store_root=artifacts_root, split_seed=split_seed,
-        ))
-    except KeyboardInterrupt:
-        click.echo('\nInterrupted.')
-        sys.exit(130)
-    except Exception as exc:  # noqa: BLE001 -- surface ANY run failure as a non-zero gate
+    def _run_and_report(store_root: Path) -> None:
+        """Run the smoke into *store_root*, print the report, and sys.exit the gate."""
         click.echo(click.style(
-            f'Acceptance smoke FAILED to run: {exc!r}', fg='red', bold=True,
-        ), err=True)
-        sys.exit(1)
+            f'Acceptance Smoke: artifacts_root={store_root} split_seed={split_seed}', bold=True,
+        ))
+        click.echo('=' * 60)
 
-    click.echo(format_markdown(report))
-    click.echo()
+        try:
+            report = asyncio.run(run_acceptance_smoke(
+                store_root=store_root, split_seed=split_seed,
+            ))
+        except KeyboardInterrupt:
+            click.echo('\nInterrupted.')
+            sys.exit(130)
+        except Exception as exc:  # noqa: BLE001 -- surface ANY run failure as a non-zero gate
+            click.echo(click.style(
+                f'Acceptance smoke FAILED to run: {exc!r}', fg='red', bold=True,
+            ), err=True)
+            sys.exit(1)
 
-    prov = report.provenance
-    intact = report.contract_prefix_intact
-    color = 'green' if intact else 'red'
-    status = 'PASS' if intact else 'FAIL'
-    click.echo(click.style(
-        f'Result: {status} -- held_out_TEST_score={report.test_score:.4f} '
-        f'harness_version={prov.harness_version} optimizer_model={report.optimizer_model} '
-        f'accepted={report.accepted_count} rejected={report.rejected_count} '
-        f'CONTRACT untouched={intact} (resolved source={report.resolved_source})',
-        fg=color, bold=True,
-    ))
-    # Exit 0 only when the run completed AND the reviewer CONTRACT stayed
-    # byte-identical -- the gate the operator watches before a real run.
-    sys.exit(0 if intact else 1)
+        click.echo(format_markdown(report))
+        click.echo()
+
+        prov = report.provenance
+        intact = report.contract_prefix_intact
+        color = 'green' if intact else 'red'
+        status = 'PASS' if intact else 'FAIL'
+        click.echo(click.style(
+            f'Result: {status} -- held_out_TEST_score={report.test_score:.4f} '
+            f'harness_version={prov.harness_version} optimizer_model={report.optimizer_model} '
+            f'accepted={report.accepted_count} rejected={report.rejected_count} '
+            f'CONTRACT untouched={intact} (resolved source={report.resolved_source})',
+            fg=color, bold=True,
+        ))
+        # Exit 0 only when the run completed AND the reviewer CONTRACT stayed
+        # byte-identical -- the gate the operator watches before a real run.
+        sys.exit(0 if intact else 1)
+
+    if artifacts_root is None:
+        # Safe-by-default: a bare run pins into a self-cleaning throwaway dir, so
+        # it can NEVER touch the production artifacts root and leaves no
+        # SMOKE_QUALITY sentinel pin behind. The run + echo + sys.exit all happen
+        # INSIDE the with-block, so the ephemeral tree is removed on exit — the
+        # context manager still unwinds on the sys.exit() SystemExit.
+        with tempfile.TemporaryDirectory(prefix='prompt-opt-smoke-') as _tmp:
+            _run_and_report(Path(_tmp))
+    else:
+        # Operator-owned root: used verbatim and left in place (the documented
+        # ship->rollback rehearsal). run_acceptance_smoke REFUSES the production
+        # root, which surfaces here as a non-zero gate via the except-Exception.
+        _run_and_report(artifacts_root)
 
 
 if __name__ == '__main__':
