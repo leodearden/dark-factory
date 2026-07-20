@@ -5,7 +5,7 @@ prd: plans/usage-gate-model-scoped-caps-prd.md
 schema_version: 1
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 2855
     title: "Scope substrate: scoped_cap_models config + ScopeCap state + scope_for derivation"
     capabilities:
       - name: "usage-cap-config-extensible"
@@ -23,7 +23,7 @@ tasks:
           kind: manual
           reason: "additive dataclass field; presence covered by the scoped_cap_models grep above + α's tests"
   - label: "β"
-    task_id: null
+    task_id: 2856
     title: "Scope-aware cap attribution (thread scope through InvokeSlot/report)"
     capabilities:
       - name: "model-in-scope-at-slot-acquisition"
@@ -41,7 +41,7 @@ tasks:
           kind: manual
           reason: "scoped-attribution correctness is a test property (account phase untouched on scoped CapHit)"
   - label: "γ"
-    task_id: null
+    task_id: 2857
     title: "Scope-aware selection, waiting, uncap + scope_capacity_snapshot read API"
     capabilities:
       - name: "before-invoke-selection-loop"
@@ -59,7 +59,7 @@ tasks:
           kind: manual
           reason: "counter-feeding is a test property, not greppable"
   - label: "δ"
-    task_id: null
+    task_id: 2858
     title: "Resolver model-capacity fail-safe check + _invoke snapshot threading"
     capabilities:
       - name: "resolver-fail-safe-layer-skip"
@@ -77,7 +77,7 @@ tasks:
           kind: manual
           reason: "snapshot threading is exercised by δ's own tests + ε's B7"
   - label: "ε"
-    task_id: null
+    task_id: 2859
     title: "Scope integration gate — B+H boundary suite B1–B8"
     capabilities:
       - name: "boundary-suite-producers-upstream"
@@ -87,7 +87,7 @@ tasks:
           kind: manual
           reason: "the task IS the check suite; its signal is the green B1–B8 matrix"
   - label: "ζ"
-    task_id: null
+    task_id: 2860
     title: "Docs + operator surface for model-scoped caps"
     capabilities:
       - name: "claude-md-routing-section"
