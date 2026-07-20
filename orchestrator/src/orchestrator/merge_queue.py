@@ -123,8 +123,10 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
     build_fail_fast_map,
+    build_warm_shadow_results,
     did_not_pass_subset,
     diff_per_test_results,
+    merge_retry_shadow_baseline,
     parse_per_test_results,
 )
 from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export shim
@@ -1823,6 +1825,7 @@ async def _run_post_merge_verify(
     event_store: EventStore | None = None,
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
+    shadow_baseline_sink: dict[str, str] | None = None,
     quarantine: set[str] | None = None,
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
@@ -1868,6 +1871,17 @@ async def _run_post_merge_verify(
             every existing call site byte-identical.  Used by
             :class:`SpeculativeMergeWorker` to capture warm per-test results
             for PRD §10 invariant 6(b) shadow compare.
+        shadow_baseline_sink: Optional mutable out-param (PRD
+            verify-retry-failed-only D4, §5.4).  When supplied AND this call
+            actually narrowed the retry (``narrowed`` — the D2 producer merged
+            ``retry_env`` on a tree-OID-corroborated attempt-0 sidecar), the
+            attempt-0 ``debug_verdicts`` ∪ ``release_verdicts`` map is copied
+            into it.  :class:`SpeculativeMergeWorker` unions this with the
+            PARTIAL narrowed-retry warm output (via
+            :func:`build_warm_shadow_results`) before storing the warm shadow
+            baseline, so the from-scratch full cold shadow compare sees no
+            phantom ``only_cold`` divergence.  Default ``None`` and untouched on
+            every non-narrowed path keep all existing callers byte-identical.
         keep_worktrees: Additional worktrees to protect during any disk-pressure
             prune triggered inside this verify run (pre-verify guard and ENOSPC
             retry).  Default ``None`` keeps the legacy single-keep behaviour
@@ -1998,6 +2012,19 @@ async def _run_post_merge_verify(
                     spec, verify_env={**spec.verify_env, **retry_env}
                 )
                 narrowed = True
+                # PRD verify-retry-failed-only D4 (§5.4): copy the attempt-0
+                # per-test verdict map into the caller's sink so the warm shadow
+                # baseline is MERGED (attempt-0 ∪ partial narrowed-retry output)
+                # before storage.  This narrowed retry re-runs ONLY the
+                # {did-not-pass} subset, so its output alone OMITS every
+                # attempt-0-passed test → a from-scratch full cold shadow compare
+                # would flag them all only_cold → phantom born-at-L2 divergence.
+                # Populated ONLY here (narrowed=True) so a rebased/uncorroborated
+                # tree (assemble→None) never seeds a stale baseline.
+                if shadow_baseline_sink is not None:
+                    shadow_baseline_sink.update(
+                        {**attempt0.debug_verdicts, **attempt0.release_verdicts}
+                    )
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
@@ -12555,6 +12582,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _warm_results: dict[str, str] = {}
         _is_warm_path = False
         _warm_capture: list[VerifyResult] = []
+        # PRD verify-retry-failed-only D4 (§5.4): attempt-0 verdict sink populated
+        # by _run_post_merge_verify ONLY on a corroborated narrowed retry; unioned
+        # into the warm shadow baseline below (build_warm_shadow_results) so a
+        # PARTIAL narrowed-retry map never triggers a phantom only_cold divergence.
+        _attempt0_shadow: dict[str, str] = {}
         _spec_warm: bool = False  # set when acquire_spec_lane returns warm=True
 
         try:
@@ -12624,6 +12656,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 event_store=self._event_store,
                 merge_sha=merge_commit,
                 on_result=_warm_capture.append if _is_warm_path else None,
+                shadow_baseline_sink=_attempt0_shadow if _is_warm_path else None,
                 quarantine=self._runner_quarantine,
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
@@ -12941,7 +12974,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'passed=True)'
             )
             if _warm_capture:
-                _warm_results = parse_per_test_results(_warm_capture[0].test_output or '')
+                # PRD verify-retry-failed-only D4 (§5.4): union the attempt-0
+                # verdict map (populated on a corroborated narrowed retry) with
+                # the (possibly PARTIAL) narrowed warm output before storing the
+                # warm shadow baseline.  An empty _attempt0_shadow → parse-only
+                # (byte-identical to the non-narrowed path); an EMPTY parse is
+                # returned verbatim so the unparseable alarm below stays reachable.
+                _warm_results = build_warm_shadow_results(
+                    _warm_capture[0].test_output or '', _attempt0_shadow
+                )
                 if not _warm_results and req.config.git.warm_verify_shadow_compare:
                     _alarm_warm_shadow_unparseable(
                         self._escalation_queue,

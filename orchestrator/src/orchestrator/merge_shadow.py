@@ -290,6 +290,90 @@ def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
     return sorted(t for t, v in fail_fast_map.items() if v != 'pass')
 
 
+# ---------------------------------------------------------------------------
+# shadow-baseline map merge (PRD verify-retry-failed-only D4, §5.4).
+# ---------------------------------------------------------------------------
+
+
+def merge_retry_shadow_baseline(
+    attempt0: Mapping[str, str], retry: Mapping[str, str]
+) -> dict[str, str]:
+    """Union attempt-0's passes with a narrowed-retry map for the warm baseline.
+
+    A narrowed {did-not-pass} merge-verify retry re-runs ONLY the tests that
+    did not pass in attempt-0, so ``retry`` (its :func:`parse_per_test_results`
+    map) is PARTIAL — it omits every test that already passed.  Storing that
+    partial map as the warm shadow baseline makes the next from-scratch FULL
+    cold shadow compare classify every attempt-0-passed test as ``only_cold``
+    → ``has_divergence`` → a phantom born-at-L2 "warm merge may be bad" alarm
+    (PRD §5.4 shadow-safe invariant: MERGE attempt-0 ∪ retry per-test maps
+    before storing the warm baseline).
+
+    Reconstruction rule:
+
+    * **Carry forward only attempt-0's PASSED tests.**  On the pass path the
+      narrowed retry re-ran every {did-not-pass} test and they all passed, so
+      overlaying ``retry`` reconstructs an all-pass full-suite baseline.
+    * **``retry`` wins on overlap** — it is the latest verdict for the tests it
+      re-ran (a did-not-pass test flipping to ``'pass'`` overwrites the stale
+      attempt-0 ``'fail'``/``'inconclusive'``).
+    * **Drop attempt-0 non-pass verdicts** absent from ``retry``.  A stray
+      ``'not-started'``/``'fail'`` surviving into the baseline would be flipped
+      by the full cold suite into a genuine-looking divergence — the exact
+      phantom this helper removes.
+
+    Neither input map is mutated.
+
+    Args:
+        attempt0: The attempt-0 per-test verdict map (parse_per_test_results-
+            style keys, values in ``{'pass', 'fail', 'inconclusive',
+            'not-started'}``).
+        retry: The (partial) narrowed-retry per-test verdict map.
+
+    Returns:
+        ``dict[str, str]``: attempt-0 passes carried forward, overlaid by the
+        fresh ``retry`` verdicts.
+    """
+    merged = {t: v for t, v in attempt0.items() if v == 'pass'}
+    merged.update(retry)
+    return merged
+
+
+def build_warm_shadow_results(
+    test_output: str, attempt0_verdicts: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Build the warm shadow baseline from the (possibly narrowed) verify output.
+
+    Parses ``test_output`` into a per-test verdict map and, **only** when BOTH
+    the parse is non-empty AND an attempt-0 verdict map is supplied (i.e. the
+    final warm verify was a corroborated narrowed retry), unions attempt-0's
+    passes via :func:`merge_retry_shadow_baseline` so the from-scratch cold
+    shadow compare sees no phantom ``only_cold`` divergence (PRD
+    verify-retry-failed-only D4, §5.4).
+
+    An **empty parse is returned verbatim** — never unioned — so that the
+    caller's fail-closed ``_alarm_warm_shadow_unparseable`` path remains
+    reachable and an unparseable narrowed retry is never silently turned into a
+    non-empty PARTIAL baseline.  A ``None``/empty ``attempt0_verdicts`` (the
+    non-narrowed warm path) returns the parse verbatim — byte-identical to the
+    pre-D4 ``parse_per_test_results(test_output)`` behaviour.
+
+    Args:
+        test_output: Raw output from the final warm verify run.
+        attempt0_verdicts: The attempt-0 per-test verdict map, supplied only on
+            the corroborated-narrowed path; ``None``/empty on the non-narrowed
+            path.
+
+    Returns:
+        ``dict[str, str]``: the merged (attempt-0 ∪ retry) baseline on the
+        narrowed path with a non-empty parse; otherwise the plain parse.
+    """
+    retry = parse_per_test_results(test_output)
+    if retry and attempt0_verdicts:
+        return merge_retry_shadow_baseline(attempt0_verdicts, retry)
+    return retry
+
+
 # Matches cargo-nextest Summary footer lines, e.g.:
 #   Summary [   1.25s] 250 tests run: 249 passed, 1 failed, 0 skipped
 #   Summary [   0.13s]   1 test run: 1 passed, 0 failed, 0 skipped   (N==1 → singular)

@@ -843,6 +843,74 @@ class TestSpecLaneWarmPathShadowParity:
         # Parity: no escalation submitted
         escalation_queue.submit.assert_not_called()
 
+    async def test_spec_lane_warm_baseline_merges_attempt0_shadow_sink(
+        self, tmp_path: Path
+    ):
+        """Narrowed warm retry: warm_results = attempt-0 ∪ partial retry (PRD D4, §5.4).
+
+        The mock ``_run_post_merge_verify`` simulates a corroborated NARROWED
+        warm retry: it populates the ``shadow_baseline_sink`` with an attempt-0
+        PASSED test omitted from the narrowed run, and reports a PARTIAL warm
+        ``test_output`` containing ONLY the re-run test.  ``_run_inflight_verify``
+        must union them before storing the warm shadow baseline — else the
+        from-scratch FULL cold shadow compare flags the attempt-0 pass as
+        only_cold → phantom born-at-L2 divergence alarm.
+
+        RED (pre step-8): the sink is ignored; ``warm_results`` is the PARTIAL
+        parse ``{'reify-spec test_retried': 'pass'}``.
+        GREEN (step-8): ``build_warm_shadow_results`` unions the sink →
+        ``{'reify-spec test_passed': 'pass', 'reify-spec test_retried': 'pass'}``.
+        """
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=_make_spec_git_config(
+                on=True,
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,
+            ),
+        )
+        worker = _make_minimal_worker(tmp_path)
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+
+        # PARTIAL narrowed-retry output: ONLY the re-run test (attempt-0 pass omitted).
+        fake_vr = VerifyResult(
+            passed=True,
+            test_output='        PASS [0.05s] reify-spec test_retried\n',
+            lint_output='',
+            type_output='',
+            summary='',
+        )
+
+        async def _mock_verify(*args, **kwargs):
+            # Corroborated-narrowed path: seed the sink with the attempt-0 pass.
+            sink = kwargs.get('shadow_baseline_sink')
+            if sink is not None:
+                sink.update({'reify-spec test_passed': 'pass'})
+            on_result = kwargs.get('on_result')
+            if on_result is not None:
+                on_result(fake_vr)
+            return None  # verify passed
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        with patch(
+            'orchestrator.merge_queue._acquire_warm_verify_worktree',
+            new=AsyncMock(return_value=(fake_lane, True)),
+        ), patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            new=_mock_verify,
+        ):
+            vr = await worker._run_inflight_verify(item, _make_local_lease())
+
+        assert vr.warm_results == {
+            'reify-spec test_passed': 'pass',
+            'reify-spec test_retried': 'pass',
+        }, (
+            'narrowed warm retry must store the MERGED (attempt-0 ∪ retry) '
+            f'shadow baseline, not the partial parse; got {vr.warm_results!r}'
+        )
+
 
 def _make_local_lease() -> MagicMock:
     """Build a mock HostLease with is_local=True for _run_inflight_verify tests."""
