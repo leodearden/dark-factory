@@ -7320,6 +7320,49 @@ class TestMergeBackstopNoModuleConfigs:
         assert calls == [], f'No commands should run with empty globs; got: {calls}'
         assert 'No source files' in result.summary
 
+    @pytest.mark.asyncio
+    async def test_deleted_matching_file_merge_overrides_trivial_pass(
+        self, tmp_path: Path, guard_spy,
+    ):
+        """A DELETED manifest-relevant path forces the full gate too (reviewer
+        amendment, task 2838).
+
+        The deleted file (tests/deleted_case.sh) is present in task_files but
+        NOT on disk, so it is excluded from existing_files; a present,
+        non-source, non-matching config file (scripts/deploy.sh) keeps
+        existing_files non-empty, mirroring a realistic config-only diff.
+        role='merge', NO guard script (consult falls open) → the backstop still
+        overrides the trivial pass, because removing a file a manifest
+        enumerates shifts the manifest just as an addition does.
+        """
+        # Present, non-matching, non-source file → lands in existing_files.
+        scripts_dir = tmp_path / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / 'deploy.sh').write_text('#!/usr/bin/env bash\n')
+        # tests/deleted_case.sh deliberately NOT created → it is a deletion.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*']),
+                [],
+                task_files=['scripts/deploy.sh', 'tests/deleted_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            'Expected full-gate command when a manifest-relevant file is'
+            f' DELETED; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            'Expected trivial-pass overridden by backstop on deletion; got'
+            f' summary: {result.summary!r}'
+        )
+
 
 class TestMergeGuardModuleConfigs:
     """Integration: guard wires into the module_configs trivial-pass branch.
@@ -7509,6 +7552,51 @@ class TestMergeBackstopModuleConfigs:
         assert result.passed
         assert calls == [], f'No commands should run with empty globs; got: {calls}'
         assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_deleted_matching_file_merge_overrides_trivial_pass(
+        self, tmp_path: Path, guard_spy,
+    ):
+        """A DELETED manifest-relevant path forces the full gate too (reviewer
+        amendment, task 2838).
+
+        The deleted file (orchestrator/tests/deleted_case.sh) is in task_files
+        but NOT on disk (excluded from existing_files); a present, non-source,
+        non-matching .sh under the same subproject prefix keeps existing_files
+        non-empty. role='merge', NO guard script → the backstop overrides the
+        trivial pass and per-subproject fan-out runs, because a deletion can
+        shift a manifest just as an addition can.
+        """
+        # Present, non-matching, non-source file under the subproject prefix.
+        scripts_dir = tmp_path / 'orchestrator' / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / 'deploy.sh').write_text('#!/usr/bin/env bash\n')
+        # orchestrator/tests/deleted_case.sh deliberately NOT created → deletion.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*.sh']),
+                self._module_configs(),
+                task_files=[
+                    'orchestrator/scripts/deploy.sh',
+                    'orchestrator/tests/deleted_case.sh',
+                ],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__orch_cmd__' in joined, (
+            'Expected per-subproject fan-out when a manifest-relevant file is'
+            f' DELETED; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            'Expected trivial-pass overridden by backstop on deletion; got'
+            f' summary: {result.summary!r}'
+        )
 
 
 @pytest.mark.asyncio

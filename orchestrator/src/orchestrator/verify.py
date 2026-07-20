@@ -1886,10 +1886,13 @@ def _merge_config_only_diff_forces_full_gate(
     case-sensitive and OS-independent (unlike ``fnmatch.fnmatch``, which
     normalizes case per-OS); shell-glob ``*`` crosses ``/``, an intentional,
     safe over-approximation (over-forcing the full gate is the safe direction,
-    under-forcing is the bug being closed).  Matched against *changed_files*
-    (the diff's added+modified on-disk ``existing_files``), a safe
-    over-approximation of "adds files that shift the manifest" — a
-    modification to a classification/manifest file can shift it too.
+    under-forcing is the bug being closed).  The call sites pass the FULL
+    changed set (``task_files``) — added, modified, AND deleted paths — a safe
+    over-approximation of "adds files that shift the manifest": a modification
+    to a classification/manifest file shifts it too, and so does a DELETION of
+    a file the manifest enumerates (deleted paths are absent from the on-disk
+    ``existing_files`` the reify consult receives, so matching ``task_files``
+    here is what closes the deletion residual — reviewer amendment, task 2838).
 
     Empty globs (the default,
     ``config.git.merge_config_only_full_gate_globs``) short-circuit to False in
@@ -4860,8 +4863,15 @@ async def run_scoped_verification(
                         # it short-circuits the verify-pipeline-guard.sh
                         # subprocess on the merge hot path; empty globs (default)
                         # → False → expression byte-identical to guard-only.
+                        # The backstop matches the FULL changed set (task_files)
+                        # — including DELETED manifest-relevant paths, which are
+                        # absent from existing_files — because removing a file a
+                        # manifest enumerates shifts the manifest just as adding
+                        # one does (reviewer amendment, task 2838). The reify
+                        # consult keeps its existing on-disk existing_files
+                        # contract.
                         should_override = role == 'merge' and (
-                            _merge_config_only_diff_forces_full_gate(config, existing_files)
+                            _merge_config_only_diff_forces_full_gate(config, task_files)
                             or await _verify_pipeline_guard_requires_full_gate(
                                 worktree, existing_files,
                             )
@@ -4994,8 +5004,14 @@ async def run_scoped_verification(
                 # short-circuits the verify-pipeline-guard.sh subprocess on the
                 # merge hot path; empty globs (default) → False → expression
                 # byte-identical to the guard-only behaviour.
+                # The backstop matches the FULL changed set (task_files) —
+                # including DELETED manifest-relevant paths, which are absent
+                # from existing_files — because removing a file a manifest
+                # enumerates shifts the manifest just as adding one does
+                # (reviewer amendment, task 2838). The reify consult keeps its
+                # existing on-disk existing_files contract.
                 should_override = role == 'merge' and (
-                    _merge_config_only_diff_forces_full_gate(config, existing_files)
+                    _merge_config_only_diff_forces_full_gate(config, task_files)
                     or await _verify_pipeline_guard_requires_full_gate(
                         worktree, existing_files,
                     )
