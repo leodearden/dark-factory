@@ -145,6 +145,56 @@ class TestBuildEvalOrchConfigVerifyPythonPin:
 
 
 # ---------------------------------------------------------------------------
+# task 2851 — build_eval_orch_config gains an optional `worktree` param so the
+# verify UV_PYTHON pin derives from the eval WORKTREE's .python-version (the
+# SAME tree snapshots._eval_setup_env reads for `uv sync`), not the target
+# project_root's current HEAD. Threaded (the eval executors), the worktree wins;
+# left None (every non-eval caller), pin_source stays project_root — byte-
+# identical to today. When a worktree IS threaded but carries no .python-version,
+# inject NO pin (fail-safe) — crucially with NO fallback to project_root, so the
+# setup/verify interpreter split task 2847 BUG 2 removed cannot reappear.
+# ---------------------------------------------------------------------------
+
+class TestBuildEvalOrchConfigWorktreePin:
+    def test_pin_follows_threaded_worktree_over_project_root(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        # project_root (tmp_path) pins 3.12; the eval worktree pins 3.13. The two
+        # trees diverge — exactly the fixture divergence this task guards against.
+        (tmp_path / '.python-version').write_text('3.12\n')
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / '.python-version').write_text('3.13\n')
+
+        base = _base_config(tmp_path)
+        task = {'project_root': str(tmp_path)}
+
+        cfg = build_eval_orch_config(_impl_cfg(), task, base, worktree=wt)
+
+        # The pin follows the threaded WORKTREE (3.13), NOT project_root (3.12) —
+        # so verify runs under the same interpreter `uv sync` built the venv with.
+        assert cfg.verify_env['UV_PYTHON'] == '3.13'
+        assert cfg.verify_env['UV_PYTHON'] != '3.12'
+
+    def test_threaded_worktree_without_python_version_injects_no_pin(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        # project_root pins 3.12, but the threaded worktree has NO .python-version.
+        (tmp_path / '.python-version').write_text('3.12\n')
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        base = _base_config(tmp_path)
+        task = {'project_root': str(tmp_path)}
+
+        cfg = build_eval_orch_config(_impl_cfg(), task, base, worktree=wt)
+
+        # Fail-safe no-pin — and crucially NO fallback to project_root's 3.12,
+        # proving pin_source is strictly the worktree (mirrors _eval_setup_env).
+        assert 'UV_PYTHON' not in cfg.verify_env
+
+
+# ---------------------------------------------------------------------------
 # step-01/02 — build_eval_orch_config gains an optional judge_config param.
 #
 # Default None keeps the current sonnet/medium/claude judge pin byte-identical
