@@ -25,6 +25,29 @@ class TestReviewerSpec:
         spec = ReviewerSpec(name='test', model='opus', specialization='Testing.', budget=5.0)
         assert spec.budget == 5.0
 
+    def test_cross_family_field_defaults(self) -> None:
+        """A default spec is a native Claude reviewer: backend='claude',
+        no env overrides, no oauth-token env var (keeps every existing
+        spec byte-identical)."""
+        spec = ReviewerSpec(name='test', model='sonnet', specialization='Testing.')
+        assert spec.backend == 'claude'
+        assert spec.env_overrides is None
+        assert spec.oauth_token_env is None
+
+    def test_cross_family_fields_carry_values(self) -> None:
+        """A spec built with cross-family fields carries them verbatim."""
+        spec = ReviewerSpec(
+            name='xfam',
+            model='gpt-5.4',
+            specialization='Testing.',
+            backend='codex',
+            env_overrides={'ANTHROPIC_BASE_URL': 'https://x'},
+            oauth_token_env='TOK',
+        )
+        assert spec.backend == 'codex'
+        assert spec.env_overrides == {'ANTHROPIC_BASE_URL': 'https://x'}
+        assert spec.oauth_token_env == 'TOK'
+
 
 class TestBuildTrialReviewerRole:
     def test_returns_agent_role(self) -> None:
