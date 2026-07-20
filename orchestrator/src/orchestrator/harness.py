@@ -6697,6 +6697,54 @@ task, include it with an empty "files" list rather than omitting it.
                 assignment.task_id, exc,
             )
 
+    async def _bump_routing_tier_by_id(self, task_id: str) -> None:
+        """Bump ``metadata.routing.routing_tier`` for *task_id* by id.
+
+        The async worker behind ``pre_increment_routing_tier`` (task μ,
+        trigger 3 — the escalation ``escalate_model`` flag). Fetches the task's
+        CURRENT metadata via ``scheduler.get_task`` (so the read-then-+1 sees
+        the latest tier, keeping the counter monotonic — invariant 8) and
+        writes the bumped ``routing`` blob through ``metadata_mode='merge'``,
+        exactly like the terminal-failure bump. No-ops when the task is absent
+        (a synthetic/sentinel task_id resolves to None). Best-effort +
+        suppressed: an escalate_model hint must never fail the resolve.
+        """
+        try:
+            task = await self.scheduler.get_task(task_id)
+            if task is None:
+                return
+            await self.scheduler.update_task(
+                task_id,
+                {'routing': _bumped_routing_dump(task.get('metadata'))},
+                metadata_mode='merge',
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: escalate_model routing-tier bump failed (non-fatal): %s',
+                task_id, exc,
+            )
+
+    def pre_increment_routing_tier(self, task_id: str) -> None:
+        """Pre-increment a task's routing tier for its next dispatch (SYNC shim).
+
+        Called from the escalation server's ``resolve_issue`` when
+        ``escalate_model=True`` on a resume/restart — a deliberately SYNC entry
+        point, because ``resolve_issue`` runs on a FastMCP threadpool worker
+        OFF the orchestrator loop and harness code relies on it staying sync
+        (see this task's plan design decision). The escalation package must not
+        write orchestrator task metadata directly either; the harness owns both
+        the metadata write path and the loop. So this shim does NO write itself
+        — it bridges the async ``_bump_routing_tier_by_id`` coroutine onto
+        ``self._loop`` via ``_schedule_coro_threadsafe`` (mirroring the
+        auto-resume-on-resolve pattern), keeping the write harness-owned and
+        on-loop. Best-effort: the metadata write lands one dispatch late in the
+        worst case (a benign ordering race, documented as a soft hint).
+        """
+        self._schedule_coro_threadsafe(
+            self._bump_routing_tier_by_id(task_id),
+            label=f'routing-tier-preincrement-{task_id}',
+        )
+
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
     ) -> None:
