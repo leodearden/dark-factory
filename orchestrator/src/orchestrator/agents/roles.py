@@ -1003,6 +1003,15 @@ An agent hit a blocker it cannot resolve — iteration limit, infra issue, unres
 review feedback, or scope problem. Fix the code, verify with tests, and resolve the
 escalation so the agent can continue.
 
+**Scope expansion grants (`scope_violation` + `action='resume'`).** When you resolve a
+`scope_violation` escalation by granting the agent permission to touch additional
+files, pass `granted_files=["<project-relative path>", ...]` to `resolve_issue` — this
+is the structured grant the orchestrator persists into plan.files/metadata.files/
+file-locks before resuming the agent. Keep your free-text `resolution` as
+human-readable rationale; `granted_files` is what actually widens scope — omitting it
+means the grant exists only as prose and the resumed agent's briefing will not reflect
+the expanded scope.
+
 ### Review Suggestions
 Post-merge improvement suggestions from automated code reviewers.
 

@@ -4081,3 +4081,44 @@ class TestSubmitDurability:
 
         by_task = fresh_queue.get_by_task('2842', status='pending')
         assert [e.id for e in by_task] == ['esc-2842-1']
+
+
+class TestResolveGrantedFiles:
+    """EscalationQueue.resolve() accepts an optional granted_files grant (task 2505).
+
+    granted_files is the steward's structured scope-expansion grant — a
+    file-level, project-relative list distinct from the free-text
+    `resolution` rationale string. Not propagated through the member cascade:
+    grants are L0 scope_violations, which carry empty members lists.
+    """
+
+    def test_granted_files_round_trips_to_queue_get_and_archive(self, tmp_path: Path):
+        """resolve(..., granted_files=[...]) -> queue.get() and the archived JSON both carry it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'ok', granted_files=['crate/Cargo.toml'])
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.status == 'resolved'
+        assert updated.granted_files == ['crate/Cargo.toml']
+
+        archived_files = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived_files) == 1
+        data = json.loads(archived_files[0].read_text())
+        assert data['granted_files'] == ['crate/Cargo.toml'], (
+            f"Expected archived JSON granted_files=['crate/Cargo.toml']; "
+            f"got {data.get('granted_files')!r}"
+        )
+
+    def test_resolve_without_granted_files_leaves_it_empty(self, tmp_path: Path):
+        """resolve(...) with no granted_files argument leaves granted_files==[]."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'ok')
+
+        updated = queue.get('esc-1-1')
+        assert updated is not None
+        assert updated.granted_files == []

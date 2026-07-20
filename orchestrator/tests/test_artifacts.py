@@ -407,6 +407,52 @@ class TestBumpRevalidationStamp:
             artifacts.bump_revalidation_stamp('sess-1')
 
 
+class TestSetPlanFiles:
+    """Tests for ``set_plan_files`` — the orchestrator-side plan.files widen
+    used by the resume-path scope-grant consumer (task 2505)."""
+
+    def test_updates_files_preserves_other_fields_and_owner(self, artifacts: TaskArtifacts):
+        plan = {
+            'task_id': 'task-1',
+            'title': 'Test Task',
+            'files': ['a.py'],
+            'analysis': 'Some analysis',
+            'steps': [
+                {'id': 'step-1', 'type': 'test', 'description': 'Write test', 'status': 'pending', 'commit': None},
+            ],
+            'design_decisions': [{'decision': 'Use X', 'rationale': 'Because Y'}],
+        }
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('S')
+
+        artifacts.set_plan_files(['a.py', 'b.py'], 'S')
+
+        updated = artifacts.read_plan()
+        assert updated['files'] == ['a.py', 'b.py']
+        assert updated['analysis'] == 'Some analysis'
+        assert updated['design_decisions'] == [{'decision': 'Use X', 'rationale': 'Because Y'}]
+        assert len(updated['steps']) == 1
+        assert updated['steps'][0]['id'] == 'step-1'
+        assert artifacts.validate_plan_owner('S') is True
+
+    def test_preserves_original_session_id_when_owner_via_revalidation(
+        self, artifacts: TaskArtifacts,
+    ):
+        plan = dict(VALID_PLAN_WITH_STEPS)
+        plan['files'] = ['a.py']
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance('orig-planner')
+        artifacts.bump_revalidation_stamp('reval-runner')
+
+        artifacts.set_plan_files(['a.py', 'b.py'], 'reval-runner')
+
+        updated = artifacts.read_plan()
+        assert updated['files'] == ['a.py', 'b.py']
+        assert updated['_session_id'] == 'orig-planner'
+        assert updated['_revalidated_by_session'] == 'reval-runner'
+        assert artifacts.validate_plan_owner('reval-runner') is True
+
+
 class TestStalePlanLock:
     """Tests for stale plan.lock detection and cleanup."""
 

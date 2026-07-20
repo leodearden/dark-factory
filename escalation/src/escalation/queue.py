@@ -517,8 +517,16 @@ class EscalationQueue:
         self, escalation_id: str, resolution: str, dismiss: bool = False,
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
         resolution_class: str | None = None,
+        granted_files: list[str] | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
+
+        ``granted_files`` (task 2505): an optional structured scope-expansion
+        grant — a list of file-level, project-relative paths — stamped onto
+        the record when not ``None``. Distinct from ``resolution``, which
+        stays free-text human-readable rationale. Not propagated through the
+        member cascade below: grants are L0 ``scope_violation`` escalations,
+        which carry empty ``members`` lists.
 
         ``resolution_class`` (plans/escalation-lifecycle-dashboard-prd.md Seam 1):
         an optional explicit ``'benign' | 'actionable'`` classification stamp,
@@ -590,6 +598,8 @@ class EscalationQueue:
                 resolution_class if resolution_class is not None
                 else default_resolution_class_for_resolver(resolved_by)
             )
+            if granted_files is not None:
+                esc.granted_files = granted_files
 
             self._atomic_write(escalation_id, esc.to_json())
             self._archive_resolved(escalation_id, esc.resolved_at)

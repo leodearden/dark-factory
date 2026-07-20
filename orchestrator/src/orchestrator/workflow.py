@@ -2464,6 +2464,69 @@ class TaskWorkflow:
                     if thrash_outcome is not None:
                         return thrash_outcome
 
+                    # Fold any steward-granted scope expansion (task 2505)
+                    # into plan.files/metadata.files/locks BEFORE resuming
+                    # the implementer — otherwise the grant lives only as
+                    # free-text resolution prose and the resumed
+                    # implementer's briefing/_task_files never reflect the
+                    # expanded scope. granted_files is read from resolved
+                    # escalation records, not the joined `resolution` string.
+                    granted = self._collect_granted_files()
+                    if granted:
+                        current_files = self.plan.get('files', [])
+                        new_files = current_files + [
+                            f for f in granted if f not in current_files
+                        ]
+                        # Fire whenever the grant actually WIDENS the file
+                        # set — not only on a module-set change. A
+                        # same-package sibling grant leaves the module set
+                        # unchanged yet still must reach plan.files /
+                        # metadata.files / _task_files, so route every real
+                        # widen through _set_task_scope. (Task 2505 reviewer
+                        # regression: the old `set(new_modules) !=
+                        # set(self.modules)` gate silently dropped a
+                        # same-module grant — plan.files was never widened.)
+                        # The `and` short-circuits so _set_task_scope only
+                        # runs on a real widen; on its False return (a genuine
+                        # cross-module lock conflict) we requeue.
+                        if (
+                            new_files != current_files
+                            and not await self._set_task_scope(new_files)
+                        ):
+                            # Lock conflict on a genuine cross-module
+                            # expansion: the scheduler already requeued the
+                            # task to pending and persisted
+                            # metadata.files=new_files on its own (plan.json
+                            # was widened to match by _set_task_scope before
+                            # the conflict was detected). Do NOT resume the
+                            # implementer under a lock a sibling task still
+                            # holds — requeue and let this task redispatch
+                            # once the lock frees. new_modules is computed
+                            # HERE (only on the conflict path) so the
+                            # block_detail names the exact unavailable locks.
+                            new_modules = files_to_modules(
+                                new_files, self.config.lock_depth,
+                            )
+                            additional = sorted(
+                                set(new_modules) - set(self.modules)
+                            )
+                            block_detail = (
+                                f'Scope grant blocked: additional locks '
+                                f'{additional} unavailable (held by other '
+                                f'tasks). Held modules: '
+                                f'{sorted(self.modules)}; granted files: '
+                                f'{sorted(granted)}.'
+                            )
+                            self._terminal_report = TerminalReport(
+                                outcome=WorkflowOutcome.REQUEUED,
+                                reason='scope_grant_lock_conflict',
+                                phase=self.machine.state,
+                                detail=block_detail,
+                                category=None,
+                                blocked_from_phase=self.machine.state,
+                            )
+                            return WorkflowOutcome.REQUEUED
+
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     resume_prompt = await self.briefing.build_resume_prompt(
@@ -3070,6 +3133,12 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
+        # Tripwire (task 2505): plan.files must equal metadata.files by
+        # construction (the scope-reconciliation choke point keeps them in
+        # lockstep) — a divergence here means some path bypassed it. Purely
+        # observational: logs + escalates, never blocks the merge.
+        await self._check_scope_invariant()
+
         # Defense-in-depth: any blocking L0 escalation, or any
         # born-at-L2 (critical/urgent), or any level≥2 escalation
         # created during execute/verify/review (e.g. plan-overwrite
@@ -3323,6 +3392,83 @@ class TaskWorkflow:
                 logger.info('Task %s: synced venv for %s', self.task_id, prefix)
 
         await asyncio.gather(*(_sync(p) for p in sorted(prefixes)))
+
+    async def _reconcile_scope_locks(self, plan_files: list[str]) -> bool:
+        """Shared blast-radius-expansion + ``self.modules``/``_module_configs``
+        sync — the scope-reconciliation choke point (task 2505) used by every
+        path that (re)establishes plan.files against the scheduler's file-lock
+        set: ``_plan()``, ``_apply_revalidation_skip()``, ``_run_simple_task()``,
+        and ``_set_task_scope()``.
+
+        Derives the module set from *plan_files*; if it already matches
+        ``self.modules`` this is a no-op (returns True without touching the
+        scheduler). Otherwise asks the scheduler to expand/reconcile the lock
+        via ``handle_blast_radius_expansion`` (``persist_files=plan_files`` —
+        this call persists ``metadata.files=plan_files`` on BOTH its success
+        and lock-conflict/requeue branches). On success, updates
+        ``self.modules``/``self._module_configs`` and returns True. On a lock
+        conflict, ``self.modules`` is left UNCHANGED (the scheduler has
+        already persisted ``metadata.files=plan_files`` and requeued the task
+        to pending on its own) and this returns False — callers decide what
+        "not expanded" means for their own flow (REQUEUED report,
+        decline-and-fall-through-to-architect, or silent no-op).
+        """
+        new_modules = files_to_modules(plan_files, self.config.lock_depth)
+        if set(new_modules) == set(self.modules):
+            return True
+        expanded = await self.scheduler.handle_blast_radius_expansion(
+            self.task_id, self.modules, new_modules,
+            persist_files=plan_files,
+        )
+        if not expanded:
+            return False
+        # Persistence of the tightened lock set is centralized in
+        # handle_blast_radius_expansion (success branch) — not here.
+        self.modules = new_modules
+        self._module_configs = self._resolve_module_configs()
+        return True
+
+    async def _set_task_scope(self, new_files: list[str]) -> bool:
+        """Orchestrator-side single choke point for widening a task's file
+        scope OUTSIDE the architect/plan-boundary flow (task 2505) — used by
+        the resume-path scope-grant consumer to fold a steward's
+        ``granted_files`` into plan.files without re-invoking the architect.
+
+        Writes plan.json first (``self.plan['files'] = new_files`` +
+        ``artifacts.set_plan_files`` — preserves ownership/provenance), then
+        reconciles the scheduler's locks/metadata.files via
+        ``_reconcile_scope_locks``. On a lock conflict, plan.json is already
+        widened (matching metadata.files, which ``handle_blast_radius_expansion``
+        persists on both branches) but ``self.modules`` is left unchanged and
+        this returns False so the caller does NOT resume under a foreign lock.
+
+        Same-module widen (task 2505 reviewer regression): when the granted
+        file maps to a module the task already locks, ``_reconcile_scope_locks``
+        no-ops the ``handle_blast_radius_expansion`` call — which is the ONLY
+        path that persists ``metadata.files``. Without a direct persist here,
+        plan.files would be widened while metadata.files stayed behind, tripping
+        the MERGE-entry ``_check_scope_invariant`` divergence tripwire. So on a
+        successful reconcile that left ``self.modules`` UNCHANGED, persist
+        ``metadata.files=new_files`` directly (mirroring the done-metadata
+        reconcile read-modify-write). On the module-CHANGE success path and the
+        lock-CONFLICT path this is skipped — ``handle_blast_radius_expansion``
+        already persisted ``metadata.files=new_files`` on both those branches,
+        so a direct write would be a redundant double write.
+        """
+        assert self.artifacts is not None
+        self.plan['files'] = new_files
+        self.artifacts.set_plan_files(new_files, self.session_id)
+        modules_before = set(self.modules)
+        reconciled = await self._reconcile_scope_locks(new_files)
+        if reconciled and set(self.modules) == modules_before:
+            merged = await self._merge_fresh_metadata(
+                self.task.get('metadata') or {},
+                log_context='scope-grant files persist',
+            )
+            merged['files'] = sanitize_files_for_persist(new_files)
+            self.task['metadata'] = merged
+            await self.scheduler.update_task(self.task_id, merged)
+        return reconciled
 
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
@@ -3681,37 +3827,33 @@ class TaskWorkflow:
             f'from {len(plan_files)} files: {plan_modules}'
         )
 
-        if set(plan_modules) != set(self.modules):
-            expanded = await self.scheduler.handle_blast_radius_expansion(
-                self.task_id, self.modules, plan_modules,
-                persist_files=plan_files,
+        if (
+            set(plan_modules) != set(self.modules)
+            and not await self._reconcile_scope_locks(plan_files)
+        ):
+            # Annotate the requeue so the per-task retry-cap report can
+            # name *why* — without this, three blast-radius requeues in a
+            # row produce a cap-exhaust report with phase/reason='unknown'.
+            additional = sorted(set(plan_modules) - set(self.modules))
+            block_detail = (
+                f'Plan expansion blocked: additional locks {additional} '
+                f'unavailable (held by other tasks). '
+                f'Held modules: {sorted(self.modules)}; '
+                f'plan modules: {sorted(plan_modules)}.'
             )
-            if not expanded:
-                # Annotate the requeue so the per-task retry-cap report can
-                # name *why* — without this, three blast-radius requeues in a
-                # row produce a cap-exhaust report with phase/reason='unknown'.
-                additional = sorted(set(plan_modules) - set(self.modules))
-                block_detail = (
-                    f'Plan expansion blocked: additional locks {additional} '
-                    f'unavailable (held by other tasks). '
-                    f'Held modules: {sorted(self.modules)}; '
-                    f'plan modules: {sorted(plan_modules)}.'
-                )
-                self._terminal_report = TerminalReport(
-                    outcome=WorkflowOutcome.REQUEUED,
-                    reason='plan_blast_radius_lock_conflict',
-                    phase=self.machine.state, detail=block_detail,
-                    category=None,
-                    # No BLOCKED transition on this path — blocked_from_phase
-                    # mirrors the current (working) phase, preserving the
-                    # harness's retry-cap block_phase='plan' (REVIEW-CYCLE-1).
-                    blocked_from_phase=self.machine.state,
-                )
-                return WorkflowOutcome.REQUEUED
-            # Persistence of the tightened lock set is centralized in
-            # handle_blast_radius_expansion (success branch) — not here.
-            self.modules = plan_modules
-            self._module_configs = self._resolve_module_configs()
+            self._terminal_report = TerminalReport(
+                outcome=WorkflowOutcome.REQUEUED,
+                reason='plan_blast_radius_lock_conflict',
+                phase=self.machine.state, detail=block_detail,
+                category=None,
+                # No BLOCKED transition on this path — blocked_from_phase
+                # mirrors the current (working) phase, preserving the
+                # harness's retry-cap block_phase='plan' (REVIEW-CYCLE-1).
+                blocked_from_phase=self.machine.state,
+            )
+            return WorkflowOutcome.REQUEUED
+        # self.modules/_module_configs already updated by
+        # _reconcile_scope_locks on success (no-op if scope unchanged).
 
         # Write plan decisions to memory
         await self._write_decisions_to_memory()
@@ -3804,22 +3946,18 @@ class TaskWorkflow:
         # already handles the requeue case.
         plan_files = plan.get('files', [])
         plan_modules = files_to_modules(plan_files, self.config.lock_depth)
-        if set(plan_modules) != set(self.modules):
-            expanded = await self.scheduler.handle_blast_radius_expansion(
-                self.task_id, self.modules, plan_modules,
-                persist_files=plan_files,
+        if (
+            set(plan_modules) != set(self.modules)
+            and not await self._reconcile_scope_locks(plan_files)
+        ):
+            logger.info(
+                'Task %s: revalidation skip declined — blast-radius '
+                'expansion denied',
+                self.task_id,
             )
-            if not expanded:
-                logger.info(
-                    'Task %s: revalidation skip declined — blast-radius '
-                    'expansion denied',
-                    self.task_id,
-                )
-                return None
-            # Persistence of the tightened lock set is centralized in
-            # handle_blast_radius_expansion (success branch) — not here.
-            self.modules = plan_modules
-            self._module_configs = self._resolve_module_configs()
+            return None
+        # self.modules/_module_configs already updated by
+        # _reconcile_scope_locks on success (no-op if scope unchanged).
 
         # Bump revalidation stamp + base commit (mirrors confirm_plan).
         try:
@@ -3968,15 +4106,10 @@ class TaskWorkflow:
         if plan_files:
             plan_modules = files_to_modules(plan_files, self.config.lock_depth)
             if set(plan_modules) != set(self.modules):
-                expanded = await self.scheduler.handle_blast_radius_expansion(
-                    self.task_id, self.modules, plan_modules,
-                    persist_files=plan_files,
-                )
-                if expanded:
-                    # Persistence of the tightened lock set is centralized in
-                    # handle_blast_radius_expansion (success branch) — not here.
-                    self.modules = plan_modules
-                    self._module_configs = self._resolve_module_configs()
+                # Silent no-op on lock conflict (same as before this was
+                # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
+                # fail out here, it just doesn't re-tighten the lock.
+                await self._reconcile_scope_locks(plan_files)
 
         await self._stamp_optimistic_path('simple_task')
 
@@ -4384,6 +4517,32 @@ class TaskWorkflow:
             )
 
         return None
+
+    def _collect_granted_files(self) -> list[str]:
+        """Union ``granted_files`` across every resolved escalation for this
+        task (task 2505) — the steward's structured scope-expansion grant
+        stamped via ``resolve_issue(..., granted_files=[...])`` when
+        resolving a ``scope_violation`` L0 with ``action='resume'``.
+
+        Order-preserving de-duplication across ALL resolved records (not
+        just the most recently resolved one), so a grant from an earlier
+        resolution in this task's history is never dropped on a later
+        resume-loop re-entry. Returns ``[]`` when no ``escalation_queue`` is
+        wired (eval mode) — the caller's union with ``plan.files`` is then a
+        no-op.
+        """
+        if not self.escalation_queue:
+            return []
+        seen: set[str] = set()
+        granted: list[str] = []
+        for esc in self.escalation_queue.get_by_task(self.task_id):
+            if esc.status != 'resolved':
+                continue
+            for f in esc.granted_files:
+                if f not in seen:
+                    seen.add(f)
+                    granted.append(f)
+        return granted
 
     async def _check_merge_outcome_thrash(
         self,
@@ -10381,6 +10540,106 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f'Expected _session_id={self.session_id} but plan.json contains '
                 f'{foreign_session}. A duplicate workflow may have overwritten plan.json.'
             )
+        logger.error(f'Task {self.task_id}: {summary}')
+
+        if not self.escalation_queue:
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail,
+            suggested_action='investigate_and_retry',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': esc.category,
+                      'severity': esc.severity, 'summary': summary[:200]},
+            )
+
+    async def _check_scope_invariant(self) -> None:
+        """Tripwire (task 2505): warn + escalate if ``plan.files`` and
+        ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
+
+        The scope-reconciliation choke point (``_reconcile_scope_locks`` /
+        ``_set_task_scope``) keeps ``plan.files`` and ``metadata.files`` in
+        lockstep on every path that changes either. This surfaces a genuine
+        divergence loudly (the project's loud-over-silent-degradation norm)
+        rather than letting scope drift ship silently into a merge.
+
+        Compared at MODULE (lock) granularity, NOT file granularity. Locks —
+        the only thing ``metadata.files`` functionally drives — are
+        module-granular (``files_to_modules`` at ``lock_depth``), and
+        ``metadata.files`` is only ever persisted by the scheduler's
+        ``handle_blast_radius_expansion``, which no-ops (never persists)
+        whenever the derived module set is unchanged. So a benign same-module
+        file addition by the architect (author declares ``pkg/a.py``; the
+        architect plans ``pkg/a.py`` + same-package ``pkg/b.py``) legitimately
+        leaves the two file lists differing while the module sets — and thus
+        the locks and the merge — agree. A file-granularity comparison would
+        false-escalate that common architect widen with a blocking
+        ``infra_issue`` that routes to a human even though nothing is wrong;
+        only a MODULE-set divergence (a real lock/scope-reconciliation bug) is
+        escalation-worthy. The stronger file-level equality is still maintained
+        by construction on the resume/grant path (``_set_task_scope`` persists
+        ``metadata.files`` directly), so nothing is lost there.
+
+        Fail-safe: an unreadable task (``self.scheduler.get_task`` returns
+        ``None`` — e.g. a transient backend hiccup) is treated as "cannot
+        check" and skipped, not "divergent" — a read failure must not wedge
+        an otherwise-valid merge or false-escalate.
+        """
+        fresh_task = await self.scheduler.get_task(self.task_id)
+        if fresh_task is None:
+            return
+        plan_files = sanitize_files_for_persist(self.plan.get('files', []))
+        metadata_files = list((fresh_task.get('metadata') or {}).get('files') or [])
+        plan_modules = set(files_to_modules(plan_files, self.config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, self.config.lock_depth)
+        )
+        if plan_modules == metadata_modules:
+            return
+        logger.warning(
+            'Task %s: plan.files/metadata.files LOCK-MODULE divergence detected '
+            'at MERGE entry — plan modules=%s (files=%s), metadata modules=%s '
+            '(files=%s)',
+            self.task_id, sorted(plan_modules), sorted(plan_files),
+            sorted(metadata_modules), sorted(metadata_files),
+        )
+        self._escalate_scope_invariant_violation(
+            sorted(plan_files), sorted(metadata_files),
+        )
+
+    def _escalate_scope_invariant_violation(
+        self, plan_files: list[str], metadata_files: list[str],
+    ) -> None:
+        """Submit an ``infra_issue`` escalation for a plan.files/metadata.files
+        divergence caught by :meth:`_check_scope_invariant` (task 2505).
+        Mirrors :meth:`_escalate_plan_overwrite`'s submission shape.
+        """
+        summary = (
+            f'plan.files/metadata.files divergence detected for task {self.task_id}'
+        )
+        detail = (
+            f'plan.files={plan_files} but metadata.files={metadata_files} — '
+            f'these derive DIFFERENT lock-module sets at lock_depth='
+            f'{self.config.lock_depth} (a benign same-module file delta does '
+            f'NOT reach here). The scope-reconciliation choke point '
+            f'(_reconcile_scope_locks/_set_task_scope) should keep the module '
+            f'sets in lockstep on every path that changes either.'
+        )
         logger.error(f'Task {self.task_id}: {summary}')
 
         if not self.escalation_queue:

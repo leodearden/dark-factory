@@ -1227,6 +1227,55 @@ class TestResolveIssueResolutionClass:
         )
 
 
+class TestResolveIssueGrantedFiles:
+    """resolve_issue accepts an optional granted_files scope-expansion grant (task 2505)."""
+
+    def _seed_pending(self, queue: EscalationQueue, esc_id: str = 'esc-gf-0001') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-granted-files',
+            agent_role='implementer',
+            severity='blocking',
+            category='scope_violation',
+            summary='granted_files test escalation',
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_granted_files_round_trips_to_queue_get(self, tmp_path: Path):
+        """action='resume', granted_files=[...] -> queue.get(id).granted_files carries it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=['crate/Cargo.toml'],
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == ['crate/Cargo.toml'], (
+            f"Expected granted_files=['crate/Cargo.toml']; got {record.granted_files!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_granted_files_leaves_it_empty(self, tmp_path: Path):
+        """resolve_issue with no granted_files argument -> record.granted_files == []."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == []
+
+
 # ---------------------------------------------------------------------------
 # TestResolveIssueTerminateMcpPath: terminate= guard reachable via MCP dispatch
 # ---------------------------------------------------------------------------

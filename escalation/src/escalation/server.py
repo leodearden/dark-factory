@@ -604,6 +604,7 @@ def create_server(
         resolved_by: str | None = None,
         resolution_turns: int | None = None,
         resolution_class: str | None = None,
+        granted_files: list[str] | None = None,
         terminate: Any = None,
     ) -> dict[str, Any]:
         """Resolve or dismiss an escalation.
@@ -645,6 +646,14 @@ def create_server(
 
         ``resolved_by`` attributes the resolver (e.g. ``"steward"``, ``"interactive"``).
         ``resolution_turns`` records how many conversation turns resolution took.
+
+        ``granted_files`` (task 2505): an optional structured scope-expansion
+        grant — a list of file-level, project-relative paths — consumed only
+        on the ``action='resume'`` orchestrator path (it widens
+        ``plan.files``/``metadata.files``/locks there). Distinct from
+        ``resolution``, which stays free-text human-readable rationale. Not
+        forwarded to the ``park`` action; omit to leave the record's
+        ``granted_files`` at its existing value (``[]`` for a fresh record).
 
         ``resolution_class`` optionally stamps an explicit
         ``'benign'``/``'actionable'`` classification
@@ -849,6 +858,7 @@ def create_server(
             escalation_id, resolution, dismiss=dismiss,
             resolved_by=resolved_by, resolution_turns=resolution_turns,
             resolution_class=resolution_class,
+            granted_files=granted_files,
         )
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found'}
