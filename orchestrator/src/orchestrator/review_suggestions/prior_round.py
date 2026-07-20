@@ -105,3 +105,66 @@ def partition_by_decisions(
         else:
             kept.append(suggestion)
     return kept, suppressed
+
+
+def _format_suggestion_block(
+    suggestions: list[dict], *, enumerated: bool
+) -> str:
+    """Render *suggestions* as a human-readable block for the adjudicator.
+
+    When *enumerated* is True each entry is prefixed with its 0-based index
+    (``[i]``) so the adjudicator can address a per-index verdict back; otherwise
+    entries are bulleted.  Field access is tolerant — a non-dict or a missing
+    field renders as empty rather than raising.
+    """
+    lines: list[str] = []
+    for i, s in enumerate(suggestions):
+        get = s.get if isinstance(s, dict) else (lambda _k, _d='': '')
+        location = get('location', '')
+        category = get('category', '')
+        description = get('description', '')
+        suggested_fix = get('suggested_fix', '')
+        header = f'[{i}] ' if enumerated else '- '
+        lines.append(
+            f'{header}location={location} | category={category}\n'
+            f'    description: {description}\n'
+            f'    suggested_fix: {suggested_fix}'
+        )
+    return '\n'.join(lines) if lines else '(none)'
+
+
+def build_resettled_adjudicator_prompt(
+    current: list[dict], prior_settled: list[dict],
+) -> str:
+    """Build the batched prior-round-resolution adjudication prompt (pure).
+
+    Embeds an enumerated (0-indexed) block of the *current* suggestions
+    (location + category + description + suggested_fix) and a block of the
+    *prior_settled* suggestions, and asks for a per-index verdict drawn from the
+    {:data:`SETTLED`, :data:`NOT_SETTLED`, :data:`INCONCLUSIVE`} vocabulary —
+    with explicit guidance to answer ``inconclusive`` when unsure so the
+    caller's fail-safe partition keeps anything ambiguous.
+    """
+    current_block = _format_suggestion_block(current, enumerated=True)
+    prior_block = _format_suggestion_block(prior_settled, enumerated=False)
+    return (
+        'You are adjudicating whether each CURRENT review suggestion merely '
+        're-flags a concern that was already SETTLED in a PRIOR amendment round '
+        'of this same task — a concern the team already tried and resolved '
+        '(applied a fix, or deliberately reverted and kept the code as-is). '
+        'Re-flagging a settled concern wastes cycles re-litigating a closed '
+        'decision.\n\n'
+        'PRIOR-ROUND SETTLED SUGGESTIONS:\n'
+        f'{prior_block}\n\n'
+        'CURRENT SUGGESTIONS (0-indexed):\n'
+        f'{current_block}\n\n'
+        'For EACH current suggestion index, return exactly one decision:\n'
+        f'  - "{SETTLED}": substantively the same concern as a prior-round '
+        'settled suggestion — it re-litigates that closed decision.\n'
+        f'  - "{NOT_SETTLED}": a new or still-open concern — emit it.\n'
+        f'  - "{INCONCLUSIVE}": you cannot tell. Answer this whenever you are '
+        'unsure — do NOT guess "' + SETTLED + '".\n\n'
+        'Only "' + SETTLED + '" suppresses a suggestion; every other answer '
+        'emits it. When in doubt, prefer "' + INCONCLUSIVE + '". Return one '
+        'decision per current index.'
+    )
