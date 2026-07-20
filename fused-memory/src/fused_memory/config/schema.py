@@ -443,15 +443,22 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
         ),
         ProceduralTopicCluster(
             topic_id='eval-worktree-venv-shadowing',
+            # Reviewer (robustness): the earlier seed paired short, generic tokens
+            # ('shadow', 'pyright', 'conftest', 'site-packages', bare '.venv') that
+            # co-occur in unrelated Python-env notes, so a genuine pyright/conftest
+            # or a plain '.venv'/'site-packages' gotcha could reach min_phrase_hits
+            # on its own and be mis-routed to gate 2844. Narrowed to eval-worktree
+            # anchors plus distinctive multi-word phrases, so a match now requires
+            # the eval-worktree context or an unambiguous venv-shadowing phrase
+            # (mirrors the more distinctive plan-tools cluster above). 'shadow' as a
+            # bare 6-char substring (fires on 'shadowing'/'overshadow'/'shadow copy')
+            # is replaced by the longer 'venv shadowing' / '.venv shadow'.
             phrases=[
-                'shadow',
+                'eval-worktree',  # anchor; also substring-matches '.eval-worktrees'
+                'eval worktree',  # anchor (space spelling)
                 'editable install',
-                '.venv',
-                '.eval-worktrees',
-                'eval-worktree',
-                'pyright',
-                'conftest',
-                'site-packages',
+                'venv shadowing',
+                '.venv shadow',
             ],
             min_phrase_hits=2,
             hint=(
