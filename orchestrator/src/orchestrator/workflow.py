@@ -288,6 +288,49 @@ def _is_gating_escalation(e: Escalation) -> bool:
     )
 
 
+def _format_reescalation_detail(escalations: list[Escalation]) -> str:
+    """Render the payload carried by ``_StewardReescalated`` into a rich
+    ``_mark_blocked(detail=...)`` string (task 2553).
+
+    Without this, ``run()``'s ``except _StewardReescalated`` clause discarded
+    the exception's ``escalations`` payload and called ``_mark_blocked``
+    without ``detail=``, so ``_mark_blocked``'s ``detail = detail or reason``
+    fallback made ``TerminalReport.detail`` an exact copy of
+    ``TerminalReport.reason`` ('Steward re-escalated to human') — block-time
+    investigators started from zero information (harness ``block_detail``).
+
+    Renders, per escalation: its id/severity/level/category header line,
+    then — only when non-``None`` — the run phase (``workflow_state``) and
+    resolution turn count (``resolution_turns``), then the full ``summary``
+    and ``detail`` text. Multiple escalations (a burst may hold more than
+    one) are joined with a blank line between them. Returns ``''`` for an
+    empty list — defensive; the two raise sites in ``_wait_for_resolution``
+    (born-at-L2 / level>=2, and steward-gave-up level-1) both guarantee a
+    non-empty list, and ``''`` preserves ``_mark_blocked``'s
+    ``detail or reason`` fallback rather than emitting an empty-but-present
+    detail.
+    """
+    if not escalations:
+        return ''
+
+    blocks = []
+    for e in escalations:
+        lines = [
+            f'Escalation {e.id} (severity={e.severity}, level={e.level}, '
+            f'category={e.category})',
+        ]
+        if e.workflow_state is not None:
+            lines.append(f'phase={e.workflow_state}')
+        if e.resolution_turns is not None:
+            lines.append(f'turns={e.resolution_turns}')
+        lines.append(f'Summary: {e.summary}')
+        lines.append(f'Detail: {e.detail}')
+        blocks.append('\n'.join(lines))
+
+    header = f'Steward re-escalated; {len(escalations)} pending escalation(s):'
+    return header + '\n\n' + '\n\n'.join(blocks)
+
+
 class _StewardReescalated(Exception):
     """Raised when the steward re-escalates to level-1 (consumed by the auto-watcher, which may promote to L2 for a human)."""
 
