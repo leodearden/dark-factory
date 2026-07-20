@@ -5913,6 +5913,19 @@ class TaskWorkflow:
                     if escalation_key not in self._unreconciled_done_step_escalations:
                         self._unreconciled_done_step_escalations.add(escalation_key)
                         self._escalate_unreconciled_done_step(item['id'], commit, wip_tip_sha)
+                        # task 2764: durably persist the emitted key (in the
+                        # meta-root reconcile_state.json sidecar) so a restarted
+                        # orchestrator — which constructs a fresh, empty
+                        # in-memory set — hydrates it and does not re-file this
+                        # same (step_id, stale_commit) pair. Placed AFTER the
+                        # `if remapped: continue` early-out above, so only a
+                        # genuinely-escalated pair (not WIP-reconciled, not
+                        # 2762 patch-id-remapped) gets a durable key.
+                        # Escalate-FIRST-then-persist is deliberate: a rare
+                        # persist failure at worst re-files the pair once on the
+                        # next restart (a loud duplicate) rather than silently
+                        # dropping the escalation.
+                        self.artifacts.append_emitted_step_escalation(item['id'], commit)
         except Exception:
             logger.warning(
                 'Done-step commit reconciliation failed; leaving plan commits unchanged',
