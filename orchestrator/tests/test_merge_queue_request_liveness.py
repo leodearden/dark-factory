@@ -1584,7 +1584,11 @@ class TestContendedLeaseDefers:
         robustness suggestion #1).
         """
         from orchestrator.git_ops import MergeVerifyLeaseContended
-        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            InflightVerifyResult,
+            SpeculativeMergeWorker,
+        )
         from orchestrator.verify_runner import HostLease
 
         async def _lease_contended_verify(*_a: object, **_k: object) -> object:
@@ -1608,7 +1612,7 @@ class TestContendedLeaseDefers:
 
         task_id = 'wedged-holder'
 
-        async def _drive_one(branch: str, verify: object) -> object:
+        async def _drive_one(branch: str, verify: object) -> InflightVerifyResult:
             # Fresh merged item on a distinct branch but the SAME task_id, so
             # the per-task streak counter accumulates across dispatch attempts.
             req, item = await _make_merged_item(

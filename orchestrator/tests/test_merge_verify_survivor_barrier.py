@@ -176,7 +176,13 @@ class TestReapMergeVerifySurvivors:
 
         assert result is True
 
-    @pytest.mark.timeout(20)
+    # Widened from 20s (task 2828 debug): the real /proc scan + killpg reap is
+    # heavy and, under 32-worker xdist host oversubscription, balloons ~3x-8x
+    # (measured ~8.5s at 40-hog load vs ~3s isolated).  A too-tight cap trips
+    # pytest-timeout's `thread` method, which os._exit()s the whole worker
+    # ("node down: Not properly terminated"), not just fails the test.  Mirrors
+    # the task-2376 heavy-test widening (test_shutdown=120, test_crash_recovery=180).
+    @pytest.mark.timeout(90)
     async def test_knob_on_reaps_real_survivor_and_excludes_own_group(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
@@ -286,7 +292,11 @@ class TestReapMergeVerifySurvivors:
         # exactly two scans (pre-reap find + post-reap residual re-scan).
         assert scan.call_count == 2
 
-    @pytest.mark.timeout(20)
+    # Widened from 20s (task 2828 debug): two real /proc scans under host
+    # oversubscription measured ~7.9s at 40-hog load (vs ~1s isolated) and can
+    # exceed a tight cap — the `thread` timeout method then os._exit()s the
+    # worker rather than failing the test.  See the sibling widening above.
+    @pytest.mark.timeout(90)
     async def test_residual_survivor_returns_false_and_logs_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
@@ -333,7 +343,12 @@ class TestReapMergeVerifySurvivors:
             with contextlib.suppress(Exception):
                 await proc.wait()
 
-    @pytest.mark.timeout(30)
+    # Widened from 30s (task 2828 debug): the heaviest test here — real git
+    # worktree setup + /proc scan + killpg reap + a second reset round-trip.
+    # Measured ~10s at 40-hog oversubscription (vs ~3s isolated); under the full
+    # verify's sustained load it exceeded 30s and the `thread` timeout method
+    # os._exit()'d the worker.  120s mirrors test_shutdown's real-reap widening.
+    @pytest.mark.timeout(120)
     async def test_integration_reap_then_reset_succeeds_on_clear_tree(
         self, real_git_ops: GitOps,
     ):
