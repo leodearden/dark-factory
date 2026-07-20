@@ -7220,6 +7220,107 @@ class TestMergeGuardNoModuleConfigs:
         assert 'No source files' in result.summary
 
 
+class TestMergeBackstopNoModuleConfigs:
+    """Integration: the manifest-drift backstop (task 2838) wires into the
+    no-module_configs trivial-pass branch.
+
+    Mirrors TestMergeGuardNoModuleConfigs, but DELIBERATELY omits the reify
+    guard script (so _verify_pipeline_guard_requires_full_gate falls open) and
+    instead configures merge_config_only_full_gate_globs, isolating the
+    deterministic backstop as the sole override trigger. The added config-only
+    file (tests/new_case.sh — .sh, so _has_source_files is False) matches the
+    configured glob.
+    """
+
+    def _write_case_sh(self, worktree: Path) -> None:
+        """Create tests/new_case.sh (config-only .sh under a manifest-relevant path)."""
+        tests_dir = worktree / 'tests'
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / 'new_case.sh').write_text('#!/usr/bin/env bash\n')
+
+    def _make_config(self, tmp_path: Path, globs=None) -> OrchestratorConfig:
+        from orchestrator.config import GitConfig
+
+        kwargs = {}
+        if globs is not None:
+            kwargs['git'] = GitConfig(merge_config_only_full_gate_globs=globs)
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__scope_all_cmd__',
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_merge_overrides_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches + role='merge' + NO guard script (consult falls
+        open) → trivial-pass overridden by the backstop; global test command runs."""
+        self._write_case_sh(tmp_path)
+        # Deliberately NO guard script → _verify_pipeline_guard_requires_full_gate
+        # falls open; the backstop is the sole override trigger.
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*']),
+                [],
+                task_files=['tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected full-gate test command in calls; got: {calls}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass overridden by backstop; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_glob_task_role_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Configured glob matches but role='task' (default) → trivial pass
+        preserved (backstop is role-gated to merge)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path, globs=['*tests/*']),
+                [],
+                task_files=['tests/new_case.sh'],
+                # role='task' is the default
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run for task role; got: {calls}'
+        assert 'No source files' in result.summary
+
+    @pytest.mark.asyncio
+    async def test_empty_globs_merge_preserves_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Empty globs (default) + role='merge' + NO guard script → trivial pass
+        preserved (backward-compat no-op: backstop False, consult falls open)."""
+        self._write_case_sh(tmp_path)
+
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),  # default empty globs
+                [],
+                task_files=['tests/new_case.sh'],
+                role='merge',
+            )
+
+        assert result.passed
+        assert calls == [], f'No commands should run with empty globs; got: {calls}'
+        assert 'No source files' in result.summary
+
+
 class TestMergeGuardModuleConfigs:
     """Integration: guard wires into the module_configs trivial-pass branch.
 
