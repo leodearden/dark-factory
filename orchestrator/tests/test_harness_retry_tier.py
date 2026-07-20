@@ -20,12 +20,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness, _bumped_routing_dump
+from orchestrator.harness import Harness, TaskReport, _bumped_routing_dump
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -121,7 +122,9 @@ class TestMaybeBumpRoutingTier:
         harness = self._harness()
         report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED)
 
-        await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
+        await Harness._maybe_bump_routing_tier(
+            cast(Harness, harness), self._assignment(0), cast(TaskReport, report)
+        )
 
         harness.scheduler.update_task.assert_awaited_once()
         args, kwargs = harness.scheduler.update_task.call_args
@@ -134,7 +137,9 @@ class TestMaybeBumpRoutingTier:
         harness = self._harness()
         report = SimpleNamespace(outcome=WorkflowOutcome.DONE)
 
-        await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
+        await Harness._maybe_bump_routing_tier(
+            cast(Harness, harness), self._assignment(0), cast(TaskReport, report)
+        )
 
         harness.scheduler.update_task.assert_not_awaited()
 
@@ -143,7 +148,9 @@ class TestMaybeBumpRoutingTier:
         harness = self._harness()
         report = SimpleNamespace(outcome=WorkflowOutcome.REQUEUED)
 
-        await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
+        await Harness._maybe_bump_routing_tier(
+            cast(Harness, harness), self._assignment(0), cast(TaskReport, report)
+        )
 
         harness.scheduler.update_task.assert_not_awaited()
 
@@ -183,7 +190,7 @@ class TestAutoEvalRedoCarriesBumpedTier:
         )
 
     def _submitted_metadata(self, harness: Harness) -> dict:
-        call = harness.scheduler.dispatch_tool.call_args_list[0]
+        call = cast(AsyncMock, harness.scheduler.dispatch_tool).call_args_list[0]
         assert call.args[0] == 'submit_task'
         return call.args[1]['metadata']
 
@@ -192,7 +199,7 @@ class TestAutoEvalRedoCarriesBumpedTier:
         harness = self._harness(tmp_path)
         report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED, block_phase='verify')
 
-        await harness._maybe_auto_eval(self._assignment(routing_tier=2), report)
+        await harness._maybe_auto_eval(self._assignment(routing_tier=2), cast(TaskReport, report))
 
         submitted = self._submitted_metadata(harness)
         assert submitted.get('routing') == {'routing_tier': 3}
@@ -203,7 +210,9 @@ class TestAutoEvalRedoCarriesBumpedTier:
         harness = self._harness(tmp_path)
         report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED, block_phase='verify')
 
-        await harness._maybe_auto_eval(self._assignment(routing_tier=None), report)
+        await harness._maybe_auto_eval(
+            self._assignment(routing_tier=None), cast(TaskReport, report)
+        )
 
         submitted = self._submitted_metadata(harness)
         assert submitted.get('routing') == {'routing_tier': 1}
@@ -226,7 +235,7 @@ class TestBumpRoutingTierById:
             ),
         )
 
-        await Harness._bump_routing_tier_by_id(harness, '42')
+        await Harness._bump_routing_tier_by_id(cast(Harness, harness), '42')
 
         harness.scheduler.get_task.assert_awaited_once_with('42')
         harness.scheduler.update_task.assert_awaited_once()
@@ -244,7 +253,7 @@ class TestBumpRoutingTierById:
             ),
         )
 
-        await Harness._bump_routing_tier_by_id(harness, 'nope')
+        await Harness._bump_routing_tier_by_id(cast(Harness, harness), 'nope')
 
         harness.scheduler.update_task.assert_not_awaited()
 
@@ -267,7 +276,7 @@ class TestPreIncrementRoutingTier:
             _schedule_coro_threadsafe=Mock(),
         )
 
-        Harness.pre_increment_routing_tier(harness, '42')
+        Harness.pre_increment_routing_tier(cast(Harness, harness), '42')
 
         harness._bump_routing_tier_by_id.assert_called_once_with('42')
         harness._schedule_coro_threadsafe.assert_called_once()
