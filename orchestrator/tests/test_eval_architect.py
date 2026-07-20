@@ -336,6 +336,38 @@ class TestArchitectEvalConfigs:
         assert cfg.name == name
         assert cfg.role == 'architect'
 
+    def test_architect_fable_candidate_added_existing_byte_unchanged(self):
+        """eval-revival π: architect-fable-high joins ARCHITECT_EVAL_CONFIGS.
+
+        Parity discipline (eval-revival decision 11): the three pre-existing
+        candidates stay byte-unchanged (dataclass equality) when a new
+        candidate is appended; the new candidate is config-only — it rides
+        run_ofat_stage's existing generic role='architect' branch (task 2478).
+        """
+        from orchestrator.evals.configs import ARCHITECT_EVAL_CONFIGS, EvalConfig
+
+        existing = [
+            EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
+            EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
+            EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+        ]
+        by_name = {c.name: c for c in ARCHITECT_EVAL_CONFIGS}
+        for expected in existing:
+            assert by_name[expected.name] == expected
+
+        fable = by_name['architect-fable-high']
+        assert fable.backend == 'claude'
+        assert fable.model == 'claude-fable-5'
+        assert fable.effort == 'high'
+        assert fable.role == 'architect'
+
+        assert {c.name for c in ARCHITECT_EVAL_CONFIGS} == {
+            'architect-opus-high',
+            'architect-opus-max',
+            'architect-sonnet-high',
+            'architect-fable-high',
+        }
+
 
 # ---------------------------------------------------------------------------
 # run_architect_eval — the plan-only architect eval entry (step-9/10)
