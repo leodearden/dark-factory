@@ -14538,6 +14538,125 @@ class TestRunPostMergeVerify:
             f'expected the persistent transient-infra hold, got: {result.reason!r}'
         )
 
+    async def test_narrowed_infra_budget_exhausted_falls_through_to_persistent_hold(self) -> None:
+        """(task 2835 amendment, reviewer_comprehensive/test-coverage) The
+
+        narrowed budget is BOUNDED, not unbounded: when every narrowed retry
+        stays infra-transient, the loop consumes exactly max_narrowed
+        retries (via the separate narrowed_retries counter) and then falls
+        through to the same persistent transient-infra hold
+        (TRANSIENT_INFRA_REASON_PREFIX) as the legacy ENOSPC-budget
+        exhaustion path — never an unbounded retry loop.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.retry_failed_only = True
+        merge_wt = MagicMock()
+
+        infra_result = _infra_category_verify_result('semaphore_timeout')
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue._load_attempt0_sidecar',
+                MagicMock(return_value=object()),
+            ),
+            patch(
+                'orchestrator.merge_queue._assemble_retry_verify_env',
+                AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=infra_result),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries=(er := {}),
+                max_timeouts=2, max_enospc=1,
+                max_narrowed=2, narrowed_retries=(nr := {}),
+            )
+
+        assert result is not None
+        assert mock_verify.call_count == 3, (
+            f'expected 1 initial + 2 narrowed retries (3 total calls) before the '
+            f'narrowed budget is exhausted, got {mock_verify.call_count} calls'
+        )
+        assert nr[req.task_id] == 2, (
+            f'expected the narrowed counter to reach max_narrowed=2, got: {nr}'
+        )
+        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'expected the persistent transient-infra hold once the narrowed '
+            f'budget is exhausted, got: {result.reason!r}'
+        )
+        assert er == {}, f'the legacy ENOSPC counter must stay untouched: {er}'
+
+    async def test_narrowed_retry_not_starved_by_exhausted_enospc_budget(self) -> None:
+        """(task 2835 amendment, reviewer_comprehensive/test-coverage) The
+
+        headline decoupling invariant: an earlier UNRELATED ENOSPC event
+        that already exhausted enospc_retries/max_enospc must never starve
+        a narrowed retry. Pre-seeds enospc_retries at its exhausted value
+        (as if a prior ENOSPC event already spent the legacy budget) and
+        confirms the narrowed loop still gets its own full, separate
+        max_narrowed budget — and leaves the pre-seeded ENOSPC counter
+        untouched.
+        """
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        git_ops = self._make_git_ops()
+        req = self._make_req()
+        req.retry_failed_only = True
+        merge_wt = MagicMock()
+
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='',
+        )
+
+        with (
+            patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            patch(
+                'orchestrator.merge_queue._load_attempt0_sidecar',
+                MagicMock(return_value=object()),
+            ),
+            patch(
+                'orchestrator.merge_queue._assemble_retry_verify_env',
+                AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(side_effect=[
+                    _infra_category_verify_result('semaphore_timeout'),
+                    _infra_category_verify_result('semaphore_timeout'),
+                    passing,
+                ]),
+            ) as mock_verify,
+        ):
+            result = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                # Simulate an already-exhausted legacy ENOSPC budget from an
+                # earlier, unrelated event in this task's merge lifecycle.
+                timeouts={}, enospc_retries=(er := {req.task_id: 1}),
+                max_timeouts=2, max_enospc=1,
+                max_narrowed=2, narrowed_retries=(nr := {}),
+            )
+
+        assert result is None, f'expected None (verify eventually passed), got: {result!r}'
+        assert mock_verify.call_count == 3, (
+            f'expected 1 initial + 2 narrowed retries (3 total calls) — the '
+            f'already-exhausted ENOSPC budget must not starve the narrowed '
+            f'retry, got {mock_verify.call_count} calls'
+        )
+        assert nr[req.task_id] == 2, (
+            f'expected the narrowed loop to consume its own full budget, got: {nr}'
+        )
+        assert er == {req.task_id: 1}, (
+            f'the pre-seeded legacy ENOSPC counter must stay untouched by the '
+            f'narrowed loop: {er}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestUnscopedTypecheckGate — step-5 gate tests
