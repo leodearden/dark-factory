@@ -995,6 +995,35 @@ class TestVerifyRunnerPool:
 
 
 # ---------------------------------------------------------------------------
+# retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
+# ---------------------------------------------------------------------------
+
+
+class TestRetryScopeEventFields:
+    """retry_scope_event_fields derives the merge_verify event's retry_scope +
+    per-suite subset sizes from spec.verify_env (the D2 failed-only contract).
+
+    A full/legacy verify (no REIFY_VERIFY_RETRY_SCOPE='failed_only') carries no
+    scope signal, so the survey's runtime mining never miscounts a narrowed
+    retry as a full green gate (PRD verify-retry-failed-only §4.4/§5.6, INV-2).
+    """
+
+    def test_retry_scope_event_fields_absent_when_not_failed_only(self):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # (a) empty verify_env — the common full/legacy verify.
+        assert retry_scope_event_fields({}) == {
+            'retry_scope': None,
+            'retry_subset_sizes': None,
+        }
+        # (b) some other/legacy REIFY_VERIFY_RETRY_SCOPE value — still no signal.
+        assert retry_scope_event_fields({'REIFY_VERIFY_RETRY_SCOPE': 'full'}) == {
+            'retry_scope': None,
+            'retry_subset_sizes': None,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Step-7: build_merge_verify_spec
 # ---------------------------------------------------------------------------
 
