@@ -19,10 +19,14 @@ class ReviewerSpec:
     """Specification for a single reviewer in a trial panel."""
 
     name: str
-    model: str                 # "opus" | "sonnet"
+    model: str                 # "opus" | "sonnet" | cross-family model id (e.g. "gpt-5.4")
     specialization: str        # combined specialization prompt text
     budget: float = 2.0
     effort: str = 'high'
+    # Cross-family dispatch (default-off keeps every existing spec byte-identical):
+    backend: str = 'claude'                        # 'claude' | 'codex' | 'gemini'
+    env_overrides: dict[str, str] | None = None    # merged into the invoke_agent subprocess env
+    oauth_token_env: str | None = None             # env var whose value becomes invoke_agent's oauth_token
 
 
 @dataclass
