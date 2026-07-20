@@ -1129,6 +1129,31 @@ class UsageGate:
             for m in self._config.scoped_cap_models
         }
 
+    def scope_status(self) -> dict[str, dict[str, dict]]:
+        """Per-(account × scope) serialized cap state (task γ) for a future
+        digest/dashboard panel (rendering out of scope here).
+
+        Emits ``acct.name -> {model: {'capped', 'resets_at', 'near_cap',
+        'capped_at'}}`` for every account with a NON-EMPTY ``scope_caps``;
+        accounts that have observed no scoped cap/near-cap are skipped, so the
+        map reflects only genuinely-observed scope state (the lazy-population
+        contract). Datetimes render as ISO strings (JSON-ready); None passes
+        through as None. Pure read — no sweep, no mutation.
+        """
+        return {
+            acct.name: {
+                model: {
+                    'capped': sc.capped,
+                    'resets_at': sc.resets_at.isoformat() if sc.resets_at else None,
+                    'near_cap': sc.near_cap,
+                    'capped_at': sc.capped_at.isoformat() if sc.capped_at else None,
+                }
+                for model, sc in acct.scope_caps.items()
+            }
+            for acct in self._accounts
+            if acct.scope_caps
+        }
+
     def _handle_cap_detected(
         self,
         reason: str,
