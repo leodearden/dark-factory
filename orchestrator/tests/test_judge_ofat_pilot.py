@@ -126,3 +126,105 @@ class TestDecideAdopt:
         decision = decide_judge_adoption(report)
         assert decision.margin == DEFAULT_NON_INFERIORITY_MARGIN
         assert isinstance(DEFAULT_NON_INFERIORITY_MARGIN, float)
+
+
+# ---------------------------------------------------------------------------
+# step-3/4 — the non-adopt branches. Insufficient data (n<3) and a missing
+# config row map to a LOUD `marginal` (escalate) with a structured reason — not
+# a silent pass or an unhandled KeyError (loud-over-silent norm, decision 4).
+# ---------------------------------------------------------------------------
+
+class TestDecideNonAdopt:
+    def test_reject_when_candidate_composite_ci_lo_below_margin(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        # candidate lo 0.70 << incumbent mean 0.90 - margin 0.05 == 0.85 → NOT
+        # non-inferior; both CIs sufficient (n=3) so we can confidently reject.
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3),
+            _row('judge-haiku', composite=0.72, cost_usd=0.10, lo=0.70, hi=0.74, n=3),
+        ])
+
+        decision = decide_judge_adoption(report, margin=0.05)
+
+        assert decision.verdict == 'reject'
+        assert decision.escalate is True
+        assert decision.non_inferior is False
+        # Human-readable reason explains the non-inferiority failure.
+        assert decision.reasons
+        assert any('inferior' in r.lower() for r in decision.reasons)
+
+    def test_marginal_when_non_inferior_but_not_cheaper(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        # non-inferior (lo 0.88 >= 0.85) and sufficient, but candidate is MORE
+        # expensive (0.60 >= 0.50) → marginal + escalate, not adopt.
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3),
+            _row('judge-haiku', composite=0.89, cost_usd=0.60, lo=0.88, hi=0.90, n=3),
+        ])
+
+        decision = decide_judge_adoption(report, margin=0.05)
+
+        assert decision.verdict == 'marginal'
+        assert decision.escalate is True
+        assert decision.non_inferior is True
+        assert decision.cheaper is False
+        assert decision.reasons
+        assert any(('cheaper' in r.lower() or 'cost' in r.lower()) for r in decision.reasons)
+
+    def test_marginal_when_ci_insufficient_n_below_3(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        # Candidate would otherwise adopt (non-inferior + cheaper) but only n=2
+        # trials → composite CI not `sufficient` → LOUD marginal + escalate.
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3),
+            _row('judge-haiku', composite=0.89, cost_usd=0.10, lo=0.87, hi=0.91, n=2, sufficient=False),
+        ])
+
+        decision = decide_judge_adoption(report, margin=0.05)
+
+        assert decision.verdict == 'marginal'
+        assert decision.escalate is True
+        assert decision.sufficient is False
+        assert decision.reasons
+        assert any(
+            ('insufficient' in r.lower() or 'trials' in r.lower() or 'n<3' in r.lower())
+            for r in decision.reasons
+        )
+
+    def test_marginal_when_a_required_row_is_missing(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        # candidate row absent from the report → no KeyError; a loud structured
+        # marginal verdict naming the missing config instead.
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3),
+        ])
+
+        decision = decide_judge_adoption(report, margin=0.05)
+
+        assert decision.verdict == 'marginal'
+        assert decision.escalate is True
+        assert decision.candidate_row is None
+        assert decision.reasons
+        assert any(
+            ('missing' in r.lower() or 'judge-haiku' in r.lower() or 'absent' in r.lower())
+            for r in decision.reasons
+        )
+
+    def test_marginal_when_incumbent_row_is_missing(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        # Symmetric: incumbent absent → loud marginal, no KeyError.
+        report = _report([
+            _row('judge-haiku', composite=0.89, cost_usd=0.10, lo=0.88, hi=0.90, n=3),
+        ])
+
+        decision = decide_judge_adoption(report, margin=0.05)
+
+        assert decision.verdict == 'marginal'
+        assert decision.escalate is True
+        assert decision.incumbent_row is None
+        assert decision.reasons
