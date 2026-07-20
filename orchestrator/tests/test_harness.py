@@ -13,6 +13,7 @@ Asserts that:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -412,3 +413,88 @@ class TestHarnessMergeLivenessGuard:
 
         with patch('orchestrator.merge_queue.TOUCH_MISS_TOLERANCE', 1000), pytest.raises(MergeLivenessConfigError):
             await harness._start_merge_worker()
+
+
+# ---------------------------------------------------------------------------
+# TestHarnessMergeVerifySurvivorBarrierWiring (task 2828, step-09 RED / step-10 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessMergeVerifySurvivorBarrierWiring:
+    """Harness._start_merge_worker must invoke the startup survivor barrier
+    (GitOps.reap_merge_verify_survivors) ONCE, BEFORE the merge-worker loop is
+    scheduled — so a previous run's orphaned verify subtree under _merge-verify
+    is reaped before the worker's first reset_persistent_merge_worktree can
+    clobber a live tree (task 2828, limb 1).  The call must be fail-open: a
+    raising barrier must NOT crash startup.
+    """
+
+    @pytest.mark.asyncio
+    async def test_barrier_awaited_once_before_worker_loop(
+        self, tmp_path: Path,
+    ) -> None:
+        """reap_merge_verify_survivors is awaited exactly once and strictly
+        before the worker's run() loop begins."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+
+        call_order: list[str] = []
+        worker_started = asyncio.Event()
+
+        async def _record_reap(*_a, **_k):
+            call_order.append('reap')
+            return True
+
+        reap_mock = AsyncMock(side_effect=_record_reap)
+        harness.git_ops.reap_merge_verify_survivors = reap_mock  # type: ignore[method-assign]
+
+        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
+            call_order.append('worker_loop')
+            worker_started.set()
+
+        try:
+            with patch(
+                'orchestrator.merge_queue.SpeculativeMergeWorker.run', _noop_run,
+            ):
+                await harness._start_merge_worker()
+                await asyncio.wait_for(worker_started.wait(), timeout=5)
+
+            reap_mock.assert_awaited_once()
+            assert call_order == ['reap', 'worker_loop'], (
+                'the survivor barrier must run to completion BEFORE the merge '
+                f'worker loop starts; got order {call_order}'
+            )
+            assert harness._merge_worker_task is not None
+        finally:
+            await harness._stop_merge_worker()
+
+    @pytest.mark.asyncio
+    async def test_barrier_failure_is_fail_open(self, tmp_path: Path) -> None:
+        """A raising barrier must NOT propagate — the worker still starts.
+
+        Mirrors the enforce_merge_liveness_margin generic-except precedent: the
+        barrier is best-effort, so a failure is logged and swallowed rather than
+        aborting merge-worker startup.
+        """
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+
+        reap_mock = AsyncMock(side_effect=RuntimeError('scan blew up'))
+        harness.git_ops.reap_merge_verify_survivors = reap_mock  # type: ignore[method-assign]
+
+        async def _noop_run(self_w):  # type: ignore[no-untyped-def]
+            pass
+
+        try:
+            with patch(
+                'orchestrator.merge_queue.SpeculativeMergeWorker.run', _noop_run,
+            ):
+                # Must NOT raise despite the barrier raising.
+                await harness._start_merge_worker()
+
+            reap_mock.assert_awaited_once()
+            assert harness._merge_worker_task is not None, (
+                'a fail-open barrier must still create the merge-worker task'
+            )
+        finally:
+            await harness._stop_merge_worker()
