@@ -29,9 +29,14 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore
+from shared.prompt_artifact import (
+    ArtifactProvenance,
+    PromptArtifactStore,
+    default_artifacts_root,
+)
 
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
 from orchestrator.evals.prompt_opt.engine import run_optimization_loop
@@ -361,8 +366,34 @@ async def run_acceptance_smoke(
     rollback (:meth:`PromptArtifactStore.unpin`) path from the returned
     :class:`AcceptanceReport.pin_key`. *store_root* must therefore be an
     isolated/throwaway root — never a production artifacts root — since the
-    pinned heuristics carry the hermetic ``SMOKE_QUALITY`` sentinel.
+    pinned heuristics carry the hermetic ``SMOKE_QUALITY`` sentinel. This is
+    ENFORCED: a *store_root* whose resolved path equals
+    :func:`default_artifacts_root` is refused with a ``ValueError`` before the
+    loop runs or anything is written (a subdir of that root is a different key
+    dir the live store never resolves, so subdirs stay allowed).
     """
+    # Fail-fast: refuse the PRODUCTION artifacts root BEFORE running the loop or
+    # writing anything. The smoke pins the loop's final heuristics — which carry
+    # the hermetic SMOKE_QUALITY sentinel — under the reviewer's LIVE key
+    # (prompt_id + executor_model + harness_version) and leaves the pin in place
+    # (the documented ship->rollback rehearsal). Were *store_root* the production
+    # root, the next real reviewer invocation would resolve that sentinel pin as
+    # source='artifact' and silently degrade production reviews. Match the EXACT
+    # root only (post-.resolve()): a subdir yields a different key dir that the
+    # live PromptArtifactStore(default_artifacts_root()) never resolves, so
+    # subdirs stay allowed.
+    resolved_root = Path(store_root).resolve()
+    if resolved_root == default_artifacts_root().resolve():
+        raise ValueError(
+            f'run_acceptance_smoke refuses to run against the production prompt '
+            f'artifacts root ({resolved_root}): the smoke pins a SMOKE_QUALITY '
+            f'sentinel under the reviewer key (prompt_id + {executor_model!r} + '
+            f"harness_version) and leaves it in place, so the next real reviewer "
+            f"invocation would resolve it as source='artifact' and silently "
+            f'degrade production reviews. Pass an isolated/throwaway store_root '
+            f'(e.g. a tmp dir) instead.'
+        )
+
     role = REVIEWER_COMPREHENSIVE
     spec = role.prompt_spec
     if spec is None:  # pragma: no cover - guards a T2 regression, not a runtime branch
