@@ -3492,7 +3492,16 @@ def test_boundary4_defers_busy_unit_while_others_proceed(tmp_path: pathlib.Path)
             # cutoff and flake the ordering assertion; FORCE_FIRE_AFTER_SECS
             # is 99999s, so widening this can't accidentally let R's own
             # restart land before the timeout fires.
-            timeout=8,
+            #
+            # 20s (not 8s): under full tests/scripts/ suite load (32-way
+            # xdist), the handful of subprocess spawns above can collectively
+            # take long enough under CPU contention that an 8s wall-clock cap
+            # kills the child before R's "deferring restart of ...: mid-merge"
+            # line (a plain, unbuffered bash `echo`) is even reached -- not a
+            # buffering issue, just insufficient scheduling margin. 20s
+            # matches _boundary_run_drain_script's own default timeout, which
+            # every other caller in this file already relies on safely.
+            timeout=20,
         )
 
     stdout = _boundary_decode(exc_info.value.stdout)
