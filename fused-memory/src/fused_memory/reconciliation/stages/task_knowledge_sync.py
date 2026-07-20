@@ -2231,6 +2231,20 @@ class TaskKnowledgeSync(BaseStage):
             self.memory, self.project_id, run_id,
         )
 
+        # Legacy Mem0 stage1_flag_marker pool (task 2853): task 2406 retired
+        # its mirror write (markers now persist only to the recon_ledger,
+        # reaped above by _gc_recon_markers), and task 2228 W5-κ deleted the
+        # prior in-cycle Mem0 sweep for this source on the assumption that
+        # the ledger gc() pass replaced it — it does not reach Mem0, so the
+        # pre-2406 pool was left uncollected for every project (the
+        # operational sweep_orphan_flag_markers.py systemd timer only
+        # targets dark_factory by default). Runs unconditionally every cycle,
+        # per-project, so each project self-heals its own legacy pool;
+        # explicit zero for the same reason as the two GC stats above.
+        report.stats['stale_mem0_flag_markers_gc_swept'] = await _sweep_stale_mem0_flag_markers(
+            self.memory, self.project_id, run_id,
+        )
+
         return report
 
     async def _apply_post_flight_guards(

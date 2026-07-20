@@ -7470,6 +7470,11 @@ class TestReconMarkersGcSweptStat:
                 '._sweep_stale_persistence_markers',
                 new=AM(return_value=4),
             ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
         ):
             report = await stage.run(
                 events=[], watermark=watermark, prior_reports=[], run_id='test-run'
@@ -7533,6 +7538,11 @@ class TestReconMarkersGcSweptStat:
             patch(
                 'fused_memory.reconciliation.stages.task_knowledge_sync'
                 '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
                 new=AM(return_value=0),
             ),
         ):
@@ -7609,6 +7619,11 @@ class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
                 'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_persistence_markers',
                 new=AM(return_value=4),
             ) as mock_sweep,
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
         ):
             report = await stage.run(
                 events=[], watermark=watermark, prior_reports=[], run_id='test-run'
@@ -7652,6 +7667,11 @@ class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
             patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
             patch(
                 'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
                 new=AM(return_value=0),
             ),
         ):
