@@ -18,7 +18,13 @@ RED (step-3) until ``_bumped_routing_dump`` exists in ``orchestrator.harness``.
 
 from __future__ import annotations
 
-from orchestrator.harness import _bumped_routing_dump
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from orchestrator.harness import Harness, _bumped_routing_dump
+from orchestrator.workflow import WorkflowOutcome
 
 
 def _valid_mirror(routing_tier: int = 0) -> dict:
@@ -83,3 +89,58 @@ class TestBumpedRoutingDump:
     def test_by_two_adds_two(self):
         dump = _bumped_routing_dump({'routing': {'routing_tier': 1}}, by=2)
         assert dump['routing_tier'] == 3
+
+
+class TestMaybeBumpRoutingTier:
+    """``Harness._maybe_bump_routing_tier(assignment, report)``: the
+    terminal-failure auto-bump called from ``_run_slot``'s finally.
+
+    Fires ONLY on ``report.outcome == BLOCKED`` -- the unambiguous
+    terminal-failed dispatch that boundary test 5 exercises. DONE (the success
+    path, boundary test 6) and REQUEUED (an in-process retry of the SAME work
+    — deferred by design decision, since there is no clean per-requeue
+    lost-work signal here) do NOT bump. Called as an unbound method against a
+    duck-typed self so the unit stays isolated to ``self.scheduler.update_task``.
+    """
+
+    @staticmethod
+    def _assignment(routing_tier: int = 0):
+        return SimpleNamespace(
+            task={'metadata': {'routing': {'routing_tier': routing_tier}}},
+            task_id='42',
+        )
+
+    @staticmethod
+    def _harness():
+        return SimpleNamespace(scheduler=SimpleNamespace(update_task=AsyncMock()))
+
+    @pytest.mark.asyncio
+    async def test_blocked_bumps_via_merge(self):
+        harness = self._harness()
+        report = SimpleNamespace(outcome=WorkflowOutcome.BLOCKED)
+
+        await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
+
+        harness.scheduler.update_task.assert_awaited_once()
+        args, kwargs = harness.scheduler.update_task.call_args
+        assert args[0] == '42'
+        assert args[1]['routing']['routing_tier'] == 1
+        assert kwargs['metadata_mode'] == 'merge'
+
+    @pytest.mark.asyncio
+    async def test_done_does_not_bump(self):
+        harness = self._harness()
+        report = SimpleNamespace(outcome=WorkflowOutcome.DONE)
+
+        await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
+
+        harness.scheduler.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_requeued_does_not_bump(self):
+        harness = self._harness()
+        report = SimpleNamespace(outcome=WorkflowOutcome.REQUEUED)
+
+        await Harness._maybe_bump_routing_tier(harness, self._assignment(0), report)
+
+        harness.scheduler.update_task.assert_not_awaited()
