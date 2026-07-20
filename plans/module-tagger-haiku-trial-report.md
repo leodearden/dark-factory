@@ -78,3 +78,37 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
   }
 }
 ```
+
+## Decide-and-act outcome (step 16)
+
+**Action: NO FLIP — config left unchanged.** `module_tagger` remains on its
+configured incumbent (sonnet). `dark-factory-orchestrator.yaml` was **not**
+edited and no hot-reload was performed, per the plan's rule "do NOT flip on
+anything but a clear pass."
+
+**Why the verdict is FAIL:** the only hard-fail trigger that fired is the
+haiku-vs-sonnet **agreement floor** — mean Jaccard `0.368` < `AGREEMENT_FAIL`
+`0.50`. Neither F1-gap nor the adjudication trigger fired.
+
+**Important nuance (surfaced to a human via a `design_concern` escalation):**
+the fail is driven by low *agreement*, not by haiku underperforming. On the
+primary quality signal (F1 vs ground truth) haiku (`0.370`) **beats** the
+incumbent sonnet (`0.267`) — an F1 gap of `-0.103` in haiku's favour — and the
+opus frontier judged haiku better on **16** of the 25 disagreements vs **6**
+for sonnet (3 ties; `haiku_worse_fraction=0.273`). So the low agreement
+reflects sonnet being the weaker model on this recent-30 sample, not haiku
+being unreliable — the opposite of the divergence the agreement floor was
+designed to catch. Absolute F1 is low for both models because exact merge-diff
+file prediction from title+description is a demanding target; production locks
+at coarser module granularity, so the *comparative* signal is what matters.
+
+Per the plan's fail/marginal branch this is escalated (`escalate_blocker`,
+category `design_concern`) for human adjudication of the threshold tension —
+whether to flip anyway on haiku's ground-truth + cost edge (~10× cheaper),
+re-run at larger N / higher effort to tighten the estimate, keep sonnet, or
+revisit whether `AGREEMENT_FAIL` should hard-fail when the divergence favours
+the challenger.
+
+**Deferred follow-on (NOT performed):** the `defaults.yaml` bake
+(module_tagger sonnet→haiku) was contingent on a PASS + the δ-rollup watch
+window, neither of which occurred; it is not done.
