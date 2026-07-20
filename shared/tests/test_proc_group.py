@@ -6,13 +6,19 @@ Verifies the SIGTERM-then-SIGKILL sequence that ensures bash → cargo → rustc
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 
 import pytest
 
-from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.proc_group import (
+    reap_process_groups,
+    scan_process_groups_under_path,
+    snapshot_process_group,
+    terminate_process_group,
+)
 
 
 async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
@@ -45,6 +51,28 @@ async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) 
             return True
         await asyncio.sleep(step)
     return False
+
+
+async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
+    """Spawn a real ``sleep 30`` leading its own process group, with cwd *cwd*.
+
+    ``start_new_session=True`` makes the child the leader of a fresh process
+    group (``pgid == pid``), and *cwd* becomes the process's working directory
+    so ``/proc/<pid>/cwd`` points at (a path under) the scan root.
+    """
+    return await asyncio.create_subprocess_exec(
+        'sleep', '30',
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        cwd=str(cwd),
+        start_new_session=True,
+    )
+
+
+def _kill_group(pgid: int) -> None:
+    """Best-effort SIGKILL of an entire process group (test cleanup)."""
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(pgid, signal.SIGKILL)
 
 
 class TestTerminateProcessGroup:
@@ -561,3 +589,153 @@ def _snapshot_impl_with_proc_dir(pgid: int, proc_dir) -> str:
 
     header = f'snapshot_process_group({pgid}): {len(rows)} process(es) in group:'
     return '\n'.join([header] + rows)
+
+
+class TestScanProcessGroupsUnderPath:
+    """Tests for scan_process_groups_under_path — /proc-based at-or-under scan.
+
+    Used by the task-2828 startup survivor barrier to find process groups
+    whose cwd / open fds / mmap'd paths fall at-or-under the ``_merge-verify``
+    worktree of a *previous* orchestrator run.  Like snapshot_process_group it
+    must never raise, even on vanished/permission-denied pids.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_scan_matches_cwd_under_root_and_respects_boundary(self, tmp_path):
+        """A process whose cwd is under root is returned; sibling/outside are not.
+
+        Three real subprocesses:
+        - ``under``   — cwd = <root>/build          → MUST be returned
+        - ``sibling`` — cwd = <root>XYZ (prefix but not under root) → MUST NOT
+        - ``outside`` — cwd = a wholly unrelated dir → MUST NOT
+
+        The sibling case locks in the at-or-under boundary (equality OR
+        ``startswith(str(root) + os.sep)``) so ``_merge-verifyXYZ`` never
+        matches ``_merge-verify``.
+        """
+        base = tmp_path.resolve()
+        root = base / '_merge-verify'
+        work = root / 'build'
+        sibling = base / '_merge-verifyXYZ'
+        outside = base / 'other'
+        for d in (work, sibling, outside):
+            d.mkdir(parents=True)
+
+        under = await _spawn_sleeper_in(work)
+        sib = await _spawn_sleeper_in(sibling)
+        out = await _spawn_sleeper_in(outside)
+        try:
+            found = scan_process_groups_under_path(root)
+            assert under.pid in found, (
+                f'expected pgid {under.pid} (cwd under {root}) in {found}'
+            )
+            assert sib.pid not in found, (
+                f'sibling {sibling} must NOT match root {root} (prefix boundary); '
+                f'got {found}'
+            )
+            assert out.pid not in found, (
+                f'outside pgid {out.pid} must NOT be returned; got {found}'
+            )
+        finally:
+            for p in (under, sib, out):
+                _kill_group(p.pid)
+                with contextlib.suppress(Exception):
+                    await p.wait()
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_scan_respects_exclude_pgids(self, tmp_path):
+        """A pgid in *exclude_pgids* is dropped even when its cwd is under root.
+
+        Also exercises the equality branch (cwd == root exactly).
+        """
+        root = tmp_path.resolve() / '_merge-verify'
+        root.mkdir()
+        proc = await _spawn_sleeper_in(root)
+        try:
+            assert proc.pid in scan_process_groups_under_path(root)
+            assert proc.pid not in scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({proc.pid})
+            )
+        finally:
+            _kill_group(proc.pid)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+    def test_scan_never_raises_on_unreadable_pid(self, monkeypatch, tmp_path):
+        """A readlink that raises (vanished / permission-denied pid) is swallowed.
+
+        Force every ``os.readlink`` to raise ProcessLookupError, simulating a
+        pid that vanishes mid-walk.  The scan must still return a set and never
+        propagate the error (mirrors snapshot_process_group's never-raise
+        invariant).
+        """
+        def boom(*_a, **_k):
+            raise ProcessLookupError('pid vanished mid-scan')
+
+        monkeypatch.setattr('shared.proc_group.os.readlink', boom)
+        result = scan_process_groups_under_path(tmp_path / '_merge-verify')
+        assert isinstance(result, set)
+
+    def test_scan_never_raises_on_real_proc(self, tmp_path):
+        """Scanning the real /proc never raises and returns a set.
+
+        On a non-root runner, ``/proc/1/cwd`` (and other root-owned pids) raise
+        PermissionError, and pids vanish mid-walk (ProcessLookupError); the scan
+        must swallow both.  A fresh, never-created root matches nothing.
+        """
+        result = scan_process_groups_under_path(tmp_path / 'never-created')
+        assert isinstance(result, set)
+        assert result == set()
+
+
+class TestReapProcessGroups:
+    """Tests for reap_process_groups — SIGTERM→wait→SIGKILL over a set of pgids.
+
+    The barrier's reaping half: generalizes terminate_process_group's
+    escalation from a single owned proc handle to a set of foreign pgids,
+    refusing any unsafe pgid (self/parent/own-group/init) via
+    _unsafe_pgid_reason.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_reap_kills_real_group(self, tmp_path):
+        """A real planted process group is reaped and reported 'reaped'."""
+        proc = await _spawn_sleeper_in(tmp_path)
+        pgid = proc.pid
+        try:
+            # Off-thread so the event loop keeps running and the child watcher
+            # reaps the killed leader promptly (mirrors the production
+            # asyncio.to_thread(reap...) call site).
+            outcomes = await asyncio.to_thread(reap_process_groups, {pgid})
+            assert outcomes.get(pgid) == 'reaped', f'unexpected outcomes: {outcomes}'
+            assert await _pgid_gone_within(pgid), (
+                f'process group {pgid} not gone after reap'
+            )
+        finally:
+            _kill_group(pgid)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+    @pytest.mark.timeout(5)
+    def test_reap_refuses_unsafe_pgids(self, monkeypatch):
+        """os.getpgrp() and pgid 1 are REFUSED and never signalled.
+
+        Defence-in-depth: reaping our own group (or init) would kill the
+        orchestrator/test session.  Refused pgids must yield 'refused:<reason>'
+        and receive no killpg at all (not even the liveness 0-probe).
+        """
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg',
+            lambda pgid, sig: calls.append((pgid, sig)),
+        )
+        own = os.getpgrp()
+        outcomes = reap_process_groups({own, 1})
+        assert outcomes[own].startswith('refused:'), outcomes
+        assert outcomes[1].startswith('refused:'), outcomes
+        assert calls == [], (
+            f'refused pgids must never be signalled; got killpg calls {calls}'
+        )
