@@ -1937,7 +1937,9 @@ async def _run_post_merge_verify(
                     escalation_queue is not None
                     and not escalation_queue.has_open_l1(_CROSS_CHECK_SENTINEL)
                 ):
-                    from escalation.models import Escalation  # local import — escalation optional dep
+                    from escalation.models import (
+                        Escalation,  # local import — escalation optional dep
+                    )
                     escalation_queue.submit(Escalation(
                         id=escalation_queue.make_id(_CROSS_CHECK_SENTINEL),
                         task_id=_CROSS_CHECK_SENTINEL,

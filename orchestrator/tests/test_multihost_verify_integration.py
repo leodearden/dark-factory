@@ -1586,7 +1586,7 @@ class TestPerLandCrossCheck:
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
                 merge_sha='mergesha01',
                 runner=remote,
                 escalation_queue=eq,
@@ -1637,7 +1637,7 @@ class TestPerLandCrossCheck:
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
                 merge_sha='mergesha02',
                 runner=remote,
                 escalation_queue=eq,
@@ -1672,7 +1672,7 @@ class TestPerLandCrossCheck:
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
                 merge_sha='mergesha03',
                 runner=remote,
                 escalation_queue=eq,
@@ -1708,7 +1708,7 @@ class TestPerLandCrossCheck:
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
                 merge_sha='mergesha04',
                 runner=remote,
                 escalation_queue=eq,
@@ -1746,7 +1746,7 @@ class TestPerLandCrossCheck:
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
                 merge_sha='mergesha05',
                 runner=remote,
                 escalation_queue=eq,
@@ -1782,7 +1782,7 @@ class TestPerLandCrossCheck:
                 git_ops, req, tmp_path,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
                 merge_sha='mergesha06',
                 runner=None,  # LOCAL dispatch
                 escalation_queue=eq,
