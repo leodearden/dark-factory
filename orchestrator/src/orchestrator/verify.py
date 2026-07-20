@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import errno
+import fnmatch
 import json
 import logging
 import os
@@ -1863,6 +1864,44 @@ async def _verify_pipeline_guard_requires_full_gate(
             worktree, exc_info=True,
         )
         return False
+
+
+def _merge_config_only_diff_forces_full_gate(
+    config: OrchestratorConfig,
+    changed_files: list[str],
+) -> bool:
+    """Return True iff a config-only diff touches a manifest-relevant glob.
+
+    The deterministic dark-factory-side manifest-drift backstop (task 2838),
+    the local complement to the async remote
+    ``_verify_pipeline_guard_requires_full_gate`` consult above.  A merge-role
+    config-only (no .py/.rs) diff whose files match any configured glob forces
+    the full per-subproject verify gate EVEN WHEN the reify
+    verify-pipeline-guard.sh consult falls open — closing the fail-open
+    residual that let a config-only diff CAS-advance a new manifest-drift RED
+    onto main (incident deb-reify-964887, tasks 5247/5249).
+
+    Pure and synchronous (no subprocess, no git), so it cannot wedge the merge
+    pipeline and is trivially unit-testable.  Uses ``fnmatch.fnmatchcase`` —
+    case-sensitive and OS-independent (unlike ``fnmatch.fnmatch``, which
+    normalizes case per-OS); shell-glob ``*`` crosses ``/``, an intentional,
+    safe over-approximation (over-forcing the full gate is the safe direction,
+    under-forcing is the bug being closed).  Matched against *changed_files*
+    (the diff's added+modified on-disk ``existing_files``), a safe
+    over-approximation of "adds files that shift the manifest" — a
+    modification to a classification/manifest file can shift it too.
+
+    Empty globs (the default,
+    ``config.git.merge_config_only_full_gate_globs``) short-circuit to False in
+    O(1), leaving the config-only fast-path byte-identical for dark-factory's
+    own merges and non-reify projects.
+    """
+    globs = config.git.merge_config_only_full_gate_globs
+    if not globs:
+        return False
+    return any(
+        fnmatch.fnmatchcase(f, g) for f in changed_files for g in globs
+    )
 
 
 def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
