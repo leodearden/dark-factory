@@ -1922,7 +1922,7 @@ _OVERRIDABLE_FIELDS = frozenset({
     'lock_depth', 'max_per_module', 'module_overrides',
     'verify_command_timeout_secs',
     'verify_cold_command_timeout_secs',
-    'concurrent_verify', 'verify_env',
+    'concurrent_verify', 'sequential_lint_first', 'verify_env',
     'scope_cargo',
 })
 
@@ -1957,6 +1957,7 @@ class ModuleConfig:
     # Falls back to verify_command_timeout_secs when None.
     verify_cold_command_timeout_secs: float | None = None
     concurrent_verify: bool | None = None
+    sequential_lint_first: bool | None = None
     verify_env: dict[str, str] | None = None
     scope_cargo: bool | None = None
 
@@ -2419,6 +2420,15 @@ class OrchestratorConfig(BaseSettings):
     # invocation.  Useful for Rust workspaces where cargo takes an advisory
     # lock on target/ and the concurrent subcommands serialize anyway.
     concurrent_verify: bool = Field(default=True)
+    # Merge-role fail-fast phase order.  When True AND concurrent_verify is
+    # False AND role=='merge', the sequential verify branch runs LINT FIRST and
+    # short-circuits on a lint failure (test+type recorded as skipped, attempt
+    # fails) so a lint-only-red merge doesn't burn the long test phase before
+    # the short lint phase.  Default False = opt-in: byte-unchanged for existing
+    # configs.  Deliberately NOT in RELOADABLE_FIELDS (restart-tier, mirroring
+    # concurrent_verify): flipping verify phase-order mid-process could split
+    # behaviour across an in-flight merge.
+    sequential_lint_first: bool = Field(default=False)
     # Extra env vars injected into verify commands (e.g. RUSTC_WRAPPER=sccache).
     # Distinct from env_overrides, which targets agent invocations, not verify.
     verify_env: dict[str, str] = Field(default_factory=dict)
