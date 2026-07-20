@@ -5520,48 +5520,66 @@ class Scheduler:
             if task.get('status') != 'blocked':
                 continue
             tid = str(task.get('id', ''))
-            if tid in self._dispatched:
+            try:
+                if tid in self._dispatched:
+                    continue
+                # DESIGN GAP carve-out (mirrors harness Fix #1b / task-1622):
+                # a deterministic blocked task is owned exclusively by the
+                # deterministic gate flow (born-at-L2 resolve_issue) or the
+                # deterministic-recon sweep (deploy strands) — redispatching it
+                # here would race/duplicate that flow.  Unconditional: this
+                # cheap metadata check runs before any of the pricier checks
+                # below, including the escalation-queue I/O.
+                if (task.get('metadata') or {}).get('task_kind') == 'deterministic':
+                    continue
+                # A workflow just cancelled/parked this task; its finally-block
+                # teardown may still be writing state (mirrors Fix #1b gate 4).
+                if self.workflow_cancel_recent(tid):
+                    continue
+                # Same dispatch/requeue cooldown deadline check
+                # _eligible_for_dispatch uses (monotonic clock).
+                cooldown_deadline = self._requeue_until.get(tid)
+                if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
+                    continue
+                if not is_stranded_blocked(task, now, ttl):
+                    continue
+                if not self._deps_satisfied(task, ctx.status_map, ctx.tasks_by_id):
+                    continue
+                if self.escalation_queue.get_by_task(tid, status='pending'):
+                    continue
+                logger.warning(
+                    'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
+                    'pending (no live claimant, deps satisfied, no open escalation)',
+                    tid,
+                )
+                # Clear the stale claimant BEFORE the status flip — mirrors the
+                # slot-release ordering at harness.py:5693-5696. The task is
+                # still 'blocked' here (not yet dispatch-contestable), so
+                # nothing should be racing in a fresh claimant stamp; clearing
+                # first means a concurrent orchestrator that dispatches into
+                # this task right after it goes 'pending' below can never have
+                # its fresh stamp clobbered by a late-landing clear.
+                # Best-effort — set_task_claimant already swallows its own
+                # errors, so this can never block the flip.
+                await self.set_task_claimant(tid, claimant_run_id=None, heartbeat_at=None)
+                await self.set_task_status(tid, 'pending')
+            except Exception:
+                # Isolation guard (task 2849): a single task's predicate/write
+                # failure must never abort the batch — that previously
+                # propagated out of this sweep (and the tick-phase loop),
+                # silently skipping every genuinely-stranded sibling sorted
+                # after this one in ctx.tasks. Log loudly (per the
+                # loud-over-silent-degradation / no-silent-fail-soft design
+                # invariants) and move on; the sweep is stateless per tick,
+                # so this task is simply re-evaluated next tick.
+                logger.warning(
+                    'Task %s: stranded-blocked-redispatch sweep raised while '
+                    'processing this task; isolating so siblings are not '
+                    'collateral-stranded',
+                    tid,
+                    exc_info=True,
+                )
                 continue
-            # DESIGN GAP carve-out (mirrors harness Fix #1b / task-1622):
-            # a deterministic blocked task is owned exclusively by the
-            # deterministic gate flow (born-at-L2 resolve_issue) or the
-            # deterministic-recon sweep (deploy strands) — redispatching it
-            # here would race/duplicate that flow.  Unconditional: this
-            # cheap metadata check runs before any of the pricier checks
-            # below, including the escalation-queue I/O.
-            if (task.get('metadata') or {}).get('task_kind') == 'deterministic':
-                continue
-            # A workflow just cancelled/parked this task; its finally-block
-            # teardown may still be writing state (mirrors Fix #1b gate 4).
-            if self.workflow_cancel_recent(tid):
-                continue
-            # Same dispatch/requeue cooldown deadline check
-            # _eligible_for_dispatch uses (monotonic clock).
-            cooldown_deadline = self._requeue_until.get(tid)
-            if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
-                continue
-            if not is_stranded_blocked(task, now, ttl):
-                continue
-            if not self._deps_satisfied(task, ctx.status_map, ctx.tasks_by_id):
-                continue
-            if self.escalation_queue.get_by_task(tid, status='pending'):
-                continue
-            logger.warning(
-                'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
-                'pending (no live claimant, deps satisfied, no open escalation)',
-                tid,
-            )
-            # Clear the stale claimant BEFORE the status flip — mirrors the
-            # slot-release ordering at harness.py:5693-5696. The task is
-            # still 'blocked' here (not yet dispatch-contestable), so
-            # nothing should be racing in a fresh claimant stamp; clearing
-            # first means a concurrent orchestrator that dispatches into
-            # this task right after it goes 'pending' below can never have
-            # its fresh stamp clobbered by a late-landing clear.
-            # Best-effort — set_task_claimant already swallows its own
-            # errors, so this can never block the flip.
-            await self.set_task_claimant(tid, claimant_run_id=None, heartbeat_at=None)
-            await self.set_task_status(tid, 'pending')
 
         return _CONTINUE
 
