@@ -42,7 +42,6 @@ from datetime import datetime
 from pathlib import Path
 
 import click
-from shared.prompt_artifact import default_artifacts_root
 
 from orchestrator.evals.prompt_opt.canary import (
     CanaryThresholds,
