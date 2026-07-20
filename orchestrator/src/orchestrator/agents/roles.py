@@ -970,6 +970,52 @@ def submit_only_instructions(
     return textwrap.indent(raw, caller_indent)
 
 
+# Task 2640 — Source 1: file follow-up work discovered OUTSIDE the current task's
+# scope as a task candidate AT THE SOURCE (fire-and-forget submit_task), instead
+# of relying on the lossy orphan-reaper → auto-watcher backstop (18% conversion
+# on cleanup_needed/design_concern).  Rendered via submit_only_instructions so it
+# stays consistent with the steward / deep_reviewer fire-and-forget filing sites
+# (NO resolve_ticket wait — a budget/turn-capped architect or implementer must
+# never block on the curator).  Defined HERE, after submit_only_instructions, and
+# appended to ARCHITECT / IMPLEMENTER below via `+=`, because both roles are
+# declared earlier in the module than this helper (Python definition order); the
+# `+=` is the same additive composition as the `+ _ESCALATION_INSTRUCTIONS`
+# chain in each role literal, just applied post-construction.  ROLES (built far
+# below) references the same objects, so the append is visible through it too.
+_FOLLOWUP_FILING_INSTRUCTIONS = """
+## Filing follow-up work
+
+While working you may notice follow-up work discovered OUTSIDE the scope of your
+assigned task — a latent bug in an adjacent module, missing test coverage, a
+cleanup/refactor you should not do here. Do NOT silently drop it, and do NOT do
+it inline (that expands your scope). File it at the source as a low-priority task
+candidate so it is captured deterministically instead of left for a downstream
+reaper to maybe recover:
+""" + submit_only_instructions(
+    '{"source": "agent-followup", "spawn_context": "agent_followup",\n'
+    '"spawned_from": "<this task id>", "files": ["path/to/file-or-dir", ...],\n'
+    '"escalation_id": "agent-followup-<this task id>",\n'
+    '"suggestion_hash": "<stable hash of the follow-up>"}',
+    outcome_target='iteration log',
+    step_label='1',
+    extra_submit_guidance=(
+        "Only file work that is OUTSIDE this task's scope — never in-scope plan\n"
+        "steps you can just do. Use priority `low` unless the work is clearly more\n"
+        "urgent. The `description` must stand alone WITHOUT your session context:\n"
+        "name this task's id, the escalation id if one exists, the concrete file\n"
+        "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
+        "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
+        "A pure observation with no work item goes to `escalate_info` instead; when\n"
+        "something is BOTH an observation and a work item, do both. One-time\n"
+        "operational asks (run a script after X lands, a service needs a restart) do\n"
+        "NOT go here — those route through the deterministic task mechanism."
+    ),
+)
+
+ARCHITECT.system_prompt = ARCHITECT.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
+IMPLEMENTER.system_prompt = IMPLEMENTER.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
