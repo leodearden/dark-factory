@@ -247,3 +247,69 @@ class TestRequeueWiring:
         stamp_spy.assert_not_awaited()
         # The non-merge_phase requeue durably re-pends through the scheduler.
         f.scheduler.set_task_status.assert_any_await(f.wf.task_id, 'pending')
+
+
+# ---------------------------------------------------------------------------
+# step-7: _merge_and_finalise(branch_name) extraction contract
+# ---------------------------------------------------------------------------
+
+
+def _wire_finalise_spies(f: _Fixture, *, merge_result):
+    """Spy _run_merge_phase and the finalise tail on the fixture's workflow."""
+    wf = f.wf
+    wf._run_merge_phase = AsyncMock(return_value=merge_result)  # type: ignore[method-assign]
+    wf._write_completion_to_memory = AsyncMock()  # type: ignore[method-assign]
+    wf._ensure_steward_started = AsyncMock()  # type: ignore[method-assign]
+    wf._await_steward_completion = AsyncMock()  # type: ignore[method-assign]
+    wf._finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+    wf._enter_phase = MagicMock()  # type: ignore[method-assign]
+    return wf
+
+
+class TestMergeAndFinalise:
+    @pytest.mark.asyncio
+    async def test_terminal_merge_outcome_returned_as_is_without_finalise_tail(self):
+        # (a) _run_merge_phase returns a terminal WorkflowOutcome (merge did NOT
+        # succeed) → return it verbatim, never run the finalise/DONE tail.
+        f = _make()
+        wf = _wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
+
+        outcome = await wf._merge_and_finalise('task/77')
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        wf._run_merge_phase.assert_awaited_once()
+        wf._write_completion_to_memory.assert_not_awaited()
+        wf._finalise_merged_done.assert_not_awaited()
+        wf._enter_phase.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_merge_result_runs_finalise_tail_and_returns_done(self):
+        # (b) _run_merge_phase returns None (merge SUCCEEDED) → run the finalise
+        # tail and return _finalise_merged_done()'s value, entering DONE.
+        f = _make()
+        wf = _wire_finalise_spies(f, merge_result=None)
+
+        outcome = await wf._merge_and_finalise('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        wf._run_merge_phase.assert_awaited_once()
+        wf._write_completion_to_memory.assert_awaited_once()
+        wf._await_steward_completion.assert_awaited_once()
+        wf._enter_phase.assert_any_call(WorkflowState.DONE)
+        wf._finalise_merged_done.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_eval_mode_skips_merge_phase_but_runs_finalise_tail(self):
+        # (c) eval mode (_worktree_external=True) never merges into main, but the
+        # SUCCESS/finalise tail still runs.
+        f = _make()
+        wf = _wire_finalise_spies(f, merge_result=WorkflowOutcome.BLOCKED)
+        wf._worktree_external = True
+
+        outcome = await wf._merge_and_finalise('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        wf._run_merge_phase.assert_not_awaited()
+        wf._write_completion_to_memory.assert_awaited_once()
+        wf._enter_phase.assert_any_call(WorkflowState.DONE)
+        wf._finalise_merged_done.assert_awaited_once()
