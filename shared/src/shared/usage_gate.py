@@ -857,21 +857,66 @@ class UsageGate:
 
         return False
 
+    def _scope_cap_for(self, acct: AccountState, scope: str) -> ScopeCap:
+        """Lazily get-or-create the per-(account, model) cap overlay for *scope*.
+
+        The scope substrate (task 2855 / PRD scope): ``acct.scope_caps`` starts
+        empty and is populated on first scoped observation, so today's general
+        (unscoped) paths stay byte-identical.
+        """
+        sc = acct.scope_caps.get(scope)
+        if sc is None:
+            sc = ScopeCap()
+            acct.scope_caps[scope] = sc
+        return sc
+
     def _handle_cap_detected(
         self,
         reason: str,
         resets_at: datetime | None,
         oauth_token: str | None,
+        scope: str | None = None,
     ) -> bool:
         """Mark the matching account as capped.
 
         Returns True if an account was resolved and mutated; False if
         ``_resolve_account`` returned None (unknown token / all capped).
+
+        *scope* (PRD task β, invariant S5): when non-None (a scoped-cap model,
+        e.g. ``claude-fable-5``), the cap is attributed to ONLY this account's
+        model-scope — ``acct.scope_caps[scope]`` is flagged capped and the
+        account-level phase machine is left untouched, so the account keeps
+        serving general work. Attribution is by invoked model (PRD decision 2),
+        never by cap-message text. ``scope=None`` (the general scope) is
+        byte-identical to today: the account transitions to CAPPED via
+        ``_transition``.
         """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Cap detected but no matching account: {reason}')
             return False
+
+        if scope is not None:
+            # Scoped (per-model) cap overlay — invariant S5: cap ONLY this
+            # account's model-scope, leaving the account-level phase machine
+            # untouched. _transition is both the sole phase writer AND the
+            # account-level cap_hit event site, so the scoped path deliberately
+            # bypasses it and fires its own cap_hit event (scope detail added)
+            # to preserve observability without transitioning the account.
+            # resets_at is the value the generic classifier already parsed
+            # (decision 2); an unknown (None) is stored verbatim — the
+            # None-backoff policy is γ's (task 2857).
+            sc = self._scope_cap_for(acct, scope)
+            sc.capped = True
+            sc.resets_at = resets_at
+            sc.capped_at = datetime.now(UTC)
+            logger.warning(f'Account {acct.name} scope {scope!r} CAPPED: {reason}')
+            if self._cost_store:
+                details: dict[str, str] = {'reason': reason, 'scope': scope}
+                if resets_at is not None:
+                    details['resets_at'] = resets_at.isoformat()
+                self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
+            return True
 
         # resets_at is refreshed unconditionally (even on a same-phase repeat
         # detection) — it feeds the resume-probe backoff target and
@@ -893,16 +938,36 @@ class UsageGate:
         self,
         reason: str,
         oauth_token: str | None,
+        scope: str | None = None,
     ) -> bool:
         """Record a near-cap warning without blocking the account.
 
         Returns True if an account was resolved and mutated; False if
         ``_resolve_account`` returned None (unknown token / all capped).
+
+        *scope* (PRD task β, invariant S5): when non-None, the warning is
+        annotated on ONLY this account's model-scope (``acct.scope_caps[scope]``)
+        and the account-level ``near_cap`` flag stays untouched. ``scope=None``
+        is byte-identical to today (sets ``acct.near_cap``).
         """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Near-cap warning but no matching account: {reason}')
             return False
+
+        if scope is not None:
+            # Scoped near-cap overlay (invariant S5): annotate only this
+            # account's model-scope; the account-level near_cap flag is left put.
+            sc = self._scope_cap_for(acct, scope)
+            sc.near_cap = True
+            logger.warning(f'Account {acct.name} scope {scope!r} NEAR CAP: {reason}')
+            if self._cost_store:
+                self._fire_cost_event(
+                    acct.name,
+                    'near_cap',
+                    json.dumps({'reason': reason, 'scope': scope}),
+                )
+            return True
 
         acct.near_cap = True
         logger.warning(f'Account {acct.name} NEAR CAP: {reason}')
