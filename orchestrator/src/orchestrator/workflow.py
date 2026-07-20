@@ -4464,6 +4464,95 @@ class TaskWorkflow:
             )
         return stamped
 
+    async def _stamp_merge_retry_pending(self) -> None:
+        """Persist a durable merge-phase-resume obligation into task metadata.
+
+        Best-effort record that "this task owes an in-place merge resubmission".
+        ``_requeue``'s ``merge_phase=True`` path returns REQUEUED while leaving
+        the task ``in-progress`` for an in-RAM in-place retry; without this stamp
+        a restart mid-retry loses the obligation entirely (Reify 5166).
+        Persisting ``{branch_head, base_sha, resolved_at}`` lets
+        :meth:`_resume_merge_retry_if_pending` reconstruct it on re-dispatch and
+        jump straight back to the merge phase when the post-rebase worktree HEAD
+        still equals ``branch_head``.
+
+        Mirrors :meth:`_stamp_first_merge_enqueue`'s durability contract: read
+        fresh backend metadata (via :meth:`_merge_fresh_metadata`) so a
+        concurrent write (``retry_ledger``, ``memory_hints``) is not clobbered,
+        update the in-memory task, and persist via ``scheduler.update_task``
+        inside a logged try/except. A persistence failure must never crash the
+        block/resume path.
+        """
+        try:
+            rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
+        except Exception as exc:  # noqa: BLE001 — best-effort, log and skip
+            logger.warning(
+                'Task %s: could not read worktree HEAD for merge_retry_pending '
+                'stamp (skipping durable stamp): %s', self.task_id, exc,
+            )
+            return
+        branch_head = out.strip()
+        if rc != 0 or not branch_head:
+            logger.warning(
+                'Task %s: git rev-parse HEAD failed (rc=%s) for '
+                'merge_retry_pending stamp — skipping durable stamp',
+                self.task_id, rc,
+            )
+            return
+        try:
+            base_sha = await self.git_ops.get_main_sha()
+        except Exception as exc:  # noqa: BLE001 — base_sha is advisory context only
+            logger.warning(
+                'Task %s: could not read main SHA for merge_retry_pending stamp: %s',
+                self.task_id, exc,
+            )
+            base_sha = ''
+
+        metadata = self.task.get('metadata') or {}
+        fresh = await self._merge_fresh_metadata(
+            metadata, log_context='merge_retry_pending stamp',
+        )
+        fresh['merge_retry_pending'] = {
+            'branch_head': branch_head,
+            'base_sha': base_sha,
+            'resolved_at': datetime.now(UTC).isoformat(),
+        }
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(self.task_id, metadata=fresh)
+        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_retry_pending stamp '
+                '(retry obligation not durable this cycle): %s',
+                self.task_id, exc,
+            )
+
+    async def _clear_merge_retry_pending(self) -> None:
+        """Remove the durable merge-retry obligation from task metadata (best-effort).
+
+        Called by :meth:`_resume_merge_retry_if_pending` on consume — both on a
+        HEAD match (before delegating to the merge phase) and on a HEAD mismatch
+        (the stamp can never match again once the branch moved). Uses the
+        full-dict :meth:`_merge_fresh_metadata` + ``scheduler.update_task(
+        metadata=...)`` pattern because only a full-dict write can REMOVE a key
+        (an append-merge can add but not delete). A persistence failure must
+        never crash the resume path; a subsequent re-block re-stamps a fresh
+        obligation, so a lost clear is self-healing.
+        """
+        metadata = self.task.get('metadata') or {}
+        fresh = await self._merge_fresh_metadata(
+            metadata, log_context='merge_retry_pending clear',
+        )
+        fresh.pop('merge_retry_pending', None)
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(self.task_id, metadata=fresh)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_retry_pending clear: %s',
+                self.task_id, exc,
+            )
+
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
 
