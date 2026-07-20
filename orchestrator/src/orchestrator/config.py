@@ -1798,6 +1798,26 @@ class GitConfig(BaseModel):
             '(default) disables the tripwire entirely — logged no-op.'
         ),
     )
+    merge_config_only_full_gate_globs: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Per-project list of fnmatch globs for the dark-factory '
+            'manifest-drift backstop (task 2838).  When a merge-role '
+            'config-only (no .py/.rs) diff TOUCHES a file matching any glob, '
+            'the full per-subproject verify gate is forced even if reify\'s '
+            'scripts/verify-pipeline-guard.sh consult falls open — closing '
+            'the fail-open residual that let a config-only diff CAS-advance a '
+            'new manifest-drift RED onto main (incident deb-reify-964887). '
+            'Matched (case-sensitive, OS-independent) against the diff\'s '
+            'existing added+modified files, a safe over-approximation of '
+            '"adds files that shift the manifest".  Empty (default) disables '
+            'the backstop entirely — a no-op for dark-factory\'s own merges '
+            'and non-reify projects, leaving the config-only fast-path '
+            'byte-identical.  Not a merge-lane structural git field: a '
+            'behavioural leaf tunable read fresh from the passed config per '
+            'verify call (green-tier hot-reloadable).'
+        ),
+    )
     load_bearing_oracle_timeout_secs: float = Field(
         default=60.0,
         gt=0,
