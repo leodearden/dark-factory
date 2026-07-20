@@ -212,9 +212,19 @@ class EscalationQueue:
         (add_members_to_l2, attach_dedupe_child, resolve).  The notify callback
         fires OUTSIDE the lock so a callback that re-enters the queue for the
         same id does not deadlock.
+
+        Durability contract: the pending record is written with
+        ``durable=True`` — fsync-flushed (temp-file fd, then the containing
+        directory fd) before this call returns — so it is at least as
+        crash-durable as the per-task seq counter that names it
+        (``_write_seq_counter``, also durable=True). This closes the window
+        in which a machine-level crash / power-loss / storage fault (e.g.
+        during a merge-triggered service restart) could drop a just-filed
+        born-at-L2 gate escalation while its durable seq counter and the
+        orchestrator's ``gate_escalated_at`` stamp survived.
         """
         with escalation_id_lock(self.queue_dir, escalation.id):
-            self._atomic_write(escalation.id, escalation.to_json())
+            self._atomic_write(escalation.id, escalation.to_json(), durable=True)
         logger.info(f'Escalation submitted: {escalation.id} [{escalation.severity}]')
 
         if self._notify_callback:
@@ -1085,16 +1095,22 @@ class EscalationQueue:
         """Atomically rewrite an escalation's JSON file."""
         self._atomic_write(escalation_id, escalation.to_json())
 
-    def _atomic_write(self, escalation_id: str, json_text: str) -> None:
+    def _atomic_write(self, escalation_id: str, json_text: str, *, durable: bool = False) -> None:
         """Write *json_text* atomically to ``queue_dir/{escalation_id}.json``.
 
         Thin wrapper around ``_atomic_write_path`` that constructs the target
         path from *escalation_id* and ``queue_dir``.  Always writes to the queue
         root — not the archive.
 
-        Callers: submit(), resolve(), submit_resolved(), _rewrite().
+        *durable*, when True, is forwarded to ``_atomic_write_path``'s existing
+        fsync branch (temp-file fd before rename, containing-directory fd
+        after) — the same durability guarantee ``_write_seq_counter`` already
+        uses. Defaults to False so existing callers are byte-identical.
+
+        Callers: submit() (durable=True), resolve(), submit_resolved(), _rewrite()
+        (the latter three keep the default durable=False).
         """
-        self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text)
+        self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text, durable=durable)
 
     def _atomic_write_path(self, path: Path, json_text: str, *, durable: bool = False) -> None:
         """Write *json_text* atomically to *path*.
