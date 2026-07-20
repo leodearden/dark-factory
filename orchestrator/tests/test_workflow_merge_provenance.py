@@ -23,7 +23,8 @@ from _workflow_helpers import (  # noqa: F401  _Fixture: re-export, see test_wor
     _make,
 )
 
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_queue import reconcile_landed_outbox
 from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import (
     WorkflowOutcome,
@@ -804,3 +805,111 @@ class TestNoPhantomDoneProperty:
         outcome3 = await f3.wf._recover_before_merge('branchhead123', 'mainsha123')
         assert outcome3 == WorkflowOutcome.DONE
         assert f3.wf._merge_recovery_basis in ('journal', 'fallback')
+
+
+# ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._finalise_merged_done consumes the write-ahead LandedRow
+# on the single-branch happy path (task 2681/ζ — close the RC-3 stale-row
+# window that reconcile_landed_outbox documented as a KNOWN LIMITATION).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinaliseMergedDoneConsumesLandedRow:
+    """The single-branch happy-path completion (``_finalise_merged_done``)
+    consumes its write-ahead LandedRow via ``MergeProvenance.consume`` the
+    moment ``mark_done`` succeeds — so a successfully-landed task no longer
+    leaves a stale row that survives to the next orchestrator startup (the
+    task-2155 KNOWN LIMITATION). The consume is scoped to the SUCCESS path
+    only: a rejected done-write must leave the row for the reconciler to retry.
+    """
+
+    def _bind_outbox_with_row(
+        self, tmp_path: Path, task_id: str, advanced_sha: str,
+    ) -> LandedOutbox:
+        """Construct + bind a real LandedOutbox holding a row for *task_id*,
+        returning the handle so the caller can assert on it after the fact
+        (unlike ``_bind_landed_row``, which discards the outbox reference)."""
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id=task_id, branch_tip_sha='branchtip',
+            advanced_sha=advanced_sha, landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+        return outbox
+
+    async def test_happy_path_consumes_row_after_mark_done(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        outbox = self._bind_outbox_with_row(tmp_path, f.wf.task_id, 'advsha')
+        f.wf._merge_sha = 'advsha'
+        f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+
+        # Row present BEFORE completion.
+        assert outbox.lookup(f.wf.task_id) is not None
+
+        outcome = await f.wf._finalise_merged_done()
+
+        assert outcome == WorkflowOutcome.DONE
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='merged', sha='advsha',
+        )
+        # Row CONSUMED on completion — no restart / startup reconcile needed.
+        assert outbox.lookup(f.wf.task_id) is None
+
+    async def test_rc3_prunes_nothing_after_happy_path_completion(
+        self, tmp_path: Path,
+    ):
+        """End-to-end: after a happy-path completion, driving the real startup
+        RC-3 reconcile over the same bound outbox finds nothing to prune — the
+        row was already consumed on completion. An UNconsumed 'done' row WOULD
+        trip RC-3's ``already_done_pruned`` branch (get_status → 'done',
+        advanced_sha an ancestor of main), so a zero prune count is a genuine
+        RED→GREEN signal that the happy-path consume fired.
+        """
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        outbox = self._bind_outbox_with_row(tmp_path, f.wf.task_id, 'advsha')
+        f.wf._merge_sha = 'advsha'
+        f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+        # get_status → 'done' so an unconsumed row WOULD be RC-3 pruned;
+        # is_ancestor/get_main_sha are already AsyncMocks from _make
+        # (is_ancestor → True, get_main_sha → 'mainsha123').
+        f.wf.scheduler.get_status = AsyncMock(return_value='done')
+
+        outcome = await f.wf._finalise_merged_done()
+        assert outcome == WorkflowOutcome.DONE
+
+        report = await reconcile_landed_outbox(
+            outbox, f.wf.git_ops, f.wf.scheduler,
+        )
+
+        assert report['already_done_pruned'] == 0, (
+            f'Expected zero RC-3 prunes for a happy-path-completed task; '
+            f'got {report!r}'
+        )
+        assert report['marked_done'] == 0
+
+    async def test_rejected_done_write_leaves_row_for_reconciler(
+        self, tmp_path: Path,
+    ):
+        """Consume-only-on-success: a rejected ``mark_done`` routes to
+        ``_mark_blocked`` and must NOT consume the write-ahead row — the task
+        is not done, so the row must survive for the startup/dispatch
+        reconciler to retry (RC-1/RC-2)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        outbox = self._bind_outbox_with_row(tmp_path, f.wf.task_id, 'advsha')
+        f.wf._merge_sha = 'advsha'
+        f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+        rejection = SetTaskStatusRejected(
+            task_id=f.wf.task_id, error_code='conflict', raw='row already terminal',
+        )
+        f.wf.scheduler.mark_done = AsyncMock(side_effect=rejection)
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+        outcome = await f.wf._finalise_merged_done()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        mark_blocked.assert_awaited_once()
+        # The write-ahead row must STILL be present — a rejected done-write
+        # must not consume it.
+        assert outbox.lookup(f.wf.task_id) is not None
