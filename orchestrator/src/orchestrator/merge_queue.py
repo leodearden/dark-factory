@@ -1571,6 +1571,14 @@ def _spawn_main_health_probe(
     return True
 
 
+# Dedup sentinel task_id for fix (b)'s per-land cross-check divergence escalation
+# (task 2822) — mirrors verify_runner.py's _DRIFT_SENTINEL / this module's
+# _RESOURCE_AUDIT_SENTINEL.  A single open L1 per episode keeps a run of divergent
+# lands from flooding the queue; the caller-owned quarantine set does the per-host
+# withholding.
+_CROSS_CHECK_SENTINEL = '__verify_cross_check__'
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1716,9 +1724,12 @@ async def _run_post_merge_verify(
     # the trust anchor and out of slot accounting).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
-    # The `quarantine` parameter is reserved/unused here; it remains in the signature
-    # so existing call sites stay byte-identical.
-    _ = quarantine  # reserved/unused
+    # The caller-owned `quarantine` set is the divergence-quarantine sink for
+    # fix (b)'s per-land cross-check below (task 2822): on a remote PASS / local
+    # trust-anchor FAIL split we add runner.name to it so the shared HostAllocator
+    # drops the host.  None is treated as "no quarantine sink" (module-level and
+    # test callers that pass nothing) — the cross-check still fails closed, it
+    # just records no host name.
     if runner is not None:
         # Remote path: build a single-runner pool from the injected runner.
         # Warm-swap runs only for LOCAL leases (caller's responsibility).
@@ -1845,6 +1856,134 @@ async def _run_post_merge_verify(
     # Default None keeps existing call sites byte-identical.
     if on_result is not None:
         on_result(verify)
+
+    # Fix (b) — per-land cross-check of a remote GREEN (task 2822).  A single
+    # remote host's green must not blindly decide a land: re-verify it with the
+    # LOCAL trust-anchor on the intact merge_wt BEFORE the land.  Scoped to a
+    # REMOTE dispatch (runner is not None) of a REAL-suite green — a trivial
+    # config-only pass ran no suite on either host, so there is nothing to
+    # cross-check and it is left for task 2823's trivial-pass main-red gate on
+    # the pass path below.  Gated by verify_cross_check_remote_green (default
+    # True), provably INERT on main today: reify's verify_runners is not yet
+    # enabled, so this call site always gets runner=None and this branch never
+    # runs — zero behaviour change until Lever C is turned on.
+    #
+    #   AGREE (local passes too)  → emit verdict_parity_ok, proceed to land.
+    #   DIVERGE (local FAILs)     → fail-CLOSED: quarantine the remote, file a
+    #                               dedup'd blocking verify_cross_check_mismatch
+    #                               escalation, and ADOPT the local FAIL verdict
+    #                               so the `if not verify.passed:` path below
+    #                               withholds the land and cleans up merge_wt.
+    #   local RunnerUnavailable   → fail-SAFE: emit verify_cross_check_inconclusive
+    #                               and TRUST the remote green (never block a land
+    #                               on a local infra hiccup — DriftDetector Invariant 5).
+    if (
+        runner is not None
+        and verify.passed
+        and not getattr(verify, 'trivial', False)
+        and req.config.verify_cross_check_remote_green
+    ):
+        cross_check_runner = LocalRunner(
+            merge_wt, req.config, req.module_configs, task_files_tuple,
+            run_scoped=run_scoped_verification,
+            run_unscoped=_run_unscoped_typechecks,
+            task_id=req.task_id,
+            archive_root=req.config.project_root / 'data' / 'verify-logs',
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+        )
+        try:
+            local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+        except RunnerUnavailable as exc:
+            # Fail-safe: a closed/flaky laptop trust-anchor must never block a
+            # remote green (symmetric with DriftDetector's Invariant 5).
+            if event_store is not None:
+                event_store.emit(
+                    EventType.verify_cross_check_inconclusive,
+                    task_id=req.task_id,
+                    data={
+                        'merge_sha': merge_sha,
+                        'remote_runner': runner.name,
+                        'reason': str(exc),
+                    },
+                )
+            logger.warning(
+                'Task %s: local cross-check trust-anchor unavailable for %s '
+                '(remote=%s) — trusting the remote green (fail-safe): %s',
+                req.task_id, merge_sha, runner.name, exc,
+            )
+        else:
+            if local_verify.passed == verify.passed:
+                # AGREE — both green.  Emit parity telemetry and proceed to land.
+                if event_store is not None:
+                    event_store.emit(
+                        EventType.verdict_parity_ok,
+                        task_id=req.task_id,
+                        data={
+                            'merge_sha': merge_sha,
+                            'local_runner': cross_check_runner.name,
+                            'remote_runner': runner.name,
+                            'passed': verify.passed,
+                        },
+                    )
+            else:
+                # DIVERGE — remote PASS / local trust-anchor FAIL.  Fail-closed:
+                # quarantine the remote, file a dedup'd blocking escalation
+                # (mirrors DriftDetector's shape), and adopt the local FAIL
+                # verdict so the not-passed path below withholds the land.
+                if quarantine is not None:
+                    quarantine.add(runner.name)
+                if (
+                    escalation_queue is not None
+                    and not escalation_queue.has_open_l1(_CROSS_CHECK_SENTINEL)
+                ):
+                    from escalation.models import (
+                        Escalation,  # local import — escalation optional dep
+                    )
+                    escalation_queue.submit(Escalation(
+                        id=escalation_queue.make_id(_CROSS_CHECK_SENTINEL),
+                        task_id=_CROSS_CHECK_SENTINEL,
+                        agent_role='orchestrator-cross-check',
+                        severity='blocking',
+                        level=1,
+                        category='verify_cross_check_mismatch',
+                        summary=(
+                            f'Cross-check divergence for {merge_sha}: '
+                            f'remote={runner.name!r} PASS / local trust-anchor FAIL'
+                        ),
+                        detail=(
+                            f'merge_sha={merge_sha!r} remote_runner={runner.name!r} '
+                            f'reported PASS but the local trust-anchor re-verify FAILED '
+                            f'(summary={local_verify.summary!r}, '
+                            f'category={local_verify.category!r}). A remote PASS / local '
+                            f'FAIL split can land unverified code on main; the land is '
+                            f'withheld and {runner.name!r} is quarantined.'
+                        ),
+                        suggested_action=(
+                            'Re-prove the remote host env (run_verdict_parity) and clear '
+                            'its quarantine once parity is restored; investigate why the '
+                            'remote green disagreed with the local trust-anchor.'
+                        ),
+                    ))
+                if event_store is not None:
+                    event_store.emit(
+                        EventType.verify_cross_check_mismatch,
+                        task_id=req.task_id,
+                        data={
+                            'merge_sha': merge_sha,
+                            'remote_runner': runner.name,
+                            'remote_passed': verify.passed,
+                            'local_passed': local_verify.passed,
+                        },
+                    )
+                logger.warning(
+                    'Task %s: cross-check DIVERGENCE for %s — remote %s PASS but '
+                    'local trust-anchor FAIL; withholding the land and quarantining %s',
+                    req.task_id, merge_sha, runner.name, runner.name,
+                )
+                # Adopt the local (failing) verdict so the `if not verify.passed:`
+                # path below withholds the land and cleans up merge_wt.
+                verify = local_verify
 
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
@@ -6953,11 +7092,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            churn for a host that recovers in the same cycle it would have tripped
            the time-based threshold.
 
-        **Correctness invariant**: hosts quarantined by :class:`DriftDetector`
-        for verdict divergence are intentionally skipped — they are in the
-        allocator quarantine but absent from ``self._runner_unavailable``.
-        Clearing them on mere SSH reachability would bypass the drift parity
-        gate (Invariant 5).
+        **Correctness invariant**: hosts quarantined for verdict divergence —
+        by :class:`DriftDetector`'s sampled parity check OR by the land-time
+        per-land cross-check in :func:`_run_post_merge_verify` (task 2822 fix
+        b, which adds ``runner.name`` to the same worker-owned
+        ``_runner_quarantine`` set) — are intentionally skipped: they are in
+        the allocator quarantine but absent from ``self._runner_unavailable``.
+        Clearing either on mere SSH reachability would bypass the verdict
+        parity gate (Invariant 5); both stay quarantined until an operator
+        re-proves the host and clears it explicitly.
 
         Per-host exceptions are caught so one host's failure cannot abort the
         sweep for the remaining hosts.

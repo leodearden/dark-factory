@@ -102,6 +102,17 @@ class EventType(StrEnum):
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
     verdict_parity_ok = 'verdict_parity_ok'
+    # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
+    # AGREE case reuses verdict_parity_ok above; these two give the divergence
+    # and local-infra-inconclusive outcomes their own auditable types.
+    # verify_cross_check_mismatch: remote PASS vs local trust-anchor FAIL — the
+    # land is withheld (fail-closed), the remote runner quarantined, and a
+    # blocking escalation filed. verify_cross_check_inconclusive: the local
+    # cross-check runner was unavailable (RunnerUnavailable) so the remote green
+    # is trusted (fail-safe) — the land proceeds but the skipped second opinion
+    # is recorded.
+    verify_cross_check_mismatch = 'verify_cross_check_mismatch'
+    verify_cross_check_inconclusive = 'verify_cross_check_inconclusive'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
     merge_queued = 'merge_queued'

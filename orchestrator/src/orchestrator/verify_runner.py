@@ -269,6 +269,12 @@ class MergeVerifySpec:
     verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
+    merge_verify_workspace : force-workspace profile of the merge gate (fix a,
+                          task 2822) — carried so the remote host runs the
+                          SAME profile as the dispatching merge gate, not the
+                          laptop config's (possibly narrower) default.
+    merge_verify_breadth   : 'scoped' | 'full' breadth of the merge gate (fix a,
+                          task 2822) — same rationale.
 
     Note
     ----
@@ -285,6 +291,12 @@ class MergeVerifySpec:
     verify_env: Mapping[str, str]
     cold_timeout_secs: float
     is_merge_verify: bool = True
+    # Fix (a), task 2822 — the merge-gate PROFILE rides the spec so the remote
+    # host runs the identical scope/profile as the dispatching merge gate.
+    # Narrow defaults match the pre-fix behaviour and the OrchestratorConfig
+    # field defaults (merge_verify_workspace=False, merge_verify_breadth='scoped').
+    merge_verify_workspace: bool = False
+    merge_verify_breadth: str = "scoped"
 
     def to_dict(self) -> dict:
         return {
@@ -294,6 +306,8 @@ class MergeVerifySpec:
             "verify_env": dict(self.verify_env),
             "cold_timeout_secs": float(self.cold_timeout_secs),
             "is_merge_verify": self.is_merge_verify,
+            "merge_verify_workspace": self.merge_verify_workspace,
+            "merge_verify_breadth": self.merge_verify_breadth,
         }
 
     @classmethod
@@ -306,6 +320,10 @@ class MergeVerifySpec:
             verify_env=dict(d.get("verify_env", {})),
             cold_timeout_secs=float(d["cold_timeout_secs"]),
             is_merge_verify=d.get("is_merge_verify", True),
+            # Back-compat: a legacy spec dict (pre-task-2822) lacks these keys,
+            # so default to the narrow merge gate — same d.get idiom as verify_env.
+            merge_verify_workspace=d.get("merge_verify_workspace", False),
+            merge_verify_breadth=d.get("merge_verify_breadth", "scoped"),
         )
 
 
@@ -377,6 +395,11 @@ def build_merge_verify_spec(
         verify_env=dict(config.effective_verify_env),
         cold_timeout_secs=float(cold_timeout),
         is_merge_verify=True,
+        # Fix (a), task 2822 — project the merge-gate profile from LIVE config so
+        # the spec is the single source of truth for the profile at the transport
+        # boundary; the remote host applies these over its own (laptop) config.
+        merge_verify_workspace=config.merge_verify_workspace,
+        merge_verify_breadth=config.merge_verify_breadth,
     )
 
 
@@ -469,6 +492,20 @@ async def run_merge_verify_on_worktree(
     # invariant or reconstruct module_configs from spec.unscoped_typecheck instead.
     module_configs = [_module_config_from_command(vc, spec) for vc in spec.verify_commands]
     task_files = tuple(spec.task_files) if spec.task_files is not None else None
+
+    # Fix (a), task 2822 — the SPEC is the single source of truth for the
+    # merge-deciding profile. Override the reconstructed (remote) config's
+    # profile from the spec so the remote runs the IDENTICAL scope/profile as
+    # the dispatching merge gate; the laptop's own --config can no longer narrow
+    # it. The local path is unaffected — its config already equals the spec's
+    # source, so this is a value-preserving no-op there. (pydantic v2 model_copy;
+    # values originate from a validated config via build_merge_verify_spec.)
+    config = config.model_copy(
+        update={
+            'merge_verify_workspace': spec.merge_verify_workspace,
+            'merge_verify_breadth': spec.merge_verify_breadth,
+        }
+    )
 
     runner = LocalRunner(
         merge_wt,
@@ -941,8 +978,11 @@ class RemoteRunner:
         When the result has passed=False and both *task_id* and *archive_root*
         are provided, the remote ssh stderr is archived best-effort to
         ``<archive_root>/<task_id>/attempt-1.remote-<name>-<utc_ts>.stderr.log``
-        (task 1920).  Any archival error is swallowed so the VerifyResult is
-        always returned unchanged (PRD §A Invariant 5).
+        (task 1920).  Symmetrically, when the result has passed=True and both are
+        provided, a JSON pass-summary (scope+result+timing) is archived best-effort
+        to ``<archive_root>/<task_id>/attempt-1.remote-<name>.pass-summary-<utc_ts>.json``
+        (task 2822 fix c) so a remote GREEN is auditable.  Any archival error is
+        swallowed so the VerifyResult is always returned unchanged (PRD §A Invariant 5).
 
         Raises RunnerUnavailable on any transport failure (step-8).
         Returns a VerifyResult unchanged — even passed=False or timed_out=True
@@ -1031,12 +1071,17 @@ class RemoteRunner:
                 argv += ['--request-id', request_id]
                 remote_cmd = ' '.join(shlex.quote(a) for a in argv)
 
+                # Fix (c), task 2822 — measure the remote verify wall-clock so a
+                # PASSING remote verify can be archived with TIMING (mirrors the
+                # pool.dispatch monotonic timing at ~1455/1484).
+                _ssh_t0 = time.monotonic()
                 try:
                     ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
                         ['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd],
                     )
                 except OSError as exc:
                     raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
+                duration_ms = round((time.monotonic() - _ssh_t0) * 1000)
 
                 if ssh_rc != 0:
                     raise RunnerUnavailable(
@@ -1062,6 +1107,15 @@ class RemoteRunner:
                 # Mirrors local _archive_merge_verify_logs; distinguishes timeout vs real failure.
                 if not result.passed and archive_root is not None and task_id is not None:
                     self._archive_failure_streams(archive_root, task_id, result)
+
+                # task-2822 fix (c): archive a PASSING remote verify as a best-effort
+                # JSON pass-summary (scope+result+timing) so a remote GREEN is auditable
+                # side-by-side with the failure archives — closing the incident's
+                # un-auditable-laptop-scope gap.  Failure-only archiving above is unchanged.
+                if result.passed and archive_root is not None and task_id is not None:
+                    self._archive_pass_summary(
+                        archive_root, task_id, spec, result, merge_sha, duration_ms,
+                    )
 
                 return result
 
@@ -1115,6 +1169,59 @@ class RemoteRunner:
         except Exception as exc:
             _logging.getLogger(__name__).warning(
                 'RemoteRunner %r: best-effort stderr archival failed: %s', self.name, exc,
+            )
+
+    def _archive_pass_summary(
+        self,
+        archive_root: Path,
+        task_id: str,
+        spec: MergeVerifySpec,
+        result: VerifyResult,
+        merge_sha: str,
+        duration_ms: int,
+    ) -> None:
+        """Archive a PASSING remote merge-verify as a best-effort JSON pass-summary.
+
+        Filename: ``attempt-1.remote-<safe_name>.pass-summary-<utc_ts>.json``
+
+        Mirrors _archive_failure_stderr's best-effort shape (mkdir(parents,exist_ok),
+        microsecond-UTC timestamp via _STDERR_ARCHIVE_TS_FMT, _sanitize_runner_name,
+        swallow-with-WARNING) so a remote GREEN is auditable side-by-side with the
+        failure archives (task 2822 fix c), closing the incident's un-auditable
+        laptop-scope gap.
+
+        The payload captures SCOPE (task_files + the merge-gate profile — all read
+        from the SPEC, the single source of truth after fix a, NOT the host config),
+        RESULT (passed, category), and TIMING (duration_ms of the remote ssh verify),
+        plus runner name and merge_sha.
+
+        Best-effort: any exception is swallowed with a WARNING so the caller's
+        VerifyResult is always returned unchanged (PRD §A Invariant 5).
+        """
+        import logging as _logging
+        try:
+            target_dir = Path(archive_root) / task_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            utc_ts = datetime.now(UTC).strftime(_STDERR_ARCHIVE_TS_FMT)
+            safe = _sanitize_runner_name(self.name)
+            payload = {
+                'merge_sha': merge_sha,
+                'runner': self.name,
+                'passed': result.passed,
+                'category': result.category,
+                'duration_ms': duration_ms,
+                'scope': {
+                    'task_files': list(spec.task_files) if spec.task_files is not None else None,
+                    'merge_verify_workspace': spec.merge_verify_workspace,
+                    'merge_verify_breadth': spec.merge_verify_breadth,
+                },
+            }
+            (target_dir / f'attempt-1.remote-{safe}.pass-summary-{utc_ts}.json').write_text(
+                json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8',
+            )
+        except Exception as exc:
+            _logging.getLogger(__name__).warning(
+                'RemoteRunner %r: best-effort pass-summary archival failed: %s', self.name, exc,
             )
 
     def _archive_failure_streams(

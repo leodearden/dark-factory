@@ -208,6 +208,47 @@ class TestMergeVerifySpec:
             "SCCACHE_DIR": "/home/user/.cache/sccache",
         }
 
+    # --- Fix (a): the merge-gate PROFILE now rides the spec (task 2822) ------
+
+    def test_roundtrip_profile_fields(self):
+        """merge_verify_workspace + merge_verify_breadth survive to_dict->from_dict."""
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=("src/a/mod.py",),
+            verify_env={},
+            cold_timeout_secs=300.0,
+            is_merge_verify=True,
+            merge_verify_workspace=True,
+            merge_verify_breadth="full",
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored.merge_verify_workspace is True
+        assert restored.merge_verify_breadth == "full"
+        assert restored == spec
+
+    def test_profile_fields_default_narrow(self):
+        """A spec built without the profile fields defaults to the NARROW gate."""
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand(prefix="src/a"),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=None,
+            verify_env={},
+            cold_timeout_secs=60.0,
+        )
+        assert spec.merge_verify_workspace is False
+        assert spec.merge_verify_breadth == "scoped"
+
+    def test_from_dict_back_compat_missing_profile_keys(self):
+        """BACK-COMPAT: a legacy dict WITHOUT the profile keys deserialises to the
+        narrow defaults (mirrors the verify_env / is_merge_verify d.get idiom)."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("merge_verify_workspace", None)
+        legacy.pop("merge_verify_breadth", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.merge_verify_workspace is False
+        assert restored.merge_verify_breadth == "scoped"
+
 
 # ---------------------------------------------------------------------------
 # VerifyResult codec  (result_to_dict / result_from_dict)
@@ -716,6 +757,16 @@ def _make_spec():
     )
 
 
+def _narrow_config():
+    """A real OrchestratorConfig pinned to the NARROW merge-gate profile.
+
+    run_merge_verify_on_worktree does a real ``config.model_copy(update=...)``
+    (task 2822 fix a), so its callers need a real config, not a fields-only
+    ``pydantic_spec`` mock (which exposes no ``model_copy``).
+    """
+    return OrchestratorConfig(merge_verify_workspace=False, merge_verify_breadth='scoped')
+
+
 @pytest.mark.asyncio
 class TestLocalRunnerBundle:
     """LocalRunner.run_merge_verify: combined scoped+unscoped bundle."""
@@ -965,6 +1016,11 @@ class TestBuildMergeVerifySpec:
         config.effective_verify_env = verify_env or {}
         config.merge_verify_cold_command_timeout_secs = cold_timeout
         config.verify_cold_command_timeout_secs = None
+        # Fix (a), task 2822: build_merge_verify_spec now projects these two
+        # profile fields from config, so the double must carry real values
+        # (a bare MagicMock attr is not JSON-serialisable in spec_to_json).
+        config.merge_verify_workspace = False
+        config.merge_verify_breadth = 'scoped'
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -1193,8 +1249,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         merge_wt = MagicMock()
         spec = self._make_two_command_spec()
 
@@ -1218,8 +1273,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         merge_wt = MagicMock()
         spec = self._make_two_command_spec()
 
@@ -1253,8 +1307,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         spec = self._make_two_command_spec()
 
         await run_merge_verify_on_worktree(
@@ -1269,6 +1322,52 @@ class TestRunMergeVerifyOnWorktree:
         assert call_kwargs['is_merge_verify'] is True
         assert call_kwargs['force_workspace'] is False
         assert call_kwargs['role'] == 'merge'
+
+    async def test_spec_profile_overrides_host_config(self):
+        """Fix (a): the SPEC's merge-gate profile wins over the (remote) host
+        config, so the remote runs the SAME scope/profile as the merge gate
+        rather than the laptop config's narrow defaults."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False,
+                timed_out=False,
+                failing_subprojects=[],
+                timed_out_subprojects=[],
+            )
+        )
+        # The (remote) host config carries the NARROW laptop defaults ...
+        # (set explicitly: OrchestratorConfig is a BaseSettings whose bare
+        # defaults may be widened by a settings source, so pin them here).
+        config = OrchestratorConfig(merge_verify_workspace=False, merge_verify_breadth='scoped')
+        assert config.merge_verify_workspace is False
+        assert config.merge_verify_breadth == 'scoped'
+        # ... but the spec carries the FULL merge-gate profile.
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            merge_verify_workspace=True,
+            merge_verify_breadth='full',
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        # force_workspace is read from the (now spec-overridden) config -> True.
+        assert run_scoped.await_args[1]['force_workspace'] is True
+        # The config object threaded into run_scoped carries the spec's breadth,
+        # not the laptop's 'scoped'.
+        effective_config = run_scoped.await_args[0][1]
+        assert effective_config.merge_verify_breadth == 'full'
+        assert effective_config.merge_verify_workspace is True
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
@@ -1286,8 +1385,7 @@ class TestRunMergeVerifyOnWorktree:
                 detail='type err',
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         spec = self._make_two_command_spec()
 
         result = await run_merge_verify_on_worktree(
@@ -1319,8 +1417,7 @@ class TestRunMergeVerifyOnWorktree:
                 timed_out_subprojects=[],
             )
         )
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
 
         # Spec with type_check_command mirroring what build_merge_verify_spec produces
         # when the module has a real typecheck command
@@ -1384,8 +1481,7 @@ class TestRunMergeVerifyOnWorktreeDefaults:
         monkeypatch.setattr(verify_mod, 'run_scoped_verification', fake_scoped)
         monkeypatch.setattr(mq_mod, '_run_unscoped_typechecks', fake_unscoped)
 
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         spec = MergeVerifySpec(
             verify_commands=(VerifyCommand('mod', test_command='true'),),
             unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
@@ -4294,8 +4390,7 @@ class TestLocalRunnerArchiveRoot:
             captured.append(kwargs)
             return _make_pass_result()
 
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
 
         runner = LocalRunner(
@@ -4360,8 +4455,7 @@ class TestLocalRunnerArchiveRoot:
             captured.append(kwargs)
             return _make_pass_result()
 
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.merge_verify_workspace = False
+        config = _narrow_config()
         run_unscoped = AsyncMock(return_value=MagicMock(broken=False, timed_out=False))
 
         # Construct without archive_root (uses default)
@@ -4552,8 +4646,10 @@ class TestRemoteRunnerStderrArchival:
         assert stderr_files[0].read_text(encoding='utf-8') == 'REMOTE STDERR DETAIL'
 
     # step-3 negative cases
-    async def test_passing_result_writes_no_file(self, tmp_path):
-        """Passing remote verify: ssh_stderr noise is NOT archived (failure-only contract)."""
+    async def test_passing_result_writes_no_stderr_log(self, tmp_path):
+        """Passing remote verify: ssh_stderr noise is NOT archived as a .stderr.log
+        (failure-only contract).  Task 2822 fix (c) now writes a pass-summary on the
+        pass path, but the failure-specific .stderr.log must never appear."""
         pass_result = VerifyResult(
             passed=True, test_output='', lint_output='', type_output='', summary='ok',
         )
@@ -4578,9 +4674,17 @@ class TestRemoteRunnerStderrArchival:
 
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1920', archive_root=tmp_path)
 
-        # No file should have been written
         task_dir = tmp_path / '1920'
-        assert not task_dir.exists(), f'Expected no archive dir, found {list(task_dir.iterdir()) if task_dir.exists() else "nothing"}'
+        entries = sorted(p.name for p in task_dir.iterdir()) if task_dir.exists() else []
+        # The failure-specific .stderr.log must NOT be written on a pass...
+        assert not any(n.endswith('.stderr.log') for n in entries), (
+            f'Expected no .stderr.log on pass, got {entries}'
+        )
+        # ...only the task 2822 fix (c) pass-summary appears (exactly one artifact).
+        assert entries == [n for n in entries if '.pass-summary-' in n], (
+            f'Expected only pass-summary artifacts on pass, got {entries}'
+        )
+        assert len(entries) == 1, f'Expected exactly 1 pass-summary, got {entries}'
 
     async def test_whitespace_only_stderr_writes_no_file(self, tmp_path):
         """Failed verify with whitespace-only ssh_stderr → NO .stderr.log written (strip guard).
@@ -4754,8 +4858,10 @@ class TestRemoteRunnerStreamArchival:
         assert 'commands' in summary, 'Summary missing commands'
 
     # (c) passing result → no archive dir
-    async def test_passing_result_writes_no_files(self, tmp_path):
-        """Passing remote verify (passed=True) → no archive dir written."""
+    async def test_passing_result_writes_no_stream_files(self, tmp_path):
+        """Passing remote verify (passed=True) → no failure stream logs / summary.
+        Task 2822 fix (c) writes a pass-summary on the pass path, but the
+        failure-specific stream .log files and summary-*.json must never appear."""
         pass_result = VerifyResult(
             passed=True, test_output='all tests pass', lint_output='clean', type_output='no errors',
             summary='ok', category='',
@@ -4779,7 +4885,16 @@ class TestRemoteRunnerStreamArchival:
         await runner.run_merge_verify('abc123', _make_spec(), task_id='1921', archive_root=tmp_path)
 
         task_dir = tmp_path / '1921'
-        assert not task_dir.exists(), f'Expected no archive dir for passing result, got {task_dir}'
+        entries = sorted(p.name for p in task_dir.iterdir()) if task_dir.exists() else []
+        # No failure stream .log files and no failure summary-*.json on a pass...
+        assert not any(n.endswith('.log') for n in entries), (
+            f'Expected no failure stream .log on pass, got {entries}'
+        )
+        # ...only the task 2822 fix (c) pass-summary appears (exactly one artifact).
+        assert entries == [n for n in entries if '.pass-summary-' in n], (
+            f'Expected only pass-summary artifacts on pass, got {entries}'
+        )
+        assert len(entries) == 1, f'Expected exactly 1 pass-summary, got {entries}'
 
     # (d) failure with all-empty streams → no file and no summary
     async def test_all_empty_streams_failure_writes_nothing(self, tmp_path):
@@ -4934,6 +5049,133 @@ class TestRemoteRunnerStreamArchival:
         )
 
         assert result == fail_result
+
+
+# ---------------------------------------------------------------------------
+# task-2822 fix (c): TestRemoteRunnerPassSummaryArchival
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerPassSummaryArchival:
+    """RemoteRunner archives a PASSING remote merge-verify as a best-effort JSON
+    pass-summary (task 2822 fix c), closing the incident's un-auditable-laptop-scope
+    gap.  Filename mirrors the failure archivers:
+        attempt-1.remote-<safe_name>.pass-summary-<utc_ts>.json
+    capturing SCOPE (task_files + merge_verify_workspace + merge_verify_breadth from
+    the SPEC), RESULT (passed, category), and TIMING (duration_ms), plus runner name
+    and merge_sha.  A FAILING verify writes NO pass-summary (failure-only archives
+    unchanged); a missing archive_root/task_id is a best-effort no-op.
+    """
+
+    def _make_runner(self, result, *, name='leo-laptop'):
+        """RemoteRunner whose fake run returns git→(0,'','') and ssh→(0,json,'')."""
+        _it = iter([
+            (0, '', ''),                       # git push (load-bearing)
+            (0, result_to_json(result), ''),   # ssh verify
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            # ref cleanup delete push (best-effort, inside contextlib.suppress)
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        return RemoteRunner(
+            name=name,
+            ssh_host=f'{name}.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'test-id',
+        )
+
+    def _spec_with_scope(self):
+        """Spec carrying task_files + the FULL merge-gate profile (fix a fields)."""
+        return MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/mod.py', 'src/b/mod.py'),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            merge_verify_workspace=True,
+            merge_verify_breadth='full',
+        )
+
+    async def test_passing_remote_verify_writes_pass_summary(self, tmp_path):
+        """A passing remote verify writes one pass-summary JSON with scope+result+timing."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='',
+            summary='ok', category='merge_ok',
+        )
+        runner = self._make_runner(pass_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', self._spec_with_scope(), task_id='2822', archive_root=tmp_path,
+        )
+
+        # VerifyResult is returned UNCHANGED (PRD §A Invariant 5)
+        assert result == pass_result
+
+        task_dir = tmp_path / '2822'
+        assert task_dir.is_dir(), f'Expected {task_dir} to be a directory'
+
+        summaries = list(task_dir.glob('attempt-1.remote-leo-laptop.pass-summary-*.json'))
+        assert len(summaries) == 1, f'Expected 1 pass-summary, got {[f.name for f in summaries]}'
+
+        data = json.loads(summaries[0].read_text(encoding='utf-8'))
+        # identity
+        assert data['merge_sha'] == 'abc123'
+        assert data['runner'] == 'leo-laptop'
+        # RESULT
+        assert data['passed'] is True
+        assert data['category'] == 'merge_ok'
+        # TIMING
+        assert isinstance(data['duration_ms'], (int, float))
+        assert data['duration_ms'] >= 0
+        # SCOPE — sourced from the SPEC (the merge-gate profile), not the host config
+        scope = data['scope']
+        assert scope['task_files'] == ['src/a/mod.py', 'src/b/mod.py']
+        assert scope['merge_verify_workspace'] is True
+        assert scope['merge_verify_breadth'] == 'full'
+
+    async def test_failing_remote_verify_writes_no_pass_summary(self, tmp_path):
+        """A FAILING remote verify writes NO pass-summary (only the failure archives)."""
+        fail_result = VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='test fail', category='test_failure',
+        )
+        runner = self._make_runner(fail_result)
+
+        result = await runner.run_merge_verify(
+            'abc123', self._spec_with_scope(), task_id='2822', archive_root=tmp_path,
+        )
+        assert result == fail_result
+
+        task_dir = tmp_path / '2822'
+        pass_files = list(task_dir.glob('*.pass-summary-*.json')) if task_dir.exists() else []
+        assert pass_files == [], f'Expected no pass-summary on failure, got {pass_files}'
+
+    async def test_no_pass_summary_when_archive_root_none(self, tmp_path):
+        """archive_root=None → best-effort no-op; VerifyResult returned unchanged, no raise."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='', summary='ok',
+        )
+        runner = self._make_runner(pass_result)
+
+        result = await runner.run_merge_verify('abc123', self._spec_with_scope(), task_id='2822')
+        assert result == pass_result
+
+    async def test_no_pass_summary_when_task_id_none(self, tmp_path):
+        """task_id=None → best-effort no-op; no files written, no raise."""
+        pass_result = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='', summary='ok',
+        )
+        runner = self._make_runner(pass_result)
+
+        result = await runner.run_merge_verify('abc123', self._spec_with_scope(), archive_root=tmp_path)
+        assert result == pass_result
+        assert list(tmp_path.rglob('*.pass-summary-*.json')) == []
 
 
 # ---------------------------------------------------------------------------

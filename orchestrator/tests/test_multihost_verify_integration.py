@@ -1469,3 +1469,513 @@ class TestUnreachableHostCapstone:
         )
         recovered = es.events_of(EventType.verify_host_recovered)
         assert recovered, 'reprobe loop must have emitted verify_host_recovered'
+
+
+# ===========================================================================
+# Task 2822 fix (b): per-land cross-check of a remote GREEN in
+# _run_post_merge_verify.  A single remote host's green is re-verified by the
+# LOCAL trust-anchor before the land.  AGREE -> verdict_parity_ok + proceed;
+# DIVERGE (local FAIL) -> fail-closed (adopt the local FAIL verdict so the land
+# is withheld, quarantine the remote, file a dedup'd blocking escalation);
+# local RunnerUnavailable -> fail-safe (verify_cross_check_inconclusive, TRUST
+# the remote green — never block a land on a local infra hiccup).  Gated by
+# config.verify_cross_check_remote_green (default True, provably inert on main
+# today because runner is always None until Lever C is enabled).
+#
+# step-7 (RED) / step-8 (GREEN).
+# ===========================================================================
+
+
+def _xcheck_config(*, cross_check: bool = True) -> OrchestratorConfig:
+    """OrchestratorConfig with the fix-(b) knob explicit + a project_root the
+    cross-check LocalRunner's archive_root is derived from."""
+    return OrchestratorConfig(
+        git=GitConfig(main_branch='main'),
+        project_root=Path('/tmp/xcheck-fake'),
+        verify_cross_check_remote_green=cross_check,
+    )
+
+
+def _xcheck_req(config: OrchestratorConfig, *, task_files=('src/foo.py',), worktree=None):
+    """A minimal MergeRequest for _run_post_merge_verify cross-check tests."""
+    from orchestrator.merge_queue import MergeRequest
+
+    loop = asyncio.get_running_loop()
+    return MergeRequest(
+        task_id='task-2822',
+        branch='task/2822',
+        worktree=worktree or Path('/repo/task-2822'),
+        pre_rebased=False,
+        task_files=list(task_files) if task_files is not None else None,
+        module_configs=[],
+        config=config,
+        result=loop.create_future(),
+    )
+
+
+def _xcheck_git_ops() -> MagicMock:
+    """GitOps double with plenty of disk + async cleanup (mirrors the wiring test)."""
+    mock = MagicMock()
+    mock.get_main_sha = AsyncMock(return_value='main-sha')
+    mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
+    mock.cleanup_merge_worktree = AsyncMock()
+    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    return mock
+
+
+def _remote_stub(result: VerifyResult, *, name: str = 'laptop') -> MagicMock:
+    """A single-host remote runner double (is_local=False) for the runner= param."""
+    stub = MagicMock()
+    stub.name = name
+    stub.is_local = False
+    stub.run_merge_verify = AsyncMock(return_value=result)
+    return stub
+
+
+def _local_runner_patch(*, result=None, raises=None, calls: list | None = None):
+    """Factory to patch orchestrator.merge_queue.LocalRunner.
+
+    Every construction is recorded in *calls*; the instance's run_merge_verify
+    returns *result* (or raises *raises*).  In the REMOTE dispatch path the
+    local-path pool never builds a LocalRunner, so the ONLY construction is the
+    fix-(b) cross-check trust-anchor — making len(calls) an exact cross-check
+    ran/skipped signal.
+    """
+    def _factory(*args, **kwargs):
+        if calls is not None:
+            calls.append((args, kwargs))
+        stub = MagicMock()
+        stub.name = 'local'
+        stub.is_local = True
+        if raises is not None:
+            stub.run_merge_verify = AsyncMock(side_effect=raises)
+        else:
+            stub.run_merge_verify = AsyncMock(return_value=result)
+        return stub
+
+    return _factory
+
+
+@pytest.mark.asyncio
+class TestPerLandCrossCheck:
+    """_run_post_merge_verify cross-checks a remote GREEN against the local
+    trust-anchor before the land (task 2822 fix b).  RED until step-8."""
+
+    async def test_diverge_local_fail_withholds_land_quarantines_and_escalates(self, tmp_path):
+        """knob ON, remote PASS + local FAIL -> land withheld + quarantine + escalation + event."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        local_fail = _make_result(False)
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=local_fail, calls=lr_calls)), \
+             patch('orchestrator.merge_queue._classify_main_health_red',
+                   new=AsyncMock(return_value=None)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha01',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        # (1) land withheld — the local (failing) verdict is adopted, merge_wt cleaned up
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        git_ops.cleanup_merge_worktree.assert_awaited()
+        assert len(lr_calls) == 1, 'cross-check must build exactly one local trust-anchor'
+
+        # (2) runner quarantined in the caller-owned set (fix (b)'s first use of `quarantine`)
+        assert 'laptop' in quarantine
+
+        # (3) exactly one dedup'd blocking escalation, category verify_cross_check_mismatch
+        assert len(eq.submitted) == 1
+        esc = eq.submitted[0]
+        assert esc.category == 'verify_cross_check_mismatch'
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.agent_role == 'orchestrator-cross-check'
+        assert 'mergesha01' in (esc.summary + esc.detail)
+        assert 'laptop' in esc.detail
+
+        # (4) distinct mismatch telemetry emitted
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+
+    async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
+        """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(True), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha02',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None  # land proceeds
+        assert quarantine == set()  # no quarantine on agree
+        assert eq.submitted == []  # no escalation on agree
+        assert len(lr_calls) == 1  # cross-check ran
+        assert es.events_of(EventType.verdict_parity_ok)
+
+    async def test_knob_off_never_constructs_local_runner_byte_identical(self, tmp_path):
+        """knob OFF -> the local cross-check runner is NEVER constructed (byte-identical)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=False)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha03',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None  # remote green stands, land proceeds
+        assert lr_calls == []  # local trust-anchor NEVER constructed
+        assert quarantine == set()
+        assert eq.submitted == []
+        assert not es.events_of(EventType.verify_cross_check_mismatch)
+        assert not es.events_of(EventType.verdict_parity_ok)
+
+    async def test_local_runner_unavailable_is_inconclusive_and_trusts_remote(self, tmp_path):
+        """knob ON, local cross-check raises RunnerUnavailable -> inconclusive + trust remote green."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(raises=RunnerUnavailable('laptop closed'), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha04',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None  # fail-safe: trust the remote green
+        assert quarantine == set()  # no quarantine on a local infra hiccup
+        assert eq.submitted == []  # no escalation
+        assert es.events_of(EventType.verify_cross_check_inconclusive)
+
+    async def test_trivial_remote_pass_skips_cross_check(self, tmp_path):
+        """knob ON, remote returns a TRIVIAL pass -> cross-check SKIPPED (no suite ran to compare)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        trivial = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='trivial pass', trivial=True,
+        )
+        remote = _remote_stub(trivial, name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha05',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        # cold-baseline trivial-pass gate is fail-open -> land proceeds, and the
+        # cross-check is skipped for a trivial pass (nothing was verified to compare).
+        assert outcome is None
+        assert lr_calls == [], 'a trivial remote pass must not trigger a local cross-check'
+        assert not es.events_of(EventType.verify_cross_check_mismatch)
+        assert not es.events_of(EventType.verdict_parity_ok)
+
+    async def test_local_dispatch_path_skips_cross_check_entirely(self, tmp_path):
+        """runner is None (local dispatch): the cross-check branch never runs."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        # Real local-path pool with a patched scoped verify returning PASS
+        # (mirrors the existing local-only wiring tests) — no cross-check side effects.
+        with patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_result(True))):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha06',
+                runner=None,  # LOCAL dispatch
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None
+        assert quarantine == set()
+        assert eq.submitted == []
+        assert not es.events_of(EventType.verify_cross_check_mismatch)
+        assert not es.events_of(EventType.verify_cross_check_inconclusive)
+        assert not es.events_of(EventType.verdict_parity_ok)
+
+
+# ===========================================================================
+# Task 2822 step-9: end-to-end capstone tying fixes a + b + c through the
+# PRODUCTION two-host path.
+#   (a) the merge-gate PROFILE ships in the spec and overrides the remote host's
+#       NARROW config at the host-entry (RemoteRunner transport -> the
+#       run_merge_verify_on_worktree host-entry: the laptop's config no longer
+#       narrows the merge-deciding verify).
+#   (c) a passing remote verify is archived with SCOPE + RESULT + TIMING.
+#   (b) a remote FALSE-GREEN (remote PASS while the LOCAL trust-anchor FAILs)
+#       does NOT land — driven through the real SpeculativeMergeWorker
+#       ._run_inflight_verify -> _run_post_merge_verify caller, proving the
+#       event_store / escalation_queue / by-reference quarantine set all reach
+#       the cross-check.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestTwoHostFalseGreenCapstone:
+    """Production capstone for the two-host merge-verify false-green fix (task 2822)."""
+
+    async def test_a_profile_ships_full_and_overrides_narrow_remote_config_plus_c_archive(
+        self, tmp_path,
+    ):
+        """(a) spec carries the FULL profile over the transport and wins over the
+        remote's NARROW config at the host-entry; (c) the passing remote verify is
+        archived with scope+result+timing."""
+        import json
+
+        from orchestrator.verify_runner import (
+            RemoteRunner,
+            build_merge_verify_spec,
+            result_to_json,
+            run_merge_verify_on_worktree,
+        )
+
+        # Dispatching host runs the FULL merge-gate profile.
+        full_config = OrchestratorConfig(
+            git=GitConfig(main_branch='main'),
+            project_root=tmp_path,
+            merge_verify_workspace=True,
+            merge_verify_breadth='full',
+        )
+        spec = build_merge_verify_spec(full_config, [], ('src/foo.py',))
+        # fix (a), spec half: the merge-gate profile is shipped in the spec.
+        assert spec.merge_verify_workspace is True
+        assert spec.merge_verify_breadth == 'full'
+
+        # --- transport: a real RemoteRunner ships the spec over a fake ssh ---
+        captured_argvs: list[list[str]] = []
+        pass_result = VerifyResult(
+            passed=True, test_output='green', lint_output='', type_output='',
+            summary='ok', category='merge_ok',
+        )
+        _it = iter([
+            (0, '', ''),                              # git push
+            (0, result_to_json(pass_result), ''),     # ssh verify -> PASS
+        ])
+
+        async def fake_run(argv, *, cwd=None):
+            captured_argvs.append(list(argv))
+            if argv[0] == 'git' and '--delete' in argv:
+                return (0, '', '')
+            return next(_it)
+
+        runner = RemoteRunner(
+            name='leo-laptop', ssh_host='leo-laptop.local', git_remote='origin',
+            cwd='/repo', run=fake_run, id_factory=lambda: 'cap-id',
+        )
+        result = await runner.run_merge_verify(
+            'mergesha_cap', spec, task_id='2822', archive_root=tmp_path,
+        )
+        assert result == pass_result
+
+        # fix (a), transport half: the shipped ssh payload carries the full profile.
+        ssh_argvs = [a for a in captured_argvs if a and a[0] == 'ssh']
+        assert ssh_argvs, f'no ssh dispatch captured; argvs={captured_argvs}'
+        joined = ' '.join(' '.join(a) for a in ssh_argvs)
+        assert 'merge_verify_workspace' in joined
+        assert 'merge_verify_breadth' in joined
+        assert 'full' in joined
+
+        # fix (c): the passing remote verify is archived with scope+result+timing.
+        summaries = list((tmp_path / '2822').glob('attempt-1.remote-leo-laptop.pass-summary-*.json'))
+        assert len(summaries) == 1, f'expected 1 pass-summary, got {[f.name for f in summaries]}'
+        data = json.loads(summaries[0].read_text(encoding='utf-8'))
+        assert data['merge_sha'] == 'mergesha_cap'
+        assert data['runner'] == 'leo-laptop'
+        assert data['passed'] is True
+        assert data['scope']['merge_verify_workspace'] is True
+        assert data['scope']['merge_verify_breadth'] == 'full'
+        assert data['scope']['task_files'] == ['src/foo.py']
+        assert isinstance(data['duration_ms'], (int, float)) and data['duration_ms'] >= 0
+
+        # fix (a), host-entry half: the SPEC's full profile overrides the remote's
+        # NARROW config so the remote runs force_workspace=True (the laptop config
+        # can no longer narrow the merge-deciding verify).
+        narrow_remote_config = OrchestratorConfig(
+            merge_verify_workspace=False, merge_verify_breadth='scoped', project_root=tmp_path,
+        )
+        scoped_calls: list[dict] = []
+
+        async def capture_scoped(wt, cfg, module_configs, **kwargs):
+            scoped_calls.append({'config': cfg, 'kwargs': kwargs})
+            return VerifyResult(
+                passed=True, test_output='', lint_output='', type_output='', summary='ok',
+            )
+
+        async def noop_unscoped(*a, **k):
+            return MagicMock(broken=False, timed_out=False, failing_subprojects=[],
+                             timed_out_subprojects=[])
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), narrow_remote_config, spec,
+            run_scoped=capture_scoped, run_unscoped=noop_unscoped,
+        )
+        assert scoped_calls, 'run_scoped was never invoked by the host-entry'
+        assert scoped_calls[0]['kwargs'].get('force_workspace') is True, (
+            'the spec full profile must override the narrow remote config -> force_workspace=True'
+        )
+        assert scoped_calls[0]['config'].merge_verify_breadth == 'full', (
+            'the effective remote config breadth must be overridden to full by the spec'
+        )
+
+    async def test_b_false_green_withheld_and_escalated_via_run_inflight_verify(self, tmp_path):
+        """(b) a remote FALSE-GREEN driven through the real _run_inflight_verify
+        caller does NOT land: the outcome is withheld/blocked, the remote is
+        quarantined in the worker's by-reference set, and a dedup'd
+        verify_cross_check_mismatch escalation is filed."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import ItemLifecycleState, RealMergeItem
+        from orchestrator.verify_runner import HostLease
+
+        worker = _make_minimal_worker()
+        worker._git_ops = _xcheck_git_ops()
+        eq = _make_minimal_escalation_queue()
+        worker._escalation_queue = eq
+        es = _RecordingEventStore()
+        worker._event_store = es  # type: ignore[assignment]
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        item = RealMergeItem(
+            request=req,
+            merge_result=MagicMock(merge_commit='mergesha_fg'),
+            merge_wt=tmp_path,
+            base_sha='base-sha',
+            speculative=False,
+        )
+        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+        # REMOTE lease whose runner reports a FALSE GREEN (PASS).
+        remote = _remote_stub(_make_result(True), name='leo-laptop')
+        lease = HostLease(name='leo-laptop', runner=remote, is_local=False)
+
+        # The LOCAL trust-anchor cross-check FAILs -> divergence -> fail-closed.
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False))), \
+             patch('orchestrator.merge_queue._resolve_dispatch_time_merge_base',
+                   new=AsyncMock(return_value=None)), \
+             patch('orchestrator.merge_queue._spawn_main_health_probe', return_value=False):
+            result = await worker._run_inflight_verify(item, lease)
+
+        # (b1) the false-green does NOT land — a blocked outcome is returned.
+        assert result.outcome is not None, (
+            'a remote false-green must not pass through _run_inflight_verify as a land'
+        )
+        assert result.outcome.status == 'blocked'
+
+        # (b2) the diverging remote is quarantined in the worker's by-reference set
+        # (the same set shared with the HostAllocator — task 2822 fix b's first use).
+        assert 'leo-laptop' in worker._runner_quarantine
+
+        # (b3) a dedup'd blocking verify_cross_check_mismatch escalation was filed.
+        mismatch = [e for e in eq.submitted if getattr(e, 'category', None) == 'verify_cross_check_mismatch']
+        assert len(mismatch) == 1, f'expected 1 cross-check escalation, got {eq.submitted}'
+        assert mismatch[0].agent_role == 'orchestrator-cross-check'
+        assert mismatch[0].level == 1
+        assert 'leo-laptop' in mismatch[0].detail
+
+        # (b4) distinct mismatch telemetry emitted through the real caller.
+        assert es.events_of(EventType.verify_cross_check_mismatch)
