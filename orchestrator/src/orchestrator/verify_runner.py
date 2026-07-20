@@ -1437,15 +1437,18 @@ def retry_scope_event_fields(verify_env: Mapping[str, str]) -> dict[str, Any]:
         """Line-count a nextest filter file, or None on any read failure.
 
         The filter files reliably exist at emit time (verify just ran against
-        them), but the read is GUARDED so an absent key or a missing/unreadable
-        path degrades to None (INV-2 structured-facts-at-failure, no silent
-        crash) rather than aborting the whole merge_verify event.
+        them), but the read is GUARDED so an absent key, a missing/unreadable
+        path, or a non-UTF-8/undecodable file degrades to None (INV-2
+        structured-facts-at-failure, no silent crash) rather than aborting the
+        whole merge_verify event.  The except spans (OSError, ValueError)
+        because Path.read_text() decodes as UTF-8 and raises UnicodeDecodeError
+        — a ValueError subclass, NOT an OSError — on non-UTF-8 bytes.
         """
         if not path_str:
             return None
         try:
             return len(Path(path_str).read_text().splitlines())
-        except OSError:
+        except (OSError, ValueError):
             return None
 
     nextest_debug = _nextest_subset_size(verify_env.get('REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG'))

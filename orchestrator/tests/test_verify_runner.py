@@ -1150,6 +1150,30 @@ class TestRetryScopeEventFields:
         assert sizes['run_all'] == 2             # comma-values still compute
         assert sizes['gui'] == 1
 
+    def test_retry_scope_event_fields_nextest_non_utf8_degrades_honestly(self, tmp_path):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # A filter file with non-UTF-8 bytes makes Path.read_text() raise
+        # UnicodeDecodeError — a ValueError subclass, NOT an OSError.  Per INV-2
+        # the read must still degrade to None rather than propagate and abort the
+        # whole merge_verify event emission (amend: reviewer robustness note).
+        bad_file = tmp_path / 'nextest-retry-nonutf8.filter'
+        bad_file.write_bytes(b'\x80\x81\x82')  # invalid UTF-8 (lone continuation bytes)
+        verify_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(bad_file),
+            # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
+        }
+        result = retry_scope_event_fields(verify_env)
+        assert result['retry_scope'] == 'failed_only'
+        sizes = result['retry_subset_sizes']
+        assert sizes['nextest_debug'] is None   # undecodable file → None (no crash)
+        assert sizes['nextest_release'] is None  # absent key → None
+        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['gui'] == 1
+
 
 # ---------------------------------------------------------------------------
 # Step-7: build_merge_verify_spec
