@@ -26,12 +26,17 @@ from orchestrator.config import (
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import Scheduler, TaskAssignment
-from orchestrator.workflow import WorkflowOutcome, _meta_root_for_worktree, build_workflow
+from orchestrator.workflow import (
+    WorkflowOutcome,
+    _inject_plan_tools_mcp,
+    _meta_root_for_worktree,
+    build_workflow,
+)
 
 from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
-from .snapshots import create_eval_worktree
+from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +230,15 @@ def build_eval_orch_config(
         'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
     }
+    # BUG 2a: pin the eval verify interpreter to the target's own
+    # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
+    # pyright` runs under the worktree's own 3.13 venv. verify_env is overlaid
+    # LAST in verify._target_subprocess_env (wins) and survives
+    # effective_verify_env, so the pin reaches every verify subprocess. Absent a
+    # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
+    pin = read_python_pin(Path(task.get('project_root', str(base.project_root))))
+    if pin is not None:
+        update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
     # D8: an explicit recording endpoint layers over the profile's null
     # sentinel — override only fused_memory.url (preserving project_id and
     # every other fused-memory leaf from the profiled config). Left None, the
@@ -478,7 +492,11 @@ async def run_architect_eval(
         )
 
         # 3. Init artifacts so the architect has a place to write plan.json.
-        artifacts = TaskArtifacts(worktree)
+        #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
+        #    injected plan-tools server writes to (BUG 1: writer==reader), so
+        #    read_plan() below picks up what the architect's plan-tools calls
+        #    persisted, exactly like real dispatch.
+        artifacts = TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
         task_def = task.get('task_definition', {})
         artifacts.init(
             task_id,
@@ -491,6 +509,11 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = BriefingAssembler(orch_config)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
+        # Wire plan-tools MCP via the SAME production seam real dispatch uses
+        # (workflow._invoke): relocated meta_root + direct-interpreter launch.
+        # strict_mcp_config stays default False so the ambient .mcp.json
+        # escalation/fused-memory servers still merge, mirroring _invoke.
+        mcp_config = _inject_plan_tools_mcp(None, worktree)
         result = await asyncio.wait_for(
             invoke_agent(
                 prompt=prompt,
@@ -504,6 +527,7 @@ async def run_architect_eval(
                 effort=config.effort or 'high',
                 backend=config.backend,
                 env_overrides=config.env_overrides or None,
+                mcp_config=mcp_config,
             ),
             timeout=timeout_minutes * 60,
         )

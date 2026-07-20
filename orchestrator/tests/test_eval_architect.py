@@ -505,6 +505,41 @@ class TestRunArchitectEval:
         assert isinstance(result.metrics['plan_quality'], float)
         assert result.metrics['role_under_test'] == 'architect'
 
+    async def test_wires_plan_tools_mcp_into_architect_invoke(self):
+        # BUG 1: the eval architect must be wired with plan-tools MCP exactly
+        # like real dispatch — otherwise read_plan() returns {} → plan_steps=0 →
+        # plan_quality collapses to the structural floor (esc-df_task_12-3).
+        # run_architect_eval must pass a non-None mcp_config to invoke_agent whose
+        # 'plan-tools' entry launches the direct-interpreter no-uv hot path against
+        # the RELOCATED .task-meta/<name>/ root (matching production
+        # _inject_plan_tools_mcp), so the plan-tools server writes plan.json where
+        # the TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
+        # readback reads it.
+        import sys
+
+        from orchestrator.workflow import _meta_root_for_worktree
+
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        # Computed OUTSIDE the harness ExitStack (above) so the TaskArtifacts
+        # patch is inactive and the REAL relocated path is produced. This uses
+        # workflow's own unpatched TaskArtifacts binding — the harness patches
+        # only orchestrator.artifacts.TaskArtifacts.
+        expected_meta_root = _meta_root_for_worktree(Path('/fake/wt'))
+        assert str(expected_meta_root) == '/fake/.task-meta/wt'
+
+        mcp_config = mocks['invoke'].call_args.kwargs.get('mcp_config')
+        assert mcp_config is not None, 'run_architect_eval passed no mcp_config'
+        plan_tools = mcp_config['mcpServers']['plan-tools']
+        assert plan_tools['command'] == sys.executable
+        assert plan_tools['args'] == [
+            '-m', 'orchestrator.mcp.plan_tools',
+            '--worktree', str(Path('/fake/wt')),
+            '--meta-root', str(expected_meta_root),
+        ]
+
 
 # ---------------------------------------------------------------------------
 # plan_quality report column — additive interim surface (step-11/12)
