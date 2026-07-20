@@ -217,6 +217,27 @@ async def _contaminating_reset(lane_dir, full_branch, target_commit) -> None:
     )
 
 
+async def _contaminating_seed(lane_dir, mode, *_args, **_kwargs) -> int:
+    """Stand-in for :meth:`GitOps._seed_warm_lane` on the CREATE_ONCE_FRESH
+    route (the OTHER fresh-reseed route the gate guards). The real seed
+    CoW-copies target/ and returns 0 WITHOUT committing, so a genuinely-clean
+    ``git worktree add -b <full_branch> <lane> <start_ref>`` leaves full_branch
+    AT base. This stub instead leaves the freshly-created full_branch 1 commit
+    BEYOND base (the reify incident shape) while still "succeeding" (rc 0):
+    the create-once path already checked the lane out on full_branch via
+    ``add -b``, so a commit here advances that branch. The seed-rc==0 return
+    lets the acquire proceed into the shared-tail reseed gate exactly as a
+    real-but-contaminated fresh checkout would."""
+    lane = Path(lane_dir)
+    (lane / 'prior_occupant.txt').write_text('retained prior task work\n')
+    await _run(['git', 'add', '-A'], cwd=lane)
+    await _run(
+        ['git', 'commit', '-m', 'retained prior-occupant commit (contamination)'],
+        cwd=lane,
+    )
+    return 0
+
+
 @pytest.mark.asyncio
 class TestAcquireReseedContaminationGate:
     """The fresh-reseed acquire routes (RECYCLE / CREATE_ONCE_FRESH) must
@@ -264,6 +285,63 @@ class TestAcquireReseedContaminationGate:
         # record reflecting the PRIOR 'OLD' assignment; the gate never called
         # _note_assigned_via_route for 'NEW', so the record's task_id must
         # never be the contaminating task.
+        assert git_ops.warm_lane_pool.state(lane) == PoolLaneState.FREE, (
+            'contaminated lane must be released FREE, not left ASSIGNED'
+        )
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is None or record.task_id != 'NEW', (
+            f'lane must never be ASSIGNED to the contaminating task NEW; got {record!r}'
+        )
+
+        # (c) A WARNING naming the reseed contamination (data-integrity signal).
+        low = caplog.text.lower()
+        assert 'reseed' in low and 'contaminat' in low, (
+            f'expected a reseed-contamination WARNING; caplog:\n{caplog.text}'
+        )
+
+    async def test_contaminated_create_once_fresh_faults_and_releases_lane(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Route parity for the OTHER fresh-reseed route the gate guards.
+
+        The gate condition is ``route in (RECYCLE, CREATE_ONCE_FRESH)``; the
+        recycle case above covers reset-in-place of a released lane, this one
+        covers the INITIAL create-once acquire (``git worktree add -b``, no
+        prior occupant). A contaminated fresh checkout — full_branch left 1
+        commit over base — must fault to the SAME
+        ``WarmLaneUnavailable.RESEED_CONTAMINATED`` sentinel with the lane
+        released FREE, so a future narrowing of that tuple to only RECYCLE
+        would be caught here (mirrors
+        test_contaminated_recycle_faults_and_releases_lane)."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+        start_ref = await _get_head(git_repo)
+
+        # First acquire on a brand-new pool: the sole lane does not exist on
+        # disk yet, so acquire routes through create-once (CREATE_ONCE_FRESH) —
+        # `git worktree add -b task/NEW <lane> start_ref` then seed. Patch the
+        # seed to leave the just-created branch 1 commit over base (the incident
+        # shape) instead of a clean CoW seed at base.
+        seed_mock = AsyncMock(side_effect=_contaminating_seed)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch.object(git_ops, '_seed_warm_lane', seed_mock):
+            result = await git_ops.acquire_warm_lane('NEW', start_ref)
+
+        # The patched seed ran → the create-once route was genuinely taken (not
+        # a reuse/reattach path), so this exercises CREATE_ONCE_FRESH. Recover
+        # the lane path from the seed call (its first positional arg).
+        assert seed_mock.await_args is not None, 'seed (create-once route) never ran'
+        lane = Path(seed_mock.await_args.args[0])
+
+        # (a) The sentinel, NOT a dispatchable WorktreeInfo.
+        assert result is WarmLaneUnavailable.RESEED_CONTAMINATED, (
+            f'Expected RESEED_CONTAMINATED sentinel; got {result!r}'
+        )
+        assert not isinstance(result, WorktreeInfo)
+
+        # (b) The lane is released back to FREE — never handed out ASSIGNED for
+        # the contaminating task, so nothing is dispatched onto the stale tree.
         assert git_ops.warm_lane_pool.state(lane) == PoolLaneState.FREE, (
             'contaminated lane must be released FREE, not left ASSIGNED'
         )
