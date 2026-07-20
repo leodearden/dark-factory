@@ -733,6 +733,9 @@ class WarmLaneRequeue(Exception):
         WarmLaneSoftPressure  — θ proactive soft-floor throttle (task 2443,
             §9.5): pure backpressure/defer for a FRESH allocation, distinct
             from WarmLaneDiskPressure's exit-75 hard floor.
+        WarmLaneReseedContaminated — fresh reseed failed verification: the
+            lane still carries a prior occupant's commits (task 2854,
+            data-integrity); requeue to re-acquire a DIFFERENT lane.
     """
 
 
@@ -798,6 +801,31 @@ class WarmLanePoolHardDown(WarmLaneRequeue):
     base vanishes.  Task should be requeued with a
     ``warm_lane_pool_hard_down`` block-reason annotation.  Run
     reify/scripts/ensure-warm-base.sh to rebuild the base.
+    """
+
+
+class WarmLaneReseedContaminated(WarmLaneRequeue):
+    """A fresh-reseed acquire (RECYCLE / CREATE_ONCE_FRESH) failed its
+    post-reseed verification — the lane's branch is not at the base, still
+    carrying a PRIOR occupant's retained commits (task 2854).
+
+    A data-integrity / reseed-consistency FAULT, not transient backpressure:
+    raised by :meth:`GitOps.create_worktree` instead of a generic
+    FAULT/RuntimeError so the workflow REQUEUES (via the shared
+    :class:`WarmLaneRequeue` base handler) to re-acquire a DIFFERENT lane
+    rather than dispatch a task onto the stale tree.
+    :meth:`GitOps.acquire_warm_lane` returns
+    :attr:`WarmLaneUnavailable.RESEED_CONTAMINATED` for this condition and has
+    already released the contaminated lane back to FREE — retaining the
+    commit-bearing branch, so a re-grab of the SAME single-pool lane converges
+    to the existing reattach→:class:`BranchResetError` block instead of a
+    silent livelock.
+
+    Unlike the transient WarmLaneDiskPressure / WarmLanePoolHardDown /
+    WarmLaneSoftPressure rows, its disposition-table row sets
+    ``counts_against_requeue_cap=True`` so a persistent/pathological
+    contamination eventually trips the requeue-cap escalation — a loud human
+    signal — instead of requeuing forever silently.
     """
 
 
@@ -2355,6 +2383,17 @@ class GitOps:
                     f'warm-lane base absent (host-scoped pool hard-down) for '
                     f'branch {branch_name!r}; requeue (fail-open) — run '
                     f'reify/scripts/ensure-warm-base.sh'
+                )
+            if pool_info is WarmLaneUnavailable.RESEED_CONTAMINATED:
+                # Data-integrity / reseed-consistency fault (task 2854): the
+                # fresh reseed left the lane carrying a prior occupant's
+                # commits. Requeue (WarmLaneRequeue) to re-acquire a DIFFERENT
+                # lane rather than dispatch onto the stale tree — never a
+                # cold-path fall-through onto the contaminated content.
+                raise WarmLaneReseedContaminated(
+                    f'warm-lane reseed contamination for branch {branch_name!r} '
+                    f"(lane retained a prior occupant's commits beyond base); "
+                    f'requeue to re-acquire a different lane (task 2854)'
                 )
             # FAULT or DISABLED → RuntimeError reuses existing blocked+L1 plumbing.
             # DISABLED is a programming error (caller bypassed the pool-enabled
