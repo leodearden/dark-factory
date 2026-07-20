@@ -141,6 +141,40 @@ class TestFollowupFilingAllowlist:
         assert 'mcp__fused-memory__submit_task' in IMPLEMENTER.allowed_tools
 
 
+class TestFollowupFilingPrompts:
+    """ARCHITECT/IMPLEMENTER prompts must direct fire-and-forget follow-up filing.
+
+    Both prompts gain a follow-up-filing block (rendered via
+    ``submit_only_instructions``) telling the agent to file work discovered
+    OUTSIDE its task scope as a low-priority ``submit_task`` candidate, and to
+    fire-and-forget (never wait on ``resolve_ticket``) — mirroring the
+    steward/deep_reviewer contract asserted in ``TestSiteWiringMinimal``.
+    Anchored on load-bearing tokens, not prose wording.
+    """
+
+    def test_architect_prompt_has_followup_filing_block(self):
+        p = ARCHITECT.system_prompt
+        assert 'submit_task' in p
+        assert 'Filing follow-up work' in p
+        assert 'OUTSIDE the scope' in p
+
+    def test_implementer_prompt_has_followup_filing_block(self):
+        p = IMPLEMENTER.system_prompt
+        assert 'submit_task' in p
+        assert 'Filing follow-up work' in p
+        assert 'OUTSIDE the scope' in p
+
+    def test_architect_followup_is_fire_and_forget(self):
+        p = ARCHITECT.system_prompt
+        assert 'Do NOT call `resolve_ticket`' in p
+        assert 'Call `resolve_ticket`' not in p
+
+    def test_implementer_followup_is_fire_and_forget(self):
+        p = IMPLEMENTER.system_prompt
+        assert 'Do NOT call `resolve_ticket`' in p
+        assert 'Call `resolve_ticket`' not in p
+
+
 # ---------------------------------------------------------------------------
 # Site-wiring test: ReviewCheckpoint._build_prompt (site 4)
 # ---------------------------------------------------------------------------
