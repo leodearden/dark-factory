@@ -2743,6 +2743,60 @@ async def _kill_cgroup_scope(unit: str) -> None:
                 await asyncio.wait_for(p.wait(), 10)
 
 
+async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
+    """Stop THIS project's leftover transient verify-scope units at startup.
+
+    A crash/SIGKILL of a prior orchestrator incarnation can strand a
+    ``df-verify-{tag}-{uuid}.scope`` whose processes keep running (the
+    controller died but the scope's cgroup subtree — bash → cargo → rustc —
+    lives on).  Run once before the first dispatch, this sweep enumerates and
+    reaps ONLY this project's leftovers, returning the reaped unit names.
+
+    Cross-project safety: every ``orchestrator-*.service`` unit shares ONE
+    per-user ``systemctl --user`` session, so ``df-verify-*.scope`` is a single
+    shared namespace.  The enumeration is TAG-SCOPED to
+    ``df-verify-{tag}-*.scope`` (see ``_scope_tag_for``) AND the returned names
+    are DEFENSIVELY re-filtered to the same ``df-verify-{tag}-…\\.scope`` shape,
+    so a sibling project's LIVE in-flight verify scope can never be reaped even
+    if the ``systemctl`` glob were to over-return.  systemd guarantees one
+    incarnation per unit, and this runs before this incarnation's first
+    dispatch, so any same-tag scope is necessarily a dead predecessor's leak.
+
+    Fully fail-soft: returns ``[]`` (never raises) when ``systemctl`` /
+    ``systemd-run`` are unavailable, or on any enumeration/parse error — a
+    systemd fault must never abort startup.
+    """
+    if shutil.which('systemctl') is None or shutil.which('systemd-run') is None:
+        return []
+    tag = _scope_tag_for(project_root)
+    pattern = f'df-verify-{tag}-*.scope'
+    listing = ''
+    with contextlib.suppress(Exception):
+        proc = await asyncio.create_subprocess_exec(
+            'systemctl', '--user', 'list-units', '--all', '--plain',
+            '--no-legend', pattern,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), 30)
+        listing = out.decode('utf-8', 'replace') if out else ''
+    keep = re.compile(rf'^df-verify-{re.escape(tag)}-.*\.scope$')
+    reaped: list[str] = []
+    for line in listing.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        unit = parts[0]
+        # Defensive re-filter: never stop a name outside this project's tag,
+        # regardless of any surprise in systemctl glob semantics.
+        if not keep.match(unit):
+            continue
+        with contextlib.suppress(Exception):
+            await _kill_cgroup_scope(unit)
+        reaped.append(unit)
+    return reaped
+
+
 # Environment variables that activate a *specific* Python virtualenv / uv
 # project.  The orchestrator runs under `uv run --project orchestrator`, which
 # activates dark-factory/.venv and exports these into our process env.  If they
