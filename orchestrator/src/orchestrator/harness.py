@@ -1694,6 +1694,16 @@ class Harness:
             # fail-soft, so a reaper fault can never break startup.
             await self._run_interactive_worktree_reaper_pass()
 
+            # 1c1h. Unconditional leftover verify-scope (df-verify-{tag}-*.scope)
+            # crash-safety sweep (task 2829; companion to reify enabling
+            # verify_use_cgroup_scope). A crash/SIGKILL can strand a transient
+            # verify scope whose cgroup subtree keeps running; this reaps ONLY
+            # this project's tag-scoped leftovers. Placed beside the interactive
+            # reaper so it inherits the same ordering guarantee — it runs before
+            # scheduler.finish_startup() and the first acquire_next, i.e. before
+            # first dispatch, on every boot. The pass is itself fail-soft.
+            await self._run_leftover_verify_scope_reaper_pass()
+
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
                 hours, rem = divmod(delay_secs, 3600)
