@@ -505,6 +505,16 @@ class WarmLaneUnavailable(Enum):
       (no lane touched) or via a seed exit-76 (reify contract, DORMANT until
       a shipped seed-warm-lane.sh emits it).  HOST-SCOPED pool condition —
       requeue (:class:`WarmLanePoolHardDown`), never a per-task BLOCKED+L1.
+    * ``RESEED_CONTAMINATED`` — a FRESH-reseed acquire
+      (:attr:`AcquireRoute.RECYCLE` / :attr:`AcquireRoute.CREATE_ONCE_FRESH`)
+      failed its post-reseed verification
+      (:meth:`GitOps._reseed_verified_clean`): the lane's checked-out branch
+      is not at the base, still carrying a PRIOR occupant's retained commits
+      (reify incident 2026-07-20: ``_lane-12`` acquired for task 5279 while
+      ``task/5279`` sat at task 5264's commits).  A data-integrity /
+      reseed-consistency defect — :meth:`create_worktree` maps it to
+      :class:`WarmLaneReseedContaminated` so the task requeues to re-acquire a
+      DIFFERENT lane rather than dispatch onto the stale tree (task 2854).
     * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
       sentinel returned when :meth:`acquire_warm_lane` is called without first
       checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
@@ -522,6 +532,7 @@ class WarmLaneUnavailable(Enum):
     DISK_PRESSURE = 'disk_pressure'
     SOFT_PRESSURE = 'soft_pressure'
     BASE_ABSENT = 'base_absent'
+    RESEED_CONTAMINATED = 'reseed_contaminated'
     DISABLED = 'disabled'
 
 
@@ -4682,6 +4693,43 @@ class GitOps:
                 if recycle_result is not None:
                     return recycle_result
                 route = AcquireRoute.RECYCLE
+
+            # ── Reseed-consistency post-condition (task 2854) ──────────────
+            # The two FRESH-reseed routes (RECYCLE / CREATE_ONCE_FRESH) reset
+            # or create full_branch at start_ref and are the ONLY routes that
+            # reach this shared tail; unlike every REUSE/REATTACH/DISK_BACKSTOP
+            # route (which returns early through _reuse_warm_lane and is already
+            # protected by the rebase-collapse BranchResetError guard that
+            # caught the incident downstream), they have NO post-condition
+            # check today. Verify the reseed actually landed clean — HEAD on
+            # full_branch, zero commits beyond start_ref — BEFORE handing the
+            # lane out for dispatch. A lane still serving a PRIOR occupant's
+            # tree (reify incident 2026-07-20: _lane-12 acquired for task 5279
+            # while task/5279 sat at task 5264's commits) is faulted here and
+            # requeued onto a DIFFERENT lane rather than dispatched onto stale
+            # content — closing the gap "before it hits a case the [collapse]
+            # guard misses". _reseed_verified_clean is fail-closed, so an
+            # unprovable-clean lane is treated as contaminated
+            # (loud-over-silent-degradation); never returning a WorktreeInfo
+            # here guarantees the lane is left FREE, never ASSIGNED.
+            if route in (
+                AcquireRoute.RECYCLE, AcquireRoute.CREATE_ONCE_FRESH,
+            ) and not await self._reseed_verified_clean(lane, full_branch, start_ref):
+                _, offending_head, _ = await _run(
+                    ['git', 'rev-parse', 'HEAD'], cwd=lane,
+                )
+                logger.warning(
+                    'acquire_warm_lane: reseed contamination detected — lane %s '
+                    'branch %s HEAD %s carries retained prior-occupant commits '
+                    'beyond base %s (data-integrity / reseed-consistency defect, '
+                    'task 2854); faulting to re-acquire a different lane',
+                    lane, full_branch, offending_head.strip() or '?',
+                    start_ref[:12] if start_ref else '?',
+                )
+                await self._abort_lane_acquisition(
+                    lane, branch_name, remove_worktree=False,
+                )
+                return WarmLaneUnavailable.RESEED_CONTAMINATED
 
             # ── Shared tail: base, debug-port ──────────────────────────────
             _, mb_out, _ = await _run(

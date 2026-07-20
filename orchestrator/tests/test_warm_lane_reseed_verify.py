@@ -32,7 +32,13 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
 )
-from orchestrator.lane_lifecycle import LaneState
+# Two distinct LaneState enums: the pure in-memory pool state machine
+# (FREE/ASSIGNED) that ``warm_lane_pool.state()`` returns, and the durable
+# LaneLifecycle record state (SEED/REGISTERED/ASSIGNED/…) that
+# ``_lane_lifecycle.read()`` returns. Alias both so the assertions below read
+# against the correct one.
+from orchestrator.lane_lifecycle import LaneState as RecordLaneState
+from orchestrator.warm_lane_pool import LaneState as PoolLaneState
 
 # ---------------------------------------------------------------------------
 # Repo fixture (copied from test_lane_lifecycle_gitops.py — self-contained)
@@ -250,14 +256,19 @@ class TestAcquireReseedContaminationGate:
         )
         assert not isinstance(result, WorktreeInfo)
 
-        # (b) The lane is released back to FREE — never left ASSIGNED, so
-        # nothing is dispatched onto the stale tree.
-        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+        # (b) The lane is released back to FREE — never handed out ASSIGNED
+        # for the contaminating task, so nothing is dispatched onto the stale
+        # tree. The pool FREE state is the dispatch-gating invariant (matches
+        # the abort-teardown tests). A bare pool release leaves the durable
+        # record reflecting the PRIOR 'OLD' assignment; the gate never called
+        # _note_assigned_via_route for 'NEW', so the record's task_id must
+        # never be the contaminating task.
+        assert git_ops.warm_lane_pool.state(lane) == PoolLaneState.FREE, (
             'contaminated lane must be released FREE, not left ASSIGNED'
         )
         record = git_ops._lane_lifecycle.read(lane)
-        assert record is None or record.state is not LaneState.ASSIGNED, (
-            f'durable record must not be ASSIGNED after contamination; got {record!r}'
+        assert record is None or record.task_id != 'NEW', (
+            f'lane must never be ASSIGNED to the contaminating task NEW; got {record!r}'
         )
 
         # (c) A WARNING naming the reseed contamination (data-integrity signal).
@@ -287,6 +298,6 @@ class TestAcquireReseedContaminationGate:
             f'a clean recycle reseed must return a WorktreeInfo; got {result!r}'
         )
         record = git_ops._lane_lifecycle.read(result.path)
-        assert record is not None and record.state is LaneState.ASSIGNED, (
+        assert record is not None and record.state is RecordLaneState.ASSIGNED, (
             f'a clean recycle must leave an ASSIGNED durable record; got {record!r}'
         )
