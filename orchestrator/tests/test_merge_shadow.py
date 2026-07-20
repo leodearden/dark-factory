@@ -400,3 +400,45 @@ def test_did_not_pass_subset_all_pass_is_empty() -> None:
     from orchestrator.merge_shadow import did_not_pass_subset
 
     assert did_not_pass_subset({'a::x': 'pass', 'a::y': 'pass'}) == []
+
+
+def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
+    """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
+
+    A test present in ``planned`` but absent from ``verdicts`` was cancelled by
+    nextest fail-fast and is annotated ``'not-started'`` — the crux of the
+    soundness core.  ``planned`` is authoritative: a verdict key not in
+    ``planned`` is ignored.
+    """
+    from orchestrator.merge_shadow import build_fail_fast_map
+
+    planned = ['crate a::x', 'crate a::y', 'crate a::z']
+    # As produced by parse_per_test_results on attempt-0 output: 'crate a::z'
+    # was cancelled by fail-fast and is ABSENT.  'crate a::stale' is a verdict
+    # for a test NOT in the plan and must be ignored.
+    verdicts = {
+        'crate a::x': 'pass',
+        'crate a::y': 'fail',
+        'crate a::stale': 'pass',
+    }
+    assert build_fail_fast_map(planned, verdicts) == {
+        'crate a::x': 'pass',
+        'crate a::y': 'fail',
+        'crate a::z': 'not-started',
+    }
+
+
+def test_build_fail_fast_map_then_subset_retains_not_started() -> None:
+    """End-to-end: the {did-not-pass} subset retains the fail-fast-cancelled test.
+
+    A raw failed-only view would drop 'crate a::z'; feeding the fail-fast map
+    through did_not_pass_subset keeps it (soundness).
+    """
+    from orchestrator.merge_shadow import build_fail_fast_map, did_not_pass_subset
+
+    planned = ['crate a::x', 'crate a::y', 'crate a::z']
+    verdicts = {'crate a::x': 'pass', 'crate a::y': 'fail'}
+    assert did_not_pass_subset(build_fail_fast_map(planned, verdicts)) == [
+        'crate a::y',
+        'crate a::z',
+    ]
