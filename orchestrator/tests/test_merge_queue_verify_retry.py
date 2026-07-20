@@ -20,13 +20,18 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_merge_queue_concurrent_verify import _make_request, _mock_verify_result
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.verify_runner import build_merge_verify_spec
-from test_merge_queue_concurrent_verify import _make_request, _mock_verify_result
+
+if TYPE_CHECKING:
+    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.verify_runner import MergeVerifySpec
 
 # The reify-written attempt-0 sidecar contract (path + schema).  reify owns the
 # authoritative schema (verify-retry-failed-only α/β/γ); this producer reads it
@@ -69,7 +74,7 @@ async def test_assemble_retry_verify_env_tree_pinned(tmp_path: Path) -> None:
     from orchestrator.merge_queue import _assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
-    req = SimpleNamespace(task_id='t-1', retry_failed_only=True)
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-1', retry_failed_only=True))
     env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
     assert env is not None
@@ -93,7 +98,7 @@ async def test_assemble_retry_verify_env_rebased_returns_none(
     from orchestrator.merge_queue import _assemble_retry_verify_env
 
     git_ops = _git_ops_returning('different-oid')
-    req = SimpleNamespace(task_id='t-2', retry_failed_only=True)
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-2', retry_failed_only=True))
     with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
         env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
@@ -109,7 +114,7 @@ async def test_assemble_retry_verify_env_unknown_tree_returns_none(tmp_path: Pat
     from orchestrator.merge_queue import _assemble_retry_verify_env
 
     git_ops = _git_ops_returning(None)
-    req = SimpleNamespace(task_id='t-3', retry_failed_only=True)
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-3', retry_failed_only=True))
     env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
     assert env is None
 
@@ -235,7 +240,7 @@ async def test_run_post_merge_verify_wires_retry_env_when_flag_on(tmp_path: Path
         'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
         'REIFY_VERIFY_RETRY_TREE_OID': 'deadbeef',
     }
-    captured: dict[str, object] = {}
+    captured: dict[str, MergeVerifySpec] = {}
 
     async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
         captured['spec'] = spec
@@ -274,7 +279,7 @@ async def test_run_post_merge_verify_flag_off_is_byte_identical(tmp_path: Path) 
     req = _make_request('r-off', 'task/r-off', tmp_path, config)  # flag defaults False
     git_ops = _make_git_ops_mock()
 
-    captured: dict[str, object] = {}
+    captured: dict[str, MergeVerifySpec] = {}
 
     async def _fake_dispatch(merge_sha, spec, **kw):  # type: ignore[no-untyped-def]
         captured['spec'] = spec
