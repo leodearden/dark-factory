@@ -258,6 +258,58 @@ class TestMergeProvenanceFacade:
 
 
 # ---------------------------------------------------------------------------
+# task 2681/ζ — MergeProvenance.consume() fail-safe façade prune
+# ---------------------------------------------------------------------------
+
+
+class TestMergeProvenanceConsume:
+    """MergeProvenance.consume() is a fail-safe façade over the bound outbox's
+    consume(): it prunes durably when bound, no-ops when unbound (mirroring
+    lookup()'s unbound contract), and is idempotent for an absent id."""
+
+    def test_consume_prunes_bound_outbox_durably(
+        self, tmp_path: Path, _restore_merge_provenance_binding: None,
+    ) -> None:
+        from orchestrator.landed_outbox import MergeProvenance
+
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        row = LandedRow(task_id='77', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+        outbox.record(row)
+        MergeProvenance.bind(outbox)
+
+        MergeProvenance.consume('77')
+
+        # Pruned from the bound outbox...
+        assert outbox.lookup('77') is None
+        # ...and the prune is durable: a re-opened LandedOutbox at the same
+        # path (simulated restart) also observes the row gone.
+        reopened = LandedOutbox(path)
+        assert reopened.lookup('77') is None
+
+    def test_consume_with_nothing_bound_is_noop(
+        self, _restore_merge_provenance_binding: None,
+    ) -> None:
+        from orchestrator.landed_outbox import MergeProvenance
+
+        MergeProvenance._outbox = None  # explicit: nothing bound
+        # Fail-safe: must not raise (mirrors lookup's unbound contract).
+        MergeProvenance.consume('anything')
+
+    def test_consume_absent_id_is_idempotent_noop(
+        self, tmp_path: Path, _restore_merge_provenance_binding: None,
+    ) -> None:
+        from orchestrator.landed_outbox import MergeProvenance
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        MergeProvenance.bind(outbox)
+
+        # An id absent from the bound outbox: idempotent no-op, must not raise.
+        MergeProvenance.consume('never-recorded')
+        assert outbox.all() == []
+
+
+# ---------------------------------------------------------------------------
 # step-11 — SpeculativeMergeWorker holds a LandedOutbox instance
 # ---------------------------------------------------------------------------
 
