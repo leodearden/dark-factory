@@ -1825,6 +1825,7 @@ async def _run_post_merge_verify(
     event_store: EventStore | None = None,
     merge_sha: str = '',
     on_result: Callable[[VerifyResult], None] | None = None,
+    shadow_baseline_sink: dict[str, str] | None = None,
     quarantine: set[str] | None = None,
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
@@ -1870,6 +1871,17 @@ async def _run_post_merge_verify(
             every existing call site byte-identical.  Used by
             :class:`SpeculativeMergeWorker` to capture warm per-test results
             for PRD §10 invariant 6(b) shadow compare.
+        shadow_baseline_sink: Optional mutable out-param (PRD
+            verify-retry-failed-only D4, §5.4).  When supplied AND this call
+            actually narrowed the retry (``narrowed`` — the D2 producer merged
+            ``retry_env`` on a tree-OID-corroborated attempt-0 sidecar), the
+            attempt-0 ``debug_verdicts`` ∪ ``release_verdicts`` map is copied
+            into it.  :class:`SpeculativeMergeWorker` unions this with the
+            PARTIAL narrowed-retry warm output (via
+            :func:`build_warm_shadow_results`) before storing the warm shadow
+            baseline, so the from-scratch full cold shadow compare sees no
+            phantom ``only_cold`` divergence.  Default ``None`` and untouched on
+            every non-narrowed path keep all existing callers byte-identical.
         keep_worktrees: Additional worktrees to protect during any disk-pressure
             prune triggered inside this verify run (pre-verify guard and ENOSPC
             retry).  Default ``None`` keeps the legacy single-keep behaviour
@@ -2000,6 +2012,19 @@ async def _run_post_merge_verify(
                     spec, verify_env={**spec.verify_env, **retry_env}
                 )
                 narrowed = True
+                # PRD verify-retry-failed-only D4 (§5.4): copy the attempt-0
+                # per-test verdict map into the caller's sink so the warm shadow
+                # baseline is MERGED (attempt-0 ∪ partial narrowed-retry output)
+                # before storage.  This narrowed retry re-runs ONLY the
+                # {did-not-pass} subset, so its output alone OMITS every
+                # attempt-0-passed test → a from-scratch full cold shadow compare
+                # would flag them all only_cold → phantom born-at-L2 divergence.
+                # Populated ONLY here (narrowed=True) so a rebased/uncorroborated
+                # tree (assemble→None) never seeds a stale baseline.
+                if shadow_baseline_sink is not None:
+                    shadow_baseline_sink.update(
+                        {**attempt0.debug_verdicts, **attempt0.release_verdicts}
+                    )
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
