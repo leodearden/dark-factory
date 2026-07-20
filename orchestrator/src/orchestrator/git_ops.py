@@ -57,7 +57,11 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
 from shared.branch_names import canonical_queued_branch_name  # noqa: F401
-from shared.proc_group import reap_process_groups, scan_process_groups_under_path
+from shared.proc_group import (
+    reap_process_groups,
+    scan_process_groups_under_path,
+    snapshot_process_group,
+)
 from shared.transcript_archive import archive_task_transcripts
 
 from orchestrator.artifacts import TaskArtifacts
@@ -7835,19 +7839,33 @@ class GitOps:
         root = str(self.persistent_merge_worktree_path)
         own_pgid = os.getpgrp()
 
-        def _scan_reap_rescan() -> tuple[set[int], dict[int, str], set[int]]:
+        def _scan_reap_rescan() -> tuple[
+            set[int], dict[int, str], dict[int, str], set[int]
+        ]:
             found = scan_process_groups_under_path(
                 root, exclude_pgids=frozenset({own_pgid}),
             )
             if not found:
-                return set(), {}, set()
+                return set(), {}, {}, set()
+            # task 2828 amend (reviewer_comprehensive, robustness): snapshot each
+            # group's member processes (pid / comm / cmdline) WHILE THEY ARE
+            # STILL ALIVE — before the reap below — so the WARNING identifies
+            # exactly what was killed.  The reap targets any same-user group by
+            # PATH signal (cwd / fd / mmap under the lane), NOT by toolchain
+            # comm, so it can also catch an operator's interactive shell or
+            # debugger cwd'd under the lane mid-incident; logging the cmdline
+            # lets them tell after the fact that their own session was the
+            # casualty (snapshot_process_group never raises).
+            snapshots = {pgid: snapshot_process_group(pgid) for pgid in found}
             outcomes = reap_process_groups(found, grace_secs=grace_secs)
             remaining = scan_process_groups_under_path(
                 root, exclude_pgids=frozenset({own_pgid}),
             )
-            return found, outcomes, remaining
+            return found, snapshots, outcomes, remaining
 
-        found, outcomes, remaining = await asyncio.to_thread(_scan_reap_rescan)
+        found, snapshots, outcomes, remaining = await asyncio.to_thread(
+            _scan_reap_rescan
+        )
 
         if not found:
             return True
@@ -7855,8 +7873,12 @@ class GitOps:
         logger.warning(
             'reap_merge_verify_survivors: found %d orphaned process group(s) '
             '%s under the warm merge-verify lane %s (a previous-run verify '
-            'subtree survived restart); reap outcomes=%s',
+            'subtree survived restart); reap outcomes=%s. Reaped process '
+            'group details (pid/comm/cmdline captured pre-reap, so an operator '
+            'can identify a same-user session caught by the path-based reap):'
+            '\n%s',
             len(found), sorted(found), root, outcomes,
+            '\n'.join(snapshots[pgid] for pgid in sorted(snapshots)),
         )
 
         if remaining:
