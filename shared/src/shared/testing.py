@@ -71,16 +71,22 @@ def make_gate_mock(**overrides) -> MagicMock:
     for k, v in overrides.items():
         setattr(gate, k, v)
 
-    def _make_invoke_slot_cm():
+    def _make_invoke_slot_cm(*_a, **_kw):
         holder: dict = {'slot': None}
+        # Prod now calls invoke_slot(scope=...) (PRD task β). Accept and ignore
+        # the kwarg (additive — behavior unchanged), mirroring the scope onto
+        # the slot so a caller can still read slot.scope. Captured here (not via
+        # _aenter_impl's own **_kw, which __aenter__ is called with no args).
+        _scope = _kw.get('scope')
 
-        async def _aenter_impl(*_args, **_kw):
+        async def _aenter_impl(*_args, **_akw):
             token = await gate.before_invoke()
             slot = MagicMock(spec=InvokeSlot)
             slot.token = token
             # Mirror InvokeSlot.__init__: None → '' so tests can rely on
             # the same coercion as production code.
             slot.account_name = gate.active_account_name or ''
+            slot.scope = _scope
             slot._settled = False
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):

@@ -1100,8 +1100,23 @@ async def invoke_with_cap_retry(
         )
         completed_at = datetime.now(UTC).isoformat()
     else:
+        # Derive this invocation's cap scope once (PRD task β, write half of
+        # boundary B1): the invoked model when it is a scoped-cap model, else
+        # None (the general scope). Scoped ONLY for the claude backend
+        # (decision 7 "claude-backend scope only"): a non-claude backend
+        # (codex/gemini) never touches the OAuth account pool's model-scoped
+        # caps, satisfying B8. Lazy import mirrors the invocation_outcome
+        # import below to avoid the usage_gate<->cli_invoke cycle.
+        # getattr(...,'_config',None) is None for a spec'd MagicMock gate and
+        # scope_for(m, <no config>) is None, so every existing mock-based suite
+        # derives scope None → byte-equivalent.
+        from shared.usage_gate import scope_for
+        _cfg = getattr(usage_gate, '_config', None)
+        scope = (
+            scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
+        )
         while True:
-            async with usage_gate.invoke_slot() as slot:
+            async with usage_gate.invoke_slot(scope=scope) as slot:
                 # slot.account_name is derived from slot.lease — the SAME
                 # account slot.token came from (task W4-δ, PRD §7.4). This
                 # is what makes the attribution below (and the save_invocation

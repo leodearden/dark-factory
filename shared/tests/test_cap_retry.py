@@ -127,14 +127,18 @@ def _mock_gate(**overrides) -> MagicMock:
     # A fresh slot is built on each call to invoke_slot() so that
     # per-iteration side_effects on before_invoke / detect_cap_hit /
     # active_account_name PropertyMock fire in the expected order.
-    def _make_invoke_slot_cm():
+    def _make_invoke_slot_cm(*_a, **_kw):
         holder: dict = {'slot': None}
+        # Prod now calls invoke_slot(scope=...) (PRD task β); accept and ignore
+        # the kwarg — additive, behavior unchanged.
+        _scope = _kw.get('scope')
 
-        async def _aenter_impl(*_args, **_kw):
+        async def _aenter_impl(*_args, **_akw):
             token = await gate.before_invoke()
             slot = MagicMock()
             slot.token = token
             slot.account_name = gate.active_account_name
+            slot.scope = _scope
             slot._settled = False
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):
@@ -2381,9 +2385,11 @@ class TestInvokeFnParameter:
         detect_calls: list[str] = []
         orig_detect = gate.detect_cap_hit
 
-        def spy(stderr, result_text, backend='claude', oauth_token=None):
+        def spy(stderr, result_text, backend='claude', oauth_token=None, scope=None):
             detect_calls.append(backend)
-            return orig_detect(stderr, result_text, backend, oauth_token=oauth_token)
+            return orig_detect(
+                stderr, result_text, backend, oauth_token=oauth_token, scope=scope,
+            )
 
         gate.detect_cap_hit = spy  # type: ignore[assignment]
 

@@ -297,12 +297,23 @@ class InvokeSlot:
         # any other exit: __aexit__ calls release_probe_slot
     """
 
-    __slots__ = ('_gate', 'lease', '_settled')
+    __slots__ = ('_gate', 'lease', '_settled', 'scope')
 
-    def __init__(self, gate: UsageGate, lease: AccountLease | None) -> None:
+    def __init__(
+        self,
+        gate: UsageGate,
+        lease: AccountLease | None,
+        scope: str | None = None,
+    ) -> None:
         self._gate = gate
         self.lease = lease
         self._settled = False
+        # Cap scope for this invocation (PRD task β): the invoked model when it
+        # is a scoped-cap model, else None (the general scope). `report` /
+        # `detect_cap_hit` forward it to the gate's cap handlers so a scoped
+        # CapHit attributes to only this account's model-scope. β does NOT use
+        # it for account selection — that is γ (task 2857).
+        self.scope = scope
 
     @property
     def token(self) -> str | None:
@@ -326,9 +337,13 @@ class InvokeSlot:
         output: str,
         backend: str = 'claude',
     ) -> bool:
-        """Proxy to ``UsageGate.detect_cap_hit``; auto-settles on True."""
+        """Proxy to ``UsageGate.detect_cap_hit``; auto-settles on True.
+
+        Forwards ``self.scope`` (PRD task β) so a scoped cap detected here
+        attributes to only this account's model-scope.
+        """
         hit = self._gate.detect_cap_hit(
-            stderr, output, backend, oauth_token=self.token,
+            stderr, output, backend, oauth_token=self.token, scope=self.scope,
         )
         if hit:
             self._settled = True
@@ -367,12 +382,14 @@ class InvokeSlot:
         - OK -> ``confirm_account_ok`` (PROBE_IN_FLIGHT -> AVAILABLE; clears
           ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
           stays a caller concern (``confirm()`` / ``on_agent_complete``).
-        - CapHit -> ``_handle_cap_detected`` (-> CAPPED).
+        - CapHit -> ``_handle_cap_detected`` (-> CAPPED), forwarding
+          ``self.scope`` (PRD task β): a scoped cap attributes to only this
+          account's model-scope and leaves the account phase AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
-          guard).
-        - NearCap -> ``_handle_near_cap_warning`` (annotation only), then
-          ``release_probe_slot``.
+          guard). Scope-blind.
+        - NearCap -> ``_handle_near_cap_warning`` (annotation only, forwarding
+          ``self.scope``), then ``release_probe_slot``.
         - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
           ``release_probe_slot`` only; no phase change.
 
@@ -401,11 +418,13 @@ class InvokeSlot:
             if isinstance(outcome, OK):
                 self._gate.confirm_account_ok(token)
             elif isinstance(outcome, CapHit):
-                self._gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                self._gate._handle_cap_detected(
+                    outcome.reason, outcome.resets_at, token, scope=self.scope,
+                )
             elif isinstance(outcome, AuthFailed):
                 self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
             elif isinstance(outcome, NearCap):
-                self._gate._handle_near_cap_warning(outcome.reason, token)
+                self._gate._handle_near_cap_warning(outcome.reason, token, scope=self.scope)
                 self._gate.release_probe_slot(token)
             else:
                 self._gate.release_probe_slot(token)
@@ -771,13 +790,19 @@ class UsageGate:
             await self._open.wait()
 
     @contextlib.asynccontextmanager
-    async def invoke_slot(self):
+    async def invoke_slot(self, scope: str | None = None):
         """Acquire an account slot, releasing the probe lock on any exit path.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
         (returning True) nor :meth:`~InvokeSlot.confirm` was called,
         ``release_probe_slot`` runs as a safety net.
+
+        *scope* (PRD task β) is stored on the yielded slot (``slot.scope``) and
+        forwarded by ``report`` / ``detect_cap_hit`` into the cap handlers so a
+        scoped cap attributes to only this account's model-scope. β does not use
+        it for account *selection* (that is γ, task 2857) — ``before_invoke``
+        is unchanged.
 
         Usage::
 
@@ -791,7 +816,7 @@ class UsageGate:
                 # any other exit path (continue, exception): auto-released
         """
         lease = await self.before_invoke()
-        slot = InvokeSlot(self, lease)
+        slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot
         finally:
@@ -804,6 +829,7 @@ class UsageGate:
         result_text: str,
         backend: str = 'claude',
         oauth_token: str | None = None,
+        scope: str | None = None,
     ) -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
@@ -826,14 +852,21 @@ class UsageGate:
         case no account state changed and the retry loop should not increment
         consecutive_cap_hits or trigger a cooldown, since before_invoke() would
         return the same token on the next iteration.
+
+        *scope* (PRD task β) is forwarded verbatim to the cap/near-cap handler:
+        when non-None it attributes the hit to only that account's model-scope
+        (``acct.scope_caps``), leaving the account phase machine untouched; the
+        cap-like-prefix breadcrumb path and the Failure return are scope-blind.
         """
         result = AgentResult(success=False, output=result_text, stderr=stderr)
         outcome = classify_invocation(result, strict_confirm=True, backend=backend)
 
         if isinstance(outcome, CapHit):
-            return self._handle_cap_detected(outcome.reason, outcome.resets_at, oauth_token)
+            return self._handle_cap_detected(
+                outcome.reason, outcome.resets_at, oauth_token, scope=scope,
+            )
         if isinstance(outcome, NearCap):
-            return self._handle_near_cap_warning(outcome.reason, oauth_token)
+            return self._handle_near_cap_warning(outcome.reason, oauth_token, scope=scope)
 
         # Not a cap/near-cap verdict (Failure, or CliLocalError overriding a
         # cap-like prefix) — if a cap-like prefix IS present, emit a debug
@@ -857,21 +890,66 @@ class UsageGate:
 
         return False
 
+    def _scope_cap_for(self, acct: AccountState, scope: str) -> ScopeCap:
+        """Lazily get-or-create the per-(account, model) cap overlay for *scope*.
+
+        The scope substrate (task 2855 / PRD scope): ``acct.scope_caps`` starts
+        empty and is populated on first scoped observation, so today's general
+        (unscoped) paths stay byte-identical.
+        """
+        sc = acct.scope_caps.get(scope)
+        if sc is None:
+            sc = ScopeCap()
+            acct.scope_caps[scope] = sc
+        return sc
+
     def _handle_cap_detected(
         self,
         reason: str,
         resets_at: datetime | None,
         oauth_token: str | None,
+        scope: str | None = None,
     ) -> bool:
         """Mark the matching account as capped.
 
         Returns True if an account was resolved and mutated; False if
         ``_resolve_account`` returned None (unknown token / all capped).
+
+        *scope* (PRD task β, invariant S5): when non-None (a scoped-cap model,
+        e.g. ``claude-fable-5``), the cap is attributed to ONLY this account's
+        model-scope — ``acct.scope_caps[scope]`` is flagged capped and the
+        account-level phase machine is left untouched, so the account keeps
+        serving general work. Attribution is by invoked model (PRD decision 2),
+        never by cap-message text. ``scope=None`` (the general scope) is
+        byte-identical to today: the account transitions to CAPPED via
+        ``_transition``.
         """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Cap detected but no matching account: {reason}')
             return False
+
+        if scope is not None:
+            # Scoped (per-model) cap overlay — invariant S5: cap ONLY this
+            # account's model-scope, leaving the account-level phase machine
+            # untouched. _transition is both the sole phase writer AND the
+            # account-level cap_hit event site, so the scoped path deliberately
+            # bypasses it and fires its own cap_hit event (scope detail added)
+            # to preserve observability without transitioning the account.
+            # resets_at is the value the generic classifier already parsed
+            # (decision 2); an unknown (None) is stored verbatim — the
+            # None-backoff policy is γ's (task 2857).
+            sc = self._scope_cap_for(acct, scope)
+            sc.capped = True
+            sc.resets_at = resets_at
+            sc.capped_at = datetime.now(UTC)
+            logger.warning(f'Account {acct.name} scope {scope!r} CAPPED: {reason}')
+            if self._cost_store:
+                details: dict[str, str] = {'reason': reason, 'scope': scope}
+                if resets_at is not None:
+                    details['resets_at'] = resets_at.isoformat()
+                self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
+            return True
 
         # resets_at is refreshed unconditionally (even on a same-phase repeat
         # detection) — it feeds the resume-probe backoff target and
@@ -893,16 +971,36 @@ class UsageGate:
         self,
         reason: str,
         oauth_token: str | None,
+        scope: str | None = None,
     ) -> bool:
         """Record a near-cap warning without blocking the account.
 
         Returns True if an account was resolved and mutated; False if
         ``_resolve_account`` returned None (unknown token / all capped).
+
+        *scope* (PRD task β, invariant S5): when non-None, the warning is
+        annotated on ONLY this account's model-scope (``acct.scope_caps[scope]``)
+        and the account-level ``near_cap`` flag stays untouched. ``scope=None``
+        is byte-identical to today (sets ``acct.near_cap``).
         """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Near-cap warning but no matching account: {reason}')
             return False
+
+        if scope is not None:
+            # Scoped near-cap overlay (invariant S5): annotate only this
+            # account's model-scope; the account-level near_cap flag is left put.
+            sc = self._scope_cap_for(acct, scope)
+            sc.near_cap = True
+            logger.warning(f'Account {acct.name} scope {scope!r} NEAR CAP: {reason}')
+            if self._cost_store:
+                self._fire_cost_event(
+                    acct.name,
+                    'near_cap',
+                    json.dumps({'reason': reason, 'scope': scope}),
+                )
+            return True
 
         acct.near_cap = True
         logger.warning(f'Account {acct.name} NEAR CAP: {reason}')
