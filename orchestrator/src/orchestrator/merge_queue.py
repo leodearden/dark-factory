@@ -7154,6 +7154,92 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         self._note_transition(request_id, current, ItemLifecycleState.QUEUED, live_obj=live_obj)
 
+    def _advance_if_at(
+        self,
+        request_id: str,
+        from_state: ItemLifecycleState,
+        to_state: ItemLifecycleState,
+        *,
+        live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+        tolerate: frozenset[ItemLifecycleState] = frozenset(),
+    ) -> bool:
+        """Shared re-entry-tolerant forward-hop primitive (task 2852 /
+        SHARPER RCA option B): fire ``from_state -> to_state`` for
+        *request_id* iff the registry's CURRENT state actually equals
+        *from_state*; otherwise tolerate a benign no-op — but ONLY when
+        *current* is a caller-named, already-reasoned-about downstream state
+        for this hop — instead of routing a stale/hardcoded *from_state*
+        into :meth:`_note_transition`'s rejection-and-escalation path.
+
+        Mirrors :meth:`_note_requeue`'s read-``current()``-first discipline
+        (the pattern the SHARPER RCA endorses): both offender call sites —
+        ``_finalize_inflight`` (VERIFYING -> FINALIZING) and
+        ``_buffer_owned_request`` (QUEUED -> LANE_BUFFERED) — previously
+        hardcoded *from_state* and let a duplicate/re-entrant driver that
+        touches a request_id already deep in the pipeline hit
+        ``IllegalLifecycleTransition`` and fire a dedup'd
+        ``merge_lifecycle_transition_rejected`` L1 escalation. Once
+        recognized here, that divergence is HANDLED and benign, so it is
+        logged loudly at WARNING — NOT escalated (escalating would
+        re-introduce the exact noise this primitive removes).
+
+        *tolerate* names the ADDITIONAL registry states — besides
+        *from_state* itself — that the caller has confirmed are benign
+        already-advanced duplicates for THIS hop (e.g. `_finalize_inflight`
+        passes the states it documents as a tolerated double-finalize:
+        FINALIZING/MERGING/GATE_REVERIFY/TERMINAL). Defaults to empty, so a
+        caller that does not opt in keeps the strict pre-existing behavior
+        (any mismatch escalates).
+
+        A *current* that is neither *from_state* nor a member of *tolerate*
+        is deliberately NOT assumed benign — amendment review (task 2852)
+        flagged that treating EVERY mismatch as tolerable would also swallow
+        the opposite pathology: a genuinely earlier/off-path *current* (a
+        real wiring/ordering bug), which the pre-existing hardcoded-from_state
+        call would have surfaced as a loud escalation. A generic "is current
+        downstream of from_state" graph check cannot substitute for the
+        explicit allowlist here: ``_LEGAL_TRANSITIONS`` has legal backward/
+        lateral edges (the VERIFYING/DISPATCHING -> QUEUED requeue bounces,
+        the DISPATCHING <-> REDISPATCH_PARKED redispatch loop, the
+        VERIFYING <-> GATE_REVERIFY / GATE_REVERIFY <-> FINALIZING loops, the
+        MERGING <-> DISPATCHING cascade-remerge edges) that put almost every
+        non-TERMINAL state in one strongly-connected component — "reachable
+        forward from from_state" would therefore tolerate nearly anything,
+        defeating the point. So an untolerated mismatch falls through to
+        :meth:`_note_transition` with the ORIGINAL *from_state*/*to_state*
+        pair, exactly as before this helper existed: ``ItemLifecycle.
+        transition``'s own current-mismatch check raises, and the existing
+        best-effort-loud handling fires the escalation.
+
+        Returns True iff the transition fired (delegated to
+        :meth:`_note_transition`, so still best-effort-loud against a
+        genuine registry/edge violation); False on a no-op — the registry is
+        left completely untouched in that case (no :meth:`_note_transition`
+        call at all) whether the no-op was tolerated (in *tolerate*) or is
+        about to be escalated by the fall-through below.
+        """
+        current = self._lifecycle.current(request_id)
+        if current == from_state:
+            self._note_transition(request_id, from_state, to_state, live_obj=live_obj)
+            return True
+        if current in tolerate:
+            logger.warning(
+                'ItemLifecycle: skipping re-entrant %s->%s for request_id=%s; '
+                'registry already at %s (tolerated benign no-op, NOT escalated)',
+                from_state, to_state, request_id, current,
+            )
+            return False
+        # current is neither from_state nor a caller-tolerated downstream
+        # state for this hop — do NOT assume this is a harmless duplicate.
+        # Fall through with the ORIGINAL from_state so
+        # ItemLifecycle.transition's own current-mismatch check raises and
+        # _note_transition's best-effort-loud handling escalates, exactly as
+        # it did before this helper existed — a genuinely earlier/off-path
+        # state is a real wiring/ordering bug, not a tolerated re-entrant
+        # duplicate.
+        self._note_transition(request_id, from_state, to_state, live_obj=live_obj)
+        return False
+
     def _entry_phase(self, entry: InflightEntry) -> str:
         """Return *entry*'s current phase, derived from the ItemLifecycle
         registry rather than a stored field (merge-queue-reliability PRD
@@ -7669,21 +7755,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         previously put back on ``_queue`` by a requeue site
         (:meth:`_note_requeue` — operator-halt / cascade self-requeue),
         which leaves it registered at QUEUED rather than removing it
-        (:class:`ItemLifecycle` has no deregister op). Registers only when
-        the request_id is not already tracked; an already-tracked rid skips
-        straight to the QUEUED -> LANE_BUFFERED transition below instead of
-        re-``register()``-ing, which would raise ``ValueError`` on the live
-        duplicate (:meth:`ItemLifecycle.register`'s precondition). Either
-        way, the item ends up seeded/confirmed at QUEUED then immediately
-        transitioned to LANE_BUFFERED, matching this method's own
-        postcondition (the item is now sitting in a lane buffer).
+        (:class:`ItemLifecycle` has no deregister op).
+
+        task 2852 (SHARPER RCA mr-8cafbaf0 / original incident mr-c69ca480):
+        an already-tracked rid does NOT unconditionally skip straight to the
+        QUEUED -> LANE_BUFFERED transition — that assumption is exactly what
+        the incident disproved (a duplicate/re-entrant *item*, e.g. from the
+        journal-recovery ``reconstruct_merge_request`` path, can arrive for a
+        request_id that has already advanced well past QUEUED, such as
+        VERIFYING). The registry's CURRENT state discriminates three cases:
+
+          * unregistered (``None``)   — register fresh at QUEUED, then fall
+            through.
+          * ``QUEUED`` (fresh-just-registered, OR a legit requeue left here
+            by :meth:`_note_requeue`) — fall through as-is; this is the ONLY
+            case where re-``register()``-ing would raise ``ValueError`` on
+            the live duplicate (:meth:`ItemLifecycle.register`'s
+            precondition), which is exactly why registration is skipped here.
+          * anything else (already advanced past QUEUED) — a duplicate/
+            re-entrant *item* for a request_id already deep in the pipeline.
+            Coalesced via :meth:`_coalesce_reentrant_drain` and dropped
+            BEFORE the transition, the lane-buffer append, and the journal
+            block below — never re-``register()``-ed, never buffered, never
+            re-recorded (which would otherwise clobber the live original's
+            durable journal entry under the shared request_id).
+
+        The fall-through path routes the QUEUED -> LANE_BUFFERED hop through
+        :meth:`_advance_if_at` (current is always QUEUED at that point, so it
+        always fires), matching this method's own postcondition (the item is
+        now sitting in a lane buffer).
         """
         lane = _normalize_lane(item.lane)
         self._assert_single_writer(self._merger_task, '_lane_buffers')
         rid = item.request_id
-        if self._lifecycle.current(rid) is None:
+        current = self._lifecycle.current(rid)
+        if current is not None and current != ItemLifecycleState.QUEUED:
+            self._coalesce_reentrant_drain(item, current)
+            return
+        if current is None:
             self._register_item(item, initial=ItemLifecycleState.QUEUED)
-        self._note_transition(
+        self._advance_if_at(
             rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED, live_obj=item,
         )
         self._lane_buffers[lane].append(item)
@@ -7750,6 +7861,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     self._journaled_request_ids.discard(_rid)
 
                 item.result.add_done_callback(_on_terminal)
+
+    def _coalesce_reentrant_drain(
+        self, item: MergeRequest, current_state: ItemLifecycleState,
+    ) -> None:
+        """Coalesce a duplicate/re-entrant drain of *item* onto a request_id
+        already live in the registry at *current_state* (task 2852 /
+        SHARPER RCA option B — mr-8cafbaf0, original incident mr-c69ca480).
+
+        Called by :meth:`_buffer_owned_request` BEFORE the QUEUED ->
+        LANE_BUFFERED transition, the lane-buffer append, and the
+        ``_merge_store.record``/``_on_terminal`` journal block — dropping
+        *item* here (rather than after) prevents both a divergent second
+        pipeline item under the shared request_id (which would otherwise
+        keep firing rejected transitions for the rest of the live
+        original's lifetime, exactly the reported incident) and a journal
+        clobber of the live original's durable entry under that same
+        request_id.
+
+        Logs loudly at WARNING — deliberately NOT an escalation: once
+        recognized here the divergence is HANDLED and benign, and
+        escalating would re-introduce the exact
+        ``merge_lifecycle_transition_rejected`` noise this task removes
+        (PRD design decision 4: invariants escalate loudly, degrade never —
+        satisfied here via the WARNING without silently degrading).
+
+        Also, defensively:
+
+          * resolves *item*'s ``result`` Future (if not already done) to a
+            benign ``MergeOutcome(status='already_merged')`` so no
+            (hypothetical) waiter on the twin's future hangs forever — the
+            confirmed journal-recovery twin has a fresh, unobserved future,
+            so this is robustness, not a correctness dependency; and
+          * emits a ``merge_coalesced`` observability event
+            (``source='duplicate_submission'``) via the shared
+            :func:`_emit_merge_coalesced` helper, None-safe when this
+            worker has no ``_event_store`` wired.
+        """
+        logger.warning(
+            'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
+            'merge submission for request_id=%s branch=%s; registry already at '
+            '%s. Coalescing as a benign no-op — NOT buffering a divergent '
+            'twin, NOT escalated.',
+            item.request_id, item.branch, current_state,
+        )
+        if not item.result.done():
+            item.result.set_result(
+                MergeOutcome(
+                    status='already_merged',
+                    reason=(
+                        'duplicate/re-entrant merge submission coalesced onto '
+                        'in-flight/landed request'
+                    ),
+                ),
+            )
+        _emit_merge_coalesced(self._event_store, item, source='duplicate_submission', eta=None)
 
     def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
@@ -13114,6 +13280,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # at DISPATCHING/QUEUED. Every path below (DROPPED/REQUEUED, RUNNER_
             # UNAVAILABLE's FINALIZING -> MERGING, FAIL/skip, PASS) already assumes
             # FINALIZING as its from-state.
+            #
+            # task 2852 (SHARPER RCA mr-99585bb8): routed through _advance_if_at
+            # instead of a hardcoded-from_state _note_transition call — a
+            # double-finalize (this hop firing twice for the same request_id,
+            # e.g. a re-entrant/duplicate finalize drive) now reads the
+            # registry's CURRENT state first. When it is already past VERIFYING
+            # and at one of the four states this method itself documents as
+            # reachable here (FINALIZING/MERGING/GATE_REVERIFY/TERMINAL —
+            # passed explicitly via `tolerate` below), the second hop
+            # coalesces as a benign WARNING no-op instead of hitting
+            # IllegalLifecycleTransition and firing a
+            # merge_lifecycle_transition_rejected escalation. Any OTHER
+            # current state (QUEUED/LANE_BUFFERED/AWAITING_VERIFY/
+            # REDISPATCH_PARKED/DISPATCHING — this entry has not even
+            # reached verify yet) is NOT in `tolerate` and still escalates:
+            # that would be a genuine wiring/ordering bug, not a tolerated
+            # duplicate (amendment review, task 2852).
+            #
+            # Scope note (amendment review, task 2852): only THIS hop is
+            # wired through _advance_if_at. The downstream hardcoded-
+            # from_state _note_transition calls later in this method (e.g.
+            # FINALIZING -> MERGING / MERGING -> REDISPATCH_PARKED in the
+            # RUNNER_UNAVAILABLE branch, FINALIZING <-> GATE_REVERIFY in the
+            # CAS gate-retry loop) are UNCHANGED. That is safe for the
+            # incident this task actually fixes: the SHARPER RCA's twin
+            # (a distinct MergeRequest/InflightEntry object sharing a
+            # request_id with an already-live original) can no longer reach
+            # dispatch/verify/finalize AT ALL — `_buffer_owned_request`
+            # (see `_coalesce_reentrant_drain` below) now coalesces it at
+            # the drain chokepoint, before it is ever buffered, dispatched,
+            # or given its own InflightEntry. A literal second call to
+            # `_finalize_inflight` for the SAME entry object is likewise not
+            # a reachable call pattern today: every call site (the shutdown
+            # drain, the passthrough-inline branch, and FINALIZE-HEAD) pops
+            # the entry off its container immediately before the one call it
+            # makes. Should a future change introduce a path that invokes
+            # this method twice for one request_id, the downstream hops
+            # would need the same tolerate-aware treatment as this one —
+            # flagged here explicitly rather than silently assumed safe.
             if (
                 entry.passthrough_outcome is None
                 and entry.status not in (
@@ -13121,9 +13326,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     InflightStatus.REQUEUED_PREDISPATCH,
                 )
             ):
-                self._note_transition(
+                self._advance_if_at(
                     req.request_id, ItemLifecycleState.VERIFYING,
                     ItemLifecycleState.FINALIZING, live_obj=entry,
+                    tolerate=frozenset({
+                        ItemLifecycleState.FINALIZING,
+                        ItemLifecycleState.MERGING,
+                        ItemLifecycleState.GATE_REVERIFY,
+                        ItemLifecycleState.TERMINAL,
+                    }),
                 )
 
             # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
