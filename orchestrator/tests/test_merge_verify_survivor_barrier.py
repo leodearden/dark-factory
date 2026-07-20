@@ -19,6 +19,8 @@ loop (hence before the first reset) runs.  These tests drive:
   (a) knob off            → returns True, never scans (no fixed lane to protect)
   (b) knob on, clear tree → returns True
   (c) knob on, live       → reaps a real straggler; own pgid is excluded
+  (c') reaped-log detail  → WARNING names each reaped group's pid/comm/cmdline
+                            (task 2828 amend — operator legibility)
   (d) residual            → returns False + a loud ERROR (fail-open barrier)
   (e) integration         → reap-then-reset round-trip on a real git worktree
                             (the induced-restart approximation)
@@ -219,6 +221,70 @@ class TestReapMergeVerifySurvivors:
             _kill_group(pgid)
             with contextlib.suppress(Exception):
                 await proc.wait()
+
+    async def test_reap_logs_comm_cmdline_of_reaped_group(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """The WARNING for a reaped survivor names each group's pid / comm /
+        cmdline (captured pre-reap), so an operator can tell after the fact
+        whether their own same-user session — caught by the path-based reap —
+        was the casualty (task 2828 amend — reviewer_comprehensive robustness
+        suggestion #2).
+
+        Fully stubbed — no real subprocess, no real ``killpg`` — so it is fast,
+        deterministic, and (unlike the real-straggler reap tests) can never
+        signal a sibling process under high test parallelism.  The scan is a
+        MagicMock returning the survivor group on the first (pre-reap) call and
+        an empty set on the re-scan (so the group reads as reaped → True).
+        """
+        git_ops = _git_ops(tmp_path, persistent_merge_worktree=True)
+        fake_pgid = 424242  # never signalled — reap is a no-op stub below
+        snap_text = (
+            f'snapshot_process_group({fake_pgid}): 2 process(es) in group:\n'
+            f'  pid={fake_pgid} ppid=1 state=S wchan=0 comm=cargo '
+            f'cmdline=cargo build --release\n'
+            f'  pid={fake_pgid + 1} ppid={fake_pgid} state=R wchan=0 comm=rustc '
+            f'cmdline=rustc --edition 2021 src/lib.rs'
+        )
+
+        # found (pre-reap) → {fake_pgid}; re-scan (post-reap) → clear.
+        scan = MagicMock(side_effect=[{fake_pgid}, set()])
+        monkeypatch.setattr(
+            'orchestrator.git_ops.scan_process_groups_under_path', scan,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            'orchestrator.git_ops.snapshot_process_group',
+            lambda pgid: snap_text, raising=False,
+        )
+        monkeypatch.setattr(
+            'orchestrator.git_ops.reap_process_groups',
+            lambda pgids, **_kw: {p: 'reaped' for p in pgids}, raising=False,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.reap_merge_verify_survivors(grace_secs=5.0)
+
+        assert result is True, 'a reaped-then-clear tree returns True'
+        warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warn_records, 'a reaped survivor must be logged at WARNING'
+        joined = '\n'.join(r.getMessage() for r in warn_records)
+        # The reaped group's comm/cmdline (captured pre-reap) must be surfaced so
+        # the reaped identity is legible post-incident — an operator's own shell
+        # would show up here just as this cargo/rustc snapshot does.
+        assert 'cargo' in joined and 'rustc' in joined, (
+            f'the WARNING must carry the reaped group comm/cmdline; got {joined!r}'
+        )
+        assert 'cmdline=' in joined, (
+            f'the WARNING must carry the per-process cmdline detail; got {joined!r}'
+        )
+        assert str(fake_pgid) in joined, (
+            f'the reaped pgid {fake_pgid} must appear in the WARNING; got {joined!r}'
+        )
+        # Snapshots are taken BEFORE the reap (while the group is still alive):
+        # exactly two scans (pre-reap find + post-reap residual re-scan).
+        assert scan.call_count == 2
 
     @pytest.mark.timeout(20)
     async def test_residual_survivor_returns_false_and_logs_error(
