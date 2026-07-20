@@ -212,3 +212,58 @@ class TestUnscopedHandlerByteEquivalence:
         details = json.loads(details_json)
         assert details == {'reason': 'reason'}
         assert 'scope' not in details
+
+
+# ===========================================================================
+# Step 3 — UsageGate.detect_cap_hit forwards `scope` to the handlers
+# ===========================================================================
+
+# Known-good cap / near-cap stderr strings (lifted from
+# test_usage_gate_exhaustive.py): "You've hit your" + a confirm keyword
+# ("usage limit"/"resets") → CapHit; "You're close to" + confirm → NearCap.
+CAP_STDERR = "You've hit your usage limit resets in 3h"
+NEAR_CAP_STDERR = "You're close to your usage limit. resets in 2h"
+
+
+class TestDetectCapHitScope:
+    """``UsageGate.detect_cap_hit(..., scope=<model>)`` routes the classified
+    outcome into the scoped attribution branch of the handlers."""
+
+    def test_detect_cap_hit_scoped_writes_scope_cap_not_phase(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        assert (
+            gate.detect_cap_hit('', CAP_STDERR, oauth_token=acct.token, scope=SCOPE)
+            is True
+        )
+
+        sc = acct.scope_caps[SCOPE]
+        assert sc.capped is True
+        # resets_at came from the generic classifier's parse of "resets in 3h".
+        assert sc.resets_at is not None
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    def test_detect_near_cap_scoped_writes_scope_cap_not_phase(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        assert (
+            gate.detect_cap_hit(
+                '', NEAR_CAP_STDERR, oauth_token=acct.token, scope=SCOPE
+            )
+            is True
+        )
+
+        assert acct.scope_caps[SCOPE].near_cap is True
+        assert acct.near_cap is False
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    def test_detect_cap_hit_unscoped_transitions_account(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        assert gate.detect_cap_hit('', CAP_STDERR, oauth_token=acct.token) is True
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.scope_caps == {}
