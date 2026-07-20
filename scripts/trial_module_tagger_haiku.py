@@ -535,6 +535,43 @@ PROJECT_ROOT = Path('/home/leo/src/dark-factory')
 FUSED_MEMORY_URL = 'http://127.0.0.1:8002'
 REPORT_REL_PATH = 'plans/module-tagger-haiku-trial-report.md'
 
+# Account-pool OAuth env var for live calls (reviewer_trial / run_vllm_eval
+# convention: CLAUDE_OAUTH_TOKEN_A..G; _A is the documented eval/frontier
+# account). A standalone script does NOT inherit the orchestrator's usage_gate
+# slot, so the spawned Claude CLI subprocess would otherwise run with ambient
+# credentials — typically "Not logged in" — and every invocation would fail
+# fast. Resolve one of the pool tokens and pass it through as invoke_agent's
+# oauth_token (which sets CLAUDE_CODE_OAUTH_TOKEN in the subprocess env).
+OAUTH_TOKEN_ENV = 'CLAUDE_OAUTH_TOKEN_A'
+
+# Live-call resilience + throughput. Each invoke_agent call is a ~1-min CLI
+# subprocess; a 30-sample run is ~2N tagger + up to N opus calls. Retry a
+# transient failure a few times before going loud (so one flake never wastes
+# the batch), and fan independent calls out under a bounded semaphore against
+# the single pool account (see _prefetch_live) so the whole run fits a single
+# foreground window instead of ~80 min sequential.
+LIVE_RETRIES = 2
+LIVE_RETRY_BACKOFF_SECS = 4.0
+DEFAULT_CONCURRENCY = 4
+
+
+def _resolve_oauth_token(env_var: str) -> str | None:
+    """Resolve the account-pool OAuth token for live calls (reviewer_trial shape).
+
+    Returns the token from *env_var* (default ``CLAUDE_OAUTH_TOKEN_A``), or
+    ``None`` with a loud WARNING when it is unset — deferring to ambient Claude
+    CLI credentials, which for a standalone run are usually "Not logged in".
+    Mirrors ``evals/reviewer_trial/__main__.py``'s ``--oauth-token-env`` handling.
+    """
+    import os
+    token = os.environ.get(env_var)
+    if not token:
+        print(f'WARNING: {env_var} not set; falling back to ambient Claude CLI '
+              f'credentials (a standalone run is typically "Not logged in", '
+              f'which will surface as a loud per-invocation failure below).')
+        return None
+    return token
+
 
 def _flatten_tasks(tasks_payload: Any) -> list[dict]:
     """Flatten a get_tasks payload (with nested subtasks) into a flat list."""
@@ -663,55 +700,173 @@ def current_top_level_dirs(project_root: Path) -> list[str]:
         return []
 
 
-async def _live_invoke(prompt: str, model: str, project_root: Path) -> Any:
+async def _live_invoke(
+    prompt: str, model: str, project_root: Path,
+    oauth_token: str | None = None,
+) -> Any:
     """Live tagger replay for one (prompt, model) via real ``invoke_agent``.
 
     Faithful "at the call site": byte-identical production prompt + schema +
     system prompt; only the model is forced (haiku vs sonnet head-to-head), and
     ``effort='low'`` is applied SYMMETRICALLY to both so the comparison stays
     fair. ``allowed_tools=[]`` — the tagger only emits structured output.
+    *oauth_token* (the account-pool token) is forwarded so the CLI subprocess is
+    actually authenticated (see ``OAUTH_TOKEN_ENV``).
+
+    Fails LOUD on an unsuccessful invocation instead of returning a result that
+    ``parse_predictions`` would silently flatten to ``[]`` — a failed call
+    (auth/cap/timeout) scored as an "empty prediction" would corrupt the
+    precision/recall verdict (no-silent-fail-soft / structured-facts-at-failure).
+    A transient failure is retried (``LIVE_RETRIES`` attempts, brief backoff)
+    before going loud, so one flaky call does not waste the whole batch.
     """
     from orchestrator.agents.invoke import invoke_agent
-    return await invoke_agent(
-        prompt=prompt,
-        system_prompt=TAGGER_SYSTEM_PROMPT,
-        cwd=project_root,
-        model=model,
-        output_schema=TAGGER_SCHEMA,
-        allowed_tools=[],
-        effort='low',
-        max_turns=2,
-        max_budget_usd=0.50,
+    result: Any = None
+    for attempt in range(LIVE_RETRIES + 1):
+        result = await invoke_agent(
+            prompt=prompt,
+            system_prompt=TAGGER_SYSTEM_PROMPT,
+            cwd=project_root,
+            model=model,
+            output_schema=TAGGER_SCHEMA,
+            allowed_tools=[],
+            effort='low',
+            max_turns=2,
+            max_budget_usd=0.50,
+            oauth_token=oauth_token,
+        )
+        if getattr(result, 'success', False):
+            return result
+        if attempt < LIVE_RETRIES:
+            await asyncio.sleep(LIVE_RETRY_BACKOFF_SECS * (attempt + 1))
+    raise RuntimeError(
+        f'module_tagger replay FAILED after {LIVE_RETRIES + 1} attempts '
+        f'(model={model}, success={getattr(result, "success", None)}, '
+        f'subtype={getattr(result, "subtype", None)!r}, '
+        f'timed_out={getattr(result, "timed_out", None)}, '
+        f'account={getattr(result, "account_name", None)!r}): '
+        f'{(getattr(result, "output", None) or "")[:200]!r}. Refusing to '
+        f'score a failed call as an empty prediction.'
     )
 
 
-async def _live_adjudicate(prompt: str, project_root: Path) -> dict:
+async def _live_adjudicate(
+    prompt: str, project_root: Path, oauth_token: str | None = None,
+) -> dict:
     """Frontier (opus) adjudication for one haiku-vs-sonnet disagreement.
 
-    Returns ``{'winner': 'haiku'|'sonnet'|'tie'}`` — fail-safe to ``'tie'`` on a
-    missing / out-of-enum opus payload so a flaky judgement never crashes the
-    run (a tie is the neutral outcome for ``tally_adjudications``).
+    Returns ``{'winner': 'haiku'|'sonnet'|'tie'}``. *oauth_token* (the
+    account-pool token) authenticates the CLI subprocess. Fails LOUD on an
+    unsuccessful invocation (auth/cap/timeout) — a failed opus call must not be
+    silently counted as a neutral 'tie', which would understate
+    ``haiku_worse_fraction``. The ``'tie'`` fallback is retained ONLY for a
+    SUCCESSFUL call whose payload is missing / out-of-enum, so a genuinely
+    ambiguous judgement never crashes the run. A transient failure is retried
+    (``LIVE_RETRIES`` attempts, brief backoff) before going loud.
     """
     from orchestrator.agents.invoke import invoke_agent
-    result = await invoke_agent(
-        prompt=prompt,
-        system_prompt=(
-            'You are an impartial adjudicator comparing two file-prediction '
-            'candidates against ground truth. Answer with a single winner.'
-        ),
-        cwd=project_root,
-        model='opus',
-        output_schema=ADJUDICATION_SCHEMA,
-        allowed_tools=[],
-        effort='low',
-        max_turns=2,
-        max_budget_usd=1.0,
-    )
+    result: Any = None
+    for attempt in range(LIVE_RETRIES + 1):
+        result = await invoke_agent(
+            prompt=prompt,
+            system_prompt=(
+                'You are an impartial adjudicator comparing two file-prediction '
+                'candidates against ground truth. Answer with a single winner.'
+            ),
+            cwd=project_root,
+            model='opus',
+            output_schema=ADJUDICATION_SCHEMA,
+            allowed_tools=[],
+            effort='low',
+            max_turns=2,
+            max_budget_usd=1.0,
+            oauth_token=oauth_token,
+        )
+        if getattr(result, 'success', False):
+            break
+        if attempt < LIVE_RETRIES:
+            await asyncio.sleep(LIVE_RETRY_BACKOFF_SECS * (attempt + 1))
+    else:
+        raise RuntimeError(
+            f'opus adjudication FAILED after {LIVE_RETRIES + 1} attempts '
+            f'(success={getattr(result, "success", None)}, '
+            f'subtype={getattr(result, "subtype", None)!r}, '
+            f'timed_out={getattr(result, "timed_out", None)}, '
+            f'account={getattr(result, "account_name", None)!r}): '
+            f'{(getattr(result, "output", None) or "")[:200]!r}. Refusing to '
+            f'count a failed adjudication as a neutral tie.'
+        )
     payload = getattr(result, 'structured_output', None) or {}
     winner = payload.get('winner')
     if winner not in ('haiku', 'sonnet', 'tie'):
         winner = 'tie'
     return {'winner': winner}
+
+
+async def _prefetch_live(
+    eligible: list,
+    top_level_dirs: list,
+    project_root: Path,
+    oauth_token: str | None,
+    concurrency: int,
+) -> tuple[dict, dict]:
+    """Concurrently pre-warm tagger + adjudication results (throughput only).
+
+    Returns two caches — ``pred_cache[(prompt, model)] -> AgentResult`` and
+    ``adj_cache[adjudication_prompt] -> {'winner': ...}`` — populated by fanning
+    the INDEPENDENT live calls out under a ``concurrency``-bounded semaphore
+    (bounded so the single pool account is not overrun). The caches are a PURE
+    OPTIMIZATION: ``run_trial`` stays the source of truth for which calls matter,
+    and ``main``'s ``invoke_fn`` / ``adjudicate_fn`` fall back to a live call on
+    any cache miss — so a mis-warmed key degrades to slower, never to wrong.
+
+    Phase 2 selects adjudications with the EXACT predicate ``run_trial`` uses
+    (sanitized-set inequality on the same parsed predictions) and builds the
+    prompt with the same ``build_adjudication_prompt`` call, so the pre-warmed
+    key matches the one ``run_trial`` will request — a cache hit, not a miss.
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    # Phase 1 — tagger predictions (haiku + sonnet) for every eligible task.
+    pred_cache: dict = {}
+
+    async def _tag(prompt: str, model: str) -> None:
+        async with sem:
+            pred_cache[(prompt, model)] = await _live_invoke(
+                prompt, model, project_root, oauth_token,
+            )
+
+    tagger_jobs = []
+    for task in eligible:
+        prompt = faithful_prompt_for(task, top_level_dirs)
+        tagger_jobs.append(_tag(prompt, 'haiku'))
+        tagger_jobs.append(_tag(prompt, 'sonnet'))
+    await asyncio.gather(*tagger_jobs)
+
+    # Phase 2 — opus adjudication ONLY for sanitized-set disagreements.
+    adj_cache: dict = {}
+
+    async def _adj(prompt: str) -> None:
+        async with sem:
+            adj_cache[prompt] = await _live_adjudicate(
+                prompt, project_root, oauth_token,
+            )
+
+    adj_jobs = []
+    for task in eligible:
+        gold = (task.get('metadata') or {}).get('files') or []
+        prompt = faithful_prompt_for(task, top_level_dirs)
+        haiku_files = parse_predictions(pred_cache[(prompt, 'haiku')])
+        sonnet_files = parse_predictions(pred_cache[(prompt, 'sonnet')])
+        haiku_set = set(sanitize_files_for_persist(list(haiku_files)))
+        sonnet_set = set(sanitize_files_for_persist(list(sonnet_files)))
+        if haiku_set != sonnet_set:
+            adj_jobs.append(_adj(
+                build_adjudication_prompt(task, haiku_files, sonnet_files, gold)
+            ))
+    await asyncio.gather(*adj_jobs)
+
+    return pred_cache, adj_cache
 
 
 def main() -> int:
@@ -738,21 +893,48 @@ def main() -> int:
     parser.add_argument('--all', action='store_true',
                         help='replay the FULL eligible corpus instead of a '
                              'bounded recent sample (expensive — opt-in)')
+    parser.add_argument('--oauth-token-env', default=OAUTH_TOKEN_ENV,
+                        help='env var holding the account-pool OAuth token for '
+                             'live calls (default: %(default)s; reviewer_trial '
+                             'convention — a standalone run has no usage_gate slot)')
+    parser.add_argument('--concurrency', type=int, default=DEFAULT_CONCURRENCY,
+                        help='max concurrent live calls when pre-warming the '
+                             'sample (default: %(default)s; bounded to spare the '
+                             'single pool account)')
     args = parser.parse_args()
 
     project_root = Path(args.project_root)
     out_path = Path(args.out) if args.out else project_root / REPORT_REL_PATH
+
+    oauth_token = _resolve_oauth_token(args.oauth_token_env)
 
     tasks = asyncio.run(load_done_tasks(project_root, args.server_url))
     size = None if args.all else args.sample_size
     tasks = select_trial_sample(tasks, size)
     dirs = current_top_level_dirs(project_root)
 
+    # Pre-warm all independent live calls concurrently (throughput only); the
+    # caches are best-effort and invoke_fn/adjudicate_fn fall back to a live
+    # call on any miss, so run_trial stays the source of truth.
+    eligible = [t for t in tasks if _eligible_for_trial(t)]
+    print(f'Pre-warming {len(eligible)} eligible tasks '
+          f'(~{2 * len(eligible)} tagger calls + adjudications) '
+          f'at concurrency={args.concurrency}…')
+    pred_cache, adj_cache = asyncio.run(
+        _prefetch_live(eligible, dirs, project_root, oauth_token, args.concurrency)
+    )
+
     def invoke_fn(prompt: str, model: str) -> Any:
-        return asyncio.run(_live_invoke(prompt, model, project_root))
+        cached = pred_cache.get((prompt, model))
+        if cached is not None:
+            return cached
+        return asyncio.run(_live_invoke(prompt, model, project_root, oauth_token))
 
     def adjudicate_fn(prompt: str) -> dict:
-        return asyncio.run(_live_adjudicate(prompt, project_root))
+        cached = adj_cache.get(prompt)
+        if cached is not None:
+            return cached
+        return asyncio.run(_live_adjudicate(prompt, project_root, oauth_token))
 
     result = run_trial(tasks, dirs, invoke_fn, adjudicate_fn)
 
