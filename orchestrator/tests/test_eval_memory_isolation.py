@@ -196,7 +196,7 @@ async def test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config(tmp_p
 
     captured: dict = {}
 
-    def _rec(config, task, base_config=None, *, memory_endpoint=None, judge_config=None):
+    def _rec(config, task, base_config=None, *, memory_endpoint=None, judge_config=None, worktree=None):
         captured['memory_endpoint'] = memory_endpoint
         raise _Sentinel
 
