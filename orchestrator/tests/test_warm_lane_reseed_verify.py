@@ -32,6 +32,7 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
 )
+
 # Two distinct LaneState enums: the pure in-memory pool state machine
 # (FREE/ASSIGNED) that ``warm_lane_pool.state()`` returns, and the durable
 # LaneLifecycle record state (SEED/REGISTERED/ASSIGNED/…) that

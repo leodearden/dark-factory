@@ -7535,9 +7535,8 @@ class TestCreateWorktreeWarmLaneRouting:
         with patch.object(
             git_ops, 'acquire_warm_lane',
             AsyncMock(return_value=WarmLaneUnavailable.RESEED_CONTAMINATED),
-        ):
-            with pytest.raises(WarmLaneReseedContaminated):
-                await git_ops.create_worktree('B')
+        ), pytest.raises(WarmLaneReseedContaminated):
+            await git_ops.create_worktree('B')
         assert not cold_path.exists(), (
             f'Cold dir {cold_path} must NOT be created on reseed contamination'
         )
