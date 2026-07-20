@@ -3995,3 +3995,42 @@ class TestMultipleCoOpenL1Resolution:
         queue.resolve('esc-T-2', 'human unblocked post_merge_verify')
         assert queue.has_open_l1('T') is False
         assert queue.has_open_l1('T', category='post_merge_verify') is False
+
+
+class TestAtomicWriteDurability:
+    """`_atomic_write` gains an optional `durable` kwarg forwarding to
+    `_atomic_write_path`'s existing fsync branch (queue.py:1099-1136) — the
+    same durability guarantee `_write_seq_counter` already uses (queue.py:
+    1198-1205). Task 2846: a just-filed born-at-L2 escalation must be at
+    least as crash-durable as the seq counter that names it.
+    """
+
+    def test_atomic_write_durable_kwarg_fsyncs_file_and_dir(self, tmp_path: Path):
+        """durable=True fsyncs the temp-file fd before rename and the
+        containing-directory fd after rename; omitting `durable` preserves
+        the existing non-durable (zero-fsync) default for backward
+        compatibility with resolve()/submit_resolved()/_rewrite().
+
+        RED on main: _atomic_write() does not yet accept a `durable` keyword
+        argument at all, so the durable=True call raises TypeError.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with patch('escalation.queue.os.fsync', wraps=os.fsync) as fsync_spy:
+            queue._atomic_write('esc-9-1', '{}', durable=True)
+
+        assert fsync_spy.call_count >= 2, (
+            f'Expected >=2 fsync calls (temp-file fd + dir fd) for durable=True, '
+            f'got {fsync_spy.call_count}'
+        )
+        written_path = tmp_path / 'queue' / 'esc-9-1.json'
+        assert written_path.exists()
+        assert written_path.read_text() == '{}'
+
+        with patch('escalation.queue.os.fsync', wraps=os.fsync) as fsync_spy2:
+            queue._atomic_write('esc-9-2', '{}')
+
+        assert fsync_spy2.call_count == 0, (
+            f'Expected 0 fsync calls when durable is omitted (default), '
+            f'got {fsync_spy2.call_count}'
+        )
