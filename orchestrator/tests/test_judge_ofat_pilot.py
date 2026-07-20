@@ -15,6 +15,9 @@ non-inferiority margin is an exposed policy parameter, never an asserted bound).
 
 from __future__ import annotations
 
+import importlib.util
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -361,3 +364,83 @@ class TestAnalyzeJudgeOfat:
         assert decision.verdict == 'adopt'
         assert decision.escalate is False
         assert decision.cheaper is True
+
+
+# ---------------------------------------------------------------------------
+# step-9/10 — scripts/run_judge_ofat_pilot.py CLI, --analyze-only path only
+# (hermetic). The --run live path spawns real workflows and is NOT unit-tested by
+# design. The exit code reflects the verdict (0=adopt, non-zero otherwise) so an
+# operator/CI can gate the models.judge flip on the process result.
+# ---------------------------------------------------------------------------
+
+_CLI_PATH = Path(__file__).resolve().parents[2] / 'scripts' / 'run_judge_ofat_pilot.py'
+
+
+def _load_cli():
+    """Load the operator CLI from its scripts/ path (scripts/ is not importable)."""
+    spec = importlib.util.spec_from_file_location('_run_judge_ofat_pilot', _CLI_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _write_result(results_dir: Path, task_id: str, config: str, *, quality: float, cost_usd: float):
+    """Persist one judge EvalResult JSON in the {task}__{config}__{run_id}.json shape."""
+    from orchestrator.evals.runner import EvalResult
+
+    r = EvalResult(
+        task_id, config, 'done',
+        {
+            'composite_score': quality,
+            'tests_pass': True,
+            'role_under_test': 'judge',
+            'cost_usd': cost_usd,
+            'workflow_duration_ms': 1000,
+        },
+        '/tmp/wt',
+        run_id='r1',
+    )
+    path = results_dir / f'{task_id}__{config}__{r.run_id}.json'
+    path.write_text(json.dumps(r.to_dict()))
+
+
+def _seed(results_dir: Path, *, haiku_quality: float):
+    # 3 fixtures × {judge-sonnet(q=0.9,cost=1.0), judge-haiku(cost=0.5)}; the
+    # haiku quality is the only knob that flips adopt↔reject.
+    for fx in ('fix1', 'fix2', 'fix3'):
+        _write_result(results_dir, fx, 'judge-sonnet', quality=0.9, cost_usd=1.0)
+        _write_result(results_dir, fx, 'judge-haiku', quality=haiku_quality, cost_usd=0.5)
+
+
+class TestCliAnalyzeOnly:
+    def test_adopt_writes_report_and_exit_zero(self, tmp_path):
+        results_dir = tmp_path / 'results'
+        results_dir.mkdir()
+        _seed(results_dir, haiku_quality=0.9)  # equal quality, cheaper → adopt
+        out = tmp_path / 'report.md'
+
+        rc = _load_cli().main(
+            ['--analyze-only', '--results-dir', str(results_dir), '--out', str(out)],
+        )
+
+        assert rc == 0
+        text = out.read_text()
+        assert 'adopt' in text
+        assert 'models.judge: sonnet -> haiku' in text
+
+    def test_reject_exits_nonzero(self, tmp_path):
+        results_dir = tmp_path / 'results'
+        results_dir.mkdir()
+        _seed(results_dir, haiku_quality=0.3)  # much worse quality → reject
+        out = tmp_path / 'report.md'
+
+        rc = _load_cli().main(
+            ['--analyze-only', '--results-dir', str(results_dir), '--out', str(out)],
+        )
+
+        assert rc != 0
+        text = out.read_text()
+        assert 'reject' in text
+        # A reject must NOT recommend the flip.
+        assert 'models.judge: sonnet -> haiku' not in text
