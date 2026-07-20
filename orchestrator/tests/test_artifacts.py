@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -629,6 +630,73 @@ class TestAgentSession:
         }
         (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_null))
         assert artifacts.read_agent_session() is None
+
+
+class TestEmittedStepEscalations:
+    """Durable cross-restart dedup for orphaned done-step escalations (task 2764).
+
+    ``_reconcile_done_step_commits`` files a non-blocking info escalation for a
+    done-step commit orphaned by a rebase that can be neither WIP-filename-matched
+    nor patch-id/unique-subject-remapped.  The in-memory flood guard is
+    process-local, so an orchestrator restart re-files every prior pair.  These
+    emitted ``(step_id, stale_commit)`` keys are persisted to
+    ``reconcile_state.json`` in the meta-root and hydrated on the next run so a
+    restarted workflow files at most genuinely-new pairs.  This mirrors the
+    ``TestAgentSession`` read/write/corrupt-fail-safe structure.
+    """
+
+    def test_read_returns_empty_set_when_missing(self, artifacts: TaskArtifacts):
+        assert artifacts.read_emitted_step_escalations() == set()
+
+    def test_append_then_read_roundtrip(self, artifacts: TaskArtifacts):
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
+
+    def test_append_same_pair_is_idempotent(self, artifacts: TaskArtifacts):
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
+
+    def test_append_same_pair_skips_redundant_write(self, artifacts: TaskArtifacts):
+        # Efficiency (task 2764 amend): a redundant append for an
+        # already-persisted pair short-circuits to a pure read and skips the
+        # disk rewrite entirely (dedup-before-write). Deterministic spy on
+        # ``_write_json`` rather than mtime (coarse fs resolution is a weak
+        # regression guard).
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        with patch.object(
+            artifacts, '_write_json', wraps=artifacts._write_json
+        ) as spy:
+            artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        spy.assert_not_called()
+        # Content is unchanged and still readable after the skipped write.
+        assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
+
+    def test_append_distinct_pairs_accumulate(self, artifacts: TaskArtifacts):
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        artifacts.append_emitted_step_escalation('step-2', 'def456')
+        assert artifacts.read_emitted_step_escalations() == {
+            ('step-1', 'abc123'),
+            ('step-2', 'def456'),
+        }
+
+    def test_read_returns_empty_set_on_corrupt_json(self, artifacts: TaskArtifacts):
+        # Fail-safe: unreadable JSON reads as an empty set (mirrors
+        # ``test_read_returns_none_on_corrupt_json`` for the agent-session sidecar).
+        (artifacts.root / 'reconcile_state.json').write_text('{not valid json')
+        assert artifacts.read_emitted_step_escalations() == set()
+
+    def test_survives_restart_new_instance_same_root(
+        self, artifacts: TaskArtifacts, worktree: Path
+    ):
+        """RESTART SURVIVAL: a fresh TaskArtifacts on the same root (as a
+        restarted orchestrator constructs a new workflow + artifacts) reads back
+        the pair persisted by the prior instance."""
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        # A brand-new TaskArtifacts on the SAME worktree resolves to the SAME
+        # meta-root, so the durable store survives the "restart".
+        restarted = TaskArtifacts(worktree)
+        assert restarted.read_emitted_step_escalations() == {('step-1', 'abc123')}
 
 
 class TestVerdicts:

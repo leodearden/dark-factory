@@ -1018,6 +1018,89 @@ class TaskArtifacts:
             return None
 
     # ──────────────────────────────────────────────────────────────────
+    # Reconcile-state sidecar — durable, cross-restart dedup for the
+    # orphaned-done-step info escalations filed by
+    # TaskWorkflow._reconcile_done_step_commits (task 2764).
+    #
+    # The workflow's in-memory (step_id, stale_commit) flood guard is
+    # process-local, so an orchestrator restart re-files every prior pair.
+    # These emitted keys are persisted here in the meta-root (which survives
+    # worktree resets AND process restarts) and hydrated into the in-memory
+    # set on the workflow's first reconcile pass, so a restarted orchestrator
+    # files at most genuinely-new pairs.
+    # ──────────────────────────────────────────────────────────────────
+
+    def read_emitted_step_escalations(self) -> set[tuple[str, str]]:
+        """Return the set of ``(step_id, stale_commit)`` orphaned-done-step
+        escalation keys already filed for this task, persisted across restarts.
+
+        Stored at ``self.root/reconcile_state.json`` (beside plan.json in the
+        meta-root).  JSON has no set/tuple types, so the on-disk shape is
+        ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
+        2-element list is re-tupled here and malformed entries are skipped.
+
+        Fail-safe: a missing file, corrupt/unreadable JSON, or a non-object
+        payload all return an empty ``set`` (mirrors ``read_agent_session``),
+        so a corrupt sidecar re-files rather than silently suppressing.
+        """
+        path = self._read_path('reconcile_state.json')
+        if not path.exists():
+            return set()
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning('Corrupt reconcile_state.json at %s: %s', path, exc)
+            return set()
+        if not isinstance(data, dict):
+            logger.warning(
+                'Malformed reconcile_state.json at %s: not an object', path
+            )
+            return set()
+        result: set[tuple[str, str]] = set()
+        for entry in data.get('emitted_done_step_escalations', []):
+            # Each entry must be a 2-element [step_id, commit] list of strings;
+            # skip anything malformed rather than raising (fail-safe read).
+            if (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and all(isinstance(x, str) for x in entry)
+            ):
+                result.add((entry[0], entry[1]))
+        return result
+
+    def append_emitted_step_escalation(
+        self, step_id: str, stale_commit: str
+    ) -> None:
+        """Durably record that a ``(step_id, stale_commit)`` orphaned-done-step
+        escalation was filed, so a restarted workflow does not re-file it.
+
+        Read-modify-write: reads the current set via
+        :meth:`read_emitted_step_escalations`, adds the pair, and rewrites
+        ``reconcile_state.json`` with the keys serialized as a sorted list of
+        2-element lists (stable diffs; JSON has no set/tuple types).
+
+        Idempotent *without* redundant disk work (task 2764 amend): if the pair
+        is already persisted, return early and skip the rewrite entirely, so a
+        repeat append — or a caller that forgets the workflow's in-memory flood
+        guard — costs one read and no write.  This dedup-before-write preserves
+        the escalate-first-then-persist ordering: the early return fires only
+        when a prior persist already succeeded, so a genuinely-new pair (the
+        only case the caller normally reaches) is never skipped.
+        """
+        keys = self.read_emitted_step_escalations()
+        if (step_id, stale_commit) in keys:
+            return
+        keys.add((step_id, stale_commit))
+        self._write_json(
+            self.root / 'reconcile_state.json',
+            {
+                'emitted_done_step_escalations': sorted(
+                    [k[0], k[1]] for k in keys
+                )
+            },
+        )
+
+    # ──────────────────────────────────────────────────────────────────
     # Verdict artifacts — written by the per-worktree verdict-tools MCP
     # server (task 2481). One file per role under verdicts/<role>.json;
     # the role-derived filename is authoritative (never an agent-supplied
