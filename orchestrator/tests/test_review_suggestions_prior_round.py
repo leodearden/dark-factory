@@ -163,3 +163,52 @@ class TestPartitionByDecisions:
     def test_empty_current_returns_empty_pair(self):
         """(d) Empty current → ([], [])."""
         assert self._fn()([], []) == ([], [])
+
+
+class TestBuildResettledAdjudicatorPrompt:
+    """``build_resettled_adjudicator_prompt(current, prior_settled)`` — prompt."""
+
+    @staticmethod
+    def _fn():
+        from orchestrator.review_suggestions.prior_round import (
+            build_resettled_adjudicator_prompt,
+        )
+        return build_resettled_adjudicator_prompt
+
+    def test_includes_current_descriptions_and_locations(self):
+        """(a) Each current suggestion's description + location is embedded."""
+        current = [
+            _issue('suggestion', 'current-desc-alpha', location='src/a.py:10'),
+            _issue('suggestion', 'current-desc-beta', location='src/b.py:20'),
+        ]
+        prior = [_issue('suggestion', 'prior-desc-gamma', location='src/c.py:30')]
+        prompt = self._fn()(current, prior)
+        assert 'current-desc-alpha' in prompt
+        assert 'current-desc-beta' in prompt
+        assert 'src/a.py:10' in prompt
+        assert 'src/b.py:20' in prompt
+
+    def test_includes_prior_settled_descriptions(self):
+        """(b) Each prior-round settled suggestion's description is embedded."""
+        current = [_issue('suggestion', 'cur')]
+        prior = [
+            _issue('suggestion', 'prior-desc-one'),
+            _issue('suggestion', 'prior-desc-two'),
+        ]
+        prompt = self._fn()(current, prior)
+        assert 'prior-desc-one' in prompt
+        assert 'prior-desc-two' in prompt
+
+    def test_references_decision_vocabulary(self):
+        """(c) The SETTLED/NOT_SETTLED/INCONCLUSIVE vocabulary is present."""
+        from orchestrator.review_suggestions.prior_round import (
+            INCONCLUSIVE,
+            NOT_SETTLED,
+            SETTLED,
+        )
+        prompt = self._fn()(
+            [_issue('suggestion', 'c')], [_issue('suggestion', 'p')]
+        )
+        assert SETTLED in prompt
+        assert NOT_SETTLED in prompt
+        assert INCONCLUSIVE in prompt
