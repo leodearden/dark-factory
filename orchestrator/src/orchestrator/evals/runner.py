@@ -107,6 +107,7 @@ def build_eval_orch_config(
     memory_endpoint: str | None = None,
     architect_config: EvalConfig | None = None,
     judge_config: EvalConfig | None = None,
+    worktree: Path | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
@@ -153,6 +154,15 @@ def build_eval_orch_config(
     only ``fused_memory.url`` (preserving ``project_id`` and every other
     fused-memory leaf), so ``self.mcp.url`` — the single leaf every
     ``_write_*_to_memory`` POST funnels through — becomes the sink.
+
+    ``worktree`` (task 2851): the eval worktree whose ``.python-version`` sources
+    the verify ``UV_PYTHON`` pin (BUG 2a). The three eval executors thread the
+    worktree they created at the fixture's ``pre_task_commit`` — the SAME tree
+    ``snapshots._eval_setup_env`` reads for the setup ``uv sync`` — so setup and
+    verify agree on the interpreter even if the fixture's pinned commit diverges
+    from the target's current HEAD. Left ``None`` (every non-eval caller), the pin
+    source stays the target ``project_root``'s current HEAD, byte-identical to
+    today (the P1/B1 parity tripwire and the project_root pin tests hold).
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
@@ -243,7 +253,22 @@ def build_eval_orch_config(
     # LAST in verify._target_subprocess_env (wins) and survives
     # effective_verify_env, so the pin reaches every verify subprocess. Absent a
     # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
-    pin = read_python_pin(Path(task.get('project_root', str(base.project_root))))
+    #
+    # pin_source is the eval WORKTREE when the executor threads one (task 2851) —
+    # the SAME tree snapshots._eval_setup_env reads for the setup `uv sync`, so
+    # setup and verify agree on the interpreter even if a fixture's
+    # pre_task_commit .python-version diverges from the target's current HEAD
+    # (closing the setup/verify split task 2847 BUG 2 removed). Left None (every
+    # non-eval caller), pin_source stays the target project_root's current HEAD —
+    # byte-identical to today. When a worktree IS threaded but has no
+    # .python-version, read_python_pin returns None → inject nothing; there is NO
+    # fallback to project_root (a fallback would resurrect the very split above).
+    pin_source = (
+        worktree
+        if worktree is not None
+        else Path(task.get('project_root', str(base.project_root)))
+    )
+    pin = read_python_pin(pin_source)
     if pin is not None:
         update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
     # D8: an explicit recording endpoint layers over the profile's null
