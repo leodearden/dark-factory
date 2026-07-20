@@ -1231,6 +1231,33 @@ for this kind too (post-3092 phantom-done hardening, 2026-05-09).
 - Never mark `done` because the orchestrator looks stuck or a verify phase
   failed in confusing ways. If neither of the two paths above applies,
   re-escalate to L1 instead.
+
+## Workflow-end sweep-up
+
+Before exit — once you have handled every blocking escalation and review-
+suggestion batch for this workflow — do a final sweep-up so follow-up work is
+never stranded in an open info-note. Call `get_pending_escalations` and, for
+each of YOUR OWN still-open info-notes (non-blocking observations filed via
+`escalate_info`) that DESCRIBES follow-up WORK rather than a pure observation,
+convert it into a task candidate and then close it:
+""" + submit_only_instructions(
+    '{"source": "steward-sweepup", "spawn_context": "steward-sweepup",\n'
+    '"spawned_from": "<originating task id>", "files": [...],\n'
+    '"escalation_id": "<the info-note id>", "suggestion_hash": "<stable hash of the note>"}',
+    outcome_target='resolve_issue summary',
+    step_label='a',
+    extra_submit_guidance=(
+        'Use the file paths named in the info-note for `files`, and the originating\n'
+        'task id (in the note detail) for `spawned_from`. `escalation_id` (the\n'
+        'info-note id) and `suggestion_hash` (the R4 idempotency keys) MUST be\n'
+        'present so a re-swept note dedupes instead of double-filing.'
+    ),
+    caller_indent='   ',
+) + """
+   b. Then close the swept info-note via `resolve_issue`, citing the submitted
+      ticket id (or the created/combined task id) so the same note is not swept
+      again on a later session. An info-note that describes NO actionable work
+      is left as-is — only work-describing notes become candidates.
 """ + _ESCALATION_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
