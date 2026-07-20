@@ -18,7 +18,12 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
+from shared.prompt_artifact import (
+    ArtifactProvenance,
+    PromptArtifactStore,
+    compose_prompt,
+    default_artifacts_root,
+)
 
 from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
 from orchestrator.evals.prompt_opt import measure_repeatability_band, split_corpus
@@ -352,3 +357,70 @@ class TestSmokeCli:
         # pinned the smoke artifact THERE (proving isolation from the real
         # data/prompt_artifacts root — the gate never writes production state).
         assert artifacts_root.exists()
+
+
+class TestProductionRootGuard:
+    """run_acceptance_smoke REFUSES to pin into the PRODUCTION artifacts root.
+
+    The blocking review finding: the smoke leaves a SMOKE_QUALITY sentinel pin
+    under the reviewer's LIVE key (prompt_id + 'opus' + 'reviewer-v1'). Were
+    that pin written into the production root, the next real reviewer
+    invocation on 'opus' would resolve it as source='artifact' and silently
+    degrade production reviews. The guard refuses the EXACT production root
+    (matched post-.resolve()), fail-fast — before the loop runs and before
+    anything is written — and is exact-root only (a subdir is safe)."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_production_root_before_writing_anything(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prod_dir = tmp_path / 'prod'
+        # default_artifacts_root() returns Path(os.environ[...]) when the env
+        # var is set — point it at a tmp 'prod' dir so the guard is exercised
+        # hermetically, never against the real data/prompt_artifacts root.
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(prod_dir))
+        assert default_artifacts_root() == prod_dir
+
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None
+
+        # (a) awaiting the smoke on the production root raises ValueError
+        with pytest.raises(ValueError):
+            await run_acceptance_smoke(store_root=default_artifacts_root())
+
+        # (b) it raised BEFORE writing anything: nothing is pinned under the
+        # reviewer's live key, so the next REAL reviewer invocation on 'opus'
+        # resolves the in-code baseline — not a SMOKE_QUALITY artifact
+        resolved = PromptArtifactStore(prod_dir).resolve(
+            spec, _SMOKE_EXECUTOR_MODEL, _REVIEWER_PROMPT_HARNESS_VERSION
+        )
+        assert resolved.source == 'in_code'
+
+    @pytest.mark.asyncio
+    async def test_refuses_non_normalized_spelling_of_production_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prod_dir = tmp_path / 'prod'
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(prod_dir))
+
+        # (c) a non-normalized spelling of the SAME on-disk root (it .resolve()s
+        # back to prod_dir) is ALSO refused — pins the .resolve()-normalization
+        # choice, so a caller can't sidestep the guard with 'child/..'
+        sneaky = prod_dir / 'child' / '..'
+        assert sneaky.resolve() == prod_dir.resolve()
+        with pytest.raises(ValueError):
+            await run_acceptance_smoke(store_root=sneaky)
+
+    @pytest.mark.asyncio
+    async def test_isolated_root_distinct_from_production_still_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prod_dir = tmp_path / 'prod'
+        monkeypatch.setenv('DARK_FACTORY_PROMPT_ARTIFACTS', str(prod_dir))
+
+        # (d) a genuinely isolated root (!= prod_dir) still runs and returns an
+        # AcceptanceReport — the guard is EXACT-root only, NOT whole-subtree
+        scratch = tmp_path / 'scratch'
+        assert scratch.resolve() != prod_dir.resolve()
+        report = await run_acceptance_smoke(store_root=scratch, split_seed=2498)
+        assert isinstance(report, AcceptanceReport)
