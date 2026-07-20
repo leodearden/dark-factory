@@ -26,8 +26,8 @@ from shared.prompt_artifact import (
 )
 
 from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
-from orchestrator.evals.prompt_opt import measure_repeatability_band, split_corpus
-from orchestrator.evals.prompt_opt.__main__ import cli
+from orchestrator.evals.prompt_opt import measure_repeatability_band, smoke, split_corpus
+from orchestrator.evals.prompt_opt.__main__ import _SMOKE_DEFAULT_SPLIT_SEED, cli
 from orchestrator.evals.prompt_opt.smoke import (
     _SMOKE_EXECUTOR_MODEL,
     _SMOKE_OPTIMIZER_MODEL,
@@ -217,7 +217,7 @@ class TestRunAcceptanceSmoke:
         assert spec is not None
         assert report.contract_prefix_intact is True
         assert report.resolved_source == 'artifact'
-        assert report.resolved_text.startswith(spec.contract + '\n\n---\n\n')
+        assert report.resolved_text.startswith(spec.contract + smoke._CONTRACT_SEPARATOR)
 
 
 class TestLoaderRoundTripAndRollback:
@@ -264,7 +264,9 @@ class TestContractImmutabilityEndToEnd:
     async def test_malicious_loop_output_cannot_touch_contract(self, tmp_path: object) -> None:
         spec = REVIEWER_COMPREHENSIVE.prompt_spec
         assert spec is not None
-        separator = '\n\n---\n\n'
+        # Reference smoke's separator constant (the single source of truth
+        # within this package) rather than re-hardcoding the literal.
+        separator = smoke._CONTRACT_SEPARATOR
         # the separator does not occur inside the contract, so split() cleanly
         # isolates the contract prefix from the heuristics region
         assert separator not in spec.contract
@@ -357,6 +359,36 @@ class TestSmokeCli:
         # pinned the smoke artifact THERE (proving isolation from the real
         # data/prompt_artifacts root — the gate never writes production state).
         assert artifacts_root.exists()
+
+    def test_cli_default_split_seed_mirrors_library_default(self) -> None:
+        # __main__ keeps a local _SMOKE_DEFAULT_SPLIT_SEED mirror of the library
+        # default (so the light `smoke` command need not import the heavy smoke
+        # module just to read a decorator default). Nothing else pins the two
+        # equal, so a future edit to only one would silently diverge the CLI
+        # default from the library default with no failing test — this is that
+        # guard.
+        assert _SMOKE_DEFAULT_SPLIT_SEED == smoke._DEFAULT_SPLIT_SEED
+
+    def test_smoke_command_uses_default_split_seed_when_omitted(self, tmp_path: Path) -> None:
+        # Invoking `smoke` WITHOUT --split-seed must exercise the CLI's DEFAULT
+        # seed path (the other CLI tests all pass --split-seed explicitly, so
+        # the decorator default was never covered) and still run the gate to
+        # completion in an isolated root.
+        artifacts_root = tmp_path / 'artifacts'
+        runner = CliRunner()
+        result = runner.invoke(cli, ['smoke', '--artifacts-root', str(artifacts_root)])
+
+        assert result.exit_code == 0, (
+            f'Command exited with code {result.exit_code}.\nOutput:\n{result.output}'
+            + (f'\nException: {result.exception}' if result.exception else '')
+        )
+        # the default-seed run produced the gate report and pinned into the root
+        assert 'held_out_TEST_score' in result.output
+        assert 'CONTRACT untouched' in result.output
+        assert artifacts_root.exists()
+        # the banner reflects the CLI's default seed, proving the omitted-flag
+        # default path (not some other seed) actually ran.
+        assert f'split_seed={_SMOKE_DEFAULT_SPLIT_SEED}' in result.output
 
     def test_bare_smoke_command_does_not_touch_production(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
