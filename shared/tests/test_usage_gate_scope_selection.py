@@ -375,3 +375,58 @@ class TestScopeWaitNoFreeze:
         )
         assert lease is not None
         assert lease.name == 'a'  # returned in one call (no wait, no timeout)
+
+
+# ===========================================================================
+# Step 9 — scope_capacity_snapshot() -> dict[str, bool] (advisory; S8)
+# ===========================================================================
+
+
+class TestScopeCapacitySnapshot:
+    """``scope_capacity_snapshot()`` reports, per configured scoped model,
+    whether ANY account has headroom for that scope — the same admission
+    predicate ``before_invoke(scope=m)`` applies (S8). Pure read."""
+
+    def test_one_key_per_configured_scoped_model(self):
+        gate = make_gate(['a'])
+        # default scoped_cap_models == ['claude-fable-5']
+        assert set(gate.scope_capacity_snapshot()) == {SCOPE}
+
+    def test_true_when_any_account_has_scope_headroom(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
+        # B has fable headroom → snapshot True.
+        assert gate.scope_capacity_snapshot()[SCOPE] is True
+
+    def test_false_when_all_lack_scope_headroom(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        # A account-level capped; B fable-scope-capped future → no fable headroom.
+        gate._handle_cap_detected('r', now + timedelta(hours=1), a.token, scope=None)
+        set_scope_cap(b, resets_at=now + timedelta(hours=1), capped_at=now)
+        assert gate.scope_capacity_snapshot()[SCOPE] is False
+
+    def test_past_deadline_scope_cap_counts_as_headroom(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        now = datetime.now(UTC)
+        set_scope_cap(acct, resets_at=now - timedelta(seconds=5),
+                      capped_at=now - timedelta(hours=1))
+        # Snapshot agrees with the optimistic-uncap predicate (past deadline → headroom).
+        assert gate.scope_capacity_snapshot()[SCOPE] is True
+
+    def test_empty_scoped_cap_models_yields_empty_snapshot(self):
+        gate = make_gate(['a'], scoped_cap_models=[])
+        assert gate.scope_capacity_snapshot() == {}
+
+    def test_only_account_fable_capped_future_yields_false(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        now = datetime.now(UTC)
+        set_scope_cap(acct, resets_at=now + timedelta(hours=1), capped_at=now)
+        # Generally available, but the sole account has no fable headroom.
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate.scope_capacity_snapshot()[SCOPE] is False
