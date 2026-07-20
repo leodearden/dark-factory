@@ -28,6 +28,17 @@ Steps covered:
   step-7  GREEN — _coalesce_reentrant_drain resolves the twin's future +
                   emits a merge_coalesced event
 
+Amendment (reviewer_comprehensive, task 2852): ``_advance_if_at`` gained a
+``tolerate`` parameter so a *current* state is only coalesced as a benign
+no-op when the caller explicitly names it as a known-downstream state for
+that hop — an untolerated mismatch still escalates, preserving detection of
+a genuine wiring/ordering bug (``TestAdvanceIfAtToleratesOnlyNamedStates``).
+Also adds a regression proving a twin sharing a request_id with an original
+already at FINALIZING (the exact mr-99585bb8 double-finalize state) is
+coalesced upstream of ``_finalize_inflight`` entirely, so that method's own
+downstream hardcoded-from_state hops are never reached by this incident
+class (``test_twin_drain_at_finalizing_state_never_reaches_finalize_inflight``).
+
 This module imports orchestrator.merge_queue LOCALLY inside each test
 method (not at module scope) so a not-yet-implemented symbol (e.g.
 ``_advance_if_at``, before step-2) never breaks collection of the rest of
@@ -217,6 +228,12 @@ class TestAdvanceIfAt:
         """The exact double-finalize condition (SHARPER RCA mr-99585bb8):
         the registry is already at FINALIZING when ``_finalize_inflight``'s
         hop fires a second time for the same request_id.
+
+        Amendment (reviewer_comprehensive, task 2852): passes ``tolerate=``
+        matching ``_finalize_inflight``'s real call site exactly (the four
+        states it documents as reachable here) — a bare mismatch is no
+        longer unconditionally tolerated (see
+        ``TestAdvanceIfAtToleratesOnlyNamedStates`` below).
         """
         from orchestrator.merge_queue import ItemLifecycleState
 
@@ -228,13 +245,135 @@ class TestAdvanceIfAt:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             result = worker._advance_if_at(
-                rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING, live_obj=entry,
+                rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
+                live_obj=entry,
+                tolerate=frozenset({
+                    ItemLifecycleState.FINALIZING,
+                    ItemLifecycleState.MERGING,
+                    ItemLifecycleState.GATE_REVERIFY,
+                    ItemLifecycleState.TERMINAL,
+                }),
             )
 
         assert result is False
         assert worker._lifecycle.current(rid) == ItemLifecycleState.FINALIZING
         assert fake_eq.submitted == [], (
             f'tolerant no-op must NOT escalate: {fake_eq.submitted!r}'
+        )
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
+        assert rid in warnings[0].message
+
+
+@pytest.mark.asyncio
+class TestAdvanceIfAtToleratesOnlyNamedStates:
+    """Amendment (reviewer_comprehensive, task 2852): ``_advance_if_at``
+    must NOT treat every ``current != from_state`` mismatch as a benign
+    duplicate — only a *current* the caller explicitly names via
+    ``tolerate`` (or omits, meaning "none"). Anything else is a genuinely
+    earlier/off-path state — a real wiring/ordering bug — and must still
+    fall through to :meth:`_note_transition` and escalate, exactly as it
+    did before ``_advance_if_at`` existed. This scopes the noise-suppression
+    to the actual duplicate/re-entry case the SHARPER RCA targeted instead
+    of silently swallowing an unrelated ordering violation.
+    """
+
+    async def test_off_path_current_not_in_tolerate_still_escalates(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """current=DISPATCHING when the caller expects VERIFYING (and only
+        tolerates FINALIZING/MERGING/GATE_REVERIFY/TERMINAL, mirroring
+        ``_finalize_inflight``'s real call) is off-path, not downstream —
+        the entry has not even reached verify yet. Must escalate exactly
+        like the pre-``_advance_if_at`` hardcoded call would have.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        entry = _make_request('advance-offpath', 'advance-offpath', tmp_path, config)
+        rid = entry.request_id
+        worker._register_item(entry, initial=ItemLifecycleState.DISPATCHING)
+
+        result = worker._advance_if_at(
+            rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
+            live_obj=entry,
+            tolerate=frozenset({
+                ItemLifecycleState.FINALIZING,
+                ItemLifecycleState.MERGING,
+                ItemLifecycleState.GATE_REVERIFY,
+                ItemLifecycleState.TERMINAL,
+            }),
+        )
+
+        assert result is False
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.DISPATCHING, (
+            'a rejected transition must leave the registry state unchanged'
+        )
+        assert len(fake_eq.submitted) == 1, (
+            f'an off-path/untolerated mismatch must still escalate: {fake_eq.submitted!r}'
+        )
+        assert fake_eq.submitted[0].category == 'merge_lifecycle_transition_rejected'
+
+    async def test_off_path_current_with_no_tolerate_argument_still_escalates(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Default ``tolerate=frozenset()`` (the ``_buffer_owned_request``
+        call site never passes ``tolerate`` — its own pre-branching already
+        guarantees ``current == QUEUED``) keeps the strict pre-existing
+        behavior: ANY mismatch escalates.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        entry = _make_request('advance-strict', 'advance-strict', tmp_path, config)
+        rid = entry.request_id
+        worker._register_item(entry, initial=ItemLifecycleState.VERIFYING)
+
+        result = worker._advance_if_at(
+            rid, ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED, live_obj=entry,
+        )
+
+        assert result is False
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING
+        assert len(fake_eq.submitted) == 1
+        assert fake_eq.submitted[0].category == 'merge_lifecycle_transition_rejected'
+
+    async def test_tolerates_named_downstream_state_beyond_the_exact_hardcoded_case(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """current=MERGING (named in ``tolerate`` but distinct from the
+        FINALIZING case already covered by
+        ``TestAdvanceIfAt.test_tolerant_noop_at_finalize_seam_when_already_advanced``)
+        must ALSO coalesce as a benign no-op — proving ``tolerate`` is a
+        real set, not just a single-value special case.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+        entry = _make_request('advance-tolerate-merging', 'advance-tolerate-merging', tmp_path, config)
+        rid = entry.request_id
+        worker._register_item(entry, initial=ItemLifecycleState.MERGING)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._advance_if_at(
+                rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
+                live_obj=entry,
+                tolerate=frozenset({
+                    ItemLifecycleState.FINALIZING,
+                    ItemLifecycleState.MERGING,
+                    ItemLifecycleState.GATE_REVERIFY,
+                    ItemLifecycleState.TERMINAL,
+                }),
+            )
+
+        assert result is False
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.MERGING
+        assert fake_eq.submitted == [], (
+            f'a named-tolerated downstream state must NOT escalate: {fake_eq.submitted!r}'
         )
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
@@ -292,6 +431,53 @@ class TestBufferOwnedRequestDuplicateDrain:
         assert worker._live_items[rid] is original, (
             'the live original must not be displaced by the twin'
         )
+
+    async def test_twin_drain_at_finalizing_state_never_reaches_finalize_inflight(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """Amendment (reviewer_comprehensive, task 2852): the SHARPER RCA's
+        second cluster (mr-99585bb8) was a double-finalize — a request_id
+        whose registry state had already reached FINALIZING. This proves
+        that scenario is now closed off UPSTREAM of ``_finalize_inflight``
+        entirely: a twin sharing a request_id with an original already at
+        FINALIZING is coalesced right here at the drain chokepoint and
+        never gets buffered, dispatched, or given its own InflightEntry —
+        so it can never reach ``_finalize_inflight``'s downstream hardcoded-
+        from_state hops (FINALIZING -> MERGING, etc.) at all. This is why
+        those downstream hops do not need their own ``_advance_if_at``
+        wiring for THIS incident class: there is no second entry object left
+        to drive them re-entrantly once the twin is coalesced here.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = _make_worker(git_ops, escalation_queue=fake_eq)
+
+        original = _make_request('mr-twin-finalizing', 'mr-twin-finalizing-branch', tmp_path, config)
+        rid = original.request_id
+        worker._register_item(original, initial=ItemLifecycleState.FINALIZING)
+
+        twin = _make_request(
+            'mr-twin-finalizing', 'mr-twin-finalizing-branch', tmp_path, config, request_id=rid,
+        )
+
+        worker._buffer_owned_request(twin)
+
+        assert fake_eq.submitted == [], (
+            f'a duplicate drain onto an already-FINALIZING request_id must not '
+            f'escalate: {fake_eq.submitted!r}'
+        )
+        for lane, buf in worker._lane_buffers.items():
+            assert twin not in buf, f'twin must not be buffered in lane {lane!r}: {buf!r}'
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.FINALIZING, (
+            'registry must be untouched by the coalesced duplicate'
+        )
+        assert worker._live_items[rid] is original, (
+            'the live original must not be displaced by the twin — no second '
+            'InflightEntry is ever created for the twin, so _finalize_inflight '
+            'is never invoked a second time for this request_id'
+        )
+        assert twin.result.done() and twin.result.result().status == 'already_merged'
 
 
 # ---------------------------------------------------------------------------

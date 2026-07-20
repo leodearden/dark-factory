@@ -7161,13 +7161,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         to_state: ItemLifecycleState,
         *,
         live_obj: MergeRequest | SpeculativeItem | InflightEntry | None = None,
+        tolerate: frozenset[ItemLifecycleState] = frozenset(),
     ) -> bool:
         """Shared re-entry-tolerant forward-hop primitive (task 2852 /
         SHARPER RCA option B): fire ``from_state -> to_state`` for
         *request_id* iff the registry's CURRENT state actually equals
-        *from_state*; otherwise tolerate a benign no-op instead of routing a
-        stale/hardcoded *from_state* into :meth:`_note_transition`'s
-        rejection-and-escalation path.
+        *from_state*; otherwise tolerate a benign no-op — but ONLY when
+        *current* is a caller-named, already-reasoned-about downstream state
+        for this hop — instead of routing a stale/hardcoded *from_state*
+        into :meth:`_note_transition`'s rejection-and-escalation path.
 
         Mirrors :meth:`_note_requeue`'s read-``current()``-first discipline
         (the pattern the SHARPER RCA endorses): both offender call sites —
@@ -7181,21 +7183,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         logged loudly at WARNING — NOT escalated (escalating would
         re-introduce the exact noise this primitive removes).
 
+        *tolerate* names the ADDITIONAL registry states — besides
+        *from_state* itself — that the caller has confirmed are benign
+        already-advanced duplicates for THIS hop (e.g. `_finalize_inflight`
+        passes the states it documents as a tolerated double-finalize:
+        FINALIZING/MERGING/GATE_REVERIFY/TERMINAL). Defaults to empty, so a
+        caller that does not opt in keeps the strict pre-existing behavior
+        (any mismatch escalates).
+
+        A *current* that is neither *from_state* nor a member of *tolerate*
+        is deliberately NOT assumed benign — amendment review (task 2852)
+        flagged that treating EVERY mismatch as tolerable would also swallow
+        the opposite pathology: a genuinely earlier/off-path *current* (a
+        real wiring/ordering bug), which the pre-existing hardcoded-from_state
+        call would have surfaced as a loud escalation. A generic "is current
+        downstream of from_state" graph check cannot substitute for the
+        explicit allowlist here: ``_LEGAL_TRANSITIONS`` has legal backward/
+        lateral edges (the VERIFYING/DISPATCHING -> QUEUED requeue bounces,
+        the DISPATCHING <-> REDISPATCH_PARKED redispatch loop, the
+        VERIFYING <-> GATE_REVERIFY / GATE_REVERIFY <-> FINALIZING loops, the
+        MERGING <-> DISPATCHING cascade-remerge edges) that put almost every
+        non-TERMINAL state in one strongly-connected component — "reachable
+        forward from from_state" would therefore tolerate nearly anything,
+        defeating the point. So an untolerated mismatch falls through to
+        :meth:`_note_transition` with the ORIGINAL *from_state*/*to_state*
+        pair, exactly as before this helper existed: ``ItemLifecycle.
+        transition``'s own current-mismatch check raises, and the existing
+        best-effort-loud handling fires the escalation.
+
         Returns True iff the transition fired (delegated to
         :meth:`_note_transition`, so still best-effort-loud against a
-        genuine registry/edge violation); False on the tolerated no-op —
-        the registry is left completely untouched in that case (no
-        :meth:`_note_transition` call at all).
+        genuine registry/edge violation); False on a no-op — the registry is
+        left completely untouched in that case (no :meth:`_note_transition`
+        call at all) whether the no-op was tolerated (in *tolerate*) or is
+        about to be escalated by the fall-through below.
         """
         current = self._lifecycle.current(request_id)
         if current == from_state:
             self._note_transition(request_id, from_state, to_state, live_obj=live_obj)
             return True
-        logger.warning(
-            'ItemLifecycle: skipping re-entrant %s->%s for request_id=%s; '
-            'registry already at %s (tolerated benign no-op, NOT escalated)',
-            from_state, to_state, request_id, current,
-        )
+        if current in tolerate:
+            logger.warning(
+                'ItemLifecycle: skipping re-entrant %s->%s for request_id=%s; '
+                'registry already at %s (tolerated benign no-op, NOT escalated)',
+                from_state, to_state, request_id, current,
+            )
+            return False
+        # current is neither from_state nor a caller-tolerated downstream
+        # state for this hop — do NOT assume this is a harmless duplicate.
+        # Fall through with the ORIGINAL from_state so
+        # ItemLifecycle.transition's own current-mismatch check raises and
+        # _note_transition's best-effort-loud handling escalates, exactly as
+        # it did before this helper existed — a genuinely earlier/off-path
+        # state is a real wiring/ordering bug, not a tolerated re-entrant
+        # duplicate.
+        self._note_transition(request_id, from_state, to_state, live_obj=live_obj)
         return False
 
     def _entry_phase(self, entry: InflightEntry) -> str:
@@ -13244,10 +13286,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # double-finalize (this hop firing twice for the same request_id,
             # e.g. a re-entrant/duplicate finalize drive) now reads the
             # registry's CURRENT state first. When it is already past VERIFYING
-            # (FINALIZING/MERGING/GATE_REVERIFY/TERMINAL), the second hop
+            # and at one of the four states this method itself documents as
+            # reachable here (FINALIZING/MERGING/GATE_REVERIFY/TERMINAL —
+            # passed explicitly via `tolerate` below), the second hop
             # coalesces as a benign WARNING no-op instead of hitting
             # IllegalLifecycleTransition and firing a
-            # merge_lifecycle_transition_rejected escalation.
+            # merge_lifecycle_transition_rejected escalation. Any OTHER
+            # current state (QUEUED/LANE_BUFFERED/AWAITING_VERIFY/
+            # REDISPATCH_PARKED/DISPATCHING — this entry has not even
+            # reached verify yet) is NOT in `tolerate` and still escalates:
+            # that would be a genuine wiring/ordering bug, not a tolerated
+            # duplicate (amendment review, task 2852).
+            #
+            # Scope note (amendment review, task 2852): only THIS hop is
+            # wired through _advance_if_at. The downstream hardcoded-
+            # from_state _note_transition calls later in this method (e.g.
+            # FINALIZING -> MERGING / MERGING -> REDISPATCH_PARKED in the
+            # RUNNER_UNAVAILABLE branch, FINALIZING <-> GATE_REVERIFY in the
+            # CAS gate-retry loop) are UNCHANGED. That is safe for the
+            # incident this task actually fixes: the SHARPER RCA's twin
+            # (a distinct MergeRequest/InflightEntry object sharing a
+            # request_id with an already-live original) can no longer reach
+            # dispatch/verify/finalize AT ALL — `_buffer_owned_request`
+            # (see `_coalesce_reentrant_drain` below) now coalesces it at
+            # the drain chokepoint, before it is ever buffered, dispatched,
+            # or given its own InflightEntry. A literal second call to
+            # `_finalize_inflight` for the SAME entry object is likewise not
+            # a reachable call pattern today: every call site (the shutdown
+            # drain, the passthrough-inline branch, and FINALIZE-HEAD) pops
+            # the entry off its container immediately before the one call it
+            # makes. Should a future change introduce a path that invokes
+            # this method twice for one request_id, the downstream hops
+            # would need the same tolerate-aware treatment as this one —
+            # flagged here explicitly rather than silently assumed safe.
             if (
                 entry.passthrough_outcome is None
                 and entry.status not in (
@@ -13258,6 +13329,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._advance_if_at(
                     req.request_id, ItemLifecycleState.VERIFYING,
                     ItemLifecycleState.FINALIZING, live_obj=entry,
+                    tolerate=frozenset({
+                        ItemLifecycleState.FINALIZING,
+                        ItemLifecycleState.MERGING,
+                        ItemLifecycleState.GATE_REVERIFY,
+                        ItemLifecycleState.TERMINAL,
+                    }),
                 )
 
             # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
