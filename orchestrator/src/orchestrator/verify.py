@@ -3229,6 +3229,21 @@ def _resolve_concurrent_verify(
     return config.concurrent_verify
 
 
+def _resolve_sequential_lint_first(
+    config: OrchestratorConfig,
+    module_config: ModuleConfig | None,
+) -> bool:
+    """Return whether the merge-role sequential branch should run lint first.
+
+    Module override wins over top-level config.  Consulted only for the
+    merge-role sequential lint-first branch in ``run_verification`` (gated
+    additionally on ``role == 'merge'`` and ``not concurrent``).
+    """
+    if module_config is not None and module_config.sequential_lint_first is not None:
+        return module_config.sequential_lint_first
+    return config.sequential_lint_first
+
+
 def _resolve_verify_env(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
