@@ -36,3 +36,51 @@ async def test_cleanup_removes_sibling_relocated_meta_root(tmp_path):
     assert not meta_root.exists(), (
         'cleanup_eval_worktree left the sibling relocated meta root behind'
     )
+
+
+# ---------------------------------------------------------------------------
+# BUG 2b: pin the eval worktree `uv sync` to the worktree's own 3.13 venv and
+# scrub the orchestrator venv from its env (the 2026-05-29 ghost-venv incident).
+# read_python_pin / _eval_setup_env do not exist yet → ImportError until step-6.
+# ---------------------------------------------------------------------------
+
+def test_read_python_pin_reads_stripped_first_line(tmp_path):
+    from orchestrator.evals.snapshots import read_python_pin
+
+    (tmp_path / '.python-version').write_text('3.13\n')
+    assert read_python_pin(tmp_path) == '3.13'
+
+
+def test_read_python_pin_absent_returns_none(tmp_path):
+    from orchestrator.evals.snapshots import read_python_pin
+
+    assert read_python_pin(tmp_path) is None
+
+
+def test_eval_setup_env_scrubs_venv_and_pins_python(tmp_path, monkeypatch):
+    from orchestrator.evals.snapshots import _eval_setup_env
+
+    # Ambient orchestrator venv activation vars present (as under a live run).
+    monkeypatch.setenv('VIRTUAL_ENV', '/orchestrator/.venv')
+    monkeypatch.setenv('UV_PROJECT_ENVIRONMENT', '/orchestrator/.venv')
+    (tmp_path / '.python-version').write_text('3.13\n')
+
+    env = _eval_setup_env(tmp_path)
+
+    # Scrubbed of the orchestrator venv activation vars (the 2026-05-29
+    # ghost-venv hazard) via verify._target_subprocess_env.
+    assert 'VIRTUAL_ENV' not in env
+    assert 'UV_PROJECT_ENVIRONMENT' not in env
+    # Pinned to the worktree's own interpreter.
+    assert env['UV_PYTHON'] == '3.13'
+
+
+def test_eval_setup_env_no_pin_when_no_python_version(tmp_path, monkeypatch):
+    from orchestrator.evals.snapshots import _eval_setup_env
+
+    monkeypatch.setenv('VIRTUAL_ENV', '/orchestrator/.venv')
+    monkeypatch.delenv('UV_PYTHON', raising=False)
+    # No .python-version in the worktree → no UV_PYTHON injected (fail-safe).
+    env = _eval_setup_env(tmp_path)
+    assert 'UV_PYTHON' not in env
+    assert 'VIRTUAL_ENV' not in env
