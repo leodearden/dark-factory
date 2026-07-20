@@ -436,6 +436,13 @@ ARCHITECT_EVAL_CONFIGS = [
     EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
     EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role='architect'),
     EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+    # eval-revival π: the architect-fable candidate (serves
+    # fable-architect-eval-admission PRD τ1's hard-subset campaign gate).
+    # run_ofat_stage's architect branch (task 2478) already handles any
+    # role='architect' candidate — config-only, no runner edit. A
+    # 'architect-fable-max' variant is a tactical add only if the consumer
+    # campaign's effort-sensitivity screen calls for it (PRD open question 3).
+    EvalConfig('architect-fable-high', 'claude', 'claude-fable-5', 'high', role='architect'),
 ]
 
 
