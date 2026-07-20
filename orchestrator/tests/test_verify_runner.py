@@ -1066,6 +1066,27 @@ class TestRetryScopeEventFields:
         assert result['retry_subset_sizes']['gui'] == 0
         assert result['retry_subset_sizes']['nextest_debug'] == 0
 
+    def test_retry_scope_event_fields_nextest_read_degrades_honestly(self, tmp_path):
+        from orchestrator.verify_runner import retry_scope_event_fields
+
+        # Narrowed verify_env, but the debug filter path is MISSING and the
+        # release key is entirely ABSENT — INV-2 honest degrade to None (never a
+        # crash), while the comma-delimited run_all/gui still compute correctly.
+        verify_env = {
+            'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(tmp_path / 'missing.filter'),
+            # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
+        }
+        result = retry_scope_event_fields(verify_env)
+        assert result['retry_scope'] == 'failed_only'
+        sizes = result['retry_subset_sizes']
+        assert sizes['nextest_debug'] is None   # unreadable path → None
+        assert sizes['nextest_release'] is None  # absent key → None
+        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['gui'] == 1
+
 
 # ---------------------------------------------------------------------------
 # Step-7: build_merge_verify_spec
