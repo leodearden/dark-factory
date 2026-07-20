@@ -1104,6 +1104,31 @@ class UsageGate:
                 deadlines.append(deadline)
         return min(deadlines) if deadlines else None
 
+    def scope_capacity_snapshot(self) -> dict[str, bool]:
+        """Advisory per-scoped-model headroom snapshot (task γ, invariant S8).
+
+        For each model in ``config.scoped_cap_models``, True iff AT LEAST ONE
+        account has headroom for that scope, where headroom ==
+        ``(not acct.capped and not acct.auth_failed) and not
+        _scope_capped_at(acct, m, now)`` — the SAME admission
+        ``before_invoke(scope=m)`` applies, so the resolver's advisory snapshot
+        (threaded by δ) agrees with the gate's authoritative invoke-time
+        predicate; a stale snapshot degrades to a scope-wait/failover rather
+        than a wrong decision. Empty when ``scoped_cap_models`` is empty (the
+        kill switch); each model False when no account is configured. Pure read
+        — no sweep, no mutation (a read caller is never surprised by an
+        optimistic-uncap side effect).
+        """
+        now = datetime.now(UTC)
+        return {
+            m: any(
+                (not acct.capped and not acct.auth_failed)
+                and not self._scope_capped_at(acct, m, now)
+                for acct in self._accounts
+            )
+            for m in self._config.scoped_cap_models
+        }
+
     def _handle_cap_detected(
         self,
         reason: str,
