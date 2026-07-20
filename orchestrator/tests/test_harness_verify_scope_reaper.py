@@ -126,3 +126,81 @@ class TestRunLeftoverVerifyScopeReaperPass:
         assert errors, (
             'expected an ERROR log when reap_leftover_verify_scopes raises'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-09: an unconditional startup sweep runs once at run() startup, before
+# first dispatch (crash recovery on boot). Mirrors
+# test_harness_interactive_reaper.TestInteractiveReaperStartupSweep.
+# ---------------------------------------------------------------------------
+
+
+def _neutralise_heavy_startup(harness: Harness) -> None:
+    """Stub heavyweight startup/shutdown so the real run() loop is drivable.
+
+    Copied from test_harness_interactive_reaper._neutralise_heavy_startup —
+    every background-loop starter and external-server touchpoint is stubbed so
+    run() can be driven end-to-end against a bare tmp_path.
+    """
+    harness.mcp = MagicMock()
+    harness.mcp.start = AsyncMock()
+    harness.mcp.stop = AsyncMock()
+    harness.mcp.url = 'http://localhost:0'
+    harness.usage_gate = None
+    harness.review_checkpoint = None
+
+    harness._build_lifecycle_registry()
+    assert harness._lifecycle is not None
+    harness._lifecycle.start_all = AsyncMock()
+    harness._lifecycle.stop_all = AsyncMock()
+
+    harness._dismiss_stale_escalations = AsyncMock()
+    harness._rehydrate_merge_halt = MagicMock()
+    harness._file_restored_pause_escalation = MagicMock()
+    harness._tag_task_modules = AsyncMock()
+    harness._recover_crashed_tasks = AsyncMock()
+    harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+    harness._enforce_cost_ceilings = AsyncMock()
+
+
+class TestVerifyScopeReaperStartupSweep:
+    """An unconditional leftover-verify-scope reaper sweep runs once at
+    ``run()`` startup, before the first dispatch — crash recovery on boot.
+
+    RED until step-10 GREEN wires the unconditional startup call into run()
+    adjacent to ``_run_interactive_worktree_reaper_pass()``.
+    """
+
+    async def _drive_empty_until_idle_run(
+        self, harness: Harness, monkeypatch,
+    ) -> None:
+        """Drive run() to a clean, immediate exit on a drained empty tree."""
+        _neutralise_heavy_startup(harness)
+        harness.scheduler.acquire_next = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'1': 'pending'}, None),
+        )
+
+        async def fake_sleep(_secs, *args, **kwargs):
+            return
+
+        monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+        await harness.run(
+            prd_path=None, dry_run=False, force_dirty_start=True,
+            until_idle=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_startup_sweep_runs_once(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The leftover-verify-scope reaper pass is awaited exactly once during
+        run() startup (before first dispatch / scheduler.finish_startup)."""
+        harness, _rs = _make_harness(tmp_path)
+        mock_pass = AsyncMock(return_value=None)
+        harness._run_leftover_verify_scope_reaper_pass = mock_pass
+
+        await self._drive_empty_until_idle_run(harness, monkeypatch)
+
+        mock_pass.assert_awaited_once()
