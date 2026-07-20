@@ -135,7 +135,11 @@ async def _run_single_reviewer(
     a ``finally`` block; an injected *meta_root* is left untouched for the
     caller to inspect.
 
-    Returns (reviewer_name, review_dict_or_None, cost_usd).
+    Returns (reviewer_name, review_dict_or_None, cost_usd), where cost_usd is
+    the summed spend across every invocation attempt (not just the last):
+    a verdict-less attempt that triggers a retry still costs money, so
+    run_panel's total_cost_usd rollup would under-report multi-attempt trial
+    spend if only the final attempt's cost were returned (task 2493 amendment).
 
     Threads the spec's cross-family dispatch fields (``backend``,
     ``env_overrides``, and an ``os.environ``-resolved ``oauth_token`` from
@@ -154,6 +158,14 @@ async def _run_single_reviewer(
     cwd = diff.cwd or _DEFAULT_CWD
     owns_root = meta_root is None
     root = meta_root if meta_root is not None else Path(tempfile.mkdtemp(prefix='reviewer_trial_'))
+    # Sum spend across ALL invocation attempts, not just the last one: an
+    # attempt that invokes successfully but produces no valid verdict still
+    # costs money and triggers a retry, so overwriting (rather than
+    # accumulating) would silently drop that attempt's real spend from the
+    # returned cost (task 2493 amendment). The live-transport path makes such
+    # verdict-less retries more likely (a reviewer that never calls
+    # submit_review_verdict), so accumulate a running total.
+    total_cost = 0.0
     try:
         artifacts = TaskArtifacts(cwd, meta_root=root)
         mcp_config = {
@@ -206,9 +218,9 @@ async def _run_single_reviewer(
                     )
                     continue
                 logger.error('Reviewer %s failed after %d attempts: %s', spec.name, max_retries, exc)
-                return spec.name, None, 0.0
+                return spec.name, None, total_cost
 
-            cost = result.cost_usd
+            total_cost += result.cost_usd
 
             # Read the reviewer's structured verdict instead of the
             # structured_output/json.loads cascade (task 2493, mirrors task
@@ -220,7 +232,7 @@ async def _run_single_reviewer(
             envelope = artifacts.read_verdict(role.name)
             payload = envelope.get('verdict') if isinstance(envelope, dict) else None
             if result.success and isinstance(payload, dict) and payload.get('verdict') in {'PASS', 'ISSUES_FOUND'}:
-                return spec.name, payload, cost
+                return spec.name, payload, total_cost
 
             if attempt < max_retries:
                 logger.warning(
@@ -240,10 +252,10 @@ async def _run_single_reviewer(
                     f'Reviewer emitted no/invalid verdict after {max_retries} '
                     f'attempt(s) (result.success={result.success}).'
                 ),
-            }, cost
+            }, total_cost
 
         # Unreachable, but satisfy type checker
-        return spec.name, None, 0.0
+        return spec.name, None, total_cost
     finally:
         if owns_root:
             shutil.rmtree(root, ignore_errors=True)

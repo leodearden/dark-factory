@@ -105,6 +105,25 @@ def _make_verdict_writing_invoke(verdict: str = 'PASS', success: bool = True, wr
     return _invoke
 
 
+def _make_retry_then_succeed_invoke():
+    """Build an ``invoke_agent`` side effect that, on its FIRST call, invokes
+    successfully but writes NO verdict (forcing a retry), then on the second
+    call writes a valid PASS verdict. Both calls report a real ``cost_usd``,
+    so a correct runner must return the SUMMED spend across both attempts
+    (task 2493 amendment) rather than only the final attempt's cost.
+    """
+    calls = {'n': 0}
+    no_verdict = _make_verdict_writing_invoke(write=False)
+    with_verdict = _make_verdict_writing_invoke(verdict='PASS')
+
+    async def _invoke(**kwargs):
+        calls['n'] += 1
+        delegate = no_verdict if calls['n'] == 1 else with_verdict
+        return await delegate(**kwargs)
+
+    return _invoke
+
+
 class TestBuildReviewerPrompt:
     def test_contains_diff(self) -> None:
         prompt = _build_reviewer_prompt('--- a/f.py\n+++ b/f.py')
@@ -262,6 +281,34 @@ class TestRunSingleReviewerLiveTransport:
         assert name == 'r1'
         assert review is not None
         assert review['verdict'] == 'PASS'
+
+    @pytest.mark.asyncio
+    async def test_cost_accumulates_across_retries(self, tmp_path) -> None:
+        """A verdict-less first attempt (which still cost money) followed by a
+        successful retry must return the SUM of both attempts' cost, not just
+        the last attempt's — otherwise run_panel under-reports trial spend
+        (task 2493 amendment).
+        """
+        spec = ReviewerSpec(name='r1', model='sonnet', specialization='Testing.')
+        diff = CorpusDiff(
+            diff_id='d1', language='python', source='synthetic',
+            diff_text='diff', description='Test', ground_truth=[],
+        )
+
+        with patch(
+            'orchestrator.evals.reviewer_trial.runner.invoke_agent',
+            side_effect=_make_retry_then_succeed_invoke(),
+        ):
+            name, review, cost = await _run_single_reviewer(
+                spec, diff, max_retries=2, meta_root=tmp_path,
+            )
+
+        assert name == 'r1'
+        assert review is not None
+        assert review['verdict'] == 'PASS'
+        # attempt 1 (no verdict → retried) + attempt 2 (valid) each cost 0.50;
+        # the returned cost must sum BOTH, not report only the final 0.50.
+        assert cost == pytest.approx(1.0)
 
 
 class TestRunPanel:
