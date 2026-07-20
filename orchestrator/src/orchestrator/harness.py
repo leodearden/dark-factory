@@ -24,6 +24,7 @@ from shared.cli_invoke import (
 )
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
+from shared.task_metadata import RoutingState
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -134,6 +135,26 @@ logger = logging.getLogger(__name__)
 # constant so the value stays inside the declared module scope without
 # touching config.py / defaults.yaml.
 _REBLOCK_GUARD_THRESHOLD: int = 3
+
+
+def _bumped_routing_dump(metadata: Any, by: int = 1) -> dict[str, Any]:
+    """Return the ``metadata['routing']`` blob with ``routing_tier`` bumped by ``by``.
+
+    The single pure authority for the retry-escalation tier bump (task μ,
+    plans/adaptive-model-routing-prd.md Phase 4), reused by every bump site:
+    the terminal-failure auto-bump (``_maybe_bump_routing_tier``) and the
+    escalate_model by-id bump (``_bump_routing_tier_by_id``).
+
+    Reads via :meth:`RoutingState.from_metadata` (tolerant-degrade: a missing/
+    non-dict ``metadata`` or ``routing`` key yields a fresh ``RoutingState()``),
+    increments only ``routing_tier`` via ``model_copy`` — ``latest``/``history``/
+    ``simple_saturated`` and any ``extra`` fields ride through unchanged — and
+    serializes with ``model_dump()``. Because it only ever *adds*, the
+    harness-owned counter stays monotonic (invariant 8) even under a
+    last-write-wins ``metadata_mode='merge'`` race.
+    """
+    state = RoutingState.from_metadata(metadata if isinstance(metadata, dict) else None)
+    return state.model_copy(update={'routing_tier': state.routing_tier + by}).model_dump()
 
 # Fixed sentinel task_id for the dirty-project-root-at-startup born-at-L2
 # escalation (task 2380). Not a real task — _on_escalation only bumps a
