@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from orchestrator.agents.roles import AgentRole
+from orchestrator.config import default_price_table
 from orchestrator.evals.reviewer_trial.variants import (
     ALL_VARIANTS,
+    REVIEWER_REFRESH_VARIANTS,
     VARIANT_A,
     VARIANT_B,
     VARIANT_BASELINE,
     VARIANT_C,
+    VARIANT_CROSS_FAMILY,
     VARIANT_D,
+    VARIANT_SONNET5_SOLO,
     ReviewerSpec,
+    _SPEC_COMPREHENSIVE,
     build_trial_reviewer_role,
 )
 
@@ -140,3 +145,36 @@ class TestVariantDefinitions:
         for variant in ALL_VARIANTS:
             assert variant.description
             assert variant.name
+
+
+class TestRefreshVariants:
+    """The eval-revival κ refresh set: 1×Opus incumbent vs Sonnet-5 vs cross-family."""
+
+    def test_sonnet5_solo_single_comprehensive_sonnet(self) -> None:
+        assert len(VARIANT_SONNET5_SOLO.reviewers) == 1
+        reviewer = VARIANT_SONNET5_SOLO.reviewers[0]
+        assert reviewer.model == 'sonnet'
+        assert reviewer.specialization == _SPEC_COMPREHENSIVE
+
+    def test_cross_family_single_priced_non_claude(self) -> None:
+        assert len(VARIANT_CROSS_FAMILY.reviewers) == 1
+        reviewer = VARIANT_CROSS_FAMILY.reviewers[0]
+        # A non-Claude backend so its cost comes from the price table...
+        assert reviewer.backend != 'claude'
+        # ...and its model must be priced (non-sentinel cost by construction).
+        assert reviewer.model in default_price_table()
+        assert reviewer.specialization == _SPEC_COMPREHENSIVE
+
+    def test_refresh_set_order_and_incumbent(self) -> None:
+        assert REVIEWER_REFRESH_VARIANTS == [
+            VARIANT_A,
+            VARIANT_SONNET5_SOLO,
+            VARIANT_CROSS_FAMILY,
+        ]
+        # The incumbent (first) is the 1×Opus generalist.
+        assert REVIEWER_REFRESH_VARIANTS[0].reviewers[0].model == 'opus'
+
+    def test_refresh_variants_not_in_all_variants(self) -> None:
+        """Keeps `full`/`sweep` (which run ALL_VARIANTS) byte-identical."""
+        assert VARIANT_SONNET5_SOLO not in ALL_VARIANTS
+        assert VARIANT_CROSS_FAMILY not in ALL_VARIANTS
