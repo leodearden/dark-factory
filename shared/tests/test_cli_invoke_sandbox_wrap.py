@@ -182,7 +182,7 @@ async def test_invoke_with_cap_retry_forwards_sandbox_wrap_with_gate(tmp_path: P
         soonest_resets_at = None
 
         @contextlib.asynccontextmanager
-        async def invoke_slot(self):
+        async def invoke_slot(self, scope=None):
             yield slot
 
     await invoke_with_cap_retry(

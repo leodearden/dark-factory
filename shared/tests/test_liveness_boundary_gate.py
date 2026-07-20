@@ -321,7 +321,7 @@ class TestB4CapRetryGuardGated:
             cm.__aexit__ = _aexit
             return cm
 
-        gate.invoke_slot = MagicMock(side_effect=lambda: _make_slot_cm())
+        gate.invoke_slot = MagicMock(side_effect=lambda *_a, **_kw: _make_slot_cm())
 
         # invoke_fn returns success on the first call
         success_result = AgentResult(
