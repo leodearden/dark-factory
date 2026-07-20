@@ -20,6 +20,13 @@ import os
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+)
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit
 from shared.usage_gate import AccountPhase, InvokeSlot, UsageGate
@@ -322,3 +329,64 @@ class TestInvokeSlotScope:
 
         assert acct.phase == AccountPhase.CAPPED
         assert acct.scope_caps == {}
+
+
+# ===========================================================================
+# Step 7 — end-to-end β: invoke_with_cap_retry derives + threads scope
+# ===========================================================================
+
+
+async def _fake_cap_invoke(**kwargs) -> AgentResult:
+    """A heuristic-cap invoke_fn: zero-cost / instant / ≤1-turn / not-success.
+
+    Accepts arbitrary kwargs (oauth_token / config_dir / backend / model /
+    prompt) so it drops into invoke_with_cap_retry's dispatch. The empty
+    output+stderr classify as a non-cap Failure, so the heuristic safety net
+    fires ``slot.report(synthetic CapHit)`` — the deterministic β signal.
+    """
+    return AgentResult(success=False, output='', stderr='')
+
+
+class TestCliThreadsScope:
+    """``invoke_with_cap_retry`` derives the slot scope from the invoked model
+    (claude-backend only) and threads it to the write-half handlers (boundary
+    B1 write half; B8 non-claude bypass)."""
+
+    async def test_claude_scoped_cap_lands_on_scope_not_account(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        with pytest.raises(AllAccountsCappedException):
+            await invoke_with_cap_retry(
+                gate,
+                'lbl',
+                invoke_fn=_fake_cap_invoke,
+                backend='claude',
+                max_cap_retries=1,
+                model=SCOPE,
+                prompt='hi',
+            )
+
+        # Write half of B1: scoped cap recorded, account phase machine untouched.
+        assert acct.scope_caps[SCOPE].capped is True
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_non_claude_backend_bypasses_scope(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+
+        with pytest.raises(AllAccountsCappedException):
+            await invoke_with_cap_retry(
+                gate,
+                'lbl',
+                invoke_fn=_fake_cap_invoke,
+                backend='codex',
+                max_cap_retries=1,
+                model=SCOPE,  # same model string, but codex → no scope derived
+                prompt='hi',
+            )
+
+        # B8: a non-claude backend never derives scope, so attribution is
+        # account-level (scope-blind), exactly as today.
+        assert acct.scope_caps == {}
+        assert acct.phase == AccountPhase.CAPPED
