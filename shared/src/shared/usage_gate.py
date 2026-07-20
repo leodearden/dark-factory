@@ -804,6 +804,7 @@ class UsageGate:
         result_text: str,
         backend: str = 'claude',
         oauth_token: str | None = None,
+        scope: str | None = None,
     ) -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
@@ -826,14 +827,21 @@ class UsageGate:
         case no account state changed and the retry loop should not increment
         consecutive_cap_hits or trigger a cooldown, since before_invoke() would
         return the same token on the next iteration.
+
+        *scope* (PRD task β) is forwarded verbatim to the cap/near-cap handler:
+        when non-None it attributes the hit to only that account's model-scope
+        (``acct.scope_caps``), leaving the account phase machine untouched; the
+        cap-like-prefix breadcrumb path and the Failure return are scope-blind.
         """
         result = AgentResult(success=False, output=result_text, stderr=stderr)
         outcome = classify_invocation(result, strict_confirm=True, backend=backend)
 
         if isinstance(outcome, CapHit):
-            return self._handle_cap_detected(outcome.reason, outcome.resets_at, oauth_token)
+            return self._handle_cap_detected(
+                outcome.reason, outcome.resets_at, oauth_token, scope=scope,
+            )
         if isinstance(outcome, NearCap):
-            return self._handle_near_cap_warning(outcome.reason, oauth_token)
+            return self._handle_near_cap_warning(outcome.reason, oauth_token, scope=scope)
 
         # Not a cap/near-cap verdict (Failure, or CliLocalError overriding a
         # cap-like prefix) — if a cap-like prefix IS present, emit a debug
