@@ -35,6 +35,7 @@ from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore
 
 from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
 from orchestrator.evals.prompt_opt.engine import run_optimization_loop
+from orchestrator.evals.prompt_opt.scorer import ProposeFn, RolloutFn, Scorer
 from orchestrator.evals.prompt_opt.variance import AcceptanceRecord
 
 __all__ = [
@@ -318,6 +319,11 @@ class AcceptanceReport:
     resolved_text: str
     resolved_source: str
     contract_prefix_intact: bool
+    # The exact byte string proven to be the untouched CONTRACT prefix of
+    # resolved_text (contract_prefix_intact == resolved_text.startswith(
+    # verified_contract_marker + separator)). Recorded explicitly so the proof
+    # is self-contained on the report.
+    verified_contract_marker: str
     pin_key: tuple[str, str, str]
     executor_model: str
     optimizer_model: str
@@ -334,6 +340,10 @@ async def run_acceptance_smoke(
     minibatch_size: int = _DEFAULT_MINIBATCH_SIZE,
     git_sha: str = _SMOKE_GIT_SHA,
     date: str = _SMOKE_DATE,
+    corpus: list[FixtureItem] | None = None,
+    rollout_fn: RolloutFn = _smoke_rollout_fn,
+    scorer: Scorer | None = None,
+    propose_fn: ProposeFn = _default_improving_propose_fn,
 ) -> AcceptanceReport:
     """Run the hermetic end-to-end Tier-1 prompt-opt acceptance smoke.
 
@@ -361,8 +371,10 @@ async def run_acceptance_smoke(
     if harness_version is None:  # pragma: no cover - same T2 guard
         raise AssertionError('REVIEWER_COMPREHENSIVE.prompt_harness_version must not be None')
 
-    corpus = build_fixture_corpus()
-    scorer = SmokeReviewerScorer()
+    if corpus is None:
+        corpus = build_fixture_corpus()
+    if scorer is None:
+        scorer = SmokeReviewerScorer()
 
     result = await run_optimization_loop(
         spec,
@@ -370,8 +382,8 @@ async def run_acceptance_smoke(
         scorer,
         executor_model,
         optimizer_model,
-        rollout_fn=_smoke_rollout_fn,
-        propose_fn=_default_improving_propose_fn,
+        rollout_fn=rollout_fn,
+        propose_fn=propose_fn,
         n_repeats=n_repeats,
         max_steps=max_steps,
         split_seed=split_seed,
@@ -408,6 +420,7 @@ async def run_acceptance_smoke(
         resolved_text=resolved.text,
         resolved_source=resolved.source,
         contract_prefix_intact=contract_prefix_intact,
+        verified_contract_marker=spec.contract,
         pin_key=(spec.prompt_id, executor_model, harness_version),
         executor_model=executor_model,
         optimizer_model=optimizer_model,
