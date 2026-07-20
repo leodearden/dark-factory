@@ -7039,6 +7039,78 @@ exit 0
         assert result is False
 
 
+class TestMergeConfigOnlyDiffForcesFullGate:
+    """Unit tests for the pure _merge_config_only_diff_forces_full_gate helper.
+
+    The deterministic dark-factory-side manifest-drift backstop (task 2838):
+    True iff any changed file matches any configured glob via
+    fnmatch.fnmatchcase (case-sensitive, OS-independent). Empty globs (the
+    default) → False in O(1), leaving the config-only fast-path unchanged.
+    """
+
+    def _config(self, globs):
+        from orchestrator.config import GitConfig
+
+        return OrchestratorConfig(
+            git=GitConfig(merge_config_only_full_gate_globs=globs),
+        )
+
+    def test_empty_globs_default_config_returns_false(self):
+        """Default OrchestratorConfig (empty globs) → False regardless of files."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = OrchestratorConfig()
+        assert config.git.merge_config_only_full_gate_globs == []
+        # Even a name that WOULD match a glob returns False when no globs set.
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/tests/new_case.sh'],
+        ) is False
+
+    def test_changed_file_matches_configured_glob_returns_true(self):
+        """A changed file matching a configured glob → True."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['*tests/*'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/tests/new_case.sh'],
+        ) is True
+
+    def test_globs_configured_but_no_file_matches_returns_false(self):
+        """Globs configured but no changed file matches → False."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['*tests/*', 'infra/*.sh'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/src/orchestrator/config.yaml', 'README.md'],
+        ) is False
+
+    def test_multiple_globs_only_second_matches_returns_true(self):
+        """Multiple globs, only the second matches → True."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['infra/*.sh', '*tests/*'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['orchestrator/tests/new_case.sh'],
+        ) is True
+
+    def test_empty_changed_files_with_globs_returns_false(self):
+        """Empty changed_files with non-empty globs → False."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['*tests/*'])
+        assert _merge_config_only_diff_forces_full_gate(config, []) is False
+
+    def test_fnmatchcase_is_case_sensitive(self):
+        """fnmatchcase: glob 'infra/*.SH' does NOT match 'infra/foo.sh'
+        (pin OS-independent case-sensitive behaviour)."""
+        from orchestrator.verify import _merge_config_only_diff_forces_full_gate
+
+        config = self._config(['infra/*.SH'])
+        assert _merge_config_only_diff_forces_full_gate(
+            config, ['infra/foo.sh'],
+        ) is False
+
+
 class TestMergeGuardNoModuleConfigs:
     """Integration: guard wires into the no-module_configs trivial-pass branch.
 
