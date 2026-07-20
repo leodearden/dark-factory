@@ -15,14 +15,18 @@ byte-level contract prefix, CLI exit codes) — never on docstrings/prose.
 from __future__ import annotations
 
 import pytest
-from shared.prompt_artifact import compose_prompt
+from shared.prompt_artifact import ArtifactProvenance, compose_prompt
 
+from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
 from orchestrator.evals.prompt_opt import measure_repeatability_band, split_corpus
 from orchestrator.evals.prompt_opt.smoke import (
     _SMOKE_EXECUTOR_MODEL,
+    _SMOKE_OPTIMIZER_MODEL,
+    AcceptanceReport,
     SmokeReviewerScorer,
     _smoke_rollout_fn,
     build_fixture_corpus,
+    run_acceptance_smoke,
 )
 
 
@@ -161,3 +165,47 @@ class TestHermeticSeams:
         scorer2 = SmokeReviewerScorer()
         flat2 = [await scorer2.score(item, rollout) for _ in range(3)]
         assert flat2 == flat
+
+
+class TestRunAcceptanceSmoke:
+    """The CENTRAL signal: the whole stack runs end-to-end through the REAL
+    engine + loader and produces a held-out TEST verdict, an 8-field
+    provenance sidecar, and a byte-level CONTRACT-untouched proof."""
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_report(self, tmp_path: object) -> None:
+        report = await run_acceptance_smoke(
+            store_root=tmp_path / 'artifacts',  # type: ignore[operator]
+            split_seed=2498,
+        )
+
+        # (a) the run COMPLETED — no ValueError => the <=3-distinct-diff corpus
+        # was splittable through the REAL engine (non-empty selection + test)
+        assert isinstance(report, AcceptanceReport)
+
+        # (b) held-out TEST verdict present + consistent with the provenance sidecar
+        assert isinstance(report.test_score, float)
+        assert 0.0 <= report.test_score <= 1.0
+        assert report.test_score == report.provenance.held_out_TEST_score
+
+        # (c) the acceptance gate ran and >=1 improving candidate was accepted
+        # (delta > band) — no numeric F1/gain asserted (PRD G6)
+        assert report.final_heuristics != report.baseline_heuristics
+        assert report.accepted_count >= 1
+        accepted = [r for r in report.accept_records if r.accepted]
+        assert accepted, 'no accepted records surfaced on the report'
+        assert all(r.paired_delta > r.band for r in accepted)
+
+        # (d) provenance is a schema-valid 8-field ArtifactProvenance
+        ArtifactProvenance.model_validate(report.provenance.model_dump())
+        assert report.provenance.harness_version == _REVIEWER_PROMPT_HARNESS_VERSION
+        assert report.provenance.optimizer_model == report.optimizer_model
+        assert report.optimizer_model == _SMOKE_OPTIMIZER_MODEL
+
+        # (e) CONTRACT untouched: the loader-resolved composed prompt starts with
+        # the reviewer spec.contract byte-for-byte, resolved via source='artifact'
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None
+        assert report.contract_prefix_intact is True
+        assert report.resolved_source == 'artifact'
+        assert report.resolved_text.startswith(spec.contract + '\n\n---\n\n')
