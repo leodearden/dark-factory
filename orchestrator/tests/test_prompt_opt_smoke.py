@@ -15,7 +15,7 @@ byte-level contract prefix, CLI exit codes) — never on docstrings/prose.
 from __future__ import annotations
 
 import pytest
-from shared.prompt_artifact import ArtifactProvenance, compose_prompt
+from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
 
 from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
 from orchestrator.evals.prompt_opt import measure_repeatability_band, split_corpus
@@ -209,3 +209,38 @@ class TestRunAcceptanceSmoke:
         assert report.contract_prefix_intact is True
         assert report.resolved_source == 'artifact'
         assert report.resolved_text.startswith(spec.contract + '\n\n---\n\n')
+
+
+class TestLoaderRoundTripAndRollback:
+    """The operator ship -> watch -> rollback path, reproduced from the report
+    alone: pin (already done by the smoke) -> resolve -> read_provenance ->
+    unpin, where unpin restores the in-code reviewer baseline."""
+
+    @pytest.mark.asyncio
+    async def test_ship_then_rollback_roundtrip(self, tmp_path: object) -> None:
+        store_root = tmp_path / 'artifacts'  # type: ignore[operator]
+        report = await run_acceptance_smoke(store_root=store_root, split_seed=2498)
+
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None
+
+        # reconstruct the store + key purely from the report (no re-run of the loop)
+        store = PromptArtifactStore(store_root)
+        prompt_id, executor_model, harness_version = report.pin_key
+
+        # (a) resolve returns source='artifact' == compose_prompt(contract, final)
+        resolved = store.resolve(spec, executor_model, harness_version)
+        assert resolved.source == 'artifact'
+        assert resolved.text == compose_prompt(spec.contract, report.final_heuristics)
+
+        # (b) read_provenance round-trips the 8-field sidecar == report.provenance
+        prov = store.read_provenance(prompt_id, executor_model, harness_version)
+        assert prov is not None
+        assert prov.model_dump() == report.provenance.model_dump()
+
+        # (c) unpin — the SOLE rollback lever — returns True and re-resolve falls
+        # back to the in-code reviewer baseline (source='in_code')
+        assert store.unpin(prompt_id, executor_model, harness_version) is True
+        after = store.resolve(spec, executor_model, harness_version)
+        assert after.source == 'in_code'
+        assert after.text == spec.in_code_constant
