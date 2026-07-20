@@ -216,6 +216,19 @@ ADJ_WORSE_PASS = 0.50    # PASS: opus not-majority-worse — haiku_worse_fractio
 ADJ_WORSE_FAIL = 0.60    # FAIL: opus majority-worse — haiku_worse_fraction > this
 MIN_SAMPLES = 20         # PASS: at least this many done-with-ground-truth tasks
 
+# ── sample-selection policy (esc-2540-16, L1-ratified) ──────────────────────
+#
+# The live corpus is ~1800 eligible done tasks — replaying all of them is
+# cost-prohibitive (2N tagger + up to N opus adjudications). The trial runs a
+# bounded sample of the MOST-RECENT eligible done tasks (highest task ids)
+# rather than the oldest: build_tagger_prompt embeds the CURRENT top-level-dir
+# listing, so recent tasks reflect the codebase structure both models actually
+# see; an oldest-N sample predates today's layout and would depress both
+# models' F1 vs ground truth, biasing the verdict. DEFAULT_SAMPLE_SIZE sits
+# comfortably above MIN_SAMPLES so a healthy run clears the too-few-samples
+# marginal band. Pass --all to opt into the full (expensive) corpus.
+DEFAULT_SAMPLE_SIZE = 30
+
 
 def decide(summary: dict) -> str:
     """Return ``'pass'`` / ``'marginal'`` / ``'fail'`` from a trial summary.
@@ -381,6 +394,42 @@ def _eligible_for_trial(task: dict) -> bool:
     if meta.get('task_kind') == 'deterministic':
         return False
     return bool(meta.get('files') or [])
+
+
+def _task_recency_key(task: dict) -> tuple[int, int]:
+    """Sort key ordering tasks newest-first by numeric id.
+
+    Task ids are numeric (int or numeric string). A non-numeric / missing id
+    fails safe to the OLDEST position (``(0, 0)``) so it is never spuriously
+    treated as most-recent — the sample is drawn descending, so oldest-position
+    keys are the first dropped. The second tuple element is unused today (ids
+    are unique) and only pins a stable, deterministic order.
+    """
+    raw = task.get('id')
+    try:
+        return (int(str(raw)), 0)
+    except (TypeError, ValueError):
+        return (0, 0)
+
+
+def select_trial_sample(tasks: list, size: int | None) -> list[dict]:
+    """Pick the bounded MOST-RECENT eligible slice to replay (esc-2540-16).
+
+    Filters *tasks* to ``_eligible_for_trial`` members, orders them newest-first
+    by task id, and returns the first *size* (all eligible when ``size is None``
+    — the explicit ``--all`` full-corpus path). Selecting most-recent rather
+    than the first-N-as-loaded (oldest, ascending id) keeps the sample aligned
+    with the current top-level-dir structure ``build_tagger_prompt`` embeds; see
+    the ``DEFAULT_SAMPLE_SIZE`` note above for the rationale.
+    """
+    eligible = sorted(
+        (t for t in tasks if _eligible_for_trial(t)),
+        key=_task_recency_key,
+        reverse=True,
+    )
+    if size is None:
+        return eligible
+    return eligible[:size]
 
 
 def _mean_metrics(scores: list, keys: tuple) -> dict[str, float]:
@@ -683,16 +732,20 @@ def main() -> int:
     parser.add_argument('--server-url', default=FUSED_MEMORY_URL)
     parser.add_argument('--out', default=None,
                         help='report path (default: <project_root>/' + REPORT_REL_PATH + ')')
-    parser.add_argument('--limit', type=int, default=None,
-                        help='cap eligible samples (smoke runs only)')
+    parser.add_argument('--sample-size', type=int, default=DEFAULT_SAMPLE_SIZE,
+                        help='number of most-recent eligible done tasks to '
+                             'replay (default: %(default)s; esc-2540-16 policy)')
+    parser.add_argument('--all', action='store_true',
+                        help='replay the FULL eligible corpus instead of a '
+                             'bounded recent sample (expensive — opt-in)')
     args = parser.parse_args()
 
     project_root = Path(args.project_root)
     out_path = Path(args.out) if args.out else project_root / REPORT_REL_PATH
 
     tasks = asyncio.run(load_done_tasks(project_root, args.server_url))
-    if args.limit is not None:
-        tasks = [t for t in tasks if _eligible_for_trial(t)][: args.limit]
+    size = None if args.all else args.sample_size
+    tasks = select_trial_sample(tasks, size)
     dirs = current_top_level_dirs(project_root)
 
     def invoke_fn(prompt: str, model: str) -> Any:

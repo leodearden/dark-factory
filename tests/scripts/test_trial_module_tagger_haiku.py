@@ -489,3 +489,55 @@ def test_run_trial_result_aggregates_scores_tally_and_decision():
         'haiku_worse_fraction': result.adjudication['haiku_worse_fraction'],
         'n_samples': result.n_samples,
     })
+
+
+# ── select_trial_sample: bounded MOST-RECENT eligible slice (esc-2540-16) ────
+
+def test_default_sample_size_is_above_min_samples():
+    # The bounded-recent default must clear the too-few-samples marginal band.
+    assert mod.DEFAULT_SAMPLE_SIZE > mod.MIN_SAMPLES
+
+
+def test_select_trial_sample_filters_to_eligible_only():
+    # Deterministic / empty-files / no-files / no-metadata tasks never selected.
+    selected = mod.select_trial_sample(_ALL_TASKS, size=None)
+    assert {t['id'] for t in selected} == {t['id'] for t in _ELIGIBLE}
+
+
+def test_select_trial_sample_orders_most_recent_first():
+    # Highest task id (newest) leads, regardless of input order.
+    shuffled = [_T3, _T1, _T4, _T2]
+    selected = mod.select_trial_sample(shuffled, size=None)
+    assert [t['id'] for t in selected] == [4, 3, 2, 1]
+
+
+def test_select_trial_sample_caps_to_size_taking_the_newest():
+    # size=2 keeps the two most-recent eligible tasks, drops the older ones.
+    selected = mod.select_trial_sample(_ALL_TASKS, size=2)
+    assert [t['id'] for t in selected] == [4, 3]
+
+
+def test_select_trial_sample_none_size_returns_all_eligible():
+    selected = mod.select_trial_sample(_ALL_TASKS, size=None)
+    assert len(selected) == len(_ELIGIBLE)
+
+
+def test_select_trial_sample_handles_numeric_string_ids():
+    # Ids arrive as numeric strings from the task backend; ordering is numeric,
+    # not lexicographic (so id "10" sorts above "9", not below).
+    tasks = [
+        {'id': '9', 'title': 't9', 'description': 'd', 'metadata': {'files': ['a.py']}},
+        {'id': '10', 'title': 't10', 'description': 'd', 'metadata': {'files': ['b.py']}},
+    ]
+    selected = mod.select_trial_sample(tasks, size=None)
+    assert [t['id'] for t in selected] == ['10', '9']
+
+
+def test_select_trial_sample_non_numeric_id_sorts_oldest_not_newest():
+    # A malformed id fails safe to the oldest position — never spuriously most-recent.
+    tasks = [
+        {'id': 'bad', 'title': 'tb', 'description': 'd', 'metadata': {'files': ['a.py']}},
+        {'id': 2, 'title': 't2', 'description': 'd', 'metadata': {'files': ['b.py']}},
+    ]
+    selected = mod.select_trial_sample(tasks, size=1)
+    assert [t['id'] for t in selected] == [2]
