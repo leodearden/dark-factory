@@ -657,6 +657,22 @@ _TASK_COUNT_SNAPSHOT_PRUNE_SOURCE = 'stage2_task_count_snapshot_prune'
 STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
 
+# Age-based GC for the legacy Mem0 stage1_flag_marker pool (task 2853).
+# Task 2406 retired the Mem0 stage1_flag_marker mirror write — markers now
+# persist only to the recon_ledger SQLite table (see _gc_recon_markers /
+# ReconLedgerStore.gc above, which reaps ledger rows only). Task 2228 W5-κ
+# deleted the prior in-cycle Mem0 sweeps for this source (_sweep_stale_flag_
+# markers, _sweep_terminal_task_flag_markers) on the assumption that the
+# ledger gc() pass fully replaced them; it does not reach Mem0, so the
+# pre-2406 Mem0 pool was left with no in-cycle collector for any project.
+# Since the write path is fully retired, every remaining Mem0
+# stage1_flag_marker record is dead weight; 14 days reuses the
+# STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention as a
+# conservative, consistent aging cutoff rather than deleting immediately.
+_STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
+STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
+_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
+
 
 async def _resolve_terminal_task_ids(
     taskmaster,
@@ -939,6 +955,138 @@ async def _sweep_stale_persistence_markers(
         if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._sweep_stale_persistence_markers: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+    return success_count
+
+
+async def _sweep_stale_mem0_flag_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    max_age_days: int = STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """Age-GC the legacy ``stage1_flag_marker`` Mem0 pool (task 2853).
+
+    Task 2406 retired the Mem0 ``stage1_flag_marker`` mirror write — markers
+    now persist only to the ``recon_ledger`` SQLite table, reaped by
+    :func:`_gc_recon_markers` / :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`.
+    Task 2228 W5-κ deleted the prior in-cycle Mem0 sweeps for this source
+    (the old ``_sweep_stale_flag_markers`` and
+    ``_sweep_terminal_task_flag_markers``) on the assumption that the ledger
+    ``gc()`` pass fully replaced them; ``gc()`` only reaps ledger rows, so
+    the pre-2406 Mem0 pool was left with no in-cycle collector for any
+    project — including projects other than ``dark_factory``, which is the
+    only project the operational ``sweep_orphan_flag_markers.py`` systemd
+    timer targets by default. This helper closes that gap per-project,
+    in-cycle, so every project self-heals its own legacy pool.
+
+    This is a near-copy of :func:`_sweep_stale_persistence_markers` with a
+    different source filter, delete ``_source`` audit tag, and max-age
+    constant: it enumerates deterministically via
+    ``memory_service.get_memories_by_metadata`` (Qdrant payload-filter
+    scroll) — NEVER semantic search, which silently drops low-similarity
+    rows and is unsuitable for exhaustive GC. Members with a missing or
+    unparseable ``created_at`` are KEPT (never deleted) — a fail-safe
+    KEEP-on-uncertainty posture shared with every other marker sweep in this
+    module.
+
+    Deletes are issued best-effort in parallel via ``gather_collect``:
+    individual failures log WARNING and are excluded from the returned
+    count.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        max_age_days: Staleness cutoff in days (default
+            ``STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS`` == 14).
+        now: Reference "current time" for the cutoff calculation. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale, or
+        on enumeration failure).
+    """
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'source': _STAGE1_FLAG_MARKER_MEM0_SOURCE},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._sweep_stale_mem0_flag_markers: '
+            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._sweep_stale_mem0_flag_markers: enumerated %d of scroll_limit=%d '
+            'stage1_flag_marker records — scroll cap reached; older stale markers may '
+            'remain uncollected this cycle; re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    if not members:
+        return 0
+
+    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
+
+    stale_ids: list[str] = []
+    for member in members:
+        mid = member.get('id')
+        if not mid:
+            continue
+        raw = member.get('created_at')
+        if raw is None:
+            continue
+        try:
+            created_at = _assume_utc(datetime.fromisoformat(raw))
+        except (ValueError, TypeError):
+            continue
+
+        if created_at < cutoff:
+            stale_ids.append(mid)
+
+    if not stale_ids:
+        return 0
+
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete sweep from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+        )
+        for mid in stale_ids
+    )
+
+    success_count = 0
+    for mid, result in zip(stale_ids, results, strict=True):
+        if isinstance(result, Exception):
+            logger.warning(
+                'reconciliation._sweep_stale_mem0_flag_markers: delete failed for memory_id=%s; not counted',
                 mid,
                 extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
             )
