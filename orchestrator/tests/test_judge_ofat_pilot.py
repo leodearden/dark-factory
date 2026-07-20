@@ -34,14 +34,18 @@ def _row(
     sufficient: bool | None = None,
     role: str = 'judge',
     judge_cost: float = 0.0,
+    quality: float | None = None,
 ) -> dict[str, Any]:
     """A full-fidelity ``build_composite_report`` ``configs`` row.
 
     Carries every field ``decide_judge_adoption`` / ``format_composite_table``
     read: the ``composite``/``cost_usd`` means, the ``ci95.composite`` sub-dict
     (``{mean, lo, hi, n, sufficient}`` — the non-inferiority + sufficiency inputs),
-    and the ``judge.cost_usd`` subset. ``lo``/``hi`` default to the point estimate
-    and ``sufficient`` to ``n >= 3`` (report.mean_ci95's own rule).
+    the RAW ``quality`` mean (un-cost-normalized — feeds ``quality_delta``), and
+    the ``judge.cost_usd`` subset. ``lo``/``hi`` default to the point estimate,
+    ``quality`` defaults to ``composite`` (matches build_composite_report when the
+    efficiency blend is a no-op), and ``sufficient`` to ``n >= 3``
+    (report.mean_ci95's own rule).
     """
     if lo is None:
         lo = composite
@@ -49,11 +53,13 @@ def _row(
         hi = composite
     if sufficient is None:
         sufficient = n >= 3
+    if quality is None:
+        quality = composite
     return {
         'config': config,
         'role_under_test': role,
         'composite': composite,
-        'quality': composite,
+        'quality': quality,
         'tests_pass_rate': 1.0,
         'cost_usd': cost_usd,
         'cost_source': 'price_table',
@@ -115,6 +121,9 @@ class TestDecideAdopt:
         assert decision.composite_delta == pytest.approx(0.89 - 0.90)
         assert decision.cost_delta == pytest.approx(0.10 - 0.50)
         assert decision.judge_cost_delta == pytest.approx(0.05 - 0.40)
+        # The RAW (un-cost-normalized) quality delta is surfaced alongside the
+        # cost-normalized composite delta; here quality defaults to composite.
+        assert decision.quality_delta == pytest.approx(0.89 - 0.90)
 
     def test_default_margin_is_exposed_policy_parameter(self):
         from orchestrator.evals.judge_pilot import (
@@ -131,6 +140,31 @@ class TestDecideAdopt:
         decision = decide_judge_adoption(report)
         assert decision.margin == DEFAULT_NON_INFERIORITY_MARGIN
         assert isinstance(DEFAULT_NON_INFERIORITY_MARGIN, float)
+
+    def test_quality_delta_surfaces_cost_composite_confound(self):
+        from orchestrator.evals.judge_pilot import decide_judge_adoption
+
+        # ο's composite embeds cost, so the cheaper candidate is composite-
+        # advantaged: here judge-haiku is composite non-inferior (lo 0.88 >= 0.85)
+        # AND cheaper → the gate still ADOPTS (unchanged by this amendment). But
+        # its RAW quality is 8 points below the incumbent — a gap the cost-boosted
+        # composite delta (only -0.01) masks. quality_delta makes it visible so a
+        # borderline verdict can be sanity-checked on the pure quality axis.
+        report = _report([
+            _row('judge-sonnet', composite=0.90, cost_usd=0.50, lo=0.88, hi=0.92, n=3, quality=0.90),
+            _row('judge-haiku', composite=0.89, cost_usd=0.10, lo=0.88, hi=0.90, n=3, quality=0.82),
+        ])
+
+        decision = decide_judge_adoption(report, margin=0.05)
+
+        assert decision.verdict == 'adopt'  # gate is composite+cost, unchanged
+        # The raw quality gap (-0.08) is far larger than the composite delta
+        # (-0.01): the confound is now observable to the operator.
+        assert decision.quality_delta == pytest.approx(0.82 - 0.90)
+        assert decision.composite_delta == pytest.approx(0.89 - 0.90)
+        assert decision.quality_delta is not None
+        assert decision.composite_delta is not None
+        assert decision.quality_delta < decision.composite_delta
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +306,14 @@ class TestFormatReport:
         # Verdict + non_inferior/cheaper booleans + margin.
         assert 'adopt' in text
         assert 'margin' in text.lower()
-        # Composite delta and cost delta are surfaced (candidate - incumbent).
+        # Composite delta, raw quality delta, and cost delta are all surfaced
+        # (candidate - incumbent); the raw quality delta disentangles the
+        # cost-embedding composite when a verdict is borderline.
         assert 'composite delta' in text.lower()
+        assert 'raw quality delta' in text.lower()
         assert 'cost delta' in text.lower()
         assert f'{decision.composite_delta:+.4f}' in text
+        assert f'{decision.quality_delta:+.4f}' in text
         assert f'{decision.cost_delta:+.4f}' in text
         # The composite table is embedded verbatim.
         assert format_composite_table(report) in text

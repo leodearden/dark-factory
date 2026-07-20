@@ -109,6 +109,23 @@ Insufficient data and a missing row are **loud** `marginal` outcomes (structured
 `reasons`, escalate) — never a silent pass or an unhandled error
 (loud-over-silent / structured-facts-at-failure).
 
+**Cost is embedded in the composite — read the raw quality delta on a borderline
+verdict.** ο's `build_composite_report` composite is *already* cost-normalized
+per fixture (it blends quality with a cost/latency ratio score), and the judge
+OFAT run contains only the two judge configs — so the cheaper candidate
+mechanically gets a cost-ratio boost to its composite. "Non-inferior on
+composite" is therefore partly the same cost win the separate **Cheaper** check
+already requires (cost is counted on both axes), which for a *borderline* case
+could let a modest genuine quality regression on the cheaper judge still read as
+`adopt`. The gate is deliberately left as composite-non-inferiority AND cheaper
+(PRD decision 11 forbids editing the instrument here), but the report surfaces
+the **raw quality delta** — the un-cost-normalized `quality` row/axis — right next
+to the composite delta. When a verdict is borderline (composite delta near zero,
+CI lower bound near the margin), inspect that raw quality delta: a small negative
+composite delta hiding a large negative raw quality delta means the composite is
+being carried by the cost boost, not by preserved quality — treat that as a
+`reject`-leaning signal and escalate rather than flipping.
+
 ---
 
 ## 3a. On ADOPT — apply the flip (staged, reversible)
@@ -173,6 +190,7 @@ verdict: <adopt|marginal|reject> (escalate: <yes|no>)
 incumbent: judge-sonnet | candidate: judge-haiku
 non-inferior: <yes|no> | cheaper: <yes|no> | sufficient: <yes|no> | margin: 0.0500
 composite delta (judge-haiku - judge-sonnet): <±d.dddd>
+raw quality delta (judge-haiku - judge-sonnet): <±d.dddd>
 cost delta (judge-haiku - judge-sonnet): <±d.dddd>
 judge cost delta (judge-haiku - judge-sonnet): <±d.dddd>
 
@@ -190,8 +208,11 @@ RECOMMENDATION: <adopt — flip models.judge: sonnet -> haiku ...>
 ```
 
 Deltas are candidate-minus-incumbent (a negative `cost delta` == the candidate is
-cheaper). The embedded composite table is the same surface every other eval stage
-renders, so the pilot report stays consistent with `eval-ofat` output.
+cheaper). The `raw quality delta` is the un-cost-normalized quality axis, printed
+next to the cost-embedding `composite delta` so the two can be compared on a
+borderline verdict (see §2's cost-in-composite note). The embedded composite table
+is the same surface every other eval stage renders, so the pilot report stays
+consistent with `eval-ofat` output.
 
 ---
 

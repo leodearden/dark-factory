@@ -46,11 +46,19 @@ class JudgeAdoptionDecision:
     """The structured judge-adoption verdict over a composite report.
 
     ``verdict`` ∈ {``'adopt'``, ``'marginal'``, ``'reject'``}; ``escalate`` is
-    ``False`` only for ``'adopt'``. ``composite_delta`` / ``cost_delta`` /
-    ``judge_cost_delta`` are candidate-minus-incumbent (a negative ``cost_delta``
-    means the candidate is cheaper). ``reasons`` is a human-readable explanation
-    of the verdict. The two rows are the raw ``build_composite_report`` rows for
-    the incumbent / candidate configs (``None`` when a row is missing).
+    ``False`` only for ``'adopt'``. ``composite_delta`` / ``quality_delta`` /
+    ``cost_delta`` / ``judge_cost_delta`` are candidate-minus-incumbent (a
+    negative ``cost_delta`` means the candidate is cheaper). ``quality_delta`` is
+    the RAW (un-cost-normalized) quality-axis delta, surfaced ALONGSIDE the
+    cost-normalized ``composite_delta`` for operator visibility: ο's composite
+    already embeds cost, so a cheaper candidate is composite-advantaged and
+    "non-inferior on composite" partly re-counts the same cost win the separate
+    ``cheaper`` check requires. Inspecting the raw quality gap disentangles the
+    two when a verdict is borderline (see the runbook's adoption criterion). It
+    is an OBSERVABILITY field only — the adopt gate is unchanged. ``reasons`` is
+    a human-readable explanation of the verdict. The two rows are the raw
+    ``build_composite_report`` rows for the incumbent / candidate configs
+    (``None`` when a row is missing).
     """
 
     verdict: str
@@ -64,6 +72,7 @@ class JudgeAdoptionDecision:
     incumbent_row: dict[str, Any] | None
     candidate_row: dict[str, Any] | None
     composite_delta: float | None
+    quality_delta: float | None
     cost_delta: float | None
     judge_cost_delta: float | None
     reasons: list[str] = field(default_factory=list)
@@ -83,6 +92,17 @@ def _composite_sufficient(row: dict[str, Any]) -> bool:
 
 def _cost(row: dict[str, Any]) -> float:
     return float(row.get('cost_usd', 0.0) or 0.0)
+
+
+def _quality(row: dict[str, Any]) -> float:
+    """The RAW quality mean (un-cost-normalized ``composite_score`` mean).
+
+    Distinct from ``composite`` (which blends cost/latency into the score):
+    surfaced as ``quality_delta`` so a borderline verdict can be sanity-checked
+    against the pure quality axis, since ο's cost-normalized composite already
+    advantages the cheaper config (build_composite_report row key ``quality``).
+    """
+    return float(row.get('quality', 0.0) or 0.0)
 
 
 def _judge_cost(row: dict[str, Any]) -> float:
@@ -140,6 +160,7 @@ def decide_judge_adoption(
             incumbent_row=incumbent_row,
             candidate_row=candidate_row,
             composite_delta=None,
+            quality_delta=None,
             cost_delta=None,
             judge_cost_delta=None,
             reasons=[
@@ -162,6 +183,7 @@ def decide_judge_adoption(
     sufficient = cand_sufficient and inc_sufficient
 
     composite_delta = cand_comp - inc_comp
+    quality_delta = _quality(candidate_row) - _quality(incumbent_row)
     cost_delta = cand_cost - inc_cost
     judge_cost_delta = _judge_cost(candidate_row) - _judge_cost(incumbent_row)
     threshold = inc_comp - margin
@@ -213,6 +235,7 @@ def decide_judge_adoption(
         incumbent_row=incumbent_row,
         candidate_row=candidate_row,
         composite_delta=composite_delta,
+        quality_delta=quality_delta,
         cost_delta=cost_delta,
         judge_cost_delta=judge_cost_delta,
         reasons=reasons,
@@ -272,7 +295,9 @@ def format_judge_ofat_report(
     """Render a judge-OFAT pilot decision as a deterministic markdown report.
 
     A header (verdict + non_inferior/cheaper/sufficient booleans + margin +
-    incumbent/candidate + composite/cost/judge-cost deltas), the structured
+    incumbent/candidate + composite/raw-quality/cost/judge-cost deltas — the raw
+    quality delta sits next to the cost-normalized composite so a borderline
+    verdict's pure quality gap is visible), the structured
     ``reasons``, the EMBEDDED :func:`report.format_composite_table` data section
     (so the committed report is consistent with every other eval surface and
     stays byte-stable), and a decide-and-act footer: on ``adopt`` the recommended
@@ -290,6 +315,7 @@ def format_judge_ofat_report(
             f'| sufficient: {_yesno(d.sufficient)} | margin: {d.margin:.4f}'
         ),
         f'composite delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.composite_delta)}',
+        f'raw quality delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.quality_delta)}',
         f'cost delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.cost_delta)}',
         f'judge cost delta ({d.candidate} - {d.incumbent}): {_fmt_delta(d.judge_cost_delta)}',
         '',
