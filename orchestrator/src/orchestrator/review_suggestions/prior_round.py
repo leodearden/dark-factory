@@ -83,3 +83,25 @@ def load_prior_round_suggestions(artifacts_root: Path) -> list[dict]:
                     continue
                 collected.append({**issue, 'reviewer': review_path.stem})
     return collected
+
+
+def partition_by_decisions(
+    current: list[dict], decisions: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Partition *current* into ``(kept, suppressed)`` by adjudicator verdict.
+
+    A current suggestion is suppressed ONLY when its positionally-aligned
+    decision (``decisions[i]``) is exactly :data:`SETTLED`.  Every other outcome
+    keeps the suggestion (fail-safe toward emit): any other value, an unknown
+    string, or a missing index (``decisions`` shorter than *current*).  Input
+    order is preserved within each partition.
+    """
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for i, suggestion in enumerate(current):
+        decision = decisions[i] if i < len(decisions) else NOT_SETTLED
+        if decision == SETTLED:
+            suppressed.append(suggestion)
+        else:
+            kept.append(suggestion)
+    return kept, suppressed
