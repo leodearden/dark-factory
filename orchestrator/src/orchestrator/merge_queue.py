@@ -4604,12 +4604,18 @@ async def reconcile_landed_task(
 ) -> bool:
     """Single-task landed-outbox consult for the scheduler dispatch gate (task 2156, W1 δ / SD-1).
 
-    Guards the git ancestry round-trip behind a cheap in-memory outbox hit:
-    landed rows exist only for the brief window between a merge advancing
-    main and the task being marked done, so the overwhelmingly common case
-    (no row) returns ``False`` with zero git I/O and zero scheduler calls —
-    keeping the per-candidate cost of the scheduler's dispatch-gate consult
-    to one dict lookup on the hot path.
+    Guards the git ancestry round-trip behind a cheap in-memory outbox hit.
+    For the single-branch happy path a landed row now exists only for the
+    brief window between a merge advancing main and the task being marked
+    done — ``_finalise_merged_done`` (workflow.py) consumes it via
+    ``MergeProvenance.consume`` the moment ``mark_done`` succeeds (task
+    2681/ζ). The only rows that outlive that window are the RC-3-backstopped
+    paths — crash-interrupted completions and the (out-of-scope) train-member
+    callbacks — which persist until the next startup reconcile prunes them
+    (see :func:`reconcile_landed_outbox`). Either way the overwhelmingly
+    common case (no row) returns ``False`` with zero git I/O and zero
+    scheduler calls — keeping the per-candidate cost of the scheduler's
+    dispatch-gate consult to one dict lookup on the hot path.
 
     When a row IS present, resolves ``main_sha`` and delegates to the shared
     :func:`reconcile_landed_row` (task 2155, W1 γ) — the SAME RC-1/RC-2/RC-3
@@ -4659,19 +4665,23 @@ async def reconcile_landed_outbox(
     instead of falling into the generic ``'errors'`` tally; ``None``
     preserves the pre-task-2677 propagate-and-tally-as-``'errors'`` behavior.
 
-    KNOWN LIMITATION (reviewer_comprehensive amendment #3, task 2155): the
-    happy path (``advance_main`` → ``'advanced'`` → task marked done) never
-    calls ``outbox.consume()`` — those ``Scheduler.mark_done(kind='merged',
-    ...)`` call sites live in ``harness.py``'s ``build_train_callback_factory``
-    (train members) and ``harness.py``'s ``found_on_main`` double-landing
-    guard, plus several mirrored sites in ``workflow.py``, none of which
-    currently hold a ``LandedOutbox`` reference. A long-running orchestrator
-    therefore accumulates one row per successfully-landed task until the
-    next startup prunes them here via RC-3 (``'already_done_pruned'``) —
-    self-cleaning at boot, never a phantom-done risk. Wiring happy-path
-    consume would require changing ``workflow.py``, which is outside this
-    task's locked-module scope; left as a follow-up rather than expanded
-    into this task (see escalation log).
+    RESOLVED (task 2681/ζ — was a KNOWN LIMITATION of task 2155): the
+    single-branch happy path now consumes its row on completion.
+    ``_finalise_merged_done`` (workflow.py) calls ``MergeProvenance.consume``
+    the moment ``Scheduler.mark_done(kind='merged', ...)`` succeeds — via the
+    same process-global façade the worker binds its outbox to — so a
+    long-running orchestrator no longer accumulates one row per
+    successfully-landed single-branch task across its uptime.
+
+    RC-3 here (``'already_done_pruned'``) is therefore now a BACKSTOP for the
+    paths that still do not consume inline, not the primary cleanup for every
+    landed task: crash-interrupted completions (the process died between
+    ``advance_main`` and the consume) and the (out-of-scope) train-member
+    ``mark_done`` callbacks in ``harness.py``'s ``build_train_callback_factory``
+    (whose functional twin lives outside task 2681's module scope). Those
+    remaining rows are still self-cleaning at boot and never a phantom-done
+    risk — and are additionally guarded against an RC-2 re-done by the
+    server-side reopen-freshness gate.
     """
     report = {
         'pruned_not_landed': 0,

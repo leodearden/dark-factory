@@ -225,3 +225,10 @@ class MergeProvenance:
         if MergeProvenance._outbox is None:
             return None
         return MergeProvenance._outbox.lookup(task_id)
+
+    @staticmethod
+    def consume(task_id: str) -> None:
+        """Idempotently prune the landed row for task_id from the bound outbox; no-op when unbound (fail-safe) or absent."""
+        if MergeProvenance._outbox is None:
+            return
+        MergeProvenance._outbox.consume(task_id)

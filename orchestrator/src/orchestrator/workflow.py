@@ -1864,6 +1864,12 @@ class TaskWorkflow:
                 f'set_task_status(done) rejected: {exc.error_code} — {exc.raw}',
                 escalate_to_human=True,
             )
+        # task 2681/ζ: consume the write-ahead LandedRow on the happy path so it
+        # no longer survives to the next startup (closing the RC-3 stale-row
+        # window); only after a SUCCESSFUL mark_done — a rejected done-write
+        # above returns early so the row survives for the reconciler to retry.
+        # Fail-safe when the façade is unbound (bare-worker / eval / test).
+        MergeProvenance.consume(self.task_id)
         logger.info(
             f'Task {self.task_id} DONE — '
             f'cost=${self.metrics.total_cost_usd:.2f} '
