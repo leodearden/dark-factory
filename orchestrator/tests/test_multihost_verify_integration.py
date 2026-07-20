@@ -1469,3 +1469,329 @@ class TestUnreachableHostCapstone:
         )
         recovered = es.events_of(EventType.verify_host_recovered)
         assert recovered, 'reprobe loop must have emitted verify_host_recovered'
+
+
+# ===========================================================================
+# Task 2822 fix (b): per-land cross-check of a remote GREEN in
+# _run_post_merge_verify.  A single remote host's green is re-verified by the
+# LOCAL trust-anchor before the land.  AGREE -> verdict_parity_ok + proceed;
+# DIVERGE (local FAIL) -> fail-closed (adopt the local FAIL verdict so the land
+# is withheld, quarantine the remote, file a dedup'd blocking escalation);
+# local RunnerUnavailable -> fail-safe (verify_cross_check_inconclusive, TRUST
+# the remote green — never block a land on a local infra hiccup).  Gated by
+# config.verify_cross_check_remote_green (default True, provably inert on main
+# today because runner is always None until Lever C is enabled).
+#
+# step-7 (RED) / step-8 (GREEN).
+# ===========================================================================
+
+
+def _xcheck_config(*, cross_check: bool = True) -> OrchestratorConfig:
+    """OrchestratorConfig with the fix-(b) knob explicit + a project_root the
+    cross-check LocalRunner's archive_root is derived from."""
+    return OrchestratorConfig(
+        git=GitConfig(main_branch='main'),
+        project_root=Path('/tmp/xcheck-fake'),
+        verify_cross_check_remote_green=cross_check,
+    )
+
+
+def _xcheck_req(config: OrchestratorConfig, *, task_files=('src/foo.py',), worktree=None):
+    """A minimal MergeRequest for _run_post_merge_verify cross-check tests."""
+    from orchestrator.merge_queue import MergeRequest
+
+    loop = asyncio.get_running_loop()
+    return MergeRequest(
+        task_id='task-2822',
+        branch='task/2822',
+        worktree=worktree or Path('/repo/task-2822'),
+        pre_rebased=False,
+        task_files=list(task_files) if task_files is not None else None,
+        module_configs=[],
+        config=config,
+        result=loop.create_future(),
+    )
+
+
+def _xcheck_git_ops() -> MagicMock:
+    """GitOps double with plenty of disk + async cleanup (mirrors the wiring test)."""
+    mock = MagicMock()
+    mock.get_main_sha = AsyncMock(return_value='main-sha')
+    mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
+    mock.cleanup_merge_worktree = AsyncMock()
+    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    return mock
+
+
+def _remote_stub(result: VerifyResult, *, name: str = 'laptop') -> MagicMock:
+    """A single-host remote runner double (is_local=False) for the runner= param."""
+    stub = MagicMock()
+    stub.name = name
+    stub.is_local = False
+    stub.run_merge_verify = AsyncMock(return_value=result)
+    return stub
+
+
+def _local_runner_patch(*, result=None, raises=None, calls: list | None = None):
+    """Factory to patch orchestrator.merge_queue.LocalRunner.
+
+    Every construction is recorded in *calls*; the instance's run_merge_verify
+    returns *result* (or raises *raises*).  In the REMOTE dispatch path the
+    local-path pool never builds a LocalRunner, so the ONLY construction is the
+    fix-(b) cross-check trust-anchor — making len(calls) an exact cross-check
+    ran/skipped signal.
+    """
+    def _factory(*args, **kwargs):
+        if calls is not None:
+            calls.append((args, kwargs))
+        stub = MagicMock()
+        stub.name = 'local'
+        stub.is_local = True
+        if raises is not None:
+            stub.run_merge_verify = AsyncMock(side_effect=raises)
+        else:
+            stub.run_merge_verify = AsyncMock(return_value=result)
+        return stub
+
+    return _factory
+
+
+@pytest.mark.asyncio
+class TestPerLandCrossCheck:
+    """_run_post_merge_verify cross-checks a remote GREEN against the local
+    trust-anchor before the land (task 2822 fix b).  RED until step-8."""
+
+    async def test_diverge_local_fail_withholds_land_quarantines_and_escalates(self, tmp_path):
+        """knob ON, remote PASS + local FAIL -> land withheld + quarantine + escalation + event."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        local_fail = _make_result(False)
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=local_fail, calls=lr_calls)), \
+             patch('orchestrator.merge_queue._classify_main_health_red',
+                   new=AsyncMock(return_value=None)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,
+                merge_sha='mergesha01',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        # (1) land withheld — the local (failing) verdict is adopted, merge_wt cleaned up
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        git_ops.cleanup_merge_worktree.assert_awaited()
+        assert len(lr_calls) == 1, 'cross-check must build exactly one local trust-anchor'
+
+        # (2) runner quarantined in the caller-owned set (fix (b)'s first use of `quarantine`)
+        assert 'laptop' in quarantine
+
+        # (3) exactly one dedup'd blocking escalation, category verify_cross_check_mismatch
+        assert len(eq.submitted) == 1
+        esc = eq.submitted[0]
+        assert esc.category == 'verify_cross_check_mismatch'
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.agent_role == 'orchestrator-cross-check'
+        assert 'mergesha01' in (esc.summary + esc.detail)
+        assert 'laptop' in esc.detail
+
+        # (4) distinct mismatch telemetry emitted
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+
+    async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
+        """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(True), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,
+                merge_sha='mergesha02',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None  # land proceeds
+        assert quarantine == set()  # no quarantine on agree
+        assert eq.submitted == []  # no escalation on agree
+        assert len(lr_calls) == 1  # cross-check ran
+        assert es.events_of(EventType.verdict_parity_ok)
+
+    async def test_knob_off_never_constructs_local_runner_byte_identical(self, tmp_path):
+        """knob OFF -> the local cross-check runner is NEVER constructed (byte-identical)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=False)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,
+                merge_sha='mergesha03',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None  # remote green stands, land proceeds
+        assert lr_calls == []  # local trust-anchor NEVER constructed
+        assert quarantine == set()
+        assert eq.submitted == []
+        assert not es.events_of(EventType.verify_cross_check_mismatch)
+        assert not es.events_of(EventType.verdict_parity_ok)
+
+    async def test_local_runner_unavailable_is_inconclusive_and_trusts_remote(self, tmp_path):
+        """knob ON, local cross-check raises RunnerUnavailable -> inconclusive + trust remote green."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(raises=RunnerUnavailable('laptop closed'), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,
+                merge_sha='mergesha04',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None  # fail-safe: trust the remote green
+        assert quarantine == set()  # no quarantine on a local infra hiccup
+        assert eq.submitted == []  # no escalation
+        assert es.events_of(EventType.verify_cross_check_inconclusive)
+
+    async def test_trivial_remote_pass_skips_cross_check(self, tmp_path):
+        """knob ON, remote returns a TRIVIAL pass -> cross-check SKIPPED (no suite ran to compare)."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        trivial = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='trivial pass', trivial=True,
+        )
+        remote = _remote_stub(trivial, name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False), calls=lr_calls)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,
+                merge_sha='mergesha05',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        # cold-baseline trivial-pass gate is fail-open -> land proceeds, and the
+        # cross-check is skipped for a trivial pass (nothing was verified to compare).
+        assert outcome is None
+        assert lr_calls == [], 'a trivial remote pass must not trigger a local cross-check'
+        assert not es.events_of(EventType.verify_cross_check_mismatch)
+        assert not es.events_of(EventType.verdict_parity_ok)
+
+    async def test_local_dispatch_path_skips_cross_check_entirely(self, tmp_path):
+        """runner is None (local dispatch): the cross-check branch never runs."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        # Real local-path pool with a patched scoped verify returning PASS
+        # (mirrors the existing local-only wiring tests) — no cross-check side effects.
+        with patch('orchestrator.merge_queue.run_scoped_verification',
+                   new=AsyncMock(return_value=_make_result(True))):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,
+                merge_sha='mergesha06',
+                runner=None,  # LOCAL dispatch
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+
+        assert outcome is None
+        assert quarantine == set()
+        assert eq.submitted == []
+        assert not es.events_of(EventType.verify_cross_check_mismatch)
+        assert not es.events_of(EventType.verify_cross_check_inconclusive)
+        assert not es.events_of(EventType.verdict_parity_ok)
