@@ -71,9 +71,12 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
+    build_topic_cluster_block,
+    find_matching_topic_cluster,
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
@@ -1190,6 +1193,22 @@ def create_mcp_server(
             and not is_recon_stage_agent
             and resolve_near_dup_guard_enabled(memory_service)
         ):
+            # Deterministic topic-keyed pre-check (task 2845): if the content
+            # matches a known-contradictory topic cluster, soft-block BEFORE the
+            # cosine search. This is strictly cheaper (no embedding round-trip)
+            # and catches same-topic paraphrases the cosine guard misses. On no
+            # match (or an empty/unconfigured clusters list) fall through to the
+            # existing cosine path unchanged. Shares the allow_near_duplicate /
+            # recon-stage exemptions and the enabled kill-switch above with the
+            # cosine guard.
+            topic_clusters = resolve_topic_guard_clusters(memory_service)
+            if topic_clusters:
+                topic_match = find_matching_topic_cluster(content, topic_clusters)
+                if topic_match is not None:
+                    matched_cluster, matched_phrases = topic_match
+                    return build_topic_cluster_block(
+                        agent_id, content, matched_cluster, matched_phrases
+                    )
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 # NOTE: this is an extra semantic search round-trip (embedding +
