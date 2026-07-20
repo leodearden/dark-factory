@@ -1569,3 +1569,89 @@ class TestContendedLeaseDefers:
             'the contended-lease requeue must leave the per-task '
             'dead-verify-abort counter untouched'
         )
+
+    async def test_consecutive_contended_requeues_raise_log_severity(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """After CONTENDED_LEASE_REQUEUE_WARN_STREAK unbroken contended-lease
+        requeues for the SAME task_id, the per-requeue WARNING rises to an
+        ERROR naming the streak, so a long-running / wedged lane holder is
+        operator-visible instead of looping silently; a subsequent verify that
+        actually RUNS resets the streak (task 2828 amend — reviewer_comprehensive
+        robustness suggestion #1).
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+        from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        async def _lease_contended_verify(*_a: object, **_k: object) -> object:
+            raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
+
+        async def _generic_verify_error(*_a: object, **_k: object) -> object:
+            # A non-lease verify error: the verify actually ran (lease acquired)
+            # and failed — hits the generic 'blocked' path that RESETS the streak.
+            raise RuntimeError('verify boom')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        # Small threshold for a fast, deterministic streak (mirrors the
+        # MAX_INFLIGHT_DEAD_VERIFY_ABORTS monkeypatch convention).
+        worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 3
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        task_id = 'wedged-holder'
+
+        async def _drive_one(branch: str, verify: object) -> object:
+            # Fresh merged item on a distinct branch but the SAME task_id, so
+            # the per-task streak counter accumulates across dispatch attempts.
+            req, item = await _make_merged_item(
+                git_ops, config, branch, f'{branch}.py', 'x=1\n',
+                task_id=task_id,
+            )
+            worker._register_owned_merge_worktree(item.merge_wt)
+            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            with patch(
+                'orchestrator.merge_queue._run_post_merge_verify', verify,
+            ):
+                return await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=5.0,
+                )
+
+        # Requeues 1..threshold-1 stay at WARNING (no ERROR yet).
+        for i in range(worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK - 1):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                result = await _drive_one(f'clc-{i}', _lease_contended_verify)
+            assert result.status == InflightStatus.REQUEUED
+            assert worker._contended_lease_requeues[task_id] == i + 1
+            assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
+                f'requeue #{i + 1} is below the streak threshold — must stay WARNING'
+            )
+
+        # The requeue that REACHES the threshold rises to ERROR naming the streak.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _drive_one('clc-cross', _lease_contended_verify)
+        assert result.status == InflightStatus.REQUEUED
+        streak = worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK
+        assert worker._contended_lease_requeues[task_id] == streak
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'crossing the streak threshold must log an ERROR'
+        assert str(streak) in errors[0].getMessage(), (
+            'the rising-severity ERROR must name the streak length so an '
+            'operator can see how long the holder has blocked this verify'
+        )
+
+        # A verify that actually RUNS (here: a generic verify error, i.e. the
+        # lease WAS acquired) resets the streak for that task.
+        result = await _drive_one('clc-runs', _generic_verify_error)
+        assert task_id not in worker._contended_lease_requeues, (
+            'a verify that actually ran must reset the contended-lease streak'
+        )
