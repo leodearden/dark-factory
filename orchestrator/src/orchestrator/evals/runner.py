@@ -22,6 +22,7 @@ from orchestrator.config import (
     EffortConfig,
     ModelsConfig,
     OrchestratorConfig,
+    PriceEntry,
     SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
@@ -33,7 +34,13 @@ from orchestrator.workflow import (
     build_workflow,
 )
 
-from .configs import EVAL_CONFIGS, JUDGE_OFAT_IMPLEMENTER_PIN, EvalConfig, matrix_pairs
+from .configs import (
+    EVAL_CONFIGS,
+    JUDGE_OFAT_IMPLEMENTER_PIN,
+    EvalConfig,
+    claude_endpoint_price_table,
+    matrix_pairs,
+)
 from .metrics import EvalMetrics, collect_metrics
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
@@ -247,6 +254,25 @@ def build_eval_orch_config(
         update['fused_memory'] = profiled.fused_memory.model_copy(
             update={'url': memory_endpoint},
         )
+    # Task 2820 (ν follow-up, escalation esc-2479-1 finding #3): auto-merge
+    # claude_endpoint_price_table() into config.prices whenever THIS
+    # candidate's env_overrides carries a proxied ANTHROPIC_BASE_URL — the
+    # identical leaf collect_metrics reads (`is_local = bool(workflow.config
+    # .env_overrides.get('ANTHROPIC_BASE_URL'))`) before calling
+    # resolve_cost_usd(model=workflow.config.models.implementer,
+    # prices=workflow.config.prices, ...). Without this, an operator who
+    # forgets to seed prices manually silently gets cost_source=
+    # 'unpriced_proxy' (there's already a loud WARNING on that fallback, so
+    # this is convenience hardening, not a silent-fail fix). Merge, not
+    # replace: profiled.prices (the base/manually-seeded table) wins on
+    # conflict, mirroring claude_endpoint_price_table()'s own
+    # default-table-then-candidate-table override order.
+    if config.env_overrides.get('ANTHROPIC_BASE_URL'):
+        seeded_prices = {
+            model: PriceEntry(**rates)
+            for model, rates in claude_endpoint_price_table().items()
+        }
+        update['prices'] = {**seeded_prices, **profiled.prices}
     return profiled.model_copy(update=update)
 
 

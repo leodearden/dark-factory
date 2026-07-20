@@ -805,3 +805,82 @@ class TestRunConfirmStage:
         # >=3 results for the single fixture, distinct trials 1..N.
         assert len(results) >= 3
         assert {r.trial for r in results} >= {1, 2, 3}
+
+
+# ---------------------------------------------------------------------------
+# Task 2820 (ν follow-up, escalation esc-2479-1 finding #3) — build_eval_orch_
+# config auto-merges claude_endpoint_price_table() into config.prices whenever
+# the candidate's env_overrides carries a proxied ANTHROPIC_BASE_URL, so an
+# operator no longer has to seed prices manually for resolve_cost_usd to
+# resolve cost_source='price_table' instead of 'unpriced_proxy'. Merge, not
+# replace: an existing (manually-seeded) config.prices entry still wins.
+# ---------------------------------------------------------------------------
+
+class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
+    def test_proxied_candidate_resolves_price_table_without_manual_seed(
+        self, tmp_path: Path,
+    ):
+        # End-to-end via the driver: build_eval_orch_config (evals/runner.py)
+        # feeds the REAL resolve_cost_usd (evals/metrics.py) with no manual
+        # price seed on `base` — the auto-seed alone must be enough to land on
+        # cost_source='price_table'.
+        from orchestrator.evals.configs import MINIMAX_BASE_URL, MINIMAX_MODEL
+        from orchestrator.evals.metrics import resolve_cost_usd
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        proxied = EvalConfig(
+            'minimax-m2.5-endpoint', 'claude', MINIMAX_MODEL, 'high',
+            env_overrides={
+                'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL,
+                'ANTHROPIC_AUTH_TOKEN': 'dummy',
+            },
+        )
+
+        cfg = build_eval_orch_config(proxied, {}, base)
+
+        cost, source = resolve_cost_usd(
+            1_000_000, 1_000_000,
+            model=cfg.models.implementer,
+            prices=cfg.prices,
+            cli_cost_usd=999.0,           # deliberately wrong CLI figure —
+            is_local_model=True,          # must be IGNORED once price_table hits
+        )
+        assert source == 'price_table'
+        assert cost != 999.0
+
+    def test_existing_config_prices_entry_wins_over_auto_seed(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.config import PriceEntry
+        from orchestrator.evals.configs import MINIMAX_BASE_URL, MINIMAX_MODEL
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        manual_rate = PriceEntry(input_per_1m=1234.0, output_per_1m=5678.0)
+        base = _base_config(tmp_path).model_copy(
+            update={'prices': {MINIMAX_MODEL: manual_rate}},
+        )
+        proxied = EvalConfig(
+            'minimax-m2.5-endpoint', 'claude', MINIMAX_MODEL, 'high',
+            env_overrides={
+                'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL,
+                'ANTHROPIC_AUTH_TOKEN': 'dummy',
+            },
+        )
+
+        cfg = build_eval_orch_config(proxied, {}, base)
+
+        # The manually-seeded entry is preserved, NOT overwritten by the
+        # auto-seeded claude_endpoint_price_table() figure.
+        assert cfg.prices[MINIMAX_MODEL].input_per_1m == 1234.0
+        assert cfg.prices[MINIMAX_MODEL].output_per_1m == 5678.0
+
+    def test_non_proxied_candidate_prices_are_untouched(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        # No ANTHROPIC_BASE_URL override → no auto-seed; prices stay exactly
+        # the base/profiled default price table.
+        assert cfg.prices == base.prices
