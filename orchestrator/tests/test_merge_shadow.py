@@ -517,3 +517,57 @@ def test_merge_retry_shadow_baseline_does_not_mutate_inputs() -> None:
     merge_retry_shadow_baseline(attempt0, retry)
     assert attempt0 == {'A': 'pass', 'C': 'fail'}
     assert retry == {'C': 'pass'}
+
+
+def test_build_warm_shadow_results_narrowed_merges_attempt0_passes() -> None:
+    """NARROWED warm retry: partial retry output ∪ attempt-0 passes → whole map.
+
+    ``test_output`` is the PARTIAL narrowed-retry output containing ONLY the
+    re-run test; ``attempt0_verdicts`` supplies the attempt-0 pass that the
+    narrowed run omitted.  The result must be the merged full-suite baseline.
+    """
+    from orchestrator.merge_shadow import build_warm_shadow_results
+
+    test_output = 'PASS [   0.05s] reify-spec test_retried\n'
+    attempt0 = {'reify-spec test_passed': 'pass'}
+    assert build_warm_shadow_results(test_output, attempt0) == {
+        'reify-spec test_passed': 'pass',
+        'reify-spec test_retried': 'pass',
+    }
+
+
+def test_build_warm_shadow_results_non_narrowed_is_parse_only() -> None:
+    """NON-narrowed (no attempt-0 map): byte-identical to a plain parse.
+
+    ``attempt0_verdicts=None`` (the default) and an explicit empty ``{}`` must
+    both return exactly ``parse_per_test_results(test_output)`` — the
+    non-narrowed warm path stays byte-identical.
+    """
+    from orchestrator.merge_shadow import (
+        build_warm_shadow_results,
+        parse_per_test_results,
+    )
+
+    test_output = (
+        'PASS [   0.05s] reify-spec test_a\n'
+        'PASS [   0.06s] reify-spec test_b\n'
+    )
+    expected = parse_per_test_results(test_output)
+    assert expected == {'reify-spec test_a': 'pass', 'reify-spec test_b': 'pass'}
+    # default None
+    assert build_warm_shadow_results(test_output) == expected
+    # explicit empty attempt0 behaves like None (parse-only)
+    assert build_warm_shadow_results(test_output, {}) == expected
+
+
+def test_build_warm_shadow_results_empty_parse_returned_unchanged() -> None:
+    """EMPTY/unparseable retry: return ``{}`` verbatim, NEVER merged.
+
+    An empty retry parse must NOT be unioned with attempt-0 (that would turn an
+    unparseable narrowed retry into a non-empty PARTIAL baseline, masking the
+    fail-closed ``_alarm_warm_shadow_unparseable`` and feeding the shadow
+    compare the exact partial map D4 exists to eliminate).
+    """
+    from orchestrator.merge_shadow import build_warm_shadow_results
+
+    assert build_warm_shadow_results('', {'reify-spec test_passed': 'pass'}) == {}
