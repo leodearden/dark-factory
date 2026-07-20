@@ -15,12 +15,18 @@ test_harness_interactive_reaper.py's structure:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import subprocess
+import time
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
@@ -204,3 +210,196 @@ class TestVerifyScopeReaperStartupSweep:
         await self._drive_empty_until_idle_run(harness, monkeypatch)
 
         mock_pass.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Step-11: the task's mandated real-systemd SIGNAL test (skip-guarded).
+# Create a real live-sleeper df-verify-{tag}-*.scope plus a DIFFERENTLY-tagged
+# sibling scope; run the reaper; assert the tagged scope + sleeper are dead and
+# a summary line is logged, while the sibling SURVIVES (cross-project safety).
+# ---------------------------------------------------------------------------
+
+
+def _systemd_user_available() -> bool:
+    """True iff a usable ``systemd --user`` manager can create a transient scope."""
+    try:
+        r = subprocess.run(
+            ['systemd-run', '--user', '--scope', '--collect', 'true'],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _sc(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ['systemctl', '--user', *args],
+        capture_output=True, text=True, timeout=15,
+    )
+
+
+def _is_active(unit: str) -> str:
+    return _sc('is-active', unit).stdout.strip()
+
+
+def _scope_pids(unit: str) -> list[int]:
+    """PIDs in the scope's cgroup. A ``--scope`` unit has no MainPID (it adopts
+    processes rather than forking one), so membership is read from cgroup.procs."""
+    cg = _sc('show', unit, '--property=ControlGroup', '--value').stdout.strip()
+    if not cg:
+        return []
+    procs = Path('/sys/fs/cgroup') / cg.lstrip('/') / 'cgroup.procs'
+    try:
+        return [int(x) for x in procs.read_text().split()]
+    except Exception:
+        return []
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff *pid* names a live (non-zombie) process.
+
+    A SIGKILL'd sleeper whose parent (this pytest process, via Popen) has not
+    yet ``wait()``ed becomes a ZOMBIE — still in the process table, so a bare
+    ``os.kill(pid, 0)`` probe would wrongly report it alive. Read the proc
+    state and treat 'Z' as dead so the reap assertion reflects real liveness.
+    """
+    if pid <= 0:
+        return False
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        # Format: "pid (comm) state ..."; comm may contain spaces/parens, so
+        # split past the final ') ' before reading the state field.
+        state = stat.rsplit(') ', 1)[1].split(' ', 1)[0]
+        return state != 'Z'
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+    except Exception:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+
+def _launch_scope(unit: str) -> subprocess.Popen:
+    """Launch a live-sleeper transient scope (foreground systemd-run, detached)."""
+    return subprocess.Popen(
+        ['systemd-run', '--user', '--scope', f'--unit={unit}', 'sleep', '300'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _wait_active(unit: str, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_active(unit) == 'active':
+            return True
+        time.sleep(0.2)
+    return _is_active(unit) == 'active'
+
+
+def _wait_scope_pids(unit: str, timeout: float = 10.0) -> list[int]:
+    deadline = time.monotonic() + timeout
+    pids = _scope_pids(unit)
+    while not pids and time.monotonic() < deadline:
+        time.sleep(0.2)
+        pids = _scope_pids(unit)
+    return pids
+
+
+@pytest.mark.skipif(
+    not _systemd_user_available(),
+    reason='systemd --user manager unavailable (CI/session degraded)',
+)
+class TestVerifyScopeReaperRealSystemd:
+    """The task's mandated acceptance signal over REAL systemd --user."""
+
+    @pytest.mark.asyncio
+    async def test_tagged_scope_reaped_sibling_survives(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        # Two distinct project roots -> two distinct tags (unique tmp_path, so
+        # the sweep can never touch a real orchestrator's scopes).
+        root = tmp_path / 'proj'
+        sibling_root = tmp_path / 'sibling'
+        root.mkdir()
+        sibling_root.mkdir()
+
+        tag = verify._scope_tag_for(root)
+        sibling_tag = verify._scope_tag_for(sibling_root)
+        assert tag != sibling_tag, (tag, sibling_tag)
+
+        unit = f'df-verify-{tag}-{uuid.uuid4().hex[:12]}.scope'
+        sibling_unit = f'df-verify-{sibling_tag}-{uuid.uuid4().hex[:12]}.scope'
+
+        launcher: subprocess.Popen | None = None
+        sibling_launcher: subprocess.Popen | None = None
+        try:
+            launcher = _launch_scope(unit)
+            sibling_launcher = _launch_scope(sibling_unit)
+            assert _wait_active(unit), f'{unit} never became active'
+            assert _wait_active(sibling_unit), f'{sibling_unit} never became active'
+
+            sleeper_pids = _wait_scope_pids(unit)
+            assert sleeper_pids and all(_pid_alive(p) for p in sleeper_pids), (
+                f'sleeper(s) for {unit} not running (cgroup pids={sleeper_pids})'
+            )
+
+            harness, _rs = _make_harness(root)
+            with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+                await harness._run_leftover_verify_scope_reaper_pass()
+
+            # The tagged scope + its sleeper(s) are reaped (poll briefly for the
+            # SIGKILL/stop to settle).
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and (
+                _is_active(unit) == 'active'
+                or any(_pid_alive(p) for p in sleeper_pids)
+            ):
+                time.sleep(0.2)
+            assert _is_active(unit) != 'active', (
+                f'{unit} still active after reap (state={_is_active(unit)!r})'
+            )
+            assert not any(_pid_alive(p) for p in sleeper_pids), (
+                f'sleeper(s) {sleeper_pids} still alive after reap'
+            )
+
+            # A summary line naming the reaped tagged unit was logged; the
+            # sibling unit is NEVER named.
+            info_msgs = [
+                r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+            ]
+            assert any('reaper' in m.lower() for m in info_msgs), (
+                f'expected a summary INFO line; got: {info_msgs}'
+            )
+            assert any(unit in m for m in info_msgs), (
+                f'expected an INFO line naming reaped {unit!r}; got: {info_msgs}'
+            )
+            assert not any(sibling_unit in m for m in info_msgs), (
+                f'sibling {sibling_unit!r} must never be named as reaped; '
+                f'got: {info_msgs}'
+            )
+
+            # Cross-project safety: the DIFFERENTLY-tagged sibling SURVIVES.
+            assert _is_active(sibling_unit) == 'active', (
+                f'sibling {sibling_unit} must survive the tag-scoped sweep '
+                f'(state={_is_active(sibling_unit)!r})'
+            )
+        finally:
+            for u in (unit, sibling_unit):
+                with contextlib.suppress(Exception):
+                    _sc('kill', '--signal=SIGKILL', u)
+                with contextlib.suppress(Exception):
+                    _sc('stop', u)
+                with contextlib.suppress(Exception):
+                    _sc('reset-failed', u)
+            for p in (launcher, sibling_launcher):
+                if p is not None:
+                    with contextlib.suppress(Exception):
+                        p.terminate()
+                    with contextlib.suppress(Exception):
+                        p.wait(timeout=5)
