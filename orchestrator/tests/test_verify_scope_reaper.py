@@ -67,3 +67,25 @@ class TestScopeTagFor:
         )
         # Both still carry the shared basename slug for operator legibility.
         assert 'proj' in tag_a and 'proj' in tag_b
+
+
+class TestVerifyScopeName:
+    """``verify._verify_scope_name`` builds a tagged, uuid-suffixed scope unit name."""
+
+    def test_name_has_prefix_tag_and_scope_suffix(self) -> None:
+        """The name preserves the ``df-verify-`` prefix (so existing prefix
+        matchers still work), embeds the tag segment, and ends in ``.scope``
+        with a 12-hex uuid segment between the tag and the suffix."""
+        tag = 'myproj-1a2b3c4d'
+        name = verify._verify_scope_name(tag)
+        assert name.startswith(f'df-verify-{tag}-'), name
+        assert name.endswith('.scope'), name
+        m = re.fullmatch(rf'df-verify-{re.escape(tag)}-([0-9a-f]{{12}})\.scope', name)
+        assert m, f'unexpected scope-name shape: {name!r}'
+
+    def test_each_call_has_unique_uuid_segment(self) -> None:
+        """Every call yields a distinct uuid segment so concurrent verifies
+        never collide on a scope unit name."""
+        tag = 'myproj-1a2b3c4d'
+        names = {verify._verify_scope_name(tag) for _ in range(20)}
+        assert len(names) == 20, f'expected 20 unique scope names; got {len(names)}'
