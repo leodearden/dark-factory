@@ -296,7 +296,7 @@ models:
   merger: "opus"
   steward: "opus"
   triage: "sonnet"
-  module_tagger: "sonnet"
+  module_tagger: "haiku"
   deep_reviewer: "opus"
   judge: "sonnet"
   simple_task: "sonnet"
