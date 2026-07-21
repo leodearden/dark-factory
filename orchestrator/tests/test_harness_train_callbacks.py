@@ -325,6 +325,44 @@ class TestRedriveMember:
         assert 'train-abc' in note, f"note missing train_id: {note!r}"
 
     @pytest.mark.asyncio
+    async def test_redrive_on_main_consumes_landed_row(self, tmp_path: Path) -> None:
+        """redrive_member found_on_main guard consumes a bound LandedRow (task 2280, PRD B1).
+
+        When a partner's merge already brought the branch into main,
+        redrive_member flips the member 'done' (kind='found_on_main'); if that
+        member is the train tip it owns the write-ahead LandedRow, which must be
+        consumed inline so it does not survive to the next startup for RC-3.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='5002', branch_tip_sha='tip',
+            advanced_sha='cafe1234beef', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        sched = FakeScheduler()
+        await sched.set_task_status('5002', 'merge-deferred')
+
+        cbs = build_train_callback_factory(sched)('train-abc')
+        assert cbs.redrive_member is not None
+
+        # Row present BEFORE the done-write.
+        assert outbox.lookup('5002') is not None
+
+        await cbs.redrive_member('5002', True, 'cafe1234beef')
+
+        assert sched.statuses['5002'][-1] == 'done', (
+            f"expected 'done', got {sched.statuses['5002'][-1]!r}"
+        )
+        assert sched.provenance.get('5002', {}).get('kind') == 'found_on_main', (
+            f"kind mismatch: {sched.provenance.get('5002')!r}"
+        )
+        # Row CONSUMED on the found_on_main done-write (PRD B1: lookup==None after done).
+        assert outbox.lookup('5002') is None
+
+    @pytest.mark.asyncio
     async def test_redrive_noop_for_nontask_member(self) -> None:
         """redrive_member for a non-seeded member must NOT raise and must NOT write status."""
         from orchestrator.harness import build_train_callback_factory
