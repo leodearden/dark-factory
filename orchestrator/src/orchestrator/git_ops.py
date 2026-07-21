@@ -1979,7 +1979,7 @@ class GitOps:
         return True
 
     @contextlib.asynccontextmanager
-    async def merge_verify_lease(self):
+    async def merge_verify_lease(self, lane_dir: Path | None = None):
         """Async context manager recording the merge-verify lease for the
         duration of a span (task 2315, BUG 1; lock path converged onto the
         shared ``<lane_dir>.lock`` in task 2685).
@@ -2011,6 +2011,21 @@ class GitOps:
         thin, or gc of the lane mutually exclude with a live local (or laptop)
         verify — the flock holder-pgid rendezvous below is unchanged.
 
+        *lane_dir* selects WHICH lane's ``<lane_dir>.lock`` inode is flocked.
+        Defaults to ``None`` → :attr:`persistent_merge_worktree_path` (the
+        singleton persistent merge lane), which keeps the sole no-arg caller
+        (``merge_queue.py``'s LOCAL-dispatch guard) and every existing lease
+        test byte-identical. A non-``None`` *lane_dir* (e.g. the EPHEMERAL
+        ``_merge-<hash>`` speculation worktree the DF 2822 per-land REMOTE-green
+        cross-check actually verifies in) flocks THAT lane instead, so the
+        cross-check mutually excludes a concurrent reseed/reclaim of its OWN
+        lane (task 2873). Only the flocked inode is parametrized — the
+        holder-pgid rendezvous below stays keyed to the GLOBAL
+        :attr:`worktree_base` (a fail-open liveness hint consumed only by
+        persistent-lane actors; an ephemeral-lane lease writing it is a safe
+        over-approximation that at worst makes a concurrent persistent
+        reseed/GC defer during the cross-check, never a clobber).
+
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out after
         ``_MERGE_VERIFY_LEASE_WAIT_SECS``), RAISES
@@ -2025,7 +2040,9 @@ class GitOps:
         this lease is defense-in-depth on top of it for the DF-side
         teardown/GC actors.
         """
-        lock_path = lane_lock_path(self.persistent_merge_worktree_path)
+        lock_path = lane_lock_path(
+            lane_dir if lane_dir is not None else self.persistent_merge_worktree_path
+        )
         # Acquire OFF the event loop: the bounded wait is now minutes
         # (_MERGE_VERIFY_LEASE_WAIT_SECS) and acquire_merge_verify_flock is a
         # synchronous time.sleep poll, so an inline call would freeze the whole
