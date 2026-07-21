@@ -1530,6 +1530,13 @@ class TaskWorkflow:
             await self.scheduler.mark_done(
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
+            # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow inline
+            # so a train-landed member no longer leaves a stale row surviving to the
+            # next startup for RC-3 to prune. Idempotent (no-op for non-tip members),
+            # fail-safe when unbound; runs only after a SUCCESSFUL mark_done (a raised
+            # mark_done above skips it, leaving the row for the reconciler). Mirrors
+            # the 2681 single-branch precedent at workflow.py:1912-1917.
+            MergeProvenance.consume(mid)
             # Diff 5d (B3/T7): release warm lane for the done member.
             # Idempotent/never-raise via the shared primitive.
             await self.git_ops.release_lane_for_terminal_task(mid)
