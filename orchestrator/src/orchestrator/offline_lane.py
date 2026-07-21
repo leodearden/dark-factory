@@ -416,7 +416,12 @@ class OfflineLaneWorker:
         and in the SAME ``_offline-deep`` worktree (task 1959, IE1):
 
         1. NUMERIC — the existing ``scripts/run-offline-deep.sh`` suite via
-           :attr:`suite_runner`. Unchanged: on red it calls
+           :attr:`suite_runner`, gated on
+           ``config.git.offline_lane_legacy_numeric_enabled`` (default True =
+           byte-identical to prior behaviour; task 2789, D2). A project with
+           no ``run-offline-deep.sh`` sets it False, in which case the numeric
+           leg is skipped and treated as vacuously green (so it never blocks
+           the all-green ``_last_green_head`` advance). On red it calls
            :meth:`_handle_red_run` BARE (``_handle_red_run(wt, head)``),
            preserving back-compat with the numeric-only red path.
         2. INFRA — reify's ``run_all --scope host-infra`` (H9 = reify:4929)
@@ -448,16 +453,18 @@ class OfflineLaneWorker:
         wt = await self.git_ops.reset_persistent_offline_deep_worktree(head)
         threads = self.config.git.offline_lane_test_threads
 
-        start = time.monotonic()
-        rc, _tail = await self.suite_runner(wt, head, threads)
-        duration = time.monotonic() - start
-        logger.info(
-            'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
-            head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
-        )
-        numeric_green = rc == 0
-        if not numeric_green:
-            await self._handle_red_run(wt, head)
+        numeric_green = True
+        if self.config.git.offline_lane_legacy_numeric_enabled:
+            start = time.monotonic()
+            rc, _tail = await self.suite_runner(wt, head, threads)
+            duration = time.monotonic() - start
+            logger.info(
+                'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
+                head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+            )
+            numeric_green = rc == 0
+            if not numeric_green:
+                await self._handle_red_run(wt, head)
 
         infra_green = True
         if self.config.git.offline_lane_infra_enabled:
