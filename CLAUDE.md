@@ -584,12 +584,50 @@ ladder-relative resolution, if applicable) is checked against
 `routing.allowed_models` and `per_model_daily_ceiling_usd`. On failure,
 that layer's model assignment is skipped — `model`/`source_layer` keep
 whatever the next-lower-precedence layer already validated — and a
-namespaced `"<layer>:<reason>"` string (`model-not-in-allowlist` or
-`model-ceiling-exhausted`) is appended to `RoutingDecision.rejected`. **A
-dispatch is never blocked by a routing mis-config.** This validation is
-scoped to claude-backend roles only — a non-claude-backend role's model
-string is the harness-backend PRD's axis and is never checked against this
-claude-centric allowlist/ceiling.
+namespaced `"<layer>:<reason>"` string (`model-not-in-allowlist`,
+`model-ceiling-exhausted`, or `model-capacity-exhausted` — the last is the
+per-scope account-capacity check, see "Model-scoped account caps" below) is
+appended to `RoutingDecision.rejected`. **A dispatch is never blocked by a
+routing mis-config.** This validation is scoped to claude-backend roles
+only — a non-claude-backend role's model string is the harness-backend
+PRD's axis and is never checked against this claude-centric
+allowlist/ceiling.
+
+### Model-scoped account caps (`usage_cap.scoped_cap_models`)
+
+`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`)
+gives the `UsageGate` (`shared/src/shared/usage_gate.py`) a per-(account,
+model) cap dimension layered on top of its existing per-account failover.
+An invocation's **scope** is its model string if that string is listed in
+`scoped_cap_models`, else `None` (general). `scoped_cap_models: []` is the
+**kill switch** — no scope state is ever allocated and every invocation
+resolves to scope `None`, so the gate behaves byte-identically to the
+pre-scope gate.
+
+Scope semantics:
+- **A fable cap-hit does not cap the account's general capacity.** A cap
+  detected on a scoped invocation marks only that account's
+  `scope_caps[model]`; the account-level phase machine is left untouched,
+  so the account keeps serving non-scoped (general) dispatches normally.
+- **Scoped failover.** `before_invoke(scope=m)` skips any account whose
+  scope `m` is capped (and not past its `resets_at`), landing on an account
+  with headroom in that scope; the resulting `failover` cost event's
+  `details` carries `scope: m`.
+- **Account cap dominates.** An account-level CAPPED/AUTH_FAILED excludes
+  the account for **every** scope, including general; a scope cap only ever
+  excludes that one scope. A general cap-hit never writes scope state (the
+  account-level exclusion already covers every scope).
+- **All-scope-capped never freezes the fleet.** If every account is capped
+  for scope `m`, a scoped caller waits on its own wake mechanism (or, at
+  resolve time, the routing resolver degrades — see "Fail-safe validation"
+  above) — it never clears the fleet's pause gate and never delays a
+  concurrent general caller.
+
+`usage_cap.*` is **not** in `RELOADABLE_FIELDS` — like the rest of the
+multi-account failover config, `scoped_cap_models` is restart-tier; a change
+requires a full orchestrator restart, not `mcp__escalation__reload_config`
+(see "Orchestrator Config Reload" above and
+`skills/orchestrate/SKILL.md`'s "Multi-account failover" section).
 
 ### Observability
 
