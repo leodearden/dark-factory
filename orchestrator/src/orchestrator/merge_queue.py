@@ -2265,6 +2265,39 @@ async def _run_post_merge_verify(
                 '(remote=%s) — trusting the remote green (fail-safe): %s',
                 req.task_id, merge_sha, runner.name, exc,
             )
+        except MergeVerifyLeaseContended as exc:
+            # Fail-safe (task 2873): a contended lane-lock means a reseed/reclaim
+            # is actively mutating merge_wt — running the local verify now would
+            # reproduce the exact ENOENT mid-verify clobber this lease exists to
+            # prevent (reify 2026-07-20, merge_sha 83336a32: the ephemeral
+            # _merge-<hash> worktree was deleted mid-compile). We already hold a
+            # primary verdict (the remote green), so we SKIP the second-opinion
+            # cross-check and TRUST the remote green — mirroring the
+            # RunnerUnavailable fail-safe above and DriftDetector Invariant 5
+            # ("never block a good land on a local infra hiccup"). Do NOT set
+            # local_verify, do NOT quarantine, do NOT file an escalation, do NOT
+            # adopt a FAIL verdict — leaving `verify` = the remote green so the
+            # `if not verify.passed:` path below is skipped and the land proceeds.
+            # Deliberately DIFFERENT from the LOCAL-dispatch-path contention at
+            # the top of this function, which correctly PROPAGATES to the requeue
+            # handler (there is no primary verdict there); this catch keeps
+            # cross-check contention from reaching that handler.
+            if event_store is not None:
+                event_store.emit(
+                    EventType.verify_cross_check_inconclusive,
+                    task_id=req.task_id,
+                    data={
+                        'merge_sha': merge_sha,
+                        'remote_runner': runner.name,
+                        'reason': f'cross-check lane-lock contended: {exc}',
+                    },
+                )
+            logger.warning(
+                'Task %s: cross-check local trust-anchor could not acquire the '
+                'lane lock for %s (remote=%s) — a reseed/reclaim is in flight; '
+                'trusting the remote green (fail-safe, DriftDetector Invariant 5): %s',
+                req.task_id, merge_sha, runner.name, exc,
+            )
         else:
             if local_verify.passed == verify.passed:
                 # AGREE — both green.  Emit parity telemetry and proceed to land.
