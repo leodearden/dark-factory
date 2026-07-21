@@ -211,6 +211,34 @@ def test_git_config_accepts_main_gate_commands():
     assert cfg_mark_only.main_gate_unmark_command is None
 
 
+def test_git_config_accepts_main_gate_bypass_commands():
+    """GitConfig.main_gate_bypass_command / _clear_command default to None and round-trip.
+
+    These are the recover_red_main break-glass knobs (task 2877): a durable
+    bypass of a project's always-on non-fast-forward main-gate guard, engaged
+    immediately before recover_red_main's backward CAS update-ref and cleared
+    immediately after.  Mirrors test_git_config_accepts_main_gate_commands for
+    the mark/unmark pair.
+    """
+    # Defaults — feature off (unset => no-op, other projects unaffected)
+    cfg_default = GitConfig()
+    assert cfg_default.main_gate_bypass_command is None
+    assert cfg_default.main_gate_bypass_clear_command is None
+
+    # Both set — values round-trip correctly
+    cfg = GitConfig(
+        main_gate_bypass_command='git config reify.mainGate.bypass true',
+        main_gate_bypass_clear_command='git config --unset reify.mainGate.bypass',
+    )
+    assert cfg.main_gate_bypass_command == 'git config reify.mainGate.bypass true'
+    assert cfg.main_gate_bypass_clear_command == 'git config --unset reify.mainGate.bypass'
+
+    # Only bypass set — clear stays None
+    cfg_bypass_only = GitConfig(main_gate_bypass_command='x')
+    assert cfg_bypass_only.main_gate_bypass_command == 'x'
+    assert cfg_bypass_only.main_gate_bypass_clear_command is None
+
+
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
     async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
