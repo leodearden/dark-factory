@@ -1382,6 +1382,45 @@ class GitConfig(BaseModel):
             'main_gate_mark_command.  None (default) => feature off (no-op).'
         ),
     )
+    main_gate_bypass_command: str | None = Field(
+        default=None,
+        description=(
+            'Optional project-configurable shell command run (via ``sh -c`` '
+            'in project_root) immediately BEFORE recover_red_main\'s CAS '
+            'update-ref to engage a DURABLE bypass of a project\'s always-on '
+            'non-fast-forward main-gate guard.  recover_red_main moves '
+            'refs/heads/main BACKWARD to an earlier good SHA, which a '
+            'reify-style non-ff guard rejects UNCONDITIONALLY (before the '
+            'sanction/sentinel check is even reached), so main_gate_mark_command '
+            'alone is insufficient for the recovery move.  When set this bypass '
+            'SUPERSEDES the mark: recover_red_main engages the bypass and SKIPS '
+            'the mark entirely (running both would leave the one-shot mark '
+            'sentinel unconsumed — the hook `continue`s on the bypass before '
+            'consuming it — falsely sanctioning the next unrelated ref move).  '
+            'The bypass is DURABLE, so recover_red_main clears it on every path '
+            'via main_gate_bypass_clear_command.  Set under the ``git:`` '
+            'section of orchestrator.yaml.  Generic, not reify-hardcoded '
+            '(honors task 1715\'s KEEP IT GENERIC).  None (default) => feature '
+            'off (no-op) so other projects are unaffected; advance_main '
+            '(forward ff moves) never uses it.'
+        ),
+    )
+    main_gate_bypass_clear_command: str | None = Field(
+        default=None,
+        description=(
+            'Optional project-configurable shell command run (via ``sh -c`` '
+            'in project_root) to CLEAR the durable bypass engaged by '
+            'main_gate_bypass_command.  recover_red_main runs it in a '
+            'try/finally around the CAS update-ref so it fires on EVERY path '
+            '(success, CAS failure, AND exception) — unlike '
+            'main_gate_unmark_command, which only runs on the failure path — '
+            'because a bypassed transaction consumes nothing, so the '
+            'durable bypass would otherwise leak into every later ref move and '
+            'disable the project\'s non-ff guard.  Set under the ``git:`` '
+            'section of orchestrator.yaml alongside main_gate_bypass_command.  '
+            'None (default) => feature off (no-op).'
+        ),
+    )
     persistent_merge_worktree: bool = Field(
         default=False,
         description=(
