@@ -2237,8 +2237,38 @@ class TaskWorkflow:
         ``scheduler.set_task_claimant`` is itself best-effort, so a transient
         failure here just means the next tick tries again.
         """
+        # Defensive interval guard (task 2780): read the cadence once and bail
+        # loudly if it is not a positive real number. The only real-world
+        # trigger is a fully-mocked OrchestratorConfig in tests — production
+        # config is pydantic-schema-validated, so this branch is unreachable in
+        # prod and there is zero prod behaviour change. Without it, a bare
+        # MagicMock interval reaches ``asyncio.sleep(<MagicMock>)``, whose
+        # ``if delay <= 0`` raises ``TypeError: '<=' not supported between
+        # instances of MagicMock and int`` (MagicMock's comparison dunders
+        # default to NotImplemented) onto the (often shared, xdist) event loop,
+        # polluting a later innocent test. The ``isinstance`` check is FIRST so
+        # a MagicMock short-circuits (via ``or``) before the ``<= 0`` comparison
+        # that would itself raise that guarded TypeError. The heartbeat refresh
+        # is already documented as best-effort, so not running it under an
+        # invalid interval is safe; the WARNING keeps the exit loud
+        # (no-silent-fail-soft). Note: the cadence is read ONCE here rather than
+        # per iteration, so a mid-loop hot-reload of
+        # ``claimant_heartbeat_interval_secs`` does not take effect until the
+        # loop is next (re)started. This is intentional and harmless — the loop
+        # is per-task and short-lived, the interval is not a documented
+        # hot-reload knob, and reading once keeps the guard and the sleep using
+        # a single consistent value.
+        interval = self.config.claimant_heartbeat_interval_secs
+        if not isinstance(interval, (int, float)) or interval <= 0:
+            logger.warning(
+                'Task %s: claimant_heartbeat_interval_secs is not a positive '
+                'number (%r) — heartbeat loop exiting without running',
+                self.task_id,
+                interval,
+            )
+            return
         while True:
-            await asyncio.sleep(self.config.claimant_heartbeat_interval_secs)
+            await asyncio.sleep(interval)
             await self.scheduler.set_task_claimant(
                 self.task_id, heartbeat_at=datetime.now(UTC).isoformat(),
             )

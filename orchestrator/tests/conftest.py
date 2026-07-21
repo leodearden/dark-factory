@@ -47,6 +47,7 @@ from _orch_helpers import (  # noqa: E402
     idle_psi_sample,
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
+    reap_leaked_claimant_heartbeats,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
@@ -154,6 +155,35 @@ async def _reap_leaked_aiosqlite_connections():
     """
     yield
     await reap_leaked_aiosqlite_connections()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_claimant_heartbeats():
+    """Cancel any leaked TaskWorkflow._claimant_heartbeat_loop before the loop closes.
+
+    Task 2780 — fix for the orchestrator merge-queue/workflow xdist load-flake.
+    ``TaskWorkflow._setup_worktree_and_artifacts`` starts a background
+    ``_claimant_heartbeat_loop`` task; production ``run()``'s finally stops it
+    via ``_stop_claimant_heartbeat``. A co-scheduled TaskWorkflow test that
+    raises before its own inline ``_stop_claimant_heartbeat`` (or never starts
+    one) orphans that loop onto the shared per-worker event loop, where it is
+    destroyed-while-pending at teardown — or, under a fully-mocked config with
+    a ``MagicMock`` ``claimant_heartbeat_interval_secs``, raises an
+    un-retrieved ``TypeError`` from ``asyncio.sleep(<MagicMock>)`` — and
+    pytest attributes the fallout to a later, innocent test (observed victim:
+    ``TestB7SingleHostNewPath``'s serial-order assertion).
+
+    Reaping here — in the test's own loop, before it is closed — cancels and
+    bounded-drains any live heartbeat loop so it can never later touch a
+    closed loop or pollute the shared worker. Best-effort and bounded (see
+    ``reap_leaked_claimant_heartbeats`` in ``_orch_helpers.py``): it never
+    fails a test and is a cheap no-op for the (vast majority of) tests that
+    leak no loop. Mirrors the sibling autouse reapers ``_reap_leaked_merge_workers``
+    (task 1907) and ``_reap_leaked_aiosqlite_connections`` (task 2413), and the
+    fused-memory ``_reap_leaked_ticket_workers`` (task 2737).
+    """
+    yield
+    await reap_leaked_claimant_heartbeats()
 
 
 @pytest.fixture(scope="session")

@@ -410,6 +410,62 @@ async def reap_leaked_aiosqlite_connections() -> int:
     return closed
 
 
+async def reap_leaked_claimant_heartbeats() -> int:
+    """Cancel + drain any orphaned TaskWorkflow._claimant_heartbeat_loop task.
+
+    Task 2780 — fix for the orchestrator merge-queue/workflow xdist load-flake.
+    ``TaskWorkflow._setup_worktree_and_artifacts`` starts a background asyncio
+    task running ``_claimant_heartbeat_loop``; production ``run()``'s finally
+    stops it via ``_stop_claimant_heartbeat``. A co-scheduled TaskWorkflow test
+    that raises before its own inline ``_stop_claimant_heartbeat`` (or never
+    starts one) orphans that loop onto the shared per-worker event loop, where
+    it is either destroyed-while-pending at loop teardown, or — if the
+    workflow's config is fully mocked and its
+    ``claimant_heartbeat_interval_secs`` is a bare ``MagicMock`` — raises an
+    un-retrieved ``TypeError`` from ``asyncio.sleep(<MagicMock>)`` onto the
+    shared loop. Either way pytest attributes the fallout to a later, innocent
+    test (observed victim: ``TestB7SingleHostNewPath``'s serial-order
+    assertion, which sees a spurious extra ``_dispatch_item`` call).
+
+    Like ``reap_leaked_ticket_workers`` (task 2737) — and unlike
+    ``MergeWorker.run`` (task 1907) — the loop just blocks on ``asyncio.sleep``
+    and owns no subprocess/child-loop machinery, so a bare ``task.cancel()`` +
+    bounded await is sufficient. Best-effort and bounded, and a cheap no-op for
+    the (vast majority of) tests that leak no loop. Only the
+    ``asyncio.wait_for`` timeout is suppressed (``asyncio.TimeoutError``): the
+    cancelled loop's own exceptions are already captured as results by
+    ``return_exceptions=True`` in the ``gather``, so nothing else needs
+    catching. A genuine bug inside the reaper itself — or a ``CancelledError``
+    targeting the reaper's own task rather than the loop it is draining — is
+    deliberately left to propagate rather than masked by a broad ``Exception``
+    / ``BaseException`` suppress (loud-over-silent-degradation), matching the
+    sibling ``reap_leaked_aiosqlite_connections`` above.
+
+    Returns:
+        The number of orphaned heartbeat-loop tasks actually cancelled and
+        drained (``task.done()`` confirmed post-drain) — a loop that fails to
+        unwind within the bounded timeout is not counted, even though it was
+        ``cancel()``-requested.
+    """
+    reaped = 0
+    for task in list(asyncio.all_tasks()):
+        if task.done():
+            continue
+        coro = task.get_coro()
+        if not getattr(coro, '__qualname__', '').endswith(
+            'TaskWorkflow._claimant_heartbeat_loop'
+        ):
+            continue
+        task.cancel()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=10.0,
+            )
+        if task.done():
+            reaped += 1
+    return reaped
+
+
 def _init_harness_state_for_test(h: Harness) -> None:
     """Initialise task-1327 AFK-hardening digest counters on a __new__-built Harness.
 

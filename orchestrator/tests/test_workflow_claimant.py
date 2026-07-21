@@ -190,3 +190,106 @@ async def test_stop_claimant_heartbeat_is_idempotent_noop_when_never_started(tmp
     assert wf._claimant_heartbeat_task is None
 
     await wf._stop_claimant_heartbeat()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_claimant_heartbeat_loop_exits_cleanly_on_nonnumeric_interval(tmp_path: Path):
+    """A non-numeric (MagicMock) interval makes the loop exit cleanly, not crash.
+
+    This is the fully-mocked-config case (task 2780 sub-mode a1): a MagicMock
+    ``claimant_heartbeat_interval_secs`` reaches ``asyncio.sleep(<MagicMock>)``,
+    whose ``if delay <= 0`` evaluates ``MagicMock() <= 0`` — and ``MagicMock``'s
+    comparison dunders (``__le__``) default to ``NotImplemented``, so Python
+    raises ``TypeError: '<=' not supported between instances of MagicMock and
+    int``. RED before the step-4 guard: that TypeError propagates out of the
+    loop, out of ``wait_for``, and fails this test. GREEN after the guard: the
+    loop reads the interval once, sees it is not a positive real number, logs a
+    WARNING, and returns without ever entering the sleep loop or refreshing the
+    claimant.
+    """
+    wf = _make_workflow(project_root=tmp_path)
+    wf.config.claimant_heartbeat_interval_secs = MagicMock()  # non-numeric interval
+
+    # Must return cleanly (no TypeError, no hang) — bounded so a regression that
+    # re-enters the sleep loop fails fast on timeout rather than hanging.
+    await asyncio.wait_for(wf._claimant_heartbeat_loop(), timeout=1.0)
+
+    # The guard returns before the first refresh, so the claimant is never touched.
+    wf.scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# leaked-heartbeat-loop reaper (task 2780)
+#
+# Mirrors the established leaked-async-task reaper family:
+#   - reap_leaked_ticket_workers  (task 2737, fused-memory _fm_helpers.py)
+#   - reap_leaked_aiosqlite_connections (task 2413, _orch_helpers.py)
+#   - _reap_leaked_merge_workers  (task 1907, this project's conftest.py)
+#
+# A co-scheduled TaskWorkflow test that raises before its own inline
+# _stop_claimant_heartbeat (or never starts one) orphans the background
+# _claimant_heartbeat_loop task onto the shared xdist-worker loop, where it is
+# destroyed-while-pending (or, under a fully-mocked config, raises an
+# un-retrieved TypeError) and pollutes a later innocent test.
+# ---------------------------------------------------------------------------
+
+
+def _live_claimant_heartbeat_tasks() -> list[asyncio.Task]:
+    """Return non-done asyncio Tasks whose coroutine is TaskWorkflow._claimant_heartbeat_loop."""
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done()
+        and getattr(t.get_coro(), '__qualname__', '').endswith(
+            'TaskWorkflow._claimant_heartbeat_loop'
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reap_leaked_claimant_heartbeats_cancels_orphaned_loop(tmp_path: Path):
+    """reap_leaked_claimant_heartbeats() cancels + drains an orphaned heartbeat loop.
+
+    Starts a leaked _claimant_heartbeat_loop task directly (the interval
+    defaults to a valid 60.0, so the loop starts and blocks on its first
+    asyncio.sleep) and deliberately does NOT call _stop_claimant_heartbeat —
+    the point is that the reaper alone can halt the orphaned loop, exactly as
+    it must for a test that crashed before its own cleanup ran.
+
+    The import is the FIRST statement so an ImportError (RED, until the helper
+    exists in step-2) fails the test before any task is created and thus cannot
+    itself leak a heartbeat loop.
+    """
+    from _orch_helpers import reap_leaked_claimant_heartbeats
+
+    wf = _make_workflow(project_root=tmp_path)
+    task = asyncio.create_task(wf._claimant_heartbeat_loop())
+    await asyncio.sleep(0)  # let the loop start and block on asyncio.sleep(60.0)
+
+    assert _live_claimant_heartbeat_tasks(), (
+        'Precondition: expected a live TaskWorkflow._claimant_heartbeat_loop '
+        'task after create_task'
+    )
+
+    reaped = await reap_leaked_claimant_heartbeats()
+
+    assert reaped >= 1, (
+        f'Expected reap_leaked_claimant_heartbeats() to reap >= 1, got {reaped}'
+    )
+    assert _live_claimant_heartbeat_tasks() == [], (
+        'No live TaskWorkflow._claimant_heartbeat_loop task should remain after reaping'
+    )
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_reap_leaked_claimant_heartbeats_noop_when_nothing_leaked():
+    """reap_leaked_claimant_heartbeats() returns 0 when nothing was leaked.
+
+    Pins the cheap no-op path: this test's own runner task (and any other live
+    task) does not match the '...TaskWorkflow._claimant_heartbeat_loop' qualname
+    filter.
+    """
+    from _orch_helpers import reap_leaked_claimant_heartbeats
+
+    assert await reap_leaked_claimant_heartbeats() == 0
