@@ -265,6 +265,16 @@ class RouteInputs:
     (``TaskWorkflow._invoke``) only populate it for ceiling'd models, so it
     is empty ``{}`` at stock config (no ceilings configured -> no cost_store
     read fires).
+
+    ``scope_capacity`` is the resolve-time advisory per-scoped-model headroom
+    snapshot (task δ / invariant S7-S8) -- the gate's
+    ``scope_capacity_snapshot()`` (task γ), True per scoped model iff >=1
+    account has headroom. Threaded from ``TaskWorkflow._invoke``; ``None``
+    (no gate wired, or a snapshot read hiccup) or a model ABSENT from the
+    mapping skips the capacity fail-safe entirely, so an absent/stale
+    snapshot NEVER blocks dispatch (S7). It is advisory only: the gate's own
+    invoke-time scope predicate stays authoritative, so a stale snapshot
+    degrades to a scope-wait/failover, never a wrong-and-stuck decision (S8).
     """
 
     role_name: str
@@ -275,6 +285,7 @@ class RouteInputs:
     dispatch_count: int
     role_defaults: RoleDefaults
     spend_by_model: Mapping[str, float] = field(default_factory=dict)
+    scope_capacity: Mapping[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -397,10 +408,13 @@ def _rule_matches(rule: RoutingRule, inputs: RouteInputs) -> bool:
 
 
 def _model_rejection_reason(
-    candidate: str, config: OrchestratorConfig, spend_by_model: Mapping[str, float],
+    candidate: str,
+    config: OrchestratorConfig,
+    spend_by_model: Mapping[str, float],
+    scope_capacity: Mapping[str, bool] | None = None,
 ) -> str | None:
     """Return a fail-safe rejection reason for *candidate*, or None if it
-    passes validation (invariants 2 and 6).
+    passes validation (invariants 2, 6, and S7).
 
     Invariant 2: *candidate* must be a member of ``config.routing.
     allowed_models`` -- ``'model-not-in-allowlist'`` otherwise. Invariant 6:
@@ -409,12 +423,26 @@ def _model_rejection_reason(
     supplied -- see ``RouteInputs.spend_by_model``) must be strictly under
     it -- ``'model-ceiling-exhausted'`` otherwise. A model with no
     configured ceiling never trips this second check.
+
+    Invariant S7 (task δ): when *scope_capacity* (the resolve-time advisory
+    snapshot -- see ``RouteInputs.scope_capacity``) reports *candidate*'s
+    account scope as having no headroom (``scope_capacity[candidate] is
+    False``), the model is rejected -- ``'model-capacity-exhausted'``. This
+    check is skipped entirely (no rejection) when *scope_capacity* is
+    ``None`` or *candidate* is ABSENT from the mapping, so an absent/stale
+    snapshot never blocks dispatch. Checked LAST (after allowlist/ceiling):
+    ordering only decides which reason string wins when several checks fail
+    at once, and the more fundamental allowlist/ceiling cause is the more
+    informative one to surface first. All three checks are gated to
+    claude-backend roles by the callers (see ``resolve_route``).
     """
     if candidate not in config.routing.allowed_models:
         return 'model-not-in-allowlist'
     ceiling = config.routing.per_model_daily_ceiling_usd.get(candidate)
     if ceiling is not None and spend_by_model.get(candidate, 0.0) >= ceiling:
         return 'model-ceiling-exhausted'
+    if scope_capacity is not None and scope_capacity.get(candidate) is False:
+        return 'model-capacity-exhausted'
     return None
 
 
@@ -460,14 +488,19 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     ``source_layer`` tracks only ``model``'s provenance. Pure and
     synchronous -- no I/O.
 
-    Fail-safe validation (invariants 2 and 6): whenever layer 3, 2, or 1
-    would set ``model``, the candidate (after ladder-relative resolution
+    Fail-safe validation (invariants 2, 6, and S7): whenever layer 3, 2, or
+    1 would set ``model``, the candidate (after ladder-relative resolution
     for a policy rule's ``'+N'``) is checked against ``config.routing.
-    allowed_models`` and ``per_model_daily_ceiling_usd``. On failure that
-    layer's model assignment is skipped -- ``model``/``source_layer`` keep
-    whatever the next-lower-precedence layer already validated -- and a
-    namespaced ``"<layer>:<reason>"`` string is appended to ``rejected``.
-    A dispatch is never blocked by a routing mis-config.
+    allowed_models``, ``per_model_daily_ceiling_usd``, and ``inputs.
+    scope_capacity`` (the resolve-time advisory account-scope headroom
+    snapshot -- see ``RouteInputs.scope_capacity``). On failure that layer's
+    model assignment is skipped -- ``model``/``source_layer`` keep whatever
+    the next-lower-precedence layer already validated -- and a namespaced
+    ``"<layer>:<reason>"`` string is appended to ``rejected``. A dispatch is
+    never blocked by a routing mis-config: an absent/stale ``scope_capacity``
+    snapshot (``None``, or the model absent from it) simply skips the
+    capacity check (S7), and the gate's own invoke-time scope predicate
+    stays authoritative so staleness degrades to a scope-wait/failover (S8).
 
     This validation is scoped to claude-backend roles only (``config.
     backends`` keyed the same way as ``config.models`` -- the reviewer*
@@ -505,7 +538,9 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     if hasattr(config.models, key):
         candidate = getattr(config.models, key)
         reason = (
-            _model_rejection_reason(candidate, config, inputs.spend_by_model)
+            _model_rejection_reason(
+                candidate, config, inputs.spend_by_model, inputs.scope_capacity,
+            )
             if claude_backend else None
         )
         if reason is None:
@@ -534,7 +569,9 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
                 candidate = rule.set.model
             if candidate is not None:
                 reason = (
-                    _model_rejection_reason(candidate, config, inputs.spend_by_model)
+                    _model_rejection_reason(
+                        candidate, config, inputs.spend_by_model, inputs.scope_capacity,
+                    )
                     if claude_backend else None
                 )
                 if reason is None:
@@ -560,7 +597,9 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
     override_model = overrides.get(inputs.role_name) if isinstance(overrides, dict) else None
     if override_model is not None:
         reason = (
-            _model_rejection_reason(override_model, config, inputs.spend_by_model)
+            _model_rejection_reason(
+                override_model, config, inputs.spend_by_model, inputs.scope_capacity,
+            )
             if claude_backend else None
         )
         if reason is None:
