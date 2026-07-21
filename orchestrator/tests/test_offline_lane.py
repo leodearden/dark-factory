@@ -725,6 +725,91 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# _default_run_command — generic per-project command seam (task 2789, step-11/12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: Path):
+    """The default command_runner seam launches `nice -n19 ionice -c3 sh -c <cmd>`.
+
+    A bare pytest does not self-nice (unlike the reify scripts), so the
+    generic runner applies the idle nice/ionice prefix itself (D4). cwd is
+    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto a full
+    os.environ copy; rc + the decoded <=2000-char tail are returned.
+
+    Step 11 (RED): _default_run_command / the command_runner seam do not
+    exist — must fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)  # no command_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory')
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'command output\n', None))
+    mock_proc.returncode = 1
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        rc, tail = await worker.command_runner(cmd, wt_path, 'HEAD1')
+
+    assert rc == 1
+    assert 'command output' in tail
+    assert len(tail) <= 2000
+
+    mock_exec.assert_awaited_once()
+    argv = list(mock_exec.call_args.args)
+    kwargs = mock_exec.call_args.kwargs
+    assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
+        'argv must start with the idle nice/ionice prefix (D4)'
+    )
+    assert argv[-3:] == ['sh', '-c', 'pytest -m integration'], (
+        'argv must end with sh -c <command>'
+    )
+    assert kwargs['cwd'] == str(wt_path / 'fused-memory'), (
+        'cwd must be <worktree>/<cmd.cwd>'
+    )
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
+            f'(missing/altered {key!r})'
+        )
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+@pytest.mark.asyncio
+async def test_default_run_command_cwd_dot_is_worktree_root(tmp_path: Path):
+    """cwd='.' (the default) resolves to the worktree root itself."""
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='r', command='pytest', cwd='.')
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'', None))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        await worker.command_runner(cmd, wt_path, 'HEAD1')
+
+    assert mock_exec.call_args.kwargs['cwd'] == str(wt_path), (
+        "cwd='.' must resolve to the worktree root"
+    )
+
+
+# ---------------------------------------------------------------------------
 # _handle_red_run — confirmation re-run + dedup'd fix-task spawn (β3, task 1954)
 # ---------------------------------------------------------------------------
 
