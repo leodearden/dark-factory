@@ -9454,16 +9454,32 @@ class GitOps:
                 cwd=self.project_root,
             )
         finally:
-            if bypass_engaged and self.config.main_gate_bypass_clear_command:
-                clear_rc, _, clear_err = await _run(
-                    ['sh', '-c', self.config.main_gate_bypass_clear_command],
-                    cwd=self.project_root,
-                )
-                if clear_rc != 0:
-                    logger.warning(
-                        'main_gate_bypass_clear_command returned non-zero '
-                        'rc=%d: %s',
-                        clear_rc, clear_err,
+            if bypass_engaged:
+                if self.config.main_gate_bypass_clear_command:
+                    clear_rc, _, clear_err = await _run(
+                        ['sh', '-c', self.config.main_gate_bypass_clear_command],
+                        cwd=self.project_root,
+                    )
+                    if clear_rc != 0:
+                        logger.warning(
+                            'main_gate_bypass_clear_command returned non-zero '
+                            'rc=%d: %s',
+                            clear_rc, clear_err,
+                        )
+                else:
+                    # Defense-in-depth: GitConfig._reject_bypass_command_without_clear
+                    # rejects bypass-without-clear at config load, so this branch
+                    # should be UNREACHABLE.  If it is ever reached (a
+                    # post-construction config mutation, or a future removal of
+                    # that validator), fail LOUD rather than silently leave the
+                    # durable bypass — and thus the project's non-fast-forward
+                    # main-gate guard — DISABLED for every later ref move.
+                    logger.error(
+                        'recover_red_main: durable main-gate bypass was engaged '
+                        'but main_gate_bypass_clear_command is unset — the '
+                        'non-fast-forward main-gate guard has been left DISABLED. '
+                        'This should be unreachable (the GitConfig validator '
+                        'rejects it at load); investigate the config.'
                     )
         if rc != 0:
             # ── Main-gate unmark (best-effort cleanup) ────────────────────

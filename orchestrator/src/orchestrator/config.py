@@ -1748,6 +1748,37 @@ class GitConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode='after')
+    def _reject_bypass_command_without_clear(self) -> 'GitConfig':
+        # A half-configured break-glass knob is a SILENT SAFETY-GUARD LEAK:
+        # recover_red_main engages the DURABLE bypass (disabling the project's
+        # always-on non-fast-forward main-gate guard) but, with no clear
+        # command, can NEVER turn it back off — the guard stays disabled for
+        # every subsequent ref move.  Reject at load time (loud, fail-fast)
+        # rather than silently degrade at recovery time (honors the project's
+        # loud-over-silent-degradation / no-silent-fail-soft norm).
+        #
+        # Note the deliberate asymmetry with main_gate_mark_command /
+        # main_gate_unmark_command, which are NOT paired-validated: the mark
+        # sentinel is ONE-SHOT (consumed by the next sanctioned txn), so
+        # mark-without-unmark is only a transient leak.  The bypass is DURABLE,
+        # so bypass-without-clear is a PERMANENT leak — hence the stricter gate.
+        # The reverse (clear set, bypass unset) is harmless — the clear only
+        # ever runs when the bypass was engaged — so it is left permissive.
+        if self.main_gate_bypass_command and not self.main_gate_bypass_clear_command:
+            raise ValueError(
+                'GitConfig.main_gate_bypass_command is set but '
+                'main_gate_bypass_clear_command is unset; recover_red_main '
+                'would engage a DURABLE bypass of the non-fast-forward '
+                'main-gate guard and never clear it, leaving that safety guard '
+                'DISABLED for all subsequent ref moves.  Set '
+                'main_gate_bypass_clear_command to the matching clear command '
+                '(the git-config --unset / flag-file rm / env-reset that '
+                'reverses main_gate_bypass_command), or unset '
+                'main_gate_bypass_command.'
+            )
+        return self
+
     merge_spec_warm_lane_pool: bool = Field(
         default=False,
         description=(

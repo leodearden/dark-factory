@@ -233,10 +233,30 @@ def test_git_config_accepts_main_gate_bypass_commands():
     assert cfg.main_gate_bypass_command == 'git config reify.mainGate.bypass true'
     assert cfg.main_gate_bypass_clear_command == 'git config --unset reify.mainGate.bypass'
 
-    # Only bypass set — clear stays None
-    cfg_bypass_only = GitConfig(main_gate_bypass_command='x')
-    assert cfg_bypass_only.main_gate_bypass_command == 'x'
-    assert cfg_bypass_only.main_gate_bypass_clear_command is None
+    # Only clear set (bypass unset) — harmless: the clear only ever runs when
+    # the bypass was engaged, so clear-without-bypass is a permissive no-op.
+    # (The reverse — bypass without clear — is REJECTED; see
+    # test_git_config_rejects_bypass_command_without_clear.)
+    cfg_clear_only = GitConfig(main_gate_bypass_clear_command='rm -f /tmp/flag')
+    assert cfg_clear_only.main_gate_bypass_command is None
+    assert cfg_clear_only.main_gate_bypass_clear_command == 'rm -f /tmp/flag'
+
+
+def test_git_config_rejects_bypass_command_without_clear():
+    """main_gate_bypass_command without main_gate_bypass_clear_command is REJECTED.
+
+    A durable bypass with no clear command would leave the project's always-on
+    non-fast-forward main-gate guard DISABLED for every later ref move — a
+    silent safety-guard leak.  GitConfig._reject_bypass_command_without_clear
+    fails fast at load time (loud-over-silent) rather than degrading at recovery
+    time.  (The reverse — clear set, bypass unset — is a harmless no-op and
+    stays permissive, asserted in test_git_config_accepts_main_gate_bypass_commands.)
+    """
+    import pydantic  # noqa: PLC0415
+
+    with pytest.raises((pydantic.ValidationError, ValueError)) as excinfo:
+        GitConfig(main_gate_bypass_command='git config reify.mainGate.bypass true')
+    assert 'main_gate_bypass_clear_command' in str(excinfo.value)
 
 
 @pytest.mark.asyncio
@@ -7410,12 +7430,17 @@ class TestRecoverRedMain:
     async def test_recover_bypass_engaged_before_update_ref(self, git_repo: Path):
         """main_gate_bypass_command fires IMMEDIATELY before the CAS update-ref (no mark)."""
         bypass_cmd = 'echo recover-bypass-engage'
+        # A clear command is required alongside the bypass (GitConfig rejects
+        # bypass-without-clear); it runs AFTER the update-ref and does not
+        # affect the engage-before-update-ref ordering asserted here.
+        clear_cmd = 'echo recover-bypass-clear'
         ops = GitOps(
             GitConfig(
                 main_branch='main',
                 branch_prefix='task/',
                 push_after_advance=False,
                 main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
             ),
             git_repo,
         )
