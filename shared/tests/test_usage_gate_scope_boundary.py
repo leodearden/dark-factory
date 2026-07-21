@@ -56,9 +56,11 @@ gate).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry
@@ -66,10 +68,9 @@ from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import AccountPhase, ScopeCap, UsageGate
 
 # NOTE: this scaffold (prerequisite P1) imports only what the harness below
-# uses today. Each Bn step below (B1-B6, B8) adds the specific additional
-# imports (asyncio, contextlib, UTC, timedelta) its own test needs, keeping
-# every commit ruff-clean rather than pre-importing the whole suite's
-# eventual closure.
+# uses today; each Bn step below adds the specific additional imports its
+# own test needs, keeping every commit ruff-clean rather than
+# pre-importing the whole suite's eventual closure.
 
 SCOPE = 'claude-fable-5'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
@@ -238,3 +239,57 @@ class TestB2ScopedFailoverCarriesScope:
         name, _event, details_json = failovers[0].args
         assert name == 'b'
         assert json.loads(details_json) == {'from': 'a', 'to': 'b', 'scope': SCOPE}
+
+
+# ===========================================================================
+# B3 -- all-fable-capped is not a fleet freeze
+# ===========================================================================
+
+
+class TestB3AllFableCappedNotFleetFreeze:
+    """B3: exhausting the fable scope on every account does not freeze the
+    fleet -- a concurrent general dispatch still completes immediately
+    (driven end-to-end through invoke_with_cap_retry), and a concurrent
+    scope=fable caller merely parks, never blocking ``_open``. All waits
+    are bounded so a regression surfaces as a timeout, never a hang."""
+
+    async def test_b3_scope_exhaustion_never_freezes_fleet(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        far = now + timedelta(hours=6)
+        # Both fable-scope-capped (far-future deadline) but generally AVAILABLE.
+        set_scope_cap(a, resets_at=far, capped_at=now)
+        set_scope_cap(b, resets_at=far, capped_at=now)
+        assert a.phase == AccountPhase.AVAILABLE
+        assert b.phase == AccountPhase.AVAILABLE
+
+        # (1) A concurrent GENERAL dispatch completes immediately -- fable
+        # exhaustion never blocks general work.
+        general = await asyncio.wait_for(
+            invoke_with_cap_retry(
+                gate, 'lbl', model='sonnet', backend='claude',
+                invoke_fn=scripted_invoke(ok_result()),
+                prompt='hi',
+            ),
+            timeout=1.0,
+        )
+        assert general.account_name in ('a', 'b')
+        assert general.output == 'complete'
+        assert gate._open.is_set() is True
+        assert gate.paused_reason == ''
+        assert gate.is_paused is False
+
+        # (2) A concurrent scope=fable caller parks -- it does NOT freeze
+        # the fleet.
+        scoped_task = asyncio.create_task(gate.before_invoke(scope=SCOPE))
+        try:
+            # Let the scoped selection reach its (scope-local) wait.
+            await asyncio.sleep(0.05)
+            assert scoped_task.done() is False
+            assert gate._open.is_set() is True
+            assert gate.paused_reason == ''
+        finally:
+            scoped_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scoped_task
