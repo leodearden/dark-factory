@@ -310,6 +310,68 @@ class TestCallSitesThreadWorktree:
 
 
 # ---------------------------------------------------------------------------
+# task 2875 — the eval verify UV_PYTHON pin follows the target project_root's
+# CURRENT checkout, NOT the eval worktree checked out at an old pre_task_commit.
+# run_eval threads the worktree it reuses/creates into build_eval_orch_config;
+# post-2851 build sourced the pin from THAT worktree, which for older fixtures
+# predates .python-version → no pin → uv default 3.14t → aiosqlite failure.
+#
+# A call-site capturing test (decision 3): wrap the REAL build to record
+# verify_env then short-circuit via _Sentinel. It is RED on current code
+# (worktree threaded → pin follows the pinless worktree → no UV_PYTHON) and
+# stays invariant across step-4's removal of the `worktree` param — it never
+# references `worktree=`, so **kwargs absorbs whatever the call site forwards.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_eval_verify_pin_follows_project_root_not_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from orchestrator.evals import runner
+
+    # project_root's CURRENT checkout pins 3.13 (df fixtures do); the eval
+    # worktree — checked out at an old pre_task_commit — carries NO
+    # .python-version (the fixture divergence this task guards against).
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    (project_root / '.python-version').write_text('3.13\n')
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+
+    # Capture the REAL build's verify_env, then short-circuit before any
+    # workflow/worktree work. **kwargs swallows whatever the call site forwards
+    # (memory_endpoint / judge_config / — today — worktree), so this test is
+    # agnostic to step-4's removal of the worktree kwarg.
+    real_build = runner.build_eval_orch_config
+    captured: dict = {}
+
+    def _capture_build(config, task, base_config=None, **kwargs):
+        cfg = real_build(config, task, base_config, **kwargs)
+        captured['verify_env'] = dict(cfg.verify_env)
+        raise _Sentinel
+
+    monkeypatch.setattr(runner, 'build_eval_orch_config', _capture_build)
+    monkeypatch.setattr(
+        runner, 'load_task',
+        lambda _p: {'id': 't', 'project_root': str(project_root)},
+    )
+
+    # worktree_path=wt short-circuits create_eval_worktree and binds the eval
+    # worktree; the build call is NOT inside a try, so _Sentinel propagates.
+    with pytest.raises(_Sentinel):
+        await runner.run_eval(
+            tmp_path / 'task.json', _impl_cfg(),
+            base_config=_base_config(project_root), worktree_path=wt,
+        )
+
+    # The verify pin follows project_root's 3.13, NOT the pinless worktree.
+    assert captured['verify_env'].get('UV_PYTHON') == '3.13', (
+        "eval verify UV_PYTHON must pin from project_root's current checkout "
+        f"(3.13), got {captured['verify_env'].get('UV_PYTHON')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-01/02 — build_eval_orch_config gains an optional judge_config param.
 #
 # Default None keeps the current sonnet/medium/claude judge pin byte-identical
