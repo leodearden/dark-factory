@@ -111,3 +111,33 @@ class TestBuildOfflineLaneFixTaskArguments:
         assert suspect_range in arguments['title'] + arguments['description'], (
             'suspect_range must be mentioned in the title or description'
         )
+
+    def test_default_priority_is_high(self, tmp_path) -> None:
+        """The legacy call site (no priority arg) stays byte-identical: 'high'.
+
+        Step 5 (regression guard): the default must remain 'high' after the
+        new per-command priority param is threaded through.
+        """
+        from orchestrator.workflow import build_offline_lane_fix_task_arguments
+
+        arguments = build_offline_lane_fix_task_arguments(
+            ['tests::test_a'], 'GREEN..HEAD1', 'fp-1', tmp_path, 'HEAD1',
+        )
+        assert arguments['priority'] == 'high'
+
+    def test_explicit_priority_is_respected(self, tmp_path) -> None:
+        """An explicit priority overrides the 'high' default (D3).
+
+        Step 5 (RED): the function does not yet accept a priority param —
+        must fail with TypeError before impl.
+        """
+        from orchestrator.workflow import build_offline_lane_fix_task_arguments
+
+        for priority in ('medium', 'low'):
+            arguments = build_offline_lane_fix_task_arguments(
+                ['tests::test_a'], 'GREEN..HEAD1', 'fp-1', tmp_path, 'HEAD1',
+                priority=priority,
+            )
+            assert arguments['priority'] == priority, (
+                f'expected priority={priority!r}, got {arguments["priority"]!r}'
+            )
