@@ -497,6 +497,115 @@ class TestRunPostMergeVerifyLocalOnly:
 
 
 # ---------------------------------------------------------------------------
+# task 2873, step-3/4 — the per-land REMOTE-green cross-check re-verify runs
+# its local trust-anchor verify INSIDE merge_verify_lease keyed to the ACTUAL
+# merge_wt (persistent OR ephemeral), closing the DF 2685 lane-lock gap for
+# the runner-is-not-None path.
+#
+# Incident (reify, 2026-07-20, task 5310, merge_sha 83336a32): the cross-check
+# verified in an EPHEMERAL _merge-<hash> worktree OUTSIDE any lease, so a
+# concurrent reseed/reclaim of that lane clobbered the tree mid-compile →
+# ENOENT storm → spurious DIVERGE that withheld a good land. Wrapping the
+# cross-check verify in a lane-lock lease keyed to merge_wt excludes that
+# reseed/reclaim. RED before step-4: the cross-check enters NO lease today.
+# ---------------------------------------------------------------------------
+
+
+def _cross_check_config():
+    """OrchestratorConfig with the warm-lane regime + cross-check both ON.
+
+    persistent_merge_worktree=True mirrors the local-path lease gate (the
+    lane-lock's contenders only exist in the warm-lane pool); the cross-check
+    itself is gated by verify_cross_check_remote_green (default True, set
+    explicitly for clarity)."""
+    return OrchestratorConfig(
+        git=GitConfig(main_branch='main', persistent_merge_worktree=True),
+        verify_cross_check_remote_green=True,
+    )
+
+
+def _green_remote(name='laptop'):
+    remote = MagicMock()
+    remote.name = name
+    remote.is_local = False
+    remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+    return remote
+
+
+@pytest.mark.asyncio
+class TestCrossCheckHoldsLaneLockLease:
+    """The runner-is-not-None cross-check wraps its local verify in
+    merge_verify_lease(lane_dir=merge_wt) (task 2873)."""
+
+    async def test_cross_check_verify_wrapped_in_lease_keyed_to_merge_wt(self, tmp_path):
+        import contextlib as _contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _cross_check_config()
+        # task_files non-None → dispatching-host derivation is skipped.
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        fake_remote = _green_remote()  # green primary → cross-check fires
+
+        # An EPHEMERAL speculation lane (the incident's _merge-<hash> shape),
+        # NOT the persistent lane — proving the lease is keyed to the ACTUAL
+        # merge_wt rather than the hardcoded persistent path.
+        merge_wt = tmp_path / '_merge-98c756bc'
+
+        order: list = []
+        lease_lanes: list = []
+
+        @_contextlib.asynccontextmanager
+        async def fake_lease(lane_dir=None):
+            lease_lanes.append(lane_dir)
+            order.append((lane_dir, 'enter'))
+            try:
+                yield
+            finally:
+                order.append('exit')
+
+        git_ops.merge_verify_lease = fake_lease
+
+        async def fake_scoped(*_args, **_kwargs):
+            order.append('verify-ran')
+            return _make_pass_result()
+
+        class FakeEventStore(EventStore):
+            def __init__(self):
+                object.__init__(self)
+
+            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+                pass
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', new=fake_scoped), \
+             patch('orchestrator.merge_queue._run_unscoped_typechecks',
+                   new=AsyncMock(return_value=MagicMock(broken=False))):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=FakeEventStore(),
+                merge_sha='abc123',
+                runner=fake_remote,
+            )
+
+        # AGREE (remote green + local green) → land proceeds.
+        assert outcome is None
+        # The lease was entered EXACTLY ONCE, keyed to the ACTUAL merge_wt (the
+        # ephemeral lane), NOT the hardcoded persistent lane.
+        assert lease_lanes == [merge_wt], (
+            'cross-check must enter merge_verify_lease(lane_dir=merge_wt) exactly '
+            f'once; got lanes={lease_lanes!r}'
+        )
+        # The lease WRAPS the local verify: enter → verify-ran → exit.
+        assert order == [(merge_wt, 'enter'), 'verify-ran', 'exit'], (
+            f'lease must wrap the cross-check verify (enter→verify→exit); got {order!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-19: SpeculativeMergeWorker._ensure_host_allocator — RED
 # ---------------------------------------------------------------------------
 
