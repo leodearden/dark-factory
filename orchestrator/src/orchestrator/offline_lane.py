@@ -249,6 +249,13 @@ class OfflineLaneWorker:
             ``config.git.offline_lane_commands``.  Defaults to
             :meth:`_default_run_command` (an idle-niced ``sh -c`` subprocess)
             when not supplied.
+        command_confirmation_runner: Optional injectable async seam (task
+            2789), ``(LaneCommand, wt_path, head) -> confirmed_still_failing_ids``,
+            bound per-command by :meth:`_run_once` into :meth:`_handle_red_run`'s
+            ``confirmation_runner`` contract for a generic command's red path.
+            Defaults to :meth:`_default_confirm_command` (serial re-run via
+            ``_serial_pytest_str`` + ``_extract_failing_test_ids``) when not
+            supplied.
         task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
             file/update the dedup'd fix task for a confirmed red run.
             Defaults to ``None`` — the red path degrades to a log-only no-op
@@ -270,6 +277,7 @@ class OfflineLaneWorker:
         infra_runner: SuiteRunner | None = None,
         infra_confirmation_runner: ConfirmationRunner | None = None,
         command_runner: CommandRunner | None = None,
+        command_confirmation_runner: CommandConfirmationRunner | None = None,
         task_client: OfflineLaneTaskClient | None = None,
         escalation_queue: EscalationQueue | None = None,
     ) -> None:
@@ -294,6 +302,11 @@ class OfflineLaneWorker:
         )
         self.command_runner: CommandRunner = (
             command_runner if command_runner is not None else self._default_run_command
+        )
+        self.command_confirmation_runner: CommandConfirmationRunner = (
+            command_confirmation_runner
+            if command_confirmation_runner is not None
+            else self._default_confirm_command
         )
         self.task_client = task_client
         self.escalation_queue = escalation_queue
@@ -1029,3 +1042,41 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         tail = (stdout or b'').decode(errors='replace')[-2000:]
         return proc.returncode or 0, tail
+
+    async def _default_confirm_command(
+        self, cmd: LaneCommand, wt_path: Path, head: str,
+    ) -> list[str]:
+        """Default ``command_confirmation_runner`` seam — serial confirm re-run (task 2789).
+
+        Reuses the reify-side confirm primitives named by the PRD (sec 5):
+        :func:`~orchestrator.verify._serial_pytest_str` rewrites ``cmd.command``
+        to run serial (appends ``-p no:xdist -o addopts=``), falling back to
+        the raw command when it is not a pytest invocation; the command is
+        launched exactly like :meth:`_default_run_command` (idle nice/ionice
+        ``sh -c`` in ``<wt_path>/<cmd.cwd>``, ``DF_VERIFY_ROLE=offline``); and
+        :func:`~orchestrator.verify._extract_failing_test_ids` extracts the
+        still-failing pytest node-ids from the FULL captured stdout (not the
+        2000-char tail — so no failure line is truncated before extraction).
+
+        An empty return means the failure did not reproduce serially (a flake,
+        B6): :meth:`_handle_red_run` treats it as intermittent and files no
+        task. Both helpers are imported lazily to avoid an
+        ``offline_lane`` <-> ``verify`` import cycle (mirrors the existing lazy
+        ``workflow`` import in :meth:`_handle_red_run`).
+        """
+        from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
+
+        run_cwd = wt_path / cmd.cwd
+        serial_command = _serial_pytest_str(cmd.command) or cmd.command
+        argv = [*nice_prefix('background'), 'sh', '-c', serial_command]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(run_cwd),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        text = (stdout or b'').decode(errors='replace')
+        return _extract_failing_test_ids(text)
