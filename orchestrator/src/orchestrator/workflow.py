@@ -11949,7 +11949,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
 
     async def _write_completion_to_memory(self) -> None:
-        """Write task completion summary so dependent tasks find it in briefings."""
+        """Write task completion summary so dependent tasks find it in briefings.
+
+        The ``add_memory`` call is tagged with
+        ``metadata={'task_id': str(self.task_id), 'source': 'orchestrator_completion'}``
+        so this organic completion note is findable by task_id-keyed audits.
+        Qdrant payload filters and the deterministic
+        ``count_memories_by_metadata`` / ``get_memories_by_metadata`` reconciliation
+        audits match on ``metadata.task_id``; without the tag the note (which
+        embeds the id only in ``agent_id``) is audit-invisible.  ``task_id`` is
+        stamped in exact-string form to match the form those audits query on.
+        """
         parts = [f"Completed: {self.task.get('title', '')}"]
 
         desc = self.task.get('description', '')
@@ -11994,6 +12004,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                 'category': 'observations_and_summaries',
                                 'project_id': self.config.fused_memory.project_id,
                                 'agent_id': f'orchestrator-task-{self.task_id}',
+                                # Stamp task_id (exact-string form) + source so the
+                                # note is audit-visible via metadata.task_id — the
+                                # key Qdrant filters and the deterministic
+                                # count/get-by-metadata audits query on.
+                                'metadata': {
+                                    'task_id': str(self.task_id),
+                                    'source': 'orchestrator_completion',
+                                },
                             },
                         },
                     },
