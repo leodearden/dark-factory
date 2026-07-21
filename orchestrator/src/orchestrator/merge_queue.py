@@ -2224,7 +2224,29 @@ async def _run_post_merge_verify(
             escalation_queue=escalation_queue,
         )
         try:
-            local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+            # task 2873: defense-in-depth lane-lock for the REMOTE-path
+            # cross-check's local trust-anchor verify. DF 2685 (local consumer)
+            # and DF 2830 (laptop CLI span) put every OTHER merge-deciding local
+            # verify under merge_verify_lease, but this DF 2822 cross-check ran
+            # its full run_merge_verify OUTSIDE any lease — the runner-is-not-None
+            # guard means the LOCAL-dispatch lease at the top of this function
+            # (which requires runner is None) never fires here. Lock the ACTUAL
+            # merge_wt lane (persistent OR the ephemeral _merge-<hash> speculation
+            # worktree the cross-check verifies in — the incident's case), so a
+            # concurrent reseed/reclaim of THAT lane mutually excludes rather than
+            # clobbering the tree mid-verify (reify 2026-07-20, merge_sha
+            # 83336a32: ENOENT storm → spurious DIVERGE that withheld a good land).
+            # Gated on persistent_merge_worktree (mirrors the local-path gate):
+            # the lane-lock's contenders only exist in the warm-lane regime.
+            # (The contended-lease fail-safe is added in step-6; until then a
+            # MergeVerifyLeaseContended propagates to the requeue handler — a safe
+            # interim, never a clobber.)
+            async with contextlib.AsyncExitStack() as cross_stack:
+                if req.config.git.persistent_merge_worktree:
+                    await cross_stack.enter_async_context(
+                        git_ops.merge_verify_lease(lane_dir=merge_wt)
+                    )
+                local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
