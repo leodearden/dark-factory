@@ -3547,8 +3547,10 @@ class TaskWorkflow:
         ``self.modules`` this is a no-op (returns True without touching the
         scheduler). Otherwise asks the scheduler to expand/reconcile the lock
         via ``handle_blast_radius_expansion`` (``persist_files=plan_files`` —
-        this call persists ``metadata.files=plan_files`` on BOTH its success
-        and lock-conflict/requeue branches). On success, updates
+        this call persists ``metadata.files=plan_files`` on EVERY successful
+        refinement (widen, narrow, or shift) AND on the lock-conflict/requeue
+        branch (task 2868); the ONLY non-persist path is its no-op early return
+        when the derived module set is unchanged). On success, updates
         ``self.modules``/``self._module_configs`` and returns True. On a lock
         conflict, ``self.modules`` is left UNCHANGED (the scheduler has
         already persisted ``metadata.files=plan_files`` and requeued the task
@@ -3567,8 +3569,10 @@ class TaskWorkflow:
         )
         if not expanded:
             return False
-        # Persistence of the tightened lock set is centralized in
-        # handle_blast_radius_expansion (success branch) — not here.
+        # Persistence of metadata.files is centralized in
+        # handle_blast_radius_expansion — on every successful refinement
+        # (widen/narrow/shift) and the conflict/requeue branch (task 2868) —
+        # not here.
         self.modules = new_modules
         self._module_configs = self._resolve_module_configs()
         return True
@@ -3584,21 +3588,27 @@ class TaskWorkflow:
         reconciles the scheduler's locks/metadata.files via
         ``_reconcile_scope_locks``. On a lock conflict, plan.json is already
         widened (matching metadata.files, which ``handle_blast_radius_expansion``
-        persists on both branches) but ``self.modules`` is left unchanged and
+        persists on every successful refinement and the conflict/requeue branch)
+        but ``self.modules`` is left unchanged and
         this returns False so the caller does NOT resume under a foreign lock.
 
         Same-module widen (task 2505 reviewer regression): when the granted
         file maps to a module the task already locks, ``_reconcile_scope_locks``
-        no-ops the ``handle_blast_radius_expansion`` call — which is the ONLY
-        path that persists ``metadata.files``. Without a direct persist here,
-        plan.files would be widened while metadata.files stayed behind, tripping
-        the MERGE-entry ``_check_scope_invariant`` divergence tripwire. So on a
-        successful reconcile that left ``self.modules`` UNCHANGED, persist
+        no-ops the ``handle_blast_radius_expansion`` call — which early-returns
+        WITHOUT persisting ``metadata.files`` (the no-op early return is the
+        only non-persist path). Without a direct persist here, plan.files would
+        be widened while metadata.files stayed behind, tripping the MERGE-entry
+        ``_check_scope_invariant`` divergence tripwire. So on a successful
+        reconcile that left ``self.modules`` UNCHANGED, persist
         ``metadata.files=new_files`` directly (mirroring the done-metadata
         reconcile read-modify-write). On the module-CHANGE success path and the
         lock-CONFLICT path this is skipped — ``handle_blast_radius_expansion``
-        already persisted ``metadata.files=new_files`` on both those branches,
-        so a direct write would be a redundant double write.
+        already persisted ``metadata.files=new_files``. The module-CHANGE
+        success path now ALWAYS persists (widen, narrow, or shift): a pure-widen
+        module change previously did NOT persist, which made skipping the direct
+        write unsound; task 2868 fixed that, so the skip is now sound. Only the
+        SAME-module (no-op) widen still needs the direct persist here, because
+        the blast call early-returns without persisting.
         """
         assert self.artifacts is not None
         self.plan['files'] = new_files
