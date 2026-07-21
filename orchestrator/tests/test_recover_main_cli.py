@@ -6,6 +6,7 @@ json.loads it, assert required keys.
 """
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -142,3 +143,103 @@ class TestRecoverMainCLI:
         assert data['result'] == 'error', f'Expected result=error; got {data}'
         assert 'detail' in data, f'Missing detail key in error output; got {data}'
         assert data['target_sha'] == _TARGET_SHA, f'target_sha missing/wrong; got {data}'
+
+    def test_cli_engages_bypass_for_exactly_cas_window(self, tmp_path, capsys):
+        """End-to-end (real repo, unmocked recover_red_main): bypass engaged for exactly the CAS window.
+
+        Builds a real git repo with a good commit and a simulated bad-merge
+        commit, installs a ``reference-transaction`` hook (git>=2.28 feature
+        baseline) that records whether the bypass flag-file is present when the
+        refs/heads/main transaction fires, and configures the ``git:`` block's
+        main_gate_bypass_command (create flag) / main_gate_bypass_clear_command
+        (remove flag).  Asserts the flag is PRESENT during the ref txn (engaged
+        for exactly the CAS window), the flag is removed afterward (cleared —
+        no durable leak), the CLI exits 0 with result 'rewound', and main now
+        points at the good SHA.  Proves the config git.* fields flow end-to-end
+        through load_config -> GitOps -> recover_red_main.
+        """
+        repo = tmp_path / 'watched'
+        repo.mkdir()
+
+        def _git(*a: str) -> str:
+            return subprocess.run(
+                ['git', *a], cwd=repo, check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+
+        _git('init', '-b', 'main')
+        _git('config', 'user.email', 'test@test.com')
+        _git('config', 'user.name', 'Test')
+        (repo / 'README.md').write_text('# Test\n')
+        _git('add', '-A')
+        _git('commit', '-m', 'good commit')
+        good_sha = _git('rev-parse', 'HEAD')
+        # Simulate a bad merge landing on main (the state to recover FROM).
+        (repo / 'bad.txt').write_text('simulated bad merge\n')
+        _git('add', '-A')
+        _git('commit', '-m', 'bad merge on main')
+        bad_sha = _git('rev-parse', 'HEAD')
+
+        flag_file = tmp_path / 'bypass.flag'
+        obs_file = tmp_path / 'hook_observations.txt'
+
+        # reference-transaction hook: when the refs/heads/main txn fires, record
+        # whether the bypass flag-file is present.  `exit 0` keeps the txn from
+        # aborting (the trailing `read` at EOF returns non-zero otherwise).
+        hooks_dir = repo / '.git' / 'hooks'
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook = hooks_dir / 'reference-transaction'
+        hook.write_text(
+            '#!/bin/sh\n'
+            'while read -r line; do\n'
+            '  case "$line" in\n'
+            '    *refs/heads/main)\n'
+            f'      if [ -e "{flag_file}" ]; then\n'
+            f'        echo "present $1" >> "{obs_file}"\n'
+            '      else\n'
+            f'        echo "absent $1" >> "{obs_file}"\n'
+            '      fi\n'
+            '      ;;\n'
+            '  esac\n'
+            'done\n'
+            'exit 0\n',
+        )
+        hook.chmod(0o755)
+
+        cfg = tmp_path / 'orchestrator.yaml'
+        cfg.write_text(
+            'git:\n'
+            '  main_branch: main\n'
+            f'  main_gate_bypass_command: "touch {flag_file}"\n'
+            f'  main_gate_bypass_clear_command: "rm -f {flag_file}"\n',
+        )
+
+        from orchestrator.recover_main import main  # noqa: PLC0415
+        rc = main([
+            '--project-root', str(repo),
+            '--config', str(cfg),
+            '--target-sha', good_sha,
+            '--expected-main', bad_sha,
+        ])
+        out = capsys.readouterr().out.strip()
+        data = json.loads(out)
+
+        assert rc == 0, f'Expected exit 0 on rewound; got {rc}; out={out}'
+        assert data['result'] == 'rewound', f'Expected rewound; got {data}'
+
+        observations = obs_file.read_text() if obs_file.exists() else ''
+        assert 'present' in observations, (
+            f'bypass flag NOT observed present during the ref txn — bypass was '
+            f'not engaged for the CAS window; observations: {observations!r}'
+        )
+        assert 'absent' not in observations, (
+            f'bypass flag observed ABSENT during the ref txn — engage window is '
+            f'wrong; observations: {observations!r}'
+        )
+        # Cleared afterward — the durable bypass must not leak past the CAS window.
+        assert not flag_file.exists(), (
+            'bypass flag leaked: main_gate_bypass_clear_command did not run'
+        )
+        # main now points at the good SHA.
+        head = _git('rev-parse', 'refs/heads/main')
+        assert head == good_sha, f'main not rewound to good; head={head}, good={good_sha}'
