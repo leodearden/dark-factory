@@ -528,6 +528,23 @@ def test_select_trial_sample_filters_to_eligible_only():
     assert {t['id'] for t in selected} == {t['id'] for t in _ELIGIBLE}
 
 
+def test_select_trial_sample_drops_task_whose_gold_sanitizes_to_empty():
+    # reviewer_comprehensive amendment: eligibility keys on the SANITIZED gold
+    # set (the same file-level set set_scores runs on), not raw metadata.files.
+    # A task whose ground truth is entirely directory-shaped sanitizes to an
+    # empty gold set — admitting it would score set_scores([], []) = 1.0 for an
+    # empty prediction but 0.0 for any non-empty one, an asymmetric per-task
+    # bias in the comparative verdict — so it is dropped, aligned with scoring.
+    tasks = [
+        {'id': 1, 'title': 'real gold', 'description': 'd',
+         'metadata': {'files': ['a.py']}},
+        {'id': 2, 'title': 'dir-only gold', 'description': 'd',
+         'metadata': {'files': ['orchestrator', 'scripts/']}},
+    ]
+    selected = mod.select_trial_sample(tasks, size=None)
+    assert [t['id'] for t in selected] == [1]
+
+
 def test_select_trial_sample_orders_most_recent_first():
     # Highest task id (newest) leads, regardless of input order.
     shuffled = [_T3, _T1, _T4, _T2]

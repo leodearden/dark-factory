@@ -395,18 +395,28 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
 def _eligible_for_trial(task: dict) -> bool:
     """Whether *task* is a valid trial sample.
 
-    Eligible iff it carries a non-empty ground-truth ``metadata.files`` set AND
-    is NOT a deterministic task. Deterministic tasks carry no worktree and no
-    code (CLAUDE.md "Deterministic task kind"), so a file-lock prediction is
-    meaningless for them — the exact exclusion ``harness._tag_task_modules``
-    applies. Empty-``files`` tasks (docs-only / no-op) give degenerate
-    precision/recall and are dropped. Status filtering to ``done`` is the
-    loader's job (see ``load_done_tasks``), not this predicate's.
+    Eligible iff its SANITIZED ground-truth ``metadata.files`` set is non-empty
+    AND it is NOT a deterministic task. Deterministic tasks carry no worktree
+    and no code (CLAUDE.md "Deterministic task kind"), so a file-lock prediction
+    is meaningless for them — the exact exclusion ``harness._tag_task_modules``
+    applies. Empty-``files`` tasks (docs-only / no-op) — AND tasks whose files
+    are all directory-shaped, since both sanitize to an empty gold set — give
+    degenerate precision/recall and are dropped. Status filtering to ``done`` is
+    the loader's job (see ``load_done_tasks``), not this predicate's.
+
+    Eligibility keys on the SANITIZED set (the same file-level set ``set_scores``
+    scores on), not the raw ``metadata.files``. A task whose gold is entirely
+    directory-shaped would otherwise be admitted yet score against an EMPTY
+    sanitized gold set, where ``set_scores([], [])`` is 1.0 for a model that
+    predicted nothing but 0.0 for one that predicted any file — an asymmetric
+    per-task bias in the comparative verdict rather than a symmetric wash. Done
+    tasks' ``metadata.files`` are reconciled to real merge-diff paths so this is
+    rare, but aligning eligibility with scoring makes the eval robust to it.
     """
     meta = task.get('metadata') or {}
     if meta.get('task_kind') == 'deterministic':
         return False
-    return bool(meta.get('files') or [])
+    return bool(sanitize_files_for_persist(list(meta.get('files') or [])))
 
 
 def _task_recency_key(task: dict) -> tuple[int, int]:
