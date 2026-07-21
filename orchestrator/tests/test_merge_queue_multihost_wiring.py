@@ -605,6 +605,95 @@ class TestCrossCheckHoldsLaneLockLease:
         )
 
 
+@pytest.mark.asyncio
+class TestCrossCheckLeaseContentionFailsSafe:
+    """A contended lane-lock lease in the cross-check FAILS SAFE: trust the
+    remote green, never run the local verify, never quarantine/escalate, and
+    emit verify_cross_check_inconclusive (task 2873, step-5/6).
+
+    A contended lane means a reseed/reclaim is actively mutating merge_wt, so
+    running the local verify would reproduce the exact ENOENT-clobber this task
+    prevents; we already hold a primary verdict (remote green), so skipping the
+    second-opinion cross-check is the correct, low-churn choice (mirrors the
+    adjacent RunnerUnavailable fail-safe + DriftDetector Invariant 5).
+
+    step-5 RED: today MergeVerifyLeaseContended has NO handler in the
+    cross-check, so it propagates out of _run_post_merge_verify — the call
+    RAISES instead of returning None.
+    """
+
+    async def test_contended_lease_trusts_remote_green_no_local_verify(self, tmp_path):
+        import contextlib as _contextlib
+
+        from orchestrator.event_store import EventStore
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.verify_cancel import lane_lock_path
+
+        config = _cross_check_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        fake_remote = _green_remote()  # green primary → cross-check fires
+        merge_wt = tmp_path / '_merge-98c756bc'
+
+        @_contextlib.asynccontextmanager
+        async def contended_lease(lane_dir=None):
+            # Reseed/reclaim is mutating merge_wt — the flock stays contended
+            # past the bounded wait, so the lease refuses (fail-closed).
+            raise MergeVerifyLeaseContended(lane_lock_path(merge_wt), 300.0)
+            yield  # unreachable — present only to make this a valid async generator
+
+        git_ops.merge_verify_lease = contended_lease
+
+        # Spy: the local trust-anchor verify must NEVER run under a contended lane.
+        scoped_spy = AsyncMock(return_value=_make_pass_result())
+
+        emitted: list = []
+
+        class FakeEventStore(EventStore):
+            def __init__(self):
+                object.__init__(self)
+
+            def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+                emitted.append({'event_type': event_type, 'data': data or {}})
+
+        quarantine: set[str] = set()
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', new=scoped_spy):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, merge_wt,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=FakeEventStore(),
+                merge_sha='abc123',
+                runner=fake_remote,
+                quarantine=quarantine,
+                escalation_queue=fake_eq,
+            )
+
+        # (1) The land PROCEEDS on the remote green — contention did NOT
+        #     propagate out (would reach the LOCAL-path requeue handler, wrong).
+        assert outcome is None
+        # (2) The local trust-anchor verify never ran (running it under an
+        #     actively-reseeding lane reproduces the ENOENT-clobber).
+        assert not scoped_spy.called, 'local cross-check verify must NOT run on a contended lane'
+        # (3) A contended lane is NOT a divergence — no quarantine, no
+        #     verify_cross_check_mismatch escalation.
+        assert quarantine == set()
+        assert fake_eq.submitted == []
+        # (4) A verify_cross_check_inconclusive event names the lane-lock contention.
+        inconclusive = [
+            e for e in emitted
+            if getattr(e['event_type'], 'value', None) == 'verify_cross_check_inconclusive'
+        ]
+        assert len(inconclusive) == 1, f'expected one inconclusive event; got {emitted!r}'
+        reason = inconclusive[0]['data'].get('reason', '')
+        assert 'lane-lock' in reason and 'contend' in reason.lower(), (
+            f'inconclusive reason must name lane-lock contention; got {reason!r}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # step-19: SpeculativeMergeWorker._ensure_host_allocator — RED
 # ---------------------------------------------------------------------------
