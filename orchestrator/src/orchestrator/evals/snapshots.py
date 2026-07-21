@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,6 +11,13 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.verify import _target_subprocess_env
 
 logger = logging.getLogger(__name__)
+
+# Cross-workspace-member runtime dep(s) eval verify needs in the worktree venv
+# but the old-baseline orchestrator-only `uv sync` omits. Empirically the ONLY
+# missing dep (installing it alone took df_task_12 pytest collection from 7/7
+# module errors to 57 tests collected). A named tuple keeps the set explicit,
+# documented, and forward-extensible without over-installing today.
+EVAL_VERIFY_EXTRA_DEPS: tuple[str, ...] = ('aiosqlite',)
 
 
 def read_python_pin(root: Path) -> str | None:
@@ -88,6 +96,61 @@ def resolve_worktree_venv_pythons(worktree: Path) -> list[Path]:
     if direct.exists():
         return [direct]
     return sorted(worktree.glob('*/.venv/bin/python'))
+
+
+async def _uv_pip_install(
+    venv_python: Path, deps: Sequence[str], cwd: Path, env: dict[str, str],
+) -> None:
+    """``uv pip install --python <venv_python> <deps...>`` into one worktree venv.
+
+    Fail-soft: logs a WARNING with the return code + stderr tail on a non-zero
+    exit and NEVER raises, mirroring create_eval_worktree's setup-command loop —
+    a transient install hiccup must not abort worktree creation for an entire
+    eval campaign. ``env`` is the already-scrubbed setup env (no VIRTUAL_ENV /
+    UV_PROJECT_ENVIRONMENT, venv bin off PATH), and ``--python`` targets the
+    worktree venv explicitly, so the install cannot corrupt the live
+    orchestrator ``.venv`` (the 2026-05-29 ghost-venv incident). ``uv`` itself
+    lives at ``~/.local/bin/uv`` — not the stripped venv bin — so it stays
+    resolvable under the scrubbed PATH.
+    """
+    cmd = ['uv', 'pip', 'install', '--python', str(venv_python), *deps]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.warning(
+            f'Eval-verify dep provisioning failed (rc={proc.returncode}) for '
+            f'{venv_python} deps={list(deps)}\n{stderr.decode()[-500:]}'
+        )
+    else:
+        logger.info(
+            f'Provisioned eval-verify deps {list(deps)} into {venv_python}'
+        )
+
+
+async def ensure_eval_verify_deps(
+    worktree: Path,
+    env: dict[str, str],
+    deps: Sequence[str] = EVAL_VERIFY_EXTRA_DEPS,
+) -> None:
+    """Provision ``deps`` into every venv the eval setup created under ``worktree``.
+
+    Iterates ``resolve_worktree_venv_pythons(worktree)`` — the resolver kept in
+    lockstep with the smoke gate — and ``uv pip install``s ``deps`` into each,
+    reusing the caller's already-built scrubbed ``env``. Idempotent no-op for a
+    recent-baseline fixture whose venv already has the dep, and a full no-op
+    (empty resolver) for a reify/Rust worktree with no venv. Empty ``deps`` is a
+    guarded no-op so we never shell out ``uv pip install`` with no packages.
+    """
+    if not deps:
+        return
+    for venv_python in resolve_worktree_venv_pythons(worktree):
+        await _uv_pip_install(venv_python, deps, worktree, env)
 
 
 async def _run(cmd: list[str], cwd: Path) -> str:
@@ -169,6 +232,18 @@ async def create_eval_worktree(
                 )
             else:
                 logger.info(f'Setup command OK: {cmd_str}')
+
+        # Provision the eval-verify cross-member runtime dep(s) into each venv
+        # the setup created. Root cause: eval verify's pytest collection imports
+        # `orchestrator.config` → `shared/__init__.py` → `shared.async_sqlite_base`
+        # → `import aiosqlite`, but this worktree is checked out at an OLD
+        # pre_task_commit whose orchestrator/pyproject.toml predates the
+        # `dark-factory-shared[vllm]` dep, so the orchestrator-only `uv sync`
+        # above never pulls aiosqlite transitively (production dispatch verifies
+        # under a recent-main workspace venv that already has it). Reuse the SAME
+        # scrubbed setup_env so the install targets the worktree venv and cannot
+        # corrupt the live orchestrator .venv (the 2026-05-29 ghost-venv incident).
+        await ensure_eval_verify_deps(worktree_path, setup_env)
 
     return worktree_path, run_id
 
