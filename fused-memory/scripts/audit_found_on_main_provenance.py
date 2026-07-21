@@ -65,20 +65,29 @@ from shared.task_metadata import parse_metadata
 logger = logging.getLogger('audit_found_on_main_provenance')
 
 # Mirrors orchestrator.git_ops.DEFAULT_COMMIT_CITATION_PATTERN (git_ops.py:219)
-# conventions. NOT imported from there — orchestrator.git_ops pulls in the
-# whole GitOps stack, and a fused-memory -> orchestrator runtime import is
-# architecturally backwards (see task 2645 design decisions). This local
-# pattern is generalized to EXTRACT every cited task id from a message
-# (named capture groups), rather than testing one already-known id via
-# str.format interpolation as the orchestrator version does:
+# conventions (task 2870 widens that pattern with the same three forms below;
+# this is a deliberately independent, self-contained copy — see the NOT
+# imported note just below — so it does not depend on 2870's landing state).
+# NOT imported from there — orchestrator.git_ops pulls in the whole GitOps
+# stack, and a fused-memory -> orchestrator runtime import is architecturally
+# backwards (see task 2645 design decisions). This local pattern is
+# generalized to EXTRACT every cited task id from a message (named capture
+# groups), rather than testing one already-known id via str.format
+# interpolation as the orchestrator version does:
 #   - conventional-commit subject: `impl(50): ...` / `fix(50): ...`
 #   - `task/{id}` branch mention: `Merge task/50 into main`, `... task/50 ...`
+#   - hash-paren / bare-paren: `(#50)` / `(50)` anywhere in the message
+#   - task-word paren: `(task 50)` anywhere in the message
 # `\d+` is greedy, so a captured id is always the FULL digit run — `task/339`
-# never yields a citation match for id '3399', nor vice versa.
+# never yields a citation match for id '3399', nor vice versa. The paren/hash
+# forms need no `\b` guard: the literal parens (and optional `#`) are
+# self-delimiting, so `(#2870)` can never yield a truncated '287'.
 CITATION_PATTERN = re.compile(
     r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
-    r'|\btask/(?P<branch_tid>\d+)\b',
+    r'|\btask/(?P<branch_tid>\d+)\b'
+    r'|\(#?(?P<paren_tid>\d+)\)'
+    r'|\(task (?P<task_word_tid>\d+)\)',
     re.MULTILINE,
 )
 
@@ -175,15 +184,19 @@ def select_found_on_main_tasks(tasks: list[dict]) -> list[TaskProvenanceAudit]:
 def extract_cited_task_ids(message: str) -> set[str]:
     """Return every task id cited in *message* (commit subject + body).
 
-    Mirrors the citation conventions in ``CITATION_PATTERN`` above
-    (conventional-commit ``type(id):`` subjects and ``task/{id}`` mentions,
-    which subsumes the ``Merge task/{id} into <main>`` merge-commit
-    subject). Returns an empty set for a message with no citations —
-    never raises.
+    Mirrors the citation conventions in ``CITATION_PATTERN`` above:
+    conventional-commit ``type(id):`` subjects, ``task/{id}`` mentions
+    (which subsumes the ``Merge task/{id} into <main>`` merge-commit
+    subject), hash-paren/bare-paren ``(#id)``/``(id)``, and the task-word
+    paren form ``(task id)``. Returns an empty set for a message with no
+    citations — never raises.
     """
     ids: set[str] = set()
     for m in CITATION_PATTERN.finditer(message or ''):
-        tid = m.group('conv_tid') or m.group('branch_tid')
+        tid = (
+            m.group('conv_tid') or m.group('branch_tid')
+            or m.group('paren_tid') or m.group('task_word_tid')
+        )
         if tid:
             ids.add(tid)
     return ids
