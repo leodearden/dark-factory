@@ -2251,7 +2251,13 @@ class TaskWorkflow:
         # that would itself raise that guarded TypeError. The heartbeat refresh
         # is already documented as best-effort, so not running it under an
         # invalid interval is safe; the WARNING keeps the exit loud
-        # (no-silent-fail-soft).
+        # (no-silent-fail-soft). Note: the cadence is read ONCE here rather than
+        # per iteration, so a mid-loop hot-reload of
+        # ``claimant_heartbeat_interval_secs`` does not take effect until the
+        # loop is next (re)started. This is intentional and harmless — the loop
+        # is per-task and short-lived, the interval is not a documented
+        # hot-reload knob, and reading once keeps the guard and the sleep using
+        # a single consistent value.
         interval = self.config.claimant_heartbeat_interval_secs
         if not isinstance(interval, (int, float)) or interval <= 0:
             logger.warning(
