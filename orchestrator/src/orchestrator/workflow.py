@@ -2640,8 +2640,15 @@ class TaskWorkflow:
                             # once the lock frees. new_modules is computed
                             # HERE (only on the conflict path) so the
                             # block_detail names the exact unavailable locks.
-                            new_modules = files_to_modules(
+                            # α-strip via derive_modules (task 2373 amendment)
+                            # so `additional` is computed on the same basis as
+                            # the real conflict detection in
+                            # _reconcile_scope_locks — a directory-shaped grant
+                            # entry must not manufacture a phantom subtree
+                            # module in the diagnostic.
+                            new_modules = derive_modules(
                                 new_files, self.config.lock_depth,
+                                task_id=self.task_id,
                             )
                             additional = sorted(
                                 set(new_modules) - set(self.modules)
