@@ -7508,6 +7508,60 @@ class TestRecoverRedMain:
             f'(idx={update_ref_idx}); commands: {recorded}'
         )
 
+    async def test_recover_bypass_clear_nonzero_rc_logs_warning(
+        self, git_repo: Path, caplog,
+    ):
+        """A non-zero clear rc is surfaced as a WARNING and does NOT change the result.
+
+        The durable-bypass clear is best-effort: if the clear command itself
+        exits non-zero (leaving the bypass possibly still engaged) recover_red_main
+        surfaces it LOUDLY via a WARNING but still returns the update-ref outcome
+        ('rewound') — a failed clear must not mask an otherwise-successful recovery.
+        """
+        bypass_cmd = 'echo recover-bypass-engage'
+        clear_cmd = 'exit 7'  # real non-zero rc via `sh -c 'exit 7'` (no _run patch)
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        # A failed clear must NOT change the recovery outcome.
+        assert result == 'rewound', (
+            f'A non-zero clear rc must not change the result; got {result!r}'
+        )
+        # The clear command still ran (best-effort, in the finally) ...
+        assert ['sh', '-c', clear_cmd] in recorded, (
+            f'clear command must still run; commands: {recorded}'
+        )
+        # ... and its non-zero rc was surfaced LOUDLY, not swallowed.
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'main_gate_bypass_clear_command returned non-zero' in r.getMessage()
+        ]
+        assert warnings, (
+            'Expected a WARNING for the non-zero clear rc; got: '
+            f'{[r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]}'
+        )
+
     async def test_recover_bypass_cleared_on_cas_failure(self, git_repo: Path):
         """bypass_clear STILL runs after a FAILED update-ref (both-paths clear via try/finally).
 

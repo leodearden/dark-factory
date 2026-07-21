@@ -9384,7 +9384,7 @@ class GitOps:
                 )
                 return 'error'
 
-        # ── Main-gate engage: bypass SUPERSEDES mark (best-effort) ────────
+        # ── Main-gate engage + CAS move (bypass SUPERSEDES mark) ──────────
         # reify's reference-transaction hook (git>=2.28) runs an ALWAYS-ON
         # non-fast-forward guard whose ordering is: (1) if the durable bypass
         # is engaged -> `continue` (skip the ref, never reach the non-ff
@@ -9406,40 +9406,47 @@ class GitOps:
         # the bypass command is configured we engage it and SKIP the mark.
         # Projects with a sanction-only gate (no non-ff guard) leave the bypass
         # unset and keep the existing mark path byte-for-byte unchanged.
+        #
+        # The engage step AND the CAS update-ref share ONE try/finally so the
+        # DURABLE bypass is cleared on EVERY exit path — success, CAS failure,
+        # an exception from the update-ref subprocess, AND an exception raised
+        # mid-engage (e.g. a transport/output-capture error rather than a
+        # non-zero rc).  bypass_engaged is therefore set True IMMEDIATELY
+        # BEFORE the engage await, not after it: a bypass that partially
+        # applies its durable state and then raises must still be cleared by
+        # the finally.  (A bypassed txn consumes nothing — unlike the one-shot
+        # mark sentinel reify's hook consumes on a successful SANCTIONED txn —
+        # so recover_red_main is solely responsible for clearing the bypass;
+        # leaving it engaged would disable the project's non-ff guard for all
+        # subsequent ref moves.)
         bypass_engaged = False
-        if self.config.main_gate_bypass_command:
-            bypass_rc, _, bypass_err = await _run(
-                ['sh', '-c', self.config.main_gate_bypass_command],
-                cwd=self.project_root,
-            )
-            # Engaged regardless of rc: even a partially-applied bypass must be
-            # cleared, so mark it engaged before checking rc.
-            bypass_engaged = True
-            if bypass_rc != 0:
-                logger.warning(
-                    'main_gate_bypass_command returned non-zero rc=%d: %s',
-                    bypass_rc, bypass_err,
-                )
-        elif self.config.main_gate_mark_command:
-            mark_rc, _, mark_err = await _run(
-                ['sh', '-c', self.config.main_gate_mark_command],
-                cwd=self.project_root,
-            )
-            if mark_rc != 0:
-                logger.warning(
-                    'main_gate_mark_command returned non-zero rc=%d: %s',
-                    mark_rc, mark_err,
-                )
-
-        # ── CAS move of refs/heads/main ───────────────────────────────────
-        # Wrapped in try/finally so the DURABLE bypass is cleared on EVERY
-        # path — success, CAS failure, AND an exception raised by the
-        # update-ref subprocess itself.  Unlike the one-shot mark sentinel
-        # (which reify's hook consumes on a successful SANCTIONED txn), a
-        # bypassed txn consumes nothing, so recover_red_main is solely
-        # responsible for clearing the bypass; leaving it engaged would
-        # disable the project's non-ff guard for all subsequent ref moves.
         try:
+            if self.config.main_gate_bypass_command:
+                # Set engaged BEFORE the await (see the try/finally note above):
+                # a partially-applied bypass whose _run then raises is still
+                # cleared by the finally.
+                bypass_engaged = True
+                bypass_rc, _, bypass_err = await _run(
+                    ['sh', '-c', self.config.main_gate_bypass_command],
+                    cwd=self.project_root,
+                )
+                if bypass_rc != 0:
+                    logger.warning(
+                        'main_gate_bypass_command returned non-zero rc=%d: %s',
+                        bypass_rc, bypass_err,
+                    )
+            elif self.config.main_gate_mark_command:
+                mark_rc, _, mark_err = await _run(
+                    ['sh', '-c', self.config.main_gate_mark_command],
+                    cwd=self.project_root,
+                )
+                if mark_rc != 0:
+                    logger.warning(
+                        'main_gate_mark_command returned non-zero rc=%d: %s',
+                        mark_rc, mark_err,
+                    )
+
+            # ── CAS move of refs/heads/main ───────────────────────────────
             rc, _, err = await _run(
                 ['git', 'update-ref',
                  f'refs/heads/{self.config.main_branch}',
