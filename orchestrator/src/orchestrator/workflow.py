@@ -9121,6 +9121,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     sha=landed_sha,
                     note=f'train {train_id} attribution: member passed solo',
                 )
+                # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow on
+                # this attribution-passer done-write. Idempotent for non-tip passers
+                # (they hold no row), fail-safe when unbound; runs only after a
+                # SUCCESSFUL mark_done. Mirrors the 2681 single-branch precedent
+                # (workflow.py:1912-1917) and the harness sites (steps 2/4).
+                MergeProvenance.consume(r.member_id)
                 landed_ids.append(r.member_id)
                 if self.event_store is not None:
                     self.event_store.emit(
