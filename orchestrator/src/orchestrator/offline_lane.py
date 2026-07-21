@@ -448,8 +448,9 @@ class OfflineLaneWorker:
         (fine) or re-sets ``_dirty`` for a coalesced re-run (fine).
         Clearing AFTER the snapshot would open a lost-update window.
 
-        Two sub-runs per coalesced cadence, both at this ONE snapshot head
-        and in the SAME ``_offline-deep`` worktree (task 1959, IE1):
+        Up to three kinds of sub-run per coalesced cadence, all at this ONE
+        snapshot head and in the SAME ``_offline-deep`` worktree (task 1959,
+        IE1; task 2789, D1):
 
         1. NUMERIC — the existing ``scripts/run-offline-deep.sh`` suite via
            :attr:`suite_runner`, gated on
@@ -472,14 +473,26 @@ class OfflineLaneWorker:
            is taken here. IE-D4: infra ``.sh``/cargo tests never touch
            ``_offline-deep/target/``, so reusing δ's worktree does not
            violate C5's single-consumer-of-target invariant.
+        3. GENERIC per-project commands (task 2789, D1) — every ENABLED entry
+           in ``config.git.offline_lane_commands`` (empty by default, so this
+           leg is a no-op for reify), each run once via :attr:`command_runner`
+           and, on red, handled by the SAME :meth:`_handle_red_run` engine as
+           the numeric/infra legs (INV-5: no new mechanism). Its per-command
+           confirm seam (:attr:`command_confirmation_runner`) is bound into
+           :meth:`_handle_red_run`'s ``confirmation_runner`` contract, and the
+           filed fix task's priority is ``LaneCommand.fix_task_priority`` (via
+           the ``priority`` kwarg). Disabled entries are skipped.
 
-        Both sub-runs are logged (the run record). ``_last_green_head``
+        All executed sub-runs are logged (the run record). ``_last_green_head``
         advances only when ALL EXECUTED sub-runs passed at this head — the
-        last-both-green head is a sound (if sometimes wider) lower bound for
-        either sub-run's suspect range (see :meth:`_suspect_range`). When
-        infra is disabled, the infra leg is vacuously green, so numeric-only
-        semantics are unchanged. Never a gate (C7): a red infra result files
-        a normal queued fix task — it never blocks the merge queue.
+        last-all-green head is a sound (if sometimes wider) lower bound for any
+        sub-run's suspect range (see :meth:`_suspect_range`). A disabled leg
+        (infra off, numeric off, or a disabled/absent generic command) is
+        vacuously green, so numeric-only semantics are unchanged. Never a gate
+        (C7): a red result — numeric, infra, or generic — files a normal queued
+        fix task, never blocking the merge queue. A raising red-handling leg
+        (any kind) propagates before ``_last_run_head`` advances, so run()'s
+        poll backstop retries the still-outstanding head (fail-open, unchanged).
         """
         self._dirty = False
         head = await self.git_ops.get_main_sha()
@@ -517,14 +530,46 @@ class OfflineLaneWorker:
                     wt, head, confirmation_runner=self.infra_confirmation_runner,
                 )
 
-        # Advance ONLY after both red-handling legs and the infra sub-run have
-        # completed without raising (task 2016, Bug #2 fix). A raise from any
-        # leg propagates out of _run_once BEFORE this line runs, so
-        # _last_run_head stays at its prior value and run()'s poll backstop
-        # (head != self._last_run_head) re-flags this head for retry on the
-        # next poll tick — see run()'s docstring "Fail-open" section.
+        # 3. GENERIC per-project command sub-runs (task 2789, D1): every
+        # ENABLED entry in config.git.offline_lane_commands, each run once at
+        # this same snapshot head in the same worktree via command_runner. On
+        # red, the entire β3 confirm→fingerprint→file/update→escalate engine is
+        # reused via _handle_red_run — the per-command confirm seam is bound
+        # into its (wt, head) confirmation_runner contract, and the filed fix
+        # task's priority comes from LaneCommand.fix_task_priority (INV-5: no
+        # new mechanism). cmd is bound per-iteration into the confirm closure
+        # (the IIFE) to avoid the late-binding-closure bug.
+        generic_green = True
+        for cmd in self.config.git.offline_lane_commands:
+            if not cmd.enabled:
+                continue
+            start = time.monotonic()
+            rc, _tail = await self.command_runner(cmd, wt, head)
+            duration = time.monotonic() - start
+            logger.info(
+                'offline-lane: %s sub-run head=%s status=%s duration=%.1fs',
+                cmd.name, head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+            )
+            if rc != 0:
+                generic_green = False
+                await self._handle_red_run(
+                    wt, head,
+                    confirmation_runner=(
+                        lambda c: (lambda w, h: self.command_confirmation_runner(c, w, h))
+                    )(cmd),
+                    priority=cmd.fix_task_priority,
+                )
+
+        # Advance ONLY after every red-handling leg (numeric, infra, and each
+        # generic command) and every sub-run have completed without raising
+        # (task 2016, Bug #2 fix). A raise from any leg — including a generic
+        # command's red-handling leg — propagates out of _run_once BEFORE this
+        # line runs, so _last_run_head stays at its prior value and run()'s poll
+        # backstop (head != self._last_run_head) re-flags this head for retry on
+        # the next poll tick — see run()'s docstring "Fail-open" section (the
+        # fail-open contract is unchanged for the generic legs).
         self._last_run_head = head
-        if numeric_green and infra_green:
+        if numeric_green and infra_green and generic_green:
             self._last_green_head = head
 
     # ------------------------------------------------------------------
