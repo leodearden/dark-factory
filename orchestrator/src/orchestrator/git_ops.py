@@ -9325,13 +9325,19 @@ class GitOps:
         target_sha: str,
         expected_main: str,
     ) -> RecoverResult:
-        """Move refs/heads/main to *target_sha* atomically, sanctioning it for reify's gate.
+        """Move refs/heads/main BACKWARD to *target_sha* atomically, break-glass past reify's gate.
 
         This is the enforce-safe break-glass recovery operation: a SINGLE CAS
         update-ref that drops a bad merge in one move (no rewind-then-readvance).
-        Mirrors advance_main's main_gate mark → update-ref → unmark-on-failure
-        sequence so that reify's reference-transaction hook records the move as
-        SANCTIONED under ENFORCE.
+        Because the move is BACKWARD (history-rewriting), a project with an
+        always-on non-fast-forward main-gate guard (reify) rejects it even when
+        sanctioned, so — when configured — this engages a DURABLE bypass
+        (main_gate_bypass_command) immediately before the update-ref and clears
+        it (main_gate_bypass_clear_command) on every path afterward.  The bypass
+        SUPERSEDES the sanction mark (they are mutually exclusive; see the
+        engage block below).  Projects with only a sanction gate leave the
+        bypass unset and fall back to advance_main's mark → update-ref →
+        unmark-on-failure sequence unchanged.
 
         Args:
             target_sha:    The good SHA to restore main to (the pre-bad-merge state).
@@ -9341,6 +9347,7 @@ class GitOps:
         Returns:
             ``'rewound'``    — update-ref succeeded; main now points at target_sha.
             ``'cas_failed'`` — another writer moved the ref first; no change made.
+            ``'error'``      — a SHA failed pre-validation; fix the SHA and retry.
 
         Note:
             The caller (skill) must ensure project_root is clean before invoking
@@ -9377,33 +9384,110 @@ class GitOps:
                 )
                 return 'error'
 
-        # ── Main-gate mark (best-effort) ──────────────────────────────────
-        # Run the project-configurable sentinel command immediately before
-        # update-ref so reify's reference-transaction hook sees the marker
-        # and records this recovery as SANCTIONED.  Mirrors advance_main's
-        # 1678 sanction block exactly.  Non-zero return is logged as WARNING
-        # but never aborts the recovery.
-        if self.config.main_gate_mark_command:
-            mark_rc, _, mark_err = await _run(
-                ['sh', '-c', self.config.main_gate_mark_command],
+        # ── Main-gate engage + CAS move (bypass SUPERSEDES mark) ──────────
+        # reify's reference-transaction hook (git>=2.28) runs an ALWAYS-ON
+        # non-fast-forward guard whose ordering is: (1) if the durable bypass
+        # is engaged -> `continue` (skip the ref, never reach the non-ff
+        # check); (2) else reject any backward/history-rewriting ref move
+        # UNCONDITIONALLY (not gated by ENFORCE, not opted out by the
+        # sanction); (3) only if the non-ff guard passes is the SANCTION
+        # sentinel consulted.  recover_red_main moves main BACKWARD
+        # (expected_main is NOT an ancestor of target_sha), so the non-ff
+        # guard (step 2) rejects the move BEFORE the sanction (step 3) is
+        # reached — the mark alone is useless here.  So engage the DURABLE
+        # bypass immediately before the CAS update-ref.
+        #
+        # Bypass is MUTUALLY EXCLUSIVE with the mark: reify's real config sets
+        # BOTH (advance_main's forward ff moves need the sanction; recover's
+        # backward move needs the bypass).  If we ran the mark alongside an
+        # engaged bypass, the hook `continue`s on the bypass BEFORE it would
+        # consume the one-shot sanction sentinel -> the sentinel lingers and
+        # falsely sanctions the NEXT unrelated ref move (a real leak).  So when
+        # the bypass command is configured we engage it and SKIP the mark.
+        # Projects with a sanction-only gate (no non-ff guard) leave the bypass
+        # unset and keep the existing mark path byte-for-byte unchanged.
+        #
+        # The engage step AND the CAS update-ref share ONE try/finally so the
+        # DURABLE bypass is cleared on EVERY exit path — success, CAS failure,
+        # an exception from the update-ref subprocess, AND an exception raised
+        # mid-engage (e.g. a transport/output-capture error rather than a
+        # non-zero rc).  bypass_engaged is therefore set True IMMEDIATELY
+        # BEFORE the engage await, not after it: a bypass that partially
+        # applies its durable state and then raises must still be cleared by
+        # the finally.  (A bypassed txn consumes nothing — unlike the one-shot
+        # mark sentinel reify's hook consumes on a successful SANCTIONED txn —
+        # so recover_red_main is solely responsible for clearing the bypass;
+        # leaving it engaged would disable the project's non-ff guard for all
+        # subsequent ref moves.)
+        bypass_engaged = False
+        try:
+            if self.config.main_gate_bypass_command:
+                # Set engaged BEFORE the await (see the try/finally note above):
+                # a partially-applied bypass whose _run then raises is still
+                # cleared by the finally.
+                bypass_engaged = True
+                bypass_rc, _, bypass_err = await _run(
+                    ['sh', '-c', self.config.main_gate_bypass_command],
+                    cwd=self.project_root,
+                )
+                if bypass_rc != 0:
+                    logger.warning(
+                        'main_gate_bypass_command returned non-zero rc=%d: %s',
+                        bypass_rc, bypass_err,
+                    )
+            elif self.config.main_gate_mark_command:
+                mark_rc, _, mark_err = await _run(
+                    ['sh', '-c', self.config.main_gate_mark_command],
+                    cwd=self.project_root,
+                )
+                if mark_rc != 0:
+                    logger.warning(
+                        'main_gate_mark_command returned non-zero rc=%d: %s',
+                        mark_rc, mark_err,
+                    )
+
+            # ── CAS move of refs/heads/main ───────────────────────────────
+            rc, _, err = await _run(
+                ['git', 'update-ref',
+                 f'refs/heads/{self.config.main_branch}',
+                 target_sha, expected_main],
                 cwd=self.project_root,
             )
-            if mark_rc != 0:
-                logger.warning(
-                    'main_gate_mark_command returned non-zero rc=%d: %s',
-                    mark_rc, mark_err,
-                )
-
-        # ── CAS move of refs/heads/main ───────────────────────────────────
-        rc, _, err = await _run(
-            ['git', 'update-ref',
-             f'refs/heads/{self.config.main_branch}',
-             target_sha, expected_main],
-            cwd=self.project_root,
-        )
+        finally:
+            if bypass_engaged:
+                if self.config.main_gate_bypass_clear_command:
+                    clear_rc, _, clear_err = await _run(
+                        ['sh', '-c', self.config.main_gate_bypass_clear_command],
+                        cwd=self.project_root,
+                    )
+                    if clear_rc != 0:
+                        logger.warning(
+                            'main_gate_bypass_clear_command returned non-zero '
+                            'rc=%d: %s',
+                            clear_rc, clear_err,
+                        )
+                else:
+                    # Defense-in-depth: GitConfig._reject_bypass_command_without_clear
+                    # rejects bypass-without-clear at config load, so this branch
+                    # should be UNREACHABLE.  If it is ever reached (a
+                    # post-construction config mutation, or a future removal of
+                    # that validator), fail LOUD rather than silently leave the
+                    # durable bypass — and thus the project's non-fast-forward
+                    # main-gate guard — DISABLED for every later ref move.
+                    logger.error(
+                        'recover_red_main: durable main-gate bypass was engaged '
+                        'but main_gate_bypass_clear_command is unset — the '
+                        'non-fast-forward main-gate guard has been left DISABLED. '
+                        'This should be unreachable (the GitConfig validator '
+                        'rejects it at load); investigate the config.'
+                    )
         if rc != 0:
             # ── Main-gate unmark (best-effort cleanup) ────────────────────
-            if self.config.main_gate_unmark_command:
+            # Only on the mark path: when the bypass was engaged the mark was
+            # never written (bypass supersedes mark), so there is nothing to
+            # unmark — and the durable bypass has already been cleared in the
+            # finally above.
+            if not bypass_engaged and self.config.main_gate_unmark_command:
                 unmark_rc, _, unmark_err = await _run(
                     ['sh', '-c', self.config.main_gate_unmark_command],
                     cwd=self.project_root,

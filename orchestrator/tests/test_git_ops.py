@@ -211,6 +211,54 @@ def test_git_config_accepts_main_gate_commands():
     assert cfg_mark_only.main_gate_unmark_command is None
 
 
+def test_git_config_accepts_main_gate_bypass_commands():
+    """GitConfig.main_gate_bypass_command / _clear_command default to None and round-trip.
+
+    These are the recover_red_main break-glass knobs (task 2877): a durable
+    bypass of a project's always-on non-fast-forward main-gate guard, engaged
+    immediately before recover_red_main's backward CAS update-ref and cleared
+    immediately after.  Mirrors test_git_config_accepts_main_gate_commands for
+    the mark/unmark pair.
+    """
+    # Defaults — feature off (unset => no-op, other projects unaffected)
+    cfg_default = GitConfig()
+    assert cfg_default.main_gate_bypass_command is None
+    assert cfg_default.main_gate_bypass_clear_command is None
+
+    # Both set — values round-trip correctly
+    cfg = GitConfig(
+        main_gate_bypass_command='git config reify.mainGate.bypass true',
+        main_gate_bypass_clear_command='git config --unset reify.mainGate.bypass',
+    )
+    assert cfg.main_gate_bypass_command == 'git config reify.mainGate.bypass true'
+    assert cfg.main_gate_bypass_clear_command == 'git config --unset reify.mainGate.bypass'
+
+    # Only clear set (bypass unset) — harmless: the clear only ever runs when
+    # the bypass was engaged, so clear-without-bypass is a permissive no-op.
+    # (The reverse — bypass without clear — is REJECTED; see
+    # test_git_config_rejects_bypass_command_without_clear.)
+    cfg_clear_only = GitConfig(main_gate_bypass_clear_command='rm -f /tmp/flag')
+    assert cfg_clear_only.main_gate_bypass_command is None
+    assert cfg_clear_only.main_gate_bypass_clear_command == 'rm -f /tmp/flag'
+
+
+def test_git_config_rejects_bypass_command_without_clear():
+    """main_gate_bypass_command without main_gate_bypass_clear_command is REJECTED.
+
+    A durable bypass with no clear command would leave the project's always-on
+    non-fast-forward main-gate guard DISABLED for every later ref move — a
+    silent safety-guard leak.  GitConfig._reject_bypass_command_without_clear
+    fails fast at load time (loud-over-silent) rather than degrading at recovery
+    time.  (The reverse — clear set, bypass unset — is a harmless no-op and
+    stays permissive, asserted in test_git_config_accepts_main_gate_bypass_commands.)
+    """
+    import pydantic  # noqa: PLC0415
+
+    with pytest.raises((pydantic.ValidationError, ValueError)) as excinfo:
+        GitConfig(main_gate_bypass_command='git config reify.mainGate.bypass true')
+    assert 'main_gate_bypass_clear_command' in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
     async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
@@ -7371,6 +7419,320 @@ class TestRecoverRedMain:
         post_cmds = recorded[update_ref_idx + 1:]
         assert not any(c[:2] == ['sh', '-c'] for c in post_cmds), (
             f'Unexpected sh -c after failed update-ref with unmark unset; post: {post_cmds}'
+        )
+
+    # ── Break-glass bypass window (task 2877) ─────────────────────────────
+    # A project with an always-on non-fast-forward main-gate guard (reify)
+    # rejects recover_red_main's BACKWARD ref move even when sanctioned, so a
+    # durable bypass must be engaged for exactly the CAS window and cleared on
+    # every path.  These mirror the mark/unmark ordering tests above.
+
+    async def test_recover_bypass_engaged_before_update_ref(self, git_repo: Path):
+        """main_gate_bypass_command fires IMMEDIATELY before the CAS update-ref (no mark)."""
+        bypass_cmd = 'echo recover-bypass-engage'
+        # A clear command is required alongside the bypass (GitConfig rejects
+        # bypass-without-clear); it runs AFTER the update-ref and does not
+        # affect the engage-before-update-ref ordering asserted here.
+        clear_cmd = 'echo recover-bypass-clear'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[tuple[list[str], object]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append((list(cmd), cwd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+
+        bypass_indices = [
+            i for i, (cmd, _) in enumerate(recorded)
+            if cmd == ['sh', '-c', bypass_cmd]
+        ]
+        update_ref_indices = [
+            i for i, (cmd, _) in enumerate(recorded)
+            if cmd[:2] == ['git', 'update-ref'] and 'refs/heads/main' in cmd
+        ]
+        assert len(bypass_indices) >= 1, f'No bypass call; commands: {[c for c, _ in recorded]}'
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
+
+        bypass_idx = bypass_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+
+        assert bypass_idx == update_ref_idx - 1, (
+            f'bypass must be IMMEDIATELY before update-ref; '
+            f'bypass_idx={bypass_idx}, update_ref_idx={update_ref_idx}, '
+            f'intervening: {[c for c, _ in recorded[bypass_idx + 1:update_ref_idx]]}'
+        )
+        assert recorded[bypass_idx][1] == ops.project_root, (
+            f'bypass must run with cwd=project_root; got {recorded[bypass_idx][1]}'
+        )
+
+        # CAS: update-ref must include both target_sha (new) and expected_main (old)
+        update_ref_cmd = recorded[update_ref_idx][0]
+        assert target_sha in update_ref_cmd, (
+            f'target_sha not in update-ref args: {update_ref_cmd}'
+        )
+        assert expected_main in update_ref_cmd, (
+            f'expected_main (CAS old-value) not in update-ref args: {update_ref_cmd}'
+        )
+
+    async def test_recover_bypass_cleared_after_success(self, git_repo: Path):
+        """main_gate_bypass_clear_command fires AFTER a successful update-ref."""
+        bypass_cmd = 'echo recover-bypass-engage'
+        clear_cmd = 'echo recover-bypass-clear'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+
+        clear_indices = [i for i, c in enumerate(recorded) if c == ['sh', '-c', clear_cmd]]
+        update_ref_indices = [
+            i for i, c in enumerate(recorded)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        ]
+        assert len(clear_indices) >= 1, f'No clear call; commands: {recorded}'
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
+
+        clear_idx = clear_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+        assert clear_idx > update_ref_idx, (
+            f'clear (idx={clear_idx}) must run AFTER the successful update-ref '
+            f'(idx={update_ref_idx}); commands: {recorded}'
+        )
+
+    async def test_recover_bypass_clear_nonzero_rc_logs_warning(
+        self, git_repo: Path, caplog,
+    ):
+        """A non-zero clear rc is surfaced as a WARNING and does NOT change the result.
+
+        The durable-bypass clear is best-effort: if the clear command itself
+        exits non-zero (leaving the bypass possibly still engaged) recover_red_main
+        surfaces it LOUDLY via a WARNING but still returns the update-ref outcome
+        ('rewound') — a failed clear must not mask an otherwise-successful recovery.
+        """
+        bypass_cmd = 'echo recover-bypass-engage'
+        clear_cmd = 'exit 7'  # real non-zero rc via `sh -c 'exit 7'` (no _run patch)
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        # A failed clear must NOT change the recovery outcome.
+        assert result == 'rewound', (
+            f'A non-zero clear rc must not change the result; got {result!r}'
+        )
+        # The clear command still ran (best-effort, in the finally) ...
+        assert ['sh', '-c', clear_cmd] in recorded, (
+            f'clear command must still run; commands: {recorded}'
+        )
+        # ... and its non-zero rc was surfaced LOUDLY, not swallowed.
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'main_gate_bypass_clear_command returned non-zero' in r.getMessage()
+        ]
+        assert warnings, (
+            'Expected a WARNING for the non-zero clear rc; got: '
+            f'{[r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]}'
+        )
+
+    async def test_recover_bypass_cleared_on_cas_failure(self, git_repo: Path):
+        """bypass_clear STILL runs after a FAILED update-ref (both-paths clear via try/finally).
+
+        This is the guarantee the mark's unmark does NOT provide: the durable
+        bypass must be cleared on the CAS-failure path too, not only on success.
+        """
+        bypass_cmd = 'echo recover-bypass-engage'
+        clear_cmd = 'echo recover-bypass-clear'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            if cmd[:2] == ['git', 'update-ref']:
+                recorded.append(list(cmd))
+                return (1, '', 'CAS mismatch: refs/heads/main has been updated')
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'cas_failed', f'Expected cas_failed, got {result!r}'
+
+        clear_indices = [i for i, c in enumerate(recorded) if c == ['sh', '-c', clear_cmd]]
+        update_ref_indices = [
+            i for i, c in enumerate(recorded)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        ]
+        assert len(clear_indices) >= 1, (
+            f'No clear call after CAS failure — durable bypass would leak; commands: {recorded}'
+        )
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
+
+        clear_idx = clear_indices[-1]
+        update_ref_idx = update_ref_indices[-1]
+        assert clear_idx > update_ref_idx, (
+            f'clear (idx={clear_idx}) must run AFTER the FAILED update-ref '
+            f'(idx={update_ref_idx}); commands: {recorded}'
+        )
+
+    async def test_recover_bypass_supersedes_mark(self, git_repo: Path):
+        """With BOTH mark AND bypass set (reify's real config), bypass supersedes mark.
+
+        bypass runs; mark does NOT run (a written-but-unconsumed sentinel would
+        linger — reify's hook `continue`s on the bypass before consuming the
+        sentinel — and falsely sanction the NEXT ref move); unmark does NOT run
+        on success; bypass_clear runs.
+        """
+        mark_cmd = 'echo recover-mark-SHOULD-NOT-RUN'
+        unmark_cmd = 'echo recover-unmark-SHOULD-NOT-RUN'
+        bypass_cmd = 'echo recover-bypass-engage'
+        clear_cmd = 'echo recover-bypass-clear'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+                main_gate_unmark_command=unmark_cmd,
+                main_gate_bypass_command=bypass_cmd,
+                main_gate_bypass_clear_command=clear_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+
+        assert ['sh', '-c', bypass_cmd] in recorded, f'bypass must run; commands: {recorded}'
+        assert ['sh', '-c', clear_cmd] in recorded, f'bypass_clear must run; commands: {recorded}'
+        assert ['sh', '-c', mark_cmd] not in recorded, (
+            f'mark must NOT run when bypass supersedes it (unconsumed sentinel would '
+            f'leak); commands: {recorded}'
+        )
+        assert ['sh', '-c', unmark_cmd] not in recorded, (
+            f'unmark must NOT run on success (and mark was never written); '
+            f'commands: {recorded}'
+        )
+
+    async def test_recover_mark_path_unchanged_when_bypass_unset(self, git_repo: Path):
+        """With only mark set (bypass unset), the sanction-only mark path is unchanged.
+
+        Backward-compat guard: mark still immediately precedes update-ref and no
+        bypass/clear sh -c fires.  Projects with a sanction-only gate leave
+        bypass unset and keep the existing behaviour.
+        """
+        mark_cmd = 'echo recover-mark-only-path'
+        ops = GitOps(
+            GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                push_after_advance=False,
+                main_gate_mark_command=mark_cmd,
+            ),
+            git_repo,
+        )
+        target_sha, expected_main = await self._two_main_shas(git_repo)
+
+        original_run = _run
+        recorded: list[list[str]] = []
+
+        async def recording_run(cmd, cwd=None):
+            recorded.append(list(cmd))
+            return await original_run(cmd, cwd=cwd)
+
+        with patch('orchestrator.git_ops._run', side_effect=recording_run):
+            result = await ops.recover_red_main(target_sha, expected_main)
+
+        assert result == 'rewound', f'Expected rewound, got {result!r}'
+
+        mark_indices = [i for i, c in enumerate(recorded) if c == ['sh', '-c', mark_cmd]]
+        update_ref_indices = [
+            i for i, c in enumerate(recorded)
+            if c[:2] == ['git', 'update-ref'] and 'refs/heads/main' in c
+        ]
+        assert len(mark_indices) >= 1, f'No mark call; commands: {recorded}'
+        assert len(update_ref_indices) >= 1, 'No update-ref call recorded'
+        assert mark_indices[-1] == update_ref_indices[-1] - 1, (
+            f'mark must remain IMMEDIATELY before update-ref; commands: {recorded}'
+        )
+        # Only the mark sh -c should fire — no bypass/clear commands
+        sh_c_cmds = [c for c in recorded if c[:2] == ['sh', '-c']]
+        assert sh_c_cmds == [['sh', '-c', mark_cmd]], (
+            f'Only the mark sh -c should fire (no bypass/clear); got: {sh_c_cmds}'
         )
 
     async def test_recover_syncs_working_tree_when_on_main(self, git_repo: Path):
