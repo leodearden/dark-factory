@@ -56,6 +56,7 @@ gate).
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
@@ -66,9 +67,9 @@ from shared.usage_gate import AccountPhase, ScopeCap, UsageGate
 
 # NOTE: this scaffold (prerequisite P1) imports only what the harness below
 # uses today. Each Bn step below (B1-B6, B8) adds the specific additional
-# imports (asyncio, contextlib, json, UTC, timedelta) its own test needs,
-# keeping every commit ruff-clean rather than pre-importing the whole
-# suite's eventual closure.
+# imports (asyncio, contextlib, UTC, timedelta) its own test needs, keeping
+# every commit ruff-clean rather than pre-importing the whole suite's
+# eventual closure.
 
 SCOPE = 'claude-fable-5'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
@@ -197,3 +198,43 @@ class TestB1FableCapLeavesGeneralOpen:
         # The fable cap did not remove A's general capacity.
         assert general.account_name == 'a'
         assert general.output == 'complete'
+
+
+# ===========================================================================
+# B2 -- scoped failover cost event carries scope
+# ===========================================================================
+
+
+def _failover_calls(mock_fire):
+    """The ('failover') calls recorded by a patched _fire_cost_event mock."""
+    return [c for c in mock_fire.call_args_list if c.args[1] == 'failover']
+
+
+class TestB2ScopedFailoverCarriesScope:
+    """B2: a scoped account switch fires a ``failover`` cost event whose
+    JSON details include ``scope``, driven end-to-end through the
+    cap-retry loop (not by calling before_invoke directly)."""
+
+    async def test_b2_scoped_failover_event_carries_scope(self):
+        gate = make_gate(['a', 'b'], cost_store=make_mock_cost_store())
+
+        with (
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', model='claude-fable-5', backend='claude',
+                invoke_fn=scripted_invoke(
+                    cap_result("You've hit your usage limit. resets in 1h"),
+                    ok_result(),
+                ),
+                prompt='hi',
+            )
+
+        assert got.account_name == 'b'
+
+        failovers = _failover_calls(mock_fire)
+        assert len(failovers) == 1
+        name, _event, details_json = failovers[0].args
+        assert name == 'b'
+        assert json.loads(details_json) == {'from': 'a', 'to': 'b', 'scope': SCOPE}
