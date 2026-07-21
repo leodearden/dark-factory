@@ -60,6 +60,36 @@ def _eval_setup_env(pin_source: Path) -> dict[str, str]:
     return _target_subprocess_env({'UV_PYTHON': pin} if pin else None)
 
 
+def resolve_worktree_venv_pythons(worktree: Path) -> list[Path]:
+    """Return every venv interpreter the eval setup created under ``worktree``.
+
+    Mirrors ``scripts/eval_bootstrap_smoke.sh``'s ``resolve_venv_pythons`` and
+    is deliberately kept in lockstep with it: the framework provisions the
+    eval-verify cross-member dep(s) into EXACTLY the venv(s) the smoke gate
+    version-checks, so gate and provisioner never disagree about where the
+    interpreter lives.
+
+    Resolution order (identical to the gate):
+
+    * direct top-level layout — ``<worktree>/.venv/bin/python`` if it exists
+      (a single venv), returned alone;
+    * else the one-level subproject glob ``<worktree>/*/.venv/bin/python`` —
+      where ``uv`` lands the venv when a fixture's setup does
+      ``cd <subproject> && uv sync`` with ``UV_PROJECT_ENVIRONMENT`` scrubbed
+      (``verify._target_subprocess_env``), e.g. df_task_12 →
+      ``<worktree>/orchestrator/.venv``. A worktree that builds more than one
+      subproject venv yields all of them, sorted.
+
+    Returns ``[]`` when no venv exists (a reify/Rust worktree with no
+    ``uv sync``) — a clean no-op signal for the provisioner. Pure: no side
+    effects, only filesystem existence/glob reads.
+    """
+    direct = worktree / '.venv' / 'bin' / 'python'
+    if direct.exists():
+        return [direct]
+    return sorted(worktree.glob('*/.venv/bin/python'))
+
+
 async def _run(cmd: list[str], cwd: Path) -> str:
     """Run a command and return stdout."""
     proc = await asyncio.create_subprocess_exec(
