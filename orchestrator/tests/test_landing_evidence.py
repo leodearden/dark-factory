@@ -123,20 +123,26 @@ class TestValidateLandingEvidenceDiscoveryMode:
         assert verdict.reason == 'no_citation'
         assert verdict.evidence_sha is None
 
-    async def test_foreign_citation_neither_direction_rejected(self) -> None:
-        """(d) the citation is an ancestor in NEITHER direction (an
-        unrelated task's commit that merely matched the citation grep
-        pattern — the task 2624 incident shape) -> rejected, reason ==
-        'lineage_mismatch'.
+    async def test_divergent_citation_accepted_anchors_effect_on_citation(
+        self,
+    ) -> None:
+        """(d) FIX-A (task 2870 / esc-5252-9): a genuine on-main citation
+        whose branch ref has diverged/realigned so it is an ancestor in
+        NEITHER direction is NO LONGER rejected as 'lineage_mismatch'. Every
+        DISCOVERY caller pre-establishes the branch's content is on main, and
+        find_task_citation_commit greps ``git log main``, so branch-ref
+        ancestry is not the landing authority — the citation is accepted and
+        the FIX-1' effect-present guard is anchored on the CITATION itself
+        (the divergent branch tip is not authoritative). Only the
+        (citation, branch) is_ancestor call is made now — the second,
+        bidirectional reject arm is gone (an unmapped (branch, citation)
+        call would raise).
         """
         branch = 'task/42'
         citation_sha = 'a' * 40
         git_ops = _git_ops(
             citation=citation_sha,
-            is_ancestor_map={
-                (citation_sha, branch): False,
-                (branch, citation_sha): False,
-            },
+            is_ancestor_map={(citation_sha, branch): False},
             effect_present=True,
         )
 
@@ -144,8 +150,33 @@ class TestValidateLandingEvidenceDiscoveryMode:
             git_ops, '42', branch, branch_tip_sha='f' * 40,
         )
 
+        assert verdict.accepted is True
+        assert verdict.evidence_sha == citation_sha
+        assert verdict.reason == 'ok'
+        git_ops.commit_effect_present_in_main.assert_awaited_once_with(citation_sha)
+        assert verdict.probe['effect_check_sha'] == citation_sha
+
+    async def test_divergent_citation_effect_absent_still_rejected(self) -> None:
+        """(d') FIX-1' still gates after the FIX-A relaxation: the same
+        divergent-citation setup but with the citation's effect reverted at
+        main HEAD (effect_present False) is still rejected as 'effect_absent',
+        evidence_sha None — relaxing the lineage guard does not weaken the
+        real gate against a reverted (task-1175) landing.
+        """
+        branch = 'task/42'
+        citation_sha = 'a' * 40
+        git_ops = _git_ops(
+            citation=citation_sha,
+            is_ancestor_map={(citation_sha, branch): False},
+            effect_present=False,
+        )
+
+        verdict = await validate_landing_evidence(
+            git_ops, '42', branch, branch_tip_sha='f' * 40,
+        )
+
         assert verdict.accepted is False
-        assert verdict.reason == 'lineage_mismatch'
+        assert verdict.reason == 'effect_absent'
         assert verdict.evidence_sha is None
 
     async def test_effect_absent_rejected(self) -> None:

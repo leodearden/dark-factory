@@ -158,17 +158,19 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
 
-    async def test_foreign_citation_not_on_branch_vetoes_flip(
+    async def test_divergent_citation_flips_to_done(
         self, mock_orch_config,
     ) -> None:
-        """FIX 2 (task 2500) citation-lineage guard: the grep-found citation
-        must be reachable from THIS task's own branch tip. Here is_ancestor
-        returns True for (branch, main) — the ancestry evidence is real —
-        but False for (citation, branch): the citation commit is NOT an
-        ancestor of this task's branch, i.e. it is an unrelated task's
-        commit that merely matched the citation grep pattern (the task
-        2624 incident shape — a foreign merge commit fabricated as this
-        task's completion evidence). The gate must reject it, not flip.
+        """FIX-A (task 2870 / esc-5252-9): the relaxed citation-lineage guard
+        now ACCEPTS a genuine on-main citation whose branch ref has
+        diverged/realigned. is_ancestor(branch, 'main') is True (the ancestry
+        evidence is real) and is_ancestor(citation, branch) is False (the
+        citation is not an in-branch work commit — the divergent shape), and
+        the bidirectional (branch, citation) reject arm is gone (an unmapped
+        call would raise). The effect is present, so the gate flips the task
+        to done anchored on the CITATION (the divergent branch tip is not
+        authoritative), rather than leaving it PENDING to close↔refile
+        ping-pong every reconcile tick.
         """
         h = _wired_ancestry_harness(mock_orch_config)
         branch = 'task/42'
@@ -178,16 +180,19 @@ class TestAlreadyLandedDispatchGateAncestryGuards:
             if (a, b) == (branch, 'main'):
                 return True
             if (a, b) == (citation_sha, branch):
-                return False  # citation NOT a work commit on this branch
-            if (a, b) == (branch, citation_sha):
-                return False  # citation NOT this branch's own merge commit
+                return False  # citation NOT a work commit on this branch (divergent)
             raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
         h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
 
         result = await h._already_landed_dispatch_gate('42')
 
-        assert result is False
-        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
+        assert call_args is not None
+        assert call_args.args[0] == '42'
+        assert call_args.args[1] == citation_sha
+        assert call_args.args[3] == 'dispatch-gate-already-on-main'
 
     async def test_no_ff_merge_commit_citation_flips_to_done(
         self, mock_orch_config,
