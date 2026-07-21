@@ -416,3 +416,43 @@ class TestB6KillSwitchByteEquivalence:
         assert a.phase == AccountPhase.CAPPED
         assert a.scope_caps == {}  # no scope state written
         assert got.account_name == 'b'
+
+
+# ===========================================================================
+# B8 -- a non-claude backend bypasses scope derivation/state entirely
+# ===========================================================================
+
+
+class TestB8NonClaudeBackendBypass:
+    """B8: a non-claude backend bypasses scope derivation/state entirely,
+    even when the invoked model string is a configured scoped-cap model --
+    the codex CapHit takes the account-level path and no scope_caps entry
+    is ever written anywhere (decision 7). The T1 reconnect contract shapes
+    (backend/prompt/oauth_token forwarded to invoke_fn) are preserved."""
+
+    async def test_b8_codex_backend_bypasses_scope_derivation(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        invoke_fn = scripted_invoke(cap_result('usage limit reached'), ok_result())
+
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', model='claude-fable-5', backend='codex',
+                invoke_fn=invoke_fn,
+                prompt='hi',
+            )
+
+        # No scope state written anywhere -- backend != 'claude' derives
+        # scope None even though the model IS a scoped-cap model.
+        assert a.scope_caps == {}
+        assert b.scope_caps == {}
+        assert gate.scope_status() == {}
+        # The codex CapHit took the account-level path and failed over.
+        assert a.phase == AccountPhase.CAPPED
+        assert got.account_name == 'b'
+
+        # T1 reconnect contract shapes preserved (mirrors TestInvokeFnParameter).
+        first_call = invoke_fn.calls[0]
+        assert first_call['backend'] == 'codex'
+        assert first_call['prompt'] == 'hi'
+        assert first_call['oauth_token'] == 'fake-token-a'
