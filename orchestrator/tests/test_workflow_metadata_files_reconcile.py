@@ -617,3 +617,35 @@ class TestReplanScopeReconcile:
             'expected metadata.files to be persisted directly (via update_task) '
             f'including {f2!r} before the 2nd EXECUTE; got {snapshots[1]["update"]!r}'
         )
+
+    async def test_cross_module_lock_conflict_requeues(self, tmp_path: Path):
+        """A genuine cross-module lock conflict on the replan reconcile must
+        REQUEUE — not silently proceed into the 2nd EXECUTE under a foreign
+        lock."""
+        initial_files = ['a/b/c/d/e.py']
+        new_file = 'x/y/z/w/v.py'
+        modules = files_to_modules(initial_files, 2)
+        assert files_to_modules(initial_files, 2) != files_to_modules(
+            [*initial_files, new_file], 2,
+        ), 'precondition: the new file must widen the MODULE set'
+
+        wf, scheduler = _make_replan_workflow(
+            tmp_path=tmp_path, initial_files=initial_files, modules=modules,
+        )
+        scheduler.blast_radius_result = False  # a sibling holds the additional lock
+        snapshots: list[dict] = []
+        wf._execute_iterations = _snapshotting_execute_iterations(scheduler, snapshots)
+        wf._review = _blocking_then_pass_reviews()
+        wf._replan = _widening_replan(wf, new_file)
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        report = wf._terminal_report
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert len(snapshots) == 1, (
+            'the 2nd EXECUTE must never run under a foreign lock; '
+            f'got {len(snapshots)} _execute_iterations call(s)'
+        )
