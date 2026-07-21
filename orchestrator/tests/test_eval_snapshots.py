@@ -8,6 +8,9 @@ non-git tmp dir and is caught) or unexercised (the pure ``read_python_pin`` /
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
@@ -94,3 +97,73 @@ def test_eval_setup_env_no_pin_when_no_python_version(tmp_path, monkeypatch):
     env = _eval_setup_env(tmp_path)
     assert 'UV_PYTHON' not in env
     assert 'VIRTUAL_ENV' not in env
+
+
+# ---------------------------------------------------------------------------
+# task 2875 — create_eval_worktree sources the setup `uv sync` UV_PYTHON pin
+# from the target project_root's CURRENT checkout (a 3.13-bearing tree), NOT
+# the eval worktree checked out at a pre_task_commit that predates
+# `.python-version`. For 11/22 fixtures that baseline predates c5ac23d7ac, so a
+# worktree-sourced pin resolves None → uv default 3.14t → aiosqlite
+# ModuleNotFoundError at verify. Sourcing from project_root mirrors production
+# dispatch and keeps setup==verify interpreter agreement (task 2847).
+# ---------------------------------------------------------------------------
+
+def _init_repo_with_late_python_version(project_root: Path) -> str:
+    """Build a real 2-commit git repo; return the pre-`.python-version` SHA.
+
+    Commit 1 is a baseline WITHOUT ``.python-version`` (the fixture's
+    ``pre_task_commit`` — its checked-out tree carries no pin); commit 2 adds
+    ``.python-version``=3.13 so project_root's CURRENT checkout pins 3.13 while
+    the returned baseline SHA does not. Exactly the fixture divergence guarded.
+    """
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ['git', *args],
+            cwd=project_root, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    _git('init')
+    _git('config', 'user.email', 'eval@test')
+    _git('config', 'user.name', 'Eval Test')
+    _git('config', 'commit.gpgsign', 'false')
+    (project_root / 'README.md').write_text('hi\n')
+    _git('add', 'README.md')
+    _git('commit', '--no-verify', '-m', 'baseline without .python-version')
+    pre = _git('rev-parse', 'HEAD')
+    (project_root / '.python-version').write_text('3.13\n')
+    _git('add', '.python-version')
+    _git('commit', '--no-verify', '-m', 'add .python-version 3.13')
+    return pre
+
+
+@pytest.mark.asyncio
+async def test_create_eval_worktree_sources_setup_pin_from_project_root(
+    tmp_path, monkeypatch,
+):
+    from orchestrator.evals import snapshots
+    from orchestrator.evals.snapshots import create_eval_worktree
+
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    pre = _init_repo_with_late_python_version(project_root)
+
+    # Spy on _eval_setup_env: record its single positional pin_source arg, then
+    # delegate to the REAL helper so setup_commands=['true'] still runs.
+    real_setup_env = snapshots._eval_setup_env
+    captured: dict = {}
+
+    def _spy(pin_source):
+        captured['pin_source'] = pin_source
+        return real_setup_env(pin_source)
+
+    monkeypatch.setattr(snapshots, '_eval_setup_env', _spy)
+
+    worktree_path, _run_id = await create_eval_worktree(
+        project_root, 'df_task_x', pre, setup_commands=['true'],
+    )
+
+    # The setup pin sources from project_root's CURRENT checkout (3.13-bearing),
+    # NOT the eval worktree checked out at `pre` (which predates .python-version).
+    assert captured['pin_source'] == project_root
+    assert captured['pin_source'] != worktree_path

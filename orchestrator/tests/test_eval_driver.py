@@ -145,168 +145,143 @@ class TestBuildEvalOrchConfigVerifyPythonPin:
 
 
 # ---------------------------------------------------------------------------
-# task 2851 — build_eval_orch_config gains an optional `worktree` param so the
-# verify UV_PYTHON pin derives from the eval WORKTREE's .python-version (the
-# SAME tree snapshots._eval_setup_env reads for `uv sync`), not the target
-# project_root's current HEAD. Threaded (the eval executors), the worktree wins;
-# left None (every non-eval caller), pin_source stays project_root — byte-
-# identical to today. When a worktree IS threaded but carries no .python-version,
-# inject NO pin (fail-safe) — crucially with NO fallback to project_root, so the
-# setup/verify interpreter split task 2847 BUG 2 removed cannot reappear.
-# ---------------------------------------------------------------------------
-
-class TestBuildEvalOrchConfigWorktreePin:
-    def test_pin_follows_threaded_worktree_over_project_root(self, tmp_path: Path):
-        from orchestrator.evals.runner import build_eval_orch_config
-
-        # project_root (tmp_path) pins 3.12; the eval worktree pins 3.13. The two
-        # trees diverge — exactly the fixture divergence this task guards against.
-        (tmp_path / '.python-version').write_text('3.12\n')
-        wt = tmp_path / 'wt'
-        wt.mkdir()
-        (wt / '.python-version').write_text('3.13\n')
-
-        base = _base_config(tmp_path)
-        task = {'project_root': str(tmp_path)}
-
-        cfg = build_eval_orch_config(_impl_cfg(), task, base, worktree=wt)
-
-        # The pin follows the threaded WORKTREE (3.13), NOT project_root (3.12) —
-        # so verify runs under the same interpreter `uv sync` built the venv with.
-        assert cfg.verify_env['UV_PYTHON'] == '3.13'
-        assert cfg.verify_env['UV_PYTHON'] != '3.12'
-
-    def test_threaded_worktree_without_python_version_injects_no_pin(self, tmp_path: Path):
-        from orchestrator.evals.runner import build_eval_orch_config
-
-        # project_root pins 3.12, but the threaded worktree has NO .python-version.
-        (tmp_path / '.python-version').write_text('3.12\n')
-        wt = tmp_path / 'wt'
-        wt.mkdir()
-
-        base = _base_config(tmp_path)
-        task = {'project_root': str(tmp_path)}
-
-        cfg = build_eval_orch_config(_impl_cfg(), task, base, worktree=wt)
-
-        # Fail-safe no-pin — and crucially NO fallback to project_root's 3.12,
-        # proving pin_source is strictly the worktree (mirrors _eval_setup_env).
-        assert 'UV_PYTHON' not in cfg.verify_env
-
-
-# ---------------------------------------------------------------------------
-# task 2851 — call-site threading guards: each eval executor threads the eval
-# worktree it created (run_eval / run_end_to_end / run_architect_eval) into
-# build_eval_orch_config, so the verify pin above actually reads that worktree.
-#
-# Behavioral guards (not signature locks), mirroring test_eval_memory_isolation.
-# test_run_eval_forwards_memory_endpoint_to_build_eval_orch_config: replace
-# build_eval_orch_config with a recorder that captures the `worktree` kwarg the
-# call site passed, then short-circuits before any workflow/worktree work.
-# Deleting a `worktree=worktree` forward makes captured['worktree'] default to
-# None and fails the guard.
+# _Sentinel: a short-circuit exception reused by the verify-pin capturing test
+# below (test_run_eval_verify_pin_follows_project_root_not_worktree) to abort
+# run_eval right after build_eval_orch_config is called, without doing any real
+# workflow/worktree work. (Task 2851's worktree-threading guards that formerly
+# lived here were removed with the `worktree` param in task 2875.)
 # ---------------------------------------------------------------------------
 
 class _Sentinel(Exception):
-    """Short-circuit sentinel: the recorder raises it after capturing worktree."""
+    """Short-circuit sentinel raised by a capturing build stand-in mid-run_eval."""
 
 
-def _worktree_recorder(captured: dict):
-    """A build_eval_orch_config stand-in that captures `worktree` then bails.
-
-    ``**kwargs`` swallows every other forwarded argument (memory_endpoint /
-    architect_config / judge_config), so the recorder is agnostic to which
-    executor calls it — only the `worktree` thread is under test here.
-    """
-    def _rec(config, task, base_config=None, *, worktree=None, **kwargs):
-        captured['worktree'] = worktree
-        raise _Sentinel
-    return _rec
-
+# ---------------------------------------------------------------------------
+# task 2875 — the eval verify UV_PYTHON pin follows the target project_root's
+# CURRENT checkout, NOT the eval worktree checked out at an old pre_task_commit.
+# run_eval threads the worktree it reuses/creates into build_eval_orch_config;
+# post-2851 build sourced the pin from THAT worktree, which for older fixtures
+# predates .python-version → no pin → uv default 3.14t → aiosqlite failure.
+#
+# A call-site capturing test (decision 3): wrap the REAL build to record
+# verify_env then short-circuit via _Sentinel. It is RED on current code
+# (worktree threaded → pin follows the pinless worktree → no UV_PYTHON) and
+# stays invariant across step-4's removal of the `worktree` param — it never
+# references `worktree=`, so **kwargs absorbs whatever the call site forwards.
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestCallSitesThreadWorktree:
-    async def test_run_eval_threads_worktree(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        from orchestrator.evals import runner
+async def test_run_eval_verify_pin_follows_project_root_not_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from orchestrator.evals import runner
 
-        captured: dict = {}
-        monkeypatch.setattr(runner, 'build_eval_orch_config', _worktree_recorder(captured))
-        monkeypatch.setattr(
-            runner, 'load_task',
-            lambda _p: {'id': 't', 'project_root': str(tmp_path)},
-        )
-        wt = tmp_path / 'wt'
+    # project_root's CURRENT checkout pins 3.13 (df fixtures do); the eval
+    # worktree — checked out at an old pre_task_commit — carries NO
+    # .python-version (the fixture divergence this task guards against).
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    (project_root / '.python-version').write_text('3.13\n')
+    wt = tmp_path / 'wt'
+    wt.mkdir()
 
-        # worktree_path=wt short-circuits create_eval_worktree and binds
-        # worktree=wt; the build call is NOT inside a try, so _Sentinel propagates.
-        with pytest.raises(_Sentinel):
-            await runner.run_eval(tmp_path / 'task.json', _impl_cfg(), worktree_path=wt)
+    # Capture the REAL build's verify_env, then short-circuit before any
+    # workflow/worktree work. **kwargs swallows whatever the call site forwards
+    # (memory_endpoint / judge_config / — today — worktree), so this test is
+    # agnostic to step-4's removal of the worktree kwarg.
+    real_build = runner.build_eval_orch_config
+    captured: dict = {}
 
-        assert captured['worktree'] == wt
+    def _capture_build(config, task, base_config=None, **kwargs):
+        cfg = real_build(config, task, base_config, **kwargs)
+        captured['verify_env'] = dict(cfg.verify_env)
+        raise _Sentinel
 
-    async def test_run_end_to_end_threads_worktree(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        from orchestrator.evals import runner
+    monkeypatch.setattr(runner, 'build_eval_orch_config', _capture_build)
+    monkeypatch.setattr(
+        runner, 'load_task',
+        lambda _p: {'id': 't', 'project_root': str(project_root)},
+    )
 
-        captured: dict = {}
-        wt = tmp_path / 'wt'
-
-        async def fake_create_wt(*_a, **_k):
-            return wt, 'run'
-
-        # run_end_to_end binds the worktree via the runner-local create_eval_worktree.
-        monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
-        monkeypatch.setattr(runner, 'build_eval_orch_config', _worktree_recorder(captured))
-        monkeypatch.setattr(
-            runner, 'load_task',
-            lambda _p: {'id': 't', 'project_root': str(tmp_path), 'pre_task_commit': 'abc'},
-        )
-
-        # The build call is BEFORE the try, so _Sentinel propagates.
-        with pytest.raises(_Sentinel):
-            await runner.run_end_to_end(tmp_path / 'task.json', _arch_cfg(), _impl_cfg())
-
-        assert captured['worktree'] == wt
-
-    async def test_run_architect_eval_threads_worktree(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ):
-        from orchestrator.evals import runner
-
-        captured: dict = {}
-        wt = tmp_path / 'wt'
-
-        async def fake_create_wt(*_a, **_k):
-            return wt, 'run'
-
-        async def fake_cleanup(*_a, **_k):
-            return None
-
-        def fake_judge(*_a, **_k):
-            raise RuntimeError('no cloud judge in tests')
-
-        # run_architect_eval binds the worktree via snapshots.create_eval_worktree
-        # (module attr, not the runner-local name) and, on the swallowed sentinel,
-        # scores an empty plan — patch the judge to raise so it degrades to the
-        # deterministic score_plan_structure floor (no cloud call).
-        monkeypatch.setattr('orchestrator.evals.snapshots.create_eval_worktree', fake_create_wt)
-        monkeypatch.setattr('orchestrator.evals.snapshots.cleanup_eval_worktree', fake_cleanup)
-        monkeypatch.setattr('orchestrator.evals.judge.judge_plan_quality', fake_judge)
-        monkeypatch.setattr(runner, 'build_eval_orch_config', _worktree_recorder(captured))
-        monkeypatch.setattr(runner, 'save_result', lambda _r: None)
-        monkeypatch.setattr(
-            runner, 'load_task',
-            lambda _p: {'id': 't', 'project_root': str(tmp_path), 'pre_task_commit': 'abc'},
+    # worktree_path=wt short-circuits create_eval_worktree and binds the eval
+    # worktree; the build call is NOT inside a try, so _Sentinel propagates.
+    with pytest.raises(_Sentinel):
+        await runner.run_eval(
+            tmp_path / 'task.json', _impl_cfg(),
+            base_config=_base_config(project_root), worktree_path=wt,
         )
 
-        # The build call is INSIDE `except Exception`, so the recorder's _Sentinel
-        # is swallowed; run_architect_eval returns normally (outcome='blocked').
-        await runner.run_architect_eval(tmp_path / 'task.json', _impl_cfg())
+    # The verify pin follows project_root's 3.13, NOT the pinless worktree.
+    assert captured['verify_env'].get('UV_PYTHON') == '3.13', (
+        "eval verify UV_PYTHON must pin from project_root's current checkout "
+        f"(3.13), got {captured['verify_env'].get('UV_PYTHON')!r}"
+    )
 
-        assert captured['worktree'] == wt
+
+# ---------------------------------------------------------------------------
+# task 2875 amendment — the SAME project_root-sourced verify pin must hold for
+# the OTHER both-live executor, run_end_to_end, not run_eval alone (reviewer
+# test-coverage finding). run_end_to_end has NO worktree_path param — it always
+# create_eval_worktree()s a fresh worktree at the fixture's old pre_task_commit —
+# so this capturing test fakes that boundary and asserts the pin still follows
+# project_root's CURRENT checkout. (run_architect_eval calls build_eval_orch_
+# config identically but INSIDE a try/finally, so a _Sentinel short-circuit is
+# swallowed there; its build path stays covered by the build-level
+# TestBuildEvalOrchConfigVerifyPythonPin, which asserts the pin sources from
+# task['project_root'].)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_end_to_end_verify_pin_follows_project_root_not_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from orchestrator.evals import runner
+
+    # project_root's CURRENT checkout pins 3.13; the eval worktree
+    # create_eval_worktree returns (checked out at an old pre_task_commit) carries
+    # NO .python-version — the fixture divergence this task guards against.
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    (project_root / '.python-version').write_text('3.13\n')
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+
+    real_build = runner.build_eval_orch_config
+    captured: dict = {}
+
+    def _capture_build(config, task, base_config=None, **kwargs):
+        cfg = real_build(config, task, base_config, **kwargs)
+        captured['verify_env'] = dict(cfg.verify_env)
+        raise _Sentinel
+
+    async def fake_create_wt(*_a, **_k):
+        # run_end_to_end has no worktree_path param — it ALWAYS creates a fresh
+        # worktree; return the pinless one without any real git work.
+        return wt, 'run-e2e'
+
+    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'build_eval_orch_config', _capture_build)
+    monkeypatch.setattr(
+        runner, 'load_task',
+        lambda _p: {
+            'id': 't', 'project_root': str(project_root),
+            'pre_task_commit': 'basecommit',
+        },
+    )
+
+    # build_eval_orch_config is called OUTSIDE run_end_to_end's try block, so
+    # _Sentinel propagates cleanly (mirrors the run_eval capturing test above).
+    with pytest.raises(_Sentinel):
+        await runner.run_end_to_end(
+            tmp_path / 'task.json', _arch_cfg(), _impl_cfg(),
+            base_config=_base_config(project_root),
+        )
+
+    # The verify pin follows project_root's 3.13, NOT the pinless worktree.
+    assert captured['verify_env'].get('UV_PYTHON') == '3.13', (
+        "eval end-to-end verify UV_PYTHON must pin from project_root's current "
+        f"checkout (3.13), got {captured['verify_env'].get('UV_PYTHON')!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
