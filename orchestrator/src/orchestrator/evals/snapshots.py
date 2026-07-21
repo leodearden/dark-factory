@@ -39,17 +39,24 @@ def read_python_pin(root: Path) -> str | None:
     return lines[0].strip() or None
 
 
-def _eval_setup_env(worktree: Path) -> dict[str, str]:
+def _eval_setup_env(pin_source: Path) -> dict[str, str]:
     """Build the env for the eval worktree's ``setup_commands`` (``uv sync``).
 
     Scrubs the orchestrator's venv activation vars via
     ``verify._target_subprocess_env`` — so ``uv sync`` can't corrupt the live
     orchestrator ``.venv`` (the 2026-05-29 ghost-venv incident) — and pins the
-    interpreter to the worktree's own ``.python-version`` (via ``UV_PYTHON``)
-    when present, so setup and verify operate on the SAME worktree venv. When
-    no pin is found, injects no ``UV_PYTHON`` (fail-safe), matching BUG 2a.
+    interpreter to ``pin_source``'s ``.python-version`` (via ``UV_PYTHON``) when
+    present. ``pin_source`` is the target ``project_root``'s current checkout (a
+    3.13-bearing tree), threaded by ``create_eval_worktree`` — NOT the eval
+    worktree checked out at the fixture's ``pre_task_commit``, which for older
+    fixtures predates ``.python-version`` and would resolve no pin → uv default
+    3.14t → aiosqlite ModuleNotFoundError (task 2875). Sourcing from
+    ``project_root`` mirrors production dispatch, so setup and verify agree on
+    the project's supported interpreter regardless of how old the fixture
+    baseline is. When no pin is found, injects no ``UV_PYTHON`` (fail-safe),
+    matching BUG 2a.
     """
-    pin = read_python_pin(worktree)
+    pin = read_python_pin(pin_source)
     return _target_subprocess_env({'UV_PYTHON': pin} if pin else None)
 
 
@@ -107,10 +114,13 @@ async def create_eval_worktree(
     logger.info(f'Created eval worktree: {worktree_path} at {pre_task_commit[:10]}')
 
     # Run setup commands to create isolated env. The env is scrubbed of the
-    # orchestrator venv and pinned to the worktree's own interpreter (BUG 2b)
-    # so `uv sync` targets <worktree>/.venv, never the live orchestrator .venv.
+    # orchestrator venv (so `uv sync` targets <worktree>/.venv, never the live
+    # orchestrator .venv) and the interpreter is pinned from project_root's
+    # CURRENT checkout — a 3.13-bearing tree — NOT the eval worktree checked out
+    # at an old pre_task_commit that may predate .python-version (task 2875), so
+    # setup and verify agree on the project's supported interpreter.
     if setup_commands:
-        setup_env = _eval_setup_env(worktree_path)
+        setup_env = _eval_setup_env(project_root)
         for cmd_str in setup_commands:
             logger.info(f'Eval worktree setup: {cmd_str}')
             proc = await asyncio.create_subprocess_shell(
