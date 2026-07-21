@@ -327,8 +327,10 @@ class TestB4GeneralCapDominatesEveryScope:
         # The account cap dominates for EVERY scope (S4) -- A is skipped for
         # both the fable scope and general selection.
         fable_lease = await gate.before_invoke(scope=SCOPE)
+        assert fable_lease is not None
         assert fable_lease.name == 'b'
         general_lease = await gate.before_invoke()
+        assert general_lease is not None
         assert general_lease.name == 'b'
 
 
@@ -395,6 +397,7 @@ class TestB6KillSwitchByteEquivalence:
         # With no scope caps possible, scope=fable selection behaves as
         # general.
         lease = await gate.before_invoke(scope=SCOPE)
+        assert lease is not None
         assert lease.name == 'a'
 
     async def test_b6_fable_model_through_loop_is_byte_equivalent_to_general(self):
