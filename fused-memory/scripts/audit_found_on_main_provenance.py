@@ -82,6 +82,16 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # never yields a citation match for id '3399', nor vice versa. The paren/hash
 # forms need no `\b` guard: the literal parens (and optional `#`) are
 # self-delimiting, so `(#2870)` can never yield a truncated '287'.
+# Accepted false-positive tradeoff: unlike `(#N)`/`(task N)`, bare `(N)`
+# matches ANY parenthesized integer (a step ref, a year, a count), not just
+# genuine citations — so an incidental one can flip a correctly-attributed
+# found_on_main task to `misattributed` (see
+# TestClassifyMisattributed.test_bare_paren_incidental_number_is_an_accepted_false_positive
+# in the test module). Accepted because the misattribution check only fires
+# when the audited task_id is absent from the cited set, `--apply` never
+# reopens a task, and the net effect is fewer missed true-positive citations
+# — this offline audit trades a bounded false-positive rate (surfaced for
+# human review, not auto-corrected) for fewer missed misattributions.
 CITATION_PATTERN = re.compile(
     r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
