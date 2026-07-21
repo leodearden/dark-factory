@@ -192,6 +192,32 @@ async def test_stop_claimant_heartbeat_is_idempotent_noop_when_never_started(tmp
     await wf._stop_claimant_heartbeat()  # must not raise
 
 
+@pytest.mark.asyncio
+async def test_claimant_heartbeat_loop_exits_cleanly_on_nonnumeric_interval(tmp_path: Path):
+    """A non-numeric (MagicMock) interval makes the loop exit cleanly, not crash.
+
+    This is the fully-mocked-config case (task 2780 sub-mode a1): a MagicMock
+    ``claimant_heartbeat_interval_secs`` reaches ``asyncio.sleep(<MagicMock>)``,
+    whose ``if delay <= 0`` evaluates ``MagicMock() <= 0`` — and ``MagicMock``'s
+    comparison dunders (``__le__``) default to ``NotImplemented``, so Python
+    raises ``TypeError: '<=' not supported between instances of MagicMock and
+    int``. RED before the step-4 guard: that TypeError propagates out of the
+    loop, out of ``wait_for``, and fails this test. GREEN after the guard: the
+    loop reads the interval once, sees it is not a positive real number, logs a
+    WARNING, and returns without ever entering the sleep loop or refreshing the
+    claimant.
+    """
+    wf = _make_workflow(project_root=tmp_path)
+    wf.config.claimant_heartbeat_interval_secs = MagicMock()  # non-numeric interval
+
+    # Must return cleanly (no TypeError, no hang) — bounded so a regression that
+    # re-enters the sleep loop fails fast on timeout rather than hanging.
+    await asyncio.wait_for(wf._claimant_heartbeat_loop(), timeout=1.0)
+
+    # The guard returns before the first refresh, so the claimant is never touched.
+    wf.scheduler.set_task_claimant.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # leaked-heartbeat-loop reaper (task 2780)
 #
