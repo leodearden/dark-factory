@@ -382,20 +382,43 @@ async def classify_merge_failure_disposition(
     merge_base_sha: str,
     main_sha: str,
     preexisting: bool,
+    real_main_head_sha: str | None = None,
     task_id: str | None = None,
     repo_root: Path | None = None,
     event_store: EventStore | None = None,
 ) -> tuple[MergeFailureDisposition, SkewEvidence | None]:
     """Classify a merge-verify failure's disposition (git-only, read-only, fail-open).
 
+    Invariants (continued from the module docstring):
+      I6 — orphan/ancestor discriminator (task 2869, reify esc-5260-8):
+           implicated landings are filtered to ancestors of the CURRENT real
+           main HEAD (*real_main_head_sha*), so orphaned speculative-train
+           commits — the frozen dispatch-time *main_sha* may be a coalesced
+           merge-queue TRAIN TIP that never fast-forwarded onto real main, and
+           walking ``merge_base_sha..main_sha`` then cites its dangling
+           commits — are never cited. Filtering is purely subtractive and
+           fail-open: an emptied implicated set falls through the existing
+           ``if not implicated_commits: return BRANCH_BUG`` branch (no new
+           disposition), while ``real_main_head_sha=None`` (unresolved real
+           main) or an unresolvable/sentinel ref keeps today's pre-2869
+           reference frame (see ``_implicated_landings``). *main_sha* stays the
+           frozen dispatch-time input (2357 untouched); *real_main_head_sha* is
+           a distinct, additional input used only for the ancestor filter.
+
     Args:
         verify_result: the failing VerifyResult from the branch's merge-time verify.
         branch: the task branch name (informational; not used for git plumbing).
         merge_base_sha: merge-base(branch, main) at dispatch time (2357 constraint:
             authoritative caller-supplied input, never re-derived here).
-        main_sha: main's tip SHA at dispatch time (same constraint as above).
+        main_sha: main's tip SHA at dispatch time (same constraint as above) —
+            may be a SPECULATIVE/coalesced merge-queue train tip (item.base_sha).
         preexisting: caller-computed result of
             ``verify_failure_is_preexisting_on_main`` (I1: never re-probed here).
+        real_main_head_sha: the CURRENT real published main HEAD (I6). When
+            supplied AND != main_sha, implicated landings are filtered to
+            ancestors of it (orphaned speculative commits pruned). None (the
+            caller could not resolve real main) skips the filter -> today's
+            pre-2869 reference frame (fail-open, additive default).
         task_id: scheduler task id, used to key the I5 event-store green lookup.
             None degrades I5 to indeterminate (fail-open).
         repo_root: git repository root for read-only ``git log`` plumbing. None
@@ -431,9 +454,12 @@ async def classify_merge_failure_disposition(
         # Map candidate files to landings on main between the branch's merge-base
         # and main's tip (I2 read-only git log; 2357: both SHAs are the
         # authoritative dispatch-time inputs, consumed as-given, never
-        # re-derived here).
+        # re-derived here). I6 (task 2869): implicated landings are filtered to
+        # ancestors of the CURRENT real main HEAD, so an orphaned speculative
+        # main_sha train tip never cites its dangling commits.
         implicated_commits, overlap_files = await _implicated_landings(
             repo_root, merge_base_sha, main_sha, candidate_files,
+            real_main_head_sha=real_main_head_sha,
         )
 
         # Searched, and nothing on main touching a failing file is implicated
