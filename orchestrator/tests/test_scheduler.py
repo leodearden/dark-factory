@@ -4432,6 +4432,14 @@ class TestBlastRadiusRefinement:
         match needed and no spurious lock_released event fires."""
         lt = scheduler.lock_table
         assert lt.try_acquire('T', ['a/lib.rs'])
+        # A pure widen now traverses the persist path (metadata.files is written
+        # on EVERY successful refinement — task 2868). Mock get_task/update_task
+        # so this test stays hermetic (no network I/O); its lock/event assertions
+        # below are unchanged.
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': 'T', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
         ok = await scheduler.handle_blast_radius_expansion(
             'T',
             current=['a/lib.rs'],
@@ -4564,27 +4572,50 @@ class TestBlastRadiusRefinement:
         }, f'Sibling keys must survive; files narrowed to needed; got {persisted}'
 
     @pytest.mark.asyncio
-    async def test_pure_expansion_does_not_persist(self, scheduler: Scheduler):
-        """Pure widening (needed ⊃ current) must NOT call update_task.
+    async def test_pure_expansion_persists_metadata_files(self, scheduler: Scheduler):
+        """Pure widening (needed ⊃ current) MUST persist metadata.files.
 
-        Widening self-heals on restart: the scheduler re-reads the smaller
-        metadata.files, re-acquires, then re-expands. Gating the persist on
-        stale being non-empty avoids unnecessary MCP round-trips on the
-        widening path and leaves test_pure_expansion_keeps_current green.
+        A pure widen advances the lock table, plan.files, and _module_cache to
+        the widened set; if it did NOT also persist metadata.files, plan.files
+        would become a durable strict-superset of metadata.files. On restart the
+        scheduler re-derives self.modules from the under-declared metadata.files
+        and re-dispatches under-locked (task 2868). Persisting on every
+        successful refinement — not just when stale locks are released — closes
+        that window. Sibling keys (memory_hints, _causation_id) must survive.
         """
         lt = scheduler.lock_table
         assert lt.try_acquire('T', ['a/lib.rs'])
-        update_task = AsyncMock()
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                'id': 'T',
+                'metadata': {
+                    'memory_hints': {'entities': ['E1']},
+                    '_causation_id': 'C1',
+                },
+            }
+        )
+        update_task = AsyncMock(return_value=True)
         scheduler.update_task = update_task  # type: ignore[method-assign]
 
         ok = await scheduler.handle_blast_radius_expansion(
             'T',
             current=['a/lib.rs'],
-            needed=['a/lib.rs', 'a/other.rs'],
+            needed=['a/lib.rs', 'a/other.rs'],  # pure widen: additional=[other], stale=[]
         )
 
         assert ok is True
-        update_task.assert_not_awaited()
+        assert update_task.await_args is not None, (
+            'a pure widen must persist metadata.files so plan.files does not '
+            'become a durable strict-superset of metadata.files'
+        )
+        persisted = update_task.await_args.args[1]
+        # Compare files as a set to avoid ordering assumptions.
+        assert set(persisted['files']) == {'a/lib.rs', 'a/other.rs'}, (
+            f'widened metadata.files must hold the full needed set; got {persisted}'
+        )
+        # Sibling keys attached by Stage-2 reconciliation survive the write.
+        assert persisted['memory_hints'] == {'entities': ['E1']}
+        assert persisted['_causation_id'] == 'C1'
 
     @pytest.mark.asyncio
     async def test_narrowing_emits_set_to_plan_event(self, scheduler: Scheduler):
@@ -4672,10 +4703,22 @@ class TestBlastRadiusRefinement:
         )
 
     @pytest.mark.asyncio
-    async def test_pure_expansion_does_not_emit_set_to_plan(self, scheduler: Scheduler):
-        """Pure widening must NOT emit a set_to_plan event (no stale release)."""
+    async def test_pure_expansion_emits_set_to_plan(self, scheduler: Scheduler):
+        """Pure widening MUST emit exactly one set_to_plan event.
+
+        set_to_plan is the DURABLE-persist signal (payload carries
+        persisted=bool(updated), consumed by the reify ζ gate). Because a pure
+        widen now persists metadata.files (task 2868), it must also emit the
+        durability signal — persisting without emitting would starve the gate of
+        widen-persist telemetry. A pure widen releases nothing, so
+        released=[] and acquired=additional.
+        """
         lt = scheduler.lock_table
         assert lt.try_acquire('T', ['a/lib.rs'])
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': 'T', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
         ok = await scheduler.handle_blast_radius_expansion(
             'T',
@@ -4690,9 +4733,17 @@ class TestBlastRadiusRefinement:
             e for e in event_store.events  # type: ignore[attr-defined]
             if e[0] == 'set_to_plan'
         ]
-        assert set_to_plan_events == [], (
-            f'Widening must not emit set_to_plan; got {set_to_plan_events}'
+        assert len(set_to_plan_events) == 1, (
+            f'a pure widen must emit exactly one set_to_plan; got {set_to_plan_events}'
         )
+        ev = set_to_plan_events[0]
+        assert ev[1]['task_id'] == 'T'
+        assert ev[1]['data'] == {
+            'files': ['a/lib.rs', 'a/other.rs'],
+            'released': [],
+            'acquired': ['a/other.rs'],
+            'persisted': True,
+        }, f'set_to_plan event payload mismatch; got {ev[1]["data"]}'
 
     @pytest.mark.asyncio
     async def test_blast_radius_persists_file_level_not_coarsened(
