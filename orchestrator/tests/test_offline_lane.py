@@ -811,6 +811,57 @@ async def test_run_once_wires_red_and_green_paths_by_returncode(tmp_path: Path):
     worker_b._handle_red_run.assert_awaited_once_with(wt_path, 'HEAD2')
 
 
+@pytest.mark.asyncio
+async def test_run_once_gates_legacy_numeric_sub_run(tmp_path: Path):
+    """_run_once fires the legacy numeric sub-run only when the gate is on (D2).
+
+    With offline_lane_legacy_numeric_enabled=False (and no generic commands),
+    the numeric suite_runner is never awaited and _last_green_head advances
+    vacuously (the disabled leg is treated as green). With the default True
+    gate, the numeric suite_runner IS awaited once (byte-identical prior
+    behaviour).
+
+    Step 9 (RED): the numeric sub-run is currently unconditional — suite_runner
+    is awaited even when the gate is False. Must fail before impl.
+    """
+    wt_path = tmp_path / '_offline-deep'
+
+    # -- gate OFF: numeric suite_runner is NOT awaited; head advances green ----
+    git_ops_off = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    suite_runner_off = AsyncMock(return_value=(0, ''))
+    config_off = _make_config(
+        tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[],
+    )
+    worker_off = _make_worker(
+        tmp_path, git_ops=git_ops_off, config=config_off, suite_runner=suite_runner_off,
+    )
+    worker_off._handle_red_run = AsyncMock()
+    worker_off._dirty = True
+
+    await worker_off._run_once()
+
+    suite_runner_off.assert_not_awaited()
+    worker_off._handle_red_run.assert_not_awaited()
+    assert worker_off._last_green_head == 'HEAD1', (
+        'a disabled legacy-numeric leg is vacuously green, so _last_green_head advances'
+    )
+
+    # -- gate ON (default True): numeric suite_runner IS awaited once ---------
+    git_ops_on = _make_git_ops(head='HEAD2', worktree_path=wt_path)
+    suite_runner_on = AsyncMock(return_value=(0, ''))
+    config_on = _make_config(tmp_path)  # default: legacy numeric enabled
+    worker_on = _make_worker(
+        tmp_path, git_ops=git_ops_on, config=config_on, suite_runner=suite_runner_on,
+    )
+    worker_on._handle_red_run = AsyncMock()
+    worker_on._dirty = True
+
+    await worker_on._run_once()
+
+    suite_runner_on.assert_awaited_once()
+    assert worker_on._last_green_head == 'HEAD2'
+
+
 # ---------------------------------------------------------------------------
 # _handle_red_run — new-fingerprint fix-task spawn (β3, task 1954, step-11/12)
 # ---------------------------------------------------------------------------
