@@ -226,9 +226,33 @@ for p, r in implementers:
             )
             sys.exit(1)
 
+# --- BUG 2 acceptance: verify must have ACTUALLY succeeded under the venv -----
+# A per-venv 3.13 + importable aiosqlite is necessary but not sufficient. Require
+# >=1 implementer cell with outcome=='done' AND metrics.tests_pass is True, so a
+# hollow pass — a 3.13 venv whose verify never went green — cannot SMOKE PASS.
+# This directly encodes the task acceptance and catches ANY future verify
+# breakage, not just an aiosqlite regression (task 2876).
+verified = [
+    (p, r)
+    for p, r in implementers
+    if r.get("outcome") == "done"
+    and (r.get("metrics") or {}).get("tests_pass") is True
+]
+if not verified:
+    print(
+        f"SMOKE FAIL [BUG 2]: none of {len(implementers)} implementer result(s) "
+        "reached outcome='done' with metrics.tests_pass=True — eval verify never "
+        "actually succeeded under the worktree 3.13 venv (a hollow pass). The "
+        "task acceptance requires at least one implementer cell with "
+        "outcome=done AND tests_pass=true.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 print(
     f"SMOKE PASS: {len(architects)} architect result(s) with plan_steps>0 & "
     f"done (BUG 1 fixed); {len(implementers)} implementer worktree venv(s) on "
-    "Python 3.13.* (BUG 2 fixed)."
+    f"Python 3.13.* with aiosqlite importable, and {len(verified)} verified "
+    "implementer cell(s) (outcome=done & tests_pass=true) (BUG 2 fixed)."
 )
 PYEOF
