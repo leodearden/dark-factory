@@ -5787,8 +5787,37 @@ class TaskWorkflow:
             # replan (the common case) reconciles to an identical file set
             # and is a harmless no-op.
             replan_files = self.plan.get('files') or []
-            if replan_files:
-                await self._set_task_scope(replan_files)
+            if replan_files and not await self._set_task_scope(replan_files):
+                # Genuine cross-module lock conflict (a sibling task holds an
+                # additional lock the widened plan needs): _set_task_scope
+                # already persisted metadata.files=replan_files and requeued
+                # the task on the scheduler's own conflict branch, but
+                # self.modules is left UNCHANGED — so the loop must NOT
+                # proceed into another EXECUTE under a foreign lock. Mirrors
+                # _plan()'s blast-radius conflict path (workflow.py:3987-4011).
+                additional = sorted(
+                    set(derive_modules(
+                        replan_files, self.config.lock_depth, task_id=self.task_id,
+                    ))
+                    - set(self.modules)
+                )
+                block_detail = (
+                    f'Replan expansion blocked: additional locks {additional} '
+                    f'unavailable (held by other tasks). '
+                    f'Held modules: {sorted(self.modules)}; '
+                    f'replan files: {replan_files}.'
+                )
+                self._terminal_report = TerminalReport(
+                    outcome=WorkflowOutcome.REQUEUED,
+                    reason='plan_blast_radius_lock_conflict',
+                    phase=self.machine.state, detail=block_detail,
+                    category=None,
+                    # No BLOCKED transition on this path — blocked_from_phase
+                    # mirrors the current (working) REVIEW phase, preserving
+                    # the harness's retry-cap block_phase semantics.
+                    blocked_from_phase=self.machine.state,
+                )
+                return WorkflowOutcome.REQUEUED
             self.metrics.review_cycles += 1
 
     async def _execute_iterations(self) -> WorkflowOutcome:
