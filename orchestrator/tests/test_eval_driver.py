@@ -219,6 +219,72 @@ async def test_run_eval_verify_pin_follows_project_root_not_worktree(
 
 
 # ---------------------------------------------------------------------------
+# task 2875 amendment — the SAME project_root-sourced verify pin must hold for
+# the OTHER both-live executor, run_end_to_end, not run_eval alone (reviewer
+# test-coverage finding). run_end_to_end has NO worktree_path param — it always
+# create_eval_worktree()s a fresh worktree at the fixture's old pre_task_commit —
+# so this capturing test fakes that boundary and asserts the pin still follows
+# project_root's CURRENT checkout. (run_architect_eval calls build_eval_orch_
+# config identically but INSIDE a try/finally, so a _Sentinel short-circuit is
+# swallowed there; its build path stays covered by the build-level
+# TestBuildEvalOrchConfigVerifyPythonPin, which asserts the pin sources from
+# task['project_root'].)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_end_to_end_verify_pin_follows_project_root_not_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from orchestrator.evals import runner
+
+    # project_root's CURRENT checkout pins 3.13; the eval worktree
+    # create_eval_worktree returns (checked out at an old pre_task_commit) carries
+    # NO .python-version — the fixture divergence this task guards against.
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    (project_root / '.python-version').write_text('3.13\n')
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+
+    real_build = runner.build_eval_orch_config
+    captured: dict = {}
+
+    def _capture_build(config, task, base_config=None, **kwargs):
+        cfg = real_build(config, task, base_config, **kwargs)
+        captured['verify_env'] = dict(cfg.verify_env)
+        raise _Sentinel
+
+    async def fake_create_wt(*_a, **_k):
+        # run_end_to_end has no worktree_path param — it ALWAYS creates a fresh
+        # worktree; return the pinless one without any real git work.
+        return wt, 'run-e2e'
+
+    monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
+    monkeypatch.setattr(runner, 'build_eval_orch_config', _capture_build)
+    monkeypatch.setattr(
+        runner, 'load_task',
+        lambda _p: {
+            'id': 't', 'project_root': str(project_root),
+            'pre_task_commit': 'basecommit',
+        },
+    )
+
+    # build_eval_orch_config is called OUTSIDE run_end_to_end's try block, so
+    # _Sentinel propagates cleanly (mirrors the run_eval capturing test above).
+    with pytest.raises(_Sentinel):
+        await runner.run_end_to_end(
+            tmp_path / 'task.json', _arch_cfg(), _impl_cfg(),
+            base_config=_base_config(project_root),
+        )
+
+    # The verify pin follows project_root's 3.13, NOT the pinless worktree.
+    assert captured['verify_env'].get('UV_PYTHON') == '3.13', (
+        "eval end-to-end verify UV_PYTHON must pin from project_root's current "
+        f"checkout (3.13), got {captured['verify_env'].get('UV_PYTHON')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-01/02 — build_eval_orch_config gains an optional judge_config param.
 #
 # Default None keeps the current sonnet/medium/claude judge pin byte-identical
