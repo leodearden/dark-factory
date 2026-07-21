@@ -267,6 +267,30 @@ def test_decide_adjudication_in_between_band_is_marginal():
     assert mod.decide(s) == 'marginal'
 
 
+def test_decide_agreement_floor_gated_when_challenger_wins_ground_truth_f1():
+    # esc-2540-17 / option d (Leo-ratified, 2026-07-21): the haiku-vs-sonnet
+    # agreement floor must NOT hard-fail the trial when the challenger (haiku)
+    # BEATS the incumbent on the PRIMARY quality signal — ground-truth mean F1.
+    # A low agreement Jaccard there reflects the incumbent (sonnet) being the
+    # weaker model, not the challenger being unreliable — the opposite of the
+    # divergence the floor was designed to catch. These are the actual recent-30
+    # live-run numbers (haiku F1 0.370 > sonnet 0.267; Jaccard 0.368 < AGREEMENT_FAIL).
+    s = _summary(haiku_f1=0.370, sonnet_f1=0.267, jaccard=0.368, worse=0.273, n=30)
+    assert mod.decide(s) != 'fail'
+    # Jaccard is still below AGREEMENT_FLOOR (0.70), so it cannot PASS either →
+    # marginal (escalate to a human), never an auto-flip on low agreement alone.
+    assert mod.decide(s) == 'marginal'
+
+
+def test_decide_agreement_floor_still_fails_when_challenger_not_better_on_f1():
+    # The gate is CONDITIONAL, not a blanket removal: when the challenger is NOT
+    # better than the incumbent on ground-truth F1 (here haiku slightly worse,
+    # gap 0.05 within F1_FAIL_GAP so the F1 trigger itself does not fire), a
+    # sub-floor agreement Jaccard STILL hard-fails.
+    s = _summary(haiku_f1=0.55, sonnet_f1=0.60, jaccard=0.40, worse=0.2, n=25)
+    assert mod.decide(s) == 'fail'
+
+
 # ── render_report: markdown leaderboard + machine-readable summary ───────────
 
 def _trial_result(decision='pass'):
