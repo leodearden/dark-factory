@@ -711,6 +711,64 @@ class TestTaskKnowledgeSyncPayload:
         assert 'project_id="reify"' in payload
 
 
+class TestTaskKnowledgeSyncDoneAuditSection:
+    """assemble_payload renders a since-boundary Done-Task Completion-Memory Audit (step-5).
+
+    The audit enumerates every done task updated at/after the watermark's
+    ``last_full_run_completed`` boundary (not a fixed 5-item sample), so
+    completion-memory gaps outside the small Proactive Task Sample are no longer
+    systematically missed as done-task throughput grows.
+    """
+
+    @pytest.fixture
+    def mock_deps(self, tmp_path):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root=str(tmp_path))
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_audit_section_windows_done_tasks_by_boundary(self, mock_deps, tmp_path):
+        """Done tasks at/after the boundary are audited; a pre-boundary done task is excluded."""
+        boundary = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='p', project_root=str(tmp_path)
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                # done AFTER the boundary → audited
+                {'id': 8801, 'status': 'done', 'title': 'After A',
+                 'updatedAt': '2026-07-14T13:00:00+00:00'},
+                # done AFTER the boundary, trailing-Z timestamp → audited
+                {'id': 8802, 'status': 'done', 'title': 'After B',
+                 'updatedAt': '2026-07-14T18:00:00.500Z'},
+                # done BEFORE the boundary → excluded from the audit section
+                {'id': 8803, 'status': 'done', 'title': 'Before C',
+                 'updatedAt': '2026-07-10T09:00:00+00:00'},
+                # active task → never part of the done-task audit
+                {'id': 8900, 'status': 'pending', 'title': 'WIP'},
+            ],
+        }
+
+        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        payload = await stage.assemble_payload([], wm, [])
+
+        assert '### Done-Task Completion-Memory Audit' in payload, (
+            'the since-boundary done-task completion-memory audit header must be rendered'
+        )
+        section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
+        assert '[8801]' in section, 'a done task updated after the boundary must be audited'
+        assert '[8802]' in section, 'a trailing-Z after-boundary done task must be audited'
+        assert '[8803]' not in section, (
+            'a done task updated before the boundary must be excluded from the audit section'
+        )
+        assert '[8900]' not in section, 'an active task must never appear in the done-task audit'
+
+
 class TestTaskKnowledgeSyncKnownProjectsSection:
     """Stage 2 surfaces a "Known Projects" section so the LLM can re-route findings."""
 
