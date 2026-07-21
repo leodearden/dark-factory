@@ -2630,7 +2630,7 @@ class TestUnionTrainScopeAlphaStrip:
         wf.plan = {'files': []}  # empty tip scope: isolate the member fold
         # Passthrough stub: assert on the derived module KEYS fed into
         # _resolve_module_configs, not on ModuleConfig/for_module plumbing.
-        wf._resolve_module_configs = lambda modules=None: modules
+        wf._resolve_module_configs = lambda modules=None: modules  # type: ignore[method-assign,return-value]
 
         members = [
             {'metadata': {'files': [
@@ -2661,7 +2661,7 @@ class TestUnionTrainScopeAlphaStrip:
         same module set as before the migration (no dirs to strip)."""
         wf = _make_workflow(tmp_path=tmp_path)
         wf.plan = {'files': []}
-        wf._resolve_module_configs = lambda modules=None: modules
+        wf._resolve_module_configs = lambda modules=None: modules  # type: ignore[method-assign,return-value]
 
         members = [
             {'metadata': {'files': ['crates/reify-compiler/src/foo.rs']}},
