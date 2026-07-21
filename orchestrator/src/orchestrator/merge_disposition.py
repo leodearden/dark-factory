@@ -243,6 +243,14 @@ async def _implicated_landings(
     When *real_main_head_sha* is ``None`` or ``== main_sha``, every cited
     commit is kept — byte-identical to the pre-2869 reference frame.
 
+    This discriminates by commit SHA and so assumes a genuine landing keeps its
+    SHA on real main (the lane CAS-advances main to the exact rebased-onto-main
+    train tip via ``git_ops.advance_main``); a landing that re-lands under a NEW
+    SHA (a CAS-retry re-rebase), or a real-main read lagging a just-landed
+    commit, is conservatively pruned to BRANCH_BUG and never re-cited — the
+    opposite failure mode from the false-INTEGRATION_SKEW this filter targets.
+    See the SHA-identity note at the filter site below for the full rationale.
+
     Returns ``(implicated_commits, overlap_files)`` — empty tuples when
     *candidate_files* is empty, on any git error (non-zero exit, missing/
     non-git *repo_root*), or on any exception (fail-safe: never raises).
@@ -285,6 +293,33 @@ async def _implicated_landings(
         # that are DEFINITIVELY not ancestors of the real main HEAD. Applied
         # only when a distinct real main HEAD is supplied; a None/definitively-
         # negative gate never falsely prunes (fail-open, see docstring).
+        #
+        # SHA-identity assumption (reviewer_comprehensive robustness note, task
+        # 2869): this discriminates by COMMIT SHA, so it relies on a genuinely-
+        # landed change keeping the SAME SHA on real main that it carried on the
+        # speculative base walked above. The merge lane upholds this on the
+        # common path — a speculative train is built by rebasing its members
+        # onto CURRENT real main, and ``git_ops.advance_main`` CAS-advances
+        # refs/heads/main to that exact pre-computed tip SHA, so member SHAs are
+        # preserved verbatim. The lane's OWN landed-detection uses the identical
+        # test (``reconcile_landed_row`` -> ``git_ops.is_ancestor(
+        # row.advanced_sha, main_sha)``), so this filter matches the lane's
+        # definition of "landed" rather than inventing a new one.
+        #
+        # When the assumption does NOT hold, the fallback is conservative, not
+        # the bug this fix targets. If a CAS retry re-rebases a landing to a NEW
+        # advanced_sha (real main moved under the train), or ``get_main_sha()``
+        # resolves a real-main HEAD lagging a just-landed commit not yet
+        # reachable, that genuine landing's speculative SHA is correctly not an
+        # ancestor of the resolved real main and is pruned — so classify() falls
+        # through to BRANCH_BUG. That is the OPPOSITE failure mode from the
+        # original bug: it never fabricates a phantom "port landed commit X"
+        # citation for a commit that is not on real main; at worst it under-cites
+        # a genuine skew and degrades to the same "nothing implicated -> hunt
+        # your own diff" the module already emits, self-healing on the next
+        # classification once the advance/read catches up. A rebased-under-a-new-
+        # SHA landing is therefore INTENTIONALLY treated as BRANCH_BUG rather
+        # than risk re-citing a dangling SHA.
         if real_main_head_sha and real_main_head_sha != main_sha:
             surviving: list[tuple[str, set[str]]] = []
             for sha, files in groups:
