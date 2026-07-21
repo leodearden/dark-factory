@@ -76,7 +76,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
-from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.routing import (
     PlanShape,
     RoleDefaults,
@@ -1869,7 +1869,9 @@ class TaskWorkflow:
                     seen_files.add(f)
                     union_files.append(f)
             if member_files:
-                for m in files_to_modules(member_files, self.config.lock_depth):
+                for m in derive_modules(
+                    member_files, self.config.lock_depth, task_id=self.task_id,
+                ):
                     if m not in seen_modules:
                         seen_modules.add(m)
                         union_modules.append(m)
