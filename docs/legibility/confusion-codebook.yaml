@@ -28,7 +28,14 @@ entries:
   filed_tasks: 2547, 2548
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: fc4b7c2d-2770-40ac-9332-025ab0315ecb
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: 'Tool envelope mismatch: recon Stage 2 agent handed claim-verification contract and implicitly attempts grep_search tool (turns 11, 13, 15), but tool is unavailable in harness'
+    note: 'Recon agent spawned for ''verify whether Mem0 GC sweep fix exists or has a bug'' (Stage 2 finding) attempted grep_search three times across separate turns, all failing with ''No such tool available''. Agent should have access to Bash grep or Explore agent type, not a nonexistent grep_search tool. Pattern: verification contract omits tool availability discovery, agent discovers by failure only.'
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -222,7 +229,13 @@ entries:
   filed_tasks: 2556, 2551, 2547, 2408
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 4bd2552d-980a-4db9-bff0-9ddd40a0b82c
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Agent operating in `.eval-worktrees/df_task_18/run-725f06cb` inherits undocumented invariants about worktree state layout. Session startup protocol documents checking `.task/plan.json` OR `.task-meta/<worktree-name>/plan.json` fallback (per W11 relocation), but error at turn 13 shows first path was attempted without clear fallback guidance. Pytest configuration also missing (turn 149), suggesting incomplete worktree initialization.
 - id: investigator-context-and-budget
   title: 'Block-time investigators and retried planners launch cold and die silent: no feed-forward of prior analysis, no partial-output protocol, wrong default diff'
   severity: high
@@ -243,7 +256,13 @@ entries:
   filed_tasks: 2557, 2550
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 4bd2552d-980a-4db9-bff0-9ddd40a0b82c
+    origin_phase: implement
+    manifested_phase: implement
+    note: Agent launched with 'No memory context available' despite fused-memory being operational. Session proceeded cold without prior analysis feed-forward, contradicting the documented investigator-context protocol. Multiple retries and errors followed (tool_error=3, not_found=4) suggesting lost context recovery paths.
 - id: recon-prompt-schema-drift
   title: Recon stage prompts show pseudocode diverging from real MCP schemas; fused-memory identifier naming is inconsistent across sibling tools
   severity: medium
@@ -495,3 +514,68 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: Journal Entries (0 total) [] despite 99 LLM calls across 3 stages (memory_consolidator:36, task_knowledge_sync:32, integrity_check:31), 16 MCP write_journal ops, and confirmed_inconsistency=1
+- id: cand-20260720-1
+  title: Eval-worktree working directory assumptions break relative path navigation
+  cause: Eval worktrees spawned in nested .eval-worktrees/<task>/<run> directory; agent code issues `cd fused-memory` as if in project root or assuming different structure; cwd is nested but not the nesting expected by path commands
+  area: eval infrastructure / agent session setup
+  first_seen: '2026-07-20'
+  disposition: pending
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: b8bffdfb-2002-42ef-80ed-57667991f1e7
+    origin_phase: architect
+    manifested_phase: implement
+    evidence_quote: 'turn 42: Bash command ''cd fused-memory'' exits with ''No such file or directory'' from cwd .eval-worktrees/df_task_18/run-d7553270; file exists at .eval-worktrees/df_task_18/run-d7553270/fused-memory/src/fused_memory/reconciliation/judge.py (turn 51) indicating path is available but cd syntax failed'
+- id: cand-20260720-2
+  title: Pydantic v2 field introspection API removed; test templates reference v1 only
+  cause: Test or debug code introspects Pydantic model fields via [f.name for f in model.model_fields.values()]; v2 removed FieldInfo.name attribute (moved to dict key); test template assumes v1 API
+  area: dependencies / test harness contract
+  first_seen: '2026-07-20'
+  disposition: pending
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: b8bffdfb-2002-42ef-80ed-57667991f1e7
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'turn 51: AttributeError: ''FieldInfo'' object has no attribute ''name'' when introspecting ReconciliationRun.model_fields in test debug code'
+- id: cand-20260720-3
+  title: TDD test-implementation method signature divergence on Judge._parse_verdict
+  cause: Test calls _parse_verdict(json_string) with single arg; implementation signature requires run_id as first positional param; neither matches TDD step specification, indicating spec→test and spec→impl both diverged independently
+  area: test harness / implementation sync
+  first_seen: '2026-07-20'
+  disposition: pending
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: b8bffdfb-2002-42ef-80ed-57667991f1e7
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'turn 56: test_judge_parse_verdict_json calls judge._parse_verdict with 1 arg (json string); implementation raises TypeError: missing 1 required positional argument: ''run_id'''
+- id: cand-20260720-4
+  title: eval-worktree bootstrap path confusion
+  cause: Session startup protocol documents two possible plan.json locations for eval-worktrees (`.task/plan.json` vs `.task-meta/<worktree-name>/plan.json` per W11 relocation), but only as a code comment buried in protocol, not in error messages or structured fallback logic. Agent wastes tool calls learning via trial-and-error; documented fallback is not automatic or clearly signaled.
+  area: session lifecycle
+  first_seen: '2026-07-20'
+  disposition: pending
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 4bd2552d-980a-4db9-bff0-9ddd40a0b82c
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: 'Turn 13: ''Read(.task/plan.json) -> File does not exist.'' Digest notes: ''If absent, check the sibling `.task-meta/<worktree-name>/plan.json` — the worktree-lane-lifecycle W11 relocation moves plan/iteration state outside the worktree for pooled lanes'' — this note is in the digest''s Session Startup Protocol section but was not surfaced to the agent as an actionable error recovery path.'
+- id: cand-20260720-5
+  title: pytest configuration missing in eval-worktree bootstrap
+  cause: Eval-worktrees inherit an incomplete pytest setup from the seed/template. Turn 149 shows agent checking for pytest config (pythonpath, testpaths, tool.pytest.ini_options) returned zero matches. Agent could not run TDD loop for reconciliation module despite plan requiring per-step tests. Likely symptom of W11 lane provisioning not seeding pytest config.
+  area: test harness
+  first_seen: '2026-07-20'
+  disposition: pending
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 4bd2552d-980a-4db9-bff0-9ddd40a0b82c
+    origin_phase: architect
+    manifested_phase: implement
+    evidence_quote: 'Turn 149 Bash stderr: ''echo "=== pytest config in worktree pyproject ==="; grep -n "pythonpath\|testpaths\|\[tool.pytest...'' returned only column headers, no pytest configuration found. Agent cannot execute TDD plan.'
