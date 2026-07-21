@@ -834,6 +834,12 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
                     sha=sha,
                     note=f'coalesce-derail re-drive: branch already on main (train {train_id})',
                 )
+                # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow on
+                # this found_on_main done-write, mirroring mark_member_done above.
+                # Idempotent for non-tip members, fail-safe when unbound; runs only
+                # after a SUCCESSFUL mark_done. NOT added to the else (not-on-main →
+                # pending re-drive) branch — that member is not done.
+                MergeProvenance.consume(mid)
                 # B3 (T6/T8): release warm lane after the done flip.
                 # Idempotent/never-raise via the shared primitive.
                 if git_ops is not None:
