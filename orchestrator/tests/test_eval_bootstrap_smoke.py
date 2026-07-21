@@ -222,3 +222,52 @@ def test_subproject_venv_wrong_python_fails(tmp_path):
     assert proc.returncode != 0, f'expected FAIL:\n{combined}'
     assert 'BUG 2' in combined
     assert '3.13' in combined
+
+
+# ---------------------------------------------------------------------------
+# task 2875 amendment — a worktree can legitimately carry MORE THAN ONE
+# subproject venv (e.g. a fixture whose setup builds both fused-memory/.venv and
+# orchestrator/.venv). The BUG-2 gate must version-check EVERY subproject venv,
+# not just the alphabetically-first, or a wrong interpreter in a non-first
+# subproject would pass undetected (reviewer robustness finding).
+# ---------------------------------------------------------------------------
+
+def test_multiple_subproject_venvs_all_checked(tmp_path):
+    # (g) Two subproject venvs: the alphabetically-FIRST ('aaa') is a good 3.13,
+    # the later one ('zzz') is a bad 3.12. A single-pick gate would inspect only
+    # 'aaa' and PASS; checking every venv must catch 'zzz' → FAIL naming BUG 2 and
+    # the expected 3.13.
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5', subdir='aaa')
+    _venv_python_stub(wt, 'Python 3.12.9', subdir='zzz')
+    # No top-level <wt>/.venv → the subproject-glob arm resolves BOTH venvs.
+    assert not (wt / '.venv').exists()
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(results, 'df_task_12__opus-high__r2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke(results)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'BUG 2' in combined
+    assert '3.13' in combined
+
+
+def test_multiple_subproject_venvs_all_313_pass(tmp_path):
+    # (h) Two subproject venvs, BOTH 3.13 → checking every one must still PASS
+    # (multi-venv coverage does not spuriously fail a clean worktree).
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5', subdir='fused-memory')
+    _venv_python_stub(wt, 'Python 3.13.5', subdir='orchestrator')
+    assert not (wt / '.venv').exists()
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(results, 'df_task_12__opus-high__r2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke(results)
+    assert proc.returncode == 0, (
+        f'expected PASS, got rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\n'
+        f'STDERR:\n{proc.stderr}'
+    )

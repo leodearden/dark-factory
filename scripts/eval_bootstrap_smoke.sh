@@ -103,22 +103,23 @@ def is_architect(r):
     return cfg.startswith("architect-") or role == "architect"
 
 
-def resolve_venv_python(wt):
-    """Return the interpreter uv actually created for this worktree, or None.
+def resolve_venv_pythons(wt):
+    """Return EVERY interpreter uv created for this worktree (possibly several).
 
-    Checks the direct <wt>/.venv/bin/python first (the top-level-venv layout);
-    else the one-level subproject match <wt>/*/.venv/bin/python — where uv lands
-    the venv when a fixture's setup does `cd <subproject> && uv sync` with
-    UV_PROJECT_ENVIRONMENT scrubbed (verify._target_subprocess_env), e.g.
-    df_task_12 → <wt>/orchestrator/.venv. Direct-first keeps the top-level-venv
+    Checks the direct <wt>/.venv/bin/python first (the top-level-venv layout —
+    a single venv); else EVERY one-level subproject match <wt>/*/.venv/bin/python
+    — where uv lands the venv when a fixture's setup does `cd <subproject> &&
+    uv sync` with UV_PROJECT_ENVIRONMENT scrubbed (verify._target_subprocess_env),
+    e.g. df_task_12 → <wt>/orchestrator/.venv. A worktree whose setup builds more
+    than one subproject venv (e.g. both fused-memory/.venv and orchestrator/.venv)
+    yields more than one path, and the BUG-2 gate version-checks EVERY one (not
+    just the alphabetically-first) so a wrong interpreter in ANY subproject is
+    caught. Returns [] when none exist. Direct-first keeps the top-level-venv
     smoke path unchanged (task 2875)."""
     direct = Path(wt) / ".venv" / "bin" / "python"
     if direct.exists():
-        return str(direct)
-    subproject = sorted(Path(wt).glob("*/.venv/bin/python"))
-    if subproject:
-        return str(subproject[0])
-    return None
+        return [str(direct)]
+    return [str(p) for p in sorted(Path(wt).glob("*/.venv/bin/python"))]
 
 
 architects = [(p, r) for p, r in results if is_architect(r)]
@@ -158,8 +159,8 @@ for p, r in implementers:
             file=sys.stderr,
         )
         sys.exit(1)
-    venv_py = resolve_venv_python(wt)
-    if venv_py is None:
+    venv_pys = resolve_venv_pythons(wt)
+    if not venv_pys:
         print(
             f"SMOKE FAIL [BUG 2]: no worktree venv found for {p} at "
             f"{wt}/.venv/bin/python or {wt}/*/.venv/bin/python. The eval "
@@ -168,27 +169,30 @@ for p, r in implementers:
             file=sys.stderr,
         )
         sys.exit(1)
-    try:
-        out = subprocess.run(
-            [venv_py, "--version"], capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        print(
-            f"SMOKE FAIL [BUG 2]: could not run {venv_py} --version: {e}. The "
-            "eval implementer worktree venv is missing — verify did not run "
-            "under a pinned 3.13 .venv.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    pyver = (out.stdout + out.stderr).strip()
-    if not pyver.startswith("Python 3.13."):
-        print(
-            f"SMOKE FAIL [BUG 2]: {venv_py} is '{pyver}', expected Python 3.13.* "
-            "— eval verify was NOT pinned to the worktree's own 3.13 .venv "
-            "(verify_env UV_PYTHON / scrubbed setup env).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # Version-check EVERY resolved venv (a worktree may build more than one
+    # subproject venv); a wrong interpreter in ANY of them fails the gate.
+    for venv_py in venv_pys:
+        try:
+            out = subprocess.run(
+                [venv_py, "--version"], capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            print(
+                f"SMOKE FAIL [BUG 2]: could not run {venv_py} --version: {e}. The "
+                "eval implementer worktree venv is missing — verify did not run "
+                "under a pinned 3.13 .venv.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        pyver = (out.stdout + out.stderr).strip()
+        if not pyver.startswith("Python 3.13."):
+            print(
+                f"SMOKE FAIL [BUG 2]: {venv_py} is '{pyver}', expected Python "
+                "3.13.* — eval verify was NOT pinned to the worktree's own 3.13 "
+                ".venv (verify_env UV_PYTHON / scrubbed setup env).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 print(
     f"SMOKE PASS: {len(architects)} architect result(s) with plan_steps>0 & "
