@@ -6131,6 +6131,82 @@ class TestBornAtL2GatesMergeEntry:
         assert len(pending) == 1
 
 
+class TestFormatReescalationDetail:
+    """Unit test of ``_format_reescalation_detail`` (task 2553).
+
+    Pins the rendered detail text built from the ``Escalation`` objects an
+    ``_StewardReescalated`` exception carries, so ``_mark_blocked``'s
+    ``detail=`` stops duplicating ``reason`` when the steward re-escalates
+    to a human (workflow.py:2444's ``except _StewardReescalated`` clause).
+    """
+
+    def test_single_escalation_contains_all_fields(self):
+        from escalation.models import Escalation
+
+        from orchestrator.workflow import _format_reescalation_detail
+
+        e = Escalation(
+            id='esc-x-1',
+            task_id='42',
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='Stop-the-line: critical risk',
+            detail='Born at L2 — cannot be auto-resolved by steward',
+            level=2,
+            workflow_state='verify',
+            resolution_turns=3,
+        )
+
+        result = _format_reescalation_detail([e])
+
+        assert 'esc-x-1' in result
+        assert 'Born at L2 — cannot be auto-resolved by steward' in result
+        assert 'Stop-the-line: critical risk' in result
+        assert 'verify' in result
+        assert '3' in result
+        # Detail must not be a bare copy of the summary.
+        assert result != 'Stop-the-line: critical risk'
+
+    def test_multi_escalation_renders_both(self):
+        from escalation.models import Escalation
+
+        from orchestrator.workflow import _format_reescalation_detail
+
+        e1 = Escalation(
+            id='esc-x-1',
+            task_id='42',
+            agent_role='implementer',
+            severity='critical',
+            category='risk_identified',
+            summary='First escalation summary',
+            detail='First escalation detail text',
+            level=2,
+        )
+        e2 = Escalation(
+            id='esc-x-2',
+            task_id='42',
+            agent_role='debugger',
+            severity='urgent',
+            category='infra_issue',
+            summary='Second escalation summary',
+            detail='Second escalation detail text',
+            level=1,
+        )
+
+        result = _format_reescalation_detail([e1, e2])
+
+        assert 'esc-x-1' in result
+        assert 'First escalation detail text' in result
+        assert 'esc-x-2' in result
+        assert 'Second escalation detail text' in result
+
+    def test_empty_list_returns_empty_string(self):
+        from orchestrator.workflow import _format_reescalation_detail
+
+        assert _format_reescalation_detail([]) == ''
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestBornAtL2HaltsRunViaWaitForResolution:
@@ -6210,6 +6286,78 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
             task_assignment.task_id, status='pending', level=2,
         )
         assert len(still_pending) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.mocks_dry_run_unblock
+class TestReescalationDetailPropagatedToBlockReport:
+    """task 2553: the ``except _StewardReescalated`` clause in ``run()``
+    (workflow.py:2444) must thread the carried escalation payload into
+    ``_mark_blocked``'s ``detail=`` instead of discarding it.
+
+    Mirrors ``TestBornAtL2HaltsRunViaWaitForResolution`` but asserts on the
+    returned ``TerminalReport.detail``/``.reason`` rather than only
+    ``.outcome``. RED today: the except clause has no ``as reesc`` binding
+    and calls ``_mark_blocked('Steward re-escalated to human',
+    skip_escalation=True)`` with no ``detail=``, so ``_mark_blocked``'s
+    ``detail = detail or reason`` fallback makes ``report.detail`` an exact
+    copy of ``report.reason`` — neither the escalation's detail text nor its
+    id appear anywhere in the report.
+    """
+
+    async def test_detail_contains_escalation_payload(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        from escalation.models import Escalation
+
+        stub = AgentStub()
+        workflow, _, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+
+        esc_id = queue.make_id(task_assignment.task_id)
+        call_count = 0
+
+        async def _escalate_and_return_escalated():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate a post-implementer/post-debugger gate firing:
+                # the inner loop submitted a critical/level-2 escalation and
+                # returned ESCALATED — which bubbles up to run().
+                queue.submit(Escalation(
+                    id=esc_id,
+                    task_id=task_assignment.task_id,
+                    agent_role='implementer',
+                    severity='critical',
+                    category='risk_identified',
+                    summary='Stop-the-line: critical risk needing human review',
+                    detail='Born at L2 — cannot be auto-resolved by steward',
+                    level=2,
+                ))
+            return WorkflowOutcome.ESCALATED
+
+        workflow._execute_verify_review_loop = _escalate_and_return_escalated  # type: ignore[method-assign]
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        # The escalation's own detail text and id must be recoverable from
+        # the block report — not just a copy of the generic reason.
+        assert 'Born at L2 — cannot be auto-resolved by steward' in report.detail
+        assert esc_id in report.detail
+        # reason stays the stable generic summary; detail must differ from it.
+        assert report.reason == 'Steward re-escalated to human'
+        assert report.detail != report.reason
 
 
 @pytest.mark.asyncio
