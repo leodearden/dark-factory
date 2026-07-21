@@ -236,6 +236,64 @@ def test_git_config_offline_lane_commands_settable():
     )
 
 
+class TestOfflineLaneCommandsReload:
+    """git.offline_lane_commands + git.offline_lane_legacy_numeric_enabled are
+    green-tier (D6): hot-reloadable, landing in applied_candidates not
+    restart_required. Mirrors test_config_verify_admission_reload.py.
+
+    Step 3 (RED): the dotted paths are not yet in RELOADABLE_FIELDS, so the
+    leaf lands in restart_required — must fail before impl.
+    """
+
+    @pytest.mark.parametrize(
+        'field',
+        ['git.offline_lane_commands', 'git.offline_lane_legacy_numeric_enabled'],
+    )
+    def test_field_is_reloadable(self, field):
+        from orchestrator.config import RELOADABLE_FIELDS
+
+        assert field in RELOADABLE_FIELDS, (
+            f'{field!r} is expected to be green-tier reloadable but is '
+            f'missing from RELOADABLE_FIELDS'
+        )
+
+    def test_commands_edit_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+        from orchestrator.config import LaneCommand, diff_config
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
+        fresh = OrchestratorConfig(
+            git=GitConfig(
+                offline_lane_commands=[
+                    LaneCommand(name='q', command='pytest -m integration'),
+                ],
+            ),
+        )
+        diff = diff_config(live, fresh)
+        assert 'git.offline_lane_commands' in diff.applied_candidates
+        assert 'git.offline_lane_commands' not in diff.restart_required
+
+    def test_apply_reload_applies_commands_in_place(self, monkeypatch, tmp_path):
+        from orchestrator.config import LaneCommand, apply_reload
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
+        fresh = OrchestratorConfig(
+            git=GitConfig(
+                offline_lane_commands=[
+                    LaneCommand(name='q', command='pytest -m integration'),
+                ],
+            ),
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert 'git.offline_lane_commands' not in report['restart_required']
+        assert len(live.git.offline_lane_commands) == 1
+        assert live.git.offline_lane_commands[0].name == 'q'
+
+
 # ---------------------------------------------------------------------------
 # on_post_merge — enqueue-and-return trigger seam (step-3/4)
 # ---------------------------------------------------------------------------
