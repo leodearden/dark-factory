@@ -120,14 +120,20 @@ def _arch_result(plan_steps: int = 8, outcome: str = 'done') -> dict:
     }
 
 
-def _impl_result(worktree_path: str) -> dict:
+def _impl_result(
+    worktree_path: str,
+    outcome: str = 'done',
+    tests_pass: bool | None = True,
+    run_id: str = 'r2',
+    config_name: str = 'opus-high',
+) -> dict:
     return {
         'task_id': 'df_task_12',
-        'config_name': 'opus-high',
-        'outcome': 'done',
-        'metrics': {'composite_score': 1.0},
+        'config_name': config_name,
+        'outcome': outcome,
+        'metrics': {'composite_score': 1.0, 'tests_pass': tests_pass},
         'worktree_path': worktree_path,
-        'run_id': 'r2',
+        'run_id': run_id,
         'trial': 2,
     }
 
@@ -321,3 +327,82 @@ def test_bug2_aiosqlite_missing_fails(tmp_path):
     assert proc.returncode != 0, f'expected FAIL:\n{combined}'
     assert 'BUG 2' in combined
     assert 'aiosqlite' in combined
+
+
+# ---------------------------------------------------------------------------
+# task 2876 DEFECT 4 (cont.) — the second BUG-2 hardening arm: after the
+# implementer loop, require >=1 implementer cell with outcome=='done' AND
+# metrics.tests_pass is True. This directly encodes the task acceptance so ANY
+# future verify breakage (not just aiosqlite) is caught, instead of a hollow
+# SMOKE PASS on a 3.13 venv whose verify never actually succeeded.
+# ---------------------------------------------------------------------------
+
+def test_implementer_no_tests_pass_fails(tmp_path):
+    # (j) The ONLY implementer cell reached outcome='done' but its verify did
+    # NOT pass (metrics.tests_pass=False) — a hollow pass. Venv is 3.13 + has
+    # aiosqlite, so BUG-2 per-venv checks are clean; the smoke must still FAIL on
+    # the "no verified implementer cell" acceptance.
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5')
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(
+        results, 'df_task_12__opus-high__r2.json',
+        _impl_result(str(wt), tests_pass=False),
+    )
+
+    proc = _run_smoke(results)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'SMOKE FAIL' in combined
+    assert 'tests_pass' in combined
+
+
+def test_implementer_cancelled_outcome_fails(tmp_path):
+    # (k) Same acceptance from the outcome axis: the only implementer cell was
+    # cancelled (never reached done) though tests_pass is nominally True → still
+    # no verified cell → FAIL.
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5')
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(
+        results, 'df_task_12__opus-high__r2.json',
+        _impl_result(str(wt), outcome='cancelled'),
+    )
+
+    proc = _run_smoke(results)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'SMOKE FAIL' in combined
+
+
+def test_at_least_one_verified_implementer_passes(tmp_path):
+    # (l) Positive companion: a MIXED set — one implementer cell failed verify
+    # (tests_pass=False) but ANOTHER reached done+tests_pass=True. The ">=1
+    # verified cell" acceptance is satisfied → smoke PASSES. Both worktree venvs
+    # are 3.13 + aiosqlite so the BUG-2 per-venv checks stay green.
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt_bad = tmp_path / 'impl-wt-bad'
+    wt_good = tmp_path / 'impl-wt-good'
+    _venv_python_stub(wt_bad, 'Python 3.13.5')
+    _venv_python_stub(wt_good, 'Python 3.13.5')
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(
+        results, 'df_task_12__opus-high__r2.json',
+        _impl_result(str(wt_bad), tests_pass=False),
+    )
+    _write_result(
+        results, 'df_task_12__sonnet-high__r3.json',
+        _impl_result(str(wt_good), outcome='done', tests_pass=True,
+                     run_id='r3', config_name='sonnet-high'),
+    )
+
+    proc = _run_smoke(results)
+    assert proc.returncode == 0, (
+        f'expected PASS, got rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\n'
+        f'STDERR:\n{proc.stderr}'
+    )
