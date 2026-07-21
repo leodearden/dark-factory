@@ -168,23 +168,86 @@ def _extract_failing_tests_and_candidate_files(
 _FULL_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 
 
+async def _is_commit_ancestor_of(
+    repo_root: Path,
+    commit: str,
+    ancestor_ref: str,
+) -> bool | None:
+    """Read-only, fail-safe ``git merge-base --is-ancestor <commit> <ancestor_ref>``.
+
+    Returns:
+        ``True``  — rc 0: *commit* is an ancestor of *ancestor_ref* (both
+                    objects resolved).
+        ``False`` — rc 1 ONLY: *commit* is DEFINITIVELY not an ancestor of
+                    *ancestor_ref* (both objects resolved, no ancestry).
+        ``None``  — any other rc (e.g. 128 = an object could not be resolved,
+                    such as an unresolvable/sentinel *ancestor_ref*), or any
+                    exception. Fail-open: an uncertain result is never read as
+                    a definitive negative, so it can never cause false pruning;
+                    never raises.
+
+    I2 (read-only): issues only ``git merge-base --is-ancestor`` — no worktree
+    add/mutation. I3 (fail-open): degrades to None on any uncertainty.
+    """
+    try:
+        rc, _stdout, _stderr = await _run(
+            ['git', 'merge-base', '--is-ancestor', commit, ancestor_ref],
+            cwd=repo_root,
+        )
+    except Exception:
+        logger.warning(
+            '_is_commit_ancestor_of: git merge-base --is-ancestor raised for '
+            'repo_root=%s (commit=%s, ancestor_ref=%s); degrading to None '
+            '(fail-safe)',
+            repo_root, commit, ancestor_ref,
+            exc_info=True,
+        )
+        return None
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
 async def _implicated_landings(
     repo_root: Path,
     merge_base_sha: str,
     main_sha: str,
     candidate_files: Iterable[str],
+    real_main_head_sha: str | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Read-only ``git log --name-only`` over ``merge_base_sha..main_sha``,
     restricted to *candidate_files*, to find landings on main that touched a
     file implicated by the branch's failing tests.
 
-    I2 (read-only): issues only ``git log`` — no worktree add/mutation, no
-    verify run. 2357: ``merge_base_sha``/``main_sha`` are consumed exactly as
-    given (authoritative dispatch-time inputs) and never re-derived here.
+    I2 (read-only): issues only ``git log`` / ``git merge-base --is-ancestor``
+    — no worktree add/mutation, no verify run. 2357: ``merge_base_sha``/
+    ``main_sha`` are consumed exactly as given (authoritative dispatch-time
+    inputs) and never re-derived here.
+
+    Orphan/ancestor discriminator (task 2869, reify esc-5260-8): *main_sha* is
+    the frozen dispatch-time base (``item.base_sha``), which may be a
+    SPECULATIVE/coalesced merge-queue train tip that never fast-forwarded onto
+    real main. Walking ``merge_base_sha..main_sha`` then cites the ORPHANED
+    speculative-train commits — none of which are ancestors of the real
+    published main HEAD. When *real_main_head_sha* is supplied AND differs from
+    *main_sha*, each cited commit is filtered to ancestors of real main HEAD:
+    an orphaned speculative commit is DEFINITIVELY not an ancestor and is
+    pruned, while a genuine landing (still reachable from real main even after
+    main advances) survives. Pruning happens ONLY on a definitive
+    not-an-ancestor (``_is_commit_ancestor_of`` returns ``False``, i.e.
+    ``git merge-base --is-ancestor`` rc 1); a ``True`` or ``None`` (an
+    unresolvable/sentinel ref or a transient git error) KEEPS the commit
+    (fail-open: never falsely prune, never suppress a genuine INTEGRATION_SKEW).
+    When *real_main_head_sha* is ``None`` or ``== main_sha``, every cited
+    commit is kept — byte-identical to the pre-2869 reference frame.
 
     Returns ``(implicated_commits, overlap_files)`` — empty tuples when
     *candidate_files* is empty, on any git error (non-zero exit, missing/
     non-git *repo_root*), or on any exception (fail-safe: never raises).
+    ``overlap_files`` is rebuilt from the SURVIVING commits only, so the
+    evidence stays honest after any pruning.
     """
     candidate_files = tuple(candidate_files)
     if not candidate_files:
@@ -202,18 +265,45 @@ async def _implicated_landings(
             return (), ()
 
         candidate_set = set(candidate_files)
-        implicated_commits: list[str] = []
-        overlap_files: set[str] = set()
+        # Parse the git-log output into ORDERED per-commit groups: each %H SHA
+        # line opens a new group; subsequent candidate-file lines accumulate
+        # into that group's touched-files set.
+        groups: list[tuple[str, set[str]]] = []
+        current: tuple[str, set[str]] | None = None
         for raw_line in stdout.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             if _FULL_SHA_RE.fullmatch(line):
-                if line not in implicated_commits:
-                    implicated_commits.append(line)
+                current = (line, set())
+                groups.append(current)
                 continue
-            if line in candidate_set:
-                overlap_files.add(line)
+            if line in candidate_set and current is not None:
+                current[1].add(line)
+
+        # Ancestor filter (task 2869): prune orphaned speculative-train commits
+        # that are DEFINITIVELY not ancestors of the real main HEAD. Applied
+        # only when a distinct real main HEAD is supplied; a None/definitively-
+        # negative gate never falsely prunes (fail-open, see docstring).
+        if real_main_head_sha and real_main_head_sha != main_sha:
+            surviving: list[tuple[str, set[str]]] = []
+            for sha, files in groups:
+                is_ancestor = await _is_commit_ancestor_of(
+                    repo_root, sha, real_main_head_sha,
+                )
+                if is_ancestor is False:
+                    continue  # definitively not on real main -> orphan, prune
+                surviving.append((sha, files))
+            groups = surviving
+
+        # Rebuild implicated_commits (ordered, deduped) and overlap_files
+        # (sorted union) from the surviving groups only.
+        implicated_commits: list[str] = []
+        overlap_files: set[str] = set()
+        for sha, files in groups:
+            if sha not in implicated_commits:
+                implicated_commits.append(sha)
+            overlap_files.update(files)
 
         return tuple(implicated_commits), tuple(sorted(overlap_files))
     except Exception:
