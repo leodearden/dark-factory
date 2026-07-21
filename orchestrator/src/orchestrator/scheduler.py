@@ -6786,32 +6786,42 @@ class Scheduler:
                         task_id=task_id,
                         data={'modules': released, 'reason': 'plan_refinement'},
                     )
-                # Persist the narrowed set so it survives a restart.  Without
-                # this, the scheduler re-reads the over-declared metadata.files
-                # on startup and re-acquires the released modules, re-introducing
-                # the over-claim (δ bug).  Best-effort: in-memory narrowing already
-                # applied via release_subset; return True even on update failure.
-                # Shares the same read-modify-write logic as the requeue branch
-                # (see _persist_files_metadata below).
-                updated = await self._persist_files_metadata(task_id, files_to_persist)
-                # Emit set_to_plan to signal the DURABLE persist (lock_released
-                # above signals the in-memory release; this signals durability).
-                # persisted=False lets the reify ζ gate distinguish a failed
-                # write from a successful one without a separate metadata read.
-                # The event payload carries `needed` (lock-level) — not the
-                # file-level persist set — to preserve the reify ζ-gate contract
-                # and existing event tests (set_to_plan.files == needed).
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.set_to_plan,
-                        task_id=task_id,
-                        data={
-                            'files': needed,
-                            'released': released,
-                            'acquired': additional,
-                            'persisted': bool(updated),
-                        },
-                    )
+            # Persist metadata.files on EVERY successful refinement (widen,
+            # narrow, or shift) — hoisted OUT of `if stale:` so a pure widen
+            # persists too (task 2868).  A pure widen advances the lock table
+            # (try_acquire_additional above), plan.files (caller side), and
+            # _module_cache (below) to the widened set; without this persist it
+            # would leave metadata.files a durable strict-subset, and on restart
+            # the scheduler would re-derive self.modules from the under-declared
+            # metadata.files and re-dispatch under-locked.  Persisting here — not
+            # just when stale locks are released — closes that window so a pure
+            # widen cannot leave metadata.files under-declared.  Mirrors commit
+            # 4e6e501cc5's _write_module_cache hoist (below).  Best-effort:
+            # in-memory refinement already applied; return True even on update
+            # failure.  Shares the same read-modify-write logic as the requeue
+            # branch (see _persist_files_metadata below).
+            updated = await self._persist_files_metadata(task_id, files_to_persist)
+            # Emit set_to_plan to signal the DURABLE persist (lock_released
+            # above signals the in-memory release; this signals durability).
+            # persisted=False lets the reify ζ gate distinguish a failed
+            # write from a successful one without a separate metadata read.
+            # Hoisted alongside the persist so a pure widen (released=[],
+            # acquired=additional) emits the durability signal too — persisting
+            # without emitting would starve the ζ gate of widen-persist telemetry.
+            # The event payload carries `needed` (lock-level) — not the
+            # file-level persist set — to preserve the reify ζ-gate contract
+            # and existing event tests (set_to_plan.files == needed).
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.set_to_plan,
+                    task_id=task_id,
+                    data={
+                        'files': needed,
+                        'released': released,
+                        'acquired': additional,
+                        'persisted': bool(updated),
+                    },
+                )
             # Keep _module_cache in sync with the lock table on every
             # successful refinement (widen, narrow, or shift) — not just the
             # acquire-FAILURE branch below.  Without this, a successful
