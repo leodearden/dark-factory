@@ -869,6 +869,49 @@ async def test_handle_red_run_new_fingerprint_files_fix_task_and_info_escalation
 
 
 @pytest.mark.asyncio
+async def test_handle_red_run_threads_priority_into_filed_task(tmp_path: Path):
+    """_handle_red_run threads its priority kwarg through to the filed fix task.
+
+    A generic per-project command red path files at ``LaneCommand.fix_task_priority``
+    (here 'medium'); the legacy bare call keeps the byte-identical 'high' default.
+
+    Step 7 (RED): _handle_red_run has no priority kwarg — must fail with
+    TypeError before impl.
+    """
+    # -- explicit priority='medium' threads into arguments['priority'] --------
+    confirmation_runner = AsyncMock(return_value=['tests::test_x'])
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='T1')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-T1-1'
+    worker = _make_worker(
+        tmp_path, task_client=task_client, escalation_queue=escalation_queue,
+    )
+    wt = Path('/tmp/_offline-deep')
+
+    await worker._handle_red_run(
+        wt, 'HEAD1', confirmation_runner=confirmation_runner, priority='medium',
+    )
+    task_client.submit_fix_task.assert_awaited_once()
+    assert task_client.submit_fix_task.await_args.args[0]['priority'] == 'medium'
+
+    # -- bare call (no priority) defaults to the byte-identical 'high' --------
+    confirmation_runner2 = AsyncMock(return_value=['tests::test_x'])
+    task_client2 = AsyncMock()
+    task_client2.submit_fix_task = AsyncMock(return_value='T2')
+    escalation_queue2 = MagicMock()
+    escalation_queue2.get_by_task.return_value = []
+    escalation_queue2.make_id.return_value = 'esc-T2-1'
+    worker2 = _make_worker(
+        tmp_path, task_client=task_client2, escalation_queue=escalation_queue2,
+    )
+    await worker2._handle_red_run(wt, 'HEAD1', confirmation_runner=confirmation_runner2)
+    task_client2.submit_fix_task.assert_awaited_once()
+    assert task_client2.submit_fix_task.await_args.args[0]['priority'] == 'high'
+
+
+@pytest.mark.asyncio
 async def test_handle_red_run_empty_task_id_does_not_pollute_dedup_or_escalate(
     tmp_path: Path,
 ):
