@@ -53,6 +53,7 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
+from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
     file_unattributed_landing_escalation,
@@ -793,6 +794,14 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
                 )
                 return
             await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
+            # task 2280 (PRD WA-3): consume the tip's write-ahead LandedRow inline
+            # so a train-landed member no longer leaves a stale row surviving to the
+            # next startup for RC-3 to prune. Idempotent (no-op for non-tip members,
+            # which hold no row) and fail-safe when the façade is unbound (tests /
+            # bare worker). Placed AFTER a SUCCESSFUL mark_done — a raised mark_done
+            # skips this so the row survives for the reconciler. Mirrors the 2681
+            # single-branch precedent at workflow.py:1912-1917.
+            MergeProvenance.consume(mid)
             # B3 (T7): release warm lane for the done member after the status flip.
             # Idempotent/never-raise via the shared primitive.
             if git_ops is not None:
