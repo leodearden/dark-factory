@@ -267,6 +267,36 @@ class TestExtractCitedTaskIdsConventions:
         assert extract_cited_task_ids('') == set()
 
 
+class TestExtractCitedTaskIdsParenForms:
+    """Additional paren-citation forms: `(#N)`, bare `(N)`, and `(task N)`."""
+
+    def test_hash_paren_form(self):
+        """A `(#N)` citation anywhere in the message cites the id."""
+        assert extract_cited_task_ids('drop stale entry (#2870)') == {'2870'}
+
+    def test_bare_paren_form(self):
+        """A bare `(N)` citation anywhere in the message cites the id."""
+        assert extract_cited_task_ids('cleanup pass (2870)') == {'2870'}
+
+    def test_task_word_paren_form(self):
+        """A `(task N)` citation anywhere in the message cites the id."""
+        assert extract_cited_task_ids('align with (task 2870)') == {'2870'}
+
+    def test_coexists_and_dedupes_with_conventional_commit_form(self):
+        """The new paren forms coexist with the conventional-commit form and
+        dedupe into a single set."""
+        assert extract_cited_task_ids('impl(2870): body cites (#123)') == {'2870', '123'}
+
+    def test_bare_paren_form_matches_incidental_numbers_not_just_citations(self):
+        """Documents an accepted false-positive tradeoff (see plan.json's
+        "False-positive tradeoff" section for task 2872): unlike `(#N)` and
+        `(task N)`, the bare `(N)` form matches ANY parenthesized integer —
+        a step reference, a year, a count — not just genuine task citations.
+        This is intentional, not a bug: see TestClassifyMisattributed for the
+        classify-level consequence and the rationale for accepting it."""
+        assert extract_cited_task_ids('see step (3) and year (2024)') == {'3', '2024'}
+
+
 class TestExtractCitedTaskIdsWordBoundary:
     r"""`\b` word-boundary guard: no substring overlap between numeric ids."""
 
@@ -343,6 +373,37 @@ class TestClassifyMisattributed:
         assert verdict == 'misattributed'
         assert reasons
         assert any('77' in r for r in reasons)
+
+    def test_hash_paren_citation_of_a_different_task_is_misattributed(self):
+        """A `(#N)` citation of a different task is also caught as misattribution
+        (documents the motivation for widening CITATION_PATTERN to paren forms)."""
+        audit = _audit(task_id='50', is_ancestor=True, commit_message='cleanup pass (#77)')
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert reasons
+        assert any('77' in r for r in reasons)
+
+    def test_bare_paren_incidental_number_is_an_accepted_false_positive(self):
+        """Documents the accepted false-positive tradeoff (plan.json's "False-
+        positive tradeoff" section for task 2872): a found_on_main task
+        correctly attributed via its recorded commit SHA, whose message
+        never cites task 50 by number but happens to contain an unrelated
+        parenthesized number (e.g. a retry-count reference), is flagged
+        misattributed by the bare `(N)` form even though the attribution is
+        actually correct. Accepted because the misattribution guard only
+        fires when the audited task_id is absent from the cited set (a real
+        self-citation still short-circuits it), `--apply` never reopens a
+        task, and the net effect is fewer missed true-positive citations
+        like test_hash_paren_citation_of_a_different_task_is_misattributed
+        above — not because this case is desired.
+        """
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='Add rate limiter with default retry budget (3)',
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert any('3' in r for r in reasons)
 
     def test_mixed_citation_does_not_flag_misattributed(self):
         """A message citing BOTH this task and another task is not misattribution."""
