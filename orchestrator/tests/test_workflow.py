@@ -2613,3 +2613,60 @@ class TestSetupWiresLanePlanSymlink:
                 hb.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await hb
+
+
+class TestUnionTrainScopeAlphaStrip:
+    """_union_train_scope (task 2373) must route train-member module-lock
+    derivation through ``module_charter.derive_modules`` so a directory-
+    shaped entry in a member's ``metadata.files`` is stripped before
+    coarsening — otherwise it would produce a subtree-wide prefix lock
+    (the reify-3468 class ``derive_modules`` exists to prevent).
+    """
+
+    def test_dir_bearing_member_files_do_not_widen_to_subtree_lock(
+        self, tmp_path: Path,
+    ):
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': []}  # empty tip scope: isolate the member fold
+        # Passthrough stub: assert on the derived module KEYS fed into
+        # _resolve_module_configs, not on ModuleConfig/for_module plumbing.
+        wf._resolve_module_configs = lambda modules=None: modules
+
+        members = [
+            {'metadata': {'files': [
+                'crates',                         # depth-1 directory (no ext)
+                'crates/reify-eval/src/lib.rs',   # file sibling under it
+            ]}},
+        ]
+
+        union_files, union_modules = wf._union_train_scope(members)
+
+        # The tip's own lock ('mod_a', from assignment.modules) is preserved,
+        # plus the file sibling's depth-2 module key 'crates/reify-eval'. The
+        # depth-1 directory entry 'crates' PREFIXES that module, so on the
+        # un-migrated base files_to_modules would ALSO fold in a bare 'crates'
+        # subtree-wide prefix lock (blocking every task under crates/).
+        # derive_modules alpha-strips the directory entry before coarsening,
+        # so 'crates' must be absent from the derived key set.
+        assert union_modules == ['mod_a', 'crates/reify-eval']
+        assert 'crates' not in union_modules
+        # union_files (unaffected by the alpha strip — it only gates lock
+        # derivation) still records the raw member files verbatim.
+        assert union_files is not None
+        assert 'crates' in union_files
+        assert 'crates/reify-eval/src/lib.rs' in union_files
+
+    def test_file_level_member_files_behaviour_preserved(self, tmp_path: Path):
+        """Non-regression: an all-file-level metadata.files list derives the
+        same module set as before the migration (no dirs to strip)."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': []}
+        wf._resolve_module_configs = lambda modules=None: modules
+
+        members = [
+            {'metadata': {'files': ['crates/reify-compiler/src/foo.rs']}},
+        ]
+
+        _union_files, union_modules = wf._union_train_scope(members)
+
+        assert union_modules == ['mod_a', 'crates/reify-compiler']
