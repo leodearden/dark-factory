@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 # Cross-workspace-member runtime dep(s) eval verify needs in the worktree venv
 # but the old-baseline orchestrator-only `uv sync` omits. Empirically the ONLY
 # missing dep (installing it alone took df_task_12 pytest collection from 7/7
-# module errors to 57 tests collected). A named tuple keeps the set explicit,
-# documented, and forward-extensible without over-installing today.
+# module errors to 57 tests collected). A module-level tuple constant keeps the
+# set explicit, documented, and forward-extensible without over-installing today.
 EVAL_VERIFY_EXTRA_DEPS: tuple[str, ...] = ('aiosqlite',)
 
 
