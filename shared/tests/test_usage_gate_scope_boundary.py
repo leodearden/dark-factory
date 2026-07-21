@@ -293,3 +293,40 @@ class TestB3AllFableCappedNotFleetFreeze:
             scoped_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await scoped_task
+
+
+# ===========================================================================
+# B4 -- a general (account-level) cap dominates every scope
+# ===========================================================================
+
+
+class TestB4GeneralCapDominatesEveryScope:
+    """B4: a general (scope=None) cap hit driven end-to-end through
+    invoke_with_cap_retry transitions the account to CAPPED via the
+    account-level path, and that CAPPED phase dominates for EVERY scope
+    (S4) -- both a fable-scope selection and a general selection skip it."""
+
+    async def test_b4_general_cap_dominates_every_scope(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', model='sonnet', backend='claude',
+                invoke_fn=scripted_invoke(
+                    cap_result("You've used your usage limit. resets in 30m"),
+                    ok_result(),
+                ),
+                prompt='hi',
+            )
+
+        assert got.account_name == 'b'
+        # Account-level cap via the scope=None path (not a scope overlay).
+        assert a.phase == AccountPhase.CAPPED
+
+        # The account cap dominates for EVERY scope (S4) -- A is skipped for
+        # both the fable scope and general selection.
+        fable_lease = await gate.before_invoke(scope=SCOPE)
+        assert fable_lease.name == 'b'
+        general_lease = await gate.before_invoke()
+        assert general_lease.name == 'b'
