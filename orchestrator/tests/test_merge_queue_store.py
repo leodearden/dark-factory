@@ -29,7 +29,6 @@ from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.merge_queue import GroupMergeRequest, MergeRequest
-from orchestrator.merge_types import QueuedBranch
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
 from orchestrator.merge_queue_store import (
@@ -38,6 +37,7 @@ from orchestrator.merge_queue_store import (
     reconstruct_merge_request,
     recover_pending_merges,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Shared helpers

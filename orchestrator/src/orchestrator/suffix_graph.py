@@ -288,7 +288,6 @@ class SuffixConflictTracker:
         # end of this method.  Do NOT re-initialise this flag in later steps.
         _any_probe_error = False
 
-        branch_prefix = self._git_ops().config.branch_prefix
         for req in suffix:
             ref = None
             head = None
