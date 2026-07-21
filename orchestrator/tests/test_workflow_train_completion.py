@@ -27,8 +27,18 @@ from _orch_helpers import pydantic_spec
 from escalation.models import Escalation  # noqa: F401 — keeps fixture parity
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
 from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """MergeProvenance._outbox is a process-global — never leak a bound outbox."""
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
+
 
 # ---------------------------------------------------------------------------
 # Shared fixture helper (mirrors test_workflow_train_state_escalation._make)
@@ -218,6 +228,50 @@ async def test_tip_fires_group_merge_happy_path():
     assert returned == statuses_dict, (
         f'status_check must return plain dict, got {returned!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_inline_mark_member_done_consumes_landed_row(tmp_path: Path):
+    """The workflow inline _mark_member_done closure consumes the member's
+    write-ahead LandedRow on the successful done-write (task 2280, PRD B1).
+
+    Mirrors test_tip_fires_group_merge_happy_path: build+enqueue the
+    GroupMergeRequest, then drive its mark_member_done('101','sha9') callback with
+    a bound LandedOutbox holding a row for '101'. The closure must consume that
+    row inline, matching the 2681 single-branch and harness (steps 2/4) precedents.
+    RED until step-6 adds MergeProvenance.consume to the inline closure.
+    """
+    members = [
+        {'id': '101', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 0}}},
+        {'id': '102', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 1}}},
+        {'id': '103', 'status': 'merge-deferred', 'metadata': {'train': {'id': 'T1', 'order': 2}}},
+    ]
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': 'T1', 'order': 2}},
+        tasks_by_train_return=members,
+    )
+    f.wf._await_cancellable = AsyncMock(  # type: ignore[method-assign]
+        return_value=MergeOutcome('done', merge_sha='deadbeef'),
+    )
+
+    outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+    outbox.record(LandedRow(
+        task_id='101', branch_tip_sha='tip', advanced_sha='deadbeef', landed_at=1.0,
+    ))
+    MergeProvenance.bind(outbox)
+
+    await f.wf._maybe_enqueue_group_merge()
+    req = f.merge_queue.get_nowait()
+
+    # Row present BEFORE the done-write.
+    assert outbox.lookup('101') is not None
+
+    await req.mark_member_done('101', 'sha9')
+
+    # Member's write-ahead row consumed inline on the successful mark_done
+    # (PRD B1: lookup==None after done).
+    assert outbox.lookup('101') is None
 
 
 # ---------------------------------------------------------------------------
