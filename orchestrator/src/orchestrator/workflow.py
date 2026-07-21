@@ -544,6 +544,7 @@ def build_offline_lane_fix_task_arguments(
     fingerprint: str,
     project_root: str | Path,
     head: str,
+    priority: str = 'high',
 ) -> dict:
     """Build the ``submit_task`` argument block for an offline-lane fix task (β3).
 
@@ -558,6 +559,11 @@ def build_offline_lane_fix_task_arguments(
     own sort) and ``metadata.suspect_ranges`` is seeded as a single-element
     list so the caller can append further ranges as the same fingerprint
     recurs across advances (C3) without restructuring the field.
+
+    *priority* is the filed fix task's priority (task 2789, D3). Defaults to
+    ``'high'`` so the legacy numeric/infra call sites in
+    :meth:`OfflineLaneWorker._file_new_fix_task` stay byte-identical; a
+    generic per-project command supplies its own ``LaneCommand.fix_task_priority``.
     """
     sorted_ids = sorted(failing_test_ids)
     test_list = ', '.join(sorted_ids)
@@ -573,7 +579,7 @@ def build_offline_lane_fix_task_arguments(
         'title': title,
         'description': description,
         'status': 'pending',
-        'priority': 'high',
+        'priority': priority,
         'project_root': str(project_root),
         'metadata': {
             'merge_lane': 'normal',
