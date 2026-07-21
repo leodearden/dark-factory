@@ -741,6 +741,13 @@ class FilteredTaskTree:
         parseable ids.  This field is independent of the done/cancelled/active
         render caps and provides ground truth for detecting partial/wrong-source
         bulk reads.
+    all_done_tasks: The FULL, UNCAPPED list of done task dicts from the input —
+        in contrast to ``done_tasks``, which is capped at MAX_DONE_TASKS_RETAINED=30
+        and sorted by id descending.  Populated by ``filter_task_tree`` at zero
+        extra cost from the same pre-cap ``done`` list.  Consumed by the Stage-2
+        since-boundary completion-memory audit (``select_done_since_boundary``) so
+        that audit's coverage does not silently shrink as done-task throughput
+        grows past the 30-cap.  Defaults to [] and is not rendered directly.
     """
 
     active_tasks: list[dict] = field(default_factory=list)
@@ -756,6 +763,7 @@ class FilteredTaskTree:
     other_count: int = 0
     total_count: int = 0
     max_task_id: int = 0
+    all_done_tasks: list[dict] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -863,6 +871,11 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
         other_count=other_count,
         total_count=total,
         max_task_id=max_task_id,
+        # Uncapped full done list (the pre-cap list built above): the
+        # since-boundary completion-memory audit reads this instead of the
+        # 30-capped done_retained so its coverage does not shrink as throughput
+        # grows.  Costs nothing extra — a list of the same dict references.
+        all_done_tasks=done,
     )
 
 
