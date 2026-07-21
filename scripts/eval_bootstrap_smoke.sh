@@ -193,6 +193,38 @@ for p, r in implementers:
                 file=sys.stderr,
             )
             sys.exit(1)
+        # BUG 2 hardening (task 2876): a 3.13 interpreter is necessary but NOT
+        # sufficient. Eval verify's pytest collection imports orchestrator.config
+        # → shared/__init__ → shared.async_sqlite_base → `import aiosqlite`, and
+        # the eval worktree is checked out at an OLD pre_task_commit whose
+        # orchestrator-only `uv sync` predates the shared[vllm] dep and so omits
+        # aiosqlite. Probe it directly — a version-only gate emits a hollow SMOKE
+        # PASS on a 3.13 venv whose verify actually dies at collection (the
+        # false-negative that let 2875 merge). snapshots.ensure_eval_verify_deps
+        # is what provisions it; this is the loud backstop if that ever regresses.
+        try:
+            imp = subprocess.run(
+                [venv_py, "-c", "import aiosqlite"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            print(
+                f"SMOKE FAIL [BUG 2]: could not probe `import aiosqlite` via "
+                f"{venv_py}: {e}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if imp.returncode != 0:
+            tail = (imp.stdout + imp.stderr).strip()[-300:]
+            print(
+                f"SMOKE FAIL [BUG 2]: {venv_py} cannot `import aiosqlite` "
+                f"(rc={imp.returncode}) — eval verify would die at pytest "
+                "collection (orchestrator.config → shared → import aiosqlite). "
+                "The worktree venv is missing aiosqlite; "
+                f"snapshots.ensure_eval_verify_deps must provision it.\n{tail}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 print(
     f"SMOKE PASS: {len(architects)} architect result(s) with plan_steps>0 & "
