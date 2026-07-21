@@ -48,10 +48,20 @@ def _write_result(results_dir: Path, name: str, payload: dict) -> None:
     (results_dir / name).write_text(json.dumps(payload))
 
 
-def _venv_python_stub(worktree: Path, version_line: str) -> None:
-    """Create ``<worktree>/.venv/bin/python`` as an executable stub that prints
-    *version_line* for any args — standing in for a real worktree interpreter."""
-    bin_dir = worktree / '.venv' / 'bin'
+def _venv_python_stub(
+    worktree: Path, version_line: str, subdir: str | None = None,
+) -> None:
+    """Create ``<worktree>[/<subdir>]/.venv/bin/python`` as an executable stub
+    that prints *version_line* for any args — standing in for a real worktree
+    interpreter.
+
+    With *subdir* set, plants the venv one level down at
+    ``<worktree>/<subdir>/.venv`` — exactly where uv creates it when a fixture's
+    ``setup_commands`` do ``cd <subdir> && uv sync`` with
+    ``UV_PROJECT_ENVIRONMENT`` scrubbed (e.g. df_task_12 →
+    ``<wt>/orchestrator/.venv``), NOT the top-level ``<wt>/.venv``."""
+    base = worktree if subdir is None else worktree / subdir
+    bin_dir = base / '.venv' / 'bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
     stub = bin_dir / 'python'
     stub.write_text(f'#!/usr/bin/env bash\necho "{version_line}"\n')
@@ -162,3 +172,53 @@ def test_no_architect_result_fails(tmp_path):
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, f'expected FAIL:\n{combined}'
     assert 'BUG 1' in combined
+
+
+# ---------------------------------------------------------------------------
+# task 2875 BUG 2 (venv path) — a fixture's setup_commands `cd orchestrator &&
+# uv sync` with UV_PROJECT_ENVIRONMENT scrubbed (verify._target_subprocess_env)
+# create the implementer venv at <wt>/orchestrator/.venv, NOT <wt>/.venv. The
+# smoke gate must resolve the ACTUAL interpreter location (direct <wt>/.venv,
+# else the one-level subproject <wt>/*/.venv) so this live subproject-venv layout
+# — never exercised by the top-level-<wt>/.venv synthetic tests above — is
+# version-checked instead of reported "missing".
+# ---------------------------------------------------------------------------
+
+def test_subproject_venv_313_passes(tmp_path):
+    # (e) GOOD subproject layout: the venv exists ONLY at <wt>/orchestrator/.venv
+    # and is 3.13 → smoke must resolve it and PASS. Currently RED: the script
+    # checks only <wt>/.venv/bin/python, so this venv reads as "missing" and BUG 2
+    # fails before ever reaching SMOKE PASS.
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.13.5', subdir='orchestrator')
+    # Only the subproject venv exists — NO top-level <wt>/.venv.
+    assert not (wt / '.venv').exists()
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(results, 'df_task_12__opus-high__r2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke(results)
+    assert proc.returncode == 0, (
+        f'expected PASS, got rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\n'
+        f'STDERR:\n{proc.stderr}'
+    )
+
+
+def test_subproject_venv_wrong_python_fails(tmp_path):
+    # (f) Same subproject layout, but the interpreter is 3.12 → must FAIL naming
+    # BUG 2 and the expected 3.13 (proving the resolved subproject venv is
+    # actually version-checked, not merely found).
+    results = tmp_path / 'results'
+    results.mkdir()
+    wt = tmp_path / 'impl-wt'
+    _venv_python_stub(wt, 'Python 3.12.9', subdir='orchestrator')
+    assert not (wt / '.venv').exists()
+    _write_result(results, 'df_task_12__architect-x__r1.json', _arch_result())
+    _write_result(results, 'df_task_12__opus-high__r2.json', _impl_result(str(wt)))
+
+    proc = _run_smoke(results)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f'expected FAIL:\n{combined}'
+    assert 'BUG 2' in combined
+    assert '3.13' in combined
