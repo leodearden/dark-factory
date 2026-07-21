@@ -32,20 +32,21 @@ is pure gate-test authoring, expected GREEN on authoring.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import ScopeCap, UsageGate
 
-from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs
-
-# NOTE: this scaffold (prerequisite P2) imports only what the harness below
-# uses today. The B7 step adds the additional imports (resolve_route,
-# DEFAULT_ALLOWED_MODELS, OrchestratorConfig, ModelsConfig, RoutingConfig)
-# its own test needs, keeping every commit ruff-clean rather than
-# pre-importing the whole file's eventual closure.
+from orchestrator.config import ModelsConfig, OrchestratorConfig, RoutingConfig
+from orchestrator.routing import (
+    DEFAULT_ALLOWED_MODELS,
+    PlanShape,
+    RoleDefaults,
+    RouteInputs,
+    resolve_route,
+)
 
 SCOPE = 'claude-fable-5'
 
@@ -143,3 +144,49 @@ def set_scope_cap(
     )
     acct.scope_caps[scope] = sc
     return sc
+
+
+# ===========================================================================
+# B7 -- resolver degrade wired from a REAL gate scope-capacity snapshot
+# ===========================================================================
+
+
+class TestB7ResolverDegradeFromRealGateSnapshot:
+    """B7: a REAL ``UsageGate.scope_capacity_snapshot()`` -- not a hand-built
+    dict, as delta's own unit tests use -- feeds ``resolve_route``'s
+    scope-capacity fail-safe (S7): a fable-pinned metadata_override degrades
+    to the next layer, dispatch still resolves a valid model, and the
+    rejection is recorded namespaced by layer."""
+
+    def test_b7_real_gate_snapshot_degrades_metadata_override(self):
+        gate = make_gate(['a'])
+        a = gate._accounts[0]
+        now = datetime.now(UTC)
+        # Exhaust A's (only account's) fable scope with a future deadline.
+        set_scope_cap(a, resets_at=now + timedelta(hours=1), capped_at=now)
+
+        snap = gate.scope_capacity_snapshot()
+        assert snap == {SCOPE: False}  # the gate reports no fable headroom
+
+        # routing.allowed_models must admit SCOPE for this test to reach the
+        # scope-capacity check (S7) rather than being rejected earlier by
+        # the unrelated allowlist check (invariant 2) -- 'claude-fable-5' is
+        # deliberately NOT in DEFAULT_ALLOWED_MODELS yet (see CLAUDE.md
+        # "Adaptive-routing substrate").
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='opus'),
+            routing=RoutingConfig(allowed_models=[*DEFAULT_ALLOWED_MODELS, SCOPE]),
+        )
+        inputs = _inputs(
+            role_name='implementer',
+            task_metadata={'model_overrides': {'implementer': SCOPE}},
+            role_defaults=_role_defaults(model='sonnet'),
+            scope_capacity=snap,
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model != SCOPE  # degraded away from the exhausted model
+        assert decision.model in DEFAULT_ALLOWED_MODELS  # a valid model resolved
+        assert decision.source_layer == 'config'
+        assert 'metadata_override:model-capacity-exhausted' in decision.rejected
