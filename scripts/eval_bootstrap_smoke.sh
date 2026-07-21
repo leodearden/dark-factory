@@ -84,6 +84,7 @@ fi
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 paths = sys.argv[1:]
 results = []
@@ -100,6 +101,24 @@ def is_architect(r):
     cfg = r.get("config_name", "")
     role = (r.get("metrics") or {}).get("role_under_test")
     return cfg.startswith("architect-") or role == "architect"
+
+
+def resolve_venv_python(wt):
+    """Return the interpreter uv actually created for this worktree, or None.
+
+    Checks the direct <wt>/.venv/bin/python first (the top-level-venv layout);
+    else the one-level subproject match <wt>/*/.venv/bin/python — where uv lands
+    the venv when a fixture's setup does `cd <subproject> && uv sync` with
+    UV_PROJECT_ENVIRONMENT scrubbed (verify._target_subprocess_env), e.g.
+    df_task_12 → <wt>/orchestrator/.venv. Direct-first keeps the top-level-venv
+    smoke path unchanged (task 2875)."""
+    direct = Path(wt) / ".venv" / "bin" / "python"
+    if direct.exists():
+        return str(direct)
+    subproject = sorted(Path(wt).glob("*/.venv/bin/python"))
+    if subproject:
+        return str(subproject[0])
+    return None
 
 
 architects = [(p, r) for p, r in results if is_architect(r)]
@@ -139,7 +158,16 @@ for p, r in implementers:
             file=sys.stderr,
         )
         sys.exit(1)
-    venv_py = f"{wt}/.venv/bin/python"
+    venv_py = resolve_venv_python(wt)
+    if venv_py is None:
+        print(
+            f"SMOKE FAIL [BUG 2]: no worktree venv found for {p} at "
+            f"{wt}/.venv/bin/python or {wt}/*/.venv/bin/python. The eval "
+            "implementer worktree venv is missing — verify did not run under a "
+            "pinned 3.13 .venv.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     try:
         out = subprocess.run(
             [venv_py, "--version"], capture_output=True, text=True, timeout=30,
