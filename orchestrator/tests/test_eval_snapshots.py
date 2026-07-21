@@ -167,3 +167,55 @@ async def test_create_eval_worktree_sources_setup_pin_from_project_root(
     # NOT the eval worktree checked out at `pre` (which predates .python-version).
     assert captured['pin_source'] == project_root
     assert captured['pin_source'] != worktree_path
+
+
+# ---------------------------------------------------------------------------
+# task 2876 DEFECT 3 — resolve_worktree_venv_pythons mirrors the smoke gate's
+# resolve_venv_pythons (scripts/eval_bootstrap_smoke.sh): direct <wt>/.venv, else
+# the one-level subproject glob <wt>/*/.venv. Kept in lockstep so the framework
+# provisions aiosqlite into EXACTLY the venv(s) the smoke gate version-checks.
+# ---------------------------------------------------------------------------
+
+def _plant_venv_python(base: Path) -> Path:
+    """Create a fake ``<base>/.venv/bin/python`` file and return its path."""
+    py = base / '.venv' / 'bin' / 'python'
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text('#!/usr/bin/env bash\n')
+    return py
+
+
+def test_resolve_worktree_venv_pythons_direct_layout(tmp_path):
+    # (a) top-level layout: <wt>/.venv/bin/python exists → returns exactly it.
+    from orchestrator.evals.snapshots import resolve_worktree_venv_pythons
+
+    py = _plant_venv_python(tmp_path)
+    assert resolve_worktree_venv_pythons(tmp_path) == [py]
+
+
+def test_resolve_worktree_venv_pythons_subproject_layout(tmp_path):
+    # (b) subproject layout (e.g. df_task_12 → <wt>/orchestrator/.venv): the
+    # direct <wt>/.venv is absent, so the one-level glob resolves the subproject.
+    from orchestrator.evals.snapshots import resolve_worktree_venv_pythons
+
+    py = _plant_venv_python(tmp_path / 'orchestrator')
+    assert not (tmp_path / '.venv').exists()
+    assert resolve_worktree_venv_pythons(tmp_path) == [py]
+
+
+def test_resolve_worktree_venv_pythons_multiple_sorted(tmp_path):
+    # (c) more than one subproject venv (e.g. fused-memory + orchestrator) →
+    # returns ALL of them, sorted, so the gate/provisioner covers every one.
+    from orchestrator.evals.snapshots import resolve_worktree_venv_pythons
+
+    py_orch = _plant_venv_python(tmp_path / 'orchestrator')
+    py_fm = _plant_venv_python(tmp_path / 'fused-memory')
+    assert not (tmp_path / '.venv').exists()
+    assert resolve_worktree_venv_pythons(tmp_path) == sorted([py_fm, py_orch])
+
+
+def test_resolve_worktree_venv_pythons_none(tmp_path):
+    # (d) no venv anywhere (e.g. a reify/Rust worktree) → [] (a clean no-op for
+    # the provisioner, which then installs nothing).
+    from orchestrator.evals.snapshots import resolve_worktree_venv_pythons
+
+    assert resolve_worktree_venv_pythons(tmp_path) == []
