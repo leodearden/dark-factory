@@ -25,7 +25,7 @@ class _CaptureClient:
     def __init__(self, captured: list[dict]) -> None:
         self._captured = captured
 
-    async def __aenter__(self) -> "_CaptureClient":
+    async def __aenter__(self) -> _CaptureClient:
         return self
 
     async def __aexit__(self, *exc: object) -> bool:
@@ -93,7 +93,10 @@ async def test_completion_write_task_id_is_string_not_int(tmp_path):
     form, so the tag must be str(...) regardless of the source type.
     """
     wf = _make_workflow(tmp_path=tmp_path, task_id='2610')
-    wf.task_id = 2610  # int form
+    # Deliberately simulate an int-like task_id (declared type is str) to pin
+    # that the writer coerces via str(); setattr sidesteps the attribute-type
+    # check for this intentional violation.
+    setattr(wf, 'task_id', 2610)  # noqa: B010 — int form, deliberate type violation
 
     captured: list[dict] = []
     with patch('httpx.AsyncClient', lambda *a, **k: _CaptureClient(captured)):
