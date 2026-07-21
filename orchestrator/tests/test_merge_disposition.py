@@ -954,3 +954,113 @@ class TestClassifyFailOpen:
         ))
         assert disposition == MergeFailureDisposition.INDETERMINATE
         assert evidence is None
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task 2869) — classify orphan speculative main_sha is NOT a skew
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyOrphanSpeculativeNotSkew:
+    """classify_merge_failure_disposition gains a ``real_main_head_sha`` kwarg
+    (task 2869, reify esc-5260-8). When ``main_sha`` is an orphaned speculative
+    train tip (never fast-forwarded onto real main), the implicated landings
+    are filtered to ancestors of the CURRENT real main HEAD, so an orphan-cited
+    'skew' collapses to the honest BRANCH_BUG instead of a fabricated
+    INTEGRATION_SKEW citing dangling commits. A genuine landing still yields
+    INTEGRATION_SKEW; real_main_head_sha=None fails open to today's frame."""
+
+    def test_orphan_speculative_main_sha_plus_green_is_branch_bug_not_skew(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        merge_base, real_main_head, orphan_tip = _build_orphan_repo(repo)
+
+        store = _make_event_store(tmp_path)
+        _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=_XPY_FAILURE,
+            branch='task/2381',
+            merge_base_sha=merge_base,
+            main_sha=orphan_tip,
+            real_main_head_sha=real_main_head,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store,
+        ))
+        # Orphan cited + green would be a false INTEGRATION_SKEW today; with the
+        # ancestor filter the orphan is pruned -> empty implicated set falls
+        # through to the honest BRANCH_BUG.
+        assert disposition == MergeFailureDisposition.BRANCH_BUG
+        assert evidence is None
+
+    def test_genuine_landing_plus_green_still_integration_skew(self, tmp_path: Path):
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            SkewEvidence,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing = _commit_file(repo, 'src/x.py', 'v2', 'genuine landing on main')
+        # Real main advances past the dispatch base; the landing is an ancestor.
+        real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'later unrelated main tip')
+
+        store = _make_event_store(tmp_path)
+        _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=_XPY_FAILURE,
+            branch='task/2381',
+            merge_base_sha=merge_base,
+            main_sha=landing,
+            real_main_head_sha=real_main_head,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store,
+        ))
+        assert disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert isinstance(evidence, SkewEvidence)
+        assert landing in evidence.implicated_commits
+
+    def test_real_main_head_none_fails_open_to_integration_skew(self, tmp_path: Path):
+        """An unresolved real-main (real_main_head_sha=None) degrades to today's
+        pre-fix reference frame: the orphan is still cited -> INTEGRATION_SKEW.
+        Documents fail-open (never crashes, never suppresses a genuine skew)."""
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        merge_base, _real_main_head, orphan_tip = _build_orphan_repo(repo)
+
+        store = _make_event_store(tmp_path)
+        _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=_XPY_FAILURE,
+            branch='task/2381',
+            merge_base_sha=merge_base,
+            main_sha=orphan_tip,
+            real_main_head_sha=None,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store,
+        ))
+        assert disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert evidence is not None
