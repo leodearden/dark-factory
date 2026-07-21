@@ -152,7 +152,7 @@ class ModelsConfig(BaseModel):
     merger: str = Field(default='opus')
     steward: str = Field(default='opus')
     triage: str = Field(default='sonnet')
-    module_tagger: str = Field(default='sonnet')
+    module_tagger: str = Field(default='haiku')
     deep_reviewer: str = Field(default='opus')
     judge: str = Field(default='sonnet')
     simple_task: str = Field(default='sonnet')

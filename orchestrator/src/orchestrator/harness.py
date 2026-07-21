@@ -66,6 +66,11 @@ from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_t
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.module_tagger_prompt import (
+    TAGGER_SCHEMA,
+    TAGGER_SYSTEM_PROMPT,
+    build_tagger_prompt,
+)
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
@@ -2227,51 +2232,10 @@ class Harness:
                 'description': t.get('description') or t.get('details') or '',
             })
 
-        schema = {
-            'type': 'object',
-            'properties': {
-                'predictions': {
-                    'type': 'array',
-                    'items': {
-                        'type': 'object',
-                        'properties': {
-                            'id': {'type': 'string'},
-                            'files': {
-                                'type': 'array',
-                                'items': {'type': 'string'},
-                                'description': 'Predicted file paths (or directory paths) this task will create or modify',
-                            },
-                        },
-                        'required': ['id', 'files'],
-                    },
-                },
-            },
-            'required': ['predictions'],
-        }
-
-        prompt = f"""\
-Given these tasks and this codebase structure, predict which files each task
-will create or modify.
-
-Be specific and exhaustive with file predictions — include source files AND
-test files. Use paths relative to the project root. The `files` field is used
-to derive concurrency locks, so accuracy prevents unnecessary serialization.
-Directory paths are accepted when an entire directory will be touched.
-
-# Codebase top-level directories
-{json.dumps(entries)}
-
-# Tasks to tag
-{json.dumps(task_summaries, indent=2)}
-
-Output JSON matching the schema: a SINGLE top-level "predictions" array — do
-NOT nest it inside another "predictions" or "tasks" key. For example:
-
-{{"predictions":[{{"id":"12","files":["src/foo.py","tests/test_foo.py"]}},{{"id":"13","files":[]}}]}}
-
-Every task must appear in the output. If you cannot predict any files for a
-task, include it with an empty "files" list rather than omitting it.
-"""
+        # Prompt/schema/system-prompt live in the shared module_tagger_prompt
+        # module (task 2540) so the offline replay trial reuses byte-identical
+        # production inputs. Behavior-preserving extraction.
+        prompt = build_tagger_prompt(entries, task_summaries)
 
         # Route resolution (task η): resolve model/max_turns/budget through the
         # single layered resolver + emit a routing_decision event. This is a
@@ -2309,12 +2273,12 @@ task, include it with an empty "files" list rather than omitting it.
                 role='module_tagger',
                 invoke_fn=invoke_agent,
                 prompt=prompt,
-                system_prompt='You are a code module classifier. Given task descriptions and a codebase structure, determine which code modules each task will modify. Be precise and conservative.',
+                system_prompt=TAGGER_SYSTEM_PROMPT,
                 cwd=self.config.project_root,
                 model=decision.model,
                 max_turns=decision.max_turns,
                 max_budget_usd=decision.budget_usd,
-                output_schema=schema,
+                output_schema=TAGGER_SCHEMA,
             )
         except AllAccountsCappedException as e:
             logger.warning(

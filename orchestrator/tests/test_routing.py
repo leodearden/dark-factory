@@ -122,12 +122,15 @@ class TestRoutingAllowlistReloadDisposition:
         applied, live is updated in place."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # module_tagger defaults to 'haiku' (task 2540 flip); pin it to an
+        # already-allowed model in `live` so this config -- whose allowlist
+        # deliberately omits 'haiku' before the widening reload -- is valid.
         live = OrchestratorConfig(
-            models=ModelsConfig(architect='opus'),
+            models=ModelsConfig(architect='opus', module_tagger='sonnet'),
             routing=RoutingConfig(allowed_models=['sonnet', 'opus']),
         )
         fresh = OrchestratorConfig(
-            models=ModelsConfig(architect='opus'),
+            models=ModelsConfig(architect='opus', module_tagger='sonnet'),
             routing=RoutingConfig(allowed_models=['haiku', 'sonnet', 'opus']),
         )
         report = apply_reload(live, fresh)
