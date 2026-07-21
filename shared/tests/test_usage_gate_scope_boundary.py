@@ -373,3 +373,46 @@ class TestB5TimerUncapReactiveRecap:
         assert sc.resets_at > datetime.now(UTC)
         # Exactly one cap cooldown -> retry: counters advanced, no tight spin.
         assert mock_sleep.await_count == 1
+
+
+# ===========================================================================
+# B6 -- byte-equivalence kill switch
+# ===========================================================================
+
+
+class TestB6KillSwitchByteEquivalence:
+    """B6: scoped_cap_models=[] (the kill switch) is byte-equivalent to no
+    scope machinery at all -- no scope state is ever allocated or read, and
+    a fable-model invocation through the loop takes the exact same
+    account-level path as any other model (decision 6)."""
+
+    async def test_b6_no_scope_state_allocated(self):
+        gate = make_gate(['a'], scoped_cap_models=[])
+
+        assert gate.scope_capacity_snapshot() == {}
+        assert gate.scope_status() == {}
+
+        # With no scope caps possible, scope=fable selection behaves as
+        # general.
+        lease = await gate.before_invoke(scope=SCOPE)
+        assert lease.name == 'a'
+
+    async def test_b6_fable_model_through_loop_is_byte_equivalent_to_general(self):
+        gate = make_gate(['a', 'b'], scoped_cap_models=[])
+        a, b = gate._accounts
+
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', model='claude-fable-5', backend='claude',
+                invoke_fn=scripted_invoke(
+                    cap_result("You've hit your usage limit. resets in 1h"),
+                    ok_result(),
+                ),
+                prompt='hi',
+            )
+
+        # scope_for('claude-fable-5', cfg-with-empty-scoped_cap_models) is
+        # None -- the CapHit takes the account-level path.
+        assert a.phase == AccountPhase.CAPPED
+        assert a.scope_caps == {}  # no scope state written
+        assert got.account_name == 'b'
