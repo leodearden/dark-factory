@@ -215,7 +215,7 @@ async def test_claimant_heartbeat_loop_exits_cleanly_on_nonnumeric_interval(tmp_
     await asyncio.wait_for(wf._claimant_heartbeat_loop(), timeout=1.0)
 
     # The guard returns before the first refresh, so the claimant is never touched.
-    wf.scheduler.set_task_claimant.assert_not_awaited()
+    wf.scheduler.set_task_claimant.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
