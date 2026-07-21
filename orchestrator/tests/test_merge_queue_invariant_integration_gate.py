@@ -114,6 +114,7 @@ from orchestrator.merge_queue import (
     coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.run_store import RunStore
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
@@ -198,7 +199,7 @@ def _make_req(
         kwargs['request_id'] = request_id
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -292,7 +293,7 @@ async def _make_merged_item(
     wt = await _make_branch_with_file(git_ops, branch, filename, content)
     loop = asyncio.get_running_loop()
     req = MergeRequest(
-        task_id=branch, branch=branch, worktree=wt,
+        task_id=branch, branch=QueuedBranch.parse(branch, config.git.branch_prefix), worktree=wt,
         pre_rebased=False, task_files=None, module_configs=[],
         config=config, result=loop.create_future(), lane='normal',
     )
@@ -695,12 +696,12 @@ class TestScenario1SpeculativeCascade:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='casc1-a', branch='task/casc1-a', worktree=wt_a,
+            task_id='casc1-a', branch=QueuedBranch.parse('task/casc1-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='casc1-b', branch='task/casc1-b', worktree=wt_b,
+            task_id='casc1-b', branch=QueuedBranch.parse('task/casc1-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -1082,7 +1083,7 @@ class TestScenario56NewSurfaceEscalations:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
         assert req.request_id in warnings[0].message
-        assert req.branch in warnings[0].message
+        assert req.branch.bare_id in warnings[0].message
 
         assert len(fake_eq.submitted) == 1
         esc = fake_eq.submitted[0]
@@ -1406,7 +1407,7 @@ def _make_request_with_worktree(
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -1533,10 +1534,10 @@ class TestScenario9GuardMatrixEquivalence:
                 'row9-drop-remerge', 'row9-drop-remerge', wt_r, config,
             )
             fake_results = {
-                'row9-drop-merger': MergeResult(
+                'task/row9-drop-merger': MergeResult(
                     success=True, merge_commit=sha_m, pre_merge_sha=sha_m, merge_worktree=None,
                 ),
-                'row9-drop-remerge': MergeResult(
+                'task/row9-drop-remerge': MergeResult(
                     success=True, merge_commit=sha_r, pre_merge_sha=sha_r, merge_worktree=None,
                 ),
             }
@@ -1551,8 +1552,8 @@ class TestScenario9GuardMatrixEquivalence:
                 'row9-fail-remerge', 'row9-fail-remerge', wt_r, config,
             )
             fake_results = {
-                'row9-fail-merger': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
-                'row9-fail-remerge': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
+                'task/row9-fail-merger': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
+                'task/row9-fail-remerge': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
             }
         else:
             raise AssertionError(f'unknown scenario {scenario!r}')
@@ -1900,12 +1901,12 @@ class TestB8RegistrySingleSourceOfTruth:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='b8-a', branch='task/b8-a', worktree=wt_a,
+            task_id='b8-a', branch=QueuedBranch.parse('task/b8-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='b8-b', branch='task/b8-b', worktree=wt_b,
+            task_id='b8-b', branch=QueuedBranch.parse('task/b8-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )

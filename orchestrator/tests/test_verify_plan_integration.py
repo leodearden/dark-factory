@@ -94,6 +94,7 @@ from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
 from orchestrator.merge_queue import (
     MergeRequest,
+    QueuedBranch,
     _DryRunInvestigationHandles,
     _run_post_merge_verify,
 )
@@ -191,7 +192,7 @@ def _make_req(
         kwargs['request_id'] = request_id
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=task_files,

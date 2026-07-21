@@ -15,6 +15,7 @@ from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Real-git fixtures (mirroring test_merge_queue_restart_hook.py)
@@ -93,7 +94,7 @@ def _make_merge_request(
         future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

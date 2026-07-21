@@ -47,6 +47,7 @@ from orchestrator.merge_queue import (
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ── Module-level sentinel for verify_task in pure unit tests ─────────────────
 #
@@ -114,7 +115,7 @@ def _make_req(
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,

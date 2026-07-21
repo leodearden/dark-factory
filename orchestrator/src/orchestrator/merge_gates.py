@@ -655,7 +655,7 @@ async def _finalize_advanced_merge(
     # γ2: clean landing — reset the per-branch generation chain counter
     # so consecutive tip-advances count is cleared for this branch.
     if chain_ctx is not None:
-        chain_ctx.counts.pop(req.branch, None)
+        chain_ctx.counts.pop(req.branch.bare_id, None)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 

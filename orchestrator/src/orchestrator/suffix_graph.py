@@ -298,18 +298,18 @@ class SuffixConflictTracker:
                 # SHA in the same pass avoids a redundant third rev-parse vs
                 # the previous resolve_queued_branch_ref + resolve_branch_sha
                 # pattern (each call forks a git subprocess).
-                prefixed = f'{branch_prefix}{req.branch}'
+                # task ν: req.branch.full_name IS the canonical ref, so a single
+                # resolve replaces the old prefixed-then-bare try-both (the bare
+                # fallback only ever mattered for a non-task shape, which a typed
+                # QueuedBranch no longer produces).
+                prefixed = req.branch.full_name
                 sha = await self._git_ops().resolve_branch_sha(prefixed)
                 if sha is not None:
                     ref, head = prefixed, sha
-                else:
-                    sha2 = await self._git_ops().resolve_branch_sha(req.branch)
-                    if sha2 is not None:
-                        ref, head = req.branch, sha2
             except Exception:
                 logger.warning(
                     'recompute_suffix_conflict_graph: resolve_queued_branch_ref(%r) raised; '
-                    'treating item as missing ref', req.branch, exc_info=True,
+                    'treating item as missing ref', req.branch.bare_id, exc_info=True,
                 )
                 ref = None
                 head = None
@@ -541,7 +541,7 @@ class SuffixConflictTracker:
             if isinstance(req, GroupMergeRequest):
                 continue  # trains keep their own TRAIN_REBASE_CONFLICT path
 
-            branch = req.branch
+            branch = req.branch.bare_id
             logger.info(
                 '_bounce_conflicting_suffix_items: needs_rebase task_id=%s rid=%s '
                 'branch=%s frozen_tip=%s',

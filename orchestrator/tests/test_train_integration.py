@@ -46,6 +46,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -174,7 +175,7 @@ def build_group_merge_request(
 
     return GroupMergeRequest(
         task_id=tip_name,
-        branch=tip_name,
+        branch=QueuedBranch.parse(tip_name, config.git.branch_prefix),
         worktree=tip_worktree,
         pre_rebased=False,
         task_files=None,
@@ -183,7 +184,7 @@ def build_group_merge_request(
         result=future,
         train_id=train_id,
         member_task_ids=list(member_names),
-        tip_branch=tip_name,
+        tip_branch=QueuedBranch.parse(tip_name, config.git.branch_prefix),
         tip_task_id=tip_name,
         status_check=status_check,
         mark_member_done=mark_member_done,
@@ -701,7 +702,7 @@ class TestTrainIntegrationB8:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id="b8_solo",
-            branch="b8_solo",
+            branch=QueuedBranch.parse("b8_solo", config.git.branch_prefix),
             worktree=wt_solo,
             pre_rebased=False,
             task_files=None,

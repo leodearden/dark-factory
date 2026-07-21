@@ -30,6 +30,7 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     _check_post_merge_pyright,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — shared real-git setup (mirrors TestCheckPostMergeEquivalence)
@@ -549,7 +550,7 @@ def _make_merge_request(
     future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

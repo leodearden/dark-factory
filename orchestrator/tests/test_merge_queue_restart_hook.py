@@ -36,6 +36,7 @@ from orchestrator.merge_queue import (
     _journal_landed_then_advance as _real_journal_landed_then_advance,
 )
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — mirror test_merge_queue.py
@@ -110,7 +111,7 @@ def _make_request(
         future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -552,7 +553,7 @@ async def test_buffer_owned_request_terminal_removal_policy(
         fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         return MergeRequest(
             task_id=label,
-            branch=label,
+            branch=QueuedBranch.parse(label, config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,

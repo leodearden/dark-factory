@@ -1224,6 +1224,7 @@ def create_server(
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
+            QueuedBranch,
             WaiterRecord,
             coalesce_or_enqueue_merge_request,
         )
@@ -1269,7 +1270,7 @@ def create_server(
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         merge_req = MergeRequest(
             task_id=task_id,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, orch_config.git.branch_prefix),
             worktree=Path(worktree),
             pre_rebased=False,
             task_files=None,

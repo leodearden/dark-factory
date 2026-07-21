@@ -82,6 +82,7 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     SuffixConflictGraph,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.run_store import RunStore
 from orchestrator.verify_runner import HostLease
 
@@ -171,7 +172,7 @@ def _make_req(
         kwargs['request_id'] = request_id
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -1041,7 +1042,7 @@ class TestScenario2CleanRebaseRequeues:
         )
 
         # Assert: bounce registry incremented to 1.
-        branch = req.branch
+        branch = req.branch.bare_id
         assert worker._bounce_registry.count(branch) == 1, (
             f'Expected bounce registry count for branch {branch!r} to be 1 '
             f'after one clean rebase bounce'
@@ -1175,7 +1176,7 @@ class TestScenario3RealConflictCapped:
         remove the req, and resolve it 'blocked' with NEEDS_REBASE_REASON_PREFIX.
         """
         worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
-        branch = req.branch
+        branch = req.branch.bare_id
 
         # Pre-seed registry to MERGE_BOUNCE_CAP.
         for _ in range(MERGE_BOUNCE_CAP):
@@ -1221,7 +1222,7 @@ class TestScenario3RealConflictCapped:
         before clearing by checking the blocking outcome.
         """
         worker, req, _ = await self._setup_conflict_worker(git_repo, config, git_ops)
-        branch = req.branch
+        branch = req.branch.bare_id
 
         # CASE A check: one real conflict → blocked, registry cleared.
         worker._git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
@@ -1646,7 +1647,7 @@ class TestScenario9CircuitBreaker:
         # Add a queued req so depth > 0 (idle-queue guard bypass).
         req = MergeRequest(
             task_id='breaker-dummy',
-            branch='breaker-dummy',
+            branch=QueuedBranch.parse('breaker-dummy', config.git.branch_prefix),
             worktree=git_repo,
             pre_rebased=False,
             task_files=None,
@@ -1838,7 +1839,7 @@ async def _make_merged_item(
     wt = await _make_branch_with_file(git_ops, branch, filename, content)
     loop = asyncio.get_running_loop()
     req = MergeRequest(
-        task_id=branch, branch=branch, worktree=wt,
+        task_id=branch, branch=QueuedBranch.parse(branch, config.git.branch_prefix), worktree=wt,
         pre_rebased=False, task_files=None, module_configs=[],
         config=config, result=loop.create_future(), lane='normal',
     )

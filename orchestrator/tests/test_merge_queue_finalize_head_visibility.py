@@ -37,6 +37,7 @@ from orchestrator.merge_queue import (
     MergeRequest,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostLease
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -92,7 +93,7 @@ def _make_req(
     """Build a minimal MergeRequest with a fresh event-loop future."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -426,7 +427,7 @@ class TestFinalizingHeadLifecycle:
 
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=worktree,
             pre_rebased=False,
             task_files=None,

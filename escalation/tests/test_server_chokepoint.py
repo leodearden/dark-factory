@@ -2175,6 +2175,7 @@ class TestBoundaryTableMcpSurface:
         """
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeRequest,
+            QueuedBranch,
         )
 
         queued_spy: list[int] = []
@@ -2189,7 +2190,7 @@ class TestBoundaryTableMcpSurface:
         x_future: asyncio.Future = asyncio.get_running_loop().create_future()
         dummy_req = MergeRequest(
             task_id='X',
-            branch='X',
+            branch=QueuedBranch.parse('X', 'task/'),
             worktree=tmp_path / 'wt-x',
             pre_rebased=False,
             task_files=None,

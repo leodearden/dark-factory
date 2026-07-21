@@ -34,6 +34,7 @@ try:
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
     from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
         MergeRequest,
+        QueuedBranch,
         RealMergeItem,
         SpeculativeItem,
         SpeculativeMergeWorker,
@@ -51,6 +52,7 @@ except ImportError:
     EventStore: Any = None
     EventType: Any = None
     MergeRequest: Any = None
+    QueuedBranch: Any = None
     RealMergeItem: Any = None
     SpeculativeItem: Any = None
     SpeculativeMergeWorker: Any = None
@@ -2499,7 +2501,7 @@ class TestMergeRequestDedup:
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
         workflow_req = MergeRequest(
             task_id='workflow-task',
-            branch='B',
+            branch=QueuedBranch.parse('B', 'task/'),
             worktree=_Path(str(tmp_path / 'wf-wt')),
             pre_rebased=False,
             task_files=None,
@@ -3109,7 +3111,7 @@ class TestGetMergeQueue:
 
         req = MergeRequest(
             task_id=task_id,
-            branch=task_id,
+            branch=QueuedBranch.parse(task_id, 'task/'),
             worktree=tmp_path / 'wt',
             pre_rebased=False,
             task_files=None,
@@ -3169,7 +3171,7 @@ class TestGetMergeQueue:
 
         req = MergeRequest(
             task_id='T1',
-            branch='T1',
+            branch=QueuedBranch.parse('T1', 'task/'),
             worktree=tmp_path / 'wt',
             pre_rebased=False,
             task_files=None,
@@ -3194,7 +3196,7 @@ class TestGetMergeQueue:
 
         grq = GroupMergeRequest(
             task_id='G1',
-            branch='G1',
+            branch=QueuedBranch.parse('G1', 'task/'),
             worktree=tmp_path / 'wt2',
             pre_rebased=False,
             task_files=None,
@@ -3203,7 +3205,7 @@ class TestGetMergeQueue:
             result=loop.create_future(),
             train_id='train-1',
             member_task_ids=['G1'],
-            tip_branch='G1',
+            tip_branch=QueuedBranch.parse('G1', 'task/'),
             tip_task_id='G1',
             status_check=_noop_status,
             mark_member_done=_noop_done,
@@ -3231,7 +3233,7 @@ class TestGetMergeQueue:
 
         req = MergeRequest(
             task_id='Q',
-            branch='Q',
+            branch=QueuedBranch.parse('Q', 'task/'),
             worktree=tmp_path / 'wt',
             pre_rebased=False,
             task_files=None,
@@ -3286,12 +3288,12 @@ class TestGetMergeQueue:
         cancelled_fut.cancel()
 
         await mq.put(MergeRequest(
-            task_id='LIVE', branch='LIVE', worktree=tmp_path / 'wt1',
+            task_id='LIVE', branch=QueuedBranch.parse('LIVE', 'task/'), worktree=tmp_path / 'wt1',
             pre_rebased=False, task_files=None, module_configs=[], config=config,
             result=live_fut,
         ))
         await mq.put(MergeRequest(
-            task_id='DEAD', branch='DEAD', worktree=tmp_path / 'wt2',
+            task_id='DEAD', branch=QueuedBranch.parse('DEAD', 'task/'), worktree=tmp_path / 'wt2',
             pre_rebased=False, task_files=None, module_configs=[], config=config,
             result=cancelled_fut,
         ))
@@ -3342,7 +3344,7 @@ class TestGetMergeQueue:
 
         def _req(tid: str):
             return MergeRequest(
-                task_id=tid, branch=tid,
+                task_id=tid, branch=QueuedBranch.parse(tid, 'task/'),
                 worktree=tmp_path / f'wt-{tid}',
                 pre_rebased=False, task_files=None, module_configs=[],
                 config=config, result=loop.create_future(),
@@ -3509,7 +3511,7 @@ class TestGetMergeQueue:
 
         req = MergeRequest(
             task_id='P',
-            branch='P',
+            branch=QueuedBranch.parse('P', 'task/'),
             worktree=tmp_path / 'wt',
             pre_rebased=False,
             task_files=None,
@@ -3655,7 +3657,7 @@ class TestGetMergeQueue:
 
         req = MergeRequest(
             task_id='GR',
-            branch='GR',
+            branch=QueuedBranch.parse('GR', 'task/'),
             worktree=tmp_path / 'wt',
             pre_rebased=False,
             task_files=None,
@@ -4731,7 +4733,7 @@ class TestMergeStatus:
             queue=mq,
         )
         req = MergeRequest(
-            task_id='T-live', branch='branch-live',
+            task_id='T-live', branch=QueuedBranch.parse('branch-live', 'task/'),
             worktree=tmp_path / 'wt',
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(),
@@ -4761,7 +4763,7 @@ class TestMergeStatus:
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
         req = MergeRequest(
-            task_id='T-lbranch', branch='branch-bylookup',
+            task_id='T-lbranch', branch=QueuedBranch.parse('branch-bylookup', 'task/'),
             worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
             module_configs=[], config=config, result=loop.create_future(),
         )
@@ -4786,7 +4788,7 @@ class TestMergeStatus:
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
         req = MergeRequest(
-            task_id='T-ltask', branch='branch-ltask',
+            task_id='T-ltask', branch=QueuedBranch.parse('branch-ltask', 'task/'),
             worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
             module_configs=[], config=config, result=loop.create_future(),
         )
@@ -4811,7 +4813,7 @@ class TestMergeStatus:
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
         req = MergeRequest(
-            task_id='T-prec', branch='branch-prec',
+            task_id='T-prec', branch=QueuedBranch.parse('branch-prec', 'task/'),
             worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
             module_configs=[], config=config, result=loop.create_future(),
         )
@@ -4822,7 +4824,7 @@ class TestMergeStatus:
         ring.record(TerminalOutcomeRecord(
             request_id=req.request_id,
             task_id=req.task_id,
-            branch=req.branch,
+            branch=req.branch.bare_id,
             state='done',
         ))
 
@@ -4831,7 +4833,7 @@ class TestMergeStatus:
         event_store.emit(
             EventType.merge_finalized,
             task_id=req.task_id,
-            data={'request_id': req.request_id, 'branch': req.branch, 'state': 'done'},
+            data={'request_id': req.request_id, 'branch': req.branch.bare_id, 'state': 'done'},
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
@@ -4866,7 +4868,7 @@ class TestMergeStatus:
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
 
         req = MergeRequest(
-            task_id='T-phase', branch='branch-phase',
+            task_id='T-phase', branch=QueuedBranch.parse('branch-phase', 'task/'),
             worktree=tmp_path / 'wt', pre_rebased=False, task_files=None,
             module_configs=[], config=config, result=loop.create_future(),
         )

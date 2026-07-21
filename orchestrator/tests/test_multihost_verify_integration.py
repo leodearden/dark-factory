@@ -58,6 +58,7 @@ from orchestrator.merge_queue import (
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     DriftDetector,
@@ -1313,7 +1314,7 @@ class TestUnreachableHostCapstone:
             )
             req = MergeRequest(
                 task_id='task-cap',
-                branch='task/cap',
+                branch=QueuedBranch.parse('task/cap', config.git.branch_prefix),
                 worktree=MagicMock(),
                 pre_rebased=False,
                 task_files=[],
@@ -1503,7 +1504,7 @@ def _xcheck_req(config: OrchestratorConfig, *, task_files=('src/foo.py',), workt
     loop = asyncio.get_running_loop()
     return MergeRequest(
         task_id='task-2822',
-        branch='task/2822',
+        branch=QueuedBranch.parse('task/2822', config.git.branch_prefix),
         worktree=worktree or Path('/repo/task-2822'),
         pre_rebased=False,
         task_files=list(task_files) if task_files is not None else None,

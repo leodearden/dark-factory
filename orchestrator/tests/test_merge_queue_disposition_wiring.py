@@ -39,6 +39,7 @@ from orchestrator.merge_queue import (
     _classify_main_health_red,
     _run_post_merge_verify,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 
 MAIN_SHA = 'cafecafe1234567890deadbeef'
@@ -98,7 +99,7 @@ def _make_req(
     future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=f'task/{task_id}',
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

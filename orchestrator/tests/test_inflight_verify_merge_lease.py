@@ -27,6 +27,7 @@ from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, _run_post_merge_verify
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ def _make_request(config: OrchestratorConfig, worktree: Path) -> MergeRequest:
         future = make_placeholder_future()
     return MergeRequest(
         task_id='lease-t1',
-        branch='task/lease-t1',
+        branch=QueuedBranch.parse('task/lease-t1', config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

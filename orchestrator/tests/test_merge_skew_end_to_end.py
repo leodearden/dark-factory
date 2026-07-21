@@ -38,6 +38,7 @@ from orchestrator.merge_queue import (
     InflightEntry,
     MergeOutcome,
     MergeRequest,
+    QueuedBranch,
     RealMergeItem,
     SpeculativeMergeWorker,
 )
@@ -168,7 +169,7 @@ def _make_item(
     merge_wt = tmp_path / 'merge-wt'
     merge_wt.mkdir(exist_ok=True)
     req = MergeRequest(
-        task_id=TASK_ID, branch=BRANCH, worktree=repo, pre_rebased=False,
+        task_id=TASK_ID, branch=QueuedBranch.parse(BRANCH, config.git.branch_prefix), worktree=repo, pre_rebased=False,
         task_files=None, module_configs=[], config=config, result=future, lane='normal',
     )
     item = RealMergeItem(

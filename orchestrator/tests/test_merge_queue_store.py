@@ -73,7 +73,7 @@ def _make_req(
     """Build a MergeRequest with a placeholder future (safe outside a running loop)."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=pre_rebased,
         task_files=task_files,
@@ -101,7 +101,7 @@ def _make_group_req(
 
     return GroupMergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -110,7 +110,7 @@ def _make_group_req(
         result=make_placeholder_future(),
         train_id='train-001',
         member_task_ids=[task_id],
-        tip_branch=branch,
+        tip_branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         tip_task_id=task_id,
         status_check=_status_check,
         mark_member_done=_mark_done,
@@ -329,7 +329,7 @@ class TestReconstructMergeRequest:
         # Identity fields preserved.
         assert reconstructed.request_id == original.request_id
         assert reconstructed.task_id == '99'
-        assert reconstructed.branch == '99'
+        assert reconstructed.branch.bare_id == '99'
         assert reconstructed.snapshot_tip == 'cafebabe'
         assert reconstructed.generation == 2
         assert reconstructed.lane == 'high'
@@ -746,7 +746,7 @@ class TestRecoverPendingMergesPrefixedBranch:
         assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
         recovered_req = queue.get_nowait()
         assert recovered_req.request_id == 'mr-4959'
-        assert recovered_req.branch == 'task/4959', (
+        assert recovered_req.branch.full_name == 'task/4959', (
             f'Expected reconstructed branch to resolve via the already-prefixed '
             f"shape 'task/4959'; got {recovered_req.branch!r}"
         )
@@ -838,7 +838,7 @@ class TestRecoverPendingMergesPrefixedBranch:
         assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
         recovered_req = queue.get_nowait()
         assert recovered_req.request_id == 'mr-4959'
-        assert recovered_req.branch == '4959', (
+        assert recovered_req.branch.bare_id == '4959', (
             f"Expected the reconstructed request's branch to stay bare "
             f"('4959', passed through verbatim from the persisted record) "
             f"even though resolution went through the canonically prefixed "

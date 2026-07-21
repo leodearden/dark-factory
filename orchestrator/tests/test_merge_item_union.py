@@ -40,6 +40,7 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 
 pytestmark = pytest.mark.asyncio
 
@@ -91,7 +92,7 @@ def _make_req(
     """Build a minimal MergeRequest with a fresh event-loop future."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -233,7 +234,7 @@ async def test_train_handoff_decided_item_passthrough_no_drift(
     future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     req = GroupMergeRequest(
         task_id='union-train',
-        branch='union-train',
+        branch=QueuedBranch.parse('union-train', config.git.branch_prefix),
         worktree=git_ops.project_root,
         pre_rebased=False,
         task_files=None,
@@ -242,7 +243,7 @@ async def test_train_handoff_decided_item_passthrough_no_drift(
         result=future,
         train_id='union-train-id',
         member_task_ids=['union-train'],
-        tip_branch='union-train',
+        tip_branch=QueuedBranch.parse('union-train', config.git.branch_prefix),
         tip_task_id='union-train',
         status_check=AsyncMock(),
         mark_member_done=AsyncMock(),

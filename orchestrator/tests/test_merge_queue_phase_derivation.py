@@ -108,11 +108,11 @@ def _make_request(
     request_liveness.py (per-file duplication convention — see this file's
     module docstring).
     """
-    from orchestrator.merge_types import MergeRequest
+    from orchestrator.merge_types import MergeRequest, QueuedBranch
 
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

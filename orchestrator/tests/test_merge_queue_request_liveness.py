@@ -44,7 +44,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_types import MergeOutcome, MergeRequest
+from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -102,7 +102,7 @@ def _make_request(
     """Build a MergeRequest with a fresh Future for the running event loop."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -195,7 +195,7 @@ class TestCheckRequestLiveness:
         assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
         msg = warnings[0].message
         assert req.request_id in msg
-        assert req.branch in msg
+        assert req.branch.bare_id in msg
         assert '2000' in msg
 
         assert len(fake_eq.submitted) == 1
@@ -496,7 +496,7 @@ class TestWedgedVerifyIntegration:
             assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
             msg = warnings[0].message
             assert req.request_id in msg
-            assert req.branch in msg
+            assert req.branch.bare_id in msg
 
             assert len(fake_eq.submitted) == 1
             esc = fake_eq.submitted[0]
@@ -644,7 +644,7 @@ async def _make_merged_item(
     loop = asyncio.get_running_loop()
     req = MergeRequest(
         task_id=task_id if task_id is not None else branch,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=wt,
         pre_rebased=False,
         task_files=None,

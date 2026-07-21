@@ -20,6 +20,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import MergeOutcome, MergeRequest
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = Path('/tmp/non-existent-for-test')
     config.max_consecutive_merge_thrash = 2
+    config.git.branch_prefix = 'task/'
 
     if update_task_raises:
         update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
@@ -123,7 +125,7 @@ def test_merge_request_carries_first_enqueued_at_field():
     # Round-trip an explicit value
     req_explicit = MergeRequest(
         task_id='1',
-        branch='1',
+        branch=QueuedBranch.parse('1', 'task/'),
         worktree=Path('/tmp/wt'),
         pre_rebased=False,
         task_files=None,
@@ -137,7 +139,7 @@ def test_merge_request_carries_first_enqueued_at_field():
     # Default is None when not supplied
     req_default = MergeRequest(
         task_id='2',
-        branch='2',
+        branch=QueuedBranch.parse('2', 'task/'),
         worktree=Path('/tmp/wt'),
         pre_rebased=False,
         task_files=None,

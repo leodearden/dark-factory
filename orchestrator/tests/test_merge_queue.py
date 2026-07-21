@@ -76,6 +76,7 @@ from orchestrator.merge_queue import (
     item_merge_wt,
     register_and_enqueue_merge_request,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 
@@ -142,7 +143,7 @@ def _make_request(
         future = make_placeholder_future()
     kwargs: dict = dict(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=pre_rebased,
         task_files=None,
@@ -1518,7 +1519,7 @@ class TestMergeWorker:
 
         req = MergeRequest(
             task_id='snap-am-test',
-            branch='snap-already-merged',
+            branch=QueuedBranch.parse('snap-already-merged', config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -1567,7 +1568,7 @@ class TestMergeWorker:
         with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
             req = MergeRequest(
                 task_id='snap-bc-none',
-                branch='snap-backcompat-none',
+                branch=QueuedBranch.parse('snap-backcompat-none', config.git.branch_prefix),
                 worktree=wt,
                 pre_rebased=False,
                 task_files=None,
@@ -4129,7 +4130,7 @@ class TestSpeculativeMergeWorker:
             merge_call_count += 1
             # First two calls are speculative merges for N and N+1 (normal)
             # Third call is the re-merge for N+1 after N fails — return conflict
-            if merge_call_count >= 3 and branch == 'rmp-n1':
+            if merge_call_count >= 3 and branch == 'task/rmp-n1':
                 return MergeResult(
                     success=False,
                     conflicts=True,
@@ -4606,7 +4607,7 @@ class TestSpeculativeMergeWorker:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
             task_id='tr-excl',
-            branch='tr-excl',
+            branch=QueuedBranch.parse('tr-excl', config.git.branch_prefix),
             worktree=git_ops.project_root,
             pre_rebased=False,
             task_files=None,
@@ -4615,7 +4616,7 @@ class TestSpeculativeMergeWorker:
             result=future,
             train_id='train-excl',
             member_task_ids=['tr-excl'],
-            tip_branch='tr-excl',
+            tip_branch=QueuedBranch.parse('tr-excl', config.git.branch_prefix),
             tip_task_id='tr-excl',
             status_check=AsyncMock(),
             mark_member_done=AsyncMock(),
@@ -4921,7 +4922,7 @@ class TestSpeculativeMergeWorker:
         original_merge = git_ops.merge_to_main
 
         async def tracking_merge(worktree, branch, **kwargs):
-            if branch == 'cap-n2':
+            if branch == 'task/cap-n2':
                 n2_merge_attempted.set()
             return await original_merge(worktree, branch, **kwargs)
 
@@ -5673,7 +5674,7 @@ class TestSpeculativeMergeWorker:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
             task_id='tr-exempt',
-            branch='tr-exempt',
+            branch=QueuedBranch.parse('tr-exempt', config.git.branch_prefix),
             worktree=tr_wt,
             pre_rebased=False,
             task_files=None,
@@ -5682,7 +5683,7 @@ class TestSpeculativeMergeWorker:
             result=future,
             train_id='train-exempt',
             member_task_ids=['tr-exempt'],
-            tip_branch='tr-exempt',
+            tip_branch=QueuedBranch.parse('tr-exempt', config.git.branch_prefix),
             tip_task_id='tr-exempt',
             status_check=AsyncMock(),
             mark_member_done=AsyncMock(),
@@ -5853,7 +5854,7 @@ class TestSpeculativeMergeWorker:
 
         async def tracking_merge(worktree, branch, **kwargs):
             result = await original_merge(worktree, branch, **kwargs)
-            if branch == 'ab-n' and result.success:
+            if branch == 'task/ab-n' and result.success:
                 n_merge_done.set()
             return result
 
@@ -5974,7 +5975,7 @@ class TestGenerationFieldsIdentity:
             future: asyncio.Future[MergeOutcome] = loop.create_future()
             req = MergeRequest(
                 task_id='t-gen1',
-                branch='task/t-gen1',
+                branch=QueuedBranch.parse('task/t-gen1', config.git.branch_prefix),
                 worktree=tmp_path,
                 pre_rebased=False,
                 task_files=None,
@@ -5995,7 +5996,7 @@ class TestGenerationFieldsIdentity:
             future: asyncio.Future[MergeOutcome] = loop.create_future()
             req = MergeRequest(
                 task_id='t-gen2',
-                branch='task/t-gen2',
+                branch=QueuedBranch.parse('task/t-gen2', config.git.branch_prefix),
                 worktree=tmp_path,
                 pre_rebased=False,
                 task_files=None,
@@ -6017,7 +6018,7 @@ class TestGenerationFieldsIdentity:
             future: asyncio.Future[MergeOutcome] = loop.create_future()
             req = GroupMergeRequest(
                 task_id='t-grp',
-                branch='task/t-grp',
+                branch=QueuedBranch.parse('task/t-grp', config.git.branch_prefix),
                 worktree=tmp_path,
                 pre_rebased=False,
                 task_files=None,
@@ -6026,7 +6027,7 @@ class TestGenerationFieldsIdentity:
                 result=future,
                 train_id='train-1',
                 member_task_ids=['t-grp'],
-                tip_branch='task/t-grp',
+                tip_branch=QueuedBranch.parse('task/t-grp', config.git.branch_prefix),
                 tip_task_id='t-grp',
                 status_check=AsyncMock(),
                 mark_member_done=AsyncMock(),
@@ -7433,7 +7434,7 @@ class TestEnqueueMergeRequest:
         assert rows[0][0] == 'merge_queued'
         assert rows[0][1] == '42'
         assert rows[0][2] == 'merge'
-        assert rows[0][3] == 'task/42'
+        assert rows[0][3] == '42'
 
     @pytest.mark.asyncio
     async def test_enqueue_helper_with_none_event_store_still_enqueues(
@@ -7494,7 +7495,7 @@ class TestEnqueueMergeRequest:
         assert rows[0][1] == '42'           # task_id
         assert rows[0][2] == req.request_id  # data.request_id
         assert rows[0][3] == 'done'          # data.state
-        assert rows[0][4] == 'task/42'       # data.branch
+        assert rows[0][4] == '42'            # data.branch (QueuedBranch.bare_id)
         assert rows[0][5] == 'abc123'        # data.merge_sha
 
     @pytest.mark.asyncio
@@ -7555,7 +7556,7 @@ class TestEnqueueMergeRequest:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='77',
-            branch='task/77',
+            branch=QueuedBranch.parse('task/77', config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -7575,7 +7576,7 @@ class TestEnqueueMergeRequest:
         assert stored.state == 'done'
         assert stored.merge_sha == 'sha9'
         assert stored.snapshot_tip == 'tip-sha-0077'
-        assert stored.branch == 'task/77'
+        assert stored.branch == '77'
         assert stored.task_id == '77'
 
     @pytest.mark.asyncio
@@ -7679,7 +7680,7 @@ class TestEnqueueMergeRequest:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='sup-task',
-            branch='task/sup-task',
+            branch=QueuedBranch.parse('task/sup-task', config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -7866,7 +7867,7 @@ class TestMergeRequestIdentity:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='1',
-            branch='task/1',
+            branch=QueuedBranch.parse('task/1', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -7889,7 +7890,7 @@ class TestMergeRequestIdentity:
         mark_done_mock = AsyncMock()
         greq = GroupMergeRequest(
             task_id='tip',
-            branch='task/tip',
+            branch=QueuedBranch.parse('task/tip', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -7898,7 +7899,7 @@ class TestMergeRequestIdentity:
             result=future,
             train_id='train-1',
             member_task_ids=['tip'],
-            tip_branch='task/tip',
+            tip_branch=QueuedBranch.parse('task/tip', config.git.branch_prefix),
             tip_task_id='tip',
             status_check=status_check_mock,
             mark_member_done=mark_done_mock,
@@ -8485,6 +8486,7 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         wf_config.max_amendment_rounds = 1
         wf_config.lock_depth = 2
         wf_config.steward_completion_timeout = 300.0
+        wf_config.git.branch_prefix = 'task/'
 
         workflow = TaskWorkflow(
             assignment=assignment,
@@ -8531,7 +8533,7 @@ class TestWorkflowSubmitUsesEnqueueHelper:
         assert call_queue is merge_queue_mock
         assert isinstance(call_req, MergeRequest)
         assert call_req.task_id == '42'
-        assert call_req.branch == 'task/42'
+        assert call_req.branch.full_name == 'task/42'
         assert call_es is event_store_mock
 
 
@@ -8564,6 +8566,7 @@ class TestEscalationServerUsesEnqueueHelper:
         _spec2 = pydantic_spec(OrchestratorConfig)
         stub_config = MagicMock(spec_set=_spec2)
         stub_config._module_configs = {}
+        stub_config.git.branch_prefix = 'task/'
 
         # Mock resolves the future so the tool doesn't hang
         async def _mock_enqueue(queue, req, es, **kwargs):
@@ -8592,7 +8595,7 @@ class TestEscalationServerUsesEnqueueHelper:
         assert call_queue is merge_queue
         assert isinstance(call_req, MergeRequest)
         assert call_req.task_id == '9'
-        assert call_req.branch == 'task/9'
+        assert call_req.branch.full_name == 'task/9'
         assert call_es is event_store
 
 
@@ -10804,7 +10807,7 @@ class TestGroupMergeRequestDataclass:
         mark_done_mock = AsyncMock()
         return GroupMergeRequest(
             task_id='tip-task',
-            branch='tip-branch',
+            branch=QueuedBranch.parse('tip-branch', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -10813,7 +10816,7 @@ class TestGroupMergeRequestDataclass:
             result=future,
             train_id='train-42',
             member_task_ids=['task-a', 'task-b', 'task-c'],
-            tip_branch='tip-branch',
+            tip_branch=QueuedBranch.parse('tip-branch', config.git.branch_prefix),
             tip_task_id='tip-task',
             status_check=status_check_mock,
             mark_member_done=mark_done_mock,
@@ -10834,7 +10837,7 @@ class TestGroupMergeRequestDataclass:
     ):
         req = self._make_instance(config, tmp_path)
         assert req.task_id == 'tip-task'
-        assert req.branch == 'tip-branch'
+        assert req.branch.bare_id == 'tip-branch'
         assert req.worktree == tmp_path
         assert req.pre_rebased is False
         assert req.task_files is None
@@ -10847,7 +10850,7 @@ class TestGroupMergeRequestDataclass:
         req = self._make_instance(config, tmp_path)
         assert req.train_id == 'train-42'
         assert req.member_task_ids == ['task-a', 'task-b', 'task-c']
-        assert req.tip_branch == 'tip-branch'
+        assert req.tip_branch.bare_id == 'tip-branch'
         assert req.tip_task_id == 'tip-task'
 
     def test_callback_fields_callable(
@@ -10933,7 +10936,7 @@ async def _make_stacked_train(
 
     return GroupMergeRequest(
         task_id=c_name,
-        branch=c_name,
+        branch=QueuedBranch.parse(c_name, config.git.branch_prefix),
         worktree=wt_c_path,
         pre_rebased=False,
         task_files=None,
@@ -10942,7 +10945,7 @@ async def _make_stacked_train(
         result=future,
         train_id=train_id,
         member_task_ids=[a_name, b_name, c_name],
-        tip_branch=c_name,
+        tip_branch=QueuedBranch.parse(c_name, config.git.branch_prefix),
         tip_task_id=c_name,
         status_check=status_check,
         mark_member_done=mark_member_done,
@@ -12270,7 +12273,7 @@ class TestCoalesceOrEnqueueRegistryOnly:
         primary_rec = TerminalOutcomeRecord(
             request_id=primary_request_id,
             task_id=req1.task_id,
-            branch=req1.branch,
+            branch=req1.branch.bare_id,
             state='done',
         )
         retention.record(primary_rec)
@@ -14679,7 +14682,7 @@ def _make_request_with_module_configs(
     future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -15081,7 +15084,7 @@ class TestFinalizeAdvancedMerge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='task-gate',
-            branch='task/t-gate',
+            branch=QueuedBranch.parse('task/t-gate', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -15140,7 +15143,7 @@ class TestFinalizeAdvancedMerge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='task-chain',
-            branch='task/t-chain',
+            branch=QueuedBranch.parse('task/t-chain', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -15199,7 +15202,7 @@ class TestFinalizeAdvancedMerge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='task-event',
-            branch='task/t-event',
+            branch=QueuedBranch.parse('task/t-event', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -15273,10 +15276,10 @@ class TestFinalizeAdvancedMerge:
 
         git_ops = self._make_git_ops()
         req = self._make_req()
-        req.branch = 'task/t-done-pop'
+        req.branch = QueuedBranch.parse('task/t-done-pop', config.git.branch_prefix)
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        counts: dict[str, int] = {'task/t-done-pop': 1}
+        counts: dict[str, int] = {'t-done-pop': 1}
         chain_ctx = _GenerationChainContext(
             queue=queue, counts=counts, max_auto_generations=2,
         )
@@ -15299,7 +15302,7 @@ class TestFinalizeAdvancedMerge:
             )
 
         assert outcome.status == 'done'
-        assert 'task/t-done-pop' not in counts  # popped on clean landing
+        assert 't-done-pop' not in counts  # popped on clean landing
 
     async def _run_chaining_driver(
         self, tmp_path: Path, config: OrchestratorConfig,
@@ -15309,7 +15312,7 @@ class TestFinalizeAdvancedMerge:
 
         Replicates the setup from test_chain_ctx_superset_advance_returns_superseded_and_enqueues.
         After this returns:
-        - counts['task/t-chain'] == 1 (incremented by _maybe_auto_chain_generation)
+        - counts['t-chain'] == 1 (incremented by _maybe_auto_chain_generation)
         - queue.qsize() == 1 (gen_next request enqueued)
         - gen_next = queue.get_nowait() has its own result future
 
@@ -15328,7 +15331,7 @@ class TestFinalizeAdvancedMerge:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='task-chain',
-            branch='task/t-chain',
+            branch=QueuedBranch.parse('task/t-chain', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -15365,7 +15368,7 @@ class TestFinalizeAdvancedMerge:
 
         assert outcome.status == 'superseded', f'driver: expected superseded; got {outcome.status!r}'
         assert queue.qsize() == 1, f'driver: expected 1 item on queue; got {queue.qsize()}'
-        assert counts.get('task/t-chain') == 1, (
+        assert counts.get('t-chain') == 1, (
             f'driver: expected counts[task/t-chain]==1; got {counts!r}'
         )
         gen_next = queue.get_nowait()
@@ -15389,7 +15392,7 @@ class TestFinalizeAdvancedMerge:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        assert 'task/t-chain' not in counts, (
+        assert 't-chain' not in counts, (
             f'blocked terminal must pop the chain counter; counts={counts!r}'
         )
 
@@ -15406,7 +15409,7 @@ class TestFinalizeAdvancedMerge:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        assert 'task/t-chain' not in counts, (
+        assert 't-chain' not in counts, (
             f'cancellation must pop the chain counter; counts={counts!r}'
         )
 
@@ -15429,7 +15432,7 @@ class TestFinalizeAdvancedMerge:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        assert counts.get('task/t-chain') == 1, (
+        assert counts.get('t-chain') == 1, (
             f"superseded must NOT pop the chain counter (lineage continues); counts={counts!r}"
         )
 
@@ -15463,7 +15466,7 @@ class TestFinalizeAdvancedMerge:
             await asyncio.sleep(0)
 
         # _cleanup_chain_counter must have fired: counter popped.
-        assert 'task/t-chain' not in counts, (
+        assert 't-chain' not in counts, (
             f'coexistence: _cleanup_chain_counter did not fire; counts={counts!r}'
         )
         # _on_finalized must have fired: retention recorded the outcome.
@@ -15475,7 +15478,7 @@ class TestFinalizeAdvancedMerge:
         assert rec.state == 'blocked', (
             f'coexistence: retention recorded wrong state; got {rec.state!r}'
         )
-        assert rec.branch == 'task/t-chain', (
+        assert rec.branch == 't-chain', (
             f'coexistence: retention recorded wrong branch; got {rec.branch!r}'
         )
 
@@ -17275,7 +17278,7 @@ class TestRegisterAndEnqueue:
         assert stored is not None
         assert stored.state == 'done'
         assert stored.merge_sha == 'rae1'
-        assert stored.branch == req.branch
+        assert stored.branch == req.branch.bare_id
         assert stored.task_id == req.task_id
 
         # merge_finalized row must exist in the event store
@@ -17306,7 +17309,7 @@ class TestSnapshotEntryRequestId:
 
         req = MergeRequest(
             task_id='T1630',
-            branch='T1630',
+            branch=QueuedBranch.parse('T1630', config.git.branch_prefix),
             worktree=tmp_path / 'wt',
             pre_rebased=False,
             task_files=None,
@@ -18034,7 +18037,7 @@ class TestMaybeAutoChainGeneration:
         fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         return MergeRequest(
             task_id='t1',
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -18138,7 +18141,7 @@ class TestMaybeAutoChainGeneration:
         assert chained.task_id == req.task_id
         assert result.superseded_by == chained.request_id
         # counts incremented
-        assert counts[req.branch] == 1
+        assert counts[req.branch.bare_id] == 1
 
     async def test_divergent_resolves_to_superset_chains(
         self, tmp_path: Path, config: OrchestratorConfig,
@@ -18222,7 +18225,7 @@ class TestMaybeAutoChainGeneration:
         git_ops.project_root = tmp_path
         event_store = MagicMock()
         # Pre-populate counter at max
-        counts: dict[str, int] = {'task/t-bound': 2}
+        counts: dict[str, int] = {'t-bound': 2}
 
         with (
             patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead777\n', ''))),
@@ -18242,7 +18245,7 @@ class TestMaybeAutoChainGeneration:
         assert '2' in result.reason  # mentions the bound
         assert queue.empty()  # NO new request enqueued
         # Counter reset (popped)
-        assert 'task/t-bound' not in counts
+        assert 't-bound' not in counts
 
     async def test_consecutive_sequence_first_two_chain_third_escalates(
         self, tmp_path: Path, config: OrchestratorConfig,
@@ -18271,7 +18274,7 @@ class TestMaybeAutoChainGeneration:
                 merged_branch_tip='old0', counts=counts, queue=queue, max_auto_generations=2,
             )
             assert r1 is not None and r1.status == 'superseded'
-            assert counts.get('task/t-seq') == 1
+            assert counts.get('t-seq') == 1
             _ = queue.get_nowait()  # drain
 
             # Second advance → chain
@@ -18280,7 +18283,7 @@ class TestMaybeAutoChainGeneration:
                 merged_branch_tip='head1', counts=counts, queue=queue, max_auto_generations=2,
             )
             assert r2 is not None and r2.status == 'superseded'
-            assert counts.get('task/t-seq') == 2
+            assert counts.get('t-seq') == 2
             _ = queue.get_nowait()  # drain
 
             # Third advance → escalate
@@ -18290,7 +18293,7 @@ class TestMaybeAutoChainGeneration:
             )
             assert r3 is not None and r3.status == 'blocked'
             assert queue.empty()
-            assert 'task/t-seq' not in counts  # reset
+            assert 't-seq' not in counts  # reset
 
     async def test_retention_seam_chained_request_gets_recorded(
         self, tmp_path: Path, config: OrchestratorConfig,
@@ -18411,7 +18414,7 @@ class TestMergeWorkerGenerationChain:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='wt-1',
-            branch='task/wt-branch',
+            branch=QueuedBranch.parse('task/wt-branch', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -18512,7 +18515,7 @@ class TestSMWGenerationChain:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         req = MergeRequest(
             task_id='smw-wt',
-            branch='task/smw-branch',
+            branch=QueuedBranch.parse('task/smw-branch', config.git.branch_prefix),
             worktree=tmp_path,
             pre_rebased=False,
             task_files=None,
@@ -18719,7 +18722,7 @@ class TestBoundaryTableWorkerEntry:
         # MergeRequest's result IS the primary future that registry acquires
         req = MergeRequest(
             task_id=bt9_branch,
-            branch=bt9_branch,
+            branch=QueuedBranch.parse(bt9_branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -18823,7 +18826,7 @@ class TestBoundaryTableWorkerEntry:
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
             return MergeRequest(
                 task_id='t11',
-                branch='task/t11',
+                branch=QueuedBranch.parse('task/t11', config.git.branch_prefix),
                 worktree=tmp_path,
                 pre_rebased=False,
                 task_files=None,
@@ -18860,7 +18863,7 @@ class TestBoundaryTableWorkerEntry:
         req2 = queue.get_nowait()
         assert req2.generation == 2, f'gen-2 request must have generation=2, got: {req2.generation}'
         assert req2.request_id == gen2_rid, f'request_id must match superseded_by: {req2.request_id!r}'
-        assert counts['task/t11'] == 1, f'counts must be 1 after first advance: {counts}'
+        assert counts['t11'] == 1, f'counts must be 1 after first advance: {counts}'
 
         # ── Second advance: gen-2 SUPERSET → superseded, enqueues gen-3 ──
         with (
@@ -18878,7 +18881,7 @@ class TestBoundaryTableWorkerEntry:
         assert result2 is not None and result2.status == 'superseded', (
             f'gen-2 must be superseded, got: {result2}'
         )
-        assert counts['task/t11'] == 2, f'counts must be 2 after second advance: {counts}'
+        assert counts['t11'] == 2, f'counts must be 2 after second advance: {counts}'
 
         # ── Third advance: counts at MAX → escalate, returns blocked ─────
         req3 = queue.get_nowait()
@@ -18903,7 +18906,7 @@ class TestBoundaryTableWorkerEntry:
             f'blocked reason must start with POST_MERGE_EQUIVALENCE_FAILED prefix: {result3.reason!r}'
         )
         # counts reset after bound exceeded
-        assert counts.get('task/t11', 0) == 0, (
+        assert counts.get('t11', 0) == 0, (
             f'counts must be reset after bound-exceeded, got: {counts}'
         )
 
@@ -19835,7 +19838,7 @@ class TestSoftCancelMidVerify:
             One asyncio.sleep(0) tick ensures the done-callback fires so
             retention records 'abandoned' before the mock returns.
             """
-            registry.detach(req.branch, req.request_id)
+            registry.detach(req.branch.bare_id, req.request_id)
             # Yield one tick so the done-callback fires.
             await asyncio.sleep(0)
             from orchestrator.merge_queue import MergeOutcome as _MO  # noqa: PLC0415
@@ -19944,7 +19947,7 @@ class TestSoftCancelMidVerify:
             await asyncio.wait_for(verify_started.wait(), timeout=5)
 
             # Simulate sole-waiter detach: cancels req.result.
-            registry.detach(req.branch, req.request_id)
+            registry.detach(req.branch.bare_id, req.request_id)
 
             # Sleep > 2 poll cycles (0.05 s >> 2 × 0.01 s).
             await asyncio.sleep(0.05)
@@ -20089,7 +20092,7 @@ class TestSoftCancelMidVerify:
         )
 
         # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
-        registry.detach(req.branch, req.request_id)
+        registry.detach(req.branch.bare_id, req.request_id)
         await asyncio.sleep(0)  # let _on_finalized fire
         assert req.result.cancelled()
         _rec_b = retention.get(req.request_id)
@@ -20154,7 +20157,7 @@ class TestSoftCancelMidVerify:
         )
 
         # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
-        registry.detach(req.branch, req.request_id)
+        registry.detach(req.branch.bare_id, req.request_id)
         await asyncio.sleep(0)  # let _on_finalized fire
         assert req.result.cancelled()
         _rec_d = retention.get(req.request_id)
@@ -21800,7 +21803,7 @@ class TestSpeculationPermitLeakOnMergerError:
         original_merge = git_ops.merge_to_main
 
         async def _patched_merge(worktree, branch, **kwargs):
-            if branch == 'leak-wm-n1':
+            if branch == 'task/leak-wm-n1':
                 raise WorktreeMissing(worktree)
             return await original_merge(worktree, branch, **kwargs)
 
@@ -21868,7 +21871,7 @@ class TestSpeculationPermitLeakOnMergerError:
         original_merge = git_ops.merge_to_main
 
         async def _patched_merge(worktree, branch, **kwargs):
-            if branch == 'leak-ex-n1':
+            if branch == 'task/leak-ex-n1':
                 raise RuntimeError('Simulated unexpected merger error for N+1')
             return await original_merge(worktree, branch, **kwargs)
 
@@ -23000,7 +23003,7 @@ class TestEntryPhaseDuringFinalize:
         branch = 'ep-finalize-a'
         wt = await _make_branch_with_file(git_ops, branch, 'ep_a.py', 'x=1\n')
         req = MergeRequest(
-            task_id=branch, branch=branch, worktree=wt, pre_rebased=False,
+            task_id=branch, branch=QueuedBranch.parse(branch, config.git.branch_prefix), worktree=wt, pre_rebased=False,
             task_files=None, module_configs=[], config=config,
             result=asyncio.get_running_loop().create_future(), lane='normal',
         )

@@ -118,7 +118,7 @@ def test_merge_queue_reexports_identical_objects() -> None:
 
     request = merge_queue.MergeRequest(
         task_id='t1',
-        branch='591',
+        branch=merge_queue.QueuedBranch.parse('591', 'task/'),
         worktree=Path('/tmp/wt'),
         pre_rebased=False,
         task_files=None,
@@ -127,7 +127,7 @@ def test_merge_queue_reexports_identical_objects() -> None:
         result=make_placeholder_future(),
     )
     assert request.task_id == 't1'
-    assert request.branch == '591'
+    assert request.branch.bare_id == '591'
 
 
 class TestQueuedBranch:

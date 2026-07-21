@@ -46,6 +46,7 @@ from orchestrator.merge_queue import (
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -116,7 +117,7 @@ def _make_request(
     """Build a MergeRequest with a fresh Future for the running event loop."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -917,12 +918,12 @@ class TestCascadeErrorChokepoint:
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='rrcas-a', branch='task/rrcas-a', worktree=wt_a,
+            task_id='rrcas-a', branch=QueuedBranch.parse('task/rrcas-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='rrcas-b', branch='task/rrcas-b', worktree=wt_b,
+            task_id='rrcas-b', branch=QueuedBranch.parse('task/rrcas-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
@@ -987,7 +988,7 @@ class TestCascadeErrorChokepoint:
                 git_ops, 'task/rrcas-c', 'rrcas_c.py', 'c = 3\n'
             )
             req_c = MergeRequest(
-                task_id='rrcas-c', branch='task/rrcas-c', worktree=wt_c,
+                task_id='rrcas-c', branch=QueuedBranch.parse('task/rrcas-c', config.git.branch_prefix), worktree=wt_c,
                 pre_rebased=False, task_files=None, module_configs=[],
                 config=config, result=event_loop.create_future(), lane='normal',
             )
@@ -1126,12 +1127,12 @@ class TestCascadeErrorChokepoint:
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='rrcdc-a', branch='task/rrcdc-a', worktree=wt_a,
+            task_id='rrcdc-a', branch=QueuedBranch.parse('task/rrcdc-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='rrcdc-b', branch='task/rrcdc-b', worktree=wt_b,
+            task_id='rrcdc-b', branch=QueuedBranch.parse('task/rrcdc-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
@@ -1202,7 +1203,7 @@ class TestCascadeErrorChokepoint:
                 git_ops, 'task/rrcdc-c', 'rrcdc_c.py', 'c = 3\n'
             )
             req_c = MergeRequest(
-                task_id='rrcdc-c', branch='task/rrcdc-c', worktree=wt_c,
+                task_id='rrcdc-c', branch=QueuedBranch.parse('task/rrcdc-c', config.git.branch_prefix), worktree=wt_c,
                 pre_rebased=False, task_files=None, module_configs=[],
                 config=config, result=event_loop.create_future(), lane='normal',
             )
@@ -1299,12 +1300,12 @@ class TestCascadeErrorChokepoint:
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='rrcr-a', branch='task/rrcr-a', worktree=wt_a,
+            task_id='rrcr-a', branch=QueuedBranch.parse('task/rrcr-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='rrcr-b', branch='task/rrcr-b', worktree=wt_b,
+            task_id='rrcr-b', branch=QueuedBranch.parse('task/rrcr-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
@@ -1354,7 +1355,7 @@ class TestCascadeErrorChokepoint:
                 git_ops, 'task/rrcr-c', 'rrcr_c.py', 'c = 3\n'
             )
             req_c = MergeRequest(
-                task_id='rrcr-c', branch='task/rrcr-c', worktree=wt_c,
+                task_id='rrcr-c', branch=QueuedBranch.parse('task/rrcr-c', config.git.branch_prefix), worktree=wt_c,
                 pre_rebased=False, task_files=None, module_configs=[],
                 config=config, result=event_loop.create_future(), lane='normal',
             )
@@ -1461,12 +1462,12 @@ class TestCascadeErrorChokepoint:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='rrhalt-a', branch='task/rrhalt-a', worktree=wt_a,
+            task_id='rrhalt-a', branch=QueuedBranch.parse('task/rrhalt-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='rrhalt-b', branch='task/rrhalt-b', worktree=wt_b,
+            task_id='rrhalt-b', branch=QueuedBranch.parse('task/rrhalt-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )

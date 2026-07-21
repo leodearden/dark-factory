@@ -28,6 +28,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     _do_train_merge,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Helpers shared by both test classes
@@ -93,7 +94,7 @@ def _make_group_req(
 
     return GroupMergeRequest(
         task_id=task_id,
-        branch=task_id,
+        branch=QueuedBranch.parse(task_id, 'task/'),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -102,7 +103,7 @@ def _make_group_req(
         result=future,
         train_id=train_id,
         member_task_ids=members,
-        tip_branch=task_id,
+        tip_branch=QueuedBranch.parse(task_id, 'task/'),
         tip_task_id=task_id,
         status_check=status_check,
         mark_member_done=mark_member_done,
@@ -244,6 +245,7 @@ class TestReverifyMemberSoloContract:
         solo_branch = '_solo-b2'
         tip_sha = 'cafe1234solo'
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'
 
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
@@ -278,6 +280,7 @@ class TestReverifyMemberSoloContract:
         solo_branch = '_solo-b1'
         tip_sha = 'dead1234solo'
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'
 
         fail_outcome = MergeOutcome(
             'blocked',
@@ -323,6 +326,7 @@ class TestReverifyMemberSoloContract:
         solo_wt = Path('/tmp/fake-solo-wt-pass')
         solo_branch = '_solo-b2'
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'
 
         with patch(
             'orchestrator.merge_queue._run_post_merge_verify',
@@ -360,6 +364,7 @@ class TestReverifyMemberSoloContract:
         solo_wt = Path('/tmp/fake-solo-wt-fail')
         solo_branch = '_solo-b1'
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'
 
         fail_outcome = MergeOutcome('blocked', reason='tests failed', failure_category='x')
 

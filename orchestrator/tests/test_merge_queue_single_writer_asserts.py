@@ -59,6 +59,7 @@ from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import InflightEntry, MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_types import QueuedBranch
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 #
@@ -147,7 +148,7 @@ def _make_req(
     """
     return MergeRequest(
         task_id='t-1',
-        branch='task/t-1',
+        branch=QueuedBranch.parse('task/t-1', config.git.branch_prefix),
         worktree=tmp_path,
         pre_rebased=False,
         task_files=None,
@@ -523,7 +524,7 @@ def _make_e2e_request(
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

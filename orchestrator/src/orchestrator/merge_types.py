@@ -631,16 +631,16 @@ class QueuedBranch:
     field value (and hash identically), regardless of which shape the raw
     input arrived in.
 
-    This type has no production consumer yet: it is deliberately the
-    *producer half* of ``plans/merge-queue-reliability-prd.md`` scope 5
-    (task μ; boundary test B9). The consumer half — repointing
-    :attr:`MergeRequest.branch` (below) onto ``QueuedBranch``, building refs
-    from ``.full_name``, and deleting ``canonical_queued_branch_name``, the
-    try-both ``resolve_queued_branch_ref``, and the ``merge_queue_store``
-    journal strip/re-add — is the PRD's next spine task (task ν, prereq: μ;
-    see PRD lines 218-220). Until ν lands, do not add further ad hoc
-    prefix-stripping/prepending call sites; route them through
-    :meth:`parse` instead.
+    Consumed in production as of task ν (``plans/merge-queue-reliability-prd.md``
+    scope 5): :attr:`MergeRequest.branch` and :attr:`GroupMergeRequest.tip_branch`
+    are typed ``QueuedBranch``, parsed at every construction boundary; consumers
+    build git refs from ``.full_name`` and bookkeeping keys from ``.bare_id``.
+    ν narrowed the original spec — ``canonical_queued_branch_name`` (this type's
+    delegate) and ``GitOps.resolve_queued_branch_ref``'s try-both are RETAINED
+    (still load-bearing for raw-input and str-branch callers); only the
+    orchestrator-internal journal strip/re-add and re-exports were removed. Do
+    not add further ad hoc prefix-stripping/prepending call sites; route them
+    through :meth:`parse` instead.
     """
 
     bare_id: str
@@ -713,7 +713,7 @@ class MergeRequest:
     """A request to merge a task branch into main."""
 
     task_id: str
-    branch: str  # e.g. "591" — without the task/ prefix; becomes QueuedBranch at task ν (PRD scope 5, plans/merge-queue-reliability-prd.md:218)
+    branch: QueuedBranch  # typed branch identity (task ν, PRD scope 5); .bare_id == the old bare "591", .full_name == the old f'{prefix}591'
     worktree: Path
     pre_rebased: bool
     task_files: list[str] | None
@@ -819,7 +819,7 @@ class GroupMergeRequest(MergeRequest):
     member_task_ids: list[str]
     """Ordered list of task IDs from root to tip (inclusive)."""
 
-    tip_branch: str
+    tip_branch: QueuedBranch
     """Branch name of the tip task (alias of ``branch``)."""
 
     tip_task_id: str

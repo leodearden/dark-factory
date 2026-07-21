@@ -1553,6 +1553,7 @@ class TestMaybeScheduleShadowCompare:
 from orchestrator.merge_queue import (  # noqa: E402
     MergeOutcome,
     MergeRequest,
+    QueuedBranch,
     SpeculativeMergeWorker,
 )
 
@@ -1728,7 +1729,7 @@ def _make_smw_req(task_id: str, branch: str, worktree: Path, config: Orchestrato
         fut = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

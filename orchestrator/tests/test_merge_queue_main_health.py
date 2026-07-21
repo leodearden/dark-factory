@@ -27,6 +27,7 @@ from orchestrator.merge_queue import (
     _MainHealthProbeHandles,
     _run_post_merge_verify,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
@@ -95,7 +96,7 @@ def _make_req(
     future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=f'task/{task_id}',
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

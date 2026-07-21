@@ -36,6 +36,7 @@ from orchestrator.merge_queue import (
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
+    QueuedBranch,
     RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
@@ -106,7 +107,7 @@ def _make_req(
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,

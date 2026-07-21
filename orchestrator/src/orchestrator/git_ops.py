@@ -56,7 +56,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
-from shared.branch_names import canonical_queued_branch_name  # noqa: F401
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,

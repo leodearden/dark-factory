@@ -26,6 +26,7 @@ from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Step 1 / Step 2 — worker-side surface
@@ -105,7 +106,7 @@ class TestRealTaskFlip:
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         req = GroupMergeRequest(
             task_id='4442',
-            branch='4442',
+            branch=QueuedBranch.parse('4442', 'task/'),
             worktree=MagicMock(),
             pre_rebased=False,
             task_files=None,
@@ -114,7 +115,7 @@ class TestRealTaskFlip:
             result=future,
             train_id='train-xyz',
             member_task_ids=['4442'],
-            tip_branch='4442',
+            tip_branch=QueuedBranch.parse('4442', 'task/'),
             tip_task_id='4442',
             status_check=cbs.status_check,
             mark_member_done=cbs.mark_member_done,

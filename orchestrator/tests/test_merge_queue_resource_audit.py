@@ -57,7 +57,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
-from orchestrator.merge_types import MergeRequest
+from orchestrator.merge_types import MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -1047,7 +1047,7 @@ def _make_request(task_id: str, branch: str, worktree: Path) -> MergeRequest:
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, 'task/'),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
