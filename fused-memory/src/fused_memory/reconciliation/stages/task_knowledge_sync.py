@@ -70,6 +70,7 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+    select_done_since_boundary,
 )
 from fused_memory.services.live_workflow_detector import detect_live_workflow
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
@@ -1929,6 +1930,16 @@ class TaskKnowledgeSync(BaseStage):
     # Minimum number of tasks to proactively spot-check each run
     MIN_TASK_SAMPLE: int = 5
 
+    # Defensive render cap for the since-boundary Done-Task Completion-Memory
+    # Audit section.  The audit is meant to cover EVERY done task since the last
+    # cycle, but a pathological gap between cycles (or a first-cycle None
+    # boundary that admits the full done history) could otherwise grow the prompt
+    # unboundedly.  When the audit list exceeds this cap the section renders the
+    # most-recent MAX_DONE_AUDIT_RENDERED and appends an explicit overflow note
+    # (never a silent truncation) plus a WARNING log — per the project's
+    # no-silent-caps principle.
+    MAX_DONE_AUDIT_RENDERED: int = 60
+
     # Current reconciliation run_id — set by run() so assemble_payload can use
     # it for stale-flag persistence markers (FIX D).
     # Sentinel None means run() has not yet been called; assemble_payload raises
@@ -2472,6 +2483,59 @@ class TaskKnowledgeSync(BaseStage):
                 f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
             )
 
+        # Done-Task Completion-Memory Audit — enumerate EVERY task that
+        # transitioned to `done` since the prior successful cycle boundary
+        # (watermark.last_full_run_completed) via an updatedAt-window scan over
+        # the UNCAPPED filtered.all_done_tasks.  This supersedes reliance on the
+        # 5-item Proactive Task Sample for done-task completion-memory coverage,
+        # which systematically missed done tasks as throughput grew (the sample
+        # sorts done tasks last, so they rarely survive the top-5 cut).  Gated on
+        # `not self.remediation_mode` — mirrors proactive_sample_section
+        # (remediation is a focused second pass, not general sync).
+        done_audit_section = ''
+        if not self.remediation_mode:
+            boundary = watermark.last_full_run_completed
+            audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
+            total_audit = len(audit_tasks)
+            boundary_label = (
+                boundary.isoformat()
+                if boundary is not None
+                else 'no prior full-run boundary (first cycle — all done tasks in scope)'
+            )
+            # Defensive render cap: never a silent truncation.  select_done_since_boundary
+            # sorts most-recent-first (and parse-failures to the front), so a clip
+            # drops only the oldest tasks, and the note + WARNING log make the
+            # clipped coverage explicit (no-silent-caps principle).
+            rendered_audit = audit_tasks
+            overflow_note = ''
+            if total_audit > self.MAX_DONE_AUDIT_RENDERED:
+                rendered_audit = audit_tasks[: self.MAX_DONE_AUDIT_RENDERED]
+                omitted = total_audit - self.MAX_DONE_AUDIT_RENDERED
+                overflow_note = (
+                    f'\n_NOTE: {omitted} additional done task(s) since the boundary were '
+                    f'omitted from this render by the MAX_DONE_AUDIT_RENDERED='
+                    f'{self.MAX_DONE_AUDIT_RENDERED} cap. Coverage was clipped — NOT complete '
+                    f'this cycle; the oldest since-boundary tasks were dropped first._'
+                )
+                logger.warning(
+                    'reconciliation.done_task_audit_render_capped',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': self._current_run_id,
+                        'total_since_boundary': total_audit,
+                        'rendered': self.MAX_DONE_AUDIT_RENDERED,
+                        'omitted': omitted,
+                        'boundary': boundary_label,
+                    },
+                )
+            done_audit_section = (
+                f'\n### Done-Task Completion-Memory Audit '
+                f'({total_audit} since last cycle)\n'
+                f'Boundary (last full-run completed): {boundary_label}\n'
+                f'{format_task_list(rendered_audit)}\n'
+                f'{overflow_note}'
+            )
+
         # Live-Workflow Signals section: check active tasks for live workflows so the
         # Stage 2 LLM can skip set_task_status / stranded-work escalation for those tasks.
         # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
@@ -2784,7 +2848,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{hint_conversion_section}{live_workflow_section}
+{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{live_workflow_section}
 
 ## Your Task
 Reconcile task state against memory:

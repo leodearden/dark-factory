@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 
@@ -21,6 +22,7 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+    select_done_since_boundary,
     select_visible_active,
     summarize_statuses,
 )
@@ -4054,3 +4056,186 @@ class TestNonterminalCompletionClaimTaskIds:
             f'Expected the probe to NEVER be called when there is no completion '
             f'claim, got calls={probe.calls!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 1: select_done_since_boundary helper (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestSelectDoneSinceBoundary:
+    """RED tests for select_done_since_boundary(done_tasks, boundary) (step-1).
+
+    The helper enumerates the done tasks that transitioned since a cycle
+    boundary via an ``updatedAt``-window scan.  Its failure mode must be
+    "audit an extra task" (over-inclusion), never "silently skip one":
+    tasks whose ``updatedAt`` is missing/unparseable are INCLUDED, and a
+    ``None`` boundary (first cycle) returns every provided done task.
+    Results are always most-recent-first (updatedAt desc, id desc tiebreak).
+    """
+
+    @staticmethod
+    def _done(tid: int, updated: str | None) -> dict:
+        t: dict = {
+            'id': tid,
+            'title': f'Task {tid}',
+            'status': 'done',
+            'dependencies': [],
+        }
+        if updated is not None:
+            t['updatedAt'] = updated
+        return t
+
+    def test_excludes_tasks_updated_before_boundary(self):
+        """Only tasks with updatedAt >= boundary are returned; strictly-before is excluded."""
+        boundary = datetime(2026, 7, 14, 10, 0, 0, tzinfo=UTC)
+        after = self._done(100, '2026-07-14T11:00:00+00:00')
+        before = self._done(101, '2026-07-14T09:00:00+00:00')
+
+        result = select_done_since_boundary([after, before], boundary)
+
+        ids = [t['id'] for t in result]
+        assert 100 in ids, 'a task updated after the boundary must be included'
+        assert 101 not in ids, 'a task updated strictly before the boundary must be excluded'
+
+    def test_includes_task_updated_exactly_at_boundary(self):
+        """A task updated exactly at the boundary is included (>= comparison)."""
+        boundary = datetime(2026, 7, 14, 10, 0, 0, tzinfo=UTC)
+        at = self._done(100, '2026-07-14T10:00:00+00:00')
+
+        result = select_done_since_boundary([at], boundary)
+
+        assert [t['id'] for t in result] == [100]
+
+    def test_sorted_most_recent_first_with_id_desc_tiebreak(self):
+        """Results are updatedAt-desc, with id-desc as the tiebreak for equal timestamps."""
+        boundary = datetime(2026, 7, 1, 0, 0, 0, tzinfo=UTC)
+        older = self._done(50, '2026-07-10T00:00:00+00:00')
+        newer = self._done(51, '2026-07-12T00:00:00+00:00')
+        # same-timestamp pair to exercise the id-desc tiebreak
+        tie_lo = self._done(60, '2026-07-11T00:00:00+00:00')
+        tie_hi = self._done(61, '2026-07-11T00:00:00+00:00')
+
+        result = select_done_since_boundary([older, tie_lo, newer, tie_hi], boundary)
+
+        ids = [t['id'] for t in result]
+        assert ids == [51, 61, 60, 50], (
+            f'Expected most-recent-first with id-desc tiebreak [51,61,60,50], got {ids}'
+        )
+
+    def test_trailing_z_timestamps_parse(self):
+        """Trailing-`Z` ISO-8601 timestamps parse correctly for the window comparison."""
+        boundary = datetime(2026, 7, 14, 0, 0, 0, tzinfo=UTC)
+        z_after = self._done(100, '2026-07-14T10:22:13.096Z')
+        z_before = self._done(101, '2026-07-13T10:22:13.096Z')
+
+        result = select_done_since_boundary([z_after, z_before], boundary)
+
+        ids = [t['id'] for t in result]
+        assert 100 in ids, 'trailing-Z timestamp after boundary must parse and be included'
+        assert 101 not in ids, 'trailing-Z timestamp before boundary must parse and be excluded'
+
+    def test_missing_or_unparseable_updated_at_included(self):
+        """Missing/unparseable/empty updatedAt → INCLUDED (fail-safe over-inclusion)."""
+        boundary = datetime(2026, 7, 14, 0, 0, 0, tzinfo=UTC)
+        missing = self._done(200, None)  # no updatedAt key at all
+        unparseable = self._done(201, 'not-a-date')
+        empty = self._done(202, '')
+        old_but_present = self._done(203, '2026-01-01T00:00:00+00:00')  # legitimately excluded
+
+        result = select_done_since_boundary(
+            [missing, unparseable, empty, old_but_present], boundary
+        )
+
+        ids = [t['id'] for t in result]
+        assert 200 in ids, 'missing updatedAt must be included (fail-safe)'
+        assert 201 in ids, 'unparseable updatedAt must be included (fail-safe)'
+        assert 202 in ids, 'empty updatedAt must be included (fail-safe)'
+        assert 203 not in ids, 'a parseable pre-boundary task is still excluded'
+
+    def test_boundary_none_returns_all_recency_sorted(self):
+        """boundary=None (first cycle) returns every provided done task, recency-sorted."""
+        older = self._done(50, '2026-07-10T00:00:00+00:00')
+        newer = self._done(51, '2026-07-12T00:00:00+00:00')
+
+        result = select_done_since_boundary([older, newer], None)
+
+        ids = [t['id'] for t in result]
+        assert set(ids) == {50, 51}, 'boundary=None must return all provided done tasks'
+        assert ids == [51, 50], 'boundary=None result must still be most-recent-first'
+
+    def test_naive_boundary_treated_as_utc(self):
+        """A naive boundary must not raise — it is normalized to UTC (mirrors _assume_utc)."""
+        boundary = datetime(2026, 7, 14, 10, 0, 0)  # naive (tzinfo=None)
+        after = self._done(100, '2026-07-14T11:00:00+00:00')
+        before = self._done(101, '2026-07-14T09:00:00+00:00')
+
+        result = select_done_since_boundary([after, before], boundary)
+
+        assert [t['id'] for t in result] == [100]
+
+    def test_empty_input_returns_empty_list(self):
+        """No done tasks → empty list regardless of boundary."""
+        boundary = datetime(2026, 7, 14, 10, 0, 0, tzinfo=UTC)
+        assert select_done_since_boundary([], boundary) == []
+        assert select_done_since_boundary([], None) == []
+
+
+# ---------------------------------------------------------------------------
+# Step 3: all_done_tasks uncapped field (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterTaskTreeAllDoneTasks:
+    """RED tests for the uncapped FilteredTaskTree.all_done_tasks field (step-3).
+
+    all_done_tasks must contain EVERY done task from the input (no cap), in
+    contrast to done_tasks which is capped at MAX_DONE_TASKS_RETAINED=30.  The
+    since-boundary completion-memory audit reads all_done_tasks so its coverage
+    does not silently shrink as task throughput grows past the 30-cap.
+    """
+
+    def test_all_done_tasks_is_uncapped(self):
+        """all_done_tasks holds every done task even when done_tasks caps at 30."""
+        n_done = MAX_DONE_TASKS_RETAINED + 5
+        done_tasks = [_make_task(i, 'done') for i in range(1, n_done + 1)]
+        # a couple of non-done tasks to prove all_done_tasks is done-only
+        extra = [_make_task(1000, 'pending'), _make_task(1001, 'cancelled')]
+        tasks_data = {'tasks': done_tasks + extra}
+
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == MAX_DONE_TASKS_RETAINED, (
+            f'done_tasks must stay capped at {MAX_DONE_TASKS_RETAINED}, '
+            f'got {len(result.done_tasks)}'
+        )
+        assert len(result.all_done_tasks) == n_done, (
+            f'all_done_tasks must be uncapped: expected {n_done}, '
+            f'got {len(result.all_done_tasks)}'
+        )
+        # all_done_tasks contains only done tasks
+        assert all(t.get('status') == 'done' for t in result.all_done_tasks), (
+            'all_done_tasks must contain done tasks only'
+        )
+        # every done id is present (no silent drop)
+        assert {t['id'] for t in result.all_done_tasks} == {t['id'] for t in done_tasks}
+
+    def test_all_done_tasks_defaults_to_empty_list(self):
+        """FilteredTaskTree.all_done_tasks defaults to [] and is independent per instance."""
+        tree1 = FilteredTaskTree()
+        tree2 = FilteredTaskTree()
+
+        assert hasattr(tree1, 'all_done_tasks')
+        assert tree1.all_done_tasks == []
+
+        # Mutating one instance's all_done_tasks must not affect the other
+        tree1.all_done_tasks.append({'id': 99, 'status': 'done'})
+        assert tree2.all_done_tasks == [], (
+            'Mutable default arg regression: tree2.all_done_tasks was affected by tree1 mutation'
+        )
+
+    def test_all_done_tasks_empty_for_no_done_tasks(self):
+        """all_done_tasks is [] when the input carries no done tasks."""
+        tasks_data = {'tasks': [_make_task(1, 'pending'), _make_task(2, 'cancelled')]}
+        result = filter_task_tree(tasks_data)
+        assert result.all_done_tasks == []

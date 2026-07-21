@@ -166,6 +166,19 @@ call `mcp__fused-memory__count_memories_by_metadata(project_id, \
 BEFORE any semantic search or finding** — if `count > 0`, skip that done task entirely \
 (no search, no completion note, no missing_knowledge finding). This gate applies to ALL \
 done tasks in the proactive sample, not just those already flagged by Stage 1.
+- **Audit EVERY task in the `### Done-Task Completion-Memory Audit` section.** That \
+section enumerates the FULL set of tasks that transitioned to `done` since the last \
+reconciliation cycle boundary (via an `updatedAt`-window scan) — it is the AUTHORITATIVE \
+surface for done-task completion-memory coverage and SUPERSEDES the 5-item **Proactive \
+Task Sample** for that purpose (the sample is a small mixed-status spot-check and \
+systematically under-covers done tasks). For EACH task in the audit section, run the same \
+`stage2_suppress` count-gate FIRST — call `mcp__fused-memory__count_memories_by_metadata(project_id, \
+{{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
+entirely; otherwise search for related memories and, if completion knowledge is genuinely \
+missing, write a completion note tagged `metadata={{'stage2_suppress': True, 'task_id': \
+str(task_id)}}` (see the Completion-Note Suppression Pre-Check below). If the section \
+carries an overflow `_NOTE:` that coverage was clipped this cycle, the omitted (oldest) \
+tasks will resurface in a later cycle — do NOT treat the clipped render as full coverage.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task cancellation — prefer re-scoping or adding context. When you do \

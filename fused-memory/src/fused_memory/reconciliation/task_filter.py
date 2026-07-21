@@ -22,6 +22,7 @@ import heapq
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
@@ -740,6 +741,13 @@ class FilteredTaskTree:
         parseable ids.  This field is independent of the done/cancelled/active
         render caps and provides ground truth for detecting partial/wrong-source
         bulk reads.
+    all_done_tasks: The FULL, UNCAPPED list of done task dicts from the input —
+        in contrast to ``done_tasks``, which is capped at MAX_DONE_TASKS_RETAINED=30
+        and sorted by id descending.  Populated by ``filter_task_tree`` at zero
+        extra cost from the same pre-cap ``done`` list.  Consumed by the Stage-2
+        since-boundary completion-memory audit (``select_done_since_boundary``) so
+        that audit's coverage does not silently shrink as done-task throughput
+        grows past the 30-cap.  Defaults to [] and is not rendered directly.
     """
 
     active_tasks: list[dict] = field(default_factory=list)
@@ -755,6 +763,7 @@ class FilteredTaskTree:
     other_count: int = 0
     total_count: int = 0
     max_task_id: int = 0
+    all_done_tasks: list[dict] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -862,7 +871,89 @@ def filter_task_tree(tasks_data: object) -> FilteredTaskTree:
         other_count=other_count,
         total_count=total,
         max_task_id=max_task_id,
+        # Uncapped full done list (the pre-cap list built above): the
+        # since-boundary completion-memory audit reads this instead of the
+        # 30-capped done_retained so its coverage does not shrink as throughput
+        # grows.  Costs nothing extra — a list of the same dict references.
+        all_done_tasks=done,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Done-task since-boundary window scan
+# --------------------------------------------------------------------------- #
+
+
+def _parse_task_updated_at(task: dict) -> datetime | None:
+    """Parse a task's ``updatedAt`` into a tz-aware UTC datetime, or None on failure.
+
+    Accepts ISO-8601 with a trailing ``Z`` (normalised to ``+00:00``) and
+    assumes UTC for a naive parsed value, mirroring the tolerant parse posture
+    of ``stages.task_knowledge_sync._marker_is_within_run_window`` / ``_assume_utc``.
+    Returns None when ``updatedAt`` is missing, non-string, empty, or unparseable,
+    so callers can apply a fail-open (over-include) policy.
+    """
+    raw = task.get('updatedAt')
+    if not isinstance(raw, str) or not raw:
+        return None
+    normalized = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except (ValueError, TypeError):
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def select_done_since_boundary(
+    done_tasks: Iterable[dict], boundary: datetime | None
+) -> list[dict]:
+    """Return the done tasks that transitioned since *boundary*, most-recent-first.
+
+    Enumerates the FULL set of done tasks whose ``updatedAt`` is at or after
+    *boundary* (the prior successful reconciliation cycle boundary — typically
+    ``Watermark.last_full_run_completed``), so the Stage-2 completion-memory
+    audit covers every task that reached ``done`` since the last cycle instead
+    of a small fixed sample.  Intended to consume the uncapped
+    ``FilteredTaskTree.all_done_tasks`` (not the 30-capped ``done_tasks``) so
+    the coverage does not silently shrink as task throughput grows.
+
+    The failure mode is deliberately over-inclusion, never a silent skip:
+
+    * A task whose ``updatedAt`` is missing, empty, or unparseable is INCLUDED
+      (and sorted as most-recent so a downstream render cap never clips it).
+    * ``boundary=None`` (e.g. the first cycle, before any full run completed)
+      returns every provided done task.
+
+    Args:
+        done_tasks: Iterable of done task dicts (e.g. ``FilteredTaskTree.all_done_tasks``).
+            Non-dict elements are skipped defensively.
+        boundary: Lower-bound cycle boundary (inclusive), or ``None`` to include
+            all.  A naive *boundary* is assumed UTC.
+
+    Returns:
+        A new list of the selected task dicts, sorted by parsed ``updatedAt``
+        descending with task-id descending as the tiebreak.
+    """
+    if boundary is not None and boundary.tzinfo is None:
+        boundary = boundary.replace(tzinfo=UTC)
+
+    # Sentinel sort key for parse-failures: sorts them to the front (treated as
+    # most-recent) so a downstream render cap clips genuinely-older tasks first,
+    # never an over-included parse-failure.  It is only ever a sort key — a
+    # parse-failure bypasses the boundary comparison entirely.
+    most_recent = datetime.max.replace(tzinfo=UTC)
+
+    selected: list[tuple[datetime, int, dict]] = []
+    for t in done_tasks:
+        if not isinstance(t, dict):
+            continue  # defensive: skip non-dict elements
+        parsed = _parse_task_updated_at(t)
+        if boundary is None or parsed is None or parsed >= boundary:
+            selected.append((parsed if parsed is not None else most_recent, id_key(t), t))
+
+    # Most-recent-first: updatedAt descending, id descending as the tiebreak.
+    selected.sort(key=lambda triple: (triple[0], triple[1]), reverse=True)
+    return [t for _, _, t in selected]
 
 
 # --------------------------------------------------------------------------- #
