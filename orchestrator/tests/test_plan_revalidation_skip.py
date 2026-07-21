@@ -355,6 +355,32 @@ async def test_blast_radius_granted_succeeds(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_blast_radius_dir_bearing_plan_files_alpha_stripped(tmp_path: Path):
+    """Task 2373: ``_plan``'s plan-file module-lock re-derivation routes
+    through ``module_charter.derive_modules``. A directory-shaped entry in
+    plan.json's "files" (no recognised extension) must be stripped before
+    coarsening, so it derives only the file-level sibling's module key
+    instead of widening to a subtree-wide prefix lock (reify-3468 class).
+    """
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        # 'mod_b/subdir' has no extension -> directory-shaped; the sibling
+        # file is the only entry that should survive alpha-strip.
+        plan_files=['mod_b/subdir', 'mod_b/x.py'],
+        modules=['mod_a'],
+        blast_radius_grants=True,
+    )
+
+    outcome = await f.wf._plan()
+
+    assert outcome == WorkflowOutcome.PLANNED
+    f.handle_blast_radius_expansion.assert_awaited_once()
+    _task_id, _current, needed = f.handle_blast_radius_expansion.call_args.args
+    assert needed == ['mod_b/x.py']
+    assert set(f.wf.modules) == {'mod_b/x.py'}
+
+
+@pytest.mark.asyncio
 async def test_fresh_dispatch_excludes_prior_proposals(tmp_path: Path):
     """Truly-fresh dispatch (no existing plan at all) reaches the `else`
     branch with a falsy existing_plan — C-A1 anti-anchoring — so
