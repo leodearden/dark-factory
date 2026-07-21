@@ -60,15 +60,15 @@ import os
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import ScopeCap, UsageGate
+from shared.usage_gate import AccountPhase, ScopeCap, UsageGate
 
 # NOTE: this scaffold (prerequisite P1) imports only what the harness below
 # uses today. Each Bn step below (B1-B6, B8) adds the specific additional
-# imports (asyncio, contextlib, json, UTC, timedelta, invoke_with_cap_retry,
-# AccountPhase, _SLEEP_PATCH) its own test needs, keeping every commit
-# ruff-clean rather than pre-importing the whole suite's eventual closure.
+# imports (asyncio, contextlib, json, UTC, timedelta) its own test needs,
+# keeping every commit ruff-clean rather than pre-importing the whole
+# suite's eventual closure.
 
 SCOPE = 'claude-fable-5'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
@@ -156,3 +156,44 @@ def cap_result(stderr: str, output: str = 'partial') -> AgentResult:
 def ok_result(output: str = 'complete') -> AgentResult:
     """A successful AgentResult (mirrors make_result in test_cap_retry.py)."""
     return AgentResult(success=True, output=output, cost_usd=0.5)
+
+
+# ===========================================================================
+# B1 -- a fable cap leaves general capacity open
+# ===========================================================================
+
+
+class TestB1FableCapLeavesGeneralOpen:
+    """B1: a scoped (fable) cap hit driven end-to-end through
+    invoke_with_cap_retry fails over WITHOUT transitioning the capped
+    account's phase (it stays serviceable for general work), and a
+    following general invocation still selects and completes on it."""
+
+    async def test_b1_fable_cap_leaves_general_open(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', model='claude-fable-5', backend='claude',
+                invoke_fn=scripted_invoke(
+                    cap_result("You've hit your usage limit. resets in 1h"),
+                    ok_result(),
+                ),
+                prompt='hi',
+            )
+
+        assert got.account_name == 'b'  # failed over
+        assert a.phase == AccountPhase.AVAILABLE  # NOT capped by the fable hit
+        assert a.scope_caps[SCOPE].capped is True
+
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            general = await invoke_with_cap_retry(
+                gate, 'lbl', model='sonnet', backend='claude',
+                invoke_fn=scripted_invoke(ok_result()),
+                prompt='hi',
+            )
+
+        # The fable cap did not remove A's general capacity.
+        assert general.account_name == 'a'
+        assert general.output == 'complete'
