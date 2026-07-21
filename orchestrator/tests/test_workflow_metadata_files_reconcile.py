@@ -24,10 +24,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import FakeScheduler
 from shared.locking import directory_locks
 
+from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.scheduler import files_to_modules
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
 def _make_workflow(
@@ -354,3 +357,295 @@ async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path
     assert wf.task['metadata']['files'] == persisted, (
         f'in-memory task metadata.files must equal persisted files; got {wf.task["metadata"]["files"]!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# TestReplanScopeReconcile — post-``_replan`` scope reconcile (task 2874)
+#
+# On a BLOCKING review verdict, ``_execute_verify_review_loop`` calls
+# ``_replan()``, which lets the architect rewrite plan.json ("you may add
+# new steps") — the architect naturally widens ``plan.files`` for the files
+# those new steps touch.  The post-replan block previously only re-read the
+# plan and validated steps/prerequisites — it never routed the possibly-
+# widened ``plan.files`` through the scope-reconciliation choke point
+# (``TaskWorkflow._set_task_scope``), so ``metadata.files``/module-locks
+# could lag ``plan.files`` for an entire ``reviewer_comprehensive`` pass —
+# the window the orphan-reaper sweeps in and fires the
+# ``plan.files ⊋ metadata.files`` divergence (esc-2865-11 cluster).
+#
+# These tests drive one EXECUTE→VERIFY→REVIEW cycle with a BLOCKING verdict
+# (forcing a replan) and assert the reconcile happened BEFORE the loop
+# re-enters EXECUTE for the second time — the orphan-reaper sweep point.
+# ---------------------------------------------------------------------------
+
+
+def _make_replan_workflow(
+    *,
+    tmp_path: Path,
+    initial_files: list[str],
+    modules: list[str],
+    task_id: str = '2874',
+    max_review_cycles: int = 2,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Loop-driving harness for ``_execute_verify_review_loop``.
+
+    Modeled on ``test_workflow_review_persistence.py::_make_workflow`` but
+    wired to ``_workflow_helpers.FakeScheduler`` (instead of a bare
+    MagicMock scheduler) so ``blast_radius_calls``/``update_task_calls``/
+    ``blast_radius_result`` are trackable — the scope-reconcile assertion
+    seam this task's tests need.
+    """
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
+    assignment.modules = list(modules)
+
+    _spec = pydantic_spec(OrchestratorConfig)
+    config = MagicMock(spec_set=_spec)
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.max_review_cycles = max_review_cycles
+    config.max_amendment_rounds = 1
+    config.lock_depth = 2
+    config.project_root = tmp_path / 'proj'
+    # Real reviewer model string so _reviewer_config_fingerprint() (task 2749)
+    # yields a deterministic, non-None digest — mirrors
+    # test_workflow_review_persistence.py::_make_workflow.
+    config.models = MagicMock()
+    config.models.reviewer = 'sonnet'
+
+    scheduler = FakeScheduler()
+    git_ops = MagicMock()
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+    )
+    worktree = tmp_path / 'wt'
+    worktree.mkdir(parents=True, exist_ok=True)
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init(task_id, 'T', 'd')
+    wf.artifacts = artifacts
+    wf.worktree = worktree
+    wf.modules = list(modules)
+
+    plan = {
+        'task_id': task_id,
+        'title': 'T',
+        'files': list(initial_files),
+        'analysis': 'a',
+        'prerequisites': [],
+        'steps': [
+            {
+                'id': 'step-1',
+                'type': 'test',
+                'description': 'x',
+                'status': 'pending',
+                'commit': None,
+            },
+        ],
+        'design_decisions': [],
+        'reuse': [],
+    }
+    artifacts.write_plan(plan)
+    artifacts.stamp_plan_provenance(wf.session_id)
+    wf.plan = artifacts.read_plan()
+
+    # Loop sub-steps default to success; the REVIEW/replan branch is what
+    # each test exercises, so stub VERIFY to DONE and the git_ops seams
+    # _execute_verify_review_loop reads directly.
+    wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)
+    wf.git_ops.get_head_tree_hash = AsyncMock(return_value='TREE1')
+    wf.git_ops.get_new_side_changed_line_ranges = AsyncMock(return_value={})
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+    wf._route_review_suggestions_to_curator = AsyncMock()
+    wf._write_suggestions_to_memory = AsyncMock()
+    wf._amend = AsyncMock(return_value=True)
+
+    return wf, scheduler
+
+
+def _snapshotting_execute_iterations(
+    scheduler: FakeScheduler, snapshots: list[dict],
+) -> AsyncMock:
+    """AsyncMock for ``wf._execute_iterations`` that snapshots the
+    scheduler's blast-radius/update_task call lists on EVERY invocation, so
+    ``snapshots[1]`` captures state at the entry of the 2nd EXECUTE pass —
+    the orphan-reaper sweep point (the reviewer_comprehensive pass runs
+    between the replan and this 2nd EXECUTE)."""
+
+    async def _side_effect(*_args, **_kwargs) -> WorkflowOutcome:
+        snapshots.append({
+            'blast': list(scheduler.blast_radius_calls),
+            'update': list(scheduler.update_task_calls),
+        })
+        return WorkflowOutcome.DONE
+
+    return AsyncMock(side_effect=_side_effect)
+
+
+def _widening_replan(wf: TaskWorkflow, new_file: str) -> AsyncMock:
+    """AsyncMock for ``wf._replan`` that mimics an architect replan which
+    WIDENS plan.files — appends *new_file*, keeps the existing steps, and
+    resets ``prerequisites`` to ``[]`` (mirrors what a real replanning
+    architect leaves in plan.json for a single-file widen)."""
+
+    async def _side_effect(_reviews) -> None:
+        assert wf.artifacts is not None
+        plan = wf.artifacts.read_plan()
+        plan['files'] = [*plan.get('files', []), new_file]
+        plan['prerequisites'] = []
+        wf.artifacts.write_plan(plan)
+        wf.plan = plan
+
+    return AsyncMock(side_effect=_side_effect)
+
+
+def _blocking_then_pass_reviews() -> AsyncMock:
+    """AsyncMock for ``wf._review``: cycle 1 BLOCKING (forces a replan),
+    cycle 2 PASS (drives the loop to DONE after the reconcile — only
+    reached if the fix does not short-circuit on a lock conflict)."""
+    return AsyncMock(side_effect=[
+        ReviewAggregation(
+            has_blocking_issues=True,
+            blocking_issues=[{
+                'reviewer': 'reviewer_comprehensive',
+                'severity': 'blocking',
+                'location': 'x.py:1',
+                'category': 'missing_edge_case',
+                'description': 'needs a fix',
+            }],
+            suggestions=[],
+            reviews={},
+        ),
+        ReviewAggregation(
+            has_blocking_issues=False,
+            blocking_issues=[],
+            suggestions=[],
+            reviews={},
+        ),
+    ])
+
+
+@pytest.mark.asyncio
+class TestReplanScopeReconcile:
+    """Acceptance tests for task 2874: the post-``_replan`` block must
+    reconcile a possibly-widened ``plan.files`` through ``_set_task_scope``
+    BEFORE the loop re-enters EXECUTE — closing the window where
+    ``metadata.files``/module-locks could lag ``plan.files`` for an entire
+    ``reviewer_comprehensive`` pass.
+    """
+
+    async def test_new_module_widen_persists_and_locks_before_next_execute(
+        self, tmp_path: Path,
+    ):
+        initial_files = ['a/b/c/d/e.py']
+        new_file = 'x/y/z/w/v.py'
+        modules = files_to_modules(initial_files, 2)
+        assert files_to_modules(initial_files, 2) != files_to_modules(
+            [*initial_files, new_file], 2,
+        ), 'precondition: the new file must widen the MODULE set'
+
+        wf, scheduler = _make_replan_workflow(
+            tmp_path=tmp_path, initial_files=initial_files, modules=modules,
+        )
+        snapshots: list[dict] = []
+        wf._execute_iterations = _snapshotting_execute_iterations(scheduler, snapshots)
+        wf._review = _blocking_then_pass_reviews()
+        wf._replan = _widening_replan(wf, new_file)
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert len(snapshots) == 2, (
+            f'expected exactly 2 _execute_iterations calls; got {len(snapshots)}'
+        )
+        assert any(
+            persist_files is not None and new_file in persist_files
+            for _current, _needed, persist_files in snapshots[1]['blast']
+        ), (
+            'expected a handle_blast_radius_expansion call persisting the '
+            f'widened files (including {new_file!r}) before the 2nd EXECUTE; '
+            f'got {snapshots[1]["blast"]!r}'
+        )
+        widened_files = [*initial_files, new_file]
+        assert wf.modules == files_to_modules(widened_files, 2), (
+            'wf.modules must cover the new file module before the 2nd '
+            f'EXECUTE; got {wf.modules!r}'
+        )
+
+    async def test_same_module_widen_persists_via_update_task_before_next_execute(
+        self, tmp_path: Path,
+    ):
+        f1 = 'a/b/c/d/e.py'
+        f2 = 'a/b/c/d/f.py'
+        assert files_to_modules([f1], 2) == files_to_modules([f1, f2], 2), (
+            'precondition: f1 and f2 must map to the SAME module set'
+        )
+        modules = files_to_modules([f1], 2)
+
+        wf, scheduler = _make_replan_workflow(
+            tmp_path=tmp_path, initial_files=[f1], modules=modules,
+        )
+        snapshots: list[dict] = []
+        wf._execute_iterations = _snapshotting_execute_iterations(scheduler, snapshots)
+        wf._review = _blocking_then_pass_reviews()
+        wf._replan = _widening_replan(wf, f2)
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert len(snapshots) == 2, (
+            f'expected exactly 2 _execute_iterations calls; got {len(snapshots)}'
+        )
+        assert not any(
+            persist_files is not None and f2 in persist_files
+            for _current, _needed, persist_files in snapshots[1]['blast']
+        ), (
+            'a same-module widen must NOT call handle_blast_radius_expansion; '
+            f'got {snapshots[1]["blast"]!r}'
+        )
+        assert any(
+            f2 in (metadata.get('files') or [])
+            for _tid, metadata in snapshots[1]['update']
+            if isinstance(metadata, dict)
+        ), (
+            'expected metadata.files to be persisted directly (via update_task) '
+            f'including {f2!r} before the 2nd EXECUTE; got {snapshots[1]["update"]!r}'
+        )
+
+    async def test_cross_module_lock_conflict_requeues(self, tmp_path: Path):
+        """A genuine cross-module lock conflict on the replan reconcile must
+        REQUEUE — not silently proceed into the 2nd EXECUTE under a foreign
+        lock."""
+        initial_files = ['a/b/c/d/e.py']
+        new_file = 'x/y/z/w/v.py'
+        modules = files_to_modules(initial_files, 2)
+        assert files_to_modules(initial_files, 2) != files_to_modules(
+            [*initial_files, new_file], 2,
+        ), 'precondition: the new file must widen the MODULE set'
+
+        wf, scheduler = _make_replan_workflow(
+            tmp_path=tmp_path, initial_files=initial_files, modules=modules,
+        )
+        scheduler.blast_radius_result = False  # a sibling holds the additional lock
+        snapshots: list[dict] = []
+        wf._execute_iterations = _snapshotting_execute_iterations(scheduler, snapshots)
+        wf._review = _blocking_then_pass_reviews()
+        wf._replan = _widening_replan(wf, new_file)
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        report = wf._terminal_report
+        assert report is not None
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert len(snapshots) == 1, (
+            'the 2nd EXECUTE must never run under a foreign lock; '
+            f'got {len(snapshots)} _execute_iterations call(s)'
+        )
