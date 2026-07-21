@@ -235,6 +235,23 @@ class TrainStackResult:
 # ``11750``. ``#`` and the space in ``(task 50)`` are literals in both
 # engines, so the widened pattern stays valid as ERE and as Python ``re``.
 #
+# Collision assumption (task 2870, esc-5252-9): the unanchored ``(#{tid})``
+# and bare ``({tid})`` alternatives assume a parenthesized number in a
+# subject on main is ALWAYS a task citation in THIS repo — never a GitHub
+# PR number, squash-merge suffix, or trailing issue number. This holds
+# because dark-factory's merge worker writes the canonical
+# ``Merge task/{tid} into <main>`` subject (see ``merge_to_main``), not a
+# GitHub-style ``(#PR)`` squash suffix, and the repo does not take PR
+# merges. The assumption matters because relaxing the FIX-2 bidirectional
+# lineage guard (task 2870) left the FIX-1' effect-present check as the SOLE
+# attribution gate: a landed but unrelated commit whose subject happened to
+# carry ``(1175)`` for a non-task reason WOULD be attributed to task 1175
+# (its effect genuinely is on main). That collision is accepted as a
+# deliberate tradeoff given the convention above. If this repo ever begins
+# emitting ``(#N)``/``(N)`` where N is a non-task number (e.g. a PR id),
+# narrow these two alternatives to a citation-prefix-qualified form (or drop
+# the bare-number arm) to restore disambiguation.
+#
 # Subject-only (task 2675 FIX 2): this pattern is written with ``^``
 # anchors as if applied to a single SUBJECT line, but git's ``--grep``
 # applies ``^``/``$`` per LINE across the whole commit message — a BODY
