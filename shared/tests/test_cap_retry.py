@@ -10,13 +10,13 @@ import inspect
 import itertools
 import json
 import logging
-import os
 import re
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
+from _usage_gate_test_helpers import make_gate as _shared_make_gate
 
 import shared.cli_invoke as cli_invoke_module
 from shared.cli_invoke import (
@@ -28,7 +28,6 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
 )
-from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -52,18 +51,18 @@ from shared.usage_gate import (
 # ---------------------------------------------------------------------------
 
 def make_gate(account_names: list[str], **kwargs) -> UsageGate:
-    """Create a UsageGate with fake accounts, probe disabled."""
-    acct_cfgs = []
-    env_vars = {}
-    for name in account_names:
-        env_key = f'TEST_TOKEN_{name.upper().replace("-", "_")}'
-        env_vars[env_key] = f'fake-token-{name}'
-        acct_cfgs.append(AccountConfig(name=name, oauth_token_env=env_key))
-    config = UsageCapConfig(accounts=acct_cfgs, **kwargs)
-    with patch.dict(os.environ, env_vars):
-        gate = UsageGate(config)
-    gate._run_probe = AsyncMock(return_value=True)
-    return gate
+    """Create a UsageGate with fake accounts, probe disabled.
+
+    Thin wrapper over the shared ``_usage_gate_test_helpers.make_gate`` that
+    pins cap_retry's historical default: ``UsageCapConfig.wait_for_reset``
+    stays ``True`` here (every cap_retry call site omits the kwarg), whereas
+    the scope suites force it ``False``. Construction is otherwise identical
+    -- the shared helper's ``UsageGate(config, cost_store=None)`` matches the
+    old local ``UsageGate(config)`` -- so every existing call site is
+    byte-preserved.
+    """
+    kwargs.setdefault('wait_for_reset', True)
+    return _shared_make_gate(account_names, **kwargs)
 
 
 def make_result(
