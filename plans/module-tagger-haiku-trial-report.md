@@ -4,7 +4,7 @@ Task 2540 (Routing κ) — offline haiku-vs-fresh-sonnet replay over 30
 historical done tasks carrying ground-truth `metadata.files`. The pass/fail
 verdict is computed by this trial (δ's rollup is only the post-flip watch).
 
-**Decision: FAIL**  (N = 30)
+**Decision: MARGINAL**  (N = 30)
 
 ## Leaderboard — mean precision / recall / F1 vs ground truth
 
@@ -41,6 +41,11 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
 
 ## Machine-readable summary
 
+> Regenerated under the **fixed** agreement-floor gate (Part 2): `decision` is
+> `marginal` for these numbers, so an automated re-parse reads the ratified
+> verdict — not the stale pre-fix `fail`. The human override to FLIP is recorded
+> in "Ratified outcome" below.
+
 ```json
 {
   "n_samples": 30,
@@ -66,7 +71,7 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
     "tie": 3,
     "haiku_worse_fraction": 0.2727272727272727
   },
-  "decision": "fail",
+  "decision": "marginal",
   "thresholds": {
     "F1_PARITY_BAND": 0.05,
     "F1_FAIL_GAP": 0.15,
@@ -81,19 +86,21 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
 
 ## Ratified outcome — flip applied + agreement-floor gate fixed (esc-2540-17)
 
-> **This supersedes the pre-fix auto-rendered verdict above.** The live run's
-> `Decision: FAIL` (and `"decision": "fail"` in the machine-readable block) was
-> computed under the ORIGINAL agreement-floor gate, which hard-failed on
-> `mean Jaccard 0.368 < AGREEMENT_FAIL 0.50` alone. Under the fixed gate
-> (Part 2 below) those identical numbers reclassify to **MARGINAL** — the low
-> agreement is no longer permitted to hard-fail a challenger that wins the
-> primary quality signal.
+> **The auto-rendered verdict above (`MARGINAL`) reflects the FIXED
+> agreement-floor gate (Part 2); the human decision below OVERRIDES that
+> marginal-escalate with a FLIP.** Under the ORIGINAL pre-fix gate the identical
+> numbers hard-failed (`Decision: FAIL`, `"decision": "fail"`) on
+> `mean Jaccard 0.368 < AGREEMENT_FAIL 0.50` alone; the fixed gate reclassifies
+> them to **MARGINAL** — the low agreement is no longer permitted to hard-fail a
+> challenger that wins the primary quality signal. The header + machine-readable
+> block above were regenerated to the fixed-gate `marginal` so an automated
+> re-parse reads the ratified verdict, not the stale pre-fix `fail`.
 
 **Decision (Leo, 2026-07-21, resolving the esc-2540-17 `design_concern`): FLIP
 `module_tagger` to haiku (option a) AND fix the trial's agreement-floor gate
-(option d).** The FAIL was driven SOLELY by the haiku-vs-sonnet agreement floor,
-while on the primary quality signal (F1 vs ground truth) haiku BEATS the
-incumbent sonnet. Both parts are implemented in this task.
+(option d).** The original pre-fix FAIL was driven SOLELY by the haiku-vs-sonnet
+agreement floor, while on the primary quality signal (F1 vs ground truth) haiku
+BEATS the incumbent sonnet. Both parts are implemented in this task.
 
 ### Part 1 — FLIP applied (option a)
 
