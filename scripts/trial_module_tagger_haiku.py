@@ -237,9 +237,11 @@ def decide(summary: dict) -> str:
     haiku_worse_fraction, n_samples}`` and applies design decision 5:
 
     - FAIL (checked first — any hard-fail trigger dominates): haiku F1 more than
-      ``F1_FAIL_GAP`` below sonnet, OR agreement below ``AGREEMENT_FAIL``, OR the
-      frontier judged haiku worse on a majority (> ``ADJ_WORSE_FAIL``) of decided
-      disagreements.
+      ``F1_FAIL_GAP`` below sonnet, OR agreement below ``AGREEMENT_FAIL`` *while
+      the challenger is not better than the incumbent on ground-truth mean F1*
+      (esc-2540-17 / option d — the floor is gated so it cannot hard-fail a
+      challenger that wins on the primary quality signal), OR the frontier judged
+      haiku worse on a majority (> ``ADJ_WORSE_FAIL``) of decided disagreements.
     - PASS: F1 within ``F1_PARITY_BAND`` of sonnet AND agreement at/above
       ``AGREEMENT_FLOOR`` AND frontier not-majority-worse (<= ``ADJ_WORSE_PASS``)
       AND at least ``MIN_SAMPLES`` tasks.
@@ -255,8 +257,19 @@ def decide(summary: dict) -> str:
     # Positive gap = haiku is worse than sonnet.
     f1_gap = sonnet_f1 - haiku_f1
 
+    # Agreement-floor gate (esc-2540-17 / option d, Leo-ratified 2026-07-21):
+    # a sub-floor haiku-vs-sonnet Jaccard hard-fails ONLY when the challenger is
+    # ALSO not better than the incumbent on the primary quality signal
+    # (ground-truth mean F1). When the challenger BEATS the incumbent on F1, low
+    # agreement reflects the incumbent being the weaker model — the opposite of
+    # the divergence the floor was designed to catch — so it must not hard-fail.
+    # (Such a challenger can still fall short of the PASS AGREEMENT_FLOOR → it
+    # lands in the marginal band and escalates to a human, never an auto-flip.)
+    challenger_wins_f1 = haiku_f1 > sonnet_f1
+    agreement_hard_fail = jaccard < AGREEMENT_FAIL and not challenger_wins_f1
+
     # FAIL — any hard-fail trigger.
-    if f1_gap > F1_FAIL_GAP or jaccard < AGREEMENT_FAIL or worse > ADJ_WORSE_FAIL:
+    if f1_gap > F1_FAIL_GAP or agreement_hard_fail or worse > ADJ_WORSE_FAIL:
         return 'fail'
 
     # PASS — all guards clear AND enough samples.
