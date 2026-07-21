@@ -158,6 +158,85 @@ def test_git_config_offline_lane_infra_enabled_default_and_settable():
 
 
 # ---------------------------------------------------------------------------
+# LaneCommand + generic-command GitConfig knobs (task 2789, step-1/2)
+# ---------------------------------------------------------------------------
+
+
+class TestLaneCommand:
+    """LaneCommand — a per-project offline-lane generic command entry.
+
+    Step 1 (RED): LaneCommand does not yet exist — must fail before impl.
+    """
+
+    def test_defaults(self) -> None:
+        from orchestrator.config import LaneCommand
+
+        cmd = LaneCommand(name='q', command='pytest -m integration')
+        assert cmd.cwd == '.', "cwd must default to '.' (worktree root)"
+        assert cmd.fix_task_priority == 'medium', (
+            "fix_task_priority must default to 'medium'"
+        )
+        assert cmd.enabled is True, 'enabled must default to True'
+
+    def test_name_and_command_required(self) -> None:
+        from orchestrator.config import LaneCommand
+
+        with pytest.raises(ValidationError):
+            LaneCommand(command='pytest')  # missing name
+        with pytest.raises(ValidationError):
+            LaneCommand(name='q')  # missing command
+
+    def test_bogus_priority_rejected(self) -> None:
+        from orchestrator.config import LaneCommand
+
+        with pytest.raises(ValidationError):
+            LaneCommand(name='x', command='pytest', fix_task_priority='bogus')
+
+    def test_explicit_fields_round_trip(self) -> None:
+        from orchestrator.config import LaneCommand
+
+        cmd = LaneCommand(name='x', command='pytest', fix_task_priority='low')
+        assert cmd.name == 'x'
+        assert cmd.command == 'pytest'
+        assert cmd.fix_task_priority == 'low'
+
+
+def test_git_config_offline_lane_commands_defaults():
+    """GitConfig exposes offline_lane_commands (default []) and
+    offline_lane_legacy_numeric_enabled (default True).
+
+    Step 1 (RED): the fields do not yet exist — must fail before impl.
+    """
+    cfg = GitConfig()
+    assert cfg.offline_lane_commands == [], (
+        'offline_lane_commands must default to [] (opt-in, no generic commands)'
+    )
+    assert cfg.offline_lane_legacy_numeric_enabled is True, (
+        'offline_lane_legacy_numeric_enabled must default to True '
+        '(D2 gate; reify byte-identical)'
+    )
+
+
+def test_git_config_offline_lane_commands_settable():
+    """GitConfig accepts a one-command list and a False legacy-numeric gate."""
+    from orchestrator.config import LaneCommand
+
+    cfg = GitConfig(
+        offline_lane_commands=[
+            LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory'),
+        ],
+    )
+    assert len(cfg.offline_lane_commands) == 1
+    assert cfg.offline_lane_commands[0].name == 'q'
+    assert cfg.offline_lane_commands[0].cwd == 'fused-memory'
+
+    assert (
+        GitConfig(offline_lane_legacy_numeric_enabled=False).offline_lane_legacy_numeric_enabled
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
 # on_post_merge — enqueue-and-return trigger seam (step-3/4)
 # ---------------------------------------------------------------------------
 
