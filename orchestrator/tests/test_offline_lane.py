@@ -1529,6 +1529,47 @@ async def test_default_confirm_command_no_failures_is_flake(tmp_path: Path):
     assert ids == []
 
 
+@pytest.mark.asyncio
+async def test_default_confirm_command_nonzero_exit_without_node_ids_files_sentinel(
+    tmp_path: Path,
+):
+    """A genuinely-red command with no parseable pytest node-ids is NOT a flake.
+
+    Amendment (reviewer_comprehensive, robustness): the default confirm seam is
+    pytest-oriented, but ``command`` is an arbitrary shell string. For a
+    non-pytest command (e.g. ``make check``) — or a pytest crash — that
+    reproduces red, ``_extract_failing_test_ids`` returns []. Swallowing that
+    as a flake (no fix task, no escalation) is a silent fail-soft that violates
+    the loud-over-silent / no-silent-fail-soft norm. The exit code
+    disambiguates: rc != 0 with no node-ids returns a stable
+    ``<name>::nonzero-exit`` sentinel so _handle_red_run still
+    fingerprints/files/escalates rather than classifying it a flake (contrast
+    ``test_default_confirm_command_no_failures_is_flake``, where rc == 0 means
+    the command reproduced GREEN — a real flake -> []).
+    """
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='make-check', command='make check', cwd='fused-memory')
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(
+        return_value=(b'make: *** [Makefile:12: check] Error 1\n', None)
+    )
+    mock_proc.returncode = 1
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
+
+    # Non-empty => _handle_red_run fingerprints + files a fix task, rather than
+    # treating the confirmed-red command as intermittent nondeterminism.
+    assert ids == ['make-check::nonzero-exit']
+
+
 # ---------------------------------------------------------------------------
 # infra seams — constructor wiring (task 1959, IE1, step-3/4)
 # ---------------------------------------------------------------------------

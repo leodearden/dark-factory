@@ -1319,7 +1319,14 @@ class LaneCommand(BaseModel):
     command: str = Field(
         description=(
             'Shell command string launched via ``sh -c`` for this sub-run '
-            '(e.g. ``pytest -m integration``). Required.'
+            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
+            'confirm/dedup path is pytest-oriented — it serializes via '
+            '``_serial_pytest_str`` and extracts still-failing pytest '
+            'node-ids. A non-pytest command that reproduces red (non-zero '
+            'exit, no parseable node-ids) is filed under a stable '
+            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
+            'a flake; inject a custom ``command_confirmation_runner`` for '
+            'richer per-failure dedup.'
         ),
     )
     cwd: str = Field(

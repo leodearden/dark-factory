@@ -1103,11 +1103,20 @@ class OfflineLaneWorker:
         still-failing pytest node-ids from the FULL captured stdout (not the
         2000-char tail — so no failure line is truncated before extraction).
 
-        An empty return means the failure did not reproduce serially (a flake,
-        B6): :meth:`_handle_red_run` treats it as intermittent and files no
-        task. Both helpers are imported lazily to avoid an
-        ``offline_lane`` <-> ``verify`` import cycle (mirrors the existing lazy
-        ``workflow`` import in :meth:`_handle_red_run`).
+        This default path is PYTEST-ORIENTED: node-id extraction only
+        recognizes pytest ``FAILED``/``ERROR`` lines. When no node-ids parse,
+        the exit code disambiguates (loud-over-silent / no-silent-fail-soft
+        norm): rc == 0 means the command reproduced GREEN — a real flake (B6),
+        so an empty list is returned and :meth:`_handle_red_run` files no task;
+        rc != 0 means the command reproduced RED but emitted no parseable
+        node-id (a non-pytest command like ``make check``/``cargo test``, or a
+        pytest crash), so a stable ``<cmd.name>::nonzero-exit`` sentinel is
+        returned instead of ``[]`` — the red is filed/escalated rather than
+        silently swallowed as a flake. A project wanting richer per-failure
+        dedup for a non-pytest command injects its own
+        ``command_confirmation_runner``. Both helpers are imported lazily to
+        avoid an ``offline_lane`` <-> ``verify`` import cycle (mirrors the
+        existing lazy ``workflow`` import in :meth:`_handle_red_run`).
         """
         from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
 
@@ -1124,4 +1133,20 @@ class OfflineLaneWorker:
         )
         stdout, _ = await proc.communicate()
         text = (stdout or b'').decode(errors='replace')
-        return _extract_failing_test_ids(text)
+        ids = _extract_failing_test_ids(text)
+        if ids:
+            return ids
+        # No pytest node-ids parsed from the serial re-run. Disambiguate a
+        # genuine flake from a genuinely-red-but-unparseable command by the
+        # exit code (loud-over-silent / no-silent-fail-soft norm):
+        #   rc == 0 -> reproduced GREEN -> a real flake -> [] (no task filed).
+        #   rc != 0 -> reproduced RED but emitted no FAILED/ERROR node-id (a
+        #     non-pytest command like `make check`/`cargo test`, or a pytest
+        #     crash) -> DO NOT swallow it as a flake. Return a stable,
+        #     cmd.name-keyed sentinel so _handle_red_run still fingerprints,
+        #     files a dedup'd fix task, and stages to L2. Keyed on cmd.name
+        #     alone (not rc or an output hash) so repeated reds of the same
+        #     command dedup to one open fix task and stall->L2 cleanly.
+        if (proc.returncode or 0) != 0:
+            return [f'{cmd.name}::nonzero-exit']
+        return []
