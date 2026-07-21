@@ -405,12 +405,14 @@ class TestDeriveTruthBranchStateGitFallback:
     path."""
 
     async def test_ancestor_true_with_citation_resolves_on_main_via_citation(self) -> None:
-        """task 2787 corrected contract: a branch that is an ancestor of main
-        AND carries a positive on-main citation tied to the branch resolves
+        """task 2787 corrected contract, relaxed by task 2870: a branch that is
+        an ancestor of main AND carries a positive on-main citation resolves
         ON_MAIN with the CITATION sha (the authoritative landing commit) — not
-        the raw branch tip. The FIX 2 bidirectional is_ancestor lineage guard
-        is applied to the citation, mirroring validate_landing_evidence
-        DISCOVERY mode."""
+        the raw branch tip. Task 2870 DROPPED the FIX 2 bidirectional
+        is_ancestor lineage guard (mirroring validate_landing_evidence's
+        relaxed DISCOVERY mode), so a positive citation is accepted with only
+        the (branch, main) ancestry check — no citation-lineage is_ancestor
+        calls."""
         citation_sha = 'cafefeed' + 'b' * 32
         git_ops = _fake_git_ops(
             is_ancestor=True, branch_sha='tipsha123', citation_sha=citation_sha,
@@ -421,14 +423,11 @@ class TestDeriveTruthBranchStateGitFallback:
 
         assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, citation_sha)
         git_ops.find_task_citation_commit.assert_awaited_once()
-        # is_ancestor is now awaited twice: once for (branch, main), once for
-        # the citation lineage check (citation, branch) — which short-circuits
-        # the `or` on its first (True) arm.
-        assert git_ops.is_ancestor.await_count == 2
-        git_ops.is_ancestor.assert_has_awaits(
-            [call('task/7', 'main'), call(citation_sha, 'task/7')],
-            any_order=True,
-        )
+        # FIX-A mirror (task 2870): the citation-lineage is_ancestor calls are
+        # dropped — a positive citation is accepted regardless of branch-ref
+        # lineage, so ONLY the (branch, main) ancestry check runs.
+        assert git_ops.is_ancestor.await_count == 1
+        git_ops.is_ancestor.assert_has_awaits([call('task/7', 'main')])
         # The ON_MAIN fast-path no longer consults the raw branch tip.
         git_ops.resolve_branch_sha.assert_not_awaited()
         git_ops.find_merge_marker.assert_not_awaited()
@@ -455,21 +454,27 @@ class TestDeriveTruthBranchStateGitFallback:
         assert report.branch_state == BranchState(BranchStateKind.EXISTS_OFF_MAIN)
         git_ops.find_task_citation_commit.assert_awaited_once()
 
-    async def test_ancestor_true_citation_lineage_fails_resolves_exists_off_main(self) -> None:
-        """task 2787 amendment (test-coverage): the third outcome of the
-        attribution guard. A citation IS found on main, but the FIX 2
-        bidirectional is_ancestor lineage guard rejects it — NEITHER
-        is_ancestor(citation, branch) NOR is_ancestor(branch, citation) holds
-        (e.g. the citation is a coarse --grep pattern match on an unrelated
-        commit sharing no lineage with the branch). This must classify
-        EXISTS_OFF_MAIN, never ON_MAIN(citation) — a distinct guarded path from
-        the citation-None case above that a future refactor could silently
-        break."""
+    async def test_ancestor_true_citation_lineage_fails_resolves_on_main_via_citation(self) -> None:
+        """FIX-A mirror (task 2870 / esc-5252-9): a citation IS found on main
+        but the branch ref has diverged/realigned so NEITHER
+        is_ancestor(citation, branch) NOR is_ancestor(branch, citation) holds.
+        The relaxed guard (mirroring validate_landing_evidence's relaxed
+        DISCOVERY mode) now resolves ON_MAIN carrying the CITATION sha (the
+        authoritative landing commit) rather than reverting the task to
+        EXISTS_OFF_MAIN: every ON_MAIN caller pre-establishes is_ancestor(
+        branch, main) and find_task_citation_commit greps ``git log main``, so
+        branch-ref lineage is NOT the landing authority. BOTH citation-lineage
+        is_ancestor calls are dropped — only the (branch, main) check runs.
+
+        RED on current main: the guard still requires a passing bidirectional
+        lineage check and classifies EXISTS_OFF_MAIN here (with 3 is_ancestor
+        awaits)."""
         citation_sha = 'deadbeef' + 'c' * 32
 
         async def _is_ancestor(a: str, b: str) -> bool:
-            # (branch, main) ancestry holds (a trivial-ancestor branch); BOTH
-            # citation-lineage directions fail.
+            # (branch, main) ancestry holds (a trivial-ancestor branch); the
+            # citation-lineage directions would BOTH fail if consulted — but
+            # the relaxed guard no longer consults them (the divergent shape).
             return (a, b) == ('task/2729', 'main')
 
         git_ops = _fake_git_ops(
@@ -480,20 +485,13 @@ class TestDeriveTruthBranchStateGitFallback:
 
         report = await resolver.derive_truth('2729')
 
-        assert report.branch_state == BranchState(BranchStateKind.EXISTS_OFF_MAIN)
+        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, citation_sha)
         git_ops.find_task_citation_commit.assert_awaited_once()
-        # The `or` evaluates BOTH lineage directions when the first is False,
-        # plus the initial (branch, main) check → 3 awaits total.
-        assert git_ops.is_ancestor.await_count == 3
-        git_ops.is_ancestor.assert_has_awaits(
-            [
-                call('task/2729', 'main'),
-                call(citation_sha, 'task/2729'),
-                call('task/2729', citation_sha),
-            ],
-            any_order=True,
-        )
-        # A non-attributable citation is NOT stamped as the branch tip either.
+        # The citation-lineage is_ancestor calls are dropped — only the
+        # (branch, main) ancestry check runs.
+        assert git_ops.is_ancestor.await_count == 1
+        git_ops.is_ancestor.assert_awaited_once_with('task/2729', 'main')
+        # The ON_MAIN fast-path anchors on the citation, not the raw branch tip.
         git_ops.resolve_branch_sha.assert_not_awaited()
 
     async def test_ancestor_true_citations_disabled_resolves_on_main_via_branch_tip(self) -> None:

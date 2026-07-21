@@ -49,20 +49,29 @@ a bool, the sweep reverts to pending, the coalesce re-drive calls
 **Two modes**, selected by whether ``candidate_sha`` is given:
 
 - **DISCOVERY** (``candidate_sha=None``) — the branch ref is live: discover
-  a citation via ``find_task_citation_commit``, apply the FIX 2
-  citation-lineage guard (``is_ancestor`` checked in BOTH directions against
-  the branch — a genuine citation is either an in-branch work commit or this
-  branch's own no-ff merge commit; a citation that is an ancestor in
-  NEITHER direction is an unrelated task's commit that merely matched the
-  grep pattern), then the FIX 1' effect-present guard anchored on
-  ``branch_tip_sha`` for an in-branch work-commit citation (it may be a
-  stale intermediate commit — the branch's actual final state is its tip)
-  or on the citation itself for a no-ff merge commit. That merge-commit
-  case is NOT a no-op: task 2675 made ``commit_effect_present_in_main``
-  merge-aware, so it diffs each of the merge commit's non-first parents'
-  content against current main HEAD, correctly catching a reverted no-ff
-  merge (the task-1175 shape). Used by the ancestry path, the
-  content-equivalence fallback, and the coalesce re-drive.
+  a citation via ``find_task_citation_commit``, classify the effect anchor
+  with ``is_ancestor(citation, branch)`` (True → an in-branch work commit,
+  anchor on ``branch_tip_sha``; False → this branch's own no-ff merge commit
+  OR a divergent/realigned branch ref, anchor on the citation itself), then
+  apply the FIX 1' effect-present guard to that anchor. **Task 2870 removed
+  the former FIX 2 bidirectional lineage HARD-REJECT** (a citation an
+  ancestor of the branch in NEITHER direction used to reject as
+  ``lineage_mismatch``): every DISCOVERY caller already establishes the
+  branch's content is on main before delegating here, and
+  ``find_task_citation_commit`` greps ``git log main`` so its citation is by
+  construction reachable from main — branch-ref ancestry is NOT the landing
+  authority, so a stale/divergent/realigned branch tip that fails both
+  directions is still a genuine landing (reify esc-5252-9); hard-rejecting
+  it caused a close↔refile ping-pong that never self-resolved. The FIX 1'
+  effect-present guard stays the real gate. The ``branch_tip_sha`` anchor
+  for an in-branch work-commit citation handles a stale intermediate commit
+  (the branch's actual final state is its tip); the citation anchor for a
+  no-ff merge commit is NOT a no-op — task 2675 made
+  ``commit_effect_present_in_main`` merge-aware, so it diffs each of the
+  merge commit's non-first parents' content against current main HEAD,
+  correctly catching a reverted no-ff merge (the task-1175 shape). Used by
+  the ancestry path, the content-equivalence fallback, and the coalesce
+  re-drive.
 - **CANDIDATE** (``candidate_sha`` given) — attribution was already
   established by the caller (a merge-marker subject match, or a stranded-
   sweep ground-truth report): skip citation discovery and the lineage guard
@@ -104,10 +113,11 @@ class LandingEvidenceVerdict:
             ``candidate_sha`` in CANDIDATE mode); ``None`` when rejected.
         reason: Machine-readable code — ``'ok'`` when accepted, else one of
             ``'no_citation'`` (DISCOVERY only — no commit on main cites the
-            task), ``'lineage_mismatch'`` (DISCOVERY only — FIX 2: the
-            citation is not reachable from the branch in either direction),
-            or ``'effect_absent'`` (FIX 1': the evidence sha's effect is not
-            present at current main HEAD).
+            task) or ``'effect_absent'`` (FIX 1': the evidence sha's effect
+            is not present at current main HEAD). (Task 2870 removed the
+            former ``'lineage_mismatch'`` DISCOVERY reject — a citation
+            unreachable from the branch in both directions is now accepted;
+            see :func:`validate_landing_evidence`.)
         probe: Structured facts about the check — ``task_id``, ``branch``,
             ``branch_tip_sha``, ``citation`` (the discovered citation or the
             candidate), ``effect_check_sha`` (the sha the effect-present
@@ -194,16 +204,26 @@ async def validate_landing_evidence(
         return _reject('no_citation')
     probe['citation'] = citation
 
-    # FIX 2 citation-lineage guard (task 2500/2675): the grep-found citation
-    # must be tied to THIS task's own branch, not merely match the citation
-    # grep pattern. Two shapes legitimately qualify: (a) a WORK commit ON
-    # the branch (is_ancestor(citation, branch) True), or (b) this branch's
-    # OWN no-ff merge commit (is_ancestor(branch, citation) True — the
-    # branch tip is one of its parents). Neither direction holding means an
-    # unrelated task's commit merely matched the grep pattern.
+    # Citation-anchor selection (task 2870, esc-5252-9; formerly the FIX 2
+    # bidirectional lineage HARD-REJECT). is_ancestor(citation, branch) still
+    # classifies the anchor for the FIX 1' effect-present guard below — True
+    # for a WORK commit ON the branch (anchor on the branch tip, which may
+    # have advanced past this intermediate commit); False for this branch's
+    # OWN no-ff merge commit OR a divergent/realigned branch ref (anchor on
+    # the citation itself). A citation unreachable from the branch in BOTH
+    # directions is NO LONGER rejected as 'lineage_mismatch': every DISCOVERY
+    # caller has already established the branch's content is on main before
+    # delegating here (the dispatch-gate ancestry path, the
+    # content-equivalence fallback, and the coalesce re-drive), and
+    # find_task_citation_commit greps `git log main` so its citation is by
+    # construction reachable from main — branch-ref ancestry is NOT the
+    # landing authority. A stale/divergent/realigned branch tip that fails
+    # both is_ancestor directions is still a genuine landing; hard-rejecting
+    # it caused a close<->refile ping-pong (the auto-watcher closes the
+    # benign L1, the gate re-opens it) that never self-resolved. The FIX 1'
+    # effect-present guard below stays the real gate against a reverted
+    # (task-1175) landing.
     citation_on_branch = await git_ops.is_ancestor(citation, branch)
-    if not citation_on_branch and not await git_ops.is_ancestor(branch, citation):
-        return _reject('lineage_mismatch')
 
     # FIX 1' effect-present guard (task 2500/2675): ancestry alone doesn't
     # mean the effect survives at HEAD — a later commit on main may have
@@ -212,8 +232,10 @@ async def validate_landing_evidence(
     # commit); anchor on the citation itself for a no-ff merge commit (task
     # 2675 made this a REAL check — it diffs each non-first parent's content
     # against current main HEAD, not a no-op; see
-    # commit_effect_present_in_main) or in the defensive case a DISCOVERY
-    # caller omitted branch_tip_sha despite citation_on_branch.
+    # commit_effect_present_in_main), for a divergent/realigned branch ref
+    # (task 2870 — citation_on_branch False, the branch tip is not
+    # authoritative), or in the defensive case a DISCOVERY caller omitted
+    # branch_tip_sha despite citation_on_branch.
     effect_check_sha = citation
     if citation_on_branch and branch_tip_sha is not None:
         effect_check_sha = branch_tip_sha
@@ -228,12 +250,6 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     'no_citation': (
         'No commit on main cites this task (find_task_citation_commit found '
         'nothing) — there is no positive evidence to attribute a landing to.'
-    ),
-    'lineage_mismatch': (
-        'The discovered citation is not reachable from the branch in either '
-        'direction (FIX 2, task 2500/2675) — it is most likely an unrelated '
-        "task's commit that merely matched the citation pattern, not "
-        'genuine evidence that this task landed.'
     ),
     'effect_absent': (
         "The evidence commit's own effect is not present at current main "

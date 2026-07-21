@@ -4597,6 +4597,151 @@ class TestFindTaskCitationCommit:
 
         assert await git_ops.find_task_citation_commit('1175') == commit_sha
 
+    async def test_returns_sha_for_hash_paren_citation(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B (task 2870): a subject citing the task as ``(#1175)`` — a
+        capitalized, non-prefix leading word so it does NOT match the
+        conventional-commit alternatives — still yields that commit's sha
+        via the widened prefix-independent ``\\(#?{tid}\\)`` alternative.
+        """
+        (git_repo / 'a.py').write_text('a\n')
+        await _run(['git', 'add', 'a.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Fix the bug (#1175)'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+        rc, commit_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') == commit_sha.strip()
+
+    async def test_returns_sha_for_bare_paren_citation(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B (task 2870): a subject citing the task as a bare ``(1175)``
+        still yields that commit's sha via the ``\\(#?{tid}\\)`` alternative
+        (the ``#`` is optional). Leading word ``Cleanup`` is not a
+        conventional-commit prefix token, so this is genuinely new.
+        """
+        (git_repo / 'b.py').write_text('b\n')
+        await _run(['git', 'add', 'b.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Cleanup pass (1175)'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+        rc, commit_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') == commit_sha.strip()
+
+    async def test_returns_sha_for_task_word_paren_citation(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B (task 2870): a subject citing the task as ``(task 1175)``
+        (a space, not the ``task/1175`` slash form the original pattern
+        required) still yields that commit's sha via the widened
+        ``\\(task {tid}\\)`` alternative. Leading word ``Handle`` is not a
+        conventional-commit prefix token.
+        """
+        (git_repo / 'c.py').write_text('c\n')
+        await _run(['git', 'add', 'c.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'Handle the edge case (task 1175)'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+        rc, commit_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') == commit_sha.strip()
+
+    async def test_returns_sha_for_resolve_prefixed_paren_citation(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B (task 2870): a ``resolve:``-prefixed subject (``resolve`` is
+        NOT in the conventional-commit prefix token list) that cites the task
+        in parens is rescued by the prefix-independent, unanchored
+        ``\\(#?{tid}\\)`` alternative — confirming the widening is not tied to
+        the ``^(prefix)`` conventional-commit head.
+        """
+        (git_repo / 'd.py').write_text('d\n')
+        await _run(['git', 'add', 'd.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'resolve: patch the thing (#1175)'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+        rc, commit_sha, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        assert rc == 0, f'rev-parse failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') == commit_sha.strip()
+
+    async def test_none_for_paren_citation_with_superstring_id(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B boundary guard (task 2870): the literal ``\\(``...``\\)``
+        right-boundary prevents a substring overlap — a subject citing
+        ``(11750)`` must NOT be returned for task ``1175``. The closing
+        paren is the exact numeric boundary, so no ``\\b`` is needed. (Passes
+        both before AND after the widening — a regression guard against a
+        too-greedy alternative.)
+        """
+        (git_repo / 'e.py').write_text('e\n')
+        await _run(['git', 'add', 'e.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'note about (11750)'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') is None
+
+    async def test_none_for_paren_citation_with_left_superstring_id(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B boundary guard (task 2870), symmetric LEFT-side case: the
+        literal ``\\(`` left-boundary prevents a substring overlap — a
+        subject citing ``(21175)`` must NOT be returned for task ``1175``.
+        The opening paren must sit immediately before the id, so a longer
+        number that merely ENDS in ``1175`` cannot match. Complements
+        ``test_none_for_paren_citation_with_superstring_id`` (the right-side
+        ``(11750)`` case); together they pin BOTH literal-paren boundaries.
+        """
+        (git_repo / 'f.py').write_text('f\n')
+        await _run(['git', 'add', 'f.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'note about (21175)'], cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') is None
+
+    async def test_none_when_only_body_has_paren_citation(
+        self, git_ops: GitOps, git_repo: Path,
+    ) -> None:
+        """FIX-B subject-only guard (task 2870): the widened unanchored paren
+        alternatives (``\\(#?{tid}\\)`` / ``\\(task {tid}\\)``) are re-applied
+        to the SUBJECT ONLY, exactly like the pre-existing alternatives. A
+        commit whose subject is innocuous but whose BODY carries a bare
+        ``(#1175)`` paren citation satisfies the coarse per-line ``--grep``
+        pre-filter, yet must return None because the subject-anchored re-test
+        rejects the body-only match. Pins that widening the pattern did NOT
+        open a body-only false-citation hole via the new paren alternatives
+        (the paren-form analogue of
+        ``test_none_when_only_body_has_conventional_token_mentioning_task``).
+        """
+        (git_repo / 'g.py').write_text('g\n')
+        await _run(['git', 'add', 'g.py'], cwd=git_repo)
+        rc, _, err = await _run(
+            [
+                'git', 'commit',
+                '-m', 'Documentation tweak after landing',
+                '-m', 'follow-up to (#1175)',
+            ],
+            cwd=git_repo,
+        )
+        assert rc == 0, f'commit failed: {err}'
+
+        assert await git_ops.find_task_citation_commit('1175') is None
+
     async def test_returns_older_subject_citation_when_newer_commit_only_matches_body(
         self, git_ops: GitOps, git_repo: Path,
     ) -> None:

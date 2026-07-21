@@ -218,28 +218,60 @@ class TrainStackResult:
 #     anywhere in the subject line.
 #   - The canonical no-ff merge subject ``Merge task/50 into <main>`` produced
 #     by ``merge_to_main``.
+#   - Prefix-independent, unanchored paren citations anywhere in the
+#     subject (task 2870): ``(50)`` and ``(#50)`` (via ``\(#?{tid}\)``) and
+#     ``(task 50)`` (via ``\(task {tid}\)``). These are NOT tied to the
+#     ``^(prefix)`` conventional-commit head, so they also rescue
+#     otherwise-unmatched subjects such as a ``resolve:``-prefixed commit
+#     that cites the task in parens — closing a latent false ``no_citation``
+#     that stranded genuinely-landed tasks using one of these forms.
 #
 # The ``{tid}`` placeholder is interpolated via ``str.format`` with the
-# escaped task id; a ``\b`` (word boundary) at each side blocks substring
-# overlap so ``task/3399`` doesn't match a row that cites ``task/339``.
+# escaped task id; a ``\b`` (word boundary) at each side of the
+# conventional-commit / ``task/{tid}`` alternatives blocks substring overlap
+# so ``task/3399`` doesn't match a row that cites ``task/339``. The paren
+# alternatives instead use the literal ``\(``...``\)`` as an exact numeric
+# boundary (no ``\b`` needed): ``(1175)`` never matches tid ``117`` or
+# ``11750``. ``#`` and the space in ``(task 50)`` are literals in both
+# engines, so the widened pattern stays valid as ERE and as Python ``re``.
+#
+# Collision assumption (task 2870, esc-5252-9): the unanchored ``(#{tid})``
+# and bare ``({tid})`` alternatives assume a parenthesized number in a
+# subject on main is ALWAYS a task citation in THIS repo — never a GitHub
+# PR number, squash-merge suffix, or trailing issue number. This holds
+# because dark-factory's merge worker writes the canonical
+# ``Merge task/{tid} into <main>`` subject (see ``merge_to_main``), not a
+# GitHub-style ``(#PR)`` squash suffix, and the repo does not take PR
+# merges. The assumption matters because relaxing the FIX-2 bidirectional
+# lineage guard (task 2870) left the FIX-1' effect-present check as the SOLE
+# attribution gate: a landed but unrelated commit whose subject happened to
+# carry ``(1175)`` for a non-task reason WOULD be attributed to task 1175
+# (its effect genuinely is on main). That collision is accepted as a
+# deliberate tradeoff given the convention above. If this repo ever begins
+# emitting ``(#N)``/``(N)`` where N is a non-task number (e.g. a PR id),
+# narrow these two alternatives to a citation-prefix-qualified form (or drop
+# the bare-number arm) to restore disambiguation.
 #
 # Subject-only (task 2675 FIX 2): this pattern is written with ``^``
 # anchors as if applied to a single SUBJECT line, but git's ``--grep``
 # applies ``^``/``$`` per LINE across the whole commit message — a BODY
 # line that happens to start with a conventional-commit token, or with
-# ``Merge task/{tid} into ``, would otherwise false-cite.
+# ``Merge task/{tid} into ``, or that carries a bare paren citation like
+# ``(#50)``, would otherwise false-cite.
 # ``find_task_citation_commit`` uses ``--grep`` only as a coarse
 # full-message PRE-filter (a sound superset) and then re-applies this
 # same pattern string, compiled as a Python ``re`` (no ``re.MULTILINE``,
 # so ``^`` anchors to the start of the string), to each candidate's
-# SUBJECT ONLY — body-only matches are therefore never treated as
-# citations. A caller-supplied ``pattern_template`` override must
-# therefore be valid as both a git ``--extended-regexp`` (ERE) pattern
-# *and* a Python ``re`` pattern.
+# SUBJECT ONLY — body-only matches (including via the unanchored paren
+# alternatives) are therefore never treated as citations. A caller-supplied
+# ``pattern_template`` override must therefore be valid as both a git
+# ``--extended-regexp`` (ERE) pattern *and* a Python ``re`` pattern.
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'(\(\b{tid}\b[):]|.*\btask/{tid}\b)'
     r'|^Merge task/{tid} into '
+    r'|\(#?{tid}\)'
+    r'|\(task {tid}\)'
 )
 
 # Fixed name for the persistent warm merge-verify worktree (task 1692).

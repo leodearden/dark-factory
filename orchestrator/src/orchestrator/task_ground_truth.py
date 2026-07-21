@@ -306,18 +306,29 @@ class TaskGroundTruth:
         # against real git for this path is deferred to θ2 wiring, per that
         # review's own suggested fix.)
         if await self.git_ops.is_ancestor(branch, main_branch):
-            # ON_MAIN attribution guard (task 2787): is_ancestor(branch, main)
-            # is TRIVIALLY True for a zero-commit branch whose tip == the main
-            # HEAD captured at branch-create time (a FOREIGN task's merge
-            # commit) — resolve_branch_sha(branch) would then hand back that
-            # foreign commit as this task's "landing" sha and phantom-complete
-            # it (the 2729-stamped-with-2753's-merge recurrence). Mirror
-            # landing_evidence.validate_landing_evidence DISCOVERY mode:
-            # require a POSITIVE on-main citation for tid (find_task_citation_
-            # commit's own docstring, git_ops.py, prescribes exactly this to
-            # reject the degenerate trivial-ancestor case) plus the FIX 2
-            # bidirectional is_ancestor lineage guard tying that citation to
-            # this branch. The citation — not the raw branch tip — is the
+            # ON_MAIN attribution guard (task 2787, relaxed by task 2870):
+            # is_ancestor(branch, main) is TRIVIALLY True for a zero-commit
+            # branch whose tip == the main HEAD captured at branch-create time
+            # (a FOREIGN task's merge commit) — resolve_branch_sha(branch)
+            # would then hand back that foreign commit as this task's "landing"
+            # sha and phantom-complete it (the 2729-stamped-with-2753's-merge
+            # recurrence). Mirror landing_evidence.validate_landing_evidence's
+            # (task-2870-relaxed) DISCOVERY mode: require a POSITIVE on-main
+            # citation for tid (find_task_citation_commit's own docstring,
+            # git_ops.py, prescribes exactly this to reject the degenerate
+            # trivial-ancestor / foreign zero-commit case, which falls through
+            # the `citation is None` arm below to EXISTS_OFF_MAIN). The former
+            # FIX 2 bidirectional is_ancestor lineage guard tying that citation
+            # to this branch is DROPPED (task 2870 / esc-5252-9): every ON_MAIN
+            # caller has already established is_ancestor(branch, main), and
+            # find_task_citation_commit greps `git log main`, so branch-ref
+            # lineage is NOT the landing authority — a genuine on-main citation
+            # whose branch ref has diverged/realigned (both is_ancestor
+            # directions False) is still a real landing, and rejecting it
+            # needlessly reverted an in-progress stranded task to pending.
+            # This copy has no effect-anchor decision (unlike
+            # validate_landing_evidence), so BOTH citation-lineage is_ancestor
+            # calls are gone. The citation — not the raw branch tip — is the
             # authoritative landing sha.
             citation_pattern = self.git_ops.config.commit_citation_pattern
             if citation_pattern == '':
@@ -340,10 +351,7 @@ class TaskGroundTruth:
             citation = await self.git_ops.find_task_citation_commit(
                 tid, pattern_template=citation_pattern,
             )
-            if citation is not None and (
-                await self.git_ops.is_ancestor(citation, branch)
-                or await self.git_ops.is_ancestor(branch, citation)
-            ):
+            if citation is not None:
                 return BranchState(BranchStateKind.ON_MAIN, citation)
             # Trivially-ancestor branch with no attributable citation is NOT a
             # landing. The branch ref genuinely exists (that is how is_ancestor
