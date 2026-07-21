@@ -7914,7 +7914,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'merge submission for request_id=%s branch=%s; registry already at '
             '%s. Coalescing as a benign no-op — NOT buffering a divergent '
             'twin, NOT escalated.',
-            item.request_id, item.branch, current_state,
+            item.request_id, item.branch.bare_id, current_state,
         )
         if not item.result.done():
             item.result.set_result(
@@ -10675,14 +10675,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 logger.exception(
                     'Coalesce predicate raised for request_id=%s task_id=%s '
                     'branch=%s; treating as eligible (safe-degrade)',
-                    _c.request_id, _c.task_id, _c.branch,
+                    _c.request_id, _c.task_id, _c.branch.bare_id,
                 )
                 _reason = None
             if _reason:
                 exclusions.append({'request_id': _c.request_id, 'reason': _reason})
                 logger.info(
                     'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
-                    _c.request_id, _c.task_id, _c.branch, _reason,
+                    _c.request_id, _c.task_id, _c.branch.bare_id, _reason,
                 )
             else:
                 eligible.append(_c)
