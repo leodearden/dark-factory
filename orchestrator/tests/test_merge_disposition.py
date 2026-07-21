@@ -391,6 +391,134 @@ class TestImplicatedLandings:
 
 
 # ---------------------------------------------------------------------------
+# step-1 (task 2869) — _implicated_landings real_main_head_sha ancestor filter
+# ---------------------------------------------------------------------------
+
+
+def _build_orphan_repo(repo: Path) -> tuple[str, str, str]:
+    """Build a repo modelling reify esc-5260-8's orphaned speculative train:
+
+      * ``merge_base`` — the real fork point, touches ``src/x.py`` (on main).
+      * ``real_main_head`` — real main advanced by an UNRELATED commit
+        (``src/z.py``); does NOT have the orphan tip as an ancestor.
+      * ``orphan_tip`` — a commit off ``merge_base`` on a side branch touching
+        ``src/x.py``, NEVER merged onto real main (the orphaned speculative
+        train tip).
+
+    Returns ``(merge_base, real_main_head, orphan_tip)``; leaves HEAD on main.
+    """
+    _init_git_repo(repo)
+    merge_base = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base / real fork)')
+    real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'unrelated real-main advance')
+    # Orphan side branch off merge_base, touching the same candidate file,
+    # never merged onto real main.
+    subprocess.run(
+        ['git', 'checkout', '-q', '-b', 'orphan', merge_base],
+        cwd=repo, check=True, capture_output=True,
+    )
+    orphan_tip = _commit_file(repo, 'src/x.py', 'v2-orphan', 'orphan speculative edit x')
+    # Restore HEAD to real main so the repo's default state is clean/on-main.
+    subprocess.run(
+        ['git', 'checkout', '-q', 'main'], cwd=repo, check=True, capture_output=True,
+    )
+    return merge_base, real_main_head, orphan_tip
+
+
+class TestImplicatedLandingsAncestorFilter:
+    """_implicated_landings gains a ``real_main_head_sha`` kwarg (task 2869,
+    reify esc-5260-8): when truthy AND != main_sha, cited commits are filtered
+    to ancestors of the CURRENT real main HEAD, so orphaned speculative-train
+    commits (never reachable from real main) are pruned while genuine landings
+    survive. Prunes ONLY on a definitive not-an-ancestor (git merge-base
+    --is-ancestor rc 1); fail-open on None / an unresolvable ref (keeps today's
+    citations, never suppresses a genuine skew)."""
+
+    def test_orphan_speculative_commit_is_pruned(self, tmp_path: Path):
+        from orchestrator.merge_disposition import _implicated_landings
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        merge_base, real_main_head, orphan_tip = _build_orphan_repo(repo)
+
+        head_before = _head_sha(repo)
+        implicated_commits, overlap_files = asyncio.run(
+            _implicated_landings(
+                repo, merge_base, orphan_tip, {'src/x.py'},
+                real_main_head_sha=real_main_head,
+            ),
+        )
+        # The walk merge_base..orphan_tip cites orphan_tip (it touches src/x.py),
+        # but orphan_tip is NOT an ancestor of real main HEAD -> pruned.
+        assert implicated_commits == ()
+        assert overlap_files == ()
+        # I2 read-only: the ancestor probes never mutate the repo.
+        assert _head_sha(repo) == head_before
+        assert subprocess.run(
+            ['git', 'status', '--porcelain'], cwd=repo, capture_output=True, text=True,
+        ).stdout == ''
+
+    def test_genuine_landing_kept_even_when_main_advanced_past_dispatch_base(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_disposition import _implicated_landings
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing = _commit_file(repo, 'src/x.py', 'v2', 'genuine landing on main')
+        # Real main advances PAST the dispatch base with an unrelated commit;
+        # the landing remains an ancestor of the new real main HEAD.
+        real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'later unrelated main tip')
+
+        implicated_commits, overlap_files = asyncio.run(
+            _implicated_landings(
+                repo, merge_base, landing, {'src/x.py'},
+                real_main_head_sha=real_main_head,
+            ),
+        )
+        # A genuine real-main ancestor survives even though main advanced past
+        # the dispatch base (main_sha=landing, real_main_head is a descendant).
+        assert landing in implicated_commits
+        assert 'src/x.py' in overlap_files
+
+    def test_fail_open_none_keeps_orphan_citation(self, tmp_path: Path):
+        from orchestrator.merge_disposition import _implicated_landings
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        merge_base, _real_main_head, orphan_tip = _build_orphan_repo(repo)
+
+        implicated_commits, overlap_files = asyncio.run(
+            _implicated_landings(
+                repo, merge_base, orphan_tip, {'src/x.py'},
+                real_main_head_sha=None,
+            ),
+        )
+        # real_main_head_sha=None -> filter skipped -> byte-identical to today.
+        assert orphan_tip in implicated_commits
+        assert 'src/x.py' in overlap_files
+
+    def test_fail_open_unresolvable_ref_keeps_orphan_citation(self, tmp_path: Path):
+        from orchestrator.merge_disposition import _implicated_landings
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        merge_base, _real_main_head, orphan_tip = _build_orphan_repo(repo)
+
+        implicated_commits, overlap_files = asyncio.run(
+            _implicated_landings(
+                repo, merge_base, orphan_tip, {'src/x.py'},
+                real_main_head_sha='0' * 40,  # a 40-hex SHA absent from the repo
+            ),
+        )
+        # merge-base --is-ancestor errors (rc != 0/1) against an absent ref ->
+        # the helper returns None -> prune only on a definitive negative -> keep.
+        assert orphan_tip in implicated_commits
+        assert 'src/x.py' in overlap_files
+
+
+# ---------------------------------------------------------------------------
 # step-9 — _branch_pre_merge_verify_green against a real EventStore
 # ---------------------------------------------------------------------------
 
