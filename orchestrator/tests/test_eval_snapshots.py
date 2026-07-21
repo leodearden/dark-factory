@@ -219,3 +219,83 @@ def test_resolve_worktree_venv_pythons_none(tmp_path):
     from orchestrator.evals.snapshots import resolve_worktree_venv_pythons
 
     assert resolve_worktree_venv_pythons(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# task 2876 DEFECT 3 — create_eval_worktree provisions the eval-verify
+# cross-member dep(s) (EVAL_VERIFY_EXTRA_DEPS = ('aiosqlite',)) into EACH
+# setup-created venv AFTER the setup_commands loop, reusing the already-built
+# scrubbed setup_env so the install targets the worktree venv and cannot corrupt
+# the live orchestrator .venv (2026-05-29 ghost-venv incident). Root cause: the
+# old-baseline orchestrator-only `uv sync` omits aiosqlite (predates orchestrator's
+# shared[vllm] dep), yet eval verify's pytest collection imports orchestrator.config
+# → shared/__init__ → shared.async_sqlite_base → import aiosqlite.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_eval_worktree_provisions_dep_into_subproject_venv(
+    tmp_path, monkeypatch,
+):
+    from orchestrator.evals import snapshots
+    from orchestrator.evals.snapshots import create_eval_worktree
+
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    pre = _init_repo_with_late_python_version(project_root)
+
+    # Ambient orchestrator venv activation vars present (as under a live run) so
+    # we can prove the provisioning env was scrubbed of them.
+    monkeypatch.setenv('VIRTUAL_ENV', '/orchestrator/.venv')
+    monkeypatch.setenv('UV_PROJECT_ENVIRONMENT', '/orchestrator/.venv')
+
+    # Record every _uv_pip_install invocation instead of running a real `uv pip
+    # install`. raising=False: the attribute does not exist until step-4.
+    calls: list[dict] = []
+
+    async def _spy(venv_python, deps, cwd, env):
+        calls.append(
+            {'venv_python': venv_python, 'deps': deps, 'cwd': cwd, 'env': env}
+        )
+
+    monkeypatch.setattr(snapshots, '_uv_pip_install', _spy, raising=False)
+
+    # setup_commands plant a fake subproject venv exactly where uv would
+    # (`cd orchestrator && uv sync` → <wt>/orchestrator/.venv).
+    worktree_path, _run_id = await create_eval_worktree(
+        project_root, 'df_task_x', pre,
+        setup_commands=['mkdir -p orchestrator/.venv/bin && : > orchestrator/.venv/bin/python'],
+    )
+
+    # Provisioned exactly once, into the resolved subproject venv, with aiosqlite
+    # among the deps and a scrubbed env (never the live orchestrator venv).
+    assert len(calls) == 1, f'expected one provisioning call, got {calls}'
+    call = calls[0]
+    assert call['venv_python'] == worktree_path / 'orchestrator' / '.venv' / 'bin' / 'python'
+    assert 'aiosqlite' in call['deps']
+    assert 'VIRTUAL_ENV' not in call['env']
+    assert 'UV_PROJECT_ENVIRONMENT' not in call['env']
+
+
+@pytest.mark.asyncio
+async def test_create_eval_worktree_no_venv_no_provisioning(tmp_path, monkeypatch):
+    # A setup that builds NO venv (reify/Rust-style) → resolver returns [] → the
+    # provisioner is a clean no-op (never calls _uv_pip_install).
+    from orchestrator.evals import snapshots
+    from orchestrator.evals.snapshots import create_eval_worktree
+
+    project_root = tmp_path / 'proj'
+    project_root.mkdir()
+    pre = _init_repo_with_late_python_version(project_root)
+
+    calls: list[dict] = []
+
+    async def _spy(venv_python, deps, cwd, env):
+        calls.append({'venv_python': venv_python})
+
+    monkeypatch.setattr(snapshots, '_uv_pip_install', _spy, raising=False)
+
+    await create_eval_worktree(
+        project_root, 'df_task_x', pre, setup_commands=['true'],
+    )
+
+    assert calls == [], f'expected no provisioning when no venv exists, got {calls}'
