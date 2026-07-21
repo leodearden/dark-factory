@@ -267,6 +267,27 @@ class TestExtractCitedTaskIdsConventions:
         assert extract_cited_task_ids('') == set()
 
 
+class TestExtractCitedTaskIdsParenForms:
+    """Additional paren-citation forms: `(#N)`, bare `(N)`, and `(task N)`."""
+
+    def test_hash_paren_form(self):
+        """A `(#N)` citation anywhere in the message cites the id."""
+        assert extract_cited_task_ids('drop stale entry (#2870)') == {'2870'}
+
+    def test_bare_paren_form(self):
+        """A bare `(N)` citation anywhere in the message cites the id."""
+        assert extract_cited_task_ids('cleanup pass (2870)') == {'2870'}
+
+    def test_task_word_paren_form(self):
+        """A `(task N)` citation anywhere in the message cites the id."""
+        assert extract_cited_task_ids('align with (task 2870)') == {'2870'}
+
+    def test_coexists_and_dedupes_with_conventional_commit_form(self):
+        """The new paren forms coexist with the conventional-commit form and
+        dedupe into a single set."""
+        assert extract_cited_task_ids('impl(2870): body cites (#123)') == {'2870', '123'}
+
+
 class TestExtractCitedTaskIdsWordBoundary:
     r"""`\b` word-boundary guard: no substring overlap between numeric ids."""
 
@@ -339,6 +360,15 @@ class TestClassifyMisattributed:
     def test_message_cites_only_a_different_task(self):
         """Task 50's provenance points at a commit whose subject cites task 77."""
         audit = _audit(task_id='50', is_ancestor=True, commit_message='Merge task/77 into main')
+        verdict, reasons = classify(audit)
+        assert verdict == 'misattributed'
+        assert reasons
+        assert any('77' in r for r in reasons)
+
+    def test_hash_paren_citation_of_a_different_task_is_misattributed(self):
+        """A `(#N)` citation of a different task is also caught as misattribution
+        (documents the motivation for widening CITATION_PATTERN to paren forms)."""
+        audit = _audit(task_id='50', is_ancestor=True, commit_message='cleanup pass (#77)')
         verdict, reasons = classify(audit)
         assert verdict == 'misattributed'
         assert reasons
