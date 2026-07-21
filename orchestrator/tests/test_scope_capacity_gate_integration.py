@@ -108,7 +108,10 @@ def make_gate(account_names: list[str], *, cost_store=None, **cfg) -> UsageGate:
 
     Mirrors ``shared/tests/test_usage_gate_scope_boundary.py``'s
     ``make_gate`` (P1) -- replicated locally since ``orchestrator/tests``
-    cannot import from ``shared/tests``.
+    cannot import from ``shared/tests``. This cross-package copy stays a
+    separate replica even after the shared-side consolidation tracked in
+    ticket tkt_0RRGS6H40KB28XBYSRX5HR4HNX (which only touches the
+    shared/tests copies of make_gate/set_scope_cap).
     """
     acct_cfgs = []
     env_vars: dict[str, str] = {}

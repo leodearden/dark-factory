@@ -78,7 +78,18 @@ _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
 
 # ---------------------------------------------------------------------------
 # Local helpers (mirroring test_usage_gate_scope_selection.py:46-84 and
-# test_cap_retry.py's make_gate/make_result/_SLEEP_PATCH)
+# test_cap_retry.py's make_gate/make_result/_SLEEP_PATCH).
+#
+# make_gate/set_scope_cap are intentionally duplicated here rather than
+# imported: task 2859's locked scope covered only this file and
+# orchestrator/tests/test_scope_capacity_gate_integration.py, not
+# test_cap_retry.py or test_usage_gate_scope_selection.py, so extracting a
+# shared helper module wasn't an in-scope amendment. Consolidating all
+# three shared-side copies (this file, test_cap_retry.py,
+# test_usage_gate_scope_selection.py) into one shared/tests helper is
+# tracked as a follow-up (ticket tkt_0RRGS6H40KB28XBYSRX5HR4HNX); the
+# orchestrator/tests copy stays a separate replica regardless (it cannot
+# import from shared/tests).
 # ---------------------------------------------------------------------------
 
 
