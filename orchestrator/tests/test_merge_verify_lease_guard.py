@@ -559,3 +559,92 @@ class TestResetHoldsLaneLock:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# task 2873, step-1 — merge_verify_lease(lane_dir=X) must flock
+# lane_lock_path(X) (the ACTUAL lane), leaving the hardcoded persistent lane
+# FREE; the no-arg call still locks the persistent lane (backward compatible).
+#
+# Incident (reify, 2026-07-20, task 5310, merge_sha 83336a32): the per-land
+# REMOTE-green cross-check re-verify (merge_queue.py, DF 2822) runs a full
+# local trust-anchor verify in an EPHEMERAL ``_merge-<hash>`` worktree OUTSIDE
+# any lane-lock lease, so a concurrent reseed/reclaim of that ephemeral lane
+# clobbered the tree mid-compile → ENOENT storm → spurious DIVERGE that
+# withheld a good land and quarantined the laptop remote. Parametrizing the
+# lease (DF 2873) lets that cross-check flock the ACTUAL merge_wt lane —
+# persistent OR ephemeral. Both tests below are RED before step-2's fix:
+# merge_verify_lease takes no ``lane_dir`` yet (TypeError on the kwarg).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeVerifyLeaseParametrizedLane:
+    """merge_verify_lease(lane_dir=X) flocks lane_lock_path(X), NOT the
+    hardcoded persistent lane (task 2873)."""
+
+    async def test_lease_locks_given_lane_and_leaves_persistent_free(
+        self, tmp_path: Path,
+    ):
+        """(a) An EPHEMERAL lane_dir: the lease holds lane_lock_path(lane_dir)
+        — a non-blocking flock re-acquire on that path raises BlockingIOError
+        — WHILE lane_lock_path(persistent_merge_worktree_path) stays FREE
+        (acquirable), proving it locked the GIVEN lane and not the hardcoded
+        persistent lane. The GLOBAL holder-pgid rendezvous
+        (read_lock_holder_pgid(worktree_base)) is still recorded, unchanged.
+        """
+        git_ops = _git_ops(tmp_path)
+        # An ephemeral speculation lane (the incident's _merge-<hash> shape).
+        ephemeral_wt = git_ops.worktree_base / '_merge-98c756bc'
+        ephemeral_lock = lane_lock_path(ephemeral_wt)
+        persistent_lock = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        ephemeral_lock.parent.mkdir(parents=True, exist_ok=True)
+        persistent_lock.parent.mkdir(parents=True, exist_ok=True)
+        assert ephemeral_lock != persistent_lock, (
+            'sanity: the ephemeral lane lock must be a DIFFERENT inode than '
+            'the persistent lane lock'
+        )
+
+        async with git_ops.merge_verify_lease(lane_dir=ephemeral_wt):
+            # The GIVEN lane's lock is HELD — a non-blocking re-acquire fails.
+            fd_eph = os.open(ephemeral_lock, os.O_RDWR | os.O_CREAT)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd_eph, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd_eph)
+
+            # The hardcoded persistent lane lock is FREE — acquirable, proving
+            # the lease did NOT touch it (it locked the given lane instead).
+            fd_persist = os.open(persistent_lock, os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd_persist, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must NOT raise
+                fcntl.flock(fd_persist, fcntl.LOCK_UN)
+            finally:
+                os.close(fd_persist)
+
+            # The global holder-pgid rendezvous stays keyed to worktree_base.
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
+                'the GLOBAL holder-pgid must still be recorded even for an '
+                'ephemeral-lane lease'
+            )
+
+        # Released on exit — holder-pgid cleared, flock dropped.
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+    async def test_default_lane_dir_still_locks_persistent(self, tmp_path: Path):
+        """(b) BACKWARD-COMPAT: no lane_dir arg → holds lane_lock_path(
+        persistent_merge_worktree_path), byte-identical to the sole existing
+        caller (merge_queue.py:2113) and every existing lease test."""
+        git_ops = _git_ops(tmp_path)
+        persistent_lock = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        persistent_lock.parent.mkdir(parents=True, exist_ok=True)
+
+        async with git_ops.merge_verify_lease():
+            fd = os.open(persistent_lock, os.O_RDWR | os.O_CREAT)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp()

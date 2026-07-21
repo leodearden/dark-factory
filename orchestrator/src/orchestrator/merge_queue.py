@@ -2224,7 +2224,29 @@ async def _run_post_merge_verify(
             escalation_queue=escalation_queue,
         )
         try:
-            local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+            # task 2873: defense-in-depth lane-lock for the REMOTE-path
+            # cross-check's local trust-anchor verify. DF 2685 (local consumer)
+            # and DF 2830 (laptop CLI span) put every OTHER merge-deciding local
+            # verify under merge_verify_lease, but this DF 2822 cross-check ran
+            # its full run_merge_verify OUTSIDE any lease — the runner-is-not-None
+            # guard means the LOCAL-dispatch lease at the top of this function
+            # (which requires runner is None) never fires here. Lock the ACTUAL
+            # merge_wt lane (persistent OR the ephemeral _merge-<hash> speculation
+            # worktree the cross-check verifies in — the incident's case), so a
+            # concurrent reseed/reclaim of THAT lane mutually excludes rather than
+            # clobbering the tree mid-verify (reify 2026-07-20, merge_sha
+            # 83336a32: ENOENT storm → spurious DIVERGE that withheld a good land).
+            # Gated on persistent_merge_worktree (mirrors the local-path gate):
+            # the lane-lock's contenders only exist in the warm-lane regime.
+            # (The contended-lease fail-safe is added in step-6; until then a
+            # MergeVerifyLeaseContended propagates to the requeue handler — a safe
+            # interim, never a clobber.)
+            async with contextlib.AsyncExitStack() as cross_stack:
+                if req.config.git.persistent_merge_worktree:
+                    await cross_stack.enter_async_context(
+                        git_ops.merge_verify_lease(lane_dir=merge_wt)
+                    )
+                local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
@@ -2241,6 +2263,39 @@ async def _run_post_merge_verify(
             logger.warning(
                 'Task %s: local cross-check trust-anchor unavailable for %s '
                 '(remote=%s) — trusting the remote green (fail-safe): %s',
+                req.task_id, merge_sha, runner.name, exc,
+            )
+        except MergeVerifyLeaseContended as exc:
+            # Fail-safe (task 2873): a contended lane-lock means a reseed/reclaim
+            # is actively mutating merge_wt — running the local verify now would
+            # reproduce the exact ENOENT mid-verify clobber this lease exists to
+            # prevent (reify 2026-07-20, merge_sha 83336a32: the ephemeral
+            # _merge-<hash> worktree was deleted mid-compile). We already hold a
+            # primary verdict (the remote green), so we SKIP the second-opinion
+            # cross-check and TRUST the remote green — mirroring the
+            # RunnerUnavailable fail-safe above and DriftDetector Invariant 5
+            # ("never block a good land on a local infra hiccup"). Do NOT set
+            # local_verify, do NOT quarantine, do NOT file an escalation, do NOT
+            # adopt a FAIL verdict — leaving `verify` = the remote green so the
+            # `if not verify.passed:` path below is skipped and the land proceeds.
+            # Deliberately DIFFERENT from the LOCAL-dispatch-path contention at
+            # the top of this function, which correctly PROPAGATES to the requeue
+            # handler (there is no primary verdict there); this catch keeps
+            # cross-check contention from reaching that handler.
+            if event_store is not None:
+                event_store.emit(
+                    EventType.verify_cross_check_inconclusive,
+                    task_id=req.task_id,
+                    data={
+                        'merge_sha': merge_sha,
+                        'remote_runner': runner.name,
+                        'reason': f'cross-check lane-lock contended: {exc}',
+                    },
+                )
+            logger.warning(
+                'Task %s: cross-check local trust-anchor could not acquire the '
+                'lane lock for %s (remote=%s) — a reseed/reclaim is in flight; '
+                'trusting the remote green (fail-safe, DriftDetector Invariant 5): %s',
                 req.task_id, merge_sha, runner.name, exc,
             )
         else:
