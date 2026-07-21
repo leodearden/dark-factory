@@ -59,6 +59,8 @@ def _make_worker(
     confirmation_runner=None,
     infra_runner=None,
     infra_confirmation_runner=None,
+    command_runner=None,
+    command_confirmation_runner=None,
     task_client=None,
     escalation_queue=None,
 ) -> OfflineLaneWorker:
@@ -71,6 +73,8 @@ def _make_worker(
         confirmation_runner=confirmation_runner,
         infra_runner=infra_runner,
         infra_confirmation_runner=infra_confirmation_runner,
+        command_runner=command_runner,
+        command_confirmation_runner=command_confirmation_runner,
         task_client=task_client,
         escalation_queue=escalation_queue,
     )
@@ -2010,3 +2014,329 @@ async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
         'the poll backstop must re-flag the still-outstanding head and retry '
         '_handle_red_run after the first pass raised'
     )
+
+
+# ---------------------------------------------------------------------------
+# _run_once — generic per-project command sub-runs (task 2789, step-15/16)
+#
+# The PRD sec 7 behavioral matrix (T1-T6), exercised through the REAL reused
+# red path with injected fakes — no failing test ever lands on main (INV-5:
+# the generic path reuses the whole confirm→fingerprint→file/update→escalate
+# engine, adding only per-command iteration + a priority kwarg).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_iterates_generic_commands_skipping_disabled(tmp_path: Path):
+    """_run_once runs each ENABLED generic command once (disabled ones skipped),
+    logs a labeled sub-run line, and — when every sub-run is green — advances
+    _last_green_head (Structural + T3).
+
+    Step 15 (RED): _run_once does not iterate offline_lane_commands yet —
+    command_runner is never awaited. Must fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+
+    wt_path = tmp_path / '_offline-deep'
+    cmd_a = LaneCommand(name='cmd-alpha', command='pytest -m integration', cwd='fused-memory')
+    cmd_b = LaneCommand(name='cmd-beta', command='pytest -m slow', enabled=False)
+    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config = _make_config(tmp_path, offline_lane_commands=[cmd_a, cmd_b])
+    suite_runner = AsyncMock(return_value=(0, ''))
+    command_runner = AsyncMock(return_value=(0, ''))
+    worker = _make_worker(
+        tmp_path, git_ops=git_ops, config=config,
+        suite_runner=suite_runner, command_runner=command_runner,
+    )
+    worker._handle_red_run = AsyncMock()
+    worker._dirty = True
+
+    with patch('orchestrator.offline_lane.logger') as mock_logger:
+        await worker._run_once()
+
+    command_runner.assert_awaited_once_with(cmd_a, wt_path, 'HEAD1')
+    worker._handle_red_run.assert_not_awaited()
+    assert worker._last_green_head == 'HEAD1', (
+        'all sub-runs green (numeric + the one enabled generic command) must '
+        'advance _last_green_head (T3)'
+    )
+
+    info_texts = [_log_call_text(call) for call in mock_logger.info.call_args_list]
+    assert any(
+        'cmd-alpha' in t and 'sub-run' in t and 'HEAD1' in t and 'PASS' in t
+        for t in info_texts
+    ), f'expected a labeled generic sub-run PASS log line, got {info_texts!r}'
+    assert not any('cmd-beta' in t for t in info_texts), (
+        'a disabled generic command must be skipped — never run nor logged'
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_once_generic_command_red_reuses_red_path_with_priority(tmp_path: Path):
+    """A red generic command reuses _handle_red_run with priority=cmd.fix_task_priority
+    and a confirmation_runner bound to command_confirmation_runner(cmd, …) (T6).
+
+    With the legacy numeric gate OFF, only the generic command runs (suite_runner
+    is never awaited); a red result blocks the all-green _last_green_head advance.
+
+    Step 15 (RED): _run_once does not iterate offline_lane_commands yet. Must
+    fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(
+        name='q', command='pytest -m integration', cwd='fused-memory',
+        fix_task_priority='low',
+    )
+    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config = _make_config(
+        tmp_path, offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd],
+    )
+    suite_runner = AsyncMock(return_value=(0, ''))
+    command_runner = AsyncMock(return_value=(1, 'tail'))
+    command_confirmation_runner = AsyncMock(return_value=['tests::test_x'])
+    worker = _make_worker(
+        tmp_path, git_ops=git_ops, config=config,
+        suite_runner=suite_runner, command_runner=command_runner,
+        command_confirmation_runner=command_confirmation_runner,
+    )
+    worker._handle_red_run = AsyncMock()
+    worker._dirty = True
+
+    await worker._run_once()
+
+    suite_runner.assert_not_awaited()
+    command_runner.assert_awaited_once_with(cmd, wt_path, 'HEAD1')
+    worker._handle_red_run.assert_awaited_once()
+    call = worker._handle_red_run.await_args
+    assert call.args == (wt_path, 'HEAD1')
+    assert call.kwargs['priority'] == 'low', (
+        "the filed fix task's priority must come from LaneCommand.fix_task_priority"
+    )
+    # The bound confirmation_runner must delegate to
+    # command_confirmation_runner(cmd, wt, head) — the per-iteration cmd binding
+    # (guards against the late-binding-closure bug).
+    conf = call.kwargs['confirmation_runner']
+    confirmed = await conf(wt_path, 'HEAD1')
+    command_confirmation_runner.assert_awaited_once_with(cmd, wt_path, 'HEAD1')
+    assert confirmed == ['tests::test_x']
+
+    assert worker._last_green_head is None, (
+        'a red generic sub-run must block the all-green _last_green_head advance'
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_once_generic_red_files_fix_task_end_to_end(tmp_path: Path):
+    """A confirmed-red generic command files exactly one fix task at the command's
+    priority + one L0 INFO escalation, through the REAL red path (T1).
+
+    _handle_red_run is NOT mocked here — the whole confirm→fingerprint→file→
+    INFO-escalation engine is reused (INV-5). The offline lane never touches
+    the merge queue (never-a-gate, C7).
+
+    Step 15 (RED): _run_once does not iterate offline_lane_commands yet, so no
+    fix task is ever filed. Must fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='q', command='pytest -m integration')  # default priority 'medium'
+    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config = _make_config(
+        tmp_path, offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd],
+    )
+    command_runner = AsyncMock(return_value=(1, 'tail'))
+    confirmed_ids = ['tests::test_x']
+    command_confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='fix-1')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-fix-1-1'
+    worker = _make_worker(
+        tmp_path, git_ops=git_ops, config=config,
+        command_runner=command_runner,
+        command_confirmation_runner=command_confirmation_runner,
+        task_client=task_client, escalation_queue=escalation_queue,
+    )
+    worker._dirty = True
+
+    await worker._run_once()
+
+    task_client.submit_fix_task.assert_awaited_once()
+    arguments = task_client.submit_fix_task.await_args.args[0]
+    assert arguments['priority'] == 'medium', (
+        "the default LaneCommand.fix_task_priority ('medium') must reach the filed task"
+    )
+    assert arguments['metadata']['merge_lane'] == 'normal', (
+        'the offline lane files a NORMAL queued fix task — never a merge gate'
+    )
+    assert arguments['metadata']['failing_tests'] == ['tests::test_x']
+
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+    assert worker.open_fix_tasks[fp] == 'fix-1'
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'info'
+    assert esc.level == 0
+
+    # Never-a-gate (C7): the worker only snapshots head + resets the warm
+    # worktree — it must never touch the merge queue / merge lane target.
+    touched = {str(c[0]).split('.')[0] for c in git_ops.mock_calls if c[0]}
+    assert not any(
+        kw in name.lower()
+        for name in touched
+        for kw in ('merge', 'queue', 'enqueue', 'target')
+    ), f'offline lane must never touch the merge queue (never-a-gate); git_ops calls: {touched}'
+
+
+@pytest.mark.asyncio
+async def test_run_once_generic_red_flake_files_nothing(tmp_path: Path):
+    """A generic command red that does NOT reproduce on the confirm re-run is a
+    flake (T2): no fix task, no escalation — just the intermittent log line.
+
+    Step 15 (RED): _run_once does not iterate offline_lane_commands yet. Must
+    fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='q', command='pytest -m integration')
+    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config = _make_config(
+        tmp_path, offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd],
+    )
+    command_runner = AsyncMock(return_value=(1, 'tail'))
+    command_confirmation_runner = AsyncMock(return_value=[])  # flake: nothing confirmed
+    task_client = AsyncMock()
+    escalation_queue = MagicMock()
+    worker = _make_worker(
+        tmp_path, git_ops=git_ops, config=config,
+        command_runner=command_runner,
+        command_confirmation_runner=command_confirmation_runner,
+        task_client=task_client, escalation_queue=escalation_queue,
+    )
+    worker._dirty = True
+
+    with patch('orchestrator.offline_lane.logger') as mock_logger:
+        await worker._run_once()
+
+    task_client.submit_fix_task.assert_not_awaited()
+    escalation_queue.submit.assert_not_called()
+    assert any(
+        'intermittent nondeterminism' in call.args[0]
+        for call in mock_logger.info.call_args_list
+    ), 'expected an "intermittent nondeterminism" flake log line'
+
+
+@pytest.mark.asyncio
+async def test_run_once_generic_red_dedups_then_promotes_l2_at_n_advances(tmp_path: Path):
+    """The same generic-command failing set across N confirmed-red advances files
+    once, appends the suspect range on later advances (never re-files), and stages
+    exactly one born-at-L2 blocker at N (T4) — all via the reused red engine.
+
+    Step 15 (RED): _run_once does not iterate offline_lane_commands yet. Must
+    fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='q', command='pytest -m integration')
+    heads = ['HEAD1', 'HEAD2', 'HEAD3']
+    head_calls = {'n': 0}
+
+    async def _get_main_sha() -> str:
+        h = heads[min(head_calls['n'], len(heads) - 1)]
+        head_calls['n'] += 1
+        return h
+
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(side_effect=_get_main_sha)
+    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(return_value=wt_path)
+    config = _make_config(
+        tmp_path, offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd], offline_lane_red_advances_before_blocker=3,
+    )
+    command_runner = AsyncMock(return_value=(1, 'tail'))
+    confirmed_ids = ['tests::test_x']
+    command_confirmation_runner = AsyncMock(return_value=confirmed_ids)
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='fix-1')
+    task_client.get_status = AsyncMock(return_value='in-progress')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-1'
+    worker = _make_worker(
+        tmp_path, git_ops=git_ops, config=config,
+        command_runner=command_runner,
+        command_confirmation_runner=command_confirmation_runner,
+        task_client=task_client, escalation_queue=escalation_queue,
+    )
+    fp = compute_failing_test_set_fingerprint(confirmed_ids)
+
+    # advance 1 — files the fix task
+    worker._dirty = True
+    await worker._run_once()
+    task_client.submit_fix_task.assert_awaited_once()
+    assert worker.open_fix_tasks[fp] == 'fix-1'
+    assert worker._red_advance_counts[fp] == 1
+
+    # advance 2 — appends the suspect range, no re-file, no L2 yet
+    worker._dirty = True
+    await worker._run_once()
+    task_client.submit_fix_task.assert_awaited_once()
+    task_client.append_suspect_range.assert_awaited()
+    assert worker._red_advance_counts[fp] == 2
+
+    # advance 3 — reaches N=3, stages exactly one born-at-L2 blocker
+    worker._dirty = True
+    await worker._run_once()
+    task_client.submit_fix_task.assert_awaited_once()  # never re-filed
+    assert worker._red_advance_counts[fp] == 3
+
+    levels = [c.args[0].level for c in escalation_queue.submit.call_args_list]
+    assert levels.count(0) == 1, 'exactly one L0 INFO on the first file'
+    assert levels.count(2) == 1, 'exactly one born-at-L2 blocker at N advances'
+    l2 = next(c.args[0] for c in escalation_queue.submit.call_args_list if c.args[0].level == 2)
+    assert l2.severity == 'critical'
+    assert l2.agent_role == 'orchestrator-offline-lane'
+    assert l2.task_id == 'fix-1'
+
+
+@pytest.mark.asyncio
+async def test_run_once_no_generic_commands_is_reify_byte_identical(tmp_path: Path):
+    """With no generic commands and the legacy numeric gate ON, _run_once is
+    byte-identical to prior reify behaviour (T5): the numeric suite runs, the
+    command_runner is never awaited, and a green pass advances _last_green_head.
+
+    Regression guard — must pass BOTH before and after step-16 (an empty
+    offline_lane_commands list must not change numeric behaviour).
+    """
+    wt_path = tmp_path / '_offline-deep'
+    git_ops = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config = _make_config(tmp_path)  # defaults: legacy numeric ON, commands=[]
+    suite_runner = AsyncMock(return_value=(0, ''))
+    command_runner = AsyncMock(return_value=(0, ''))
+    worker = _make_worker(
+        tmp_path, git_ops=git_ops, config=config,
+        suite_runner=suite_runner, command_runner=command_runner,
+    )
+    worker._handle_red_run = AsyncMock()
+    worker._dirty = True
+
+    await worker._run_once()
+
+    suite_runner.assert_awaited_once_with(
+        wt_path, 'HEAD1', config.git.offline_lane_test_threads,
+    )
+    command_runner.assert_not_awaited()
+    worker._handle_red_run.assert_not_awaited()
+    assert worker._last_green_head == 'HEAD1'
