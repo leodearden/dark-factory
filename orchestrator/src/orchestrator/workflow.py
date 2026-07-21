@@ -11955,10 +11955,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ``metadata={'task_id': str(self.task_id), 'source': 'orchestrator_completion'}``
         so this organic completion note is findable by task_id-keyed audits.
         Qdrant payload filters and the deterministic
-        ``count_memories_by_metadata`` / ``get_memories_by_metadata`` reconciliation
-        audits match on ``metadata.task_id``; without the tag the note (which
-        embeds the id only in ``agent_id``) is audit-invisible.  ``task_id`` is
-        stamped in exact-string form to match the form those audits query on.
+        ``get_memories_by_metadata`` reconciliation audits match on
+        ``metadata.task_id``; without the tag the note (which embeds the id only
+        in ``agent_id``) is audit-invisible.  ``task_id`` is stamped in
+        exact-string form to match the form those audits query on.
+
+        Which reconciliation surface finds this note (design-coherence note):
+
+        - **External / audit surfaces** — ``get_memories_by_metadata`` task_id
+          sweeps and the Stage-2 done-task completion-memory audit's per-task
+          *semantic search* step (Stage 2 searches related memories for each
+          done task it evaluates and will surface this note there).  This is the
+          intended reach of the stamp: the note is now visible to the widened
+          done-task audit instead of being invisible.
+        - **NOT the primary count-gate** — Stage 2's cheap first gate matches
+          ``{'task_id': str, 'stage2_suppress': True}``.  This note deliberately
+          does NOT carry ``stage2_suppress``, so it does not short-circuit that
+          gate.  That is intentional, not an oversight: ``stage2_suppress`` is
+          Stage 2's OWN "already audited & suppressed" marker; if the
+          orchestrator pre-stamped it, every organically-completed task would be
+          skipped by the count-gate before Stage 2 ever evaluated its coverage,
+          re-introducing exactly the done-task audit gap the widened audit
+          exists to close.  Leaving it off keeps each done task visible to the
+          audit's evaluation path while the note still spares it a redundant
+          re-write (the semantic search finds it).
         """
         parts = [f"Completed: {self.task.get('title', '')}"]
 
@@ -12005,9 +12025,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                 'project_id': self.config.fused_memory.project_id,
                                 'agent_id': f'orchestrator-task-{self.task_id}',
                                 # Stamp task_id (exact-string form) + source so the
-                                # note is audit-visible via metadata.task_id — the
-                                # key Qdrant filters and the deterministic
-                                # count/get-by-metadata audits query on.
+                                # note is audit-visible via metadata.task_id —
+                                # found by get_memories_by_metadata sweeps and the
+                                # Stage-2 done-task audit's semantic-search step.
+                                # Deliberately NO stage2_suppress: this must stay
+                                # visible to the audit, not silently skip its
+                                # count-gate (see method docstring).
                                 'metadata': {
                                     'task_id': str(self.task_id),
                                     'source': 'orchestrator_completion',
