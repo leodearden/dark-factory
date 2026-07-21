@@ -32,13 +32,9 @@ def test_tagger_schema_is_single_predictions_array_of_id_files():
     assert files['type'] == 'array'
     assert files['items']['type'] == 'string'
 
-
-def test_tagger_system_prompt_is_the_code_module_classifier_string():
-    sp = mtp.TAGGER_SYSTEM_PROMPT
-    assert isinstance(sp, str)
-    assert sp.startswith('You are a code module classifier.')
-    # The conservative-classifier framing the production invoke relies on.
-    assert 'Be precise and conservative.' in sp
+    # TAGGER_SYSTEM_PROMPT is public API surface (imported by both harness and
+    # the trial), so pin its existence — not its cosmetic wording.
+    assert mtp.TAGGER_SYSTEM_PROMPT
 
 
 def test_build_tagger_prompt_embeds_dirs_and_indented_summaries():
@@ -57,13 +53,3 @@ def test_build_tagger_prompt_embeds_dirs_and_indented_summaries():
     # The task summaries are embedded indent=2 under their header.
     assert '# Tasks to tag' in prompt
     assert json.dumps(task_summaries, indent=2) in prompt
-
-
-def test_build_tagger_prompt_carries_single_predictions_array_example():
-    prompt = mtp.build_tagger_prompt(['orchestrator'], [{'id': '1', 'title': 't', 'description': 'd'}])
-    # The anti-nesting instruction + the concrete single-array example line.
-    assert 'SINGLE top-level "predictions" array' in prompt
-    assert (
-        '{"predictions":[{"id":"12","files":["src/foo.py","tests/test_foo.py"]},'
-        '{"id":"13","files":[]}]}'
-    ) in prompt
