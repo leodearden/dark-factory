@@ -61,10 +61,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Protocol
 
+from shared.verify_admission import nice_prefix
+
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
-    from orchestrator.config import OrchestratorConfig
+    from orchestrator.config import LaneCommand, OrchestratorConfig
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
@@ -166,6 +168,17 @@ SuiteRunner = Callable[[Path, str, int], Awaitable[tuple[int, str]]]
 #: original failure did not reproduce in isolation (flake, B6).
 ConfirmationRunner = Callable[[Path, str], Awaitable[list[str]]]
 
+#: Signature of the injectable GENERIC per-project command seam (task 2789):
+#: (LaneCommand, worktree path, head SHA) -> (return code, output tail). Takes
+#: the LaneCommand (unlike the fixed reify seams above) because the generic
+#: path runs a different command per config entry.
+CommandRunner = Callable[['LaneCommand', Path, str], Awaitable[tuple[int, str]]]
+
+#: Signature of the injectable GENERIC per-project confirmation seam (task
+#: 2789): (LaneCommand, worktree path, head SHA) -> confirmed-still-failing
+#: test IDs (empty == flake, same contract as ConfirmationRunner).
+CommandConfirmationRunner = Callable[['LaneCommand', Path, str], Awaitable[list[str]]]
+
 
 class OfflineLaneTaskClient(Protocol):
     """Pluggable interface for filing/updating the offline-lane fix task (β3).
@@ -230,6 +243,12 @@ class OfflineLaneWorker:
             its optional ``confirmation_runner`` kwarg) to confirm an infra
             sub-run red result.  Defaults to
             :meth:`_default_infra_confirmation_run` when not supplied.
+        command_runner: Optional injectable async seam (task 2789),
+            ``(LaneCommand, wt_path, head) -> (rc, tail)``, for the generic
+            per-project command sub-runs iterated from
+            ``config.git.offline_lane_commands``.  Defaults to
+            :meth:`_default_run_command` (an idle-niced ``sh -c`` subprocess)
+            when not supplied.
         task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
             file/update the dedup'd fix task for a confirmed red run.
             Defaults to ``None`` — the red path degrades to a log-only no-op
@@ -250,6 +269,7 @@ class OfflineLaneWorker:
         confirmation_runner: ConfirmationRunner | None = None,
         infra_runner: SuiteRunner | None = None,
         infra_confirmation_runner: ConfirmationRunner | None = None,
+        command_runner: CommandRunner | None = None,
         task_client: OfflineLaneTaskClient | None = None,
         escalation_queue: EscalationQueue | None = None,
     ) -> None:
@@ -271,6 +291,9 @@ class OfflineLaneWorker:
             infra_confirmation_runner
             if infra_confirmation_runner is not None
             else self._default_infra_confirmation_run
+        )
+        self.command_runner: CommandRunner = (
+            command_runner if command_runner is not None else self._default_run_command
         )
         self.task_client = task_client
         self.escalation_queue = escalation_queue
@@ -974,3 +997,35 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         text = (stdout or b'').decode(errors='replace')
         return _parse_infra_failures(text)
+
+    async def _default_run_command(
+        self, cmd: LaneCommand, wt_path: Path, head: str,
+    ) -> tuple[int, str]:
+        """Default ``command_runner`` seam — runs a generic per-project command (task 2789).
+
+        Launches ``cmd.command`` (a shell string) via ``sh -c`` at idle
+        nice/ionice (``nice_prefix('background')`` = ``nice -n 19 ionice -c3``)
+        in ``<wt_path>/<cmd.cwd>``, with ``DF_VERIFY_ROLE=offline`` overlaid
+        onto a full ``os.environ`` copy — mirroring :meth:`_default_run_suite`.
+
+        D4: a bare ``pytest`` does not self-nice (unlike the reify scripts, for
+        which ``nice_prefix('offline')`` returns ``[]``), so the generic runner
+        applies the idle-class prefix itself. ``sh -c`` is needed because
+        ``command`` is a shell string. ``head`` is accepted for seam-signature
+        symmetry with injected runners; the worktree is already checked out to
+        it by :meth:`_run_once`. Returns the return code and the decoded,
+        2000-char output tail (stdout+stderr interleaved).
+        """
+        run_cwd = wt_path / cmd.cwd
+        argv = [*nice_prefix('background'), 'sh', '-c', cmd.command]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(run_cwd),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        return proc.returncode or 0, tail
