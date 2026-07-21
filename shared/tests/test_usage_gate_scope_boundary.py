@@ -330,3 +330,46 @@ class TestB4GeneralCapDominatesEveryScope:
         assert fable_lease.name == 'b'
         general_lease = await gate.before_invoke()
         assert general_lease.name == 'b'
+
+
+# ===========================================================================
+# B5 -- timer uncap + reactive re-cap, no tight loop
+# ===========================================================================
+
+
+class TestB5TimerUncapReactiveRecap:
+    """B5: a fable scope cap whose uncap deadline has already passed is
+    optimistically treated as open at selection time (S6), the very next
+    invocation on that account re-caps it with a NEW future deadline
+    (reactive re-cap), and the retry loop still resolves in exactly one
+    bounded cooldown + failover -- never a tight spin."""
+
+    async def test_b5_timer_uncap_then_reactive_recap_is_bounded(self):
+        gate = make_gate(['a', 'b'])
+        a, b = gate._accounts
+        now = datetime.now(UTC)
+        # A's fable-scope cap deadline has already passed -- the selection-time
+        # predicate treats it as open (S6/S8). B has fable headroom (no scope
+        # cap installed at all).
+        set_scope_cap(
+            a, resets_at=now - timedelta(seconds=5), capped_at=now - timedelta(hours=1),
+        )
+
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', model='claude-fable-5', backend='claude',
+                invoke_fn=scripted_invoke(
+                    cap_result("You've hit your usage limit. resets in 6h"),
+                    ok_result(),
+                ),
+                prompt='hi',
+            )
+
+        assert got.account_name == 'b'
+        sc = a.scope_caps[SCOPE]
+        assert sc.capped is True
+        # Reactive re-cap installed a NEW deadline, strictly in the future.
+        assert sc.resets_at is not None
+        assert sc.resets_at > datetime.now(UTC)
+        # Exactly one cap cooldown -> retry: counters advanced, no tight spin.
+        assert mock_sleep.await_count == 1
