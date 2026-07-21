@@ -3549,7 +3549,9 @@ class TaskWorkflow:
         "not expanded" means for their own flow (REQUEUED report,
         decline-and-fall-through-to-architect, or silent no-op).
         """
-        new_modules = files_to_modules(plan_files, self.config.lock_depth)
+        new_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
         if set(new_modules) == set(self.modules):
             return True
         expanded = await self.scheduler.handle_blast_radius_expansion(
@@ -3957,7 +3959,9 @@ class TaskWorkflow:
                     'Files are required to derive module locks.'
                 ),
             )
-        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        plan_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
         logger.info(
             f'Task {self.task_id}: derived {len(plan_modules)} modules '
             f'from {len(plan_files)} files: {plan_modules}'
