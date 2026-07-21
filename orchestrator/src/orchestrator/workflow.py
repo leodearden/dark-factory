@@ -9640,6 +9640,32 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
         return spend
 
+    def _scope_capacity_snapshot(self) -> dict[str, bool] | None:
+        """Resolve-time advisory per-scoped-model headroom snapshot for the
+        routing resolver (task δ, invariants S7/S8).
+
+        Returns ``None`` when no ``usage_gate`` is wired (the common case —
+        out-of-band dispatch, tests), otherwise the gate's
+        ``scope_capacity_snapshot()`` (task γ): True per scoped model iff >=1
+        account has headroom, ``{}`` when the scoped-cap kill switch is off.
+        Best-effort/fail-open — a read hiccup is logged and degrades to
+        ``None`` (mirrors ``_ceiling_spend_by_model``), so a snapshot failure
+        NEVER blocks dispatch (S7). The snapshot is advisory only: the gate's
+        own invoke-time scope predicate stays authoritative, so a stale
+        snapshot degrades to a scope-wait/failover, never a wrong-and-stuck
+        decision (S8).
+        """
+        if self.usage_gate is None:
+            return None
+        try:
+            return self.usage_gate.scope_capacity_snapshot()
+        except Exception:
+            logger.warning(
+                'Task %s: failed to read scope-capacity snapshot from usage_gate',
+                self.task_id, exc_info=True,
+            )
+            return None
+
     def _resolve_role_system_prompt(self, role: AgentRole, model: str) -> str:
         """Resolve *role*'s system prompt, applying a live artifact override when opted in.
 
@@ -9725,6 +9751,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             dispatch_count=int(task_metadata.get('dispatch_count', 0)),
             role_defaults=role_defaults,
             spend_by_model=await self._ceiling_spend_by_model(),
+            scope_capacity=self._scope_capacity_snapshot(),
         )
         decision = resolve_route(route_inputs, self.config)
         model = decision.model
