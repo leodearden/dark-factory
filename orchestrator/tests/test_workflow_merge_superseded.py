@@ -51,6 +51,7 @@ def _make(*, task_id: str = '99') -> _Fixture:
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = Path('/tmp/non-existent-for-test')
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)

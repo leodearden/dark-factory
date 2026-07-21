@@ -46,6 +46,7 @@ def _make_workflow(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = tmp_path / 'proj'
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     scheduler = MagicMock()
     git_ops = MagicMock()

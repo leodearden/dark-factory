@@ -416,6 +416,7 @@ def _make_consumer_fixture(
     config.project_root = Path('/tmp/non-existent-for-test')
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)
@@ -699,6 +700,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     config.project_root = Path('/tmp/non-existent')
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)

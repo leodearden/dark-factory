@@ -66,6 +66,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = Path('/tmp/non-existent-for-test')
     config.max_consecutive_merge_thrash = max_consecutive_merge_thrash
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     if update_task_raises:
         update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
