@@ -4085,7 +4085,9 @@ class TaskWorkflow:
         # overlapping module — fall through to the architect path which
         # already handles the requeue case.
         plan_files = plan.get('files', [])
-        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        plan_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
         if (
             set(plan_modules) != set(self.modules)
             and not await self._reconcile_scope_locks(plan_files)
@@ -4244,7 +4246,9 @@ class TaskWorkflow:
         # case where the SIMPLE_TASK agent expanded scope by one file).
         plan_files = self.plan.get('files', [])
         if plan_files:
-            plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+            plan_modules = derive_modules(
+                plan_files, self.config.lock_depth, task_id=self.task_id,
+            )
             if set(plan_modules) != set(self.modules):
                 # Silent no-op on lock conflict (same as before this was
                 # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't
