@@ -2637,38 +2637,18 @@ class TaskWorkflow:
                             # the conflict was detected). Do NOT resume the
                             # implementer under a lock a sibling task still
                             # holds — requeue and let this task redispatch
-                            # once the lock frees. new_modules is computed
-                            # HERE (only on the conflict path) so the
-                            # block_detail names the exact unavailable locks.
-                            # α-strip via derive_modules (task 2373 amendment)
-                            # so `additional` is computed on the same basis as
-                            # the real conflict detection in
-                            # _reconcile_scope_locks — a directory-shaped grant
-                            # entry must not manufacture a phantom subtree
-                            # module in the diagnostic.
-                            new_modules = derive_modules(
-                                new_files, self.config.lock_depth,
-                                task_id=self.task_id,
+                            # once the lock frees.
+                            # _requeue_on_lock_conflict re-derives the
+                            # missing modules from new_files (α-strip via
+                            # derive_modules, task 2373 amendment) on the
+                            # same basis as the real conflict detection in
+                            # _reconcile_scope_locks — a directory-shaped
+                            # grant entry must not manufacture a phantom
+                            # subtree module in the diagnostic.
+                            return await self._requeue_on_lock_conflict(
+                                new_files, 'scope_grant_lock_conflict',
+                                'Scope grant',
                             )
-                            additional = sorted(
-                                set(new_modules) - set(self.modules)
-                            )
-                            block_detail = (
-                                f'Scope grant blocked: additional locks '
-                                f'{additional} unavailable (held by other '
-                                f'tasks). Held modules: '
-                                f'{sorted(self.modules)}; granted files: '
-                                f'{sorted(granted)}.'
-                            )
-                            self._terminal_report = TerminalReport(
-                                outcome=WorkflowOutcome.REQUEUED,
-                                reason='scope_grant_lock_conflict',
-                                phase=self.machine.state,
-                                detail=block_detail,
-                                category=None,
-                                blocked_from_phase=self.machine.state,
-                            )
-                            return WorkflowOutcome.REQUEUED
 
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
@@ -3625,6 +3605,50 @@ class TaskWorkflow:
             await self.scheduler.update_task(self.task_id, merged)
         return reconciled
 
+    async def _requeue_on_lock_conflict(
+        self, files: list[str], reason: str, prefix: str,
+    ) -> WorkflowOutcome:
+        """Build a REQUEUED ``TerminalReport`` for a genuine cross-module
+        lock conflict, stash it on ``self._terminal_report``, and return
+        ``WorkflowOutcome.REQUEUED`` (task 2874 amendment).
+
+        Shared by the three sites that convert "the scheduler couldn't
+        acquire an additional module lock for a widened file scope" into a
+        requeue: ``_plan()``'s blast-radius path, the escalation-resume
+        scope-grant path, and ``_execute_verify_review_loop()``'s
+        post-replan reconcile. *files* is the full target file set the
+        caller wanted scope to cover (not just the delta) — the missing
+        locks are re-derived from it here so the diagnostic always reflects
+        the actual unavailable modules on the same basis as the real
+        conflict detection in ``_reconcile_scope_locks``. *reason* is the
+        ``TerminalReport.reason`` string callers (and the retry-cap report)
+        key off of; *prefix* only varies the human-readable ``detail``
+        message's opening clause (e.g. ``'Plan expansion'``).
+        """
+        additional = sorted(
+            set(derive_modules(
+                files, self.config.lock_depth, task_id=self.task_id,
+            ))
+            - set(self.modules)
+        )
+        block_detail = (
+            f'{prefix} blocked: additional locks {additional} unavailable '
+            f'(held by other tasks). Held modules: {sorted(self.modules)}; '
+            f'requested files: {sorted(files)}.'
+        )
+        self._terminal_report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason=reason,
+            phase=self.machine.state,
+            detail=block_detail,
+            category=None,
+            # No BLOCKED transition on this path — blocked_from_phase
+            # mirrors the current (working) phase, preserving the
+            # harness's retry-cap block_phase semantics.
+            blocked_from_phase=self.machine.state,
+        )
+        return WorkflowOutcome.REQUEUED
+
     async def _plan(self) -> WorkflowOutcome:
         """Invoke the architect to produce a plan."""
         assert self.worktree is not None and self.artifacts is not None
@@ -3990,25 +4014,11 @@ class TaskWorkflow:
         ):
             # Annotate the requeue so the per-task retry-cap report can
             # name *why* — without this, three blast-radius requeues in a
-            # row produce a cap-exhaust report with phase/reason='unknown'.
-            additional = sorted(set(plan_modules) - set(self.modules))
-            block_detail = (
-                f'Plan expansion blocked: additional locks {additional} '
-                f'unavailable (held by other tasks). '
-                f'Held modules: {sorted(self.modules)}; '
-                f'plan modules: {sorted(plan_modules)}.'
+            # row produce a cap-exhaust report with phase/reason='unknown'
+            # (REVIEW-CYCLE-1; block_phase='plan').
+            return await self._requeue_on_lock_conflict(
+                plan_files, 'plan_blast_radius_lock_conflict', 'Plan expansion',
             )
-            self._terminal_report = TerminalReport(
-                outcome=WorkflowOutcome.REQUEUED,
-                reason='plan_blast_radius_lock_conflict',
-                phase=self.machine.state, detail=block_detail,
-                category=None,
-                # No BLOCKED transition on this path — blocked_from_phase
-                # mirrors the current (working) phase, preserving the
-                # harness's retry-cap block_phase='plan' (REVIEW-CYCLE-1).
-                blocked_from_phase=self.machine.state,
-            )
-            return WorkflowOutcome.REQUEUED
         # self.modules/_module_configs already updated by
         # _reconcile_scope_locks on success (no-op if scope unchanged).
 
@@ -5794,30 +5804,12 @@ class TaskWorkflow:
                 # the task on the scheduler's own conflict branch, but
                 # self.modules is left UNCHANGED — so the loop must NOT
                 # proceed into another EXECUTE under a foreign lock. Mirrors
-                # _plan()'s blast-radius conflict path (workflow.py:3987-4011).
-                additional = sorted(
-                    set(derive_modules(
-                        replan_files, self.config.lock_depth, task_id=self.task_id,
-                    ))
-                    - set(self.modules)
+                # _plan()'s blast-radius conflict path via the shared
+                # _requeue_on_lock_conflict helper (task 2874 amendment).
+                return await self._requeue_on_lock_conflict(
+                    replan_files, 'plan_blast_radius_lock_conflict',
+                    'Replan expansion',
                 )
-                block_detail = (
-                    f'Replan expansion blocked: additional locks {additional} '
-                    f'unavailable (held by other tasks). '
-                    f'Held modules: {sorted(self.modules)}; '
-                    f'replan files: {replan_files}.'
-                )
-                self._terminal_report = TerminalReport(
-                    outcome=WorkflowOutcome.REQUEUED,
-                    reason='plan_blast_radius_lock_conflict',
-                    phase=self.machine.state, detail=block_detail,
-                    category=None,
-                    # No BLOCKED transition on this path — blocked_from_phase
-                    # mirrors the current (working) REVIEW phase, preserving
-                    # the harness's retry-cap block_phase semantics.
-                    blocked_from_phase=self.machine.state,
-                )
-                return WorkflowOutcome.REQUEUED
             self.metrics.review_cycles += 1
 
     async def _execute_iterations(self) -> WorkflowOutcome:
