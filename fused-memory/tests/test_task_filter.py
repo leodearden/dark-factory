@@ -4179,3 +4179,63 @@ class TestSelectDoneSinceBoundary:
         boundary = datetime(2026, 7, 14, 10, 0, 0, tzinfo=UTC)
         assert select_done_since_boundary([], boundary) == []
         assert select_done_since_boundary([], None) == []
+
+
+# ---------------------------------------------------------------------------
+# Step 3: all_done_tasks uncapped field (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterTaskTreeAllDoneTasks:
+    """RED tests for the uncapped FilteredTaskTree.all_done_tasks field (step-3).
+
+    all_done_tasks must contain EVERY done task from the input (no cap), in
+    contrast to done_tasks which is capped at MAX_DONE_TASKS_RETAINED=30.  The
+    since-boundary completion-memory audit reads all_done_tasks so its coverage
+    does not silently shrink as task throughput grows past the 30-cap.
+    """
+
+    def test_all_done_tasks_is_uncapped(self):
+        """all_done_tasks holds every done task even when done_tasks caps at 30."""
+        n_done = MAX_DONE_TASKS_RETAINED + 5
+        done_tasks = [_make_task(i, 'done') for i in range(1, n_done + 1)]
+        # a couple of non-done tasks to prove all_done_tasks is done-only
+        extra = [_make_task(1000, 'pending'), _make_task(1001, 'cancelled')]
+        tasks_data = {'tasks': done_tasks + extra}
+
+        result = filter_task_tree(tasks_data)
+
+        assert len(result.done_tasks) == MAX_DONE_TASKS_RETAINED, (
+            f'done_tasks must stay capped at {MAX_DONE_TASKS_RETAINED}, '
+            f'got {len(result.done_tasks)}'
+        )
+        assert len(result.all_done_tasks) == n_done, (
+            f'all_done_tasks must be uncapped: expected {n_done}, '
+            f'got {len(result.all_done_tasks)}'
+        )
+        # all_done_tasks contains only done tasks
+        assert all(t.get('status') == 'done' for t in result.all_done_tasks), (
+            'all_done_tasks must contain done tasks only'
+        )
+        # every done id is present (no silent drop)
+        assert {t['id'] for t in result.all_done_tasks} == {t['id'] for t in done_tasks}
+
+    def test_all_done_tasks_defaults_to_empty_list(self):
+        """FilteredTaskTree.all_done_tasks defaults to [] and is independent per instance."""
+        tree1 = FilteredTaskTree()
+        tree2 = FilteredTaskTree()
+
+        assert hasattr(tree1, 'all_done_tasks')
+        assert tree1.all_done_tasks == []
+
+        # Mutating one instance's all_done_tasks must not affect the other
+        tree1.all_done_tasks.append({'id': 99, 'status': 'done'})
+        assert tree2.all_done_tasks == [], (
+            'Mutable default arg regression: tree2.all_done_tasks was affected by tree1 mutation'
+        )
+
+    def test_all_done_tasks_empty_for_no_done_tasks(self):
+        """all_done_tasks is [] when the input carries no done tasks."""
+        tasks_data = {'tasks': [_make_task(1, 'pending'), _make_task(2, 'cancelled')]}
+        result = filter_task_tree(tasks_data)
+        assert result.all_done_tasks == []
