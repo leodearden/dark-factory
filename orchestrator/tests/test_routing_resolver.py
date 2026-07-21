@@ -701,3 +701,182 @@ class TestFailSafeScopedToClaudeBackend:
         assert decision.model == 'gemini-3-pro'
         assert decision.source_layer == 'metadata_override'
         assert decision.rejected == ()
+
+
+class TestScopeCapacityFallback:
+    """(δ) invariant S7 / boundary test B7: a model whose account SCOPE has
+    no headroom (``scope_capacity[m] is False``) is rejected exactly like an
+    allowlist/ceiling failure -- resolution falls back one layer, dispatch
+    proceeds with the fallback model, and ``"<layer>:model-capacity-exhausted"``
+    is appended to ``decision.rejected``. Mirrors ``TestCeilingFallback``.
+
+    ``scope_capacity`` is the resolve-time advisory snapshot threaded from
+    ``TaskWorkflow._invoke`` (the gate's ``scope_capacity_snapshot()``, task
+    γ). ``None`` (no gate wired) or a model ABSENT from the mapping skips the
+    check entirely -- the fail-safe never blocks dispatch (S7).
+    """
+
+    def test_config_model_capacity_exhausted_falls_back_to_role_default(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='opus'),
+            routing=RoutingConfig(),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity={'opus': False},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'haiku'
+        assert decision.source_layer == 'role_default'
+        assert 'config:model-capacity-exhausted' in decision.rejected
+
+    def test_policy_rule_model_capacity_exhausted_falls_back_to_config(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity={'opus': False},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert decision.rule_id == 'r'
+        assert 'policy_rule:model-capacity-exhausted' in decision.rejected
+
+    def test_metadata_override_model_capacity_exhausted_falls_back_to_config(self):
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={'model_overrides': {'implementer': 'opus'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity={'opus': False},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert 'metadata_override:model-capacity-exhausted' in decision.rejected
+
+    def test_scope_capacity_none_skips_check(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity=None,
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rejected == ()
+
+    def test_model_absent_from_scope_capacity_applies_normally(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity={'claude-fable-5': False},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rejected == ()
+
+    def test_scope_capacity_true_applies_model(self):
+        rule = RoutingRule(id='r', match=RuleMatch(role=['implementer']), set=RuleSet(model='opus'))
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(rules=[rule]),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity={'opus': True},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'opus'
+        assert decision.source_layer == 'policy_rule'
+        assert decision.rejected == ()
+
+    def test_b7_override_fable_capacity_exhausted_falls_to_config(self):
+        """PRD boundary test B7: an override pins ``claude-fable-5`` (admitted
+        to ``allowed_models``, no ceiling), but its scope has no headroom
+        (``scope_capacity['claude-fable-5'] is False``) -- the override layer
+        is skipped, resolution falls one layer down to the config model
+        (``sonnet``), and ``rejected`` names
+        ``metadata_override:model-capacity-exhausted``. Dispatch proceeds."""
+        cfg = OrchestratorConfig(
+            models=ModelsConfig(implementer='sonnet'),
+            routing=RoutingConfig(allowed_models=[*DEFAULT_ALLOWED_MODELS, 'claude-fable-5']),
+        )
+        inputs = RouteInputs(
+            role_name='implementer',
+            task_id='1',
+            task_metadata={'model_overrides': {'implementer': 'claude-fable-5'}},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=_role_defaults(model='haiku'),
+            scope_capacity={'claude-fable-5': False},
+        )
+
+        decision = resolve_route(inputs, cfg)
+
+        assert decision.model == 'sonnet'
+        assert decision.source_layer == 'config'
+        assert 'metadata_override:model-capacity-exhausted' in decision.rejected
