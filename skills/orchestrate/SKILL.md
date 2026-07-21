@@ -415,6 +415,22 @@ Today's per-invocation routing visibility: every resolved invocation emits a `ro
 
 **Forthcoming:** a per-(model×role) rollup (done/blocked/cap-hit rates, $/done) in the digest and dashboard is not yet rendered — this section will be updated once that lands.
 
+### Reading scoped cap-hit / failover cost events
+
+`cap_hit`, `near_cap`, and `failover` account events (fired by the `UsageGate`, see CLAUDE.md's "Model-scoped account caps") land in the `account_events` table of `data/orchestrator/runs.db` — the same SQLite file the `CostStore` shares with `EventStore`/`RunStore`. Each row's `details` column is a JSON blob:
+
+```bash
+sqlite3 data/orchestrator/runs.db \
+  "SELECT account_name, event_type, details, created_at FROM account_events
+   WHERE event_type IN ('cap_hit', 'near_cap', 'failover')
+   ORDER BY created_at DESC LIMIT 20;"
+```
+
+When `usage_cap.scoped_cap_models` is non-empty, a **scoped** event's `details` carries a `"scope"` key set to the model name it was attributed to (e.g. `"claude-fable-5"`); a **general** (unscoped) event's `details` omits the `scope` key entirely. Reading a row:
+- `cap_hit`/`near_cap` **with** `scope` in `details` → only that account's model-scope was affected; the account keeps serving general dispatches.
+- `cap_hit`/`near_cap` **without** `scope` → a full account-level cap; the account is excluded for every scope (general and every listed model).
+- `failover` → `details` carries `from`/`to` account names, plus `scope` on a scoped failover (omitted on a general failover).
+
 ---
 
 ## Check Status
@@ -578,6 +594,10 @@ Subprojects can override verification commands by placing an `orchestrator.yaml`
 ### Multi-account failover
 
 The `usage_cap` section configures automatic failover between Max subscription accounts when usage caps are hit. Accounts are tried in order; when one is capped, the orchestrator switches to the next and starts a background probe to detect when the capped account resets.
+
+`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`) adds a **model-scoped** cap dimension on top of that per-account failover: a cap hit while running a listed model caps only that account's scope for that model — the account keeps serving general (non-listed-model) work untouched — and a general cap-hit always caps the whole account (every scope). `scoped_cap_models: []` is the kill switch, disabling scope tracking entirely. See CLAUDE.md's "Model-scoped account caps" (under "Model Routing") for the full scope semantics and how they interact with the `resolve_route` fail-safe check.
+
+`usage_cap.*`, including `scoped_cap_models`, is **restart-tier** — it is not in `RELOADABLE_FIELDS`, so `mcp__escalation__reload_config` won't apply a change to it; see "Reload Config (vs Restart)" above.
 
 Override via YAML file (`--config`) or environment variables (`ORCH_MAX_CONCURRENT_TASKS=5`, `ORCH_MODELS__ARCHITECT=sonnet`).
 
