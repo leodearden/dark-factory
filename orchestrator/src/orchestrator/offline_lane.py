@@ -490,7 +490,9 @@ class OfflineLaneWorker:
     # ------------------------------------------------------------------
 
     async def _handle_red_run(
-        self, wt: Path, head: str, *, confirmation_runner: ConfirmationRunner | None = None,
+        self, wt: Path, head: str, *,
+        confirmation_runner: ConfirmationRunner | None = None,
+        priority: str = 'high',
     ) -> None:
         """Handle a confirmed-red ``_run_once`` pass: confirm, fingerprint, file/update.
 
@@ -516,6 +518,14 @@ class OfflineLaneWorker:
         escalation — is content-agnostic and unchanged, so infra
         test-file-names dedup exactly like numeric test IDs (IE-D1/§6): no
         new dedup mechanism.
+
+        The optional *priority* kwarg (task 2789, D3) is threaded to
+        :meth:`_file_new_fix_task` so a generic per-project command red path
+        files its fix task at ``LaneCommand.fix_task_priority``; it defaults
+        to ``'high'`` so the legacy numeric/infra call sites stay
+        byte-identical. It applies only when a NEW fingerprint is filed — an
+        already-open fingerprint appends a suspect range and its priority was
+        fixed at file time (:meth:`_update_existing_fix_task` unchanged).
         """
         runner = confirmation_runner if confirmation_runner is not None else self.confirmation_runner
         confirmed = await runner(wt, head)
@@ -534,7 +544,7 @@ class OfflineLaneWorker:
         if fp in self.open_fix_tasks:
             await self._update_existing_fix_task(fp, head)
         else:
-            await self._file_new_fix_task(fp, confirmed, head)
+            await self._file_new_fix_task(fp, confirmed, head, priority)
 
     def _suspect_range(self, head: str) -> str:
         """Cheapest sound over-approximation of the commits that could have
@@ -545,7 +555,9 @@ class OfflineLaneWorker:
             return f'{self._last_green_head}..{head}'
         return head
 
-    async def _file_new_fix_task(self, fp: str, confirmed: list[str], head: str) -> None:
+    async def _file_new_fix_task(
+        self, fp: str, confirmed: list[str], head: str, priority: str = 'high',
+    ) -> None:
         """File a NEW dedup'd fix task for a confirmed-red failing-test set (B4).
 
         Builds the ``submit_task`` argument block via
@@ -567,12 +579,16 @@ class OfflineLaneWorker:
         meaningless INFO escalation with ``task_id=''``. So an empty id is
         logged and treated the same as the unwired-client degrade: no state
         recorded, no escalation, safe to retry on the next red advance.
+
+        *priority* (task 2789, D3) is the filed task's priority, defaulting to
+        ``'high'`` so the legacy numeric/infra call sites stay byte-identical;
+        a generic per-project command passes its ``LaneCommand.fix_task_priority``.
         """
         from orchestrator.workflow import build_offline_lane_fix_task_arguments
 
         suspect = self._suspect_range(head)
         arguments = build_offline_lane_fix_task_arguments(
-            confirmed, suspect, fp, self.config.project_root, head,
+            confirmed, suspect, fp, self.config.project_root, head, priority,
         )
         if self.task_client is None:
             logger.info(
