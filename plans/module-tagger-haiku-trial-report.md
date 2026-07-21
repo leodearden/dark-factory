@@ -79,36 +79,68 @@ verdict is computed by this trial (δ's rollup is only the post-flip watch).
 }
 ```
 
-## Decide-and-act outcome (step 16)
+## Ratified outcome — flip applied + agreement-floor gate fixed (esc-2540-17)
 
-**Action: NO FLIP — config left unchanged.** `module_tagger` remains on its
-configured incumbent (sonnet). `dark-factory-orchestrator.yaml` was **not**
-edited and no hot-reload was performed, per the plan's rule "do NOT flip on
-anything but a clear pass."
+> **This supersedes the pre-fix auto-rendered verdict above.** The live run's
+> `Decision: FAIL` (and `"decision": "fail"` in the machine-readable block) was
+> computed under the ORIGINAL agreement-floor gate, which hard-failed on
+> `mean Jaccard 0.368 < AGREEMENT_FAIL 0.50` alone. Under the fixed gate
+> (Part 2 below) those identical numbers reclassify to **MARGINAL** — the low
+> agreement is no longer permitted to hard-fail a challenger that wins the
+> primary quality signal.
 
-**Why the verdict is FAIL:** the only hard-fail trigger that fired is the
-haiku-vs-sonnet **agreement floor** — mean Jaccard `0.368` < `AGREEMENT_FAIL`
-`0.50`. Neither F1-gap nor the adjudication trigger fired.
+**Decision (Leo, 2026-07-21, resolving the esc-2540-17 `design_concern`): FLIP
+`module_tagger` to haiku (option a) AND fix the trial's agreement-floor gate
+(option d).** The FAIL was driven SOLELY by the haiku-vs-sonnet agreement floor,
+while on the primary quality signal (F1 vs ground truth) haiku BEATS the
+incumbent sonnet. Both parts are implemented in this task.
 
-**Important nuance (surfaced to a human via a `design_concern` escalation):**
-the fail is driven by low *agreement*, not by haiku underperforming. On the
-primary quality signal (F1 vs ground truth) haiku (`0.370`) **beats** the
-incumbent sonnet (`0.267`) — an F1 gap of `-0.103` in haiku's favour — and the
-opus frontier judged haiku better on **16** of the 25 disagreements vs **6**
-for sonnet (3 ties; `haiku_worse_fraction=0.273`). So the low agreement
-reflects sonnet being the weaker model on this recent-30 sample, not haiku
-being unreliable — the opposite of the divergence the agreement floor was
-designed to catch. Absolute F1 is low for both models because exact merge-diff
-file prediction from title+description is a demanding target; production locks
-at coarser module granularity, so the *comparative* signal is what matters.
+### Part 1 — FLIP applied (option a)
 
-Per the plan's fail/marginal branch this is escalated (`escalate_blocker`,
-category `design_concern`) for human adjudication of the threshold tension —
-whether to flip anyway on haiku's ground-truth + cost edge (~10× cheaper),
-re-run at larger N / higher effort to tighten the estimate, keep sonnet, or
-revisit whether `AGREEMENT_FAIL` should hard-fail when the divergence favours
-the challenger.
+`module_tagger`'s default model is flipped **sonnet → haiku** in both places, so
+the code default and the shipped config agree:
 
-**Deferred follow-on (NOT performed):** the `defaults.yaml` bake
-(module_tagger sonnet→haiku) was contingent on a PASS + the δ-rollup watch
-window, neither of which occurred; it is not done.
+- `orchestrator/src/orchestrator/defaults.yaml` — `models.module_tagger: "haiku"`
+- `orchestrator/src/orchestrator/config.py` — `ModelsConfig.module_tagger` Field default `'haiku'`
+
+haiku is already in `routing.allowed_models`, so no admission change was needed
+(verified: 308 orchestrator config/routing/harness-tagging tests green). The
+running `dark-factory-orchestrator.yaml` operator config declares **no** `models`
+block, so `defaults.yaml` governs the fleet: the flip takes effect on the next
+orchestrator deploy/restart. This replaces the earlier plan's
+hot-reload-of-`dark-factory-orchestrator.yaml` step — the ratified home for the
+flip is the fleet-wide `defaults.yaml`, not a per-instance operator override.
+
+### Ground-truth-F1 evidence (why haiku wins)
+
+| Signal | haiku | sonnet |
+|--------|-------|--------|
+| mean F1 vs ground truth | **0.370** | 0.267 |
+| mean precision | 0.401 | 0.264 |
+| mean recall | 0.436 | 0.296 |
+
+- Opus frontier adjudication of the 25 disagreements: **haiku better on 16**,
+  sonnet better on 6, 3 ties (`haiku_worse_fraction = 0.273`).
+- Cost: haiku is ~10× cheaper per invocation than sonnet.
+- Absolute F1 is low for both models because exact merge-diff file prediction
+  from title+description is a demanding target; production locks at coarser
+  module granularity, so the *comparative* signal is what matters.
+
+### Part 2 — agreement-floor gate fixed (option d)
+
+`decide()` in `scripts/trial_module_tagger_haiku.py` now gates the
+agreement-floor hard-fail (`mean Jaccard < AGREEMENT_FAIL`) so it fires only when
+the challenger is **also not better** than the incumbent on ground-truth mean F1.
+A challenger that beats the incumbent on the primary signal can no longer be
+hard-failed by low agreement alone — it lands in the **marginal** band and
+escalates to a human instead of auto-failing (and still cannot auto-PASS while
+Jaccard is below `AGREEMENT_FLOOR`). The other two hard-fail triggers (F1 gap,
+opus majority-worse) and the PASS floor are unchanged. Covered by a RED→GREEN
+test in `tests/scripts/test_trial_module_tagger_haiku.py`; confined to the trial
+script + its test per PRD decision 11 (no `evals/` machinery touched).
+
+### Post-flip watch (δ, task 2534)
+
+δ's `digest.model_role_rollup` is the OUTCOME watch, never a pass/fail basis:
+once this lands, haiku `module_tagger` invocation/cost rows (NULL `task_id`)
+confirm the flip is live and quantify the F1/$ trade in production.
