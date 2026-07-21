@@ -28,6 +28,7 @@ import pytest
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.landing_evidence import LandingEvidenceVerdict
+from orchestrator.merge_types import QueuedBranch
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -98,7 +99,7 @@ def _make_single_req(
         future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=f'task/{task_id}',
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
         worktree=worktree or Path(f'/tmp/wt-{task_id}'),
         pre_rebased=False,
         task_files=None,
@@ -292,7 +293,7 @@ def _make_req(
     future = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -592,7 +593,7 @@ class TestExclusionIdempotency:
         existing_group_future = asyncio.get_running_loop().create_future()
         existing_group = GroupMergeRequest(
             task_id='gx',
-            branch='task/gx',
+            branch=QueuedBranch.parse('task/gx', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-gx',
             pre_rebased=False,
             task_files=None,
@@ -601,7 +602,7 @@ class TestExclusionIdempotency:
             result=existing_group_future,
             train_id='train-existing',
             member_task_ids=['ga', 'gx'],
-            tip_branch='task/gx',
+            tip_branch=QueuedBranch.parse('task/gx', coalesce_config.git.branch_prefix),
             tip_task_id='gx',
             status_check=AsyncMock(return_value={}),
             mark_member_done=AsyncMock(),
@@ -1301,7 +1302,7 @@ class TestBlockedHistoryGate:
             role='merger',
             data={
                 'request_id': 'mr-old-bh1',
-                'branch': 'task/bh1',
+                'branch': 'bh1',
                 'state': 'blocked',
                 'merge_sha': None,
             },
@@ -1537,7 +1538,7 @@ class TestOneStrikeRecording:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='m2',
-            branch='task/m2',
+            branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-m2',
             pre_rebased=False,
             task_files=None,
@@ -1546,7 +1547,7 @@ class TestOneStrikeRecording:
             result=group_future,
             train_id='coalesce-tipm-deadbeef',
             member_task_ids=['m1', 'm2'],
-            tip_branch='task/m2',
+            tip_branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             tip_task_id='m2',
             status_check=AsyncMock(return_value={}),
             mark_member_done=AsyncMock(),
@@ -1602,7 +1603,7 @@ class TestOneStrikeRecording:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='nc2',
-            branch='task/nc2',
+            branch=QueuedBranch.parse('task/nc2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-nc2',
             pre_rebased=False,
             task_files=None,
@@ -1611,7 +1612,7 @@ class TestOneStrikeRecording:
             result=group_future,
             train_id='train-beta-xyz',   # NOT coalesce-prefixed
             member_task_ids=['nc1', 'nc2'],
-            tip_branch='task/nc2',
+            tip_branch=QueuedBranch.parse('task/nc2', coalesce_config.git.branch_prefix),
             tip_task_id='nc2',
             status_check=AsyncMock(return_value={}),
             mark_member_done=AsyncMock(),
@@ -1742,7 +1743,7 @@ class TestOneStrikeOnErrorOutcome:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='e2',
-            branch='task/e2',
+            branch=QueuedBranch.parse('task/e2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-e2',
             pre_rebased=False,
             task_files=None,
@@ -1751,7 +1752,7 @@ class TestOneStrikeOnErrorOutcome:
             result=group_future,
             train_id='coalesce-tipm-errtest',
             member_task_ids=['e1', 'e2'],
-            tip_branch='task/e2',
+            tip_branch=QueuedBranch.parse('task/e2', coalesce_config.git.branch_prefix),
             tip_task_id='e2',
             status_check=AsyncMock(return_value={}),
             mark_member_done=AsyncMock(),
@@ -1804,7 +1805,7 @@ class TestRedriveCoalesceMembers:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         return GroupMergeRequest(
             task_id='m2',
-            branch='task/m2',
+            branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-m2',
             pre_rebased=False,
             task_files=None,
@@ -1813,7 +1814,7 @@ class TestRedriveCoalesceMembers:
             result=future,
             train_id='coalesce-tipm-deadbeef',
             member_task_ids=['m1', 'm2', 'm3'],
-            tip_branch='task/m2',
+            tip_branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             tip_task_id='m2',
             status_check=status_check,
             mark_member_done=AsyncMock(),
@@ -2087,7 +2088,7 @@ class TestRedriveCoalesceMembers:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
             task_id='m2',
-            branch='task/m2',
+            branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-except',
             pre_rebased=False,
             task_files=None,
@@ -2096,7 +2097,7 @@ class TestRedriveCoalesceMembers:
             result=future,
             train_id='coalesce-tipm-except',
             member_task_ids=['m1', 'm2'],
-            tip_branch='task/m2',
+            tip_branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             tip_task_id='m2',
             status_check=status_check,
             mark_member_done=AsyncMock(),
@@ -2211,7 +2212,7 @@ class TestRedriveCoalesceMembersStaleEvidence:
         future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         req = GroupMergeRequest(
             task_id='m2',
-            branch='task/m2',
+            branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-stale',
             pre_rebased=False,
             task_files=None,
@@ -2220,7 +2221,7 @@ class TestRedriveCoalesceMembersStaleEvidence:
             result=future,
             train_id='coalesce-stale-deadbeef',
             member_task_ids=['m1', 'm2'],
-            tip_branch='task/m2',
+            tip_branch=QueuedBranch.parse('task/m2', coalesce_config.git.branch_prefix),
             tip_task_id='m2',
             status_check=cbs.status_check,
             mark_member_done=cbs.mark_member_done,
@@ -2319,7 +2320,7 @@ class TestMergerLoopRedrive:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='rd2',
-            branch='task/rd2',
+            branch=QueuedBranch.parse('task/rd2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-rd2',
             pre_rebased=False,
             task_files=None,
@@ -2328,7 +2329,7 @@ class TestMergerLoopRedrive:
             result=group_future,
             train_id='coalesce-rd-deadbeef',
             member_task_ids=['rd1', 'rd2'],
-            tip_branch='task/rd2',
+            tip_branch=QueuedBranch.parse('task/rd2', coalesce_config.git.branch_prefix),
             tip_task_id='rd2',
             status_check=status_check,
             mark_member_done=AsyncMock(),
@@ -2387,7 +2388,7 @@ class TestMergerLoopRedrive:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='nc2',
-            branch='task/nc2',
+            branch=QueuedBranch.parse('task/nc2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-nc2',
             pre_rebased=False,
             task_files=None,
@@ -2396,7 +2397,7 @@ class TestMergerLoopRedrive:
             result=group_future,
             train_id='train-beta-xyz',   # NOT coalesce-prefixed
             member_task_ids=['nc1', 'nc2'],
-            tip_branch='task/nc2',
+            tip_branch=QueuedBranch.parse('task/nc2', coalesce_config.git.branch_prefix),
             tip_task_id='nc2',
             status_check=status_check,
             mark_member_done=AsyncMock(),
@@ -2451,7 +2452,7 @@ class TestMergerLoopRedrive:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='done2',
-            branch='task/done2',
+            branch=QueuedBranch.parse('task/done2', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-done2',
             pre_rebased=False,
             task_files=None,
@@ -2460,7 +2461,7 @@ class TestMergerLoopRedrive:
             result=group_future,
             train_id='coalesce-rd-success',
             member_task_ids=['done1', 'done2'],
-            tip_branch='task/done2',
+            tip_branch=QueuedBranch.parse('task/done2', coalesce_config.git.branch_prefix),
             tip_task_id='done2',
             status_check=status_check,
             mark_member_done=AsyncMock(),
@@ -2573,7 +2574,7 @@ class TestCoalesceRedriveEndToEnd:
         group_future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
         group = GroupMergeRequest(
             task_id='e2e-off',
-            branch='task/e2e-off',
+            branch=QueuedBranch.parse('task/e2e-off', coalesce_config.git.branch_prefix),
             worktree=tmp_path / 'wt-e2e-off',
             pre_rebased=False,
             task_files=None,
@@ -2582,7 +2583,7 @@ class TestCoalesceRedriveEndToEnd:
             result=group_future,
             train_id='coalesce-e2e-deadcafe',
             member_task_ids=['e2e-on', 'e2e-off'],
-            tip_branch='task/e2e-off',
+            tip_branch=QueuedBranch.parse('task/e2e-off', coalesce_config.git.branch_prefix),
             tip_task_id='e2e-off',
             status_check=cbs.status_check,
             mark_member_done=cbs.mark_member_done,

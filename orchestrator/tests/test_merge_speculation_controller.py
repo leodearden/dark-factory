@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_types import MergeOutcome, MergeRequest
+from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file duplication convention — see test_merge_request_ledger.py)
@@ -46,7 +46,7 @@ def _make_pending_request(task_id: str = 'pred') -> MergeRequest:
     """
     return MergeRequest(
         task_id=task_id,
-        branch=f'task/{task_id}',
+        branch=QueuedBranch.parse(f'task/{task_id}', 'task/'),
         worktree=Path('/tmp/unused'),
         pre_rebased=False,
         task_files=None,

@@ -36,6 +36,7 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator
 
@@ -114,7 +115,7 @@ def _make_request(
         future = make_placeholder_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=pre_rebased,
         task_files=None,
@@ -460,7 +461,7 @@ class TestRunInflightVerifyHappyPath:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -600,7 +601,7 @@ class TestRunInflightVerifyAbortPoll:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -804,7 +805,7 @@ class TestRunInflightVerifyRunnerUnavailable:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -915,7 +916,7 @@ class TestFinalizeInflightPass:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -1242,7 +1243,7 @@ class TestFinalizeInflightNonPass:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -1280,7 +1281,7 @@ class TestFinalizeInflightNonPass:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id='pt-task',
-            branch='pt-branch',
+            branch=QueuedBranch.parse('pt-branch', config.git.branch_prefix),
             worktree=git_repo / 'pt-wt',
             pre_rebased=False,
             task_files=None,
@@ -1802,7 +1803,7 @@ class TestSingleHostSerialByteIdentical:
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
             task_id='sh-a',
-            branch='task/sh-a',
+            branch=QueuedBranch.parse('task/sh-a', config.git.branch_prefix),
             worktree=wt_a,
             pre_rebased=False,
             task_files=None,
@@ -1813,7 +1814,7 @@ class TestSingleHostSerialByteIdentical:
         )
         req_b = MergeRequest(
             task_id='sh-b',
-            branch='task/sh-b',
+            branch=QueuedBranch.parse('task/sh-b', config.git.branch_prefix),
             worktree=wt_b,
             pre_rebased=False,
             task_files=None,
@@ -1932,12 +1933,12 @@ class TestOverlapSignal:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='ov-a', branch='task/ov-a', worktree=wt_a,
+            task_id='ov-a', branch=QueuedBranch.parse('task/ov-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='ov-b', branch='task/ov-b', worktree=wt_b,
+            task_id='ov-b', branch=QueuedBranch.parse('task/ov-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -2079,7 +2080,7 @@ class TestLastItemOfBurstFinalizes:
 
         loop = asyncio.get_running_loop()
         req = MergeRequest(
-            task_id='burst-n', branch='task/burst-n', worktree=wt,
+            task_id='burst-n', branch=QueuedBranch.parse('task/burst-n', config.git.branch_prefix), worktree=wt,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -2225,12 +2226,12 @@ class TestChainInvalidationUnderOverlap:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='ci-a', branch='task/ci-a', worktree=wt_a,
+            task_id='ci-a', branch=QueuedBranch.parse('task/ci-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='ci-b', branch='task/ci-b', worktree=wt_b,
+            task_id='ci-b', branch=QueuedBranch.parse('task/ci-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -2407,12 +2408,12 @@ class TestChainInvalidationUnderOverlap:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='ci-a-lifecycle', branch='task/ci-a-lifecycle', worktree=wt_a,
+            task_id='ci-a-lifecycle', branch=QueuedBranch.parse('task/ci-a-lifecycle', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='ci-b-lifecycle', branch='task/ci-b-lifecycle', worktree=wt_b,
+            task_id='ci-b-lifecycle', branch=QueuedBranch.parse('task/ci-b-lifecycle', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -2602,12 +2603,12 @@ class TestHaltAndUnavailable:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='halt-a', branch='task/halt-a', worktree=wt_a,
+            task_id='halt-a', branch=QueuedBranch.parse('task/halt-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='halt-b', branch='task/halt-b', worktree=wt_b,
+            task_id='halt-b', branch=QueuedBranch.parse('task/halt-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -2724,12 +2725,12 @@ class TestHaltAndUnavailable:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='unav-a', branch='task/unav-a', worktree=wt_a,
+            task_id='unav-a', branch=QueuedBranch.parse('task/unav-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='unav-b', branch='task/unav-b', worktree=wt_b,
+            task_id='unav-b', branch=QueuedBranch.parse('task/unav-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -3180,7 +3181,7 @@ class TestFinalizeInflightWarmResultsThreading:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -3419,12 +3420,12 @@ class TestRunnerUnavailableHeadCascade:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='rucascade-a', branch='task/rucascade-a', worktree=wt_a,
+            task_id='rucascade-a', branch=QueuedBranch.parse('task/rucascade-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='rucascade-b', branch='task/rucascade-b', worktree=wt_b,
+            task_id='rucascade-b', branch=QueuedBranch.parse('task/rucascade-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -3526,7 +3527,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=wt,
             pre_rebased=False,
             task_files=None,
@@ -3969,12 +3970,12 @@ class TestCascadeFiresRemoteCancel:
 
         loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='casc-a', branch='task/casc-a', worktree=wt_a,
+            task_id='casc-a', branch=QueuedBranch.parse('task/casc-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='casc-b', branch='task/casc-b', worktree=wt_b,
+            task_id='casc-b', branch=QueuedBranch.parse('task/casc-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=loop.create_future(), lane='normal',
         )
@@ -4134,12 +4135,12 @@ class TestCascadeErrorContainment:
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='cas-a', branch='task/cas-a', worktree=wt_a,
+            task_id='cas-a', branch=QueuedBranch.parse('task/cas-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='cas-b', branch='task/cas-b', worktree=wt_b,
+            task_id='cas-b', branch=QueuedBranch.parse('task/cas-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
@@ -4223,7 +4224,7 @@ class TestCascadeErrorContainment:
                 git_ops, 'task/cas-c', 'cas_c.py', 'c = 3\n'
             )
             req_c = MergeRequest(
-                task_id='cas-c', branch='task/cas-c', worktree=wt_c,
+                task_id='cas-c', branch=QueuedBranch.parse('task/cas-c', config.git.branch_prefix), worktree=wt_c,
                 pre_rebased=False, task_files=None, module_configs=[],
                 config=config, result=event_loop.create_future(), lane='normal',
             )
@@ -4349,12 +4350,12 @@ class TestCascadeErrorContainment:
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
-            task_id='cr-a', branch='task/cr-a', worktree=wt_a,
+            task_id='cr-a', branch=QueuedBranch.parse('task/cr-a', config.git.branch_prefix), worktree=wt_a,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
         req_b = MergeRequest(
-            task_id='cr-b', branch='task/cr-b', worktree=wt_b,
+            task_id='cr-b', branch=QueuedBranch.parse('task/cr-b', config.git.branch_prefix), worktree=wt_b,
             pre_rebased=False, task_files=None, module_configs=[],
             config=config, result=event_loop.create_future(), lane='normal',
         )
@@ -4420,7 +4421,7 @@ class TestCascadeErrorContainment:
                 git_ops, 'task/cr-c', 'cr_c.py', 'c = 3\n'
             )
             req_c = MergeRequest(
-                task_id='cr-c', branch='task/cr-c', worktree=wt_c,
+                task_id='cr-c', branch=QueuedBranch.parse('task/cr-c', config.git.branch_prefix), worktree=wt_c,
                 pre_rebased=False, task_files=None, module_configs=[],
                 config=config, result=event_loop.create_future(), lane='normal',
             )

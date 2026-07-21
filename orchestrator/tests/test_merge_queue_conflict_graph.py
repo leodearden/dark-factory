@@ -26,6 +26,7 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     SuffixConflictGraph,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ────────────
 
@@ -79,7 +80,7 @@ def _make_req(
     """Build a minimal MergeRequest with a fresh event-loop future."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -381,7 +382,7 @@ class TestRecomputeFootprintEdges:
         worker = _make_worker(git_ops)
         req_hi = MergeRequest(
             task_id='task-hi',
-            branch='branch-hi',
+            branch=QueuedBranch.parse('branch-hi', config.git.branch_prefix),
             worktree=git_repo,
             pre_rebased=False,
             task_files=None,

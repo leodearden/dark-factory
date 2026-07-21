@@ -161,7 +161,7 @@ class MergeWorker(_WipHaltMixin):
                     EventType.merge_dequeued,
                     task_id=req.task_id,
                     phase='merge',
-                    data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
+                    data={'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize()},
                 )
 
             outcome = await self._process(req)
@@ -320,7 +320,7 @@ class MergeWorker(_WipHaltMixin):
         outcome = await self._git_ops.advance_main(
             merge_result.merge_commit,
             merge_wt,
-            branch=req.branch,
+            branch=req.branch.full_name,
             max_attempts=req.config.max_advance_attempts,
             expected_main=main_sha,
         )

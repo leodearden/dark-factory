@@ -152,6 +152,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     MergeReadyPredicate,
     MergeRequest,
     OutcomeKind,
+    QueuedBranch,
     RealMergeItem,
     SoloVerifyResult,
     SpeculativeItem,
@@ -928,7 +929,7 @@ async def _classify_disposition_for_outcome(
     try:
         disposition, evidence = await classify_merge_failure_disposition(
             verify_result=verify,
-            branch=req.branch,
+            branch=req.branch.bare_id,
             merge_base_sha=merge_base_sha,
             main_sha=main_sha,
             preexisting=False,
@@ -3269,7 +3270,7 @@ def _emit_merge_queued(
     """
     if event_store is None:
         return
-    data: dict = {'branch': req.branch}
+    data: dict = {'branch': req.branch.bare_id}
     if reason is not None:
         data['reason'] = reason
     if queue_depth is not None:
@@ -3360,9 +3361,9 @@ async def _maybe_auto_chain_generation(
         return None
 
     # Tip advanced.  Enforce the per-branch generation bound.
-    new_count = counts.get(req.branch, 0) + 1
+    new_count = counts.get(req.branch.bare_id, 0) + 1
     if new_count > max_auto_generations:
-        counts.pop(req.branch, None)
+        counts.pop(req.branch.bare_id, None)
         return MergeOutcome(
             'blocked',
             reason=(
@@ -3386,7 +3387,7 @@ async def _maybe_auto_chain_generation(
     # Set the counter BEFORE enqueue so the cleanup callback can safely
     # pop it on any terminal path — including if the worker finalizes
     # gen_next before the post-await resumes (closes the set-after-pop race).
-    counts[req.branch] = new_count
+    counts[req.branch.bare_id] = new_count
 
     # Register a fire-and-forget cleanup callback that pops the per-branch
     # lineage counter on EVERY terminal outcome EXCEPT 'superseded'.
@@ -3398,7 +3399,7 @@ async def _maybe_auto_chain_generation(
     # coexist on gen_next.result.  The callback fires regardless of which
     # worker (the test-local MergeWorker reference or SpeculativeMergeWorker)
     # finalizes gen_next.
-    _branch = req.branch  # close over the branch name
+    _branch = req.branch.bare_id  # close over the bare branch name (dict key)
     def _cleanup_chain_counter(fut: asyncio.Future) -> None:  # noqa: ANN001
         try:
             if fut.cancelled():
@@ -3483,7 +3484,7 @@ async def enqueue_merge_request(
                 retention.record(TerminalOutcomeRecord(
                     request_id=req.request_id,
                     task_id=req.task_id,
-                    branch=req.branch,
+                    branch=req.branch.bare_id,
                     state=state,
                     snapshot_tip=req.snapshot_tip,
                     merge_sha=merge_sha,
@@ -3506,7 +3507,7 @@ async def enqueue_merge_request(
                     phase='merge',
                     data={
                         'request_id': req.request_id,
-                        'branch': req.branch,
+                        'branch': req.branch.bare_id,
                         'state': state,
                         'snapshot_tip': req.snapshot_tip,
                         'merge_sha': merge_sha,
@@ -3562,7 +3563,7 @@ async def register_and_enqueue_merge_request(
     None.  The return value is informational — the request is always enqueued.
     """
     acquired = (
-        registry.acquire(req.branch, req.task_id, req.result, request_id=req.request_id)
+        registry.acquire(req.branch.bare_id, req.task_id, req.result, request_id=req.request_id)
         if registry is not None
         else False
     )
@@ -3573,7 +3574,7 @@ async def register_and_enqueue_merge_request(
         # resolve req.result, the done_callback will never fire.  Release the
         # slot explicitly so a future merge for this branch can proceed.
         if acquired:
-            registry.release(req.branch)  # type: ignore[union-attr]
+            registry.release(req.branch.bare_id)  # type: ignore[union-attr]
         raise
     return acquired
 
@@ -3592,7 +3593,7 @@ def _emit_merge_coalesced(
     if event_store is None:
         return
     data: dict = {
-        'branch': req.branch,
+        'branch': req.branch.bare_id,
         'source': source,
     }
     if eta is not None:
@@ -3731,7 +3732,7 @@ async def coalesce_or_enqueue_merge_request(
     gate is a no-op and the path preserves current behaviour (back-compat).
     The disk-scan cross-process coalesce branch is intentionally left untouched.
     """
-    branch = req.branch
+    branch = req.branch.bare_id  # bookkeeping key (registry / worktree scan / result)
 
     # ── 1. Registry fast-path ──────────────────────────────────────────
     if registry.is_inflight(branch):
@@ -4022,7 +4023,7 @@ async def reverify_member_solo(
     """
     req = MergeRequest(
         task_id=member_id,
-        branch=solo_branch,
+        branch=QueuedBranch.parse(solo_branch, config.git.branch_prefix),
         worktree=solo_wt,
         pre_rebased=True,
         task_files=task_files,
@@ -4131,7 +4132,7 @@ async def _already_merged_is_genuine(
     (harmless) re-merge rather than a skip — the same limitation the reconciler
     carries.
     """
-    branch_ref = await git_ops.resolve_queued_branch_ref(req.branch)
+    branch_ref = await git_ops.resolve_queued_branch_ref(req.branch.full_name)
     branch_sha = (
         await git_ops.resolve_branch_sha(branch_ref)
         if branch_ref is not None else None
@@ -4218,7 +4219,7 @@ async def classify_and_merge(
     # already_merged-via-marker) emit their own merge_attempt internally —
     # do not re-emit here.
     guard = await _classify_branch_presence(
-        git_ops, event_store, req.task_id, req.branch, started_monotonic,
+        git_ops, event_store, req.task_id, req.branch.bare_id, started_monotonic,
         worktree=req.worktree,
     )
     if guard is not None:
@@ -4294,7 +4295,7 @@ async def classify_and_merge(
             depth=worker._verify_frontier_depth(),
         )
     merge_result = await git_ops.merge_to_main(
-        req.worktree, req.branch, base_sha=base_sha if speculative else None,
+        req.worktree, req.branch.full_name, base_sha=base_sha if speculative else None,
     )
 
     # Steps 4-7 run inside a try/except: an unexpected exception anywhere in
@@ -4812,7 +4813,7 @@ async def _do_train_merge(
     t0 = time.monotonic()
     logger.info(
         'Train %s: starting atomic merge of %d members via tip branch %s',
-        req.train_id, len(req.member_task_ids), req.branch,
+        req.train_id, len(req.member_task_ids), req.branch.bare_id,
     )
 
     _train_emit_kwargs: dict = {
@@ -4901,7 +4902,7 @@ async def _do_train_merge(
     if not ok:
         reason = (
             f'{TRAIN_REBASE_CONFLICT_REASON_PREFIX}: tip branch '
-            f'{req.branch!r} conflicts with current main; rebase aborted '
+            f'{req.branch.bare_id!r} conflicts with current main; rebase aborted '
             f'— resolve in the tip worktree'
         )
         logger.info('Train %s: %s', req.train_id, reason)
@@ -4918,7 +4919,7 @@ async def _do_train_merge(
     main_sha = await git_ops.get_main_sha()
 
     # (d) --no-ff merge of the tip branch (carries all member commits by stacking).
-    merge_result = await git_ops.merge_to_main(req.worktree, req.branch)
+    merge_result = await git_ops.merge_to_main(req.worktree, req.branch.full_name)
     if merge_result.conflicts or not merge_result.success:
         if merge_result.merge_worktree:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
@@ -5023,14 +5024,14 @@ async def _do_train_merge(
     # field lives only on MergedOk, single-branch's classify_and_merge
     # result; see git_ops.py:368). The resolve is therefore an accepted,
     # intentional best-effort cost rather than a deferred TODO.
-    _train_branch_tip = await git_ops.resolve_branch_sha(req.branch)
+    _train_branch_tip = await git_ops.resolve_branch_sha(req.branch.full_name)
     adv_outcome = await _journal_landed_then_advance(
         getattr(worker, '_landed_outbox', None), git_ops,
         task_id=req.task_id,
         branch_tip_sha=_train_branch_tip,
         advanced_sha=merge_commit,
         merge_wt=merge_wt,
-        branch=req.branch,
+        branch=req.branch.full_name,
         max_attempts=req.config.max_advance_attempts,
         expected_main=main_sha,
     )
@@ -7913,7 +7914,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'merge submission for request_id=%s branch=%s; registry already at '
             '%s. Coalescing as a benign no-op — NOT buffering a divergent '
             'twin, NOT escalated.',
-            item.request_id, item.branch, current_state,
+            item.request_id, item.branch.bare_id, current_state,
         )
         if not item.result.done():
             item.result.set_result(
@@ -9113,7 +9114,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ) -> dict:
             return {
                 'task_id': req.task_id,
-                'branch': req.branch,
+                'branch': req.branch.bare_id,
                 'state': state,
                 'enqueued_at': req.enqueued_at,
                 'age_secs': max(0.0, now - req.enqueued_at),
@@ -10575,7 +10576,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return 'coalesce_derailed_one_strike'
         # Signal 2: event-store blocked history.
         if self._event_store is not None:
-            rec = self._event_store.latest_merge_finalized(branch=req.branch)
+            rec = self._event_store.latest_merge_finalized(branch=req.branch.bare_id)
             if rec is not None and rec.get('state') in _COALESCE_RISKY_TERMINAL_STATES:
                 return f'recent_terminal_{rec["state"]}'
         return None
@@ -10674,14 +10675,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 logger.exception(
                     'Coalesce predicate raised for request_id=%s task_id=%s '
                     'branch=%s; treating as eligible (safe-degrade)',
-                    _c.request_id, _c.task_id, _c.branch,
+                    _c.request_id, _c.task_id, _c.branch.bare_id,
                 )
                 _reason = None
             if _reason:
                 exclusions.append({'request_id': _c.request_id, 'reason': _reason})
                 logger.info(
                     'Coalesce exclusion: request_id=%s task_id=%s branch=%s reason=%s',
-                    _c.request_id, _c.task_id, _c.branch, _reason,
+                    _c.request_id, _c.task_id, _c.branch.bare_id, _reason,
                 )
             else:
                 eligible.append(_c)
@@ -11007,7 +11008,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         EventType.merge_dequeued,
                         task_id=req.task_id,
                         phase='merge',
-                        data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
+                        data={'branch': req.branch.bare_id, 'queue_depth': self._queue.qsize()},
                     )
                 t0 = time.monotonic()
                 merge_result_local: MergeResult | None = None
@@ -12129,8 +12130,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         merge worktree have seen for this branch?").
         """
         full_branch = (
-            await self._git_ops.resolve_queued_branch_ref(req.branch)
-            or f'{self._git_ops.config.branch_prefix}{req.branch}'
+            await self._git_ops.resolve_queued_branch_ref(req.branch.full_name)
+            or req.branch.full_name
         )
         resolved = await self._git_ops.resolve_branch_sha(full_branch)
         return {
@@ -13539,7 +13540,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     branch_tip_sha=item.merged_branch_tip,
                     advanced_sha=current_sha,
                     merge_wt=merge_wt,
-                    branch=req.branch,
+                    branch=req.branch.full_name,
                     max_attempts=req.config.max_advance_attempts,
                     expected_main=item.base_sha,
                     reverify_on_rebase=True,

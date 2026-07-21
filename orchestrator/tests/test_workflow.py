@@ -54,6 +54,7 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
 
     _spec = pydantic_spec(OrchestratorConfig)
     config = MagicMock(spec_set=_spec)
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = 2
@@ -67,6 +68,11 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
     # (`merge_train_max_members < 2`) can raise `TypeError: MagicMock < int`.
     config.merge_train_former_enabled = False
     config.merge_train_max_members = 3
+    # task ν: _submit_to_merge_queue now parses the branch into a typed
+    # QueuedBranch (QueuedBranch.parse → canonical_queued_branch_name), which
+    # requires a REAL str prefix — a MagicMock branch_prefix raises in
+    # str.startswith. The old MergeRequest(branch=<str>) never read the prefix.
+    config.git.branch_prefix = 'task/'
 
     scheduler = MagicMock()
     git_ops = MagicMock()
@@ -570,6 +576,7 @@ class TestWorkflowMergeInflightRegistry:
         assignment.task = {'id': '999', 'title': 'T', 'description': 'd'}
         assignment.modules = []
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -622,6 +629,7 @@ class TestSubmitToMergeQueueRegistersInRegistry:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -653,7 +661,7 @@ class TestSubmitToMergeQueueRegistersInRegistry:
 
         async def _worker():
             req = await real_queue.get()
-            inflight_seen.append(registry.is_inflight(req.branch))
+            inflight_seen.append(registry.is_inflight(req.branch.bare_id))
             req.result.set_result(MergeOutcome(status='done', merge_sha='sha'))
 
         worker_task = asyncio.create_task(_worker())
@@ -693,6 +701,7 @@ class TestMergePhaseGraceStampLifecycle:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -784,6 +793,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1013,7 +1023,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
 
         # (4) The independently enqueued request is for branch 'B'
         enqueued_req = real_queue.get_nowait()
-        assert enqueued_req.branch == 'B'
+        assert enqueued_req.branch.bare_id == 'B'
 
         # Complete the workflow: resolve the independently enqueued request's own future.
         # (The primary P is unresolved — the workflow must be awaiting its OWN future.)
@@ -1154,6 +1164,7 @@ class TestAttachedWaiterOutcomeMapping:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1282,6 +1293,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1368,6 +1380,7 @@ class TestSubmitToMergeQueueSoftCancelDetaches:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1531,6 +1544,7 @@ class TestGroupMergePathUnchangedByGamma3:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1600,6 +1614,7 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1743,6 +1758,7 @@ class TestBoundaryTableWorkflow:
         assignment.modules = []
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1884,6 +1900,7 @@ class TestHandleSoftCancelOutcome:
 
         _spec = pydantic_spec(OrchestratorConfig)
         config = MagicMock(spec_set=_spec)
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -1965,6 +1982,7 @@ class TestGroupMergeUnionScope:
         assignment.modules = ['crate_b/src']
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
         config.fused_memory.project_id = 'dark_factory'
         config.fused_memory.url = 'http://localhost:8002'
         config.max_review_cycles = 2
@@ -2111,6 +2129,7 @@ def _make_wip_conflict_workflow(*, task_id: str = '2282') -> TaskWorkflow:
 
     _spec = pydantic_spec(OrchestratorConfig)
     config = MagicMock(spec_set=_spec)
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2

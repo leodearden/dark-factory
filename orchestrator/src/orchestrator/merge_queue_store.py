@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import load_json_or_warn
 
-from orchestrator.git_ops import canonical_queued_branch_name
+from orchestrator.merge_types import QueuedBranch
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -106,15 +106,15 @@ class MergeQueueStore:
         if isinstance(req, GroupMergeRequest):
             return
 
-        # Normalize to the bare canonical shape before persisting (task 2037
-        # fix 2): strip a leading branch_prefix so the journal only ever
-        # holds ONE canonical shape, regardless of what shape the caller
-        # submitted.  removeprefix is a no-op when the branch is already
-        # bare (or the prefix is empty), so this is safe/idempotent.
+        # Persist the bare canonical shape (task 2037 fix 2 / task ν): the
+        # journal only ever holds ONE canonical shape (the bare id), regardless
+        # of what shape the caller submitted.  branch is now a typed
+        # QueuedBranch, so .bare_id is the byte-identical successor to the old
+        # removeprefix(branch_prefix) strip.
         persisted = PersistedMergeRequest(
             request_id=req.request_id,
             task_id=req.task_id,
-            branch=req.branch.removeprefix(req.config.git.branch_prefix),
+            branch=req.branch.bare_id,
             worktree=str(req.worktree),
             pre_rebased=req.pre_rebased,
             task_files=req.task_files,
@@ -224,7 +224,7 @@ def reconstruct_merge_request(
     # preserved) and filter inside the verifier.
     return MergeRequest(
         task_id=persisted.task_id,
-        branch=persisted.branch,
+        branch=QueuedBranch.parse(persisted.branch, config.git.branch_prefix),
         worktree=Path(persisted.worktree),
         pre_rebased=False,
         task_files=persisted.task_files,
@@ -258,8 +258,8 @@ async def recover_pending_merges(
     """Re-enqueue surviving merge requests from the durable journal.
 
     For each journaled record:
-    * Builds ``full_branch = canonical_queued_branch_name(record.branch,
-      branch_prefix)`` — shape-tolerant so a legacy journal entry that was
+    * Builds ``full_branch = QueuedBranch.parse(record.branch,
+      branch_prefix).full_name`` — shape-tolerant so a legacy journal entry that was
       already persisted in the prefixed shape (e.g. ``'task/4959'``, from a
       journal written before the step-4 enqueue normalization) is not
       double-prefixed into an unresolvable ``'task/task/4959'``.
@@ -298,10 +298,12 @@ async def recover_pending_merges(
     recovered_requests: list[MergeRequest] = []
 
     for record in records:
-        # Shape-tolerant: prepend branch_prefix unless record.branch is
-        # already prefixed (legacy on-disk journals may predate the step-4
-        # enqueue normalization).  See canonical_queued_branch_name docstring.
-        full_branch = canonical_queued_branch_name(record.branch, branch_prefix)
+        # Shape-tolerant: QueuedBranch.parse prepends branch_prefix unless
+        # record.branch is already prefixed (legacy on-disk journals may
+        # predate the enqueue normalization).  .full_name is the exact git ref
+        # the existence checks resolve against (byte-identical to the old
+        # canonical_queued_branch_name result).
+        full_branch = QueuedBranch.parse(record.branch, branch_prefix).full_name
         try:
             sha = await git_ops.resolve_branch_sha(full_branch)
             if sha is None:

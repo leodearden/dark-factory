@@ -42,6 +42,7 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     classify_and_merge,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 
 
@@ -120,7 +121,7 @@ def _make_request(
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,

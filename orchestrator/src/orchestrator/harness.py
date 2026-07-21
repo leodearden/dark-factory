@@ -8361,7 +8361,7 @@ task, include it with an empty "files" list rather than omitting it.
         """
         if self._merge_worker is None:
             return
-        branches = [req.branch for req in recovered_requests]
+        branches = [req.branch.bare_id for req in recovered_requests]
         report = await self._merge_worker.reap_orphaned_merge_worktrees(
             recovered_branches=branches,
         )

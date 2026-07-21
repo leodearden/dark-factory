@@ -34,7 +34,7 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import DecidedItem, MergeOutcome, RealMergeItem
+from orchestrator.merge_types import DecidedItem, MergeOutcome, QueuedBranch, RealMergeItem
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ─────────
 
@@ -86,7 +86,7 @@ def _make_req(
     """Build a minimal MergeRequest with a fresh event-loop future."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -140,7 +140,7 @@ class TestSnapshotRedispatchEntries:
 
         rd_entry = snap['entries'][0]
         assert rd_entry['task_id'] == 'rd-parked'
-        assert rd_entry['branch'] == 'task/rd-parked'
+        assert rd_entry['branch'] == 'rd-parked'  # snapshot emits QueuedBranch.bare_id
         assert rd_entry['request_id'] == req.request_id
         assert rd_entry['state'] == 'awaiting_host', (
             f"Expected state=='awaiting_host', got {rd_entry['state']!r}."

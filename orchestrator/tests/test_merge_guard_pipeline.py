@@ -58,6 +58,7 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     item_merge_wt,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures (copied from test_merge_queue.py:62-101 — per-file duplication
@@ -128,7 +129,7 @@ def _make_request(
         future = make_placeholder_future()
     kwargs: dict = dict(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=pre_rebased,
         task_files=None,
@@ -863,11 +864,13 @@ class TestPathEquivalence:
             wt_r, sha_r = await _make_drop_guard_branch('eq-drop-remerge')
             merger_req = _make_request('eq-drop-merger', 'eq-drop-merger', wt_m, config)
             remerge_req = _make_request('eq-drop-remerge', 'eq-drop-remerge', wt_r, config)
+            # task ν: classify_and_merge calls merge_to_main with req.branch.full_name
+            # (prefixed), so key the injection by full_name, not the bare id.
             fake_results = {
-                'eq-drop-merger': MergeResult(
+                merger_req.branch.full_name: MergeResult(
                     success=True, merge_commit=sha_m, pre_merge_sha=sha_m, merge_worktree=None,
                 ),
-                'eq-drop-remerge': MergeResult(
+                remerge_req.branch.full_name: MergeResult(
                     success=True, merge_commit=sha_r, pre_merge_sha=sha_r, merge_worktree=None,
                 ),
             }
@@ -877,9 +880,11 @@ class TestPathEquivalence:
             wt_r = await _make_branch_with_file(git_ops, 'eq-fail-remerge', 'f.py', 'x = 1\n')
             merger_req = _make_request('eq-fail-merger', 'eq-fail-merger', wt_m, config)
             remerge_req = _make_request('eq-fail-remerge', 'eq-fail-remerge', wt_r, config)
+            # task ν: classify_and_merge calls merge_to_main with req.branch.full_name
+            # (prefixed), so key the injection by full_name, not the bare id.
             fake_results = {
-                'eq-fail-merger': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
-                'eq-fail-remerge': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
+                merger_req.branch.full_name: MergeResult(success=False, conflicts=False, details='boom-equivalence'),
+                remerge_req.branch.full_name: MergeResult(success=False, conflicts=False, details='boom-equivalence'),
             }
         else:
             raise AssertionError(f'unknown scenario {scenario!r}')

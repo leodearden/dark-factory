@@ -28,6 +28,7 @@ from orchestrator.merge_queue import (
     MergeRequest,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — mirror test_merge_queue_restart_hook.py
@@ -95,7 +96,7 @@ def _make_request(
     future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -420,7 +421,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
     req = MergeRequest(
         task_id='sv7-task',
-        branch='task/sv7',
+        branch=QueuedBranch.parse('task/sv7', config.git.branch_prefix),
         worktree=git_ops.project_root,  # doesn't need to be a real worktree
         pre_rebased=False,
         task_files=None,

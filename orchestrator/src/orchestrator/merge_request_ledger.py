@@ -150,7 +150,7 @@ class RequestLedger:
         self._entries[request_id] = _LedgerEntry(
             request_id=request_id,
             task_id=request.task_id,
-            branch=request.branch,
+            branch=request.branch.bare_id,
             request=request,
             dequeued_at=now,
         )

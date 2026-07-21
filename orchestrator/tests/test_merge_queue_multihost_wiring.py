@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, RemoteRunner
 
@@ -180,7 +181,7 @@ def _make_merge_request(config, *, task_files=None, worktree=None):
 
     return MergeRequest(
         task_id='task-42',
-        branch='task/42',
+        branch=QueuedBranch.parse('task/42', config.git.branch_prefix),
         worktree=worktree or Path('/repo/task-42'),
         pre_rebased=False,
         task_files=task_files,
@@ -1677,7 +1678,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         loop = asyncio.get_running_loop()
         req = MergeRequest(
             task_id='task-ru',
-            branch='task/ru',
+            branch=QueuedBranch.parse('task/ru', 'task/'),
             worktree=MagicMock(),
             pre_rebased=False,
             task_files=[],

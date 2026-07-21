@@ -35,6 +35,7 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     SuffixConflictGraph,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ── Module-level sentinel (mirrors test_merge_queue_frozen_prefix.py) ────────
 _SENTINEL_VERIFY_TASK = object()  # noqa: PD901
@@ -101,7 +102,7 @@ def _make_req(
     """
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -135,7 +136,7 @@ def _make_group_req(
 
     return GroupMergeRequest(
         task_id=branch,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=git_repo,
         pre_rebased=False,
         task_files=None,
@@ -146,7 +147,7 @@ def _make_group_req(
         merge_first_enqueued_at=None,
         train_id='train-1',
         member_task_ids=[branch],
-        tip_branch=branch,
+        tip_branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         tip_task_id=branch,
         status_check=_dummy_status_check,
         mark_member_done=_dummy_mark_done,

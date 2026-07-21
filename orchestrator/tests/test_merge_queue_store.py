@@ -37,6 +37,7 @@ from orchestrator.merge_queue_store import (
     reconstruct_merge_request,
     recover_pending_merges,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -72,7 +73,7 @@ def _make_req(
     """Build a MergeRequest with a placeholder future (safe outside a running loop)."""
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=pre_rebased,
         task_files=task_files,
@@ -100,7 +101,7 @@ def _make_group_req(
 
     return GroupMergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=False,
         task_files=None,
@@ -109,7 +110,7 @@ def _make_group_req(
         result=make_placeholder_future(),
         train_id='train-001',
         member_task_ids=[task_id],
-        tip_branch=branch,
+        tip_branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         tip_task_id=task_id,
         status_check=_status_check,
         mark_member_done=_mark_done,
@@ -328,7 +329,7 @@ class TestReconstructMergeRequest:
         # Identity fields preserved.
         assert reconstructed.request_id == original.request_id
         assert reconstructed.task_id == '99'
-        assert reconstructed.branch == '99'
+        assert reconstructed.branch.bare_id == '99'
         assert reconstructed.snapshot_tip == 'cafebabe'
         assert reconstructed.generation == 2
         assert reconstructed.lane == 'high'
@@ -745,7 +746,7 @@ class TestRecoverPendingMergesPrefixedBranch:
         assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
         recovered_req = queue.get_nowait()
         assert recovered_req.request_id == 'mr-4959'
-        assert recovered_req.branch == 'task/4959', (
+        assert recovered_req.branch.full_name == 'task/4959', (
             f'Expected reconstructed branch to resolve via the already-prefixed '
             f"shape 'task/4959'; got {recovered_req.branch!r}"
         )
@@ -837,9 +838,134 @@ class TestRecoverPendingMergesPrefixedBranch:
         assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
         recovered_req = queue.get_nowait()
         assert recovered_req.request_id == 'mr-4959'
-        assert recovered_req.branch == '4959', (
+        assert recovered_req.branch.bare_id == '4959', (
             f"Expected the reconstructed request's branch to stay bare "
             f"('4959', passed through verbatim from the persisted record) "
             f"even though resolution went through the canonically prefixed "
             f"'task/4959' ref; got {recovered_req.branch!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# task-2798 (ν) — MergeRequest.branch is a typed QueuedBranch at the recovery /
+# reconstruct construction boundary.
+#
+# These pin the typed-branch invariant at the cleanest unit seam (the journal
+# recovery path), representative of the invariant across all construction
+# boundaries: a MergeRequest reconstituted from a bare-persisted journal record
+# carries a QueuedBranch whose .full_name is the canonically prefixed ref
+# ('task/591') and whose .bare_id is the bare task id ('591'), and the recovery
+# path drives its git-existence checks off that .full_name.
+#
+# isinstance-narrowing pattern: assert isinstance(..., QueuedBranch) BEFORE any
+# .full_name/.bare_id access, so the tests are pyright-clean pre-flip (branch is
+# declared str; isinstance narrows to QueuedBranch) and RED at runtime today
+# (reconstruct currently returns the bare str, so the isinstance assert fails).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconstructMergeRequestTypedBranch:
+    """reconstruct_merge_request yields a MergeRequest whose .branch is a QueuedBranch."""
+
+    async def test_reconstruct_merge_request_branch_is_queuedbranch(
+        self, tmp_path: Path
+    ) -> None:
+        config = _real_config(tmp_path)  # git.branch_prefix == 'task/'
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        # Persisted bare, exactly as record() normalizes it on disk.
+        persisted = PersistedMergeRequest(
+            request_id='mr-591',
+            task_id='591',
+            branch='591',
+            worktree=str(wt),
+            pre_rebased=False,
+            task_files=None,
+            snapshot_tip='abc123',
+            generation=1,
+            lane='normal',
+            enqueued_at=0.0,
+        )
+
+        req = reconstruct_merge_request(persisted, config)
+
+        # Narrow FIRST (pyright-clean pre-flip; RED at runtime today).
+        assert isinstance(req.branch, QueuedBranch), (
+            f'reconstruct_merge_request must build a typed QueuedBranch branch; '
+            f'got {type(req.branch).__name__}: {req.branch!r}'
+        )
+        assert req.branch.full_name == 'task/591'
+        assert req.branch.bare_id == '591'
+
+
+@pytest.mark.asyncio
+class TestRecoverPendingMergesTypedBranch:
+    """recover_pending_merges re-enqueues a MergeRequest with a QueuedBranch branch
+    and drives its git-existence checks off .full_name."""
+
+    async def test_recover_pending_merges_enqueues_queuedbranch_branch(
+        self, tmp_path: Path
+    ) -> None:
+        config = _real_config(tmp_path)  # git.branch_prefix == 'task/'
+        wt = tmp_path / 'wt'
+        wt.mkdir()  # worktree must exist or the record is dropped
+
+        store_path = tmp_path / 'merge_queue.json'
+        store = MergeQueueStore(store_path)
+        # record() strips the prefix, so this persists bare '591'.
+        store.record(_make_req('591', '591', wt, config))
+
+        main_branch = 'main'
+        branch_prefix = 'task/'
+
+        # Capture the branch refs the recovery path resolves against, to prove
+        # the git-existence checks are driven by the canonical .full_name.
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple[str, str]] = []
+
+        async def fake_resolve(branch: str) -> str | None:
+            resolve_calls.append(branch)
+            return 'sha-591'  # branch exists
+
+        async def fake_is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return False  # not yet on main → survivor
+
+        fake_git_ops = MagicMock()
+        fake_git_ops.resolve_branch_sha = fake_resolve
+        fake_git_ops.is_ancestor = fake_is_ancestor
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store,
+            queue,
+            fake_git_ops,
+            config,
+            event_store=None,
+            main_branch=main_branch,
+            branch_prefix=branch_prefix,
+        )
+
+        assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
+        assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
+        recovered_req = queue.get_nowait()
+
+        # Narrow FIRST (pyright-clean pre-flip; RED at runtime today).
+        assert isinstance(recovered_req.branch, QueuedBranch), (
+            f'recovery must re-enqueue a typed QueuedBranch branch; '
+            f'got {type(recovered_req.branch).__name__}: {recovered_req.branch!r}'
+        )
+        assert recovered_req.branch.full_name == 'task/591'
+
+        # The existence checks were driven by the canonical full_name ref.
+        assert resolve_calls == ['task/591'], (
+            f'resolve_branch_sha must be driven by the full_name ref; '
+            f'got {resolve_calls!r}'
+        )
+        assert ancestor_calls == [('task/591', 'main')], (
+            f'is_ancestor must be driven by the full_name ref; '
+            f'got {ancestor_calls!r}'
         )

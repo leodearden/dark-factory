@@ -26,7 +26,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_types import MergeOutcome, MergeRequest
+from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file duplication convention — see test_merge_queue_resolve_release.py
@@ -51,7 +51,7 @@ def _make_request(
         kwargs['request_id'] = request_id
     return MergeRequest(
         task_id=task_id,
-        branch=branch,
+        branch=QueuedBranch.parse(branch, 'task/'),
         worktree=Path('/tmp/unused'),
         pre_rebased=False,
         task_files=None,
@@ -102,7 +102,7 @@ class TestRequestLedgerLifecycle:
         entry = stuck[0]
         assert entry.request_id == req.request_id
         assert entry.task_id == 't2'
-        assert entry.branch == 'task/t2'
+        assert entry.branch == 't2'  # ledger records QueuedBranch.bare_id
         assert entry.age_secs == pytest.approx(2000)
 
     async def test_passive_resolution_via_set_result_sweeps_entry(self) -> None:

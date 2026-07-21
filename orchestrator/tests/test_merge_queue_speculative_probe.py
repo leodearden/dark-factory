@@ -66,6 +66,7 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostLease
 
 # ---------------------------------------------------------------------------
@@ -766,7 +767,7 @@ def _make_probe_item(*, speculative: bool, config: OrchestratorConfig) -> RealMe
     near-bare placeholders (mirrors ``_make_spec_item`` above).
     """
     req = MergeRequest(
-        task_id='t-probe', branch='task/t-probe', worktree=Path('_wt'),
+        task_id='t-probe', branch=QueuedBranch.parse('task/t-probe', config.git.branch_prefix), worktree=Path('_wt'),
         pre_rebased=False, task_files=None, module_configs=[], config=config,
         result=MagicMock(),
     )
@@ -951,7 +952,7 @@ def _make_dispatch_ready_item(
     path -- so this needs a genuine (never-cancelled) asyncio.Future.
     """
     req = MergeRequest(
-        task_id='t-dispatch', branch='task/t-dispatch', worktree=merge_wt,
+        task_id='t-dispatch', branch=QueuedBranch.parse('task/t-dispatch', config.git.branch_prefix), worktree=merge_wt,
         pre_rebased=False, task_files=None, module_configs=[], config=config,
         result=asyncio.get_running_loop().create_future(),
     )
@@ -1073,7 +1074,7 @@ class TestRunInflightVerifyProbeBaseWiring:
 
         config = OrchestratorConfig()
         req = MergeRequest(
-            task_id='t-wire', branch='task/t-wire', worktree=tmp_path,
+            task_id='t-wire', branch=QueuedBranch.parse('task/t-wire', config.git.branch_prefix), worktree=tmp_path,
             pre_rebased=False, task_files=None, module_configs=[], config=config,
             result=asyncio.get_running_loop().create_future(),
         )
@@ -1124,7 +1125,7 @@ class TestRunInflightVerifyProbeBaseWiring:
 
         config = OrchestratorConfig()
         req = MergeRequest(
-            task_id='t-wire-default', branch='task/t-wire-default', worktree=tmp_path,
+            task_id='t-wire-default', branch=QueuedBranch.parse('task/t-wire-default', config.git.branch_prefix), worktree=tmp_path,
             pre_rebased=False, task_files=None, module_configs=[], config=config,
             result=asyncio.get_running_loop().create_future(),
         )

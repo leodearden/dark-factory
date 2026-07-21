@@ -67,6 +67,10 @@ def _make(
     config.project_root = Path('/tmp/non-existent-for-test')
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
+    # task ν: GroupMergeRequest construction now parses branch/tip_branch via
+    # QueuedBranch.parse(..., self.config.git.branch_prefix), which needs a REAL
+    # str prefix (MagicMock raises in str.startswith).
+    config.git.branch_prefix = 'task/'
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)
@@ -189,9 +193,9 @@ async def test_tip_fires_group_merge_happy_path():
     assert req.member_task_ids == ['101', '102', '103'], (
         f'member_task_ids mismatch: {req.member_task_ids!r}'
     )
-    assert req.tip_branch == '103', f'tip_branch mismatch: {req.tip_branch!r}'
+    assert req.tip_branch.bare_id == '103', f'tip_branch mismatch: {req.tip_branch!r}'
     assert req.tip_task_id == '103', f'tip_task_id mismatch: {req.tip_task_id!r}'
-    assert req.branch == '103', f'branch mismatch: {req.branch!r}'
+    assert req.branch.bare_id == '103', f'branch mismatch: {req.branch!r}'
     assert req.worktree == f.wf.worktree, f'worktree mismatch: {req.worktree!r}'
 
     # (d) mark_member_done callback

@@ -25,6 +25,7 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Worker factory (mirrors test_merge_queue_main_health._make_git_ops pattern)
@@ -390,7 +391,7 @@ class TestWiringIntegration:
         base_sha = await git_ops.get_main_sha()
         req = MergeRequest(
             task_id=branch,
-            branch=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
             worktree=worktree,
             pre_rebased=False,
             task_files=None,

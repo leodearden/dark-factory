@@ -1421,6 +1421,7 @@ class TaskWorkflow:
             TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
+            QueuedBranch,
             register_and_enqueue_merge_request,
         )
 
@@ -1504,9 +1505,10 @@ class TaskWorkflow:
         # decide whether and how to stamp train members.  GroupMergeRequest
         # therefore inherits the None default from the base MergeRequest field,
         # and ζ's aging comparator falls back to enqueued_at for legacy/None.
+        queued_branch = QueuedBranch.parse(branch_name, self.config.git.branch_prefix)
         req = GroupMergeRequest(
             task_id=self.task_id,
-            branch=branch_name,
+            branch=queued_branch,
             worktree=self.worktree,
             pre_rebased=False,
             task_files=union_task_files,
@@ -1515,7 +1517,7 @@ class TaskWorkflow:
             result=future,
             train_id=train_id,
             member_task_ids=member_ids,
-            tip_branch=branch_name,
+            tip_branch=queued_branch,
             tip_task_id=self.task_id,
             status_check=_status_check,
             mark_member_done=_mark_member_done,
@@ -7890,10 +7892,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         first_enqueued_at = await self._stamp_first_merge_enqueue()
 
         future: asyncio.Future[MergeOutcome] = asyncio.get_event_loop().create_future()
-        from orchestrator.merge_queue import lane_for_task_metadata
+        from orchestrator.merge_queue import QueuedBranch, lane_for_task_metadata
         merge_request = MergeRequest(
             task_id=self.task_id,
-            branch=branch_name,
+            branch=QueuedBranch.parse(branch_name, self.config.git.branch_prefix),
             worktree=self.worktree,
             pre_rebased=pre_rebased,
             task_files=self._task_files,

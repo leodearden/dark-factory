@@ -186,6 +186,7 @@ async def test_submit_to_merge_queue_rebinds_branch_before_enqueue(
     config.steward_completion_timeout = 300.0
     config.project_root = tmp_path / 'proj'
     config.max_consecutive_merge_thrash = 2
+    config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)

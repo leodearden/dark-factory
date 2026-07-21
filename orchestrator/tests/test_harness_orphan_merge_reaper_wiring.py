@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.harness import Harness
+from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Shared harness builder — mirrors test_harness_merge_store_wiring
@@ -93,7 +94,10 @@ class TestReapOrphanedMergeWorktreesWiring:
             return_value={'readopted': [], 'reaped': []},
         )
 
-        requests = [MagicMock(branch='b1'), MagicMock(branch='b2')]
+        requests = [
+            MagicMock(branch=QueuedBranch.parse('b1', 'task/')),
+            MagicMock(branch=QueuedBranch.parse('b2', 'task/')),
+        ]
         await h._reap_orphaned_merge_worktrees(requests)
 
         h._merge_worker.reap_orphaned_merge_worktrees.assert_awaited_once_with(
