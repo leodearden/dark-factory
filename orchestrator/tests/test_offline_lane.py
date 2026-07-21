@@ -186,15 +186,15 @@ class TestLaneCommand:
         from orchestrator.config import LaneCommand
 
         with pytest.raises(ValidationError):
-            LaneCommand(command='pytest')  # missing name
+            LaneCommand(command='pytest')  # type: ignore[call-arg]  # missing name
         with pytest.raises(ValidationError):
-            LaneCommand(name='q')  # missing command
+            LaneCommand(name='q')  # type: ignore[call-arg]  # missing command
 
     def test_bogus_priority_rejected(self) -> None:
         from orchestrator.config import LaneCommand
 
         with pytest.raises(ValidationError):
-            LaneCommand(name='x', command='pytest', fix_task_priority='bogus')
+            LaneCommand(name='x', command='pytest', fix_task_priority='bogus')  # type: ignore[arg-type]
 
     def test_explicit_fields_round_trip(self) -> None:
         from orchestrator.config import LaneCommand
@@ -2111,6 +2111,7 @@ async def test_run_once_generic_command_red_reuses_red_path_with_priority(tmp_pa
     command_runner.assert_awaited_once_with(cmd, wt_path, 'HEAD1')
     worker._handle_red_run.assert_awaited_once()
     call = worker._handle_red_run.await_args
+    assert call is not None
     assert call.args == (wt_path, 'HEAD1')
     assert call.kwargs['priority'] == 'low', (
         "the filed fix task's priority must come from LaneCommand.fix_task_priority"
