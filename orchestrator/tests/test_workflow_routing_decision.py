@@ -435,6 +435,110 @@ class TestInvokeCeilingSpendQuery:
         assert call_args.args[0] == 'opus'
 
 
+@pytest.mark.asyncio
+class TestInvokeThreadsScopeCapacity:
+    """δ: ``_invoke`` threads the gate's advisory ``scope_capacity_snapshot()``
+    into ``RouteInputs.scope_capacity`` (None when no gate is wired), and the
+    resolver's ``model-capacity-exhausted`` rejection surfaces end-to-end
+    (invariants S7/S8, PRD boundary test B7)."""
+
+    async def test_gate_snapshot_threaded_into_route_inputs(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        gate = MagicMock()
+        gate.scope_capacity_snapshot.return_value = {'claude-fable-5': False}
+        wf.usage_gate = gate
+
+        fake_decision = RoutingDecision(
+            model='sonnet',
+            effort='high',
+            budget_usd=_BUDGET_USD,
+            max_turns=_MAX_TURNS,
+            source_layer='config',
+            rule_id=None,
+            rejected=(),
+        )
+        with (
+            patch(
+                'orchestrator.workflow.resolve_route',
+                return_value=fake_decision,
+            ) as mock_resolve,
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=_stub_agent_result()),
+            ),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+
+        route_inputs = mock_resolve.call_args.args[0]
+        assert route_inputs.scope_capacity == {'claude-fable-5': False}
+        gate.scope_capacity_snapshot.assert_called_once()
+
+    async def test_no_gate_threads_none_and_does_not_raise(self, tmp_path: Path) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        assert wf.usage_gate is None  # _make_workflow does not wire a gate
+
+        fake_decision = RoutingDecision(
+            model='sonnet',
+            effort='high',
+            budget_usd=_BUDGET_USD,
+            max_turns=_MAX_TURNS,
+            source_layer='config',
+            rule_id=None,
+            rejected=(),
+        )
+        with (
+            patch(
+                'orchestrator.workflow.resolve_route',
+                return_value=fake_decision,
+            ) as mock_resolve,
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=_stub_agent_result()),
+            ),
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+
+        route_inputs = mock_resolve.call_args.args[0]
+        assert route_inputs.scope_capacity is None
+
+    async def test_b7_capacity_exhausted_falls_to_config_end_to_end(
+        self, tmp_path: Path,
+    ) -> None:
+        rec = _RecordingEventStore()
+        wf = _make_workflow(event_store=rec)
+        # Admit fable to the allowlist and clear policy rules so the config
+        # model (`sonnet`) is the deterministic one-layer-down fallback.
+        wf.config.routing.allowed_models = ['haiku', 'sonnet', 'opus', 'claude-fable-5']
+        wf.config.routing.rules = []
+        wf.task['metadata'] = {'model_overrides': {'implementer': 'claude-fable-5'}}
+        gate = MagicMock()
+        gate.scope_capacity_snapshot.return_value = {'claude-fable-5': False}
+        wf.usage_gate = gate
+
+        with (
+            patch(
+                'orchestrator.workflow.invoke_with_cap_retry',
+                new=AsyncMock(return_value=_stub_agent_result()),
+            ) as mock_invoke,
+            patch.object(wf, '_build_agent_env', return_value=None),
+        ):
+            await wf._invoke(IMPLEMENTER, prompt='x', cwd=tmp_path)
+
+        entries = _routing_decision_entries(rec)
+        assert len(entries) == 1
+        data = entries[0]['data']
+        assert 'metadata_override:model-capacity-exhausted' in data['rejected']
+        assert data['model'] == 'sonnet'
+        assert data['source_layer'] == 'config'
+        # Dispatch proceeded with the fallback model (S7: capacity never blocks).
+        mock_invoke.assert_awaited_once()
+        assert mock_invoke.call_args.kwargs['model'] == 'sonnet'
+
+
 class TestSelectModelForRoleRetired:
     """``_select_model_for_role`` is retired — its Rust heuristic now ships
     as defaults.yaml's ``rust-large-plan-implementer`` policy rule, applied
