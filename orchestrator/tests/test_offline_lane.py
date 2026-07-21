@@ -1449,6 +1449,83 @@ def test_parse_confirmed_failures_empty_on_blank_input():
 
 
 # ---------------------------------------------------------------------------
+# _default_confirm_command — generic per-project confirm seam (task 2789, step-13/14)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path: Path):
+    """The default command_confirmation_runner serializes the command and
+    extracts still-failing pytest node-ids from FULL stdout.
+
+    Reuses the reify-side confirm primitives (PRD sec 5): _serial_pytest_str
+    rewrites the command serial (-p no:xdist -o addopts=), and
+    _extract_failing_test_ids pulls the FAILED/ERROR node-ids. cwd/env mirror
+    _default_run_command (idle nice/ionice, DF_VERIFY_ROLE=offline).
+
+    Step 13 (RED): _default_confirm_command / the command_confirmation_runner
+    seam do not exist — must fail before impl.
+    """
+    from orchestrator.config import LaneCommand
+    from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
+
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='q', command='pytest -m integration', cwd='fused-memory')
+
+    stdout = b'FAILED tests/test_q.py::test_a\nFAILED tests/test_q.py::test_b\n'
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(stdout, None))
+    mock_proc.returncode = 1
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
+
+    assert ids == _extract_failing_test_ids(stdout.decode())
+    assert ids == ['tests/test_q.py::test_a', 'tests/test_q.py::test_b']
+
+    argv = list(mock_exec.call_args.args)
+    kwargs = mock_exec.call_args.kwargs
+    expected_serial = _serial_pytest_str('pytest -m integration')
+    assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
+        'confirm re-run must also run at idle nice/ionice'
+    )
+    assert argv[-3:] == ['sh', '-c', expected_serial], (
+        'the confirm re-run must be serialized via _serial_pytest_str'
+    )
+    assert '-p no:xdist' in argv[-1], 'serial re-run must disable xdist'
+    assert kwargs['cwd'] == str(wt_path / 'fused-memory')
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+@pytest.mark.asyncio
+async def test_default_confirm_command_no_failures_is_flake(tmp_path: Path):
+    """stdout with no FAILED/ERROR lines yields [] (the flake path)."""
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+    cmd = LaneCommand(name='q', command='pytest -m integration')
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'all tests passed\n', None))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        ids = await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
+
+    assert ids == []
+
+
+# ---------------------------------------------------------------------------
 # infra seams — constructor wiring (task 1959, IE1, step-3/4)
 # ---------------------------------------------------------------------------
 
