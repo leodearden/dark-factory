@@ -76,7 +76,7 @@ from orchestrator.git_ops import (
 )
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
-from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.routing import (
     PlanShape,
     RoleDefaults,
@@ -1869,7 +1869,9 @@ class TaskWorkflow:
                     seen_files.add(f)
                     union_files.append(f)
             if member_files:
-                for m in files_to_modules(member_files, self.config.lock_depth):
+                for m in derive_modules(
+                    member_files, self.config.lock_depth, task_id=self.task_id,
+                ):
                     if m not in seen_modules:
                         seen_modules.add(m)
                         union_modules.append(m)
@@ -2638,8 +2640,15 @@ class TaskWorkflow:
                             # once the lock frees. new_modules is computed
                             # HERE (only on the conflict path) so the
                             # block_detail names the exact unavailable locks.
-                            new_modules = files_to_modules(
+                            # α-strip via derive_modules (task 2373 amendment)
+                            # so `additional` is computed on the same basis as
+                            # the real conflict detection in
+                            # _reconcile_scope_locks — a directory-shaped grant
+                            # entry must not manufacture a phantom subtree
+                            # module in the diagnostic.
+                            new_modules = derive_modules(
                                 new_files, self.config.lock_depth,
+                                task_id=self.task_id,
                             )
                             additional = sorted(
                                 set(new_modules) - set(self.modules)
@@ -3547,7 +3556,9 @@ class TaskWorkflow:
         "not expanded" means for their own flow (REQUEUED report,
         decline-and-fall-through-to-architect, or silent no-op).
         """
-        new_modules = files_to_modules(plan_files, self.config.lock_depth)
+        new_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
         if set(new_modules) == set(self.modules):
             return True
         expanded = await self.scheduler.handle_blast_radius_expansion(
@@ -3955,7 +3966,9 @@ class TaskWorkflow:
                     'Files are required to derive module locks.'
                 ),
             )
-        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        plan_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
         logger.info(
             f'Task {self.task_id}: derived {len(plan_modules)} modules '
             f'from {len(plan_files)} files: {plan_modules}'
@@ -4079,7 +4092,9 @@ class TaskWorkflow:
         # overlapping module — fall through to the architect path which
         # already handles the requeue case.
         plan_files = plan.get('files', [])
-        plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+        plan_modules = derive_modules(
+            plan_files, self.config.lock_depth, task_id=self.task_id,
+        )
         if (
             set(plan_modules) != set(self.modules)
             and not await self._reconcile_scope_locks(plan_files)
@@ -4238,7 +4253,9 @@ class TaskWorkflow:
         # case where the SIMPLE_TASK agent expanded scope by one file).
         plan_files = self.plan.get('files', [])
         if plan_files:
-            plan_modules = files_to_modules(plan_files, self.config.lock_depth)
+            plan_modules = derive_modules(
+                plan_files, self.config.lock_depth, task_id=self.task_id,
+            )
             if set(plan_modules) != set(self.modules):
                 # Silent no-op on lock conflict (same as before this was
                 # extracted into _reconcile_scope_locks): SIMPLE_TASK doesn't

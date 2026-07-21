@@ -16,13 +16,20 @@ write, ``_persist_files_metadata``) and ``harness.py``
 re-implementing the strip -> coarsen pipeline inline (the pre-task-2122
 state had 4+ divergent copies of this logic across those two files).
 
-NOTE — consolidation scope: ``workflow.py`` derives plan-scoped module lock
-keys via its own direct ``files_to_modules(plan_files, depth)`` calls (e.g.
-``_union_train_scope``, the plan-file blast-radius re-derivation sites) and
-does NOT route through ``derive_modules``, so those sites do not apply the
-α strip. That is a known gap, not an intentional design choice, and is out
-of this module's/task's scope (task 2122 locks scheduler.py/harness.py
-only) — tracked as follow-up work rather than fixed here.
+``workflow.py``'s plan-scoped / train-scoped module lock derivations
+(``_union_train_scope``, ``_reconcile_scope_locks``, and the plan-file
+blast-radius re-derivation sites in ``_plan``, ``_apply_revalidation_skip``,
+and the SIMPLE_TASK lever-C path) were migrated to route through
+``derive_modules`` in task 2373, closing the gap task 2122 left open (its
+locked module scope was scheduler.py/harness.py only).  The ``_resume``
+scope-grant conflict diagnostic (which builds the ``block_detail``'s
+``additional`` module set) was likewise routed through ``derive_modules``
+(task 2373 amendment) so it is computed on the same α-stripped basis as the
+real conflict detection in ``_reconcile_scope_locks``.  The only remaining
+raw ``files_to_modules`` uses in ``workflow.py`` are ``_check_scope_invariant``'s
+task-2505 divergence tripwire, whose plan side is already α-stripped via
+``sanitize_files_for_persist`` and whose metadata side reads Contract-1
+file-level ``metadata.files`` — deliberately left as-is.
 """
 
 from __future__ import annotations
