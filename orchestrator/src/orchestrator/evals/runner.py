@@ -107,7 +107,6 @@ def build_eval_orch_config(
     memory_endpoint: str | None = None,
     architect_config: EvalConfig | None = None,
     judge_config: EvalConfig | None = None,
-    worktree: Path | None = None,
 ) -> OrchestratorConfig:
     """Build an OrchestratorConfig override for this eval run.
 
@@ -155,14 +154,13 @@ def build_eval_orch_config(
     fused-memory leaf), so ``self.mcp.url`` — the single leaf every
     ``_write_*_to_memory`` POST funnels through — becomes the sink.
 
-    ``worktree`` (task 2851): the eval worktree whose ``.python-version`` sources
-    the verify ``UV_PYTHON`` pin (BUG 2a). The three eval executors thread the
-    worktree they created at the fixture's ``pre_task_commit`` — the SAME tree
-    ``snapshots._eval_setup_env`` reads for the setup ``uv sync`` — so setup and
-    verify agree on the interpreter even if the fixture's pinned commit diverges
-    from the target's current HEAD. Left ``None`` (every non-eval caller), the pin
-    source stays the target ``project_root``'s current HEAD, byte-identical to
-    today (the P1/B1 parity tripwire and the project_root pin tests hold).
+    The eval verify ``UV_PYTHON`` pin (BUG 2a) sources from the target
+    ``project_root``'s current checkout (a 3.13-bearing tree) — mirroring
+    production dispatch, which verifies under the target's current
+    ``.python-version`` — and agrees with the setup ``uv sync`` pin
+    ``snapshots._eval_setup_env`` reads from the SAME ``project_root`` (task
+    2875, reverting task 2851's worktree-sourced pin). See the BUG 2a comment
+    below.
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
@@ -249,25 +247,22 @@ def build_eval_orch_config(
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
-    # pyright` runs under the worktree's own 3.13 venv. verify_env is overlaid
+    # pyright` runs under the target's own 3.13 venv. verify_env is overlaid
     # LAST in verify._target_subprocess_env (wins) and survives
     # effective_verify_env, so the pin reaches every verify subprocess. Absent a
     # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
     #
-    # pin_source is the eval WORKTREE when the executor threads one (task 2851) —
-    # the SAME tree snapshots._eval_setup_env reads for the setup `uv sync`, so
-    # setup and verify agree on the interpreter even if a fixture's
-    # pre_task_commit .python-version diverges from the target's current HEAD
-    # (closing the setup/verify split task 2847 BUG 2 removed). Left None (every
-    # non-eval caller), pin_source stays the target project_root's current HEAD —
-    # byte-identical to today. When a worktree IS threaded but has no
-    # .python-version, read_python_pin returns None → inject nothing; there is NO
-    # fallback to project_root (a fallback would resurrect the very split above).
-    pin_source = (
-        worktree
-        if worktree is not None
-        else Path(task.get('project_root', str(base.project_root)))
-    )
+    # pin_source is the target project_root's CURRENT checkout — mirroring
+    # production dispatch, which verifies under the target's current
+    # .python-version — and the SAME tree snapshots._eval_setup_env reads for the
+    # setup `uv sync`, so setup and verify agree on the interpreter. This reverts
+    # task 2851's worktree-sourced pin: the eval worktree is checked out at the
+    # fixture's pre_task_commit, which for older fixtures predates .python-version
+    # → no pin → uv default 3.14t → aiosqlite ModuleNotFoundError at verify.
+    # Sourcing from project_root (a 3.13-bearing tree) fixes that AND preserves
+    # 2847's setup==verify agreement, now anchored to a 3.13-bearing tree instead
+    # of an arbitrarily-old fixture baseline (task 2875).
+    pin_source = Path(task.get('project_root', str(base.project_root)))
     pin = read_python_pin(pin_source)
     if pin is not None:
         update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
@@ -363,7 +358,7 @@ async def run_eval(
     # 2. Build orchestrator config for this eval
     orch_config = build_eval_orch_config(
         config, task, base_config, memory_endpoint=memory_endpoint,
-        judge_config=judge_config, worktree=worktree,
+        judge_config=judge_config,
     )
 
     # 3. Build task assignment
@@ -540,7 +535,6 @@ async def run_architect_eval(
         # 2. Eval orch config (project_root / verify / profile parity).
         orch_config = build_eval_orch_config(
             config, task, base_config, memory_endpoint=memory_endpoint,
-            worktree=worktree,
         )
 
         # 3. Init artifacts so the architect has a place to write plan.json.
@@ -704,7 +698,6 @@ async def run_end_to_end(
     orch_config = build_eval_orch_config(
         impl_config, task, base_config,
         memory_endpoint=memory_endpoint, architect_config=arch_config,
-        worktree=worktree,
     )
 
     # 3. Task assignment.
