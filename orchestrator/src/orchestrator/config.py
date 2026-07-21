@@ -4307,6 +4307,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # Generic per-project offline-lane commands + legacy-numeric gate (task
+        # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
+        # so the command list, per-command priorities, and the legacy-numeric
+        # toggle hot-reload cleanly. offline_lane_commands is a whole
+        # list[LaneCommand] leaf compared by equality (like routing.rules).
+        # The offline_lane_enabled START gate stays restart-only (unchanged).
+        'git.offline_lane_commands',
+        'git.offline_lane_legacy_numeric_enabled',
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate
