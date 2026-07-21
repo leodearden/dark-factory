@@ -5773,6 +5773,22 @@ class TaskWorkflow:
             if outcome := await self._validate_prerequisites_or_block('replan'):
                 return outcome
             self.artifacts.stamp_plan_provenance(self.session_id)
+            # Task 2874: the architect may have WIDENED plan.files while
+            # addressing review feedback ("you may add new steps"), so route
+            # the possibly-widened files through the same scope-
+            # reconciliation choke point _plan()/_apply_revalidation_skip()/
+            # _run_simple_task() use — keeping plan.files ⊆ metadata.files
+            # (and module locks covering every plan.files module)
+            # CONTINUOUSLY, not just at plan-entry/merge-entry. Without this,
+            # metadata.files/the new module lock would lag plan.files for the
+            # whole ensuing reviewer_comprehensive pass — the window the
+            # orphan-reaper sweeps in and fires the plan.files ⊋
+            # metadata.files divergence (esc-2865-11 cluster). A no-widen
+            # replan (the common case) reconciles to an identical file set
+            # and is a harmless no-op.
+            replan_files = self.plan.get('files') or []
+            if replan_files:
+                await self._set_task_scope(replan_files)
             self.metrics.review_cycles += 1
 
     async def _execute_iterations(self) -> WorkflowOutcome:
