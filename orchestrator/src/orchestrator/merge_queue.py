@@ -4666,23 +4666,27 @@ async def reconcile_landed_outbox(
     instead of falling into the generic ``'errors'`` tally; ``None``
     preserves the pre-task-2677 propagate-and-tally-as-``'errors'`` behavior.
 
-    RESOLVED (task 2681/ζ — was a KNOWN LIMITATION of task 2155): the
-    single-branch happy path now consumes its row on completion.
-    ``_finalise_merged_done`` (workflow.py) calls ``MergeProvenance.consume``
-    the moment ``Scheduler.mark_done(kind='merged', ...)`` succeeds — via the
-    same process-global façade the worker binds its outbox to — so a
+    RESOLVED (task 2681/ζ, extended by task 2280 — was a KNOWN LIMITATION of
+    task 2155): every done-write path now consumes its row inline on
+    completion. The single-branch happy path (``_finalise_merged_done``,
+    workflow.py) landed first in 2681; task 2280 extended the same
+    ``MergeProvenance.consume`` call to the train paths — the
+    ``mark_member_done`` and found_on_main ``redrive_member`` callbacks in
+    ``harness.py``'s ``build_train_callback_factory``, the workflow inline
+    ``_mark_member_done`` closure, and the ``_attribute_train_failure``
+    solo-passer landing (both workflow.py). Each fires
+    ``MergeProvenance.consume`` the moment its ``Scheduler.mark_done`` succeeds
+    — via the same process-global façade the worker binds its outbox to — so a
     long-running orchestrator no longer accumulates one row per
-    successfully-landed single-branch task across its uptime.
+    successfully-landed task (single-branch OR train-landed) across its uptime.
 
-    RC-3 here (``'already_done_pruned'``) is therefore now a BACKSTOP for the
-    paths that still do not consume inline, not the primary cleanup for every
-    landed task: crash-interrupted completions (the process died between
-    ``advance_main`` and the consume) and the (out-of-scope) train-member
-    ``mark_done`` callbacks in ``harness.py``'s ``build_train_callback_factory``
-    (whose functional twin lives outside task 2681's module scope). Those
-    remaining rows are still self-cleaning at boot and never a phantom-done
-    risk — and are additionally guarded against an RC-2 re-done by the
-    server-side reopen-freshness gate.
+    RC-3 here (``'already_done_pruned'``) is therefore now a PURE crash-recovery
+    backstop, not the primary cleanup for any landed task: it fires only for a
+    landing the process crashed part-way through — died after the terminal
+    ``mark_done`` but before the inline consume ran. Such a row is still
+    self-cleaning at the next boot and never a phantom-done risk — and is
+    additionally guarded against an RC-2 re-done by the server-side
+    reopen-freshness gate.
     """
     report = {
         'pruned_not_landed': 0,

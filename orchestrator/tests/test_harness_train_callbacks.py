@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,7 +27,16 @@ from _orch_helpers import pydantic_spec
 from _workflow_helpers import FakeScheduler
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_types import QueuedBranch
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """MergeProvenance._outbox is a process-global — never leak a bound outbox."""
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
 
 # ---------------------------------------------------------------------------
 # Step 1 / Step 2 — worker-side surface
@@ -131,6 +141,42 @@ class TestRealTaskFlip:
             'commit': 'deadbeefcafe',
             'note': 'train train-xyz',
         }, f"unexpected provenance: {sched.provenance['4442']!r}"
+
+    @pytest.mark.asyncio
+    async def test_mark_member_done_consumes_landed_row(self, tmp_path: Path) -> None:
+        """mark_member_done consumes the tip's write-ahead LandedRow on success (task 2280, PRD B1).
+
+        The train journals ONE LandedRow keyed by the tip task_id
+        (merge_queue.py:5061). When the tip member flips 'done' the row must be
+        consumed inline so it no longer survives to the next orchestrator startup
+        for RC-3 to prune (the task-2155 KNOWN LIMITATION). Mirrors the 2681
+        single-branch precedent (test_workflow_merge_provenance.py:841-857).
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='4442', branch_tip_sha='tip',
+            advanced_sha='deadbeefcafe', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        sched = FakeScheduler()
+        await sched.set_task_status('4442', 'merge-deferred')
+
+        cbs = build_train_callback_factory(sched)('train-xyz')
+
+        # Row present BEFORE the done-write.
+        assert outbox.lookup('4442') is not None
+
+        await cbs.mark_member_done('4442', 'deadbeefcafe')
+
+        # Member flipped done ...
+        assert sched.statuses['4442'][-1] == 'done', (
+            f"expected 'done', got {sched.statuses['4442'][-1]!r}"
+        )
+        # ... AND its write-ahead row consumed (PRD B1: lookup==None after done).
+        assert outbox.lookup('4442') is None
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +323,44 @@ class TestRedriveMember:
         note = prov.get('note', '')
         assert 'on main' in note, f"note missing 'on main': {note!r}"
         assert 'train-abc' in note, f"note missing train_id: {note!r}"
+
+    @pytest.mark.asyncio
+    async def test_redrive_on_main_consumes_landed_row(self, tmp_path: Path) -> None:
+        """redrive_member found_on_main guard consumes a bound LandedRow (task 2280, PRD B1).
+
+        When a partner's merge already brought the branch into main,
+        redrive_member flips the member 'done' (kind='found_on_main'); if that
+        member is the train tip it owns the write-ahead LandedRow, which must be
+        consumed inline so it does not survive to the next startup for RC-3.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='5002', branch_tip_sha='tip',
+            advanced_sha='cafe1234beef', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        sched = FakeScheduler()
+        await sched.set_task_status('5002', 'merge-deferred')
+
+        cbs = build_train_callback_factory(sched)('train-abc')
+        assert cbs.redrive_member is not None
+
+        # Row present BEFORE the done-write.
+        assert outbox.lookup('5002') is not None
+
+        await cbs.redrive_member('5002', True, 'cafe1234beef')
+
+        assert sched.statuses['5002'][-1] == 'done', (
+            f"expected 'done', got {sched.statuses['5002'][-1]!r}"
+        )
+        assert sched.provenance.get('5002', {}).get('kind') == 'found_on_main', (
+            f"kind mismatch: {sched.provenance.get('5002')!r}"
+        )
+        # Row CONSUMED on the found_on_main done-write (PRD B1: lookup==None after done).
+        assert outbox.lookup('5002') is None
 
     @pytest.mark.asyncio
     async def test_redrive_noop_for_nontask_member(self) -> None:

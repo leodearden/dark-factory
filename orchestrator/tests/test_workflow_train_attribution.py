@@ -21,12 +21,22 @@ from _orch_helpers import pydantic_spec
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_queue import (
     TRAIN_VERIFY_FAILED_REASON_PREFIX,
     MergeOutcome,
     SoloVerifyResult,
 )
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """MergeProvenance._outbox is a process-global — never leak a bound outbox."""
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
+
 
 # ---------------------------------------------------------------------------
 # Shared fixture helper (mirrors test_workflow_train_completion._make)
@@ -1187,3 +1197,63 @@ class TestLandedShaFromAdvanceOutcome:
             f'Expected mark_done for 103 (unaffected by the 102 advance_main raise); '
             f'got: {f.scheduler.mark_done.await_args_list}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2280: the passer-landed path consumes the tip's write-ahead LandedRow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAttributionConsumesLandedRow:
+    """The passer-landed block in _attribute_train_failure consumes the tip's
+    write-ahead LandedRow inline on the successful mark_done (task 2280, PRD B1) —
+    so a train that derailed but whose tip passed solo and landed no longer leaves
+    a stale row surviving to the next startup for RC-3 to prune.
+    """
+
+    async def test_tip_passer_landing_consumes_landed_row(self, tmp_path: Path) -> None:
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-consume', 'order': 2,
+                                'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+        f.wf.git_ops = f.git_ops
+        f.git_ops.get_main_sha = AsyncMock(return_value='main-sha-probe')
+        f.git_ops.delete_solo_branch = AsyncMock()
+        f.git_ops.advance_main = AsyncMock(
+            return_value=AdvanceOutcome('advanced', advanced_sha='landedsha'),
+        )
+
+        members = _train_members(train_id='T-consume', tip_id='103')
+        # '101' fails solo; '102' and the tip '103' pass and land.
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_pass_wt('102'),
+            _solo_pass_wt('103'),
+        ])
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='103', branch_tip_sha='tip',
+            advanced_sha='landedsha', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        # Row present BEFORE attribution.
+        assert outbox.lookup('103') is not None
+
+        tagged = _make_tagged_result()
+        result = await f.wf._attribute_train_failure(tagged, 'T-consume', members)
+
+        # Tip passed solo and landed → DONE, flipped done with kind='merged' ...
+        assert result == WorkflowOutcome.DONE, (
+            f'Expected DONE (tip landed), got {result!r}'
+        )
+        called = {c.args[0]: c.kwargs for c in f.scheduler.mark_done.await_args_list}
+        assert '103' in called and called['103'].get('kind') == 'merged', (
+            f'Expected tip 103 marked done kind=merged, got: {called!r}'
+        )
+        # ... AND the tip's write-ahead row consumed inline (PRD B1: lookup==None).
+        assert outbox.lookup('103') is None
