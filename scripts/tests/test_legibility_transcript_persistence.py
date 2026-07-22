@@ -16,6 +16,7 @@ separately-landing ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` preventer.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -202,6 +203,66 @@ def test_find_matching_transcript_sibling_only_returns_none(tmp_path):
         rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
     )
     assert got is None
+
+
+# ---------------------------------------------------------------------------
+# step-5/6: WEAK file-mtime time-window fallback (short/empty prompts only)
+# ---------------------------------------------------------------------------
+
+_SHORT_PROMPT = "continue"  # < MIN_MATCH_LEN -> not usable -> weak fallback
+
+
+def test_weak_mtime_fallback_matches_in_window(tmp_path):
+    projects = tmp_path / "projects"
+    cwd = "/home/leo/src/dark-factory/.worktrees/2600"
+    rec = _spawn_record("sess-short", cwd, _SHORT_PROMPT)  # start_ts = now - 1h
+
+    path = _write_transcript(projects, cwd, "sess-short.jsonl", "unrelated first turn text")
+    _set_mtime(path, FIXED_NOW - timedelta(hours=1))  # within [start-skew, now+skew]
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == path
+
+
+def test_weak_mtime_fallback_out_of_window_returns_none(tmp_path):
+    projects = tmp_path / "projects"
+    cwd = "/home/leo/src/dark-factory/.worktrees/2600"
+    rec = _spawn_record("sess-short2", cwd, _SHORT_PROMPT)
+
+    path = _write_transcript(projects, cwd, "sess-short2.jsonl", "unrelated first turn text")
+    _set_mtime(path, FIXED_NOW - timedelta(hours=100))  # far before the window
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def test_weak_fallback_does_not_fire_for_usable_prompt(tmp_path):
+    # A usable-prompt record whose ONLY transcript is a time-in-window sibling
+    # that fails the content match must STILL return None — the weak fallback
+    # is gated on a non-usable prompt, so the same-cwd confound stays defeated.
+    projects = tmp_path / "projects"
+    cwd = "/home/leo/src/dark-factory/.worktrees/2600"
+    rec = _spawn_record("sess-usable", cwd, _USABLE_PROMPT)
+
+    path = _write_transcript(
+        projects, cwd, "sibling-inwindow.jsonl",
+        "You are a TDD implementer. A different first turn.",
+    )
+    _set_mtime(path, FIXED_NOW - timedelta(hours=1))  # in the time window
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def _set_mtime(path: Path, dt: datetime) -> None:
+    ts = dt.timestamp()
+    os.utime(path, (ts, ts))
 
 
 def test_find_matching_transcript_missing_dir_returns_none(tmp_path):
