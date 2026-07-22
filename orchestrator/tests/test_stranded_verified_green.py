@@ -616,3 +616,98 @@ class TestReconcileStrandedDriverVerifiedGreen:
         assert filed[0].category == 'stranded_blocked'
         assert filed[0].agent_role == 'harness-stranded-blocked-reaper'
         assert harness._merge_queue.qsize() == 0
+
+
+_DURABLE_FAILURE_STATUSES = [
+    'conflict', 'blocked', 'error', 'unknown_branch',
+    'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
+]
+_SUCCESS_TRANSIENT_STATUSES = [
+    'done', 'already_merged', 'done_wip_recovery', 'superseded', 'wip_halted',
+]
+
+
+@pytest.mark.asyncio
+class TestStrandedMergeFailedL2:
+    """Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed (step-13).
+
+    The MergeRequest's done-callback files a born-at-L2 escalation on a durable
+    failure and is a strict no-op on success/transient outcomes; the task stays
+    blocked and the branch + lane are preserved (by omission — the callback
+    never touches status/lane/branch).
+    """
+
+    async def _submit_and_get_req(self, harness: Harness, tmp_path: Path, queue):
+        harness._escalation_queue = queue
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._maybe_submit_stranded_verified_green(_TID, {})
+        return harness._merge_queue.get_nowait()
+
+    async def _drive_callback(self, harness: Harness) -> None:
+        # add_done_callback fires via call_soon; sleep(0) lets it run and
+        # schedule _file_stranded_merge_failed onto _background_tasks.
+        await asyncio.sleep(0)
+        await asyncio.gather(*list(harness._background_tasks))
+
+    @pytest.mark.parametrize('status', _DURABLE_FAILURE_STATUSES)
+    async def test_durable_failure_files_born_at_l2(
+        self, harness: Harness, tmp_path: Path, status: str,
+    ) -> None:
+        from orchestrator.merge_types import MergeOutcome
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        req = await self._submit_and_get_req(harness, tmp_path, queue)
+        req.result.set_result(MergeOutcome(status=status, reason='durable-fail'))
+        await self._drive_callback(harness)
+
+        l2s = queue.get_by_task(
+            _TID, status='pending', level=2,
+            agent_role='harness-stranded-blocked-reaper',
+        )
+        assert len(l2s) == 1
+        rec = l2s[0]
+        assert rec.category == 'stranded_merge_failed'
+        assert rec.severity == 'critical'
+        assert rec.level == 2
+        # Task NOT flipped (stays blocked; branch + lane preserved by omission).
+        for call in harness.scheduler.set_task_status.await_args_list:
+            assert tuple(call.args[:2]) != (_TID, 'pending')
+
+    @pytest.mark.parametrize('status', _SUCCESS_TRANSIENT_STATUSES)
+    async def test_success_transient_files_no_l2(
+        self, harness: Harness, tmp_path: Path, status: str,
+    ) -> None:
+        from orchestrator.merge_types import MergeOutcome
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        req = await self._submit_and_get_req(harness, tmp_path, queue)
+        req.result.set_result(MergeOutcome(status=status))
+        await self._drive_callback(harness)
+
+        assert queue.get_by_task(
+            _TID, status='pending', level=2,
+            agent_role='harness-stranded-blocked-reaper',
+        ) == []
+
+    async def test_second_durable_failure_no_duplicate_l2(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_types import MergeOutcome
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        req1 = await self._submit_and_get_req(harness, tmp_path, queue)
+        req1.result.set_result(MergeOutcome(status='conflict'))
+        await self._drive_callback(harness)
+
+        req2 = await self._submit_and_get_req(harness, tmp_path, queue)
+        req2.result.set_result(MergeOutcome(status='error'))
+        await self._drive_callback(harness)
+
+        l2s = queue.get_by_task(
+            _TID, status='pending', level=2,
+            agent_role='harness-stranded-blocked-reaper',
+        )
+        assert len(l2s) == 1  # scoped dedup — no duplicate born-at-L2
