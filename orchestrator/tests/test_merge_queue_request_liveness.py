@@ -779,7 +779,11 @@ class TestDeadInflightVerifyAborts:
         task 2921: the verify gate itself is now a plain release-event wait
         (no real writer coroutine racing the budget under host load) — the
         progress signal this test relies on instead is a deterministic
-        `newest_content_mtime` injection (patched alongside this gate).
+        `newest_content_mtime` injection (patched alongside this gate), so
+        the no-progress clock resets on every LOCAL probe regardless of
+        real-time event-loop scheduling delay under a loaded host.
+        newest_content_mtime's real-FS walk behaviour is independently
+        covered by test_merge_liveness.py.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease
@@ -801,12 +805,25 @@ class TestDeadInflightVerifyAborts:
             await release_event.wait()
             return _pass_result()
 
+        # task 2921: strictly-increasing stub so EVERY LOCAL content-mtime
+        # probe observes fresh progress and resets _last_progress_at —
+        # decouples this must-NOT-abort assertion from real wall-clock
+        # file-write timing (which a busy host can starve past the budget).
+        _mtime = [1000.0]
+
+        def _always_progress(_root: Path) -> float:
+            _mtime[0] += 1.0
+            return _mtime[0]
+
         fake_local = MagicMock()
         fake_local.name = 'local'
         fake_local.is_local = True
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _gate):
+        with (
+            patch('orchestrator.merge_queue.run_scoped_verification', _gate),
+            patch('orchestrator.merge_queue.newest_content_mtime', _always_progress),
+        ):
             verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
             # Let several budget windows elapse while content keeps writing.
             await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 4)
