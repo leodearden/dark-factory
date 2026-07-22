@@ -4265,6 +4265,74 @@ class Harness:
         await enqueue_merge_request(
             self._merge_queue, req, self.event_store, source='stranded-reaper',
         )
+
+        # Record the action (PRD §2.1): file a stranded_blocked escalation and
+        # IMMEDIATELY auto-resolve it with a close_only/dismiss disposition.
+        # dismiss=True → _resolve_escalation_action maps status='dismissed' to
+        # 'close_only' → _on_escalation_resolved's WORKFLOW_NONE branch → NO
+        # blocked→pending flip (unlike a resume-resolution, which would trigger
+        # the exact Fix #1a re-pend we are replacing).  The dismissed record
+        # still lands in the archive as an audit trail, and leaving NO pending
+        # escalation keeps the later found_on_main MARK_DONE flip unblocked
+        # (its report.open_escalations guard).
+        if self._escalation_queue is not None:
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            esc = Escalation(
+                id=self._escalation_queue.make_id(tid),
+                task_id=tid,
+                agent_role='harness-stranded-blocked-reaper',
+                severity='blocking',
+                category='stranded_blocked',
+                summary=(
+                    f'Verified-green stranded remediation: task {tid} branch '
+                    f'submitted directly to the merge queue (no re-pend).'
+                )[:200],
+                detail=(
+                    f'Task {tid} was blocked with verified-green, all-steps-done '
+                    f'lane work (branch tip {match.tip_sha}) but no open '
+                    f'escalation and no live claimant — the stranded-verified-'
+                    f'green shape (PRD leaf α §2.1).  Rather than re-pend it into '
+                    f'a possibly-paused scheduler, the branch was submitted '
+                    f'directly to the merge queue (request_id={req.request_id}, '
+                    f'source=stranded-reaper).  The merge queue\'s own full '
+                    f'verify is the sole gate; the task stays blocked and is '
+                    f'marked done by the existing found_on_main path once the '
+                    f'merge lands (or a stranded_merge_failed L2 is filed on a '
+                    f'durable merge/verify failure).'
+                ),
+                suggested_action='manual_intervention',
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            self._escalation_queue.resolve(
+                esc.id,
+                resolution=(
+                    f'submitted branch to merge queue '
+                    f'(request_id={req.request_id}, source=stranded-reaper); '
+                    f'merge-queue verify is the gate — task stays blocked'
+                ),
+                dismiss=True,
+                resolved_by='harness-stranded-blocked-reaper',
+            )
+            if self.event_store is not None:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=tid,
+                    data={
+                        'escalation_id': esc.id,
+                        'category': 'stranded_blocked',
+                        'severity': 'blocking',
+                        'level': 1,
+                        'reason': 'stranded-verified-green-submitted',
+                    },
+                )
+            logger.warning(
+                'Reconcile: task %s stranded verified-green — submitted branch '
+                'to merge queue (request_id=%s, source=stranded-reaper); filed+'
+                'dismissed record L1 %s (task stays blocked, no re-pend)',
+                tid, req.request_id, esc.id,
+            )
         return True
 
     def _on_stranded_merge_done(
