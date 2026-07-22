@@ -1508,3 +1508,51 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
     assert kwargs["agent_transcript_roots"] == expected_roots
     # (3) the [start, end] window equals _census_window_dates' first/last.
     assert (start_date, end_date) == (window[0], window[-1])
+
+
+# ---------------------------------------------------------------------------
+# _build_stage_invokes — each census stage gets its OWN claude-CLI subprocess
+# timeout, threaded through the invoke(prompt, model) seam via
+# functools.partial(coder._invoke_cli, timeout=...). The shared 120s coder
+# default is fine for mining/headroom but fatal for the per-cluster Sonnet
+# verify-vs-main and the one large Fable synthesis; this is where that split
+# is bound.
+# ---------------------------------------------------------------------------
+
+def _config_with_timeouts(mining, verify, synthesis):
+    """A minimal valid LegibilityConfig carrying explicit stage timeouts."""
+    return config_mod.LegibilityConfig(
+        project_id="dark_factory",
+        project_root="/home/leo/src/dark-factory",
+        escalation_port=8103,
+        cwd_prefixes=["/home/leo/src/dark-factory"],
+        timeouts=config_mod.Timeouts(
+            census_mining_secs=mining,
+            census_verify_secs=verify,
+            census_synthesis_secs=synthesis,
+        ),
+    )
+
+
+def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
+    # Record the timeout every stage invoke threads to coder._invoke_cli.
+    recorded = []
+
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+        recorded.append(timeout)
+        return "dummy"
+
+    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
+
+    cfg = _config_with_timeouts(111, 222, 333)
+    mining, verify, synth = mod._build_stage_invokes(cfg)
+
+    # Drive each partial exactly as its census seam does: two positional
+    # args, no kwargs (invoke(prompt, model)).
+    mining("p", "haiku")
+    verify("p", "sonnet")
+    synth("p", "fable")
+
+    # Each stage's own timeout threads through, in [mining, verify, synth]
+    # order — proving every stage carries its distinct budget.
+    assert recorded == [111, 222, 333]
