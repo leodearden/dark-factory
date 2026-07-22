@@ -64,7 +64,3 @@ headroom (wait for max-a token refresh or a cap reset window). The layer chain s
 Evidence: result JSONs `df_task_12__*__{8181499e,fb3e66f2,c498b567,fd853cf7,9cf2162c,9351652d}.json`,
 worktrees `/home/leo/src/dark-factory-eval-worktrees/df_task_12/run-*`, smoke logs (session
 scratchpad `smoke-run2.log`), forensic transcript in watcher-df session 2026-07-22.
-
-*(Note: this doc is deliberately left uncommitted — project_root HEAD is currently a live
-offline-lane task branch (task/reify-5308); an earlier direct commit was CAS-reverted off that
-branch. Commit to main once the checkout returns there, or let a docs sweep pick it up.)*
