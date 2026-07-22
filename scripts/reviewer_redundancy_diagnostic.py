@@ -64,8 +64,19 @@ def find_review_dirs() -> list[Path]:
 
 
 def task_label(reviews_dir: Path) -> str:
-    """Friendly label like '.worktrees/516' or 'eval/df_task_12/run-x'."""
-    parts = reviews_dir.relative_to(REPO).parts
+    """Friendly label like '.worktrees/516' or the relocated eval form
+    '<name>-eval-worktrees/df_task_12/run-x'.
+
+    In-repo `.worktrees` dirs are labelled relative to REPO. Relocated eval
+    worktrees (post-2881) live at eval_worktree_root(REPO) — a SIBLING of REPO
+    — so `relative_to(REPO)` raises ValueError for them; fall back to
+    REPO.parent, the common ancestor of both `.worktrees` (under REPO) and the
+    relocated eval sibling.
+    """
+    try:
+        parts = reviews_dir.relative_to(REPO).parts
+    except ValueError:
+        parts = reviews_dir.relative_to(REPO.parent).parts
     # parts ends with .task/reviews — strip those
     return '/'.join(parts[:-2])
 
