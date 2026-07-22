@@ -7437,6 +7437,69 @@ class TestEnqueueMergeRequest:
         assert rows[0][3] == '42'
 
     @pytest.mark.asyncio
+    async def test_enqueue_helper_threads_source_into_merge_queued(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """source='stranded-reaper' surfaces as data['source'] on merge_queued.
+
+        PRD leaf α §6α acceptance signal: reaper-submitted merges carry a
+        source marker distinguishing them from workflow/MCP submissions.
+        """
+        import json
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(
+            queue, req, event_store, source='stranded-reaper',
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        data = json.loads(rows[0][0])
+        assert data['source'] == 'stranded-reaper'
+        assert data['branch'] == '42'
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_omits_source_key_when_unset(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """Existing callers (no source=) emit NO 'source' key — byte-identical."""
+        import json
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        data = json.loads(rows[0][0])
+        assert 'source' not in data
+
+    @pytest.mark.asyncio
     async def test_enqueue_helper_with_none_event_store_still_enqueues(
         self, tmp_path: Path, config: OrchestratorConfig,
     ):
