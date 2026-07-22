@@ -8,6 +8,7 @@ consults before submitting a lane branch directly to the merge queue
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -483,3 +484,49 @@ class TestMaybeSubmitStrandedVerifiedGreen:
         assert result is False
         assert harness._merge_queue.qsize() == 0
         detect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestStrandedVerifiedGreenRecordEscalation:
+    """The action-recording (step-9): a submit files a stranded_blocked
+    escalation and IMMEDIATELY dismisses it (close_only) so the task stays
+    blocked — NOT re-pended (PRD §2.1)."""
+
+    async def test_records_action_via_dismissed_escalation_without_repend(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(_TID, {})
+        # Drain any coros scheduled by the resolve callback (there should be
+        # none for the WORKFLOW_NONE/close_only path — mirrors the flip tests).
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert result is True
+
+        # No pending stranded_blocked L1 remains — it was immediately dismissed.
+        assert queue.get_by_task(_TID, status='pending') == []
+
+        # The record IS archived (dismissed) as an audit trail, noting the
+        # merge request_id + source.
+        dismissed = queue.get_by_task(_TID, status='dismissed')
+        assert len(dismissed) == 1
+        rec = dismissed[0]
+        assert rec.category == 'stranded_blocked'
+        assert rec.agent_role == 'harness-stranded-blocked-reaper'
+        assert 'source=stranded-reaper' in rec.resolution
+        assert 'request_id=mr-' in rec.resolution
+
+        # CRITICALLY: the record must NOT re-pend the task (close_only →
+        # WORKFLOW_NONE, not a resume-resolution).
+        for call in harness.scheduler.set_task_status.await_args_list:
+            assert tuple(call.args[:2]) != (_TID, 'pending'), (
+                'verified-green record must NOT re-pend the task'
+            )
