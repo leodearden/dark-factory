@@ -1118,3 +1118,45 @@ async def test_gc_mixed_flips_standing_and_deletes_markers_with_terminal_ids(sto
     )
     # Count == deleted (2 markers) + flipped (1 standing decision).
     assert count == 3
+
+
+@pytest.mark.asyncio
+async def test_gc_flip_defensively_wraps_non_dict_standing_payload(store):
+    """The gc() TTL-flip tolerates a non-object payload_json on an
+    entity_standing_decision row the same way mark_addressed does: a JSON
+    scalar/list is wrapped as {'_payload': <value>} before expiry_reason='ttl'
+    is stamped, and the row still flips to state='expired' (INV-2). Written via
+    a raw upsert() because upsert_entity_standing_decision always builds a dict
+    payload, so this defensive branch is otherwise unexercised."""
+    # Raw upsert of a standing-decision-kind row whose payload_json is a JSON
+    # list (valid JSON, but not an object). The entity_standing_decision PK-slot
+    # layout (task_id='', flag_type=grounds, run_id=entity_uuid) is mirrored so
+    # gc()'s flip SELECT — keyed on record_kind + state + expires_at — matches.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+            payload_json='[1, 2, 3]',
+            state=STATE_ACTIVE,
+            created_at='2026-04-01T00:00:00+00:00',
+            task_id='',
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id='uuid-scalar',
+            expires_at='2026-06-30T00:00:00+00:00',  # < now
+            entity_uuid='uuid-scalar',
+        )
+    )
+
+    count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1  # flipped, not deleted
+    row = listed[0]
+    assert row.state == STATE_EXPIRED
+    # Non-dict payload defensively wrapped under '_payload', then ttl-stamped.
+    assert json.loads(row.payload_json) == {
+        '_payload': [1, 2, 3],
+        'expiry_reason': EXPIRY_REASON_TTL,
+    }
+    assert await store.get_active_entity_standing_decision('proj-p', 'uuid-scalar') is None
+    assert count == 1
