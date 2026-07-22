@@ -1380,10 +1380,17 @@ def _wmctrl_live_window_ids(
     ``_normalize_wm_window_id`` before being added to the set (a column 0
     that fails to parse is simply skipped, not an error).
 
-    NOTE: this parse is now duplicated across THREE call sites --
-    ``WmBackend.is_alive``, ``session_hooks._resolve_wm_window_id``, and this
-    function -- keep all three in sync if the ``wmctrl -l`` column layout
-    ever changes.
+    NOTE (reviewer-flagged): this parse is now duplicated across THREE call
+    sites -- ``WmBackend.is_alive``, ``session_hooks._resolve_wm_window_id``,
+    and this function -- keep all three in sync if the ``wmctrl -l`` column
+    layout ever changes. The three already diverge in one respect (this
+    function's deliberate any-non-empty-line/column-0 leniency vs. the other
+    two's stricter >=4-column gate, documented above), which raises the odds
+    of further drift the next time any one of them changes. No change is
+    needed now given this module's stdlib-only/import-free constraint (see
+    module docstring); if/when that constraint is ever relaxed, extracting
+    this parse and ``_wmctrl_list`` into one shared stdlib-only helper all
+    three call sites import would remove the drift risk entirely.
 
     *run* defaults to ``None``, which resolves to the real ``_wmctrl_list``
     at CALL time -- a plain name lookup in this function's body, not a bound
@@ -1455,6 +1462,22 @@ def mark_windowless_wm_sessions_exited(
     -- rather than adding retries here, keeping this sweep a single
     fail-soft decision point per call.
 
+    Known trade-off for a multi-DISPLAY fleet (reviewer-flagged): ``wmctrl
+    -l`` only reports windows on the single X ``DISPLAY`` the invoking
+    process is connected to -- whatever ``_run_launching``/``_run_reap`` (or
+    a directly-invoked CLI) happens to inherit as ``$DISPLAY`` -- never
+    every display a fleet's sessions might be spread across. A session
+    whose window genuinely lives on a DIFFERENT display than the one this
+    sweep's probe ran under is indistinguishable here from one that is
+    actually gone -- its id is simply absent from ``live_ids`` -- so a
+    multi-display fleet risks a false reap of a still-live session on
+    another display. This is accepted for the same reason as the
+    self-correction trade-off above (a live session's next hook event flips
+    it back), and single-DISPLAY is this sweep's assumed common case. To
+    keep a suspected cross-display false reap diagnosable rather than
+    silent, any sweep that marks at least one record logs the ``DISPLAY``
+    value it probed under.
+
     Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
     a matching record EXITED (exit_code=``ORPHAN_EXIT_CODE``), preserving
     every other field, and leaves its directory in place;
@@ -1513,6 +1536,17 @@ def mark_windowless_wm_sessions_exited(
             continue  # lost the race: a concurrent writer already made this terminal
         marked.append(marked_record)
 
+    if marked:
+        # Diagnostic breadcrumb for the multi-DISPLAY trade-off documented
+        # above: ties every mark to the DISPLAY the probe actually ran
+        # under, so a suspected cross-display false reap is diagnosable
+        # after the fact instead of silent. Only logged when this sweep
+        # actually marked something, to stay quiet on the common no-op call.
+        logger.info(
+            'mark_windowless_wm_sessions_exited: marked %d session(s) EXITED (probed under DISPLAY=%r)',
+            len(marked),
+            os.environ.get('DISPLAY'),
+        )
     return marked
 
 
