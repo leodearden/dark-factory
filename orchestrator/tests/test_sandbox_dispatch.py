@@ -19,7 +19,8 @@ ValueError rather than silent global poisoning).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -32,6 +33,21 @@ def _restore_backend():
     saved = sandbox_dispatch.get_backend()
     yield
     sandbox_dispatch.set_backend(saved)
+
+
+@pytest.fixture(autouse=True)
+def _reset_dedup():
+    """Reset the process-global escalation-dedup state around every test (task 2908).
+
+    ``resolve_backend_or_refuse()`` keeps a module-global
+    ``_escalated_backend_state`` so the fail-closed escalation fires exactly
+    once across N refused invocations (INV-4). Clear it before and after each
+    test so the dedup decision never leaks between tests. Uses ``setattr`` so
+    the fixture is inert on the RED steps before the global exists.
+    """
+    setattr(sandbox_dispatch, '_escalated_backend_state', None)
+    yield
+    setattr(sandbox_dispatch, '_escalated_backend_state', None)
 
 
 class TestSetBackendAcceptsValidValues:
@@ -106,3 +122,64 @@ class TestResolveActiveBackendCorruptionGuard:
                 cwd=Path(tmp_path),
                 writable_modules=['mod_a'],
             )
+
+
+class TestResolveBackendOrRefuse:
+    """resolve_backend_or_refuse(): fail-CLOSED single-call resolution (task 2908).
+
+    Mirrors recon's RemediationSandboxUnavailable (task 1935): when sandboxing
+    is required (config.sandbox.enabled + role.sandboxed) but no OS backend
+    resolves, REFUSE rather than silently running unconfined. The one exception
+    is the explicit operator escape hatch: backend='none' runs UNSANDBOXED with
+    a WARNING and never refuses (same effect as enabled:false, PRD D4).
+
+    The landlock/bwrap availability probes are imported at call-time inside
+    resolve_active_backend(), so patching the SOURCE module attribute
+    (orchestrator.agents.landlock.is_landlock_available) drives resolution.
+    """
+
+    def test_landlock_available_returns_landlock(self):
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            assert sandbox_dispatch.resolve_backend_or_refuse() == 'landlock'
+
+    def test_landlock_unavailable_refuses(self):
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ):
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo:
+                sandbox_dispatch.resolve_backend_or_refuse()
+        assert excinfo.value.should_escalate is True
+        assert excinfo.value.backend_state == 'landlock'
+
+    def test_backend_none_returns_none_with_warning(self, caplog):
+        """backend='none' is the operator escape hatch: run unsandboxed, WARN, never refuse."""
+        sandbox_dispatch.set_backend('none')
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.agents.sandbox_dispatch',
+        ):
+            result = sandbox_dispatch.resolve_backend_or_refuse()
+        assert result == 'none'
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert 'unsandboxed' in caplog.text.lower()
+
+    def test_auto_no_backend_available_refuses(self):
+        sandbox_dispatch.set_backend('auto')
+        with (
+            patch(
+                'orchestrator.agents.landlock.is_landlock_available',
+                return_value=False,
+            ),
+            patch(
+                'orchestrator.agents.sandbox.is_bwrap_available',
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo:
+                sandbox_dispatch.resolve_backend_or_refuse()
+        assert excinfo.value.backend_state == 'auto'
