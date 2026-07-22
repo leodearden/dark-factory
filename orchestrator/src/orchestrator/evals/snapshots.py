@@ -20,6 +20,34 @@ logger = logging.getLogger(__name__)
 EVAL_VERIFY_EXTRA_DEPS: tuple[str, ...] = ('aiosqlite',)
 
 
+def eval_worktree_root(project_root: Path | str) -> Path:
+    """Return the base dir for eval worktrees — a SIBLING of ``project_root``.
+
+    Eval worktrees must live OUTSIDE ``project_root`` so a pytest/pyright/ruff/
+    cargo run inside one does not walk its filesystem ancestors up into the live
+    main repo and collect that repo's ancestor config. Concretely: the main
+    repo's root ``conftest.py`` ``sys.path``-injects and ``__import__``s the
+    CURRENT-main ``<subproject>/src`` packages, pre-caching today's code in
+    ``sys.modules``; the fixture's verify then resolves every ``import
+    orchestrator.*`` to that cached current-main module, SHADOWING the pinned
+    ``pre_task_commit`` code (Defect B, task 2881). A nested worktree's rootdir/
+    confcutdir escape upward to that repo root whenever the fixture's old tree
+    lacks its own pytest anchor; a sibling worktree has no dark-factory ancestor
+    config above it at all, so a plain ``pytest`` (no flags) collects only the
+    fixture's own pinned conftests.
+
+    Mirrors ``GitOps.quarantine_base``'s sibling-outside-base construction
+    (``<name>.parent / f'{<name>.name}-…'``). The dir name intentionally retains
+    the literal ``eval-worktree`` substring so fused-memory's reconciliation
+    project-scope anchor (``config/schema.py`` — matches ``eval-worktree``) keeps
+    classifying these relocated paths. Project-name-qualified to avoid collisions
+    when multiple projects share a parent directory. Pure function, no side
+    effects.
+    """
+    project_root = Path(project_root)
+    return project_root.parent / f'{project_root.name}-eval-worktrees'
+
+
 def read_python_pin(root: Path) -> str | None:
     """Return the interpreter pin from ``<root>/.python-version``.
 
@@ -186,7 +214,11 @@ async def create_eval_worktree(
     """
     project_root = Path(project_root)
     run_id = uuid4().hex[:8]
-    worktree_path = project_root / '.eval-worktrees' / task_id / f'run-{run_id}'
+    # Placed OUTSIDE project_root (a sibling of the repo) via eval_worktree_root
+    # so a nested pytest/pyright/ruff/cargo run inside the worktree cannot walk
+    # up and collect the live main repo's ancestor config, which would shadow
+    # the fixture's pinned pre_task_commit code (Defect B, task 2881).
+    worktree_path = eval_worktree_root(project_root) / task_id / f'run-{run_id}'
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     await _run(

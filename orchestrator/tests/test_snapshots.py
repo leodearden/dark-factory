@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,37 @@ def tmp_repo(tmp_path: Path) -> tuple[Path, str, str]:
     second = _git(['rev-parse', 'HEAD'], cwd=repo)
 
     return repo, first, second
+
+
+class TestEvalWorktreeRoot:
+    """snapshots.eval_worktree_root must place eval worktrees OUTSIDE the repo.
+
+    Eval worktrees nested UNDER project_root let a pytest/pyright/ruff/cargo run
+    inside them walk up and collect the live main repo's ancestor config (root
+    conftest.py sys.path-injects + pre-imports CURRENT-main <subproject>/src,
+    shadowing the fixture's pinned pre_task_commit code — Defect B, task 2881).
+    Relocating to a sibling of the repo removes that ancestor chain entirely.
+    """
+
+    def test_returns_project_name_qualified_sibling(self) -> None:
+        assert snapshots.eval_worktree_root(Path('/a/b/repo')) == Path(
+            '/a/b/repo-eval-worktrees'
+        )
+
+    def test_result_is_outside_the_repo(self) -> None:
+        p = Path('/a/b/repo')
+        assert not snapshots.eval_worktree_root(p).is_relative_to(p)
+
+    def test_eval_worktree_substring_preserved(self) -> None:
+        # Guards fused-memory's reconciliation project-scope anchor
+        # (config/schema.py:457), which substring-matches 'eval-worktree'.
+        p = Path('/a/b/repo')
+        assert 'eval-worktree' in snapshots.eval_worktree_root(p).name
+
+    def test_accepts_str_or_path(self) -> None:
+        from_str = snapshots.eval_worktree_root('/a/b/repo')
+        from_path = snapshots.eval_worktree_root(Path('/a/b/repo'))
+        assert from_str == from_path == Path('/a/b/repo-eval-worktrees')
 
 
 class TestCreateEvalWorktreeHeadAssertion:
@@ -97,7 +130,9 @@ class TestCreateEvalWorktreeHeadAssertion:
             asyncio.run(create_eval_worktree(repo, 'test_task', first))
 
         # Cleanup any worktree git left behind before the assertion fired.
-        for child in (repo / '.eval-worktrees' / 'test_task').glob('run-*'):
+        for child in (
+            snapshots.eval_worktree_root(repo) / 'test_task'
+        ).glob('run-*'):
             subprocess.run(
                 ['git', 'worktree', 'remove', '--force', str(child)],
                 cwd=str(repo),
@@ -127,6 +162,169 @@ class TestCreateEvalWorktreeHeadAssertion:
         try:
             assert (worktree_path / 'SETUP_RAN').exists(), (
                 'setup_commands should have run after the HEAD assertion passed'
+            )
+        finally:
+            subprocess.run(
+                ['git', 'worktree', 'remove', '--force', str(worktree_path)],
+                cwd=str(repo),
+                capture_output=True,
+            )
+
+
+class TestEvalWorktreeHermeticity:
+    """create_eval_worktree must place worktrees OUTSIDE the repo (Defect B).
+
+    A nested worktree lets a plain pytest inside it walk up to the live main
+    repo's ancestor ``conftest.py``, which ``sys.path``-injects + pre-imports
+    CURRENT-main packages into ``sys.modules`` and shadows the fixture's pinned
+    ``pre_task_commit`` code. Relocating the worktree to a sibling of the repo
+    removes that ancestor chain entirely (task 2881).
+    """
+
+    def test_worktree_created_outside_repo(
+        self, tmp_repo: tuple[Path, str, str]
+    ) -> None:
+        """The created worktree is a sibling of the repo, not nested under it."""
+        repo, first, _second = tmp_repo
+
+        worktree_path, _ = asyncio.run(
+            create_eval_worktree(repo, 'test_task', first)
+        )
+        try:
+            assert not worktree_path.is_relative_to(repo), (
+                f'worktree {worktree_path} must NOT be nested under {repo}'
+            )
+            assert worktree_path.is_relative_to(
+                snapshots.eval_worktree_root(repo)
+            ), f'worktree must live under {snapshots.eval_worktree_root(repo)}'
+        finally:
+            subprocess.run(
+                ['git', 'worktree', 'remove', '--force', str(worktree_path)],
+                cwd=str(repo),
+                capture_output=True,
+            )
+
+    def test_pinned_code_not_shadowed_by_ancestor_conftest(
+        self, tmp_path: Path
+    ) -> None:
+        """A plain subprocess pytest inside the worktree imports the PINNED code.
+
+        Reproduces the RCA (Defect B) with a minimal two-commit repo:
+
+        * commit A — 'fixture era': a root ``conftest.py`` that ``sys.path``-
+          inserts ``pkg/src`` and pre-imports ``mymod`` (VALUE='fixture_era');
+          ``pkg/tests/test_mymod.py`` asserts the fixture-era value; NO in-tree
+          pytest anchor (so a NESTED worktree's rootdir escapes upward).
+        * commit B / HEAD — 'current main': adds a root ``pytest.ini`` anchoring
+          rootdir=repo and flips ``mymod`` to VALUE='current_main'. This is the
+          live-repo ancestor tree that only shadows a nested worktree.
+
+        A subprocess pytest (fresh ``sys.modules`` — essential, the shadow is a
+        pre-import cache effect) inside the RELOCATED (sibling) worktree imports
+        the pinned fixture-era value and passes with no flags. Pre-relocation
+        (nested) the live-repo ancestor conftest pre-imports current_main and
+        the suite fails.
+        """
+        repo = tmp_path / 'repo'
+        (repo / 'pkg' / 'src').mkdir(parents=True)
+        (repo / 'pkg' / 'tests').mkdir(parents=True)
+
+        _git(['init', '-q', '-b', 'main'], cwd=repo)
+        _git(['config', 'user.email', 'test@example.com'], cwd=repo)
+        _git(['config', 'user.name', 'Test User'], cwd=repo)
+        _git(['config', 'commit.gpgsign', 'false'], cwd=repo)
+
+        # commit A — fixture era (checked out into the worktree)
+        (repo / 'conftest.py').write_text(
+            'import sys\n'
+            'from pathlib import Path\n'
+            "sys.path.insert(0, str(Path(__file__).parent / 'pkg' / 'src'))\n"
+            'import mymod  # noqa: E402,F401\n'
+        )
+        (repo / 'pkg' / 'src' / 'mymod.py').write_text("VALUE = 'fixture_era'\n")
+        (repo / 'pkg' / 'tests' / 'test_mymod.py').write_text(
+            'import mymod\n'
+            'def test_value():\n'
+            "    assert mymod.VALUE == 'fixture_era'\n"
+        )
+        _git(['add', '-A'], cwd=repo)
+        _git(['commit', '-q', '-m', 'A: fixture era'], cwd=repo)
+        commit_a = _git(['rev-parse', 'HEAD'], cwd=repo)
+
+        # commit B / HEAD — current main (the live-repo ancestor tree)
+        (repo / 'pytest.ini').write_text('[pytest]\n')
+        (repo / 'pkg' / 'src' / 'mymod.py').write_text("VALUE = 'current_main'\n")
+        _git(['add', '-A'], cwd=repo)
+        _git(['commit', '-q', '-m', 'B: current main'], cwd=repo)
+
+        worktree_path, _ = asyncio.run(
+            create_eval_worktree(repo, 'shadow_task', commit_a)
+        )
+        try:
+            # Scrub PYTEST_ADDOPTS/PYTEST_CURRENT_TEST so the outer pytest run's
+            # options/state do not leak into the child invocation.
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ('PYTEST_ADDOPTS', 'PYTEST_CURRENT_TEST')
+            }
+            proc = subprocess.run(
+                [
+                    sys.executable, '-m', 'pytest',
+                    'pkg/tests/test_mymod.py',
+                    '-p', 'no:cacheprovider', '-q',
+                ],
+                cwd=str(worktree_path),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert proc.returncode == 0, (
+                'pinned fixture-era code was shadowed by the live-repo '
+                f'ancestor conftest (rc={proc.returncode}):\n'
+                f'{proc.stdout}\n{proc.stderr}'
+            )
+        finally:
+            subprocess.run(
+                ['git', 'worktree', 'remove', '--force', str(worktree_path)],
+                cwd=str(repo),
+                capture_output=True,
+            )
+
+
+class TestRunCleanupRelocated:
+    """cli._run_cleanup must discover eval worktrees at the RELOCATED root."""
+
+    def test_cleanup_removes_relocated_worktree(
+        self, tmp_repo: tuple[Path, str, str]
+    ) -> None:
+        """A worktree at eval_worktree_root(repo) is discovered and removed.
+
+        Pre-fix _run_cleanup scans ``project_root / '.eval-worktrees'`` — now
+        empty/absent since worktrees are external — so it echoes "No eval
+        worktrees found" and leaves the external worktree in place. Post-fix it
+        scans eval_worktree_root(project_root) and removes it.
+        """
+        from types import SimpleNamespace
+
+        from orchestrator.cli import _run_cleanup
+
+        repo, first, _second = tmp_repo
+
+        worktree_path, _ = asyncio.run(
+            create_eval_worktree(repo, 'test_task', first)
+        )
+        try:
+            assert worktree_path.exists()
+            # Sanity: the worktree really is at the relocated (external) root.
+            assert worktree_path.is_relative_to(
+                snapshots.eval_worktree_root(repo)
+            )
+
+            _run_cleanup(SimpleNamespace(project_root=repo))
+
+            assert not worktree_path.exists(), (
+                'cli._run_cleanup did not remove the relocated eval worktree'
             )
         finally:
             subprocess.run(
