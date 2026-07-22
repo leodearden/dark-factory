@@ -6854,3 +6854,136 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             f'Surviving flags must preserve original relative order; got {result!r}'
         )
 
+
+
+# ---------------------------------------------------------------------------
+# Entity-standing-decision (Hook A / γ, task 2896) — pure match helpers
+# ---------------------------------------------------------------------------
+#
+# _extract_uuids / _flag_text_blob / _flag_type_in_grounds_family are the three
+# pure, sync building blocks the FALLBACK (stamps-omitted) match path composes.
+# RED until step-2 defines the regex + helpers.
+
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+)
+
+# Deterministic sample UUIDs (canonical 8-4-4-4-12 hex form).
+_ESD_U1 = 'b0057f3d-1234-4abc-8def-0123456789ab'
+_ESD_U1_UPPER = 'B0057F3D-1234-4ABC-8DEF-0123456789AB'
+_ESD_U2 = 'a1b2c3d4-5678-4901-8234-567890abcdef'
+_ESD_U3 = 'ffeeddcc-0011-4223-8445-66778899aabb'
+
+
+class TestEntityStandingMatchHelpers:
+    """Pure/sync building blocks for the γ fallback match (task 2896 step-1)."""
+
+    # ---- _extract_uuids ---------------------------------------------------
+
+    def test_extract_uuids_empty_when_no_uuid(self):
+        assert flag_dedup._extract_uuids('no uuids here at all, just 12345') == set()
+
+    def test_extract_uuids_empty_string(self):
+        assert flag_dedup._extract_uuids('') == set()
+
+    def test_extract_uuids_single_mixed_case_normalized_lower(self):
+        """A single mixed-case UUID is extracted and lowercased."""
+        result = flag_dedup._extract_uuids(
+            f'the entity {_ESD_U1_UPPER} is fine'
+        )
+        assert result == {_ESD_U1}
+
+    def test_extract_uuids_two_distinct(self):
+        """Two distinct UUIDs → a set of size 2 containing both (lowercased)."""
+        result = flag_dedup._extract_uuids(f'{_ESD_U1} and also {_ESD_U2}')
+        assert result == {_ESD_U1, _ESD_U2}
+        assert len(result) == 2
+
+    def test_extract_uuids_repeated_same_deduped_to_one(self):
+        """The same UUID repeated collapses to a single set element."""
+        result = flag_dedup._extract_uuids(f'{_ESD_U1} cites {_ESD_U1} again')
+        assert result == {_ESD_U1}
+        assert len(result) == 1
+
+    def test_extract_uuids_repeated_mixed_case_is_one_distinct(self):
+        """Upper- and lower-case spellings of the same UUID are one distinct value."""
+        result = flag_dedup._extract_uuids(f'{_ESD_U1_UPPER} vs {_ESD_U1}')
+        assert result == {_ESD_U1}
+        assert len(result) == 1
+
+    # ---- _flag_text_blob --------------------------------------------------
+
+    def test_flag_text_blob_collects_nested_str_values(self):
+        """A UUID in a top-level field, a nested dict, and a nested list-of-dicts
+        is all findable in the blob; non-str values are ignored."""
+        flag = {
+            'flag_type': 'topic_conflation',
+            'description': f'entity {_ESD_U1} is too big',
+            'evidence': {'note': f'see {_ESD_U2}'},
+            'items': [{'ref': f'cited {_ESD_U3}'}, 'plain text'],
+            'edge_count': 777,          # non-str value → ignored
+            'nothing': None,            # non-str value → ignored
+        }
+        blob = flag_dedup._flag_text_blob(flag)
+        assert _ESD_U1 in blob
+        assert _ESD_U2 in blob
+        assert _ESD_U3 in blob
+        # Non-str values are not stringified into the blob.
+        assert '777' not in blob
+
+    def test_flag_text_blob_finds_all_three_via_extract_uuids(self):
+        """End-to-end: the blob feeds _extract_uuids to recover every cited UUID."""
+        flag = {
+            'description': f'{_ESD_U1}',
+            'evidence': {'deep': {'deeper': f'{_ESD_U2}'}},
+            'list': [f'{_ESD_U3}'],
+        }
+        uuids = flag_dedup._extract_uuids(flag_dedup._flag_text_blob(flag))
+        assert uuids == {_ESD_U1, _ESD_U2, _ESD_U3}
+
+    def test_flag_text_blob_empty_flag_is_empty_or_blank(self):
+        """A flag with no str values yields a blob with no UUIDs."""
+        assert flag_dedup._extract_uuids(
+            flag_dedup._flag_text_blob({'a': 1, 'b': None, 'c': [2, 3]})
+        ) == set()
+
+    # ---- _flag_type_in_grounds_family ------------------------------------
+
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['entity_too_large', 'topic_conflation', 'oversized_entity', 'high_edge_count'],
+    )
+    def test_flag_type_in_family_true_for_size_conflation_types(self, flag_type):
+        """Representative structural_size_conflation flag_types match the family."""
+        assert flag_dedup._flag_type_in_grounds_family(
+            flag_type, GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        ) is True
+
+    @pytest.mark.parametrize('flag_type', ['stale_metadata', 'missing_deliverable'])
+    def test_flag_type_in_family_false_for_unrelated_types(self, flag_type):
+        """Unrelated flag_types are NOT in the size-conflation family."""
+        assert flag_dedup._flag_type_in_grounds_family(
+            flag_type, GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        ) is False
+
+    def test_flag_type_in_family_false_for_none_flag_type(self):
+        assert flag_dedup._flag_type_in_grounds_family(
+            None, GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        ) is False
+
+    def test_flag_type_in_family_false_for_empty_flag_type(self):
+        assert flag_dedup._flag_type_in_grounds_family(
+            '', GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        ) is False
+
+    def test_flag_type_in_family_false_for_unknown_grounds(self):
+        """An unknown grounds value has no bound family → always False."""
+        assert flag_dedup._flag_type_in_grounds_family(
+            'oversized_entity', 'no_such_grounds'
+        ) is False
+
+    def test_flag_type_in_family_case_insensitive(self):
+        """Matching is casefolded on both sides."""
+        assert flag_dedup._flag_type_in_grounds_family(
+            'Oversized_Entity', GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        ) is True
