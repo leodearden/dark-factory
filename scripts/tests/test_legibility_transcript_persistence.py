@@ -265,6 +265,59 @@ def _set_mtime(path: Path, dt: datetime) -> None:
     os.utime(path, (ts, ts))
 
 
+# ---------------------------------------------------------------------------
+# step-7/8: find_missing_transcripts end-to-end
+# ---------------------------------------------------------------------------
+
+def test_find_missing_transcripts_end_to_end(tmp_path):
+    projects = tmp_path / "projects"
+    project_prefix = "/home/leo/src/dark-factory"
+    cwd_prefixes = [project_prefix]
+
+    member_present = "/home/leo/src/dark-factory/.worktrees/2700"
+    member_missing = "/home/leo/src/dark-factory/.worktrees/2701"
+    foreign_cwd = "/home/leo/src/some-other-project"
+    missing_prompt = (
+        "Diagnose the stuck reconciliation on task 2701 and summarise the root cause."
+    )
+
+    # (a) completed in-window spawn WITH a matching transcript -> no finding.
+    present = _spawn_record("sess-present", member_present, _USABLE_PROMPT)
+    _write_transcript(projects, member_present, "sess-present.jsonl", _USABLE_PROMPT)
+
+    # (b) completed in-window spawn with NO matching transcript -> one finding.
+    missing = _spawn_record("sess-missing", member_missing, missing_prompt)
+
+    # (c) in-flight (non-terminal) spawn with no transcript -> tolerated.
+    inflight = session_registry.SessionRecord(
+        session_slug="sess-inflight",
+        status=session_registry.Status.RUNNING,
+        prompt="An in-flight interactive session still running.",
+        cwd=member_present,
+        start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
+    )
+
+    # (d) completed spawn whose cwd is a FOREIGN project -> excluded.
+    foreign = _spawn_record(
+        "sess-foreign", foreign_cwd,
+        "A completed spawn in a different project entirely, definitely not a member.",
+    )
+
+    findings = mod.find_missing_transcripts(
+        [present, missing, inflight, foreign], projects, cwd_prefixes,
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert len(findings) == 1
+    found = findings[0]
+    assert found.session_slug == "sess-missing"
+    assert found.cwd == member_missing
+    assert found.start_ts == missing.start_ts
+    assert found.exit_code == 0
+    assert "Diagnose the stuck reconciliation" in found.prompt_prefix
+    assert found.expected_dir == projects / mod.inventory.encode_cwd(member_missing)
+
+
 def test_find_matching_transcript_missing_dir_returns_none(tmp_path):
     projects = tmp_path / "projects"
     projects.mkdir()
