@@ -25,7 +25,7 @@ from _orch_helpers import pydantic_spec
 from pydantic import ValidationError
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane import OfflineLaneWorker, _parse_confirmed_failures
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -74,6 +74,28 @@ def _make_worker(
         task_client=task_client,
         escalation_queue=escalation_queue,
     )
+
+
+# A faithful reproduction of reify scripts/verify.sh's error+usage() dump
+# (reify:5308 incident, verified against task 5264's corrupted fields): an
+# em-dash ``verify.sh: ERROR — <msg>`` banner on stderr followed by the full
+# usage() block (bare ``Usage:``/``Options:`` section headers + invocation and
+# option lines).  run-offline-deep.sh merges stderr into stdout, so this whole
+# blob reaches the numeric confirmation seam's parser.  Shared by the
+# _parse_confirmed_failures unit tests and the seam-level rejection test.
+_VERIFY_USAGE_DUMP = (
+    "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
+    "\n"
+    "scripts/verify.sh — unified verification entrypoint for Reify.\n"
+    "\n"
+    "Usage:\n"
+    "  verify.sh <test|lint|typecheck|all> [options]\n"
+    "\n"
+    "Options:\n"
+    "  --scope <all|rust|gui|infra>  Restrict verification to a subsystem.\n"
+    "  --profile <fast|full|both>    Select the verification profile.\n"
+    "  -h|--help  Show usage.\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1058,47 @@ async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
     assert confirmed == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_confirmed_failures helper — numeric-seam usage/help guard (task 5308)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_confirmed_failures_passes_normal_ids_through():
+    """Normal newline-separated test IDs parse through unchanged (prior behaviour)."""
+    assert _parse_confirmed_failures('tests::test_a\ntests::test_b\n') == [
+        'tests::test_a',
+        'tests::test_b',
+    ]
+
+
+def test_parse_confirmed_failures_rejects_verify_usage_dump():
+    """A faithful verify.sh ERROR+usage() dump is not a set of failing tests -> []."""
+    assert _parse_confirmed_failures(_VERIFY_USAGE_DUMP) == []
+
+
+def test_parse_confirmed_failures_rejects_bare_error_line():
+    """A lone ``verify.sh: ERROR — …`` banner (no usage block) -> []."""
+    assert _parse_confirmed_failures(
+        "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
+    ) == []
+
+
+def test_parse_confirmed_failures_rejects_embedded_usage_header():
+    """A bare ``Usage:``/``Options:`` header among otherwise-plausible lines -> []."""
+    assert _parse_confirmed_failures(
+        'tests::test_a\nOptions:\ntests::test_b\n'
+    ) == []
+    assert _parse_confirmed_failures(
+        'tests::test_a\nUsage:\ntests::test_b\n'
+    ) == []
+
+
+def test_parse_confirmed_failures_empty_on_blank_input():
+    """Blank/whitespace-only input confirms nothing -> []."""
+    assert _parse_confirmed_failures('') == []
+    assert _parse_confirmed_failures('\n  \n') == []
 
 
 # ---------------------------------------------------------------------------
