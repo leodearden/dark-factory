@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import pytest
+from fastmcp import FastMCP
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
@@ -925,3 +927,49 @@ class TestUpdatePlanMetadataToolRecoversMisserializedFiles:
 
         plan = artifacts.read_plan()
         assert plan['files'] == ['x.py', 'y.py']
+
+
+# ---------------------------------------------------------------------------
+# main() suppresses the FastMCP startup banner + PyPI update-check (task 2942).
+#
+# main() runs the stdio server via server.run(transport='stdio').  FastMCP
+# 3.x's banner rendering fires a synchronous PyPI update-check
+# (check_for_newer_version -> httpx.get) on the startup path BEFORE serving;
+# passing show_banner=False removes that network call regardless of
+# environment (log_server_banner is the ONLY caller of check_for_newer_version
+# and is gated on show_banner). This pins that main() passes show_banner=False.
+# ---------------------------------------------------------------------------
+
+
+class TestMainSuppressesBanner:
+    """plan_tools.main() calls server.run(transport='stdio', show_banner=False)."""
+
+    def test_main_runs_stdio_with_banner_disabled(self, tmp_path, monkeypatch):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        mr = tmp_path / 'base' / '.task-meta' / 'wt'
+        mr.mkdir(parents=True)
+
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['plan_tools', '--worktree', str(wt), '--meta-root', str(mr)],
+        )
+
+        captured: dict[str, object] = {}
+
+        def recorder(self, *args, **kwargs):
+            captured['args'] = args
+            captured['kwargs'] = kwargs
+            return None
+
+        # Class-level patch: create_server builds a real FastMCP instance, so
+        # patching the class method intercepts its .run() without serving.
+        monkeypatch.setattr(FastMCP, 'run', recorder)
+
+        plan_tools.main()
+
+        kwargs = captured.get('kwargs', {})
+        args = captured.get('args', ())
+        transport = kwargs.get('transport', args[0] if args else None)
+        assert transport == 'stdio'
+        assert kwargs.get('show_banner') is False
