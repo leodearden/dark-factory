@@ -414,18 +414,20 @@ class TestReachBackRouting:
             f'emitted event types: {event_store.emitted!r}'
         )
 
-    async def test_run_drift_check_reachback_for_task_file_derivation(
+    async def test_run_drift_check_full_gate_when_task_files_none(
         self, tmp_path: Path,
     ) -> None:
-        """_run_drift_check must resolve _derive_task_files_from_git via
-        orchestrator.merge_queue (not a merge_drift-local binding) when
-        task_files is None and Lever C verify runners are enabled.
+        """Fix 1b (task 2886): with req.task_files=None + enabled Lever-C
+        runners — the branch that USED to derive dispatching-host task_files —
+        _run_drift_check must now build a FULL-GATE spec (task_files=None) and
+        NOT invoke _derive_task_files_from_git.
 
-        This exercises the derivation branch that test_run_drift_check_reachback_to_verify_pool_deps
-        above does not: that test always supplies an explicit task_files list.
-        Mirrors test_dispatching_host_derives_task_files_when_enabled_runners in
-        test_merge_queue_multihost_wiring.py, which covers the identical gate for
-        _run_post_merge_verify's own dispatching-host derivation path.
+        Complements TestDriftCheckFullGateSpec's explicit-task_files case by
+        covering the previously-deriving branch.  Still exercises reach-back
+        routing (the build_merge_verify_spec spy only captures calls when
+        _run_drift_check resolves it via orchestrator.merge_queue).  Before
+        fix 1b this asserted the derived files flowed into the spec; that
+        derivation path is gone.
         """
         import orchestrator.verify_runner as _vr
         from orchestrator.event_store import EventStore
@@ -477,6 +479,7 @@ class TestReachBackRouting:
             spec_calls.append(task_files)
             return orig_build_spec(config, module_configs, task_files, **kw)
 
+        derive_spy = AsyncMock(return_value=['derived/from/mq.py'])
         with (
             patch(
                 'orchestrator.merge_queue.build_merge_verify_spec',
@@ -484,7 +487,7 @@ class TestReachBackRouting:
             ),
             patch(
                 'orchestrator.merge_queue._derive_task_files_from_git',
-                AsyncMock(return_value=['derived/from/mq.py']),
+                derive_spy,
             ),
             patch(
                 'orchestrator.merge_queue.run_scoped_verification',
@@ -497,10 +500,11 @@ class TestReachBackRouting:
             )
 
         assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
-        assert spec_calls[0] == ('derived/from/mq.py',), (
-            f'expected the orchestrator.merge_queue-patched _derive_task_files_from_git '
-            f'to flow into the built spec, got task_files={spec_calls[0]!r}'
+        assert spec_calls[0] is None, (
+            f'drift spec must be FULL-GATE (task_files=None) even when '
+            f'req.task_files is None; got task_files={spec_calls[0]!r}'
         )
+        derive_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -12,8 +12,8 @@ sibling stays permanently (``_run_unscoped_typechecks``, the module-level
 ``_build_remote_runners`` legacy-pool builder) or is monkeypatched by the
 existing test suite via the string path ``orchestrator.merge_queue.<name>``
 (``run_scoped_verification``, ``build_merge_verify_spec``, ``LocalRunner``,
-``VerifyRunnerPool``, ``_derive_task_files_from_git``, ``_run_drift_check``)
-— resolves it through a function-local (deferred) import from
+``VerifyRunnerPool``, ``_run_drift_check``) — resolves it through a
+function-local (deferred) import from
 :mod:`orchestrator.merge_queue` rather than a direct intra-module reference.
 This mirrors the ``_main_health_fingerprint`` convention in
 ``merge_queue.py`` and keeps this module free of any top-level import of
@@ -46,9 +46,9 @@ from orchestrator.merge_types import MergeRequest
 # resident binding (see its body).  Imported here only so TestReachBackRouting
 # has a "naive" orchestrator.merge_drift.run_scoped_verification patch target
 # to assert is NOT what governs.  _derive_task_files_from_git is deliberately
-# NOT imported here: unlike run_scoped_verification, nothing needs to prove a
-# merge_drift-local patch is inert for it, and _run_drift_check reaches back
-# to orchestrator.merge_queue for it exclusively (see its body).
+# NOT imported here and (as of task 2886 fix 1b) is no longer referenced by
+# _run_drift_check at all: the drift spec is now full-gate (task_files=None),
+# so the drift path performs no dispatching-host scope derivation.
 from orchestrator.verify import run_scoped_verification  # noqa: F401
 
 # LocalRunner / VerifyRunnerPool / build_merge_verify_spec: same reasoning —
@@ -187,14 +187,12 @@ async def _run_drift_check(
     # LocalRunner / run_scoped_verification also have a module-level "naive"
     # import above (kept solely as a TestReachBackRouting patch target); a
     # `from ... import` reach-back would shadow-and-thus-dead-code that
-    # naive import, which ruff flags (F811).  _derive_task_files_from_git has
-    # no merge_drift-local "naive" import at all (there is nothing to prove
-    # inert) but is reached back to for the same reason as the others:
-    # merge_queue.py imports it at module level from orchestrator.verify and
-    # the test suite patches it on that namespace.  _run_unscoped_typechecks
-    # and _build_remote_runners have no merge_drift-local copy at all (both
-    # stay permanently in merge_queue.py) but are accessed the same way for
-    # consistency.
+    # naive import, which ruff flags (F811).  _run_unscoped_typechecks and
+    # _build_remote_runners have no merge_drift-local copy at all (both stay
+    # permanently in merge_queue.py) but are accessed the same way for
+    # consistency.  (Task 2886 fix 1b dropped the _derive_task_files_from_git
+    # reach-back: the drift spec is now full-gate, task_files=None, so no
+    # dispatching-host scope derivation happens on this path.)
     import orchestrator.merge_queue as _mq
 
     # wt is initialised before the try so the finally guard (`if wt is not None`)
@@ -206,13 +204,19 @@ async def _run_drift_check(
     remote_lease = None
     try:
         wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
-        task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
-        # Derive task_files on the dispatching host (fresh main) when not supplied
-        # and Lever C is on — mirrors the same gate in _run_post_merge_verify.
-        if task_files_tuple is None and req.config.enabled_verify_runners:
-            derived = await _mq._derive_task_files_from_git(wt, req.config)
-            if derived:
-                task_files_tuple = tuple(derived)
+        # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
+        # re-dispatches this spec to BOTH the local trust-anchor and the
+        # eligible remote and alarms on divergence.  Re-dispatching the SAME
+        # scoped/no-source spec that produced a trivial pass would trivially
+        # pass on both hosts and structurally cannot catch the trivial-pass
+        # divergence class.  Forcing task_files=None runs the complete
+        # workspace gate (verify.py task_files=None path) on both hosts so a
+        # genuine divergence is observable.  This deliberately does NOT
+        # derive/scope task_files (unlike _run_post_merge_verify's serial-lane
+        # dispatching-host derivation) — the derivation gate is intentionally
+        # dropped here.  task_files_tuple stays None so BOTH the spec and the
+        # LocalRunner below run the whole suite.
+        task_files_tuple = None
         spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
         if allocator is not None:
