@@ -169,7 +169,7 @@ State:
 - Number of tasks filed.
 - Number of intra-batch and out-of-batch dependencies wired.
 - The committed **capability-manifest** path, and any bindings that had to be resolved (re-scoped / re-homed / bound relaxed) to clear the gate.
-- The **YAML sidecar** path, whether `commit_planning` stamped it (or it was hand-stamped per the Step 5.5 interim note), and which producer tasks now carry `metadata.delivered_checks`.
+- The **YAML sidecar** path, confirmation that `commit_planning` stamped it automatically, and which producer tasks now carry `metadata.delivered_checks`.
 - Any tasks that came back `combined` (and into what).
 - A note that the orchestrator does **not** currently read `user_observable_signal` / `consumer_ref` / the substrate-confirmed flag — this metadata is substrate for a future tracking-infra session.
 
