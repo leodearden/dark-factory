@@ -57,6 +57,7 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
+from orchestrator.agents.write_set import compute_write_set
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
@@ -9895,11 +9896,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             timeout_val = timeouts_cfg.reviewer
             backend_val = backends_cfg.reviewer
 
-        # Determine sandbox modules based on role (role.sandboxed is a
+        # Determine the sandbox write-set based on role (role.sandboxed is a
         # property of the role object — see roles.py's AgentRole/W9-η).
+        # Whole-worktree granularity (PRD os-sandbox D1): sandbox_modules=[] is
+        # the empty-list sandbox-on gate (no per-module writable dirs), and the
+        # full contract write set (worktree root + carve-outs) rides on
+        # sandbox_extras via compute_write_set — the INV-5 single source. Both
+        # channels are set together so a broken half-state (extras without the
+        # gate) never arises. compute_write_set is allowed to raise on a
+        # malformed worktree (fail-loud; the fail-closed backend-unavailable
+        # posture is a separate concern, not folded in here).
         sandbox_modules = None
+        sandbox_extras = None
         if self.config.sandbox.enabled and role.sandboxed:
-            sandbox_modules = self.modules
+            write_set = compute_write_set(cwd)
+            sandbox_modules = []
+            sandbox_extras = [str(p) for p in write_set.writable_paths()]
 
         # Warn once per workflow instance when an escalation-capable role is
         # dispatched without an escalation queue wired up.
@@ -10010,6 +10022,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 mcp_config=mcp_config,
                 output_schema=output_schema,
                 sandbox_modules=sandbox_modules,
+                sandbox_extras=sandbox_extras,
                 effort=effort_val,
                 backend=backend_val,
                 # Rides the same **invoke_kwargs forwarding path as backend=
