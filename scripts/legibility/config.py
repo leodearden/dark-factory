@@ -81,6 +81,33 @@ class Models(BaseModel):
     census_synthesis: str = 'fable'
 
 
+class Timeouts(BaseModel):
+    """``timeouts`` block — per-census-stage ``claude`` CLI subprocess
+    budgets (seconds).
+
+    The census runs three claude-CLI-backed stages with very different
+    shapes, but originally handed every stage ``coder._invoke_cli``'s single
+    module default of 120s (sized for one Haiku trickle-coding call). That
+    default demonstrably killed the first dark_factory census: every Sonnet
+    verify-vs-``main`` call (one per novel cluster, exploring current
+    ``main`` via targeted reads) and the final large Fable synthesis call
+    over all clusters timed out at 120s, so census-state.json never advanced.
+
+    So each stage gets its own budget: ``census_mining_secs`` (120 — mining
+    is the same shape as trickle coding, and the tiny headroom probe rides
+    the same knob), ``census_verify_secs`` (900 — one Sonnet call per
+    cluster exploring current ``main``), ``census_synthesis_secs`` (1800 —
+    one large Fable call over all verified clusters). An omitted block loads
+    with all three defaults, so a pre-existing legibility.yaml keeps working.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    census_mining_secs: int = 120
+    census_verify_secs: int = 900
+    census_synthesis_secs: int = 1800
+
+
 class LegibilityConfig(BaseModel):
     """The full ``docs/legibility/legibility.yaml`` schema (PRD §7.4).
 
@@ -106,6 +133,7 @@ class LegibilityConfig(BaseModel):
     sampling: Sampling = Field(default_factory=Sampling)
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
+    timeouts: Timeouts = Field(default_factory=Timeouts)
 
 
 def load_config(path: Path | str) -> LegibilityConfig:
