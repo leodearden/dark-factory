@@ -4246,9 +4246,17 @@ class GitOps:
 
         for lane in lanes:
             # Idempotent resident-skip: leave an already-registered lane
-            # completely untouched (no add, no reseed).
+            # completely untouched (no `git worktree add`, no `_seed_warm_lane`)
+            # and count it `already_resident`. This is the sole re-entrancy
+            # guard — it makes prewarm safe to call on every boot after the
+            # startup reconcile sweeps have already restored existing lanes,
+            # and makes a second prewarm on a fully-resident pool a pure no-op.
             if await self._is_registered_worktree(lane):
                 result.already_resident += 1
+                logger.debug(
+                    'prewarm_pool: lane %s already resident — skipping '
+                    '(no worktree add, no reseed)', lane,
+                )
                 continue
             # Create-once NEUTRAL: --detach (NOT -b task/...) so the lane
             # carries no task branch — byte-identical to a released idle lane.
