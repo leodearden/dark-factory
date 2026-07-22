@@ -1,153 +1,189 @@
-# Machine-readable twin of merge-worktree-lifecycle-integrity.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc, v1).
-# task_id values are null at authoring; commit_planning stamps them and copies
-# mechanical (grep/script) delivered_checks into producer metadata.delivered_checks.
 prd: docs/prds/merge-worktree-lifecycle-integrity.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "C1 primitive: remove_merge_worktree_guarded + route cleanup_merge_worktree through it"
-    capabilities:
-      - name: "lease-primitive-consumable-for-try-acquire"
-        binding: "capability→producer (wired) — merge_verify_lease held in production, merge_queue.py:2244-2248; MergeVerifyLeaseHeld + fail-open holder detection git_ops.py:996-1013 (verified 2026-07-22)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "pre-existing substrate, not α's deliverable; gating on it adds no information"
-      - name: "guarded-removal-primitive-exists-and-routed"
-        binding: "capability→producer — built by α; fn name contract-fixed by PRD C1 (Open Q2 covers only RemovalOutcome representation)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def remove_merge_worktree_guarded"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "lease-held-skip-observed-to-fire"
-        binding: "rejection-mechanism — built+bound by α; test observes skipped_lease_held + WARNING naming holder, with uncontended-removal positive control"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "skipped_lease_held|SKIPPED_LEASE_HELD"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "dead-holder-fail-open"
-        binding: "capability→producer (wired) — fail-open dead/stale-holder detection git_ops.py:996-1013; α's test binds dead-holder-does-not-block"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "liveness-probe quality is a test property, not mechanically greppable"
-  - label: "β"
-    task_id: null
-    title: "C2 namespace invariant: positive task-shape match in crash-recovery sweep + orphan reaper"
-    capabilities:
-      - name: "sweep-chokepoints-exist"
-        binding: "capability→producer (wired) — _recover_crashed_tasks harness.py:2576-2961 → cleanup_worktree git_ops.py:10143 (verified 2026-07-22)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "pre-existing substrate, not β's deliverable"
-      - name: "infra-namespace-survival-observed"
-        binding: "rejection-mechanism — built+bound by β; planted infra entries survive with skip/report disposition OBSERVED (not silence); positive control: task-id-shaped planless dir still cleaned"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "positive-match predicate literal is implementation-chosen; bound by β's harness test + positive control"
-      - name: "merge-entries-routed-via-alpha"
-        binding: "DAG-direction — α upstream (dep wired at decompose); _merge-* disposition calls α's primitive"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "call-site shape is implementation-chosen; routing asserted by β's test"
-  - label: "γ"
-    task_id: null
-    title: "C3 recovery dedupe: recover_pending_merges collapses per-branch via InFlightMergeRegistry"
-    capabilities:
-      - name: "coalesce-registry-reuse"
-        binding: "capability→producer (wired) — InFlightMergeRegistry (task 1604, done) consumed in production merge path merge_queue.py:143,3590; D5 forbids a second registry"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "pre-existing substrate, not γ's deliverable"
-      - name: "recovery-collapse-observed"
-        binding: "capability→producer — built by γ; journal fixture (same-SHA + descendant-SHA variants) recovers to exactly one enqueued mr, both pollers resolve; substrate recover_pending_merges harness.py:8331/:1697"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "wiring site (harness vs merge_queue helper) implementation-chosen; registry keying is Open Q3"
-  - label: "δ"
-    task_id: null
-    title: "C3 submit-path SHA semantics: coalesce / ancestry-replace / in-verify structured reject"
-    capabilities:
-      - name: "registry-gate-at-submit-exists"
-        binding: "capability→producer (wired) — merge_request registry-gated per task 1604 (done); δ adds SHA-sensitivity"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "pre-existing substrate, not δ's deliverable"
-      - name: "structured-reject-observed-to-fire"
-        binding: "rejection-mechanism — built+bound by δ; MCP-level test observes the structured rejection payload fire while SHA₁ verify is live and undisturbed; absence of the payload ⇒ FAIL"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "reject code string + field names are Open Q1 (decided in δ); no stable grep token at authoring time"
-      - name: "replace-path-scratch-cleanup-via-alpha"
-        binding: "DAG-direction — α upstream (dep wired); dropped queued entry's scratch cleaned via C1"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "call-site shape implementation-chosen; asserted by δ's replace-path test"
-      - name: "decision-atomic-with-registry-mutation"
-        binding: "INV-3 — verify-started check shares the replace/reject lock scope (PRD C3); race-freedom bound by δ's test"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "lock-scope atomicity is a test property, not mechanically greppable"
-  - label: "ε"
-    task_id: null
-    title: "C3 cancel retirement: merge_cancel returns only after full retirement, sticky result cleared"
-    capabilities:
-      - name: "merge-cancel-endpoint-exists"
-        binding: "capability→producer (wired) — merge_cancel live escalation-server MCP tool (verified in live tool registry 2026-07-22)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "pre-existing substrate, not ε's deliverable"
-      - name: "full-retirement-before-return-observed"
-        binding: "rejection-mechanism — built+bound by ε; cancel-then-immediate-resubmit test observes a FRESH entry identity + new SHA landing, never the retired sticky result"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "sticky-result clearing is registry-internal state; bound by ε's race test"
-  - label: "ζ"
-    task_id: null
-    title: "5326-replay integration gate: restart with dup journal entries + live verifies (PRD done-gate)"
-    capabilities:
-      - name: "all-legs-produced-upstream"
-        binding: "DAG-direction — α, β, γ, δ, ε all upstream deps wired at decompose; no capability owned downstream of ζ"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "dependency-closure property, checked at decompose; not a grep"
-      - name: "boundary-matrix-green-e2e"
-        binding: "capability→producer — §9 rows 1-9; one verify per branch, zero ENOENT, trees intact until verifies complete, merge finalizes; startup substrate harness.py:1697 + :2576-2961 (verified 2026-07-22)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the task IS the check suite; its signal is the green boundary matrix"
-  - label: "η"
-    task_id: null
-    title: "C4 serial-lane tripwire: concurrent-local-verify WARNING + telemetry event"
-    capabilities:
-      - name: "serial-lane-substrate-exists"
-        binding: "capability→producer (wired) — enforce_persistent_worktree_serial_lane merge_liveness.py:723; _MERGE_AHEAD_BOUND reach-back merge_liveness.py:763-765 (verified 2026-07-22)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "pre-existing substrate, not η's deliverable"
-      - name: "tripwire-event-observed"
-        binding: "capability→producer — built by η; test triggers two concurrent local dispatches at bound=1 and observes the WARNING + telemetry event fire"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "event name is Open Q4 (EventType naming decided in η); no stable grep token at authoring time"
+- label: α
+  task_id: 2924
+  title: 'C1 primitive: remove_merge_worktree_guarded + route cleanup_merge_worktree
+    through it'
+  capabilities:
+  - name: lease-primitive-consumable-for-try-acquire
+    binding: capability→producer (wired) — merge_verify_lease held in production,
+      merge_queue.py:2244-2248; MergeVerifyLeaseHeld + fail-open holder detection
+      git_ops.py:996-1013 (verified 2026-07-22)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate, not α's deliverable; gating on it adds no information
+  - name: guarded-removal-primitive-exists-and-routed
+    binding: capability→producer — built by α; fn name contract-fixed by PRD C1 (Open
+      Q2 covers only RemovalOutcome representation)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def remove_merge_worktree_guarded
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: lease-held-skip-observed-to-fire
+    binding: rejection-mechanism — built+bound by α; test observes skipped_lease_held
+      + WARNING naming holder, with uncontended-removal positive control
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: skipped_lease_held|SKIPPED_LEASE_HELD
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: dead-holder-fail-open
+    binding: capability→producer (wired) — fail-open dead/stale-holder detection git_ops.py:996-1013;
+      α's test binds dead-holder-does-not-block
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: liveness-probe quality is a test property, not mechanically greppable
+- label: β
+  task_id: 2925
+  title: 'C2 namespace invariant: positive task-shape match in crash-recovery sweep
+    + orphan reaper'
+  capabilities:
+  - name: sweep-chokepoints-exist
+    binding: capability→producer (wired) — _recover_crashed_tasks harness.py:2576-2961
+      → cleanup_worktree git_ops.py:10143 (verified 2026-07-22)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate, not β's deliverable
+  - name: infra-namespace-survival-observed
+    binding: 'rejection-mechanism — built+bound by β; planted infra entries survive
+      with skip/report disposition OBSERVED (not silence); positive control: task-id-shaped
+      planless dir still cleaned'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: positive-match predicate literal is implementation-chosen; bound by
+        β's harness test + positive control
+  - name: merge-entries-routed-via-alpha
+    binding: DAG-direction — α upstream (dep wired at decompose); _merge-* disposition
+      calls α's primitive
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: call-site shape is implementation-chosen; routing asserted by β's test
+- label: γ
+  task_id: 2926
+  title: 'C3 recovery dedupe: recover_pending_merges collapses per-branch via InFlightMergeRegistry'
+  capabilities:
+  - name: coalesce-registry-reuse
+    binding: capability→producer (wired) — InFlightMergeRegistry (task 1604, done)
+      consumed in production merge path merge_queue.py:143,3590; D5 forbids a second
+      registry
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate, not γ's deliverable
+  - name: recovery-collapse-observed
+    binding: capability→producer — built by γ; journal fixture (same-SHA + descendant-SHA
+      variants) recovers to exactly one enqueued mr, both pollers resolve; substrate
+      recover_pending_merges harness.py:8331/:1697
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: wiring site (harness vs merge_queue helper) implementation-chosen; registry
+        keying is Open Q3
+- label: δ
+  task_id: 2927
+  title: 'C3 submit-path SHA semantics: coalesce / ancestry-replace / in-verify structured
+    reject'
+  capabilities:
+  - name: registry-gate-at-submit-exists
+    binding: capability→producer (wired) — merge_request registry-gated per task 1604
+      (done); δ adds SHA-sensitivity
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate, not δ's deliverable
+  - name: structured-reject-observed-to-fire
+    binding: rejection-mechanism — built+bound by δ; MCP-level test observes the structured
+      rejection payload fire while SHA₁ verify is live and undisturbed; absence of
+      the payload ⇒ FAIL
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: reject code string + field names are Open Q1 (decided in δ); no stable
+        grep token at authoring time
+  - name: replace-path-scratch-cleanup-via-alpha
+    binding: DAG-direction — α upstream (dep wired); dropped queued entry's scratch
+      cleaned via C1
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: call-site shape implementation-chosen; asserted by δ's replace-path
+        test
+  - name: decision-atomic-with-registry-mutation
+    binding: INV-3 — verify-started check shares the replace/reject lock scope (PRD
+      C3); race-freedom bound by δ's test
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: lock-scope atomicity is a test property, not mechanically greppable
+- label: ε
+  task_id: 2928
+  title: 'C3 cancel retirement: merge_cancel returns only after full retirement, sticky
+    result cleared'
+  capabilities:
+  - name: merge-cancel-endpoint-exists
+    binding: capability→producer (wired) — merge_cancel live escalation-server MCP
+      tool (verified in live tool registry 2026-07-22)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate, not ε's deliverable
+  - name: full-retirement-before-return-observed
+    binding: rejection-mechanism — built+bound by ε; cancel-then-immediate-resubmit
+      test observes a FRESH entry identity + new SHA landing, never the retired sticky
+      result
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: sticky-result clearing is registry-internal state; bound by ε's race
+        test
+- label: ζ
+  task_id: 2929
+  title: '5326-replay integration gate: restart with dup journal entries + live verifies
+    (PRD done-gate)'
+  capabilities:
+  - name: all-legs-produced-upstream
+    binding: DAG-direction — α, β, γ, δ, ε all upstream deps wired at decompose; no
+      capability owned downstream of ζ
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency-closure property, checked at decompose; not a grep
+  - name: boundary-matrix-green-e2e
+    binding: capability→producer — §9 rows 1-9; one verify per branch, zero ENOENT,
+      trees intact until verifies complete, merge finalizes; startup substrate harness.py:1697
+      + :2576-2961 (verified 2026-07-22)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is the green boundary matrix
+- label: η
+  task_id: 2930
+  title: 'C4 serial-lane tripwire: concurrent-local-verify WARNING + telemetry event'
+  capabilities:
+  - name: serial-lane-substrate-exists
+    binding: capability→producer (wired) — enforce_persistent_worktree_serial_lane
+      merge_liveness.py:723; _MERGE_AHEAD_BOUND reach-back merge_liveness.py:763-765
+      (verified 2026-07-22)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate, not η's deliverable
+  - name: tripwire-event-observed
+    binding: capability→producer — built by η; test triggers two concurrent local
+      dispatches at bound=1 and observes the WARNING + telemetry event fire
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: event name is Open Q4 (EventType naming decided in η); no stable grep
+        token at authoring time
