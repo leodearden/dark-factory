@@ -8098,6 +8098,8 @@ class GitOps:
             )
             return 'skipped_lease_held'
         try:
+            if not path.exists():
+                return 'not_present'
             rc, _, err = await _run(
                 ['git', 'worktree', 'remove', str(path), '--force'],
                 cwd=self.project_root,
