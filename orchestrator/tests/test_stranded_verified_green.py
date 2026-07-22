@@ -387,6 +387,20 @@ def harness(tmp_path: Path, mock_orch_config):
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.update_task = AsyncMock(return_value=True)
+    h.scheduler.get_status = AsyncMock(return_value='blocked')
+
+    # Derive get_task's row from get_statuses() so TaskGroundTruth.derive_truth's
+    # db_status reflects the same status the sweep loop reads (mirrors
+    # test_stranded_blocked_sweep.py's identically-purposed default).
+    def _default_get_task(tid: str) -> dict | None:
+        ret = h.scheduler.get_statuses.return_value
+        try:
+            statuses, _err = ret
+        except (TypeError, ValueError):
+            return None
+        status = statuses.get(tid) if isinstance(statuses, dict) else None
+        return None if status is None else {'status': status, 'metadata': {}}
+    h.scheduler.get_task = AsyncMock(side_effect=_default_get_task)
     wire_scheduler_liveness_mock(h.scheduler)
 
     # Real event store so merge_queued rows are queryable via the event API.
@@ -530,3 +544,75 @@ class TestStrandedVerifiedGreenRecordEscalation:
             assert tuple(call.args[:2]) != (_TID, 'pending'), (
                 'verified-green record must NOT re-pend the task'
             )
+
+
+@pytest.mark.asyncio
+class TestReconcileStrandedDriverVerifiedGreen:
+    """End-to-end through Harness._reconcile_stranded_in_progress() (step-11).
+
+    The driver classifies a blocked task with no open escalation and no live
+    claimant as RE_FILE_ESCALATION; the verified-green gate runs BEFORE the
+    re-file.  A match submits merge-queue-direct; a non-match preserves today's
+    re-file path exactly.
+    """
+
+    async def test_a_verified_green_submits_and_no_pending_l1_no_repend(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_a')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        # git_ops mocks so recovery_for classifies the blocked task as
+        # GONE_NO_MARKER → RE_FILE_ESCALATION (mirrors test_stranded_blocked_sweep).
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({tid: 'blocked'}, None),
+        )
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        # A MergeRequest was enqueued (merge-queue-direct submission).
+        assert harness._merge_queue.qsize() == 1
+        # No pending stranded_blocked L1 remains — the record was auto-dismissed.
+        assert queue.get_by_task(tid, status='pending') == []
+        # The task was NOT re-pended.
+        for call in harness.scheduler.set_task_status.await_args_list:
+            assert tuple(call.args[:2]) != (tid, 'pending')
+
+    async def test_b_non_matching_preserves_today_refile_path(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = '8'
+        queue = EscalationQueue(tmp_path / 'esc_b')
+        harness._escalation_queue = queue
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({tid: 'blocked'}, None),
+        )
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+
+        # Today's behavior preserved: exactly one pending stranded_blocked L1
+        # and NO MergeRequest enqueued.
+        filed = queue.get_by_task(tid, status='pending')
+        assert len(filed) == 1
+        assert filed[0].category == 'stranded_blocked'
+        assert filed[0].agent_role == 'harness-stranded-blocked-reaper'
+        assert harness._merge_queue.qsize() == 0
