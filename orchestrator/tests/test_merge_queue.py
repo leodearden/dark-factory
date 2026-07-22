@@ -21904,6 +21904,13 @@ class TestSpeculationPermitLeakOnMergerError:
        verifier queue, so N+3 hangs.
     """
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  Builds 4 real
+    # worktrees and drives a full SpeculativeMergeWorker through two merge
+    # phases; cumulative wall-clock (not any single 30s wait_for) can exceed 60s
+    # under host load with no logic fault.
+    @pytest.mark.timeout(120)
     async def test_worktree_missing_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -21972,6 +21979,13 @@ class TestSpeculationPermitLeakOnMergerError:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  Builds 4 real
+    # worktrees and drives a full SpeculativeMergeWorker through two merge
+    # phases; cumulative wall-clock (not any single 30s wait_for) can exceed 60s
+    # under host load with no logic fault.
+    @pytest.mark.timeout(120)
     async def test_merger_exception_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -22032,6 +22046,13 @@ class TestSpeculationPermitLeakOnMergerError:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  Builds 4 real
+    # worktrees and drives a full SpeculativeMergeWorker; cumulative wall-clock
+    # (not any single 30s wait_for) can exceed 60s under host load with no logic
+    # fault — same shape as sibling (a)/(b), which crashed a worker this way.
+    @pytest.mark.timeout(120)
     async def test_abandoned_speculative_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
