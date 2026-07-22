@@ -570,6 +570,34 @@ class TestReconciliationConfigTimeouts:
         assert cfg.stage_timeout_seconds == 3600
 
 
+class TestReconciliationConfigJudgeInfraMaxConsecutiveFailures:
+    """Tests for judge_infra_max_consecutive_failures (task 2947 ask a).
+
+    Bounds consecutive judge transport/infra failures before a
+    judge-unreachable halt + infra_issue escalation fires.
+    """
+
+    def test_default_is_3(self):
+        assert ReconciliationConfig().judge_infra_max_consecutive_failures == 3
+
+    def test_explicit_override_accepted(self):
+        cfg = ReconciliationConfig(judge_infra_max_consecutive_failures=5)
+        assert cfg.judge_infra_max_consecutive_failures == 5
+
+    def test_value_of_one_accepted(self):
+        # ge=1 lower bound: 1 is the smallest legal value (halt on first infra failure)
+        cfg = ReconciliationConfig(judge_infra_max_consecutive_failures=1)
+        assert cfg.judge_infra_max_consecutive_failures == 1
+
+    def test_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(judge_infra_max_consecutive_failures=0)
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            ReconciliationConfig(judge_infra_max_consecutive_failures=-1)
+
+
 class TestReconciliationConfigBacklogIterationBudget:
     """Tests for backlog_iteration_budget_seconds — the cumulative per-invocation
     wall-clock budget for BacklogIterator.run() (task 2040)."""
