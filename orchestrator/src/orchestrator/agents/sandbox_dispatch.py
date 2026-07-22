@@ -27,6 +27,16 @@ _preferred: Backend = 'auto'
 # shared across every workflow in one orchestrator process. Reset (re-armed) on
 # ANY non-refusing return of resolve_backend_or_refuse (healthy backend OR the
 # 'none' escape hatch).
+#
+# Re-arm is driven ONLY by backend state, never by escalation lifecycle: an
+# operator resolving the filed escalation does NOT re-arm this dedup. So while
+# the backend stays unavailable, subsequent refusals remain deduped — they
+# still fail-closed (raise SandboxUnavailable) but file NO new escalation —
+# until the backend state actually changes (a config edit via sandbox.backend /
+# reload, or a landlock/bwrap recovery). This is an observability caveat, not a
+# safety gap (every refusal still raises); it is spelled out in the escalation
+# detail so an operator who resolves without installing a backend understands
+# the guard stays silent until the backend state changes (task 2908 review).
 _escalated_backend_state: str | None = None
 
 
@@ -67,17 +77,29 @@ def resolve_active_backend() -> Backend:
         return 'none'
     if _preferred == 'auto':
         return _resolve_auto()
+    # On the unavailable branch, return 'none' and let the CALLER decide the
+    # outcome — do NOT assert "running unsandboxed" here. resolve_active_backend
+    # is shared by a fail-OPEN caller (invoke._invoke_claude_with_sandbox, which
+    # runs unsandboxed) AND a fail-CLOSED caller (resolve_backend_or_refuse,
+    # which REFUSES). Claiming an unsandboxed run in the log would be false on
+    # the fail-closed path (task 2908 review).
     if _preferred == 'landlock':
         from orchestrator.agents.landlock import is_landlock_available
         if is_landlock_available():
             return 'landlock'
-        logger.warning('sandbox backend=landlock but unavailable — running unsandboxed')
+        logger.warning(
+            'sandbox backend=landlock configured but unavailable — resolving to '
+            'none (caller decides: run unsandboxed or refuse fail-closed)',
+        )
         return 'none'
     if _preferred == 'bwrap':
         from orchestrator.agents.sandbox import is_bwrap_available
         if is_bwrap_available():
             return 'bwrap'
-        logger.warning('sandbox backend=bwrap but unavailable — running unsandboxed')
+        logger.warning(
+            'sandbox backend=bwrap configured but unavailable — resolving to '
+            'none (caller decides: run unsandboxed or refuse fail-closed)',
+        )
         return 'none'
     # set_backend's input validator blocks corrupt values from entering via the
     # public API, so reaching this branch means _preferred was mutated directly
