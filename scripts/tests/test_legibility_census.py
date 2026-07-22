@@ -1451,10 +1451,73 @@ def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "run_census", raising_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    # Once main() routes fail-loud errors through escalate_fn, the failure path
+    # POSTs escalate_info; stub the single MCP boundary so this test never
+    # attempts a real localhost POST (conftest: no test hits a real endpoint).
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", lambda *a, **k: {})
 
     exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
 
     assert exit_code != 0
+
+
+def test_main_failure_files_escalation(tmp_path, monkeypatch):
+    """main()'s fail-loud catch-all must file an escalate_info via the reused
+    escalate_fn closure (PRD decision 8: degradation never silent) -- a hard
+    census failure exits non-zero AND leaves an operator signal, rather than
+    dying with only a stderr line (the silent-census incident this fixes)."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    posts = []
+
+    def rec(url, tool_name, arguments):
+        posts.append((url, tool_name, arguments))
+        return {}
+
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    escalations = [args for (_url, tool_name, args) in posts if tool_name == "escalate_info"]
+    assert len(escalations) == 1, "exactly one escalate_info POST for the hard failure"
+    arguments = escalations[0]
+    assert arguments["task_id"] == "legibility-census-dark_factory"
+    assert arguments["category"] == "infra_issue"
+    assert arguments["summary"] and "dark_factory" in arguments["summary"]
+    assert "codebook merge produced an invalid codebook" in arguments["detail"]
+
+
+def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, monkeypatch, caplog):
+    """The failure escalation is best-effort: if the escalation POST itself
+    raises, the closure swallows it (logging a WARNING) and main() STILL
+    returns 1 -- the escalation never masks the authoritative exit code."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    def raising_post(url, tool_name, arguments):
+        raise RuntimeError("escalation server down")
+
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", raising_post)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    assert any(
+        r.levelno >= logging.WARNING for r in caplog.records
+    ), "a raising escalation poster must be logged, never propagated"
 
 
 # ---------------------------------------------------------------------------

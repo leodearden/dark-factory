@@ -52,6 +52,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1385,6 +1386,12 @@ def main(argv: list[str] | None = None) -> int:
     # config.Timeouts for the rationale.
     mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
 
+    # One escalate_fn closure shared by BOTH consumers: run_census's
+    # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
+    # below -- so defer and hard-failure escalations share one census
+    # escalation source and one never-mask-the-exit contract.
+    escalate_fn = _build_default_escalate_fn(cfg)
+
     try:
         outcome = run_census(
             batch_source=default_batch_source(
@@ -1394,7 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_fn=_build_default_verify_fn(str(project_root), verify_invoke),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
-            escalate_fn=_build_default_escalate_fn(cfg),
+            escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
             commit=_build_default_commit(project_root),
             codebook_dict=codebook_dict,
@@ -1407,8 +1414,19 @@ def main(argv: list[str] | None = None) -> int:
             date=date_str,
             force=args.force,
         )
-    except Exception as exc:  # noqa: BLE001 - fail loud: non-zero exit, never a silent crash
+    except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
         print(f"census: FAILED -- {exc}", file=sys.stderr)
+        # PRD decision 8 -- degradation never silent: file a best-effort
+        # escalation via the shared closure so a hard failure leaves an
+        # operator signal, not just a stderr line. The closure swallows all
+        # POST errors internally (logging a best-effort warning), so this
+        # never masks the exit and `return 1` always runs.
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=f"legibility census run failed ({cfg.project_id}): {exc}",
+            detail=traceback.format_exc(),
+        )
         return 1
 
     if outcome.status == "deferred":
