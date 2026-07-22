@@ -5227,36 +5227,76 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                # Cheap deterministic backstop (task 2838) OR'd first so it
-                # short-circuits the verify-pipeline-guard.sh subprocess on the
-                # merge hot path; empty globs (default) → False → expression
-                # byte-identical to the guard-only behaviour.
-                # The backstop matches the FULL changed set (task_files) —
-                # including DELETED manifest-relevant paths, which are absent
-                # from existing_files — because removing a file a manifest
-                # enumerates shifts the manifest just as adding one does
-                # (reviewer amendment, task 2838). The reify consult keeps its
-                # existing on-disk existing_files contract.
-                should_override = role == 'merge' and (
-                    _merge_config_only_diff_forces_full_gate(config, task_files)
-                    or await _verify_pipeline_guard_requires_full_gate(
-                        worktree, existing_files,
+                if role == 'merge' and is_merge_verify:
+                    # INV-1 (task 2883): the ADOPTABLE merge verdict must never
+                    # trivially pass a no-evidence resolution. Escalate to the
+                    # global full gate when a global command exists (fall through:
+                    # _build_fallback_config→None for a no-source diff, cargo-scope
+                    # is skipped, and control reaches the global run_verification
+                    # tail which runs config.test_command/lint/type). If NO global
+                    # command exists, FAIL loud INLINE so the global-tail backstop
+                    # never double-emits.
+                    reason = (
+                        'empty_existing_files' if not existing_files
+                        else 'no_source_files'
                     )
-                )
-                if should_override:
-                    logger.info(
-                        'config-only fast-path overridden by manifest-drift'
-                        ' backstop or verify-pipeline-guard'
-                        ' — running full gate (no-module_configs merge path)',
-                    )
-                    # Fall through to the existing global run_verification path.
+                    if (
+                        config.test_command
+                        or config.lint_command
+                        or config.type_check_command
+                    ):
+                        _emit_trivial_pass_escalated(
+                            event_store, task_id,
+                            reason=reason, resolution='full_gate',
+                        )
+                        logger.info(
+                            'INV-1: merge gate escalating would-be trivial pass'
+                            ' (%s) to the global full gate',
+                            reason,
+                        )
+                        # Fall through to the global run_verification tail below.
+                    else:
+                        _emit_trivial_pass_escalated(
+                            event_store, task_id,
+                            reason=reason, resolution='loud_fail',
+                        )
+                        logger.warning(
+                            'INV-1: merge gate has no global full-gate command'
+                            ' (%s) — failing loud (merge_no_evidence)',
+                            reason,
+                        )
+                        return _merge_no_evidence_fail(reason)
                 else:
-                    logger.info(
-                        'Verification mode: trivial pass (no source files, no module configs)',
+                    # Cheap deterministic backstop (task 2838) OR'd first so it
+                    # short-circuits the verify-pipeline-guard.sh subprocess on the
+                    # merge hot path; empty globs (default) → False → expression
+                    # byte-identical to the guard-only behaviour.
+                    # The backstop matches the FULL changed set (task_files) —
+                    # including DELETED manifest-relevant paths, which are absent
+                    # from existing_files — because removing a file a manifest
+                    # enumerates shifts the manifest just as adding one does
+                    # (reviewer amendment, task 2838). The reify consult keeps its
+                    # existing on-disk existing_files contract.
+                    should_override = role == 'merge' and (
+                        _merge_config_only_diff_forces_full_gate(config, task_files)
+                        or await _verify_pipeline_guard_requires_full_gate(
+                            worktree, existing_files,
+                        )
                     )
-                    return _trivial_pass(
-                        'No source files changed — verify trivially passes',
-                    )
+                    if should_override:
+                        logger.info(
+                            'config-only fast-path overridden by manifest-drift'
+                            ' backstop or verify-pipeline-guard'
+                            ' — running full gate (no-module_configs merge path)',
+                        )
+                        # Fall through to the existing global run_verification path.
+                    else:
+                        logger.info(
+                            'Verification mode: trivial pass (no source files, no module configs)',
+                        )
+                        return _trivial_pass(
+                            'No source files changed — verify trivially passes',
+                        )
             # NOTE (task γ amendment): unlike the module_configs branch below,
             # this call site deliberately does NOT thread a shared
             # content_cache into _build_fallback_config — doing so would add
