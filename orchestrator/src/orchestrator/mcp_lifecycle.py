@@ -19,7 +19,7 @@ from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.proc_group import terminate_process_group
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.fm_retry import fm_retry_backoffs, is_fm_null_sentinel
 
 logger = logging.getLogger(__name__)
 
@@ -455,6 +455,13 @@ JCODEMUNCH_ENV: dict[str, str] = {'JCODEMUNCH_NO_VERSION_HINT': '1'}
 # deadline; and multi-attempt durations already exceeded any single
 # per-attempt timeout under the old budget too. Per-URL gating is deferred
 # as a larger transport-layer refactor outside this task's scope.
+#
+# One URL is exempted from this window (task 2880): the D8 null sentinel
+# (fm_retry.FM_NULL_SENTINEL_URL) that eval runs point fused-memory at. It is
+# non-routable by construction, so it can never host a *restarting* fm — the
+# window's whole premise is inapplicable and riding it out just burns ~120s
+# per logical call. McpSession._retry_backoffs() collapses the schedule to a
+# single attempt for that URL; every other endpoint keeps the full window.
 _RETRYABLE_STATUS = frozenset({502, 503, 504})
 
 # Exceptions treated as transient for retry purposes.
@@ -512,6 +519,24 @@ class McpSession:
     def _next_id(self) -> int:
         self._request_id += 1
         return self._request_id
+
+    def _retry_backoffs(self) -> list[float]:
+        """Backoff schedule for this session's transport retries.
+
+        Returns ``[]`` (a single attempt, zero sleeps) for the D8 null
+        sentinel (``is_fm_null_sentinel(self.base_url)``): that address is
+        non-routable and can never host a *restarting* fused-memory, so the
+        shared fm-restart retry window is inapplicable — riding it out just
+        burns ~FM_RESTART_RETRY_WINDOW_SECS per logical call (task 2880; see
+        the "Scope of the ~120s fm-restart window" note by ``_RETRYABLE_STATUS``
+        above). Every other endpoint delegates to the shared
+        ``fm_retry_backoffs()`` unchanged. The module-level name is called here
+        so tests that patch ``orchestrator.mcp_lifecycle.fm_retry_backoffs``
+        for non-sentinel URLs still take effect.
+        """
+        if is_fm_null_sentinel(self.base_url):
+            return []
+        return fm_retry_backoffs()
 
     async def initialize(self) -> None:
         """Perform MCP initialize + initialized handshake."""
@@ -575,8 +600,9 @@ class McpSession:
 
         # Shared fm-restart retry window, applied to this generic transport by
         # design (fm-scoped in practice) — see the "Scope of the ~120s
-        # fm-restart window" note by _RETRYABLE_STATUS above.
-        backoffs = fm_retry_backoffs()
+        # fm-restart window" note by _RETRYABLE_STATUS above. Collapses to a
+        # single attempt for the D8 null sentinel (task 2880).
+        backoffs = self._retry_backoffs()
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
@@ -651,8 +677,9 @@ class McpSession:
 
         # Shared fm-restart retry window, applied to this generic transport by
         # design (fm-scoped in practice) — see the "Scope of the ~120s
-        # fm-restart window" note by _RETRYABLE_STATUS above.
-        backoffs = fm_retry_backoffs()
+        # fm-restart window" note by _RETRYABLE_STATUS above. Collapses to a
+        # single attempt for the D8 null sentinel (task 2880).
+        backoffs = self._retry_backoffs()
         attempts = len(backoffs) + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
