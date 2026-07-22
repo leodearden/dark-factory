@@ -330,3 +330,42 @@ def test_find_matching_transcript_missing_dir_returns_none(tmp_path):
         rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
     )
     assert got is None
+
+
+# ---------------------------------------------------------------------------
+# step-9/10: pure preventer guard — payload_exports_force_persistence
+# (fixture strings ONLY — never the real committed spawn-claude.sh)
+# ---------------------------------------------------------------------------
+
+def test_payload_exports_force_persistence_true_for_export_form():
+    script = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1\n"
+        'claude --prompt "$PROMPT"\n'
+    )
+    assert mod.payload_exports_force_persistence(script) is True
+
+
+def test_payload_exports_force_persistence_true_for_plain_and_quoted_forms():
+    assert mod.payload_exports_force_persistence(
+        "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1\n"
+    ) is True
+    assert mod.payload_exports_force_persistence(
+        'export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE="1"\n'
+    ) is True
+
+
+def test_payload_exports_force_persistence_false_when_absent():
+    script = (
+        "#!/usr/bin/env bash\n"
+        "export CLAUDE_CODE_CHILD_SESSION=1\n"
+        'claude --prompt "$PROMPT"\n'
+    )
+    assert mod.payload_exports_force_persistence(script) is False
+
+
+def test_payload_exports_force_persistence_false_when_zero():
+    assert mod.payload_exports_force_persistence(
+        "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0\n"
+    ) is False
