@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from legibility import check_transcript_persistence as mod
+from legibility.config import load_config
 from orchestrator import session_registry
 
 
