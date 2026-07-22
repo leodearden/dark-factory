@@ -50,6 +50,19 @@ DEFAULT_LOOKBACK = timedelta(hours=48)
 """Default registry lookback window. Terminal records are reaped after the
 24h TERMINAL_TTL, so a 48h window stays populated while tolerating probe lag."""
 
+DEFAULT_SKEW = timedelta(hours=6)
+"""Default clock-skew tolerance for the WEAK mtime fallback window."""
+
+PREFIX_LEN = 200
+"""Number of leading prompt characters used as the strong-match needle. A
+prefix (not the whole prompt) tolerates a transcript that wraps/suffixes the
+prompt while staying specific enough to defeat the same-cwd sibling confound."""
+
+MIN_MATCH_LEN = 32
+"""Minimum usable prompt-prefix length. A prompt shorter than this is deemed
+too short to match reliably (a short common phrase risks false positives), so
+matching falls back to the WEAK file-mtime time window instead."""
+
 
 # ---------------------------------------------------------------------------
 # Registry enumeration + completed-spawn filtering
@@ -133,3 +146,63 @@ def find_completed_spawn_records(
             continue
         kept.append(record)
     return kept
+
+
+# ---------------------------------------------------------------------------
+# Per-session transcript matching (STRONG prompt-prefix; WEAK mtime fallback)
+# ---------------------------------------------------------------------------
+
+def _usable_prompt_prefix(prompt: str | None) -> str | None:
+    """Return the strong-match prompt prefix, or None when the prompt is not usable.
+
+    The prefix is ``prompt.strip()[:PREFIX_LEN]``; it is usable only when at
+    least ``MIN_MATCH_LEN`` characters long. A None/empty/too-short prompt
+    returns ``None`` — the caller then uses the WEAK mtime fallback.
+    """
+    if not prompt:
+        return None
+    prefix = prompt.strip()[:PREFIX_LEN]
+    if len(prefix) < MIN_MATCH_LEN:
+        return None
+    return prefix
+
+
+def find_matching_transcript(
+    record: session_registry.SessionRecord,
+    projects_root: Path | str,
+    *,
+    now: datetime,
+    skew: timedelta,
+) -> Path | None:
+    """Find the transcript file under *projects_root* that belongs to *record*, or None.
+
+    The expected dir is ``projects_root/<encoded-cwd>`` (via
+    ``inventory.encode_cwd`` — the same lossy ``/``/``.`` -> ``-`` encoding
+    Claude Code itself uses). Missing dir -> ``None``.
+
+    Matching is PER-SESSION to defeat the same-cwd confound (sibling
+    headless-agent transcripts share the encoded-cwd dir):
+      - STRONG (usable prompt): the record's prompt prefix is contained in a
+        candidate transcript's first-user-turn text (via the ``sampling``
+        helpers). This is the dominant path — spawn records carry a
+        substantive prompt — so a usable-prompt session with only sibling
+        transcripts is correctly flagged MISSING (returns ``None``).
+
+    Candidates are scanned in sorted order; the first match's ``Path`` is
+    returned.
+    """
+    session_dir = Path(projects_root) / inventory.encode_cwd(record.cwd)
+    if not session_dir.is_dir():
+        return None
+    candidates = sorted(session_dir.glob('*.jsonl'))
+
+    prefix = _usable_prompt_prefix(record.prompt)
+    if prefix is not None:
+        for path in candidates:
+            _counts, first_turn = sampling._score_and_find_first_turn(path)
+            text = sampling._first_user_turn_text(first_turn)
+            if prefix in text:
+                return path
+        return None
+
+    return None
