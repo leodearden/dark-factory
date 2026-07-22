@@ -201,6 +201,7 @@ if [ ! -f "$CODE_INDEX_DIR/config.jsonc" ]; then
   "extra_ignore_patterns": [
     ".worktrees/",
     ".eval-worktrees/",
+    "*-eval-worktrees/",
     ".claude/worktrees/",
     ".taskmaster/",
     ".playwright-mcp/",
