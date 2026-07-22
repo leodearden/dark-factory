@@ -8120,29 +8120,15 @@ class GitOps:
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         """Remove a temporary merge worktree.
 
-        **Persistent-worktree exemption**: if *merge_wt* resolves to
-        :attr:`persistent_merge_worktree_path` OR
-        :attr:`persistent_offline_deep_worktree_path`, this method is a
-        **no-op** — both persistent worktrees survive across attempts and
-        across verify failures, so their (independently retained) ``target/``
-        warmth is preserved.  The ephemeral removal path is unchanged for all
-        other ``_merge-*`` worktrees.
+        Routes through the C1 guarded primitive,
+        :meth:`remove_merge_worktree_guarded` — lease-held trees are now
+        *skipped* (leaving them for the merge reaper) rather than
+        force-removed out from under a live verify. Persistent-worktree
+        exemption and uncontended removal are unchanged; the returned
+        outcome is discarded since this method's callers do not consume
+        one.
         """
-        if merge_wt.resolve() == self.persistent_merge_worktree_path.resolve():
-            logger.debug('persistent merge worktree retained: %s', merge_wt)
-            return
-        if merge_wt.resolve() == self.persistent_offline_deep_worktree_path.resolve():
-            logger.debug('persistent offline-deep worktree retained: %s', merge_wt)
-            return
-
-        rc, _, err = await _run(
-            ['git', 'worktree', 'remove', str(merge_wt), '--force'],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            logger.warning(f'Failed to remove merge worktree {merge_wt}: {err}')
-        else:
-            logger.info(f'Cleaned up merge worktree {merge_wt}')
+        await self.remove_merge_worktree_guarded(merge_wt, reason='cleanup_merge_worktree')
 
     async def create_throwaway_verify_worktree(self, merge_commit: str) -> Path:
         """Create an ephemeral ``_merge-<uuid>`` worktree at *merge_commit*.
