@@ -2904,8 +2904,9 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
 # Denylist, NOT allowlist: reify's cargo verify depends on a broad, evolving set
 # of toolchain/sccache/jobserver vars (RUSTC_WRAPPER, CARGO_*, the jobserver
 # FIFO, ...); an allowlist would silently break Rust verify the first time a new
-# var is needed.  We remove ONLY the python-env-selection vars that cause the
-# leak and pass everything else through untouched.
+# var is needed.  We remove ONLY the python-env-selection vars below plus the
+# orchestrator's own ORCH_* control-plane namespace (see _ORCH_ENV_PREFIX) —
+# the vars that cause a leak — and pass everything else through untouched.
 _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
     'VIRTUAL_ENV',
     'UV_PROJECT_ENVIRONMENT',
@@ -2925,6 +2926,20 @@ _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
     'CONDA_DEFAULT_ENV',
     'PYTHONHOME',
 })
+
+# The orchestrator's own control-plane env namespace.  ``OrchestratorConfig`` is
+# a pydantic-settings ``BaseSettings`` whose ``env_settings`` source reads the
+# ENTIRE ``ORCH_`` prefix as config overrides, so ANY ambient ``ORCH_*`` var
+# must NOT leak into a TARGET verify subprocess.  In particular ``load_config``
+# stamps ``os.environ['ORCH_CONFIG_PATH']`` in-process; if that leaks, a
+# snapshot-era env-sensitive test (e.g. an ``OrchestratorConfig()`` defaults
+# assertion frozen before main's autouse ``_isolate_orch_config`` hardening)
+# loads the PRODUCTION ``dark-factory-orchestrator.yaml`` and fails — falsifying
+# the eval metric collector's ``tests_pass`` on every cell (task 2957 / the RCA
+# doc ``plans/eval-metric-collector-orch-config-leak-rca-2026-07-22.md``).  We
+# scrub the WHOLE prefix (not just ORCH_CONFIG_PATH) so a future ORCH_* var
+# can't reintroduce the same leak class.
+_ORCH_ENV_PREFIX: str = 'ORCH_'
 
 
 def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
@@ -2952,15 +2967,23 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``_VENV_ISOLATION_KEYS``) and minus the venv ``bin`` dir on PATH, so
-    the target's toolchain resolves the target's OWN .venv.  Then injects
+    vars (``_VENV_ISOLATION_KEYS``), minus the orchestrator's ``ORCH_*``
+    control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
+    ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
+    config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
+    toolchain resolves the target's OWN .venv.  Then injects
     ``PYTHONUNBUFFERED=1`` (the partial-log invariant — see ``_run_cmd``) and
     finally overlays *extra* (the caller's ``_resolve_verify_env`` result:
     ``DF_VERIFY_ROLE`` plus reify's ``RUSTC_WRAPPER`` / ``CARGO_*`` / jobserver
-    vars) LAST, so target-supplied vars always win.
+    vars) LAST, so target-supplied vars always win — an ``ORCH_*`` var a caller
+    intentionally injects therefore survives the scrub.
     """
     venv = os.environ.get('VIRTUAL_ENV')
-    env = {k: v for k, v in os.environ.items() if k not in _VENV_ISOLATION_KEYS}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _VENV_ISOLATION_KEYS and not k.startswith(_ORCH_ENV_PREFIX)
+    }
     stripped_path = _strip_venv_bin_from_path(env.get('PATH'), venv)
     if stripped_path is not None:
         env['PATH'] = stripped_path
