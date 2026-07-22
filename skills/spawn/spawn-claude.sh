@@ -333,10 +333,21 @@ q_sentinel=$(printf %q "$sentinel")
 # cannot trap a signal that was SIG_IGN on entry.  If the window-close path ever
 # appears broken, verify the terminal's disposition reset — do NOT simply re-bump
 # the await_sentinel timeout (that symptom is a hang, not a latency issue).
+#
+# CLAUDE_CODE_FORCE_SESSION_PERSISTENCE: Claude Code >=2.1.208 suppresses
+# transcript persistence entirely (no ~/.claude/projects/<enc>/<id>.jsonl, no
+# --resume) for an interactive session that inherits CLAUDE_CODE_CHILD_SESSION
+# — and every Bash-tool subprocess of a spawning Claude session carries that
+# marker, so it leaks through this script into the new terminal. This flag is
+# the vendor-designed override (checked FIRST in the CLI's suppression
+# predicate, and the exact remedy the 2.1.217 footer warning names). Exported
+# UNCONDITIONALLY — a plain literal, deliberately NOT a SESSION_RECORD_DIR-
+# gated *_export var — so persistence holds even on registry-fault fail-soft
+# paths. See the 2026-07-22 /deb RCA (session 15de5e77) and task 2893.
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
