@@ -30,6 +30,12 @@ from pathlib import Path
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_ENUM,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
+    STATE_ACTIVE,
+)
+
 logger = logging.getLogger(__name__)
 
 # Table creation runs first; index creation runs after so both are safe to
@@ -450,6 +456,142 @@ class ReconLedgerStore:
                 """,
                 (json.dumps(payload), project_id, record_kind, task_id, flag_type, run_id),
             )
+
+    async def upsert_entity_standing_decision(
+        self,
+        *,
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        decided_at: str,
+        expires_at: str,
+        edge_count_at_decision: int,
+        evidence: object,
+        state: str = STATE_ACTIVE,
+        expiry_reason: str | None = None,
+    ) -> None:
+        """Write (last-write-wins) one ``entity_standing_decision`` ledger row.
+
+        A standing decision records that a class of complaint about a specific
+        entity — identified by ``grounds`` (a closed-enum value in
+        :data:`~fused_memory.reconciliation.standing_decision_constants.GROUNDS_ENUM`)
+        — has been investigated and dismissed, so future recon flags matching
+        that (entity, grounds) can be filtered/annotated (γ/δ) rather than
+        re-raised. The record kind is
+        :data:`~fused_memory.reconciliation.standing_decision_constants.RECORD_KIND_ENTITY_STANDING_DECISION`.
+
+        **PK-slot mapping** (PRD Open Question 3, decided in α): the ledger PK
+        is fixed at ``(project_id, record_kind, task_id, flag_type, run_id)``,
+        so standing rows encode their natural identity by reusing slots —
+        ``task_id=''`` (entity-scoped, no task anchor), ``flag_type=grounds``
+        (the closed-enum sub-classification → per-(entity, grounds)
+        uniqueness), ``run_id=entity_uuid`` (per-entity uniqueness). The new
+        first-class ``entity_uuid`` column mirrors ``run_id`` and is the
+        indexed field Hook A/B/sweeps (γ/δ/ζ) query on. ``grounds`` is mirrored
+        canonically into ``payload_json`` (it is a COMPARED field, never a
+        WHERE-queried column). ``decided_at`` is stored as the row's
+        ``created_at``; ``edge_count_at_decision``/``evidence`` (and an optional
+        ``expiry_reason``) ride in ``payload_json``.
+
+        **Loud-over-silent validation (INV-1):** ``entity_uuid`` must be a
+        non-empty string, ``expires_at`` must not be ``None`` (the never-None
+        expires_at invariant — α enforces it at the write boundary while the β
+        writer computes ``decided_at + STANDING_DECISION_TTL_DAYS``), and
+        ``grounds`` must be a member of ``GROUNDS_ENUM``. A violation raises
+        ``ValueError`` naming the failing field rather than writing a malformed
+        row.
+        """
+        if not entity_uuid:
+            raise ValueError(
+                'upsert_entity_standing_decision: entity_uuid must be a non-empty '
+                f'string (got {entity_uuid!r})'
+            )
+        if expires_at is None:
+            raise ValueError(
+                'upsert_entity_standing_decision: expires_at must not be None '
+                '(never-None-expires_at invariant; standing decisions carry a '
+                'decided_at + STANDING_DECISION_TTL_DAYS expiry)'
+            )
+        if grounds not in GROUNDS_ENUM:
+            raise ValueError(
+                'upsert_entity_standing_decision: grounds must be a member of '
+                f'GROUNDS_ENUM {sorted(GROUNDS_ENUM)} (got {grounds!r})'
+            )
+        payload: dict[str, object] = {
+            'grounds': grounds,
+            'decided_at': decided_at,
+            'edge_count_at_decision': edge_count_at_decision,
+            'evidence': evidence,
+        }
+        if expiry_reason:
+            payload['expiry_reason'] = expiry_reason
+        record = ReconLedgerRecord(
+            project_id=project_id,
+            record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+            task_id='',
+            flag_type=grounds,
+            run_id=entity_uuid,
+            entity_uuid=entity_uuid,
+            payload_json=json.dumps(payload),
+            state=state,
+            created_at=decided_at,
+            expires_at=expires_at,
+        )
+        await self.upsert(record)
+
+    async def list_entity_standing_decisions(
+        self, project_id: str, *, state: str | None = None
+    ) -> list[ReconLedgerRecord]:
+        """Return the ``entity_standing_decision`` rows for a project.
+
+        Scoped to ``record_kind = entity_standing_decision`` and *project_id*;
+        optionally further filtered to a single ``state``. This is the ζ
+        growth/merge sweep source and the round-trip read for α's own tests.
+        """
+        db = self._require_db()
+        if state is None:
+            cursor = await db.execute(
+                """
+                SELECT * FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ?
+                """,
+                (project_id, RECORD_KIND_ENTITY_STANDING_DECISION),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT * FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ? AND state = ?
+                """,
+                (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, state),
+            )
+        rows = await cursor.fetchall()
+        return [_record_from_row(row) for row in rows]
+
+    async def get_active_entity_standing_decision(
+        self, project_id: str, entity_uuid: str
+    ) -> ReconLedgerRecord | None:
+        """Return the single ACTIVE ``entity_standing_decision`` for
+        ``(project_id, entity_uuid)``, or ``None``.
+
+        The shared active-decision-by-uuid lookup Hook A (γ) and Hook B (δ)
+        consume (INV-5). Keyed on the indexed ``entity_uuid`` column and
+        gated on ``state = active`` — an expired/revoked row (or an unknown
+        entity) yields ``None``.
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND entity_uuid = ? AND state = ?
+            LIMIT 1
+            """,
+            (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, entity_uuid, STATE_ACTIVE),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _record_from_row(row)
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
