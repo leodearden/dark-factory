@@ -69,6 +69,15 @@ set -euo pipefail
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
+# Grace re-probe window (task 2961): the fleet's slowest-draining unit
+# (long merge-verifies, warm-lane drop-in -- reify in practice) can have its
+# restart job superseded/canceled and re-run by systemd's own supervision
+# AFTER VERIFY_TIMEOUT already expired, which previously made
+# restart_and_verify() declare the unit FAILED (and the caller escalate
+# critical) seconds before the unit actually came up fresh. Give a unit that
+# is still not fresh at the VERIFY_TIMEOUT deadline this many additional
+# seconds to re-probe into before genuinely declaring it failed.
+VERIFY_GRACE="${RESTART_VERIFY_GRACE_SECS:-120}"
 SELF_UNIT="${SELF_UNIT:-orchestrator-dark-factory.service}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -132,6 +141,27 @@ restart_and_verify() {
         # would make a clean restart look spuriously stale.
         if [[ "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
             echo " OK (new MainPID=${pid})"
+            return 0
+        fi
+        sleep 1
+    done
+
+    # Grace re-probe (task 2961): VERIFY_TIMEOUT expired without seeing a
+    # fresh ActiveEnterTimestampMonotonic, but a slow-draining unit's actual
+    # stop/start can still be in flight underneath a superseded/canceled
+    # restart job -- declaring FAILED here, before that in-flight start has
+    # had a chance to land, produces a false failure/escalation for a unit
+    # that verifies fresh moments later. Re-probe on the same cadence for up
+    # to VERIFY_GRACE more seconds before giving up for real.
+    echo -n " not yet fresh after ${VERIFY_TIMEOUT}s, re-probing for up to ${VERIFY_GRACE}s more..."
+    deadline=$((SECONDS + VERIFY_GRACE))
+    while [[ $SECONDS -lt $deadline ]]; do
+        state="$(get_state "$unit")"
+        pid="$(read_field "$state" MainPID)"
+        active="$(read_field "$state" ActiveState)"
+        mono="$(read_field "$state" ActiveEnterTimestampMonotonic)"
+        if [[ "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
+            echo " OK (new MainPID=${pid}, verified fresh during grace re-probe)"
             return 0
         fi
         sleep 1
