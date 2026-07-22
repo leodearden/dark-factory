@@ -67,6 +67,11 @@ class Judge:
         self._halted_projects: set[str] = set()
         self._halt_cooldown_until: dict[str, datetime] = {}
         self._unhalt_grace_remaining: dict[str, int] = {}
+        # Per-project count of CONSECUTIVE judge transport/infra failures
+        # (JudgeInfraError). Incremented on each infra failure, reset on any
+        # successful transport or once a judge-unreachable halt fires. Bounds
+        # the phantom-halt blast radius (task 2947 ask a).
+        self._consecutive_infra_failures: dict[str, int] = {}
         self._usage_gate = usage_gate
         self._on_unhalt_cb = on_unhalt_cb
 
@@ -126,7 +131,23 @@ class Judge:
             )
 
             prompt = self._build_review_prompt(run, entries, recent_verdicts, combined_actions)
-            response_text = await self._call_llm(prompt)
+            try:
+                response_text = await self._call_llm(prompt)
+            except JudgeInfraError as err:
+                # Transport/infra failure (cap-storm CLI failure, timeout,
+                # api_error, cap-wait exhaustion, …) carries NO verdict. Do NOT
+                # fabricate a phantom severity=serious halt (the defect this
+                # fixes) — apply bounded backoff and only halt (truthfully) after
+                # judge_infra_max_consecutive_failures in a row. This except is
+                # deliberately INSIDE the broad try so its return short-circuits
+                # before _parse_verdict / add_verdict.
+                return await self._handle_infra_failure(run.project_id, run_id, err)
+
+            # Successful transport (even a malformed-content verdict, which stays
+            # fail-closed serious below) clears the per-project infra streak so a
+            # recovered judge starts fresh.
+            self._consecutive_infra_failures.pop(run.project_id, None)
+
             verdict = self._parse_verdict(response_text, run_id)
 
             # Act on verdict — must happen BEFORE persisting so the DB receives the
@@ -165,6 +186,69 @@ class Judge:
         except Exception as e:
             logger.error(f'Judge review failed for run {run_id}: {e}')
             return None
+
+    async def _handle_infra_failure(
+        self, project_id: str, run_id: str, err: JudgeInfraError,
+    ) -> None:
+        """Bounded-backoff handling for a judge transport/infra failure (task 2947).
+
+        A JudgeInfraError means the judge CLI was unreachable/broken for this run
+        — there is NO verdict to trust. Rather than fabricating a phantom
+        severity=serious halt whose "Serious verdict in run X" reason lies about a
+        review that never happened (the defect this fixes), count consecutive
+        infra failures per project:
+
+        - below ``config.judge_infra_max_consecutive_failures``: log a structured
+          warning and return None — no verdict is stamped and no halt fires, so a
+          transient outage (e.g. an account-cap storm) is given room to recover.
+        - at/above the threshold: reset the counter (so a post-halt recovery
+          starts clean) and, when ``halt_on_judge_serious`` is set, apply a
+          TRUTHFUL 'judge-unreachable' halt — which routes the existing
+          infra_issue escalation via the harness. Gated on the same master switch
+          as the serious-verdict halt.
+
+        Always returns None (review_run propagates it as the run's result). The
+        infra streak is reset elsewhere on any successful transport (see
+        review_run), so only genuinely-consecutive failures reach the threshold.
+        """
+        count = self._consecutive_infra_failures.get(project_id, 0) + 1
+        self._consecutive_infra_failures[project_id] = count
+        threshold = self.config.judge_infra_max_consecutive_failures
+
+        if count < threshold:
+            logger.warning(
+                'reconciliation.judge_infra_failure',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'consecutive_failures': count,
+                    'threshold': threshold,
+                    'error': str(err),
+                },
+            )
+            return None
+
+        # Threshold reached: reset the streak so a later recovery starts clean,
+        # then (if enabled) halt truthfully.
+        self._consecutive_infra_failures.pop(project_id, None)
+        if self.config.halt_on_judge_serious:
+            reason = (
+                f'judge-unreachable halt: reconciliation judge outage '
+                f'(cap-storm/CLI failure) — project halted after {count} '
+                f'consecutive infra failures; last error: {err}'
+            )
+            await self._apply_halt(project_id, reason=reason)
+            logger.error(
+                f'Judge: judge-unreachable — halting project {project_id} after '
+                f'{count} consecutive infra failures; last error: {err}'
+            )
+        else:
+            logger.error(
+                f'Judge: {count} consecutive judge infra failures for project '
+                f'{project_id}, but halt_on_judge_serious is disabled — not '
+                f'halting; last error: {err}'
+            )
+        return None
 
     def _build_review_prompt(self, run, entries, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
