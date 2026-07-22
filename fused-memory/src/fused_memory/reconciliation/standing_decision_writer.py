@@ -26,6 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from fused_memory.reconciliation.standing_decision_constants import (
+    MEM0_KIND_INVESTIGATION_OUTCOME,
+)
+
 # ---------------------------------------------------------------------------
 # Evidence-ref vocabulary
 # ---------------------------------------------------------------------------
@@ -48,6 +52,16 @@ EVIDENCE_TYPE_MEM0 = 'mem0'
 # human-touched, preserving the under-suppression bias (PRD decision 10). A
 # prefix tuple keeps the allowlist single-source and extensible.
 HUMAN_AUTHORED_AGENT_ID_PREFIXES: tuple[str, ...] = ('claude-interactive',)
+
+# ---------------------------------------------------------------------------
+# Arm 2 — independent-investigation predicate (PRD Open Question 2)
+# ---------------------------------------------------------------------------
+
+# Arm 2 requires ≥ this many DISTINCT non-empty investigation_outcome run_ids
+# for the entity (distinct run_ids model independent investigations). Qdrant's
+# scroll can filter on the metadata fields but cannot dedup by run_id, so the
+# distinct count is computed Python-side after the scroll.
+ARM2_MIN_DISTINCT_RUNS = 3
 
 
 def _is_human_authored(agent_id: Any) -> bool:
@@ -124,8 +138,9 @@ async def evaluate_evidence_gate(
 
     * **Arm 1** — ≥1 cited evidence ref that is a mem0 ref, locally resolvable,
       AND authored by a human (:func:`_is_human_authored`).
-    * **Arm 2** — ≥3 DISTINCT investigation_outcome run_ids for this entity
-      (implemented in a later step; stubbed to 0 for now).
+    * **Arm 2** — ≥``ARM2_MIN_DISTINCT_RUNS`` DISTINCT investigation_outcome
+      run_ids for this entity (``actionable=False``), counted Python-side after
+      the metadata scroll.
 
     The gate is satisfied when EITHER arm holds.
     """
@@ -137,9 +152,25 @@ async def evaluate_evidence_gate(
         for ref in resolved
     )
 
-    # Arm 2 is implemented in a later step; stub it to unsatisfied/0 for now.
-    arm2_distinct_run_count = 0
-    arm2_satisfied = False
+    # Arm 2 — count DISTINCT non-empty run_ids among the entity's dismissed
+    # (actionable=False) investigation_outcome records. Qdrant filters the three
+    # metadata fields; run_id dedup is Python-side. A record lacking a run_id
+    # cannot establish independence and is not counted.
+    outcomes = await memory_service.get_memories_by_metadata(
+        project_id,
+        {
+            'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+            'entity_uuid': entity_uuid,
+            'actionable': False,
+        },
+    )
+    distinct_run_ids: set[str] = set()
+    for record in outcomes or []:
+        run_id = (record.get('metadata') or {}).get('run_id')
+        if isinstance(run_id, str) and run_id:
+            distinct_run_ids.add(run_id)
+    arm2_distinct_run_count = len(distinct_run_ids)
+    arm2_satisfied = arm2_distinct_run_count >= ARM2_MIN_DISTINCT_RUNS
 
     satisfied = arm1_satisfied or arm2_satisfied
     return EvidenceGateResult(
