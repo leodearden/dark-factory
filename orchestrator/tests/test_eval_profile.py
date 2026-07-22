@@ -21,6 +21,8 @@ eval behavior.
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from orchestrator import config
@@ -73,7 +75,10 @@ def test_eval_profile_sentinel_single_sourced_from_fm_retry():
     assert EVAL_PROFILE['fused_memory.url'] == FM_NULL_SENTINEL_URL
     # (b) The transport predicate recognizes exactly the profile's sentinel —
     # the live cross-module contract that makes the fail-fast actually fire.
-    assert is_fm_null_sentinel(EVAL_PROFILE['fused_memory.url']) is True
+    # EVAL_PROFILE is heterogeneous (dict[str, bool | str]); this leaf is the
+    # str sentinel (asserted == FM_NULL_SENTINEL_URL above), so narrow bool | str
+    # -> str for the str | None predicate param.
+    assert is_fm_null_sentinel(cast(str, EVAL_PROFILE['fused_memory.url'])) is True
     # (c) Identity — proves profile.py references the shared constant object
     # rather than holding a second copy of the literal (CPython does not intern
     # URL-shaped literals, so a distinct copy would fail `is` while passing ==).
