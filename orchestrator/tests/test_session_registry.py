@@ -2025,6 +2025,73 @@ def test_main_reap_marks_then_deletes(
 
 
 # ---------------------------------------------------------------------------
+# Task 2934 step-9/10: driving the WM-window sweep from `launching`/`reap`
+# ---------------------------------------------------------------------------
+
+
+def test_main_reap_marks_windowless_wm_session_before_deleting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    windowless = _make_record(
+        session_slug='reap-windowless',
+        status=sr.Status.AWAITING_INPUT,
+        launcher_pid=os.getpid(),  # ALIVE -- the pid/TTL sweep alone would never catch this
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(windowless, root=tmp_path)
+
+    def _fake_wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x99  0 host  still-open window\n'
+        )
+
+    monkeypatch.setattr(sr, '_wmctrl_list', _fake_wmctrl_list)
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    # Marked, not deleted, in this SAME pass -- the window sweep ran in the
+    # mark phase before reap_stale_records (mark-then-delete order).
+    reloaded_dir = sr.record_path_for_slug('reap-windowless', root=tmp_path).parent
+    assert reloaded_dir.is_dir()
+    reloaded = sr.read_record('reap-windowless', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_main_launching_fail_soft_when_window_sweep_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the new WM
+    window sweep: a fault must never raise out of _run_launching (it would
+    corrupt the printed record dir spawn-claude.sh captures into
+    SESSION_RECORD_DIR), exactly like a fault in the orphan mark sweep.
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    calls: list[None] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
+        calls.append(None)
+        raise OSError('window sweep on fire')
+
+    monkeypatch.setattr(sr, 'mark_windowless_wm_sessions_exited', _boom)
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert calls  # the sweep really was invoked (and really did raise)
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+
+
+# ---------------------------------------------------------------------------
 # Step-10: role leases (Attention Rail T7)
 # ---------------------------------------------------------------------------
 
