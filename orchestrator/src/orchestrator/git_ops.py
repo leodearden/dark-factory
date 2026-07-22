@@ -125,6 +125,30 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 RecoverResult = Literal['rewound', 'cas_failed', 'error']
 
 
+# Return type for remove_merge_worktree_guarded — the C1 lease-enforced
+# removal primitive (PRD merge-worktree-lifecycle-integrity.md, task alpha).
+# 'removed'            — uncontended: the flock was free, the path existed,
+#                         and `git worktree remove --force` succeeded.
+# 'skipped_lease_held' — a LIVE merge-verify holds the tree's flock; removal
+#                         is skipped (never deferred/retried — true leaks are
+#                         collected later by the merge reaper's age-grace
+#                         sweep). A dead/stale holder never produces this
+#                         outcome: the kernel auto-releases a crashed
+#                         holder's flock, so the non-blocking acquire simply
+#                         succeeds and removal proceeds (fail-open).
+# 'skipped_persistent' — path resolves to persistent_merge_worktree_path or
+#                         persistent_offline_deep_worktree_path; persistent
+#                         lanes are never removed regardless of lease.
+# 'not_present'        — the flock was acquired but the path no longer
+#                         exists.
+# 'failed'              — the flock was acquired and the path existed, but
+#                         `git worktree remove --force` itself returned
+#                         non-zero.
+RemovalOutcome = Literal[
+    'removed', 'skipped_lease_held', 'skipped_persistent', 'not_present', 'failed',
+]
+
+
 # Single source of truth for the WIP safety-commit subject prefix produced by
 # _inter_iteration_rebase (workflow.py), and the requeue-rebase /
 # warm-lane-reclaim paths below (commit() call sites in this module). Any
@@ -8020,6 +8044,50 @@ class GitOps:
 
         logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
         return merge_wt, pre_merge_sha.strip()
+
+    async def remove_merge_worktree_guarded(
+        self, path: Path, *, reason: str,
+    ) -> RemovalOutcome:
+        """Remove a merge worktree, gated by its merge-verify flock (C1).
+
+        PRD: docs/prds/merge-worktree-lifecycle-integrity.md, task alpha.
+
+        Acquire-then-remove, never check-then-remove: non-blocking try-
+        acquires *path*'s per-lane merge-verify flock
+        (:func:`~orchestrator.verify_cancel.lane_lock_path`, the SAME inode
+        a verify holds via :meth:`merge_verify_lease`) and HOLDS it across
+        the ``git worktree remove`` — so no verify can start in the window
+        between a liveness check and the delete (the incident's 23s
+        TOCTOU). A live holder makes the non-blocking acquire fail
+        immediately, in which case removal is skipped
+        (``'skipped_lease_held'``) rather than deferred or retried; a dead
+        or stale holder's flock is auto-released by the kernel, so the
+        acquire simply succeeds and removal proceeds (fail-open, intrinsic
+        to flock — this method never consults holder liveness directly).
+
+        *reason* is a short caller-supplied label (e.g. the calling
+        function's name) recorded in logs for diagnostics.
+        """
+        fd = acquire_merge_verify_flock(lane_lock_path(path), 0.0)
+        if fd is None:
+            return 'skipped_lease_held'
+        try:
+            rc, _, err = await _run(
+                ['git', 'worktree', 'remove', str(path), '--force'],
+                cwd=self.project_root,
+            )
+            if rc == 0:
+                logger.info(
+                    'remove_merge_worktree_guarded: removed %s (reason=%s)', path, reason,
+                )
+                return 'removed'
+            logger.warning(
+                'remove_merge_worktree_guarded: failed to remove %s (reason=%s): %s',
+                path, reason, err,
+            )
+            return 'failed'
+        finally:
+            release_merge_verify_flock(fd)
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         """Remove a temporary merge worktree.
