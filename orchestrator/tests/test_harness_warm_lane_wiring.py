@@ -36,6 +36,7 @@ def _make_config(
     max_concurrent_tasks: int,
     warm_lane_pool: bool,
     spare_warm_lanes: int = 0,
+    warm_lane_prewarm: bool = False,
     tmp_path: Path,
 ) -> OrchestratorConfig:
     """Build a minimal OrchestratorConfig with the given warm-lane settings."""
@@ -46,7 +47,11 @@ def _make_config(
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=max_concurrent_tasks,
-        git=GitConfig(warm_lane_pool=warm_lane_pool, spare_warm_lanes=spare_warm_lanes),
+        git=GitConfig(
+            warm_lane_pool=warm_lane_pool,
+            spare_warm_lanes=spare_warm_lanes,
+            warm_lane_prewarm=warm_lane_prewarm,
+        ),
     )
 
 
@@ -2523,3 +2528,132 @@ class TestMidRunRecycleLeak:
             'the recycled lane must be released/unassigned after the '
             'failing re-seed, not left dangling on a stale pin'
         )
+
+
+# ===========================================================================
+# Task 2879 step-09: RED — Harness.run() eager warm-lane prewarm wiring.
+# Gated on BOTH git.warm_lane_pool AND the new git.warm_lane_prewarm knob;
+# called once at startup (after the reconcile sweeps, before finish_startup).
+# ===========================================================================
+
+
+def _neutralise_prewarm_startup(harness: Harness) -> None:
+    """Stub heavyweight startup/shutdown so run() reaches the prewarm wiring
+    point and then drains to a clean exit on an empty tree.
+
+    Extends test_harness_verify_scope_reaper._neutralise_heavy_startup with the
+    lane-reconcile sweeps that surround the prewarm call site, so none of them
+    do real git work against the (pool-configured) test repo.
+    """
+    harness.mcp = MagicMock()
+    harness.mcp.start = AsyncMock()
+    harness.mcp.stop = AsyncMock()
+    harness.mcp.url = 'http://localhost:0'
+    harness.usage_gate = None
+    harness.review_checkpoint = None
+
+    harness._build_lifecycle_registry()
+    assert harness._lifecycle is not None
+    harness._lifecycle.start_all = AsyncMock()
+    harness._lifecycle.stop_all = AsyncMock()
+
+    harness._load_persisted_scheduler_pause = AsyncMock()
+    harness._dismiss_stale_escalations = AsyncMock()
+    harness._file_dirty_tree_escalation = AsyncMock()
+    harness._rehydrate_merge_halt = MagicMock()
+    harness._recover_pending_merges = AsyncMock(return_value={})
+    harness._reap_orphaned_merge_worktrees = AsyncMock()
+    harness._reconcile_landed_outbox = AsyncMock()
+    harness._file_restored_pause_escalation = MagicMock()
+    harness._run_interactive_worktree_reaper_pass = AsyncMock()
+    harness._run_leftover_verify_scope_reaper_pass = AsyncMock()
+    harness._tag_task_modules = AsyncMock()
+    harness._recover_crashed_tasks = AsyncMock()
+    harness._reconcile_lane_checkouts = AsyncMock()
+    harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+    harness._reap_orphan_worktrees = AsyncMock()
+    harness._reconcile_terminal_lanes = AsyncMock()
+
+
+async def _build_prewarm_harness(
+    tmp_path: Path, *, warm_lane_pool: bool, warm_lane_prewarm: bool,
+) -> Harness:
+    """Real Harness over a real git repo with the given warm-lane knobs, with
+    heavyweight startup neutralised and git_ops.prewarm_pool spied."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    await _init_git_repo(repo)
+    config = OrchestratorConfig(
+        project_root=repo,
+        max_concurrent_tasks=3,
+        git=GitConfig(
+            warm_lane_pool=warm_lane_pool,
+            warm_lane_prewarm=warm_lane_prewarm,
+        ),
+    )
+    harness = Harness(config)
+    _neutralise_prewarm_startup(harness)
+    # Spy the prewarm primitive — never do real git work in the wiring test.
+    harness.git_ops.prewarm_pool = AsyncMock(  # type: ignore[method-assign]
+        return_value=None,
+    )
+    return harness
+
+
+async def _drive_startup_run(harness: Harness, monkeypatch) -> None:
+    """Drive run() through startup to a clean, immediate empty-tree exit."""
+    harness.scheduler.acquire_next = AsyncMock(return_value=None)
+    harness.scheduler.get_statuses = AsyncMock(return_value=({'1': 'pending'}, None))
+
+    async def _fake_sleep(_secs, *args, **kwargs):
+        return
+
+    monkeypatch.setattr('orchestrator.harness.asyncio.sleep', _fake_sleep)
+    await harness.run(
+        prd_path=None, dry_run=False, force_dirty_start=True, until_idle=True,
+    )
+
+
+@pytest.mark.asyncio
+class TestHarnessPrewarmWiring:
+    """run() calls git_ops.prewarm_pool exactly once at startup iff BOTH
+    warm_lane_pool and warm_lane_prewarm are set and the pool exists."""
+
+    async def test_prewarm_called_once_when_both_knobs_on(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        harness = await _build_prewarm_harness(
+            tmp_path, warm_lane_pool=True, warm_lane_prewarm=True,
+        )
+        assert harness.git_ops.warm_lane_pool is not None
+
+        await _drive_startup_run(harness, monkeypatch)
+
+        harness.git_ops.prewarm_pool.assert_awaited_once()  # type: ignore[attr-defined]
+
+    async def test_prewarm_not_called_when_knob_off(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Default (warm_lane_prewarm=False) with pool ON → never prewarms
+        (byte-identical to today)."""
+        harness = await _build_prewarm_harness(
+            tmp_path, warm_lane_pool=True, warm_lane_prewarm=False,
+        )
+        assert harness.git_ops.warm_lane_pool is not None
+
+        await _drive_startup_run(harness, monkeypatch)
+
+        harness.git_ops.prewarm_pool.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_prewarm_not_called_when_pool_off(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Pool OFF → never prewarms regardless of the prewarm knob."""
+        harness = await _build_prewarm_harness(
+            tmp_path, warm_lane_pool=False, warm_lane_prewarm=True,
+        )
+        assert harness.git_ops.warm_lane_pool is None
+
+        await _drive_startup_run(harness, monkeypatch)
+
+        harness.git_ops.prewarm_pool.assert_not_called()  # type: ignore[attr-defined]
