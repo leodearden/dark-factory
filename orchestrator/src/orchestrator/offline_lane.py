@@ -124,9 +124,7 @@ def _parse_infra_failures(text: str) -> list[str]:
 # stdout, so a malformed/usage-dumping invocation floods the numeric
 # confirmation seam with this text; real confirmed-failing test-ID output
 # never contains these markers.
-_VERIFY_USAGE_MARKER_RE = re.compile(
-    r'^\s*(?:Usage|Options):\s*$|^\s*verify\.sh:\s*ERROR\b'
-)
+_VERIFY_USAGE_MARKER_RE = re.compile(r'^\s*(?:Usage|Options):\s*$|^\s*verify\.sh:\s*ERROR\b')
 
 
 def _parse_confirmed_failures(text: str) -> list[str]:
@@ -868,9 +866,13 @@ class OfflineLaneWorker:
         seam-signature symmetry with injected runners, same as
         :meth:`_default_run_suite`.
 
-        Parses stdout as newline-separated test IDs; blank/whitespace-only
-        lines are skipped so trailing/blank output never becomes a spurious
-        "confirmed" entry.
+        Parses stdout via the module-level :func:`_parse_confirmed_failures`
+        helper: normal output is newline-separated test IDs (blank/whitespace-
+        only lines are skipped so trailing/blank output never becomes a
+        spurious "confirmed" entry), but a reify verify.sh usage/help/error
+        dump — which ``run-offline-deep.sh`` merges from stderr into stdout — is
+        rejected to ``[]`` rather than turned into bogus confirmed IDs (task
+        #5308).
         """
         argv = [_RUN_OFFLINE_DEEP_SCRIPT, '--test-threads=1', '--confirm-failed']
         env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
@@ -883,7 +885,7 @@ class OfflineLaneWorker:
         )
         stdout, _ = await proc.communicate()
         text = (stdout or b'').decode(errors='replace')
-        return [line.strip() for line in text.splitlines() if line.strip()]
+        return _parse_confirmed_failures(text)
 
     async def _default_run_infra(self, wt_path: Path, head: str, threads: int) -> tuple[int, str]:
         """Default ``infra_runner`` seam — runs reify's H9 host-infra scope (IE1).
