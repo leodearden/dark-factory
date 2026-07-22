@@ -15,6 +15,28 @@ from cockpit.backends.base import CommandRunner, DisplayTarget, FocusResult, Zon
 logger = logging.getLogger(__name__)
 
 
+def _window_id_int(raw: str | None) -> int | None:
+    """Parse a window id string to its integer value, base-autodetecting.
+
+    ``int(raw, 0)`` accepts both a ``0x``-prefixed hex string (wmctrl -l's
+    canonical column form, e.g. ``'0x03200007'``) and a bare decimal (what a
+    real terminal emulator exports in ``$WINDOWID``, e.g. ``'52428807'``) and
+    yields the SAME integer for the two encodings of one window. Fail-soft: a
+    missing (``None``) or unparseable id returns ``None`` so the caller skips
+    the id path rather than raising.
+
+    NOTE: this parse/canonicalize logic is mirrored (duplicated, not
+    shared/imported, since this is a cross-package boundary — cockpit must
+    never import orchestrator) in
+    ``orchestrator/src/orchestrator/session_hooks.py::_canonical_window_id``,
+    which keys on the identical ``int(s, 0)`` contract. Keep the two in sync.
+    """
+    try:
+        return int(raw, 0)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
 class WmBackend:
     """Focus/arrange sessions running under an X11 window manager (wmctrl/xdotool)."""
 
@@ -117,11 +139,20 @@ class WmBackend:
         when known) rather than a raw substring, so e.g. title 'a' can't
         false-positive against a longer title like 'session-a'.
 
+        The window-id comparison is by INTEGER identity (via `_window_id_int`
+        / `int(s, 0)`), not exact string: a session captured from a DECIMAL
+        `$WINDOWID` (e.g. '52428807') still matches wmctrl -l's canonical
+        zero-padded hex column ('0x03200007') because both parse to the same
+        int. An unparseable/missing id falls through fail-soft to the title
+        match.
+
         NOTE: this exact `split(None, 3)` parse is duplicated (not
         shared/imported, since this is a cross-package boundary) in
         `orchestrator/src/orchestrator/session_hooks.py::_resolve_wm_window_id`
         -- if the column layout or matching rule here ever changes, mirror
-        the change there too.
+        the change there too. The integer-identity window-id compare is
+        likewise mirrored by `session_hooks._canonical_window_id`'s
+        `int(s, 0)` contract (see `_window_id_int` above).
         """
         if not target.wm_title and not target.wm_window_id:
             logger.warning(
@@ -136,12 +167,13 @@ class WmBackend:
             )
             return False
 
+        target_id = _window_id_int(target.wm_window_id)
         for line in result.stdout.splitlines():
             columns = line.split(None, 3)
             if len(columns) < 4:
                 continue
             window_id, _desktop, _host, title = columns
-            if target.wm_window_id and window_id == target.wm_window_id:
+            if target_id is not None and _window_id_int(window_id) == target_id:
                 return True
             if target.wm_title and title == target.wm_title:
                 return True
