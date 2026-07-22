@@ -30,6 +30,8 @@ substring scan over-reports on exactly this shape.
 from __future__ import annotations
 
 import re
+import sqlite3
+from typing import NamedTuple
 
 LEAK_TAIL = re.compile(
     r'</(?:description|parameter|details)>\s*(<parameter\s+name="[^"]*">.*)$',
@@ -60,3 +62,44 @@ def detect_leak(text: object) -> str | None:
     if match is None:
         return None
     return match.group(0)
+
+
+class LeakMatch(NamedTuple):
+    """One confirmed leak: which DB/task/column it lives in and the fragment."""
+
+    db_path: str
+    tag: str
+    task_id: int
+    column: str
+    fragment: str
+
+
+def scan_db(db_path: str) -> list[LeakMatch]:
+    """Scan *db_path* read-only for leaked tool-call fragments.
+
+    Opens the database via a read-only SQLite URI (``mode=ro``) so the scan
+    is structurally incapable of mutating live task text — even while the
+    fused-memory server holds the same file open in WAL mode for concurrent
+    writers. Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
+    row; ``metadata`` is deliberately never read (see module docstring).
+    """
+    matches: list[LeakMatch] = []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(
+            "SELECT tag, id, title, description, details, test_strategy FROM tasks"
+        )
+        for tag, task_id, title, description, details, test_strategy in cursor:
+            values = {
+                "title": title,
+                "description": description,
+                "details": details,
+                "test_strategy": test_strategy,
+            }
+            for column in SCANNED_COLUMNS:
+                fragment = detect_leak(values[column])
+                if fragment is not None:
+                    matches.append(LeakMatch(db_path, tag, task_id, column, fragment))
+    finally:
+        conn.close()
+    return matches
