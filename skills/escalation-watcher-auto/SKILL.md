@@ -7,6 +7,10 @@ description: "Autonomous level-1 escalation watcher. Acts as the L1 consumer and
 
 You are running an autonomous, fully non-interactive level-1 escalation handler. Under the 3-tier escalation ladder, you are the **L1 consumer** — the triage funnel between the per-task stewards (L0) and the human (L2). Your job is to drain the L1 escalation queue, dispatch admin-class items without human involvement, perform shallow root-cause analysis, and **promote** everything requiring human judgment to L2 via `mcp__escalation__promote_to_l2` — either as individual 1-member items or as a **causal cluster** with a root-cause hypothesis, supporting evidence, and concrete options pre-formed. When your rotation limits are reached, emit the digest and exit cleanly.
 
+## Who runs this skill
+
+**The orchestrator harness embeds the rotation supervisor.** Every mention of "the supervisor" anywhere in this file — the rotation restarts, the force-kill grace window, the `BASH_MAX_TIMEOUT_MS` injection — refers to the harness's own `Harness._start_watcher_supervisor` / `Harness._run_watcher_rotation` (`orchestrator/src/orchestrator/harness.py`), which is on by default (`watcher_supervisor_enabled: true`, `orchestrator/src/orchestrator/defaults.yaml`). This skill is **never launched by hand** and manual/standalone launch is not a supported mode: the `mcp__escalation__*` tools this skill depends on only exist while an orchestrator process is up (the escalation MCP server is an in-process harness subsystem — `harness.py` registers `'escalation-server'`, and `escalation/src/escalation/server.py`'s `create_server` closes over one project's live harness). A hand-rolled `while true; claude -p /escalation-watcher-auto` launcher cannot substitute for it, and silently lacks everything a harness-run rotation provides: `BASH_MAX_TIMEOUT_MS` injection sized to the rotation (see [Waiting for the next L1](#waiting-for-the-next-l1)), the capped escalation connection headers (`X-Escalation-Levels: 0,1` / `X-Escalation-Identity`) that enforce the L2 authority boundary server-side (see [Hard Constraints](#hard-constraints--never-violate)), strict MCP config isolation, model/budget/max-turns pins, the actionable-L1 launch precheck, and the crashloop guard.
+
 ## Hard Constraints — NEVER VIOLATE
 
 - **NO terminal spawning.** Do not use `gnome-terminal`, `kitty`, `tmux`, `Bash(run_in_background)`, the `/spawn` skill, or any other form of background subprocess.
@@ -702,6 +706,15 @@ or
 ```
 Mode: LEGACY (promote_to_l2 not available — will leave pending + digest)
 ```
+
+---
+
+## Headless-mode permission gotchas (credit: external PR #4)
+
+External PR #4 (ryanthegecko) contributed a hand-rolled standalone supervisor loop for this skill that didn't land (see [Who runs this skill](#who-runs-this-skill) — the orchestrator harness already supervises rotations), but exercising non-interactive `claude -p` head-on surfaced two real permission findings worth recording for anyone spawning skills this way (cf. `skills/spawn`, eval bootstrap):
+
+- **MCP tools are NOT covered by permission-bypass mode in `-p` sessions.** Unlike Bash/Read/Edit-class tools, each MCP tool (e.g. `mcp__escalation__resolve_issue`, `mcp__fused-memory__update_task`) must be named explicitly in `--allowedTools` — a blanket bypass flag does not implicitly grant them.
+- **Bash allowlist prefix rules match the literal invoked command string.** A rule like `Bash(/path/to/script *)` matches only when the command starts with that literal prefix. An inline env-var prefix (`VAR=val /path/to/script ...`) changes the leading token and silently breaks the match. Export the variables in the calling shell instead of inlining them, and state absolute paths in the prompt rather than relying on the agent discovering environment variables it cannot read.
 
 ---
 
