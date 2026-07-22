@@ -198,3 +198,71 @@ class TestTaskMetaSymlinkResolution:
         assert ws.task_meta == expected
         # NOT the unresolved symlinked path.
         assert ws.task_meta != base_task_meta / worktree.name
+
+
+# ---------------------------------------------------------------------------
+# step-5: robust `.git` gitdir-parsing (hand-built dirs, no real git)
+# ---------------------------------------------------------------------------
+
+
+class TestGitdirParsingRobustness:
+    """step-5: compute_write_set fails LOUD (ValueError, naming the
+    worktree/`.git` path) on a missing/directory/malformed `.git`, and
+    correctly supports a RELATIVE `gitdir:` value (resolved against the
+    worktree) — real git itself writes relative gitdir files for
+    relocatable worktrees.
+
+    RED against step-2/4, which assumed an absolute, well-formed gitdir:
+    a missing/directory `.git` raises FileNotFoundError/IsADirectoryError
+    (not ValueError); malformed content silently yields a bogus cwd-relative
+    admindir; a relative gitdir value resolves against the process cwd
+    instead of the worktree.
+    """
+
+    def test_missing_git_file_raises_value_error(self, tmp_path: Path, tmp_home: Path):
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with pytest.raises(ValueError) as exc_info:
+            compute_write_set(worktree, home=tmp_home)
+        assert str(worktree / '.git') in str(exc_info.value)
+
+    def test_git_is_directory_raises_value_error(self, tmp_path: Path, tmp_home: Path):
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        (worktree / '.git').mkdir()
+
+        with pytest.raises(ValueError) as exc_info:
+            compute_write_set(worktree, home=tmp_home)
+        assert str(worktree / '.git') in str(exc_info.value)
+
+    @pytest.mark.parametrize('content', ['', 'garbage\n'])
+    def test_git_content_without_gitdir_prefix_raises_value_error(
+        self, tmp_path: Path, tmp_home: Path, content: str,
+    ):
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        (worktree / '.git').write_text(content)
+
+        with pytest.raises(ValueError) as exc_info:
+            compute_write_set(worktree, home=tmp_home)
+        assert str(worktree / '.git') in str(exc_info.value)
+
+    def test_relative_gitdir_resolves_relative_to_worktree(
+        self, tmp_path: Path, tmp_home: Path,
+    ):
+        # Hand-built admin layout — no real `git` subprocess involved.
+        main = tmp_path / 'main-repo'
+        main_git = main / '.git'
+        admin = main_git / 'worktrees' / 'my-wt'
+        admin.mkdir(parents=True)
+        (main_git / 'objects').mkdir(parents=True)
+
+        worktree = tmp_path / 'my-wt'
+        worktree.mkdir()
+        (worktree / '.git').write_text('gitdir: ../main-repo/.git/worktrees/my-wt\n')
+
+        ws = compute_write_set(worktree, home=tmp_home)
+
+        assert ws.git_worktree_admin == admin.resolve()
+        assert ws.git_objects == (main_git / 'objects').resolve()
