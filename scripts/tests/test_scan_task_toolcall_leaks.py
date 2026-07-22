@@ -25,6 +25,8 @@ from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
     discover_db_paths,
+    format_json,
+    format_report,
     scan_db,
 )
 
@@ -316,3 +318,76 @@ def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
     result = discover_db_paths(project_roots=[str(root)])
 
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# format_report(matches) -> str / format_json(matches) -> str
+# ---------------------------------------------------------------------------
+
+def test_format_report_empty_list_yields_explicit_no_leaks_message():
+    report = format_report([])
+    assert "no leaked tool-call fragments found" in report
+
+
+def test_format_report_groups_by_db_path_and_shows_match_fields():
+    matches = [
+        LeakMatch("/a/tasks.db", "master", 2, "description", GENUINE_DESCRIPTION_LEAK_FRAGMENT),
+        LeakMatch("/a/tasks.db", "master", 3, "details", DETAILS_LEAK_FRAGMENT),
+        LeakMatch("/b/tasks.db", "master", 10, "description", CHAINED_PARAMETER_LEAK_FRAGMENT),
+    ]
+
+    report = format_report(matches)
+
+    assert "/a/tasks.db" in report
+    assert "/b/tasks.db" in report
+    for m in matches:
+        assert str(m.task_id) in report
+        assert m.tag in report
+        assert m.column in report
+    assert "3 leaked fragments across 3 tasks" in report
+
+
+def test_format_report_summary_counts_distinct_tasks_not_fragments():
+    """A task with leaks in two columns must count once toward "tasks", even
+    though it contributes two lines/fragments to the report."""
+    matches = [
+        LeakMatch("/a/tasks.db", "master", 5, "description", GENUINE_DESCRIPTION_LEAK_FRAGMENT),
+        LeakMatch("/a/tasks.db", "master", 5, "details", DETAILS_LEAK_FRAGMENT),
+        LeakMatch("/a/tasks.db", "master", 6, "description", CHAINED_PARAMETER_LEAK_FRAGMENT),
+    ]
+
+    report = format_report(matches)
+
+    assert "3 leaked fragments across 2 tasks" in report
+
+
+def test_format_report_truncates_long_fragment():
+    long_fragment = '</description>\n<parameter name="details">' + "x" * 500
+    matches = [LeakMatch("/a/tasks.db", "master", 1, "description", long_fragment)]
+
+    report = format_report(matches)
+
+    assert "x" * 500 not in report, "the full fragment must be truncated, not dumped verbatim"
+
+
+def test_format_json_is_parseable_and_carries_full_untruncated_fragment():
+    matches = [
+        LeakMatch("/a/tasks.db", "master", 2, "description", SWALLOWED_DETAILS_FRAGMENT),
+    ]
+
+    payload = format_json(matches)
+    parsed = json.loads(payload)
+
+    assert parsed == [
+        {
+            "db_path": "/a/tasks.db",
+            "tag": "master",
+            "task_id": 2,
+            "column": "description",
+            "fragment": SWALLOWED_DETAILS_FRAGMENT,
+        },
+    ]
+
+
+def test_format_json_empty_list_is_empty_array():
+    assert json.loads(format_json([])) == []
