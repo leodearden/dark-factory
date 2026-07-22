@@ -18,6 +18,17 @@ Backend = Literal['auto', 'bwrap', 'landlock', 'none']
 
 _preferred: Backend = 'auto'
 
+# Process-global escalation-dedup state for resolve_backend_or_refuse (task
+# 2908, INV-4). Keyed on the configured backend string (_preferred): holds the
+# backend state for which a fail-closed escalation was last signalled, so the
+# escalation fires exactly ONCE across N consecutive refusals and re-arms when
+# the backend state changes. Lives here — alongside the process-global
+# _preferred — rather than on a per-task TaskWorkflow, because the dedup is
+# shared across every workflow in one orchestrator process. Reset (re-armed) on
+# ANY non-refusing return of resolve_backend_or_refuse (healthy backend OR the
+# 'none' escape hatch).
+_escalated_backend_state: str | None = None
+
 
 def set_backend(name: Backend) -> None:
     """Set the preferred sandbox backend. Called once at orchestrator startup.
@@ -121,24 +132,47 @@ def resolve_backend_or_refuse() -> Backend:
     - RAISE ``SandboxUnavailable`` when the configured backend (auto/landlock/
       bwrap) resolves to nothing.
     """
+    global _escalated_backend_state
     if _preferred == 'none':
         logger.warning(
             'sandbox enabled + role sandboxed but backend=none — running '
             'UNSANDBOXED (operator escape hatch)',
         )
+        # Non-refusing return -> re-arm the dedup so a later re-break re-fires.
+        _escalated_backend_state = None
         return 'none'
     resolved = resolve_active_backend()
     if resolved != 'none':
+        # Healthy backend -> re-arm the dedup (recovery re-fires on next break).
+        _escalated_backend_state = None
         return resolved
+    # Refusal path: signal escalate only when the backend state differs from the
+    # one we last escalated for (INV-4: exactly one escalation across N refusals,
+    # re-armed on any backend-state change).
+    should = _escalated_backend_state != _preferred
+    if should:
+        _escalated_backend_state = _preferred
     raise SandboxUnavailable(
         f'Sandboxing is required (sandbox.enabled + role.sandboxed) but the '
         f'configured backend={_preferred!r} resolved to no available OS '
         f'sandbox (landlock/bwrap). Refusing to launch the agent unconfined '
         f'(fail-closed, PRD D4). Install/enable landlock or bwrap, or set '
         f'sandbox.backend=none to explicitly run unsandboxed.',
-        should_escalate=True,
+        should_escalate=should,
         backend_state=_preferred,
     )
+
+
+def reset_escalation_dedupe() -> None:
+    """Re-arm the process-global fail-closed escalation dedup (test-only).
+
+    Clears ``_escalated_backend_state`` so the next refusal re-signals escalate.
+    Exposed for test fixtures that must isolate the process-global dedup state
+    between tests; production re-arms implicitly on any non-refusing return of
+    ``resolve_backend_or_refuse``.
+    """
+    global _escalated_backend_state
+    _escalated_backend_state = None
 
 
 def wrap_command(
