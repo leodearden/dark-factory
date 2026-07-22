@@ -249,6 +249,35 @@ class TestMergeVerifySpec:
         assert restored.merge_verify_workspace is False
         assert restored.merge_verify_breadth == "scoped"
 
+    # --- INV-1, task 2883: global_verify_command back-compat -----------------
+
+    def test_from_dict_back_compat_missing_global_verify_command(self):
+        """BACK-COMPAT (d): a legacy dict WITHOUT the 'global_verify_command'
+        key deserialises to None (mirrors the profile-keys d.get idiom)."""
+        legacy = self._make_spec().to_dict()
+        legacy.pop("global_verify_command", None)
+        restored = MergeVerifySpec.from_dict(legacy)
+        assert restored.global_verify_command is None
+
+    def test_global_verify_command_round_trips_to_dict(self):
+        """A directly-set global_verify_command survives to_dict -> from_dict."""
+        spec = MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=("docs/x.md",),
+            verify_env={},
+            cold_timeout_secs=300.0,
+            global_verify_command=VerifyCommand(
+                prefix="",
+                test_command="cargo test --workspace",
+                lint_command="cargo clippy --workspace",
+                type_check_command="pyright",
+            ),
+        )
+        restored = MergeVerifySpec.from_dict(spec.to_dict())
+        assert restored.global_verify_command == spec.global_verify_command
+        assert restored == spec
+
 
 # ---------------------------------------------------------------------------
 # VerifyResult codec  (result_to_dict / result_from_dict)
@@ -1191,7 +1220,10 @@ class TestBuildMergeVerifySpec:
         mc.type_check_command = type_check_cmd
         return mc
 
-    def _make_config(self, *, verify_env=None, cold_timeout=None):
+    def _make_config(
+        self, *, verify_env=None, cold_timeout=None,
+        test_cmd=None, lint_cmd=None, type_check_cmd=None,
+    ):
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.verify_env = verify_env or {}
         config.effective_verify_env = verify_env or {}
@@ -1202,6 +1234,13 @@ class TestBuildMergeVerifySpec:
         # (a bare MagicMock attr is not JSON-serialisable in spec_to_json).
         config.merge_verify_workspace = False
         config.merge_verify_breadth = 'scoped'
+        # INV-1, task 2883: build_merge_verify_spec now reads the global
+        # full-gate commands to source spec.global_verify_command when the
+        # scope resolves to zero module_configs. Default None (a bare MagicMock
+        # attr is truthy and not JSON-serialisable), overridable per-test.
+        config.test_command = test_cmd
+        config.lint_command = lint_cmd
+        config.type_check_command = type_check_cmd
         return config
 
     def test_verify_commands_project_module_fields(self):
@@ -1260,6 +1299,9 @@ class TestBuildMergeVerifySpec:
         config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
         config.verify_cold_command_timeout_secs = 3600.0
+        config.test_command = None
+        config.lint_command = None
+        config.type_check_command = None
         spec = build_merge_verify_spec(config, [], None)
         assert spec.cold_timeout_secs == 3600.0
 
@@ -1270,6 +1312,9 @@ class TestBuildMergeVerifySpec:
         config.effective_verify_env = {}
         config.merge_verify_cold_command_timeout_secs = None
         config.verify_cold_command_timeout_secs = None
+        config.test_command = None
+        config.lint_command = None
+        config.type_check_command = None
         spec = build_merge_verify_spec(config, [], None)
         assert spec.cold_timeout_secs == 0.0
 
@@ -1277,6 +1322,65 @@ class TestBuildMergeVerifySpec:
         from orchestrator.verify_runner import build_merge_verify_spec
         spec = build_merge_verify_spec(self._make_config(), [], None)
         assert spec.is_merge_verify is True
+
+    # --- INV-1, task 2883: ship the global full-gate commands for a
+    # zero-module-config project (reify) so the remote runs the SAME gate as
+    # local, not its own possibly-stale config (fidelity hole behind 966f23a6).
+
+    def test_global_verify_command_sourced_when_no_module_configs(self):
+        """(a) With NO module_configs, spec.global_verify_command carries the
+        config's three global full-gate commands (prefix='')."""
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = self._make_config(
+            test_cmd='cargo test --workspace',
+            lint_cmd='cargo clippy --workspace',
+            type_check_cmd='pyright',
+        )
+        spec = build_merge_verify_spec(config, [], ('docs/x.md',))
+        assert spec.global_verify_command is not None
+        gvc = spec.global_verify_command
+        assert gvc.prefix == ''
+        assert gvc.test_command == 'cargo test --workspace'
+        assert gvc.lint_command == 'cargo clippy --workspace'
+        assert gvc.type_check_command == 'pyright'
+
+    def test_global_verify_command_none_when_module_configs_present(self):
+        """(b) With a non-empty module_configs the global command is NOT
+        sourced — the per-module verify_commands already drive the gate."""
+        from orchestrator.verify_runner import build_merge_verify_spec
+        config = self._make_config(
+            test_cmd='cargo test --workspace',
+            lint_cmd='cargo clippy --workspace',
+            type_check_cmd='pyright',
+        )
+        mc = self._make_module_config('src/a', test_cmd='pytest src/a')
+        spec = build_merge_verify_spec(config, [mc], ('src/a/mod.py',))
+        assert spec.global_verify_command is None
+
+    def test_global_verify_command_none_when_no_global_commands(self):
+        """A command-less config (all global commands None) with no
+        module_configs sources NO global command (nothing to ship)."""
+        from orchestrator.verify_runner import build_merge_verify_spec
+        spec = build_merge_verify_spec(self._make_config(), [], ('docs/x.md',))
+        assert spec.global_verify_command is None
+
+    def test_global_verify_command_round_trips_json_codec(self):
+        """(c) spec_from_json(spec_to_json(spec)) preserves global_verify_command."""
+        from orchestrator.verify_runner import (
+            build_merge_verify_spec,
+            spec_from_json,
+            spec_to_json,
+        )
+        config = self._make_config(
+            verify_env={'K': 'V'}, cold_timeout=300.0,
+            test_cmd='cargo test --workspace',
+            lint_cmd='cargo clippy --workspace',
+            type_check_cmd='pyright',
+        )
+        spec = build_merge_verify_spec(config, [], ('docs/x.md',))
+        restored = spec_from_json(spec_to_json(spec))
+        assert restored == spec
+        assert restored.global_verify_command == spec.global_verify_command
 
     def test_result_roundtrips_json_codec(self):
         from orchestrator.verify_runner import build_merge_verify_spec, spec_from_json, spec_to_json
