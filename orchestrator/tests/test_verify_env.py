@@ -181,6 +181,30 @@ class TestOrchEnvScrub:
         assert env["ORCH_CONFIG_PATH"] == "/custom/path.yaml"
         assert env["DF_VERIFY_ROLE"] == "merge"
 
+    def test_non_prefixed_lookalike_keys_survive(self, monkeypatch):
+        # Lock the scrub to the ``ORCH_`` PREFIX (``startswith``), NOT a
+        # substring match: a var that merely contains "ORCH", or starts with
+        # "ORCH" but not the "ORCH_" prefix, is a distinct namespace and must
+        # pass through untouched.  A future refactor to substring matching would
+        # silently over-scrub these — this test catches that regression.
+        fake_environ = {
+            "ORCH_CONFIG_PATH": "/prod.yaml",  # real ORCH_ prefix — scrubbed
+            "ORCHARD_HOME": "/orchard",  # "ORCH" but not the "ORCH_" prefix
+            "MY_ORCH_CONFIG": "/my",  # "ORCH_" only as a substring, not prefix
+            "FOO_ORCH": "1",  # "ORCH" only as a substring, not prefix
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None)
+
+        # the genuine ORCH_-prefixed var is scrubbed ...
+        assert "ORCH_CONFIG_PATH" not in env
+        # ... but the non-prefixed lookalikes all survive
+        assert env["ORCHARD_HOME"] == "/orchard"
+        assert env["MY_ORCH_CONFIG"] == "/my"
+        assert env["FOO_ORCH"] == "1"
+
 
 class TestStripVenvBinFromPath:
     def test_removes_leading_venv_bin(self):
