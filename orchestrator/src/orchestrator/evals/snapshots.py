@@ -214,7 +214,11 @@ async def create_eval_worktree(
     """
     project_root = Path(project_root)
     run_id = uuid4().hex[:8]
-    worktree_path = project_root / '.eval-worktrees' / task_id / f'run-{run_id}'
+    # Placed OUTSIDE project_root (a sibling of the repo) via eval_worktree_root
+    # so a nested pytest/pyright/ruff/cargo run inside the worktree cannot walk
+    # up and collect the live main repo's ancestor config, which would shadow
+    # the fixture's pinned pre_task_commit code (Defect B, task 2881).
+    worktree_path = eval_worktree_root(project_root) / task_id / f'run-{run_id}'
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     await _run(

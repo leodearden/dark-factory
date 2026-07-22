@@ -130,7 +130,9 @@ class TestCreateEvalWorktreeHeadAssertion:
             asyncio.run(create_eval_worktree(repo, 'test_task', first))
 
         # Cleanup any worktree git left behind before the assertion fired.
-        for child in (repo / '.eval-worktrees' / 'test_task').glob('run-*'):
+        for child in (
+            snapshots.eval_worktree_root(repo) / 'test_task'
+        ).glob('run-*'):
             subprocess.run(
                 ['git', 'worktree', 'remove', '--force', str(child)],
                 cwd=str(repo),
