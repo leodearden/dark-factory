@@ -2398,6 +2398,15 @@ class GitOps:
             cwd=self.project_root,
         )
 
+        # ── Disable auto-gc/maintenance on the shared repo ─────────────
+        # PRD os-sandbox α5 (D2 corollary): reassert gc.auto=0 /
+        # maintenance.auto=false on every worktree-create so background
+        # auto-gc never fires under the narrow shared-.git write-set (and
+        # any config drift/re-clone is re-covered).  Idempotent & best-effort
+        # (never raises) — same "safe to run every time" shape as the
+        # core.hooksPath block above.
+        await self.disable_shared_repo_auto_maintenance()
+
         # ── Resolve start-ref: train-predecessor tip or freshened main ──
         # PRD § 9.4: when a train member has order > 0, branch from the prior
         # member's branch tip so the chain is contiguous.  order=0 (degenerate
