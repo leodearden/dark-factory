@@ -214,6 +214,66 @@ class TestOrphanL0Reaper:
         assert await harness._reap_orphan_l0_escalations() == 0
 
     @pytest.mark.asyncio
+    async def test_live_holder_l0_not_promoted(self, harness: Harness):
+        """Task 2878: kill the stale-snapshot FP race against live
+        redispatches.
+
+        A divergence-class L0 (filed by
+        ``TaskWorkflow._check_scope_invariant`` when metadata.files trails
+        plan.files during in-flight scope reconciliation) is aged past
+        ``orphan_l0_timeout_secs`` and its task_id is no longer in
+        ``_escalation_events`` — the dict is popped on workflow-slot exit
+        and goes stale across a coordinated batch-redispatch tick, even
+        though the scheduler still shows the task actively holding its
+        metadata.files locks (a live/re-dispatched workflow). The reaper
+        must re-check live holder state via ``Scheduler.is_actively_held``
+        before promoting, and skip (fail-safe wait) when it is True.
+
+        RED on main: the reaper ignores live holder state and promotes the
+        L0 unconditionally once it's absent from ``_escalation_events`` and
+        aged out, so count == 1 and an L1 is filed instead of 0/none.
+        """
+        assert harness._escalation_queue is not None
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-42'),
+            task_id='task-42',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task task-42'
+            ),
+            detail='detail',
+            # MUST NOT be 'verify_wip_reconciliation' — that would route
+            # through _is_done_step_commit_orphan's get_task branch, which
+            # this test does not stub.
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Deliberately NOT added to harness._escalation_events, so the
+        # stale-snapshot gate alone would not skip it.
+
+        # Scheduler shows the task actively holding its metadata.files
+        # locks right now — a live/re-dispatched workflow.
+        harness.scheduler.is_actively_held.return_value = True
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+
+    @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
