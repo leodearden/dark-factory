@@ -528,6 +528,7 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(120)  # task 2921: two subprocesses now (import baseline + contended run)
 def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
 
@@ -556,6 +557,25 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
+
+    # task 2921: same-process-shaped bare-import baseline, spawned BEFORE
+    # the holder flock is acquired below -- measures the load-sensitive
+    # `from orchestrator.cli import main` import cost in isolation so it
+    # can be subtracted from the contended run's `elapsed` (see
+    # flock_component below).
+    import_started = time.monotonic()
+    import_proc = subprocess.Popen(
+        [sys.executable, '-c', 'from orchestrator.cli import main'],
+        env=subprocess_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    import_stdout, import_stderr = import_proc.communicate(timeout=45)
+    import_cost = time.monotonic() - import_started
+    assert import_proc.returncode == 0, (
+        f'expected the bare-import baseline probe to exit 0, got '
+        f'{import_proc.returncode}; stderr={import_stderr.decode()[:2000]!r}'
+    )
 
     write_lock_holder_pgid(worktree_base, 999999)
     lock_path = merge_verify_lock_path(worktree_base)
