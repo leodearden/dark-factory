@@ -1149,3 +1149,111 @@ class TestJudgeCapWaitSanityBound:
         ):
             await judge._call_judge_cli('p')
         assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Judge._call_judge_cli infra-vs-content taxonomy (task 2947 ask a)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCallJudgeCliTaxonomy:
+    """_call_judge_cli distinguishes transport/infra failures (JudgeInfraError)
+    from a genuine benign empty verdict ('') and success (output.strip()).
+
+    Infra failures must NOT reach _parse_verdict (where a cap-storm CLI failure
+    was being fabricated into a phantom severity=serious halt); they must raise
+    a typed JudgeInfraError so review_run can apply bounded backoff and a
+    truthful judge-unreachable halt at threshold.
+    """
+
+    def _judge(self):
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+        )
+        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+
+    @pytest.mark.asyncio
+    async def test_api_error_raises_judge_infra_error(self):
+        """(a) A cap-storm api_error (api_error_status set, empty stdout) is
+        classified API_ERROR → JudgeInfraError, NOT a benign '' or a plain
+        RuntimeError, and never reaches _parse_verdict."""
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(success=False, output='', api_error_status=429)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            with pytest.raises(JudgeInfraError):
+                await judge._call_judge_cli('prompt')
+
+    @pytest.mark.asyncio
+    async def test_timed_out_raises_judge_infra_error(self):
+        """(b) A judge CLI timeout is classified TIMED_OUT → JudgeInfraError."""
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(success=False, output='', timed_out=True)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            with pytest.raises(JudgeInfraError):
+                await judge._call_judge_cli('prompt')
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_output_stays_benign(self):
+        """(c) A genuine exit-0/empty-stdout run (subtype='error_empty_output',
+        no api_error, not timed out) stays the benign '' legacy contract."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            api_error_status=None,
+            timed_out=False,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            assert await judge._call_judge_cli('prompt') == ''
+
+    @pytest.mark.asyncio
+    async def test_success_returns_stripped_output(self):
+        """(d) A successful run returns result.output.strip()."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        result = AgentResult(success=True, output='  {"severity": "ok"}  \n')
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            assert await judge._call_judge_cli('prompt') == '{"severity": "ok"}'
+
+    @pytest.mark.asyncio
+    async def test_all_accounts_capped_raises_judge_infra_error(self):
+        """(e) AllAccountsCappedException (cap-wait exhaustion) is re-raised as
+        JudgeInfraError so cap-wait exhaustion is counted/backed-off like other
+        transport failures instead of propagating opaquely to review_run's broad
+        except."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
+        ):
+            with pytest.raises(JudgeInfraError):
+                await judge._call_judge_cli('prompt')
