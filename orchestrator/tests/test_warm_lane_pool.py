@@ -1019,6 +1019,81 @@ async def _add_seed_and_debug_port_scripts(repo: Path, port: int = 39411) -> Pat
     return scripts_dir
 
 
+async def _head_is_detached(lane: Path) -> bool:
+    """True iff *lane*'s HEAD is detached (``git symbolic-ref -q HEAD`` fails)."""
+    rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane)
+    return rc != 0
+
+
+@pytest.mark.asyncio
+class TestPrewarmPool:
+    """GitOps.prewarm_pool eagerly materializes every pool lane to the same
+    at-rest state a released idle lane has: a registered worktree on a DETACHED
+    HEAD with a seeded target/, left FREE (task 2879)."""
+
+    async def test_fresh_pool_materializes_all_lanes(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """On a fresh pool (no on-disk lanes) prewarm materializes all N lanes."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.prewarm_pool(start_ref)
+
+        base = git_ops.worktree_base
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        for k in range(3):
+            lane = base / f'_lane-{k}'
+            # (a) registered worktree on disk
+            assert await git_ops._is_registered_worktree(lane), (
+                f'{lane} must be a registered worktree after prewarm'
+            )
+            # (b) DETACHED HEAD, no task/... branch, at start_ref
+            assert await _head_is_detached(lane), (
+                f'{lane} HEAD must be detached (no task branch) after prewarm'
+            )
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+            assert head_sha.strip() == start_ref
+            # (c) seeded target/seeded.bin (proof _seed_warm_lane ran)
+            assert (lane / 'target' / 'seeded.bin').exists(), (
+                f'{lane}/target/seeded.bin must exist (seed ran)'
+            )
+            # (d) pool slot still FREE — prewarm must NOT acquire
+            assert pool.state(lane) == LaneState.FREE, (
+                f'{lane} pool slot must stay FREE after prewarm'
+            )
+
+        # (e) structured accounting
+        assert result.target == 3
+        assert result.materialized == 3
+        assert result.already_resident == 0
+        assert result.failed == 0
+
+    async def test_prewarm_creates_no_task_branch(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """No ``task/...`` branch is fabricated for any prewarmed lane."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        await git_ops.prewarm_pool(start_ref)
+
+        # No branch named after any lane exists; the branch namespace carries no
+        # task/_lane-* refs (prewarm uses --detach, never -b).
+        _, branches, _ = await _run(
+            ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads/task/'],
+            cwd=wl_git_repo,
+        )
+        assert branches.strip() == '', (
+            f'prewarm must not fabricate any task/ branch; got: {branches!r}'
+        )
+
+
 @pytest.mark.asyncio
 class TestAcquireWarmLaneCreateOnce:
     """acquire_warm_lane creates a new worktree+branch and seeds it on first call."""
