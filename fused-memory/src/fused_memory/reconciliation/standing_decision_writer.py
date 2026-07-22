@@ -23,12 +23,19 @@ here are EVIDENCE reads — a separate concern from record reads.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
+    STANDING_DECISION_TTL_DAYS,
+    STATE_ACTIVE,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Evidence-ref vocabulary
@@ -242,3 +249,148 @@ async def evaluate_evidence_gate(
         resolved_evidence=resolved,
         rejection=rejection,
     )
+
+
+# ---------------------------------------------------------------------------
+# Writer
+# ---------------------------------------------------------------------------
+
+# Evidence-payload marker for an operator/backfill (η) authorization bypass.
+EVIDENCE_TYPE_OPERATOR_AUTHORIZATION = 'operator_authorization'
+
+
+class EvidenceGateRejected(Exception):
+    """Raised by :func:`write_entity_standing_decision` when the evidence gate is
+    not satisfied and no ``authorized_by`` override was supplied.
+
+    Carries the structured ``.rejection`` dict (the same
+    ``insufficient_evidence`` payload :func:`evaluate_evidence_gate` builds) so
+    the Stage-2 state method can catch it and return the dict to the LLM
+    verbatim — matching the recon-report cite_* returned-error convention.
+    """
+
+    def __init__(self, rejection: dict[str, Any]) -> None:
+        self.rejection = rejection
+        message = (
+            rejection.get('hint')
+            if isinstance(rejection, dict)
+            else str(rejection)
+        )
+        super().__init__(message or 'insufficient_evidence')
+
+
+async def write_entity_standing_decision(
+    memory_service: Any,
+    *,
+    project_id: str,
+    entity_uuid: str,
+    grounds: str,
+    evidence: Any,
+    authorized_by: str | None = None,
+) -> dict[str, Any]:
+    """Write one ACTIVE entity standing decision to α's ledger (gated).
+
+    Mirrors ``flag_dedup.write_suppression_record``: authoritative SQLite-ledger
+    write + a best-effort mem0 mirror (reads never consult mem0 for the RECORD).
+
+    Flow:
+
+    1. Resolve the cited evidence refs once (payload provenance). With an
+       ``authorized_by`` override (operator/interactive/backfill η), append an
+       operator-authorization provenance entry and SKIP the gate. Otherwise run
+       :func:`evaluate_evidence_gate` and raise :class:`EvidenceGateRejected`
+       (carrying the structured rejection) when neither arm is satisfied — no
+       row is written.
+    2. Sample the decision-time edge-count fingerprint via graphiti; a sampling
+       failure PROPAGATES (loud-over-silent, INV-1) rather than persisting a row
+       with a bogus count that would corrupt ζ's growth sweep.
+    3. Compute ``decided_at = now(UTC)`` and ``expires_at = decided_at +
+       STANDING_DECISION_TTL_DAYS``; upsert the ACTIVE row through α's
+       ``upsert_entity_standing_decision`` (which validates
+       ``grounds ∈ GROUNDS_ENUM`` and never-None ``expires_at``, raising
+       ``ValueError`` on violation).
+    4. Best-effort mirror to mem0 for ε's advisory check — its metadata carries
+       the record kind + entity_uuid + grounds. A mirror failure is swallowed
+       and never blocks the authoritative ledger write.
+
+    Returns ``{status:'written', entity_uuid, grounds, edge_count_at_decision,
+    expires_at, decided_at}``.
+    """
+    if authorized_by:
+        resolved = await resolve_evidence_refs(memory_service, project_id, evidence)
+        resolved.append(
+            {
+                'type': EVIDENCE_TYPE_OPERATOR_AUTHORIZATION,
+                'authorized_by': authorized_by,
+                'locally_resolved': False,
+            }
+        )
+    else:
+        gate = await evaluate_evidence_gate(
+            memory_service,
+            project_id=project_id,
+            entity_uuid=entity_uuid,
+            evidence=evidence,
+        )
+        if not gate.satisfied:
+            raise EvidenceGateRejected(gate.rejection or {})
+        resolved = gate.resolved_evidence
+
+    # Decision-time edge-count fingerprint — loud-fail (no row) on a sampling
+    # error rather than persisting a poisoned count.
+    edges = await memory_service.graphiti.get_valid_edges_for_node(
+        entity_uuid, group_id=project_id
+    )
+    edge_count_at_decision = len(edges)
+
+    decided_dt = datetime.now(UTC)
+    decided_at = decided_dt.isoformat()
+    expires_at = (decided_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
+
+    await memory_service.recon_ledger.upsert_entity_standing_decision(
+        project_id=project_id,
+        entity_uuid=entity_uuid,
+        grounds=grounds,
+        decided_at=decided_at,
+        expires_at=expires_at,
+        edge_count_at_decision=edge_count_at_decision,
+        evidence=resolved,
+        state=STATE_ACTIVE,
+    )
+
+    # Best-effort mem0 mirror (ε advisory check) — never blocks the ledger write.
+    try:
+        await memory_service.add_memory(
+            content=(
+                f'ENTITY STANDING DECISION entity_uuid={entity_uuid} grounds={grounds}'
+            ),
+            category='observations_and_summaries',
+            metadata={
+                'kind': RECORD_KIND_ENTITY_STANDING_DECISION,
+                'entity_uuid': entity_uuid,
+                'grounds': grounds,
+                'edge_count_at_decision': edge_count_at_decision,
+                'decided_at': decided_at,
+                'expires_at': expires_at,
+            },
+            project_id=project_id,
+            _source=RECORD_KIND_ENTITY_STANDING_DECISION,
+        )
+    except Exception:
+        logger.debug(
+            'write_entity_standing_decision: mem0 mirror failed for '
+            'entity_uuid=%s grounds=%s project_id=%s (ledger row already committed)',
+            entity_uuid,
+            grounds,
+            project_id,
+            exc_info=True,
+        )
+
+    return {
+        'status': 'written',
+        'entity_uuid': entity_uuid,
+        'grounds': grounds,
+        'edge_count_at_decision': edge_count_at_decision,
+        'expires_at': expires_at,
+        'decided_at': decided_at,
+    }
