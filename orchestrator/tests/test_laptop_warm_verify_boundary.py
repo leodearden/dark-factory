@@ -548,10 +548,17 @@ def measure_uncontended_baseline_secs(
     baseline -- which measures only module-import cost -- this captures the
     FULL pre-flock-wait CLI startup the contended run also pays before it
     ever reaches the flock gate: interpreter startup, the same import, Click
-    dispatch, config load (pydantic/YAML), and GitOps construction, plus the
-    trivial fast_spec build. Only a same-shape baseline cancels that whole
-    load-sensitive startup term when subtracted from the contended run's
-    elapsed time (see test_flock_wait_env_override_speeds_up_contention_result).
+    dispatch, config load (pydantic/YAML), and GitOps construction. A
+    same-shape baseline cancels that shared startup term when subtracted
+    from the contended run's elapsed time (see
+    test_flock_wait_env_override_speeds_up_contention_result) -- but only
+    that term: because the baseline never contends, it also proceeds PAST
+    the flock gate into fast_spec's trivial build and the merge itself,
+    which the contended run never reaches (it returns immediately on
+    FLOCK_CONTENTION_CATEGORY). That post-gate build+merge work has no
+    counterpart in the contended run, so it biases the flock_component
+    discriminant downward by that (normally trivial) amount rather than
+    cancelling out.
 
     Guards that the baseline itself never contends: a contended baseline
     would fold a flock wait into the subtrahend and silently corrupt the
@@ -678,11 +685,17 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     `baseline_cost` is now measured via
     :func:`measure_uncontended_baseline_secs`, a SAME-SHAPE uncontended
     verify-merge (same spawn path, spec, and config as the contended run
-    below) that pays that entire pre-flock-gate startup too, so the
-    subtraction cancels it in full: an honored override leaves
-    flock_component ~= 0.0 (clamped); an un-wired override leaves it at
-    ~10s minus the shared startup tail -- load-robust and still
-    regression-catching either way.
+    below) that pays that same pre-flock-gate startup too, so the
+    subtraction cancels the shared startup term: an honored override
+    leaves flock_component ~= 0.0 (clamped); an un-wired override leaves
+    it at ~10s minus the shared startup tail -- load-robust and still
+    regression-catching either way. This cancellation is exact only for
+    the pre-flock-gate startup; past the flock gate the baseline (which
+    never contends) also runs fast_spec's trivial build and the merge,
+    work the contended run never reaches before returning on
+    FLOCK_CONTENTION_CATEGORY, so flock_component is biased slightly
+    downward by that (normally trivial) build+merge term -- see
+    measure_uncontended_baseline_secs's docstring.
 
     task 2921 (reviewer amendment, still applicable to the new baseline):
     the baseline probe runs cold, before the contended run's own startup
@@ -705,11 +718,15 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     # task 2941: same-shape uncontended verify-merge baseline, run BEFORE
     # the holder flock is acquired below -- measures the load-sensitive
     # pre-flock-gate CLI startup (interpreter + import + Click dispatch +
-    # config load + GitOps construction) plus the trivial fast_spec build,
-    # in isolation, so it can be subtracted from the contended run's
-    # `elapsed` (see flock_component below). See the helper's docstring and
-    # the "task 2941" docstring note above for the full baseline-shape
-    # rationale.
+    # config load + GitOps construction), in isolation, so it can be
+    # subtracted from the contended run's `elapsed` (see flock_component
+    # below). Because this baseline run never contends, it also proceeds
+    # past the flock gate into fast_spec's trivial build and the merge --
+    # work the contended run below never reaches -- so the subtraction is
+    # exact only for the shared startup term and is biased slightly
+    # downward by that extra (normally trivial) build+merge cost. See the
+    # helper's docstring and the "task 2941" docstring note above for the
+    # full baseline-shape rationale.
     baseline_cost = measure_uncontended_baseline_secs(
         sha=head_sha, spec=fast_spec(), cfg_file=cfg_file, timeout=60.0,
     )
@@ -750,15 +767,20 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     # task 2941: subtract the same-shape uncontended baseline (measured
     # above, before the holder flock is acquired) to cancel the
     # load-sensitive pre-flock-gate startup term out of `elapsed`,
-    # isolating the flock-wait component. An honored 0.5s override keeps
-    # flock_component well under 5.0; an un-wired override leaves the full
-    # ~10s production wait (flock_component well over 5.0) -- so this
-    # discriminant is both load-robust and still catches a regression,
-    # unlike a bare absolute ceiling on `elapsed`. Clamped at 0.0: the
-    # baseline is a separate, earlier subprocess (see the docstring's
-    # "reviewer amendment" note above), so under load it can occasionally
-    # run slower than the in-run startup and drive the subtraction
-    # negative -- clamping keeps flock_component a well-formed
+    # approximating the flock-wait component. (Not an exact isolation: the
+    # baseline never contends, so it also pays fast_spec's trivial
+    # build+merge past the flock gate that the contended run -- which
+    # returns immediately on contention -- never reaches; that extra,
+    # normally-trivial cost biases flock_component slightly downward. See
+    # measure_uncontended_baseline_secs's docstring.) An honored 0.5s
+    # override keeps flock_component well under 5.0; an un-wired override
+    # leaves the full ~10s production wait (flock_component well over 5.0)
+    # -- so this discriminant is both load-robust and still catches a
+    # regression, unlike a bare absolute ceiling on `elapsed`. Clamped at
+    # 0.0: the baseline is a separate, earlier subprocess (see the
+    # docstring's "reviewer amendment" note above), so under load it can
+    # occasionally run slower than the in-run startup and drive the
+    # subtraction negative -- clamping keeps flock_component a well-formed
     # non-negative duration instead of a confusing negative value.
     flock_component = max(0.0, elapsed - baseline_cost)
     assert flock_component < 5.0, (
