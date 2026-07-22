@@ -157,3 +157,44 @@ class TestComputeWriteSetHappyPath:
     def test_purity_no_makedirs_side_effect(self, worktree: Path, tmp_home: Path):
         ws = compute_write_set(worktree, home=tmp_home)
         assert not ws.uv_cache.exists()
+
+
+# ---------------------------------------------------------------------------
+# step-3: `.task-meta` symlink-target resolution
+# ---------------------------------------------------------------------------
+
+
+class TestTaskMetaSymlinkResolution:
+    """step-3: `task_meta` must resolve to the REAL directory landlock
+    enforces on, not the unresolved symlinked path — pins the task's
+    explicit `.task-meta` symlink-resolution requirement.
+
+    Builds a layout where the resolved `.task-meta/<name>` differs from the
+    naive join: the real meta dir lives at `<tmp>/real-meta/<name>`, and
+    `<base>/.task-meta` is a symlink to `<tmp>/real-meta`. Also creates
+    `<worktree>/.task/plan.json` as an actual symlink into that real meta
+    dir (via `TaskArtifacts.ensure_lane_plan_symlink`) to mirror production.
+    """
+
+    def test_task_meta_resolves_through_symlinked_base(
+        self, tmp_path: Path, worktree: Path, tmp_home: Path,
+    ):
+        real_meta_root = tmp_path / 'real-meta'
+        real_meta_root.mkdir()
+        base_task_meta = worktree.parent / '.task-meta'
+        base_task_meta.symlink_to(real_meta_root, target_is_directory=True)
+
+        # Mirror production: TaskArtifacts creates the meta dir + a lane
+        # symlink at <worktree>/.task/plan.json pointing into it.
+        meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-2904', 'Test Task', 'Desc')
+        ta.write_plan({'steps': []})
+        ta.ensure_lane_plan_symlink()
+
+        ws = compute_write_set(worktree, home=tmp_home)
+
+        expected = (real_meta_root / worktree.name).resolve()
+        assert ws.task_meta == expected
+        # NOT the unresolved symlinked path.
+        assert ws.task_meta != base_task_meta / worktree.name
