@@ -6987,3 +6987,145 @@ class TestEntityStandingMatchHelpers:
         assert flag_dedup._flag_type_in_grounds_family(
             'Oversized_Entity', GROUNDS_STRUCTURAL_SIZE_CONFLATION
         ) is True
+
+
+# ---------------------------------------------------------------------------
+# filter_entity_standing_decisions (Hook A / γ, task 2896) — step-3/5
+# ---------------------------------------------------------------------------
+
+
+async def _seed_standing_decision(
+    ledger: ReconLedgerStore,
+    project_id: str,
+    entity_uuid: str,
+    *,
+    grounds: str = GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    state: str = 'active',
+    decided_at: str = '2026-01-01T00:00:00+00:00',
+    expires_at: str = '2099-01-01T00:00:00+00:00',
+    edge_count_at_decision: int = 42,
+    evidence: object = None,
+) -> None:
+    """Seed one entity_standing_decision ledger row via the α upsert helper."""
+    await ledger.upsert_entity_standing_decision(
+        project_id=project_id,
+        entity_uuid=entity_uuid,
+        grounds=grounds,
+        decided_at=decided_at,
+        expires_at=expires_at,
+        edge_count_at_decision=edge_count_at_decision,
+        evidence=evidence if evidence is not None else {'note': 'seed'},
+        state=state,
+    )
+
+
+class TestFilterEntityStandingDecisions:
+    """filter_entity_standing_decisions core + fail-open (task 2896 step-3)."""
+
+    _PID = 'p'
+
+    @pytest.mark.asyncio
+    async def test_empty_flags_returns_empty_and_never_queries_ledger(
+        self, ledger_memory_service
+    ):
+        """(a) Empty flags → empty result; ledger is never queried."""
+        spy = AsyncMock(return_value=[])
+        ledger_memory_service.recon_ledger.list_entity_standing_decisions = spy
+
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )
+        assert result.kept_flags == []
+        assert result.suppressed_by_decision == {}
+        assert result.grounds_by_decision == {}
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recon_ledger_none_passes_all_through(self, ledger_memory_service):
+        """(b) recon_ledger is None → fail-open, all flags kept."""
+        ledger_memory_service.recon_ledger = None
+        flags = [{'flag_type': 'oversized_entity', 'entity_uuid': _ESD_U1}]
+
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, flags
+        )
+        assert result.kept_flags == flags
+        assert result.suppressed_by_decision == {}
+
+    @pytest.mark.asyncio
+    async def test_list_raises_fails_open_with_warning(
+        self, ledger_memory_service, caplog
+    ):
+        """(c) list_entity_standing_decisions raising → all kept, WARNING, no raise."""
+        ledger_memory_service.recon_ledger.list_entity_standing_decisions = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+        flags = [{'flag_type': 'oversized_entity', 'entity_uuid': _ESD_U1,
+                  'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION}]
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'
+        ):
+            result = await flag_dedup.filter_entity_standing_decisions(
+                ledger_memory_service, self._PID, flags
+            )
+        assert result.kept_flags == flags
+        assert result.suppressed_by_decision == {}
+        assert any(
+            rec.levelno == logging.WARNING
+            and 'list_entity_standing_decisions' in rec.message
+            for rec in caplog.records
+        ), 'a WARNING naming the failed ledger read must be logged'
+
+    @pytest.mark.asyncio
+    async def test_no_active_rows_keeps_all(self, ledger_memory_service):
+        """(d) No active standing rows → every flag kept."""
+        flags = [
+            {'flag_type': 'oversized_entity', 'entity_uuid': _ESD_U1,
+             'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION},
+            {'flag_type': 'stale_metadata', 'task_id': '9'},
+        ]
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, flags
+        )
+        assert result.kept_flags == flags
+        assert result.suppressed_by_decision == {}
+
+    @pytest.mark.asyncio
+    async def test_strong_match_suppresses_stamped_flag(self, ledger_memory_service):
+        """(e) STRONG match: entity_uuid + grounds stamps → suppressed; unrelated kept."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        matching = {
+            'entity_uuid': _ESD_U1,
+            'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            'flag_type': 'x',
+            'description': 'entity is too large',
+        }
+        unrelated = {'task_id': '9', 'flag_type': 'stale_metadata'}
+
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [matching, unrelated]
+        )
+        assert matching not in result.kept_flags
+        assert unrelated in result.kept_flags
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
+        assert result.grounds_by_decision == {_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION}
+
+    @pytest.mark.asyncio
+    async def test_strong_match_entity_uuid_case_insensitive(self, ledger_memory_service):
+        """A flag stamping the UUID in upper-case still matches the active row."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        matching = {
+            'entity_uuid': _ESD_U1_UPPER,
+            'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            'flag_type': 'x',
+        }
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [matching]
+        )
+        assert result.kept_flags == []
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
