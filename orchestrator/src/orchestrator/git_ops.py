@@ -8069,9 +8069,24 @@ class GitOps:
         that WARNING — a best-effort, fail-open diagnostic hint, never a
         removal gate.
 
+        **Persistent-worktree exemption**: if *path* resolves to
+        :attr:`persistent_merge_worktree_path` OR
+        :attr:`persistent_offline_deep_worktree_path`, this method returns
+        ``'skipped_persistent'`` WITHOUT touching any flock — both
+        persistent worktrees survive across attempts and across verify
+        failures regardless of lease state, so there is nothing to
+        serialize against.
+
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
+        if path.resolve() == self.persistent_merge_worktree_path.resolve():
+            logger.debug('remove_merge_worktree_guarded: persistent merge worktree retained: %s', path)
+            return 'skipped_persistent'
+        if path.resolve() == self.persistent_offline_deep_worktree_path.resolve():
+            logger.debug('remove_merge_worktree_guarded: persistent offline-deep worktree retained: %s', path)
+            return 'skipped_persistent'
+
         fd = acquire_merge_verify_flock(lane_lock_path(path), 0.0)
         if fd is None:
             holder = read_lock_holder_pgid(self.worktree_base)
