@@ -340,12 +340,14 @@ def task_assignment() -> TaskAssignment:
 async def _invoke_probe(role, config, git_ops, task_assignment, mcp=None):
     """Build a TaskWorkflow, patch invoke_with_cap_retry, invoke workflow._invoke(role, ...).
 
-    Returns (call_kwargs, workflow) — the kwargs invoke_with_cap_retry was
-    awaited with, and the workflow instance (so callers can assert against
-    workflow.modules). ``mcp`` defaults to a bare ``FakeMcp()`` (empty
-    mcpServers); callers may pass a fake that pre-populates a server (e.g.
-    ``_FakeMcpWithFusedMemory``) to distinguish "server added alongside an
-    existing one" from "server is the only one".
+    Returns (call_kwargs, workflow, cwd) — the kwargs invoke_with_cap_retry
+    was awaited with, the workflow instance (so callers can assert against
+    workflow.modules), and the worktree path (a real linked worktree, so the
+    write-set wiring tests can recompute compute_write_set(cwd).writable_paths()).
+    ``mcp`` defaults to a bare ``FakeMcp()`` (empty mcpServers); callers may
+    pass a fake that pre-populates a server (e.g. ``_FakeMcpWithFusedMemory``)
+    to distinguish "server added alongside an existing one" from "server is
+    the only one".
     """
     wt_info = await git_ops.create_worktree(task_assignment.task_id)
     cwd = wt_info.path
@@ -371,7 +373,7 @@ async def _invoke_probe(role, config, git_ops, task_assignment, mcp=None):
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'
-    return mock_cap_retry.await_args.kwargs, workflow
+    return mock_cap_retry.await_args.kwargs, workflow, cwd
 
 
 class _FakeMcpWithFusedMemory(FakeMcp):
@@ -405,18 +407,59 @@ class TestInvokeDerivesGatingFromRole:
     async def test_sandboxed_property_wires_sandbox_modules_regardless_of_name(
         self, config, git_ops, task_assignment,
     ):
-        """probe_sbx: name is neither 'implementer' nor 'debugger', but sandboxed=True."""
+        """probe_sbx: name is neither 'implementer' nor 'debugger', but sandboxed=True.
+
+        The new whole-worktree wiring (PRD os-sandbox D1): _invoke sets
+        sandbox_modules=[] (the empty-list value is the sandbox-on gate — no
+        per-module dirs) and delivers the full contract write set (worktree
+        root + carve-outs) via
+        sandbox_extras == compute_write_set(cwd).writable_paths(). Still gated
+        off role.sandboxed, not role.name.
+        """
         from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
+        from orchestrator.agents.write_set import compute_write_set  # noqa: PLC0415
 
         role = AgentRole(
             name='probe_sbx', system_prompt='x', allowed_tools=[], sandboxed=True,
         )
-        call_kwargs, workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
-        assert call_kwargs.get('sandbox_modules') == workflow.modules, (
-            f'Expected sandbox_modules == {workflow.modules!r} (role.sandboxed=True) '
-            f"but got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
-            "sandboxing off role.sandboxed, not role.name in ('implementer', 'debugger')."
+        assert call_kwargs.get('sandbox_modules') == [], (
+            "Expected sandbox_modules == [] (whole-worktree granularity; the "
+            "empty-list value is the sandbox-on gate) for a sandboxed role, but "
+            f"got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
+            'sandboxing off role.sandboxed, not role.name.'
+        )
+        expected_extras = [str(p) for p in compute_write_set(cwd).writable_paths()]
+        assert call_kwargs.get('sandbox_extras') == expected_extras, (
+            'Expected sandbox_extras == compute_write_set(cwd).writable_paths() '
+            f"(the full contract set), but got {call_kwargs.get('sandbox_extras')!r}."
+        )
+
+    @pytest.mark.parametrize('role_name', ['implementer', 'debugger', 'simple_task'])
+    async def test_shipped_sandboxed_roles_wire_full_contract_write_set(
+        self, role_name, config, git_ops, task_assignment,
+    ):
+        """Each shipped sandboxed role (implementer/debugger/simple_task) drives
+        _invoke's sandbox block to the whole-worktree wiring: sandbox_modules=[]
+        (the sandbox-on gate) and sandbox_extras == the FULL contract write set
+        (worktree root + carve-outs) from compute_write_set(cwd) — the single
+        source of truth (INV-5). This is the α3 SIGNAL: a live wrap_command for
+        these roles now carries the full contract set."""
+        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
+        from orchestrator.agents.write_set import compute_write_set  # noqa: PLC0415
+
+        role = ROLES[role_name]
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        assert call_kwargs.get('sandbox_modules') == [], (
+            f'{role_name}: expected sandbox_modules == [] (whole-worktree gate), '
+            f"got {call_kwargs.get('sandbox_modules')!r}."
+        )
+        expected_extras = [str(p) for p in compute_write_set(cwd).writable_paths()]
+        assert call_kwargs.get('sandbox_extras') == expected_extras, (
+            f'{role_name}: expected sandbox_extras == the full compute_write_set '
+            f"contract list, got {call_kwargs.get('sandbox_extras')!r}."
         )
 
     async def test_plan_tools_family_wires_plan_tools_server_regardless_of_name(
@@ -430,7 +473,7 @@ class TestInvokeDerivesGatingFromRole:
             name='probe_plan', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'plan_tools'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         mcp_config = call_kwargs.get('mcp_config')
         servers = (mcp_config or {}).get('mcpServers', {})
@@ -452,7 +495,7 @@ class TestInvokeDerivesGatingFromRole:
             name='probe_orch', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'orchestrator'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs.get('mcp_config') is not None, (
             "Expected mcp_config to be built (role.mcp_families={'orchestrator'}) "
@@ -470,7 +513,7 @@ class TestInvokeDerivesGatingFromRole:
         from orchestrator.agents.roles import AgentRole  # noqa: PLC0415
 
         role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs.get('sandbox_modules') is None, (
             f"Expected sandbox_modules is None (role.sandboxed=False) but got "
@@ -498,7 +541,7 @@ class TestInvokeDerivesGatingFromRole:
             name='probe_verdict', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'verdict_tools'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         mcp_config = call_kwargs.get('mcp_config')
         servers = (mcp_config or {}).get('mcpServers', {})
@@ -519,7 +562,7 @@ class TestInvokeDerivesGatingFromRole:
         (PRD task β, task 2482)."""
         from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE  # noqa: PLC0415
 
-        call_kwargs, _workflow = await _invoke_probe(
+        call_kwargs, _workflow, _cwd = await _invoke_probe(
             REVIEWER_COMPREHENSIVE, config, git_ops, task_assignment,
         )
 
@@ -546,7 +589,7 @@ class TestInvokeDerivesGatingFromRole:
         orchestrator-assembled ones, not replace them (PRD task β, task 2482)."""
         from orchestrator.agents.roles import MERGER  # noqa: PLC0415
 
-        call_kwargs, _workflow = await _invoke_probe(
+        call_kwargs, _workflow, _cwd = await _invoke_probe(
             MERGER, config, git_ops, task_assignment, mcp=_FakeMcpWithFusedMemory(),
         )
 
