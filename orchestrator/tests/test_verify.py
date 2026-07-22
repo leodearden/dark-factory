@@ -8438,6 +8438,102 @@ class TestMergeGateEscalatesTrivialPassSite1:
         assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
 
 
+class TestMergeGateNoCommandLoudFails:
+    """A merge gate with NO command to run must FAIL loud (merge_no_evidence),
+    never trivially pass nor vacuously pass. Two paths:
+
+    (a) Site 2 inline — task_files present, no source, no global command.
+    (b) GLOBAL-tail backstop — task_files empty, so the Site 2 block is never
+        entered and control reaches the final global run_verification tail,
+        whose all-None/empty config commands would otherwise be a vacuous
+        0==0==0 pass.
+
+    The negative gate confirms a task-role call with the same command-less
+    config does NOT loud-FAIL (the gate is merge-only).
+    """
+
+    def _make_commandless_config(self, tmp_path: Path) -> OrchestratorConfig:
+        # The str-typed command fields reject None; '' is falsy so the merge
+        # gate sees no command to run.
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='',
+            lint_command='',
+            type_check_command='',
+        )
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_no_source_no_command_loud_fails(self, tmp_path: Path, guard_spy):
+        """(a) Site 2: no source + no global command → loud FAIL, no command runs."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_commandless_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        assert result.passed is False
+        assert result.trivial is False
+        assert result.category == 'merge_no_evidence', (
+            f'Expected loud-FAIL category; got {result.category!r}'
+        )
+        assert calls == [], f'No command should execute for a loud FAIL; got: {calls}'
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_empty_task_files_no_command_loud_fails(self, tmp_path: Path, guard_spy):
+        """(b) GLOBAL-tail backstop: empty task_files never enter Site 2 → the
+        would-be vacuous global pass FAILs loud instead."""
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_commandless_config(tmp_path),
+                [],
+                task_files=[],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        assert result.passed is False
+        assert result.trivial is False
+        assert result.category == 'merge_no_evidence', (
+            f'Expected loud-FAIL category; got {result.category!r}'
+        )
+        assert calls == [], f'No command should execute for a loud FAIL; got: {calls}'
+
+    @pytest.mark.asyncio
+    async def test_task_role_commandless_config_does_not_loud_fail(self, tmp_path: Path, guard_spy):
+        """Negative gate: task role must NOT loud-FAIL on a command-less config."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_commandless_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='task',  # not the merge gate
+            )
+
+        assert result.passed is True
+        assert result.category != 'merge_no_evidence', (
+            f'task role must not loud-FAIL; got category {result.category!r}'
+        )
+
+
 class TestMergeGateEscalatesTrivialPassSite2:
     """Site 2 — no-module_configs branch (verify.py ~line 5195).
 
