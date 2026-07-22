@@ -1,0 +1,53 @@
+# Machine-readable twin of stranding-remediation-scheduler-ergonomics-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract. task_id stamped by commit_planning.
+prd: plans/stranding-remediation-scheduler-ergonomics-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 2889
+    title: "merge-queue-direct stranded remediation (deterministic reaper action)"
+    capabilities:
+      - name: "stranded-verified-green-direct-submit"
+        binding: "capability→producer — reaper detects green-DONE lane shape and submits merge_request; L2 on durable fail"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stranded_merge_failed"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "β"
+    task_id: 2890
+    title: "pause-aware re-pend + scheduler-pause digest visibility"
+    capabilities:
+      - name: "repend-while-paused-visible"
+        binding: "capability→producer — resolution marker + event + digest standing line"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "repend_while_paused"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "γ"
+    task_id: 2891
+    title: "terminal-task lane reclamation + stale-assignment census"
+    capabilities:
+      - name: "terminal-lane-reclaim"
+        binding: "capability→producer — assigned→released for terminal-task lanes only; branch ref asserted; census line for stale live-task lanes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lane_stale_report_days"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "δ"
+    task_id: 2892
+    title: "EWA trip storm-classification annotation"
+    capabilities:
+      - name: "trip-reason-category-share"
+        binding: "capability→producer — pause reason + digest carry dominant escalation-category share"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "storm:"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present

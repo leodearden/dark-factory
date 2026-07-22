@@ -1,0 +1,88 @@
+prd: plans/merge-verdict-integrity-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 2883
+  title: 'INV-1: fail-closed trivial pass for merge-role verifies'
+  capabilities:
+  - name: trivial-pass-escalates-to-full-gate
+    binding: capability→producer — merge-role trivial-pass resolution routes to full
+      gate; empty existing_files treated as evidence-absence
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: trivial_pass_escalated
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: β
+  task_id: 2884
+  title: 'INV-2: RemoteRunner auto-sync at dispatch, fail-closed + mirror push'
+  capabilities:
+  - name: runner-staleness-sync
+    binding: capability→producer — HEAD-compare + pull/uv-sync before dispatch; bench
+      on failure
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: runner_stale
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: γ
+  task_id: 2885
+  title: 'INV-3: chain-intact enforcement at dispatch + adoption (+ cascade dangling-edge
+    fix)'
+  capabilities:
+  - name: verdict-voided-on-broken-chain
+    binding: capability→producer — adoption re-validates base chain; voided verdicts
+      re-merge, never block
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verdict_voided
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: δ
+  task_id: 2886
+  title: 'INV-5: detector hardening (drift persistence, shadow sampling, divergence
+    halt)'
+  capabilities:
+  - name: drift-counter-persisted
+    binding: capability→producer — cadence state survives restart (zero drift events
+      ever = defect baseline)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _drift_land_count
+      paths:
+      - orchestrator/src/orchestrator/merge_drift.py
+      expect: present
+- label: ε
+  task_id: 2887
+  title: foreign_drift disposition from structured offender lines
+  capabilities:
+  - name: foreign-drift-disposition
+    binding: capability→producer — offender∩taskdiff=∅ ⇒ foreign_drift, never branch_bug;
+      defensive on absence
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: foreign_drift
+      paths:
+      - orchestrator/src/orchestrator/merge_disposition.py
+      expect: present
+- label: ζ
+  task_id: 2888
+  title: 'INV-4: same-tip re-roll cap=1, never train, idle-slot only'
+  capabilities:
+  - name: same-tip-reroll-policy
+    binding: capability→producer — tip-identity via merge_sha^2; cap + spec_base exclusion
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: same_tip_retry_cap
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
