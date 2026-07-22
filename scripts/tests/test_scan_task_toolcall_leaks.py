@@ -21,7 +21,12 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from scan_task_toolcall_leaks import LeakMatch, detect_leak, scan_db
+from scan_task_toolcall_leaks import (
+    LeakMatch,
+    detect_leak,
+    discover_db_paths,
+    scan_db,
+)
 
 # Minimal reproduction of the live tasks table schema (columns + NOT NULL
 # constraints only — see fused-memory's sqlite_task_backend.py _SCHEMA_SQL).
@@ -244,3 +249,70 @@ def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
 def test_scan_db_returns_empty_list_for_clean_db(tmp_path):
     db_path = _make_db(tmp_path, [{"id": 1, "description": "All clean here."}])
     assert scan_db(str(db_path)) == []
+
+
+# ---------------------------------------------------------------------------
+# discover_db_paths(explicit_dbs, project_roots, env) -> list[str]
+# ---------------------------------------------------------------------------
+
+def _touch_tasks_db(project_root):
+    """Create an (empty-content) tasks.db under project_root/.taskmaster/tasks/."""
+    db_dir = project_root / ".taskmaster" / "tasks"
+    db_dir.mkdir(parents=True)
+    db_file = db_dir / "tasks.db"
+    db_file.write_text("")
+    return db_file
+
+
+def test_discover_db_paths_explicit_dbs_passed_through_existing_only(tmp_path):
+    existing = tmp_path / "a.db"
+    existing.write_text("")
+    missing = tmp_path / "missing.db"
+
+    result = discover_db_paths(explicit_dbs=[str(existing), str(missing)])
+
+    assert result == [str(existing)]
+
+
+def test_discover_db_paths_project_root_maps_to_taskmaster_tasks_db(tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    db_file = _touch_tasks_db(root)
+
+    result = discover_db_paths(project_roots=[str(root)])
+
+    assert result == [str(db_file)]
+
+
+def test_discover_db_paths_parses_dashboard_known_project_roots_env(tmp_path):
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    db_a = _touch_tasks_db(root_a)
+    db_b = _touch_tasks_db(root_b)
+
+    # Comma-separated, whitespace padded, with an empty entry (",,") that
+    # must be dropped rather than mapped to a bogus db path.
+    env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f" {root_a} , {root_b} ,, "}
+
+    result = discover_db_paths(env=env)
+
+    assert result == [str(db_a), str(db_b)]
+
+
+def test_discover_db_paths_falls_back_to_dark_factory_default(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_KNOWN_PROJECT_ROOTS", raising=False)
+
+    result = discover_db_paths()
+
+    assert result == ["/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db"]
+
+
+def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
+    root = tmp_path / "empty_proj"
+    root.mkdir()
+
+    result = discover_db_paths(project_roots=[str(root)])
+
+    assert result == []
