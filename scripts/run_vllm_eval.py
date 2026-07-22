@@ -42,6 +42,7 @@ from orchestrator.evals.configs import (
     FINAL_RUN_CONFIGS,
     EvalConfig,
 )
+from orchestrator.evals.snapshots import eval_worktree_root
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -375,7 +376,11 @@ def preflight_baseline(
     if repo_root is None:
         repo_root = Path(spec.get("project_root", PROJECT_ROOT))
 
-    wt = repo_root / ".eval-worktrees" / task_id / f"preflight-{uuid4().hex[:8]}"
+    # Place the preflight worktree in a SIBLING of repo_root (Defect B, task
+    # 2881) so a nested pytest/cargo/clippy run inside it can't walk up into
+    # the live repo's ancestor config. eval_worktree_root is the single source
+    # of truth for that relocated layout.
+    wt = eval_worktree_root(repo_root) / task_id / f"preflight-{uuid4().hex[:8]}"
     wt.parent.mkdir(parents=True, exist_ok=True)
 
     try:
