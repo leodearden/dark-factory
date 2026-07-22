@@ -52,8 +52,11 @@ from orchestrator.merge_disposition import (
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
+    DriftCheckState,
+    _load_drift_check_state,
     _maybe_run_drift_check,
     _run_drift_check,
+    _save_drift_check_state,
 )
 from orchestrator.merge_gates import (  # noqa: F401  re-export shim
     _OVERLAP_GIT_ERROR_SENTINEL,

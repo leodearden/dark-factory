@@ -30,7 +30,11 @@ independent sibling detectives, not caller/callee.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.event_store import EventStore
@@ -62,6 +66,79 @@ if TYPE_CHECKING:
     from orchestrator.merge_queue import SpeculativeMergeWorker
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+# ---------------------------------------------------------------------------
+# Lever-C drift-check cadence persistence (task 2886 fix 1a)
+#
+# EXACT mirror of merge_shadow's ShadowCompareState +
+# _load_shadow_compare_state / _save_shadow_compare_state.  The drift-check
+# land counter was a worker-level in-memory int (``worker._drift_land_count``)
+# that the ~8h fleet redeploy resets to 0 before it ever reaches
+# ``verify_drift_check_every_n_lands`` (default 20) — which is exactly why the
+# drift check has NEVER fired in any runs.db.  Persisting the counter to
+# ``project_root/data/orchestrator/drift_check_state.json`` makes the cadence
+# survive restarts.  The runner quarantine set is deliberately NOT persisted:
+# the dedup'd open L1 verify_drift_divergence escalation is the cross-restart
+# guard (see merge_queue.py SpeculativeMergeWorker.__init__ RESTART RE-TRUST
+# WINDOW note).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DriftCheckState:
+    """Persisted cadence state for the Lever-C drift check.
+
+    Stored as JSON at
+    ``config.project_root/data/orchestrator/drift_check_state.json`` so the
+    drift-check cadence survives orchestrator restarts (the ~8h fleet redeploy
+    otherwise resets the in-memory ``worker._drift_land_count`` before it ever
+    reaches ``verify_drift_check_every_n_lands``).
+
+    Fields:
+        land_count: Count of successful ('done') lands observed so far.  The
+            drift check fires when
+            ``land_count % verify_drift_check_every_n_lands == 0``.  Additive
+            across the worker lifetime (never reset), mirroring the in-memory
+            ``worker._drift_land_count`` it supersedes.
+    """
+
+    land_count: int = 0
+
+
+def _load_drift_check_state(path: Path) -> DriftCheckState:
+    """Load the drift-check cadence state from a JSON file.
+
+    Fail-safe: returns a default ``DriftCheckState()`` on any error (file not
+    found, unreadable, unparseable JSON, or missing/wrong-typed keys) so the
+    orchestrator never fails to start due to a corrupt state file.  Exact
+    mirror of :func:`orchestrator.merge_shadow._load_shadow_compare_state`.
+
+    Args:
+        path: Path to the JSON state file (typically
+            ``config.project_root/data/orchestrator/drift_check_state.json``).
+
+    Returns:
+        The persisted state, or ``DriftCheckState(0)`` on any failure.
+    """
+    try:
+        data = json.loads(path.read_text())
+        return DriftCheckState(land_count=int(data['land_count']))
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return DriftCheckState()
+
+
+def _save_drift_check_state(path: Path, state: DriftCheckState) -> None:
+    """Persist the drift-check cadence state to a JSON file.
+
+    Creates parent directories as needed.  Exact mirror of
+    :func:`orchestrator.merge_shadow._save_shadow_compare_state`.
+
+    Args:
+        path: Destination path for the JSON state file.
+        state: The :class:`DriftCheckState` to serialise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dataclasses.asdict(state)))
 
 
 async def _run_drift_check(
