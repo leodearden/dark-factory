@@ -318,7 +318,12 @@ def main() -> None:
     """Parse CLI args and run the stdio MCP server."""
     artifacts, role, session_id = _artifacts_from_args()
     server = create_server(artifacts, role, session_id)
-    server.run(transport='stdio')
+    # show_banner=False suppresses FastMCP's decorative startup banner and its
+    # synchronous PyPI update-check (check_for_newer_version -> httpx.get). That
+    # check runs on the stdio startup path BEFORE the MCP initialize handshake;
+    # eliminating it removes a network call that could delay startup past the
+    # CLI's MCP_TIMEOUT and get this server silently dropped (task 2942).
+    server.run(transport='stdio', show_banner=False)
 
 
 if __name__ == '__main__':
