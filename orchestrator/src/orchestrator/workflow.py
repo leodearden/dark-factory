@@ -11036,6 +11036,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         change), so this method is only ever called for the one refusal that
         should escalate.
 
+        The summary/detail are phrased as a HOST-LEVEL condition (an unavailable
+        backend affects every sandboxed role on the host, not just the one task
+        that happened to refuse first) — ``task_id`` still names the first
+        refusal for traceability, but the text makes clear other sandboxed tasks
+        are equally impacted (task 2908 review). The detail also spells out the
+        re-arm caveat: because the dedup re-arms only on a backend-STATE change,
+        resolving this escalation without actually installing/enabling a backend
+        will NOT cause a fresh one to be filed — continued refusals stay deduped
+        (still fail-closed) until the backend state changes.
+
         Filed by the orchestrator (not a harness sentinel): ``agent_role``
         'orchestrator', ``severity`` 'blocking' (L0->steward), ``category``
         'infra_issue' — an unavailable host sandbox backend is an infra
@@ -11043,20 +11053,32 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         :meth:`_escalate_plan_overwrite`.
         """
         summary = (
-            f'sandbox unavailable — refused {role_name} dispatch for task '
-            f'{self.task_id} (backend={backend_state})'
+            f'sandbox unavailable — sandboxed dispatch refused for '
+            f'backend={backend_state} (host-level: affects all sandboxed roles '
+            f'on this host). First refusal: role {role_name}, task {self.task_id}'
         )
         detail_msg = (
-            f'Role {role_name!r} requires sandboxing (sandbox.enabled + '
-            f'role.sandboxed) but the configured backend={backend_state!r} '
-            f'resolved to no available OS sandbox (landlock/bwrap). Refused to '
-            f'launch the agent unconfined (fail-closed; PRD D4, mirrors recon '
-            f'RemediationSandboxUnavailable / task 1935). This escalation is '
-            f'deduped process-wide: exactly one filing across N refused '
-            f'invocations, re-armed on any backend-state change (INV-4). '
-            f'Remediation: install/enable landlock or bwrap on this host, or '
-            f'set sandbox.backend=none to explicitly run UNSANDBOXED. '
-            f'Underlying refusal: {detail}'
+            f'Sandboxing is required (sandbox.enabled + role.sandboxed) but the '
+            f'configured backend={backend_state!r} resolved to no available OS '
+            f'sandbox (landlock/bwrap) on this host, so sandboxed dispatch is '
+            f'REFUSED fail-closed (PRD D4, mirrors recon '
+            f'RemediationSandboxUnavailable / task 1935). This is a HOST-LEVEL '
+            f'infra condition: EVERY sandboxed role on this host is affected, '
+            f'not only the task named here. The first refusal observed was role '
+            f'{role_name!r} for task {self.task_id}; other sandboxed tasks that '
+            f'refuse against the same backend propagate SandboxUnavailable to '
+            f'their own failure handlers but are NOT individually escalated. '
+            f'This escalation is deduped process-wide: exactly one filing across '
+            f'N refused invocations, re-armed only on a backend-STATE change '
+            f'(INV-4). NOTE: resolving THIS escalation alone will NOT re-file a '
+            f'new one — the dedup re-arms only when the backend state changes (a '
+            f'config edit via sandbox.backend / reload) or a backend recovers '
+            f'(landlock/bwrap becomes available). If you resolve this without '
+            f'installing/enabling a backend, subsequent refusals stay deduped '
+            f'and silent (they still fail-closed) until the backend state '
+            f'actually changes. Remediation: install/enable landlock or bwrap on '
+            f'this host, or set sandbox.backend=none to explicitly run '
+            f'UNSANDBOXED. Underlying refusal: {detail}'
         )
         logger.error(f'Task {self.task_id}: {summary}')
 
