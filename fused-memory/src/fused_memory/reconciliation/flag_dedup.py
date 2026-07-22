@@ -180,6 +180,9 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_TOKEN_FAMILIES,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -538,6 +541,95 @@ async def filter_suppressed(
         return canonical_flag_type_family(str(flag_type)) not in allowlist
 
     return [f for f in flags if _keep(f)]
+
+
+# --------------------------------------------------------------------------- #
+# Entity-standing-decision match helpers (Hook A / γ, task 2896)
+#
+# Pure, sync building blocks for filter_entity_standing_decisions' FALLBACK
+# (stamps-omitted) match path: an LLM-emitted recon flag that omits the
+# structured entity_uuid/grounds stamps is matched to an active standing
+# decision by (a) recovering every UUID it cites anywhere in its free text and
+# (b) gating on whether its flag_type belongs to the decision's grounds→token
+# family. See filter_entity_standing_decisions (step-4/6) for the composition.
+# --------------------------------------------------------------------------- #
+
+#: Canonical 8-4-4-4-12 hex UUID, anchored on word boundaries so a UUID is only
+#: extracted when it stands alone (not as a substring of a longer alnum run). A
+#: DEDICATED constant rather than a reused splitter, mirroring the module's
+#: per-feature regex convention (_CONTENT_FP_RE, _FLAG_TYPE_TOKEN_SPLIT_RE, ...).
+_UUID_RE: re.Pattern[str] = re.compile(
+    r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+)
+
+
+def _extract_uuids(text: str) -> set[str]:
+    """Return the set of lowercased canonical UUIDs appearing in *text*.
+
+    Case-insensitive extraction normalized to lowercase, so upper- and
+    lower-case spellings of the same UUID (and repeats) collapse to a single
+    distinct value. Text with no UUID (including empty/``None``-coerced) yields
+    an empty set. Pure, sync, no I/O.
+    """
+    if not text:
+        return set()
+    return {m.lower() for m in _UUID_RE.findall(text)}
+
+
+def _collect_str_values(value: Any, out: list[str]) -> None:
+    """Recursively append every ``str`` VALUE reachable in *value* to *out*.
+
+    Descends dicts (values only, not keys), lists, and tuples; every other
+    scalar type (int, float, bool, None, ...) is ignored rather than
+    stringified. Pure, sync, no I/O.
+    """
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _collect_str_values(v, out)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _collect_str_values(v, out)
+    # Any other type (int/float/bool/None/...) is intentionally ignored: only
+    # LLM-authored free text can carry a cited UUID, and stringifying a numeric
+    # or structured value could mint spurious tokens.
+
+
+def _flag_text_blob(flag: dict[str, Any]) -> str:
+    """Return every ``str`` value in *flag* (recursively), space-joined.
+
+    FALLBACK match is exactly the stamps-omitted path, so a cited UUID may
+    appear in any free-text field (``description``/``summary``/nested
+    ``evidence``/list items). Collecting all string values finds it wherever
+    the LLM placed it while ignoring structured/numeric noise. Pure, sync, no
+    I/O.
+    """
+    parts: list[str] = []
+    _collect_str_values(flag, parts)
+    return ' '.join(parts)
+
+
+def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
+    """Return True iff *flag_type* belongs to *grounds*' bound token family.
+
+    Guards a non-``str``/empty *flag_type* → ``False``. Looks up the token
+    family bound to *grounds* in
+    :data:`~fused_memory.reconciliation.standing_decision_constants.GROUNDS_TOKEN_FAMILIES`;
+    an unknown/empty grounds (no bound family) → ``False``. Otherwise returns
+    True when any family stem is a casefolded substring of *flag_type* — a
+    conservative gate reusing the token-normalization spirit of
+    :func:`canonical_flag_type_family` so only size/conflation-class flag_types
+    are fallback-suppressed. Pure, sync, no I/O.
+    """
+    if not isinstance(flag_type, str) or not flag_type:
+        return False
+    family = GROUNDS_TOKEN_FAMILIES.get(grounds)
+    if not family:
+        return False
+    folded = flag_type.casefold()
+    return any(stem.casefold() in folded for stem in family)
 
 
 # --------------------------------------------------------------------------- #
