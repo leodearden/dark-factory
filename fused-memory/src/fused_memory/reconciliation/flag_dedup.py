@@ -660,14 +660,24 @@ def _match_entity_standing_decision(
     """Return the ``entity_uuid`` (lowercased) of the active standing decision
     that suppresses *flag*, or ``None`` if none does.
 
-    STRONG path (this step): the flag carries a structured ``entity_uuid`` stamp
-    matching an active row AND its ``grounds`` stamp equals that row's grounds
+    Evaluated as independent OR conditions (strong OR fallback); STRONG wins
+    decision-attribution when both would fire.
+
+    STRONG: the flag carries a structured ``entity_uuid`` stamp matching an
+    active row AND its ``grounds`` stamp equals that row's grounds
     (``row.flag_type`` — the α PK-slot mapping). A deliberate LLM-stamped
     (entity, grounds) assertion is high-signal, so it is trusted even if the
-    flag text also cites another UUID.
+    flag text also cites another UUID (the second-UUID escape below is FALLBACK
+    -only).
 
-    (The FALLBACK stamps-omitted path is added in step-6; strong OR fallback,
-    strong wins attribution.)
+    FALLBACK (stamps omitted): the flag's free text cites exactly ONE distinct
+    UUID, that UUID names an active row, AND the flag's ``flag_type`` belongs to
+    that row's grounds token family. The exactly-one-UUID gate is the escape
+    hatch protecting this low-signal free-text guess — a second cited UUID
+    (≈ an edge/new-fact citation) means "never suppress via fallback". Together
+    with the active-row requirement and the token-family gate, this preserves
+    the under-suppression bias: a fallback miss costs one cycle of noise, never
+    a hidden finding.
     """
     stamped_uuid = flag.get('entity_uuid')
     if isinstance(stamped_uuid, str) and stamped_uuid:
@@ -675,6 +685,15 @@ def _match_entity_standing_decision(
         row = active_by_uuid.get(key)
         if row is not None and flag.get('grounds') == row.flag_type:
             return key
+
+    uuids = _extract_uuids(_flag_text_blob(flag))
+    if len(uuids) == 1:
+        sole = next(iter(uuids))
+        row = active_by_uuid.get(sole)
+        if row is not None and _flag_type_in_grounds_family(
+            flag.get('flag_type'), row.flag_type
+        ):
+            return sole
     return None
 
 
