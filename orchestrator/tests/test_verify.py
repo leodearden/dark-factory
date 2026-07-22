@@ -8436,3 +8436,73 @@ class TestMergeGateEscalatesTrivialPassSite1:
             f'task-role no-source diff must stay a trivial pass; got trivial={result.trivial}'
         )
         assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
+
+
+class TestMergeGateEscalatesTrivialPassSite2:
+    """Site 2 — no-module_configs branch (verify.py ~line 5195).
+
+    A merge-gate verify over a no-source diff with NO module_configs but a
+    configured GLOBAL test command must escalate to the global full gate rather
+    than trivially pass.  Same guard_spy harness; the fall-through reaches the
+    global run_verification tail which runs config.test_command (the sentinel).
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path, test_command='__scope_all_cmd__',
+        )
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_no_source_escalates_to_global_gate(self, tmp_path: Path, guard_spy):
+        """role='merge' AND is_merge_verify → the configured global test command
+        runs; no trivial pass."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected escalated global full gate to run; got: {calls}'
+        )
+        assert result.passed
+        assert result.trivial is False, (
+            f'A merge-gate escalation must not be a trivial pass; got trivial={result.trivial}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass escalated; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_role_same_inputs_still_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Negative gate: role='task' with identical inputs STILL trivially passes."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='task',  # not the merge gate
+            )
+
+        assert result.passed
+        assert result.trivial is True, (
+            f'task-role no-source diff must stay a trivial pass; got trivial={result.trivial}'
+        )
+        assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
