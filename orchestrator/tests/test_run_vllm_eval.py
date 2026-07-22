@@ -71,6 +71,7 @@ from run_vllm_eval import (  # type: ignore[import-not-found]  # noqa: E402
     tear_down_pod,
     wait_for_vllm,
 )
+from orchestrator.evals.snapshots import eval_worktree_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1416,6 +1417,40 @@ class TestPreflightBaseline:
             text=True,
         ).stdout
         assert "preflight-" not in live
+
+    def test_preflight_worktree_relocated_outside_repo(self, tmp_repo, monkeypatch):
+        """Preflight worktree must be created OUTSIDE the repo (Defect B, 2881).
+
+        Spy on the git-worktree-add argv to capture the checkout path while
+        letting real git still run, then assert the path lives under
+        eval_worktree_root(repo) and NOT under repo — so a nested pytest/
+        cargo/clippy run inside it can't walk up into the live repo's
+        ancestor config.
+        """
+        repo, sha = tmp_repo
+        spec = {
+            "id": "test_task",
+            "pre_task_commit": sha,
+            "verify_commands": {"lint": "true", "typecheck": "true"},
+        }
+
+        real_run = subprocess.run
+        captured: dict[str, str] = {}
+
+        def spy(cmd, *args, **kwargs):
+            if isinstance(cmd, (list, tuple)) and "--detach" in cmd:
+                captured["path"] = cmd[cmd.index("--detach") + 1]
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(launcher.subprocess, "run", spy)
+
+        status = preflight_baseline(spec, repo_root=repo)
+        assert status.is_clean  # real git still ran end-to-end
+
+        assert "path" in captured, "git worktree add --detach never invoked"
+        wt = Path(captured["path"])
+        assert wt.is_relative_to(eval_worktree_root(repo))
+        assert not wt.is_relative_to(repo)
 
     def test_strict_policy_aborts_before_pod(self, monkeypatch, tmp_path, tmp_repo):
         """Strict mode must refuse without ever creating a pod."""
