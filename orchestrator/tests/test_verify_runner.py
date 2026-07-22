@@ -1654,6 +1654,89 @@ class TestRunMergeVerifyOnWorktree:
         assert effective_config.merge_verify_breadth == 'full'
         assert effective_config.merge_verify_workspace is True
 
+    async def test_spec_global_verify_command_applied_onto_config(self):
+        """INV-1 (task 2883): a spec's global_verify_command overrides the
+        (remote) host config's global commands, so a zero-module-config project
+        runs the SAME full gate as local — preserving remote↔local scope parity
+        without injecting a synthetic module (incident 966f23a6)."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        # The (remote) host config carries STALE global commands ...
+        config = OrchestratorConfig(
+            test_command='ORIG_TEST', lint_command='ORIG_LINT',
+            type_check_command='ORIG_TYPE',
+            merge_verify_workspace=False, merge_verify_breadth='scoped',
+        )
+        # ... but the spec ships the dispatching side's LIVE full gate.
+        spec = MergeVerifySpec(
+            verify_commands=(),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('docs/x.md',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            global_verify_command=VerifyCommand(
+                prefix='',
+                test_command='SENTINEL_TEST',
+                lint_command='SENTINEL_LINT',
+                type_check_command='SENTINEL_TYPE',
+            ),
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        effective_config = run_scoped.await_args[0][1]
+        assert effective_config.test_command == 'SENTINEL_TEST'
+        assert effective_config.lint_command == 'SENTINEL_LINT'
+        assert effective_config.type_check_command == 'SENTINEL_TYPE'
+
+    async def test_none_global_verify_command_leaves_config_globals_unchanged(self):
+        """With global_verify_command=None the reconstructed config's global
+        commands are left untouched (a normal per-module merge is unaffected)."""
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        config = OrchestratorConfig(
+            test_command='ORIG_TEST', lint_command='ORIG_LINT',
+            type_check_command='ORIG_TYPE',
+            merge_verify_workspace=False, merge_verify_breadth='scoped',
+        )
+        spec = MergeVerifySpec(
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env={},
+            cold_timeout_secs=60.0,
+            global_verify_command=None,
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        effective_config = run_scoped.await_args[0][1]
+        assert effective_config.test_command == 'ORIG_TEST'
+        assert effective_config.lint_command == 'ORIG_LINT'
+        assert effective_config.type_check_command == 'ORIG_TYPE'
+
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
         from orchestrator.verify_runner import (
