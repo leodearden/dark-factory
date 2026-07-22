@@ -317,6 +317,127 @@ class TestReachBackRouting:
         )
 
 
+# ---------------------------------------------------------------------------
+# FIX 2 (task 2886, PRD leaf δ §3.4): off-lane sampling of MAP-LESS lands.
+#
+# _maybe_schedule_shadow_compare early-returned on empty warm_results, so the
+# two populations that CAN actually diverge were NEVER sampled:
+#   * trivial-pass lands (ran no suite → empty per-test map), and
+#   * remote-verdict lands (verify ran off the warm local _merge-verify lane).
+# The empty-warm_results early-return is removed: when cadence is due, a
+# map-less land is routed to a COARSE suite-level compare instead of being
+# silently skipped.  A land WITH a per-test map still uses the per-test
+# _run_shadow_compare (unchanged).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScheduleShadowCompareMapLess:
+    """FIX 2 scheduling: map-less (empty warm_results) lands are still sampled."""
+
+    async def test_empty_warm_results_schedules_coarse_compare(
+        self, tmp_path: Path,
+    ) -> None:
+        """Empty warm_results + due cadence ⇒ a COARSE compare task is scheduled.
+
+        RED today: ``_maybe_schedule_shadow_compare`` early-returns on empty
+        ``warm_results`` (merge_shadow.py ~1162-1163), so no task is ever
+        scheduled for a map-less land and ``worker._shadow_compare_tasks`` stays
+        empty.  The coarse coroutine must be dispatched via the merge_queue
+        reach-back seam (``orchestrator.merge_queue._run_coarse_shadow_compare``),
+        NOT the per-test ``_run_shadow_compare``.
+        """
+        from orchestrator.merge_shadow import _maybe_schedule_shadow_compare
+
+        git_ops = MagicMock()
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=1,
+            ),
+        )
+        req = MagicMock()
+        req.config = config
+
+        worker = MagicMock()
+        worker._shadow_state_path = tmp_path / 'warm_verify_shadow.json'
+        worker._shadow_compare_tasks = set()
+
+        coarse = AsyncMock(return_value=None)
+        # The per-test compare MUST NOT be used for a map-less land.
+        per_test = AsyncMock(side_effect=AssertionError(
+            'per-test _run_shadow_compare must not be scheduled for a map-less land'
+        ))
+
+        with (
+            # create=True: the reach-back target does not exist until the impl
+            # step adds the coroutine + shim re-export; this keeps the RED
+            # failure the scheduling assertion, not a patch-time AttributeError.
+            patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse,
+                  create=True),
+            patch('orchestrator.merge_queue._run_shadow_compare', per_test),
+        ):
+            await _maybe_schedule_shadow_compare(
+                worker, git_ops, req, 'commit-sha', {}, None, None,
+            )
+            assert len(worker._shadow_compare_tasks) == 1, (
+                'expected a coarse shadow-compare task to be scheduled for a '
+                'map-less (empty warm_results) land'
+            )
+            task = next(iter(worker._shadow_compare_tasks))
+            await task
+
+        per_test.assert_not_called()
+        coarse.assert_awaited_once()
+
+    async def test_empty_warm_results_persists_cadence_when_not_due(
+        self, tmp_path: Path,
+    ) -> None:
+        """A map-less land that is NOT yet due still increments persisted cadence.
+
+        With ``every_n_merges=3`` the first map-less land is under cadence: no
+        task is scheduled, but the persisted counter must advance to 1 so the
+        map-less population contributes to the cadence exactly like a
+        map-bearing land (no silent cadence loss).
+        """
+        from orchestrator.merge_shadow import (
+            _load_shadow_compare_state,
+            _maybe_schedule_shadow_compare,
+        )
+
+        git_ops = MagicMock()
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(
+                warm_verify_shadow_compare=True,
+                warm_verify_shadow_compare_every_n_merges=3,
+            ),
+        )
+        req = MagicMock()
+        req.config = config
+
+        worker = MagicMock()
+        worker._shadow_state_path = tmp_path / 'warm_verify_shadow.json'
+        worker._shadow_compare_tasks = set()
+
+        coarse = AsyncMock(return_value=None)
+        with patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse,
+                   create=True):
+            await _maybe_schedule_shadow_compare(
+                worker, git_ops, req, 'commit-sha', {}, None, None,
+            )
+
+        assert len(worker._shadow_compare_tasks) == 0, (
+            'under cadence (1 of 3), no compare task should be scheduled'
+        )
+        coarse.assert_not_awaited()
+        state = _load_shadow_compare_state(worker._shadow_state_path)
+        assert state.merges_since_last_shadow == 1, (
+            'a map-less land must still advance the persisted cadence counter'
+        )
+
+
 def test_merge_queue_reexports_identical_objects() -> None:
     """merge_queue re-exports the SAME objects from merge_shadow (shim identity).
 
