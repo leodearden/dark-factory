@@ -40,3 +40,17 @@ models:
   census_miner: sonnet
   census_verify: sonnet
   census_synthesis: fable
+# Per-census-stage `claude` CLI subprocess budgets (seconds). The census runs
+# three claude-CLI-backed stages of very different shape; originally every
+# stage rode coder._invoke_cli's single 120s default (sized for one Haiku
+# trickle-coding call), which killed the first dark_factory census — every
+# per-cluster Sonnet verify-vs-main call and the one large Fable synthesis call
+# timed out at 120s and census-state.json never advanced. Pinned here (not just
+# riding the schema defaults) so a future change to those defaults cannot
+# silently alter this project's census budgets. Mining/headroom keep 120s
+# (short round trips); verify explores current main per cluster; synthesis is
+# one large Fable call over all verified clusters.
+timeouts:
+  census_mining_secs: 120
+  census_verify_secs: 900
+  census_synthesis_secs: 1800
