@@ -198,6 +198,97 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n() -> No
     assert len(worker._drift_check_tasks) == 0, 'no drift-check task should be scheduled'
 
 
+def _build_drift_worker(state_path: Path) -> MagicMock:
+    """A MagicMock SpeculativeMergeWorker wired for _maybe_run_drift_check.
+
+    Fresh in-memory ``_drift_land_count=0`` (models the post-restart reset) but a
+    caller-supplied ``_drift_state_path`` so the PERSISTED cadence can be shared
+    across simulated restarts (fix 1a).
+    """
+    w = MagicMock()
+    w._drift_land_count = 0
+    w._drift_check_tasks = set()
+    w._drift_state_path = state_path
+    w._ensure_host_allocator = MagicMock(return_value=MagicMock())
+    return w
+
+
+@pytest.mark.asyncio
+class TestDriftCheckCadencePersistence:
+    """Fix 1a (task 2886): the drift-check cadence must use a PERSISTED counter
+    so it survives the ~8h fleet redeploy that resets the in-memory worker
+    counter — the root cause of the drift check having NEVER fired.
+
+    RED (pre step-4): ``_maybe_run_drift_check`` keys the cadence off the
+    in-memory ``worker._drift_land_count`` and never touches
+    ``_drift_state_path``, so (a) no state file is written and (b) a fresh
+    (restarted) worker resets the count to 0 and the carried-over cadence
+    never fires.
+    """
+
+    async def test_persisted_counter_drives_cadence_and_is_saved(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_drift import (
+            _load_drift_check_state,
+            _maybe_run_drift_check,
+        )
+
+        state_path = tmp_path / 'drift_check_state.json'
+        git_ops = MagicMock()
+        req = MagicMock()
+        req.config.enabled_verify_runners = ['laptop']
+        req.config.verify_drift_check_every_n_lands = 3
+
+        reachback = AsyncMock(return_value=None)
+        worker = _build_drift_worker(state_path)
+        with patch('orchestrator.merge_queue._run_drift_check', reachback):
+            # Land 1: no fire; persisted count advances to 1.
+            await _maybe_run_drift_check(worker, git_ops, req, 'c1')
+            assert len(worker._drift_check_tasks) == 0
+            assert _load_drift_check_state(state_path).land_count == 1
+            # Land 2: no fire; persisted count advances to 2.
+            await _maybe_run_drift_check(worker, git_ops, req, 'c2')
+            assert len(worker._drift_check_tasks) == 0
+            assert _load_drift_check_state(state_path).land_count == 2
+            # Land 3: fires (3 % 3 == 0), keyed off the PERSISTED count.
+            await _maybe_run_drift_check(worker, git_ops, req, 'c3')
+            assert len(worker._drift_check_tasks) == 1
+            for t in list(worker._drift_check_tasks):
+                await t
+        assert reachback.await_count == 1
+
+    async def test_cadence_survives_simulated_restart(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import _maybe_run_drift_check
+
+        state_path = tmp_path / 'drift_check_state.json'
+        git_ops = MagicMock()
+        req = MagicMock()
+        req.config.enabled_verify_runners = ['laptop']
+        req.config.verify_drift_check_every_n_lands = 3
+
+        reachback = AsyncMock(return_value=None)
+        with patch('orchestrator.merge_queue._run_drift_check', reachback):
+            # Worker A observes 2 lands (no fire), then the process restarts.
+            worker_a = _build_drift_worker(state_path)
+            await _maybe_run_drift_check(worker_a, git_ops, req, 'c1')
+            await _maybe_run_drift_check(worker_a, git_ops, req, 'c2')
+            assert len(worker_a._drift_check_tasks) == 0
+            assert reachback.await_count == 0
+
+            # RESTART: a FRESH worker with the in-memory counter reset to 0 but
+            # the SAME persisted state path.  The 3rd land must still fire
+            # because the persisted count (2) carried over — proving the
+            # cadence does not depend on the in-memory _drift_land_count.
+            worker_b = _build_drift_worker(state_path)
+            assert worker_b._drift_land_count == 0  # in-memory counter reset
+            await _maybe_run_drift_check(worker_b, git_ops, req, 'c3')
+            assert len(worker_b._drift_check_tasks) == 1
+            for t in list(worker_b._drift_check_tasks):
+                await t
+        assert reachback.await_count == 1
+
+
 @pytest.mark.asyncio
 class TestReachBackRouting:
     """Reach-back / string-path monkeypatch routing contract.
