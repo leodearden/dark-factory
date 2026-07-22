@@ -33,6 +33,13 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     ):
         h = Harness(mock_orch_config)
 
+    # Task 2878: h.scheduler is a MagicMock (Scheduler is patched above), so
+    # is_actively_held() would otherwise return a truthy Mock by default.
+    # Default to "not held" so the existing "no live holder -> promote"
+    # semantics are preserved for every test in this file; tests exercising
+    # the live-recheck gate override this explicitly.
+    h.scheduler.is_actively_held.return_value = False
+
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     return h
 
