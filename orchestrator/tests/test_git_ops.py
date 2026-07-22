@@ -11605,6 +11605,44 @@ class TestDisableSharedRepoAutoMaintenance:
         assert rc_mt2 == 0
         assert mt_val2.strip() == 'false'
 
+    async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A non-zero git rc degrades loudly, not fatally: the method returns
+        normally (never raises) and emits a WARNING naming each failed key + rc.
+
+        This is the core of the best-effort/loud contract (loud-over-silent
+        degradation) the docstring and PRD α5 emphasise: failing to set the key
+        merely leaves auto-gc enabled (itself only benign-but-noisy) and must
+        not block orchestrator startup or a task dispatch. A regression that
+        turned the WARNING into a raise, or dropped the rc!=0 check, is caught
+        here.
+        """
+        async def fake_run(cmd, cwd=None):
+            # Both `git config <key> <val>` writes fail with a non-zero rc.
+            return (1, '', 'fatal: could not write config')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            # Returns normally — a config-set failure must never raise.
+            result = await git_ops.disable_shared_repo_auto_maintenance()
+        assert result is None
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'disable_shared_repo_auto_maintenance' in r.getMessage()
+        ]
+        # Both keys hit the rc!=0 branch → one loud WARNING each (naming key,
+        # rc, and stderr). Asserting BOTH keys guards against a regression that
+        # drops the rc check for either write.
+        messages = ' '.join(r.getMessage() for r in warnings)
+        assert 'gc.auto' in messages
+        assert 'maintenance.auto' in messages
+        assert 'rc=1' in messages, (
+            f'expected the non-zero rc surfaced loudly; got: {messages!r}'
+        )
+
     async def test_create_worktree_disables_auto_maintenance(
         self, git_ops: GitOps,
     ):
