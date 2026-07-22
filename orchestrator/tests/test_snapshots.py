@@ -292,6 +292,48 @@ class TestEvalWorktreeHermeticity:
             )
 
 
+class TestRunCleanupRelocated:
+    """cli._run_cleanup must discover eval worktrees at the RELOCATED root."""
+
+    def test_cleanup_removes_relocated_worktree(
+        self, tmp_repo: tuple[Path, str, str]
+    ) -> None:
+        """A worktree at eval_worktree_root(repo) is discovered and removed.
+
+        Pre-fix _run_cleanup scans ``project_root / '.eval-worktrees'`` — now
+        empty/absent since worktrees are external — so it echoes "No eval
+        worktrees found" and leaves the external worktree in place. Post-fix it
+        scans eval_worktree_root(project_root) and removes it.
+        """
+        from types import SimpleNamespace
+
+        from orchestrator.cli import _run_cleanup
+
+        repo, first, _second = tmp_repo
+
+        worktree_path, _ = asyncio.run(
+            create_eval_worktree(repo, 'test_task', first)
+        )
+        try:
+            assert worktree_path.exists()
+            # Sanity: the worktree really is at the relocated (external) root.
+            assert worktree_path.is_relative_to(
+                snapshots.eval_worktree_root(repo)
+            )
+
+            _run_cleanup(SimpleNamespace(project_root=repo))
+
+            assert not worktree_path.exists(), (
+                'cli._run_cleanup did not remove the relocated eval worktree'
+            )
+        finally:
+            subprocess.run(
+                ['git', 'worktree', 'remove', '--force', str(worktree_path)],
+                cwd=str(repo),
+                capture_output=True,
+            )
+
+
 class TestGetDiff:
     """get_diff must diff the COMMITTED eval branch against the threaded base."""
 
