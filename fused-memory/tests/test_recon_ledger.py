@@ -815,6 +815,35 @@ async def test_get_active_entity_standing_decision_none_for_unknown_and_non_acti
 
 
 @pytest.mark.asyncio
+async def test_get_active_entity_standing_decision_fast_fails_on_multiple_active(store):
+    """get_active_entity_standing_decision raises (loud-over-silent, INV-1)
+    instead of silently returning an arbitrary row when an entity_uuid carries
+    more than one ACTIVE standing decision. This cannot arise through
+    upsert_entity_standing_decision today (single-member GROUNDS_ENUM ⇒ at most
+    one active grounds per entity), so two rows sharing an entity_uuid but
+    differing in the grounds/flag_type PK slot are written via a raw upsert() to
+    simulate a future multi-grounds enum. Guards against the γ/δ hooks getting
+    non-deterministic results before a second grounds value is admitted."""
+    for grounds in ('structural_size_conflation', 'some_future_grounds'):
+        await store.upsert(
+            ReconLedgerRecord(
+                project_id='proj-a',
+                record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+                payload_json='{}',
+                state=STATE_ACTIVE,
+                created_at='2026-07-01T00:00:00+00:00',
+                task_id='',
+                flag_type=grounds,  # distinct grounds → distinct PK, same entity_uuid
+                run_id='uuid-dup',
+                entity_uuid='uuid-dup',
+            )
+        )
+
+    with pytest.raises(ValueError, match='more than one ACTIVE'):
+        await store.get_active_entity_standing_decision('proj-a', 'uuid-dup')
+
+
+@pytest.mark.asyncio
 async def test_list_entity_standing_decisions_scoped_to_kind_project_and_state(store):
     """list_entity_standing_decisions returns only entity_standing_decision
     rows, scoped to the project, optionally filtered by state — never a

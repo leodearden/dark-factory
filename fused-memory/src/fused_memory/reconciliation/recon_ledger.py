@@ -643,20 +643,45 @@ class ReconLedgerStore:
         consume (INV-5). Keyed on the indexed ``entity_uuid`` column and
         gated on ``state = active`` — an expired/revoked row (or an unknown
         entity) yields ``None``.
+
+        **At-most-one-active-grounds-per-entity assumption + fast-fail
+        (loud-over-silent, INV-1):** an ``entity_uuid`` occupies the ``run_id``
+        PK slot while ``grounds`` occupies ``flag_type``, so a single entity
+        *can* carry several rows — one per grounds — and, once ``GROUNDS_ENUM``
+        grows past its single seed value, more than one of them could be ACTIVE
+        at the same time. This helper collapses to a single row, so silently
+        returning an arbitrary one of several (an unordered ``LIMIT 1``) would
+        make the γ/δ hooks non-deterministic. Rather than pick one under an
+        unstated ordering, it fetches up to two active rows and raises
+        ``ValueError`` if more than one exists, naming the entity and the
+        conflicting grounds. This guard is latent — it cannot fire today
+        (single-member ``GROUNDS_ENUM`` ⇒ at most one active row per entity) —
+        and the design question it flags (whether this lookup should take an
+        explicit ``grounds`` argument) MUST be resolved before a second grounds
+        value is admitted to ``GROUNDS_ENUM``.
         """
         db = self._require_db()
         cursor = await db.execute(
             """
             SELECT * FROM recon_ledger
             WHERE project_id = ? AND record_kind = ? AND entity_uuid = ? AND state = ?
-            LIMIT 1
+            ORDER BY flag_type
+            LIMIT 2
             """,
             (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, entity_uuid, STATE_ACTIVE),
         )
-        row = await cursor.fetchone()
-        if row is None:
+        rows = await cursor.fetchall()
+        if not rows:
             return None
-        return _record_from_row(row)
+        if len(rows) > 1:
+            raise ValueError(
+                'get_active_entity_standing_decision: found more than one ACTIVE '
+                f'entity_standing_decision for entity_uuid={entity_uuid!r} in '
+                f'project {project_id!r} (grounds={[row["flag_type"] for row in rows]}). '
+                'This lookup assumes at most one active grounds per entity; add an '
+                'explicit grounds argument before growing GROUNDS_ENUM past one value.'
+            )
+        return _record_from_row(rows[0])
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
