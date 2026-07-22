@@ -12,7 +12,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.fm_retry import FM_NULL_SENTINEL_URL, fm_retry_backoffs
 from orchestrator.mcp_lifecycle import (
     McpLifecycle,
     McpSession,
@@ -584,6 +584,86 @@ class TestSharedFmRetrySchedule:
 
         assert expected_attempts > 3
         assert mock_client.post.call_count == expected_attempts
+
+
+class TestNullSentinelFailFast:
+    """McpSession fails FAST against the D8 null sentinel (task 2880).
+
+    Eval runs point fused-memory at FM_NULL_SENTINEL_URL ('http://127.0.0.1:1',
+    a non-routable address) to neutralize orchestrator-side FM writes with an
+    immediate ECONNREFUSED. That address can never host a *restarting*
+    fused-memory, so spinning the ~120s fm-restart window against it is pure
+    dead time (~2 min per logical McpSession call). _raw_call/_raw_notify must
+    collapse the schedule to a single attempt (zero sleeps) for the sentinel,
+    while a real fm endpoint keeps the full shared schedule.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raw_call_fails_fast_on_sentinel(self):
+        session = McpSession(FM_NULL_SENTINEL_URL)
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = httpx.ConnectError('refused')
+
+        # Deliberately do NOT patch fm_retry_backoffs — the sentinel must
+        # bypass it entirely. asyncio.sleep is patched only so a RED run
+        # (which still spins the real ~11-17 schedule) stays fast.
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(RuntimeError):
+                await session._raw_call('initialize')
+
+        # Single attempt, zero retries.
+        assert mock_client.post.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_raw_notify_fails_fast_on_sentinel(self):
+        session = McpSession(FM_NULL_SENTINEL_URL)
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = httpx.ConnectError('refused')
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(RuntimeError):
+                await session._raw_notify('notifications/initialized')
+
+        assert mock_client.post.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_non_sentinel_still_retries(self):
+        """Regression: a real fm endpoint still consumes the shared schedule."""
+        session = McpSession('http://localhost:8002')
+        ok = _make_response(session_id='s1')
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = [
+            httpx.ConnectError('refused'),
+            httpx.ConnectError('refused'),
+            ok,
+        ]
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch(
+                'orchestrator.mcp_lifecycle.fm_retry_backoffs',
+                return_value=[0.5, 1.5],
+            ),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await session._raw_call('initialize')
+
+        assert result['result'] == {'ok': True}
+        assert mock_client.post.call_count == 3
 
 
 # ---------------------------------------------------------------------------
