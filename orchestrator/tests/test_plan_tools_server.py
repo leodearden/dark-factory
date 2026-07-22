@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any
 
 import pytest
 from fastmcp import FastMCP
@@ -955,7 +956,7 @@ class TestMainSuppressesBanner:
             ['plan_tools', '--worktree', str(wt), '--meta-root', str(mr)],
         )
 
-        captured: dict[str, object] = {}
+        captured: dict[str, Any] = {}
 
         def recorder(self, *args, **kwargs):
             captured['args'] = args

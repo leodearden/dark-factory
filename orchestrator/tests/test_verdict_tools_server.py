@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from typing import Any
 
 import pytest
 from fastmcp import FastMCP
@@ -356,7 +357,7 @@ class TestMainSuppressesBanner:
             ],
         )
 
-        captured: dict[str, object] = {}
+        captured: dict[str, Any] = {}
 
         def recorder(self, *args, **kwargs):
             captured['args'] = args
