@@ -94,6 +94,8 @@ class ScopeViolationEscalator:
       task-creation misroute detected by the path-scope guard.  Repeated
       identical misroutes fold into one pending parent (content-fingerprint
       dedup, unbounded window); the first occurrence always escalates.
+      Disable via the ``scope_violation_dedupe_enabled=False`` constructor
+      escape hatch to restore legacy one-escalation-per-call behavior.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
@@ -108,6 +110,7 @@ class ScopeViolationEscalator:
     def __init__(
         self,
         budget_misconfig_dedup_window_secs: float = _BUDGET_MISCONFIG_DEDUP_WINDOW_SECS,
+        scope_violation_dedupe_enabled: bool = True,
     ) -> None:
         self._queues: dict[str, EscalationQueue] = {}
         self._budget_misconfig_dedup_window_secs = budget_misconfig_dedup_window_secs
@@ -115,6 +118,10 @@ class ScopeViolationEscalator:
         # escalation.  Prevents a sustained per-call exhaustion from flooding the
         # operator queue with one entry per adjudicator hit.
         self._budget_misconfig_last_submitted: dict[str, float] = {}
+        # Escape hatch (mirrors budget_misconfig_dedup_window_secs above): set
+        # False to restore legacy no-fold behavior for report_rejection, e.g.
+        # if content-fingerprint dedup ever needs to be disabled in the field.
+        self._scope_violation_dedupe_enabled = scope_violation_dedupe_enabled
 
     def _queue_for(self, project_root: str) -> EscalationQueue | None:
         """Return (cached) :class:`EscalationQueue` for *project_root*.
@@ -232,7 +239,7 @@ class ScopeViolationEscalator:
                 ),
             )
             config = DedupeConfig(  # type: ignore[possibly-unbound]
-                infra_dedupe_enabled=True,
+                infra_dedupe_enabled=self._scope_violation_dedupe_enabled,
                 infra_dedupe_window_secs=float('inf'),
                 infra_dedupe_categories=(_CATEGORY,),
                 key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
