@@ -4749,6 +4749,19 @@ class Harness:
                 and self._escalation_queue is not None
                 and metadata.get('task_kind') != 'deterministic'
             ):
+                # Verified-green stranded remediation (PRD leaf α §2.1): BEFORE
+                # re-filing, check whether this blocked task's warm lane holds
+                # verified-green, all-steps-done work.  On a match we submit the
+                # branch DIRECTLY to the merge queue (which runs even under a
+                # scheduler pause — the incident's root cause) and record the
+                # action via an auto-dismissed escalation, leaving the task
+                # blocked; return None to SKIP today's re-file/re-pend.  On a
+                # non-match (or kill-switch off / non-pooled project) this
+                # returns False and we fall through to the unchanged re-file
+                # path below — byte-identical for every non-matching task.
+                if await self._maybe_submit_stranded_verified_green(tid, metadata):
+                    return None
+
                 from escalation.models import Escalation
 
                 esc = Escalation(
