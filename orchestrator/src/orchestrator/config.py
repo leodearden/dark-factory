@@ -1615,6 +1615,38 @@ class GitConfig(BaseModel):
             'off and does not size the merge-spec pool.'
         ),
     )
+    warm_lane_prewarm: bool = Field(
+        default=False,
+        description=(
+            'When True, Harness.run() EAGERLY materializes the full effective_N '
+            'warm-lane pool on disk at startup (GitOps.prewarm_pool), instead of '
+            'letting each _lane-k be created lazily on its first acquire.  Root '
+            'cause it addresses: the pool is effective_N = max_concurrent_tasks + '
+            'spare_warm_lanes FREE lanes in memory, but the on-disk git worktree '
+            'add for each lane happens only in the acquire create-once branch, '
+            'lowest-numbered-first — so on a host peaking below effective_N the '
+            'spare lanes are never demanded, never created, and the intended '
+            'headroom is a phantom (present in the in-memory state machine, '
+            'absent on disk).  prewarm closes that gap: for each lane not already '
+            'registered it does git worktree add --detach <lane> <main HEAD> then '
+            '_seed_warm_lane --fresh-checkout, leaving a lane byte-identical to a '
+            'released idle lane (detached HEAD, no task branch, seeded target/) '
+            'that the EXISTING reset-in-place acquire path adopts unchanged.  '
+            'Consulted ONCE at startup, AFTER all reconcile sweeps and BEFORE the '
+            'first dispatch, so it never races a live acquire/release and never '
+            'double-creates a lane the sweeps already restored.  Fail-open: skips '
+            'entirely when the CoW seed base is ABSENT (mirrors acquire\'s gate), '
+            'tolerates per-lane failures (logged, torn down, counted, loop '
+            'continues), never raises, and is idempotent across restarts.  Emits '
+            'a shortfall WARNING (the VISIBLE SIGNAL) whenever it cannot reach '
+            'effective_N so a disk/floor shortfall can never silently cap the '
+            'pool.  Gated on warm_lane_pool (no effect when the pool is off).  '
+            'Default False → byte-identical to today (no eager creation) and '
+            'trivially revertible, mirroring the warm_lane_pool / '
+            'warm_lane_disk_guard / warm_lane_soft_floor knob convention; the '
+            'reify host enables it via its own orchestrator.yaml.'
+        ),
+    )
     warm_lane_base_target_dir: str | None = Field(
         default=None,
         description=(

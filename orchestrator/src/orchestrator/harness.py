@@ -1845,6 +1845,50 @@ class Harness:
             # live workflow can race the release.
             await self._reconcile_terminal_lanes()
 
+            # 2f. Eager warm-lane pool prewarm (task 2879).  Gated on BOTH
+            # git.warm_lane_pool AND the new default-off git.warm_lane_prewarm
+            # knob, and only when the pool actually exists.  Runs HERE — after
+            # every startup reconcile sweep (which have already restored the
+            # existing on-disk lanes, so prewarm's resident-skip will not
+            # double-create them) and BEFORE finish_startup()/the first
+            # acquire_next — so it can never race a live acquire/release.
+            # prewarm_pool is itself fail-open / never-raises / idempotent; the
+            # only thing that can fail on THIS side is resolving start_ref, so
+            # the whole block is best-effort: a start_ref lookup failure logs
+            # and continues, never wedging startup.
+            if (
+                self.config.git.warm_lane_pool
+                and self.config.git.warm_lane_prewarm
+                and self.git_ops.warm_lane_pool is not None
+            ):
+                try:
+                    # Resolve current-main SHA as the neutral detached start_ref
+                    # for every materialized lane (same idiom as the substrate
+                    # gate / dispatch paths; use the configured main_branch, not
+                    # a literal 'main').  Fall back to the symbolic branch name
+                    # if rev-parse returns None so prewarm still runs.
+                    start_ref = await self.git_ops.resolve_branch_sha(
+                        self.config.git.main_branch
+                    )
+                    if start_ref is None:
+                        start_ref = self.config.git.main_branch
+                        logger.warning(
+                            'warm-lane prewarm: resolve_branch_sha returned '
+                            'None for %r — falling back to the symbolic branch '
+                            'ref', self.config.git.main_branch,
+                        )
+                    logger.info(
+                        'warm-lane prewarm enabled — eagerly materializing the '
+                        'warm-lane pool from %s', start_ref,
+                    )
+                    await self.git_ops.prewarm_pool(start_ref)
+                except Exception:
+                    logger.warning(
+                        'warm-lane prewarm: unexpected error during startup '
+                        'prewarm — continuing startup (prewarm is best-effort)',
+                        exc_info=True,
+                    )
+
             # Startup reconcile sweeps above have all run; mark the Scheduler
             # started so acquire_next() may now proceed (task 2235's runtime
             # enforcement of the "sweeps run before the first tick" invariant
