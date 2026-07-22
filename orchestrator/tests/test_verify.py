@@ -8349,3 +8349,468 @@ class TestFailureReportUsesAnchoredExcerpt:
         report = vr.failure_report()
 
         assert '## Test Failures' in report
+
+
+# ---------------------------------------------------------------------------
+# INV-1 (task 2883, plans/merge-verdict-integrity-prd.md §1/§3.2/§7/§8α):
+# the merge gate (role='merge' AND is_merge_verify=True — the ADOPTABLE
+# post-merge verdict path) must never return a no-evidence TRIVIAL PASS. Any
+# "nothing to run" resolution (no source files, empty existing_files, empty
+# command set) escalates to the project's full gate, or FAILs loud if no gate
+# command exists. The narrow role=='merge' AND is_merge_verify gate leaves the
+# baseline-probe caller and every task-1774/task-2838 guard test byte-identical.
+# ---------------------------------------------------------------------------
+class _RecordingEventStore:
+    """Minimal EventStore stand-in capturing emit() calls in-memory.
+
+    Mirrors the double in test_multihost_verify_integration.py; each recorded
+    entry is ``(event_type, task_id, role, data)``.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, str | None, str | None, dict[str, Any]]] = []
+
+    def emit(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        phase: str | None = None,
+        role: str | None = None,
+        data: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
+        duration_ms: float | None = None,
+        **kw: Any,
+    ) -> None:
+        self.events.append((event_type, task_id, role, dict(data or {})))
+
+    def events_of(self, event_type: Any) -> list[tuple[Any, str | None, str | None, dict[str, Any]]]:
+        return [e for e in self.events if e[0] == event_type]
+
+
+class TestMergeGateEscalatesTrivialPassSite1:
+    """Site 1 — module_configs branch (verify.py ~line 5011).
+
+    A merge-gate verify over a no-source (docs-only) diff, with module_configs
+    present that carry a real command, must ESCALATE to the per-subproject full
+    gate rather than trivially pass. Reuses the guard_spy _run_cmd-patch harness
+    and the ``__scope_all_cmd__`` sentinel — no guard script written and empty
+    backstop globs, so the existing should_override path is inert and, pre-fix,
+    this input trivially passed.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path)
+
+    def _module(self) -> ModuleConfig:
+        # prefix 'orchestrator' never matches the docs file, so the module is
+        # SKIPPED by derive_verify_plan → scoped is empty → the trivial-pass
+        # site is reached; but the module still carries a real (sentinel)
+        # command for the escalated per-subproject fan-out to execute.
+        return ModuleConfig(prefix='orchestrator', test_command='__scope_all_cmd__')
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_no_source_escalates_to_full_gate(self, tmp_path: Path, guard_spy):
+        """role='merge' AND is_merge_verify → no trivial pass; the module's full
+        gate command runs instead."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [self._module()],
+                task_files=['docs/x.md'],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected escalated per-subproject full gate to run; got: {calls}'
+        )
+        assert result.passed
+        assert result.trivial is False, (
+            f'A merge-gate escalation must not be a trivial pass; got trivial={result.trivial}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass escalated; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_role_same_inputs_still_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Negative gate: role='task' with identical inputs STILL trivially
+        passes (the new escalation is merge-gate-only)."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [self._module()],
+                task_files=['docs/x.md'],
+                role='task',  # not the merge gate
+            )
+
+        assert result.passed
+        assert result.trivial is True, (
+            f'task-role no-source diff must stay a trivial pass; got trivial={result.trivial}'
+        )
+        assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
+
+
+class TestMergeGateNoCommandLoudFails:
+    """A merge gate with NO command to run must FAIL loud (merge_no_evidence),
+    never trivially pass nor vacuously pass. Two paths:
+
+    (a) Site 2 inline — task_files present, no source, no global command.
+    (b) GLOBAL-tail backstop — task_files empty, so the Site 2 block is never
+        entered and control reaches the final global run_verification tail,
+        whose all-None/empty config commands would otherwise be a vacuous
+        0==0==0 pass.
+
+    The negative gate confirms a task-role call with the same command-less
+    config does NOT loud-FAIL (the gate is merge-only).
+    """
+
+    def _make_commandless_config(self, tmp_path: Path) -> OrchestratorConfig:
+        # The str-typed command fields reject None; '' is falsy so the merge
+        # gate sees no command to run.
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='',
+            lint_command='',
+            type_check_command='',
+        )
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_no_source_no_command_loud_fails(self, tmp_path: Path, guard_spy):
+        """(a) Site 2: no source + no global command → loud FAIL, no command runs."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_commandless_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        assert result.passed is False
+        assert result.trivial is False
+        assert result.category == 'merge_no_evidence', (
+            f'Expected loud-FAIL category; got {result.category!r}'
+        )
+        assert calls == [], f'No command should execute for a loud FAIL; got: {calls}'
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_empty_task_files_no_command_loud_fails(self, tmp_path: Path, guard_spy):
+        """(b) GLOBAL-tail backstop: empty task_files never enter Site 2 → the
+        would-be vacuous global pass FAILs loud instead."""
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_commandless_config(tmp_path),
+                [],
+                task_files=[],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        assert result.passed is False
+        assert result.trivial is False
+        assert result.category == 'merge_no_evidence', (
+            f'Expected loud-FAIL category; got {result.category!r}'
+        )
+        assert calls == [], f'No command should execute for a loud FAIL; got: {calls}'
+
+    @pytest.mark.asyncio
+    async def test_task_role_commandless_config_does_not_loud_fail(self, tmp_path: Path, guard_spy):
+        """Negative gate: task role must NOT loud-FAIL on a command-less config."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_commandless_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='task',  # not the merge gate
+            )
+
+        assert result.passed is True
+        assert result.category != 'merge_no_evidence', (
+            f'task role must not loud-FAIL; got category {result.category!r}'
+        )
+
+
+class TestMergeGateEscalatesTrivialPassSite2:
+    """Site 2 — no-module_configs branch (verify.py ~line 5195).
+
+    A merge-gate verify over a no-source diff with NO module_configs but a
+    configured GLOBAL test command must escalate to the global full gate rather
+    than trivially pass.  Same guard_spy harness; the fall-through reaches the
+    global run_verification tail which runs config.test_command (the sentinel).
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path, test_command='__scope_all_cmd__',
+        )
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_no_source_escalates_to_global_gate(self, tmp_path: Path, guard_spy):
+        """role='merge' AND is_merge_verify → the configured global test command
+        runs; no trivial pass."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected escalated global full gate to run; got: {calls}'
+        )
+        assert result.passed
+        assert result.trivial is False, (
+            f'A merge-gate escalation must not be a trivial pass; got trivial={result.trivial}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass escalated; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_role_same_inputs_still_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Negative gate: role='task' with identical inputs STILL trivially passes."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['docs/x.md'],
+                role='task',  # not the merge gate
+            )
+
+        assert result.passed
+        assert result.trivial is True, (
+            f'task-role no-source diff must stay a trivial pass; got trivial={result.trivial}'
+        )
+        assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
+
+
+class TestMergeGateClobberedWorktree:
+    """Incident 83336a32 — an ENOENT-clobbered merge worktree: task_files is
+    non-empty but every path is missing on disk, so existing_files resolves
+    empty and the pre-fix guards failed open into a 0ms LOCAL trivial pass.
+
+    The merge gate must NEVER trivial-pass this: it escalates to the full gate
+    (when a command exists) or FAILs loud, and the emitted trivial_pass_escalated
+    event carries reason='empty_existing_files' — distinguishing evidence-absence
+    from a genuine docs-only diff. The trivial_pass_escalated event is captured
+    via a recording event_store threaded through run_scoped_verification.
+    """
+
+    def _config_with_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, test_command='__scope_all_cmd__')
+
+    def _config_no_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path, test_command='', lint_command='', type_check_command='',
+        )
+
+    # A source path deliberately NOT created on disk → existing_files empty.
+    _CLOBBERED = ['orchestrator/src/orchestrator/foo.py']
+
+    @pytest.mark.asyncio
+    async def test_clobbered_with_command_runs_full_gate(self, tmp_path: Path, guard_spy):
+        """Clobbered worktree + a configured command → the full gate runs; not a
+        0ms trivial pass; event reason='empty_existing_files', resolution='full_gate'."""
+        from orchestrator.event_store import EventType
+
+        fake_run_cmd, calls = guard_spy
+        rec = _RecordingEventStore()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._config_with_cmd(tmp_path),
+                [],
+                task_files=self._CLOBBERED,
+                role='merge',
+                is_merge_verify=True,
+                event_store=rec,  # type: ignore[arg-type]
+            )
+
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, f'Expected full gate to run; got: {calls}'
+        assert result.passed
+        assert result.trivial is False, (
+            f'Clobbered worktree must never yield a trivial PASS; got trivial={result.trivial}'
+        )
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, f'Expected exactly one escalation event; got {rec.events}'
+        assert evs[0][3]['reason'] == 'empty_existing_files', evs[0][3]
+        assert evs[0][3]['resolution'] == 'full_gate', evs[0][3]
+
+    @pytest.mark.asyncio
+    async def test_clobbered_no_command_loud_fails(self, tmp_path: Path, guard_spy):
+        """Clobbered worktree + NO command → loud FAIL (merge_no_evidence); event
+        reason='empty_existing_files', resolution='loud_fail'."""
+        from orchestrator.event_store import EventType
+
+        fake_run_cmd, calls = guard_spy
+        rec = _RecordingEventStore()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._config_no_cmd(tmp_path),
+                [],
+                task_files=self._CLOBBERED,
+                role='merge',
+                is_merge_verify=True,
+                event_store=rec,  # type: ignore[arg-type]
+            )
+
+        assert result.passed is False
+        assert result.trivial is False
+        assert result.category == 'merge_no_evidence', result.category
+        assert calls == [], f'No command should execute for a loud FAIL; got: {calls}'
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, f'Expected exactly one escalation event; got {rec.events}'
+        assert evs[0][3]['reason'] == 'empty_existing_files', evs[0][3]
+        assert evs[0][3]['resolution'] == 'loud_fail', evs[0][3]
+
+
+class TestTrivialPassEscalatedEventContract:
+    """Pins the trivial_pass_escalated event data shape AND that the gate is
+    exactly role=='merge' AND is_merge_verify — the baseline-probe shape
+    (role='merge', is_merge_verify=False) and the task role emit NO event and
+    keep the legacy should_override / _trivial_pass behaviour."""
+
+    def _config_with_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, test_command='__scope_all_cmd__')
+
+    def _config_no_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path, test_command='', lint_command='', type_check_command='',
+        )
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_full_gate_event_shape(self, tmp_path: Path, guard_spy):
+        """(a) merge gate + no-source diff + global command → one event
+        {reason:'no_source_files', resolution:'full_gate'}, measured_at present."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, _calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                tmp_path, self._config_with_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='merge', is_merge_verify=True,
+                event_store=rec,  # type: ignore[arg-type]
+            )
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, rec.events
+        _etype, _tid, erole, data = evs[0]
+        assert data['reason'] == 'no_source_files', data
+        assert data['resolution'] == 'full_gate', data
+        assert data.get('measured_at'), data
+        assert erole == 'merge', erole
+
+    @pytest.mark.asyncio
+    async def test_loud_fail_event_shape(self, tmp_path: Path, guard_spy):
+        """(b) merge gate + no command → event resolution='loud_fail'."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, _calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                tmp_path, self._config_no_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='merge', is_merge_verify=True,
+                event_store=rec,  # type: ignore[arg-type]
+            )
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, rec.events
+        assert evs[0][3]['resolution'] == 'loud_fail', evs[0][3]
+
+    @pytest.mark.asyncio
+    async def test_baseline_probe_shape_no_event_and_trivial_passes(self, tmp_path: Path, guard_spy):
+        """(c) role='merge' but is_merge_verify=False (baseline-probe shape) →
+        NO event; the legacy guard-absent trivial pass is preserved."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, self._config_with_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='merge',  # is_merge_verify defaults False
+                event_store=rec,  # type: ignore[arg-type]
+            )
+        assert rec.events_of(EventType.trivial_pass_escalated) == []
+        assert result.passed
+        assert result.trivial is True, (
+            f'baseline-probe shape must keep the legacy trivial pass; got {result.trivial}'
+        )
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_task_role_no_event(self, tmp_path: Path, guard_spy):
+        """(d) role='task' → NO event."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, _calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, self._config_with_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='task', is_merge_verify=True,
+                event_store=rec,  # type: ignore[arg-type]
+            )
+        assert rec.events_of(EventType.trivial_pass_escalated) == []
+        assert result.trivial is True
