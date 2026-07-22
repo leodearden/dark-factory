@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import wire_scheduler_liveness_mock
@@ -24,7 +24,31 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.stranded_verified_green import VerifiedGreenMatch
+
+
+@pytest.fixture(autouse=True)
+def _reset_merge_provenance():
+    """MergeProvenance._outbox is a process-global — never leak a bound outbox
+    into another test (mirrors test_reconcile_stranded.py's identically-named
+    fixture).  A None outbox is the correct default for the non-landing tests
+    (MergeProvenance.lookup misses → git-archaeology fallback, already mocked)."""
+    MergeProvenance._outbox = None
+    yield
+    MergeProvenance._outbox = None
+
+
+def _bind_landed_row(tmp_path: Path, *, task_id: str, advanced_sha: str) -> None:
+    """Bind a real LandedOutbox holding a row for *task_id* so its branch
+    resolves ON_MAIN via MergeProvenance.lookup (mirrors
+    test_reconcile_stranded.py's identically-named helper)."""
+    outbox = LandedOutbox(tmp_path / 'landed.json')
+    outbox.record(LandedRow(
+        task_id=task_id, branch_tip_sha='branchtip', advanced_sha=advanced_sha,
+        landed_at=1.0,
+    ))
+    MergeProvenance.bind(outbox)
 
 
 def _emit_verify(
@@ -879,3 +903,103 @@ class TestStrandedMergeFailedL2:
             agent_role='harness-stranded-blocked-reaper',
         )
         assert len(l2s) == 1  # scoped dedup — no duplicate born-at-L2
+
+
+@pytest.mark.asyncio
+class TestStrandedVerifiedGreenHappyPathIntegration:
+    """PRD §6α happy-path integration + non-interference (step-17).
+
+    Sweep 1 submits the verified-green branch merge-queue-direct and records
+    the action via an auto-dismissed escalation (NO pending L1, marker
+    stamped).  The merge then LANDS (a MergeProvenance journal row makes the
+    branch resolve ON_MAIN).  Sweep 2 marks the blocked task done via the
+    EXISTING found_on_main MARK_DONE_WITH_PROVENANCE path — which is only
+    reachable because (a) the record escalation is DISMISSED, not pending
+    (else the ``not report.open_escalations`` guard would block the flip),
+    and (b) the ``stranded_merge_request`` marker lives in metadata, ignored
+    by the mark-done path.  No ``stranded_merge_failed`` L2 is ever filed.
+    """
+
+    async def test_submit_then_land_marks_done_via_found_on_main(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        advanced_sha = 'ad' * 20  # 40-hex on-main landing SHA
+        queue = EscalationQueue(tmp_path / 'esc_hp')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+
+        # --- Sweep 1: verified-green blocked task → merge-queue-direct submit.
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({tid: 'blocked'}, None),
+        )
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 1
+        # Record auto-dismissed → NO pending escalation left to block the flip.
+        assert queue.get_by_task(tid, status='pending') == []
+        harness.scheduler.update_task.assert_awaited()
+        marker = harness.scheduler.update_task.await_args.args[1][
+            'stranded_merge_request'
+        ]
+
+        # --- The merge LANDS: bind a journal row so the branch resolves ON_MAIN.
+        _bind_landed_row(tmp_path, task_id=tid, advanced_sha=advanced_sha)
+
+        # Wire the existing found_on_main mark-done collaborators (mirror
+        # test_reconcile_stranded.py: mark_done forwards to set_task_status).
+        async def _fake_mark_done(t, *, kind, sha, note=None):
+            prov = {'kind': kind, 'commit': sha}
+            if note is not None:
+                prov['note'] = note
+            await harness.scheduler.set_task_status(t, 'done', done_provenance=prov)
+        harness.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
+        harness.git_ops.cleanup_worktree = AsyncMock()
+        harness.git_ops.release_lane_for_terminal_task = AsyncMock()
+        harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
+        harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
+        # Sweep 2's task row carries the marker → prove it does NOT interfere
+        # with the found_on_main mark-done path.
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'blocked',
+                'metadata': {'stranded_merge_request': marker},
+            },
+        )
+
+        # --- Sweep 2: the EXISTING found_on_main path flips blocked → done.
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_any_await(
+            tid, 'done',
+            done_provenance={
+                'kind': 'found_on_main', 'commit': advanced_sha, 'note': ANY,
+            },
+        )
+        # The task was NOT re-pended anywhere along the way.
+        for call in harness.scheduler.set_task_status.await_args_list:
+            assert tuple(call.args[:2]) != (tid, 'pending')
+        # No stranded_merge_failed L2 was ever filed (success path is a no-op).
+        l2s = [
+            e for e in queue.get_by_task(
+                tid, status='pending', level=2,
+                agent_role='harness-stranded-blocked-reaper',
+            )
+            if e.category == 'stranded_merge_failed'
+        ]
+        assert l2s == []
