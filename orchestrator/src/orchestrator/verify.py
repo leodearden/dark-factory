@@ -5373,6 +5373,26 @@ async def run_scoped_verification(
                         role=role,
                     )
 
+        # INV-1 (task 2883) GLOBAL-tail backstop: the merge gate must never
+        # reach the final global run_verification with an empty command set —
+        # a config whose test/lint/type commands are all None/'' would make
+        # _summarize_checks return a vacuous 0==0==0 PASS, vouching for a tree
+        # no gate ever ran on. This path is reached only when Site 2 was NOT
+        # entered (task_files empty/None-derived-to-empty) — Site 2 already
+        # returns inline for the no-source case — so there is no double emission.
+        if role == 'merge' and is_merge_verify and not (
+            config.test_command or config.lint_command or config.type_check_command
+        ):
+            _emit_trivial_pass_escalated(
+                event_store, task_id,
+                reason='empty_command_set', resolution='loud_fail',
+            )
+            logger.warning(
+                'INV-1: merge gate reached the global tail with no command to run'
+                ' — failing loud (merge_no_evidence) rather than a vacuous pass',
+            )
+            return _merge_no_evidence_fail('empty_command_set')
+
         logger.info('Verification mode: global (no scope info)')
         return await run_verification(
             worktree, config, max_retries=max_retries,
