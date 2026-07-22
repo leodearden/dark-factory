@@ -900,7 +900,62 @@ class TestLocalRunnerBundle:
             role='merge',
             task_id=None,
             archive_root=None,
+            event_store=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# INV-1 (task 2883): LocalRunner threads event_store into run_scoped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLocalRunnerThreadsEventStore:
+    """LocalRunner.run_merge_verify threads its event_store into run_scoped so
+    the local merge path emits trivial_pass_escalated (INV-1). The CLI/remote
+    in-worktree path constructs the runner with event_store=None and stays
+    None-safe (it cannot reach the dispatching host's store)."""
+
+    def _make_runner(self, *, event_store, run_scoped):
+        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+        config.merge_verify_workspace = False
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        return LocalRunner(
+            merge_wt=MagicMock(),
+            config=config,
+            module_configs=[],
+            task_files=None,
+            run_scoped=run_scoped,
+            run_unscoped=run_unscoped,
+            event_store=event_store,
+        )
+
+    async def test_event_store_threaded_into_run_scoped(self):
+        sentinel = MagicMock(name='event_store')
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        runner = self._make_runner(event_store=sentinel, run_scoped=run_scoped)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert run_scoped.await_args is not None
+        kwargs = run_scoped.await_args[1]
+        assert kwargs['event_store'] is sentinel
+        assert kwargs['role'] == 'merge'
+        assert kwargs['is_merge_verify'] is True
+
+    async def test_event_store_none_stays_none(self):
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        runner = self._make_runner(event_store=None, run_scoped=run_scoped)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert run_scoped.await_args is not None
+        assert run_scoped.await_args[1]['event_store'] is None
 
 
 # ---------------------------------------------------------------------------
