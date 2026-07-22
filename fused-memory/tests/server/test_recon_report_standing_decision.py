@@ -166,3 +166,33 @@ class TestWriteEntityStandingDecisionTool:
         params = set(sigs[_TOOL].parameters)
         assert 'authorized_by' not in params
         assert {'project_id', 'entity_uuid', 'grounds', 'evidence'} <= params
+
+
+_QUALIFIED_TOOL = 'mcp__recon-report__write_entity_standing_decision'
+
+
+class TestStandingDecisionDisallowList:
+    """Boundary-test row 14: only Stage 2 may call the durable-write tool.
+
+    Unlike the in-process-STATE recon-report tools (cite_*, add_finding, …) which
+    stay callable in every stage, write_entity_standing_decision performs a
+    durable SQLite-ledger write, so it is blocked in Stage 1 and Stage 3.
+    """
+
+    def test_tool_in_stage1_disallowed(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert _QUALIFIED_TOOL in STAGE1_DISALLOWED
+
+    def test_tool_in_stage3_disallowed(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert _QUALIFIED_TOOL in STAGE3_DISALLOWED
+
+    def test_tool_not_in_stage2_disallowed(self):
+        from fused_memory.reconciliation.cli_stage_runner import STAGE2_DISALLOWED
+        assert _QUALIFIED_TOOL not in STAGE2_DISALLOWED
+
+    def test_tool_in_dedicated_sublist(self):
+        from fused_memory.reconciliation.cli_stage_runner import (
+            DISALLOW_RECON_REPORT_LEDGER_WRITES,
+        )
+        assert _QUALIFIED_TOOL in DISALLOW_RECON_REPORT_LEDGER_WRITES
