@@ -38,7 +38,7 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # Default to "not held" so the existing "no live holder -> promote"
     # semantics are preserved for every test in this file; tests exercising
     # the live-recheck gate override this explicitly.
-    h.scheduler.is_actively_held.return_value = False
+    h.scheduler.is_actively_held = MagicMock(return_value=False)
 
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     return h
@@ -258,7 +258,7 @@ class TestOrphanL0Reaper:
 
         # Scheduler shows the task actively holding its metadata.files
         # locks right now — a live/re-dispatched workflow.
-        harness.scheduler.is_actively_held.return_value = True
+        harness.scheduler.is_actively_held = MagicMock(return_value=True)
 
         assert await harness._reap_orphan_l0_escalations() == 0
 
