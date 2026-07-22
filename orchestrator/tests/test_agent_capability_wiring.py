@@ -173,7 +173,7 @@ class TestShippedRoleCapabilityDeclarations:
         'debugger': (frozenset({'orchestrator', 'plan_tools'}), True),
         'merger': (frozenset({'orchestrator', 'verdict_tools'}), False),
         'judge': (frozenset({'orchestrator', 'verdict_tools'}), False),
-        'simple_task': (frozenset({'orchestrator', 'plan_tools'}), False),
+        'simple_task': (frozenset({'orchestrator', 'plan_tools'}), True),
         'reviewer_comprehensive': (frozenset({'verdict_tools'}), False),
         'steward': (frozenset({'orchestrator'}), False),
         'deep_reviewer': (frozenset({'orchestrator'}), False),
@@ -204,12 +204,12 @@ class TestShippedRoleCapabilityDeclarations:
 
         assert SIMPLE_TASK.mcp_families == frozenset({'orchestrator', 'plan_tools'})
 
-    def test_only_implementer_and_debugger_are_sandboxed(self):
+    def test_implementer_debugger_and_simple_task_are_sandboxed(self):
         from orchestrator.agents.roles import ROLES  # noqa: PLC0415
 
         sandboxed_names = {name for name, role in ROLES.items() if role.sandboxed}
 
-        assert sandboxed_names == {'implementer', 'debugger'}
+        assert sandboxed_names == {'implementer', 'debugger', 'simple_task'}
 
     @pytest.mark.parametrize(
         'role_name', ['reviewer_comprehensive', 'judge', 'merger'],
