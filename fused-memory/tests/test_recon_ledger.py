@@ -28,6 +28,7 @@ import pytest_asyncio
 
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_TTL,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
     STATE_ACTIVE,
@@ -928,3 +929,163 @@ async def test_upsert_entity_standing_decision_validation_raises(store):
 
     # No malformed row was written by any rejected call.
     assert await store.list_entity_standing_decisions('proj-a') == []
+
+
+# ---------------------------------------------------------------------------
+# gc() TTL-flip for entity_standing_decision (task 2894 α, step-7/8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gc_flips_expired_standing_decision_to_expired_with_ttl_reason(store):
+    """An ACTIVE entity_standing_decision past its expires_at is NOT deleted by
+    gc() (unlike marker kinds) — it is flipped to state='expired' with
+    payload_json expiry_reason='ttl' (INV-2), and get_active then returns None.
+    Exercises the empty-terminal_task_ids gc branch."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-old',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-04-01T00:00:00+00:00',
+        expires_at='2026-06-30T00:00:00+00:00',  # < now
+        edge_count_at_decision=4,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+
+    count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    # Not deleted — still discoverable, but now expired with a ttl reason.
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1
+    row = listed[0]
+    assert row.state == STATE_EXPIRED
+    assert json.loads(row.payload_json)['expiry_reason'] == EXPIRY_REASON_TTL
+    # No longer active.
+    assert await store.get_active_entity_standing_decision('proj-p', 'uuid-old') is None
+    # gc acted on exactly one row (the flip).
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_gc_leaves_unexpired_active_standing_decision_untouched(store):
+    """An ACTIVE entity_standing_decision whose expires_at is in the future is
+    left fully untouched by gc() — still active, no expiry_reason stamped."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-live',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-12-01T00:00:00+00:00',  # > now
+        edge_count_at_decision=2,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+
+    count = await store.gc('proj-p', now='2026-08-01T00:00:00+00:00', terminal_task_ids=[])
+
+    active = await store.get_active_entity_standing_decision('proj-p', 'uuid-live')
+    assert active is not None
+    assert active.state == STATE_ACTIVE
+    assert 'expiry_reason' not in json.loads(active.payload_json)
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_gc_leaves_already_expired_standing_decision_idempotent(store):
+    """An already state='expired' standing row with a past expires_at is left
+    untouched — the flip is gated on state='active', so gc() neither deletes it
+    nor re-stamps expiry_reason (idempotent)."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-already',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-04-01T00:00:00+00:00',
+        expires_at='2026-06-30T00:00:00+00:00',  # < now
+        edge_count_at_decision=1,
+        evidence=[],
+        state=STATE_EXPIRED,
+    )
+
+    count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1  # not deleted
+    assert listed[0].state == STATE_EXPIRED
+    # Not re-stamped: the row carried no expiry_reason and still carries none.
+    assert 'expiry_reason' not in json.loads(listed[0].payload_json)
+    assert count == 0  # nothing acted on
+
+
+@pytest.mark.asyncio
+async def test_gc_mixed_flips_standing_and_deletes_markers_with_terminal_ids(store):
+    """Mixed pass over the non-empty terminal_task_ids branch: an expired
+    standing decision FLIPS (kept), an expired marker DELETES, a
+    terminal-referenced marker DELETES; the returned count == deleted +
+    flipped."""
+    # Standing decision (active, past expires_at) → FLIP, not delete.
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-flip',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-04-01T00:00:00+00:00',
+        expires_at='2026-06-30T00:00:00+00:00',
+        edge_count_at_decision=9,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+    # Expired marker-kind row → DELETE via the expiry arm.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='task-expired',
+            flag_type='drift_flag',
+            expires_at='2026-06-15T00:00:00+00:00',
+        )
+    )
+    # Terminal-referenced marker (not time-expired) → DELETE via the terminal arm.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind='stage2_persistence_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='task-terminal',
+            flag_type='persistence_flag',
+            expires_at='2026-12-01T00:00:00+00:00',
+        )
+    )
+
+    count = await store.gc(
+        'proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=['task-terminal']
+    )
+
+    # Standing row flipped, not deleted.
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1
+    assert listed[0].state == STATE_EXPIRED
+    assert json.loads(listed[0].payload_json)['expiry_reason'] == EXPIRY_REASON_TTL
+    assert await store.get_active_entity_standing_decision('proj-p', 'uuid-flip') is None
+    # Both markers deleted.
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-expired', flag_type='drift_flag'
+        )
+        is None
+    )
+    assert (
+        await store.get_by_identity(
+            'proj-p',
+            'stage2_persistence_marker',
+            task_id='task-terminal',
+            flag_type='persistence_flag',
+        )
+        is None
+    )
+    # Count == deleted (2 markers) + flipped (1 standing decision).
+    assert count == 3
