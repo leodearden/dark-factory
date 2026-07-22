@@ -1462,6 +1462,11 @@ def mark_windowless_wm_sessions_exited(
     later, unchanged. An already-terminal record is left fully untouched
     (idempotent -- never re-stamped with the sentinel).
 
+    A per-record try/except means one bad record (a corrupt body, a
+    concurrent-reap race vanishing the file mid-sweep, an unwritable record)
+    never aborts the sweep -- it is logged and skipped, exactly like
+    ``mark_orphaned_sessions_exited``'s own fault handling.
+
     *run* is the injectable ``wmctrl -l`` runner passed through to
     ``_wmctrl_live_window_ids`` (``None``, the default, resolves to the real
     ``_wmctrl_list`` at call time).
@@ -1492,7 +1497,18 @@ def mark_windowless_wm_sessions_exited(
         if normalized is None or normalized in live_ids:
             continue  # unprovable, or the window is still live
 
-        marked_record = _mark_exited_if_still_non_terminal(slug, root, exit_code=ORPHAN_EXIT_CODE)
+        try:
+            marked_record = _mark_exited_if_still_non_terminal(
+                slug, root, exit_code=ORPHAN_EXIT_CODE
+            )
+        except (FileNotFoundError, CorruptSessionRecord, OSError):
+            # A single unmarkable record (a concurrent-reap race, an
+            # unwritable record) must not abort the sweep -- log and move on
+            # to the next candidate.
+            logger.error(
+                'mark_windowless_wm_sessions_exited: failed to mark %s', slug, exc_info=True
+            )
+            continue
         if marked_record is None:
             continue  # lost the race: a concurrent writer already made this terminal
         marked.append(marked_record)
