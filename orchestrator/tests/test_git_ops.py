@@ -11561,3 +11561,45 @@ class TestRunInputText:
         rc, out, _ = await _run(['git', '--version'])
         assert rc == 0
         assert out.startswith('git version')
+
+
+class TestDisableSharedRepoAutoMaintenance:
+    """PRD plans/os-sandbox-worktree-containment-prd.md task α5 (D2 corollary).
+
+    Orchestrator-managed shared repos must have ``gc.auto=0`` +
+    ``maintenance.auto=false`` set idempotently so background
+    auto-gc/maintenance never fires under the narrow shared-.git write-set
+    (α2: .git root + packed-refs are RO), where it would fail
+    benignly-but-noisily.
+    """
+
+    async def test_disable_shared_repo_auto_maintenance_sets_and_is_idempotent(
+        self, git_ops: GitOps,
+    ):
+        """Both keys are set repo-locally, and a second call is a no-op-in-effect
+        (git config overwrites in place → naturally idempotent)."""
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc_gc, gc_val, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt, mt_val, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc == 0
+        assert gc_val.strip() == '0'
+        assert rc_mt == 0
+        assert mt_val.strip() == 'false'
+
+        # Idempotency: a second call overwrites in place, leaving identical values.
+        await git_ops.disable_shared_repo_auto_maintenance()
+        rc_gc2, gc_val2, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt2, mt_val2, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc2 == 0
+        assert gc_val2.strip() == '0'
+        assert rc_mt2 == 0
+        assert mt_val2.strip() == 'false'
