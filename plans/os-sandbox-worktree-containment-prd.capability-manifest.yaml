@@ -1,252 +1,287 @@
-# Machine-readable twin of os-sandbox-worktree-containment-prd.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc, v1).
-# task_id values stamped by commit_planning for the dark_factory batch;
-# γ6a/γ6b (reify registry) and γ7a-γ7e (sibling registries) are hand-stamped
-# at decompose — the DF stamper cannot reach foreign registries.
 prd: plans/os-sandbox-worktree-containment-prd.md
 schema_version: 1
 tasks:
-  - label: "α1"
-    task_id: null
-    title: "Audit ~/.claude writers for sandboxed task agents (freeze the writable list)"
-    capabilities:
-      - name: "claude-home-writer-audit-committed"
-        binding: "capability→producer (α1) — findings doc with FINAL-WRITABLE-LIST marker; α2 freezes carve-outs from it"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "FINAL-WRITABLE-LIST"
-          paths: ["plans/"]
-          expect: present
-  - label: "α2"
-    task_id: null
-    title: "compute_write_set() single-source writable-path derivation"
-    capabilities:
-      - name: "single-source-write-set"
-        binding: "capability→producer (α2) — new fn consumed by both backends via existing writable_modules/writable_extras params (verified plumbed, no live caller today)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def compute_write_set"
-          paths: ["orchestrator/src/orchestrator/agents/"]
-          expect: present
-  - label: "α3"
-    task_id: null
-    title: "Call-site wiring consumes compute_write_set(); SIMPLE_TASK sandboxed=True"
-    capabilities:
-      - name: "workflow-consumes-write-set"
-        binding: "capability→producer (α3) — workflow.py sandbox block switches self.modules → compute_write_set()"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "compute_write_set"
-          paths: ["orchestrator/src/orchestrator/workflow.py"]
-          expect: present
-      - name: "simple-task-sandboxed-flag"
-        binding: "capability→producer (α3) — sandboxed=True on SIMPLE_TASK, judged by test_agent_capability_wiring pins"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "roles.py already contains sandboxed=True for implementer/debugger — a grep cannot attribute the flag to SIMPLE_TASK; the wiring-pin suite owns this"
-  - label: "α4"
-    task_id: null
-    title: "Real-kernel enforcement-matrix suite (12 rows, landlock)"
-    capabilities:
-      - name: "enforcement-matrix-suite-exists"
-        binding: "capability→producer (α4) — module name mandated test_sandbox_enforcement_matrix; prior art test_landlock.py:106-148 (real kernel, skip-if-no-landlock)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "test_sandbox_enforcement_matrix"
-          paths: ["orchestrator/tests/"]
-          expect: present
-  - label: "α5"
-    task_id: null
-    title: "Shared-repo git maintenance discipline (gc.auto=0, maintenance.auto=false)"
-    capabilities:
-      - name: "maintenance-discipline-applied"
-        binding: "capability→producer (α5) — idempotent application on orchestrator-managed shared repos"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "maintenance\\.auto"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-  - label: "β1"
-    task_id: null
-    title: "Fail-closed dispatch guard + deduplicated escalation"
-    capabilities:
-      - name: "fail-closed-refusal-exception"
-        binding: "capability→producer (β1) — exception name mandated SandboxUnavailable, mirroring recon RemediationSandboxUnavailable (task 1935 posture)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "class SandboxUnavailable"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "escalation-deduped-per-backend-state"
-        binding: "rejection-mechanism (INV-4) — one escalation across N refused invocations; unit-tested"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "dedup is a behavioural test property, not mechanically greppable"
-  - label: "β2"
-    task_id: null
-    title: "sandbox_applied / sandbox_unavailable event emission"
-    capabilities:
-      - name: "sandbox-event-types-registered"
-        binding: "capability→producer (β2) — new EventTypes at event_store.py:44 enum; digest of WriteSet stamped per invocation (INV-2)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "sandbox_applied"
-          paths: ["orchestrator/src/orchestrator/event_store.py"]
-          expect: present
-  - label: "γ1"
-    task_id: null
-    title: "Soak predicate implementation (replaces fail-safe stub)"
-    capabilities:
-      - name: "soak-predicate-stub-replaced"
-        binding: "capability→producer (γ1) — decompose-time stub exits 2 with STUB-NOT-IMPLEMENTED marker; real predicate removes it (expect: absent is the mechanical inversion)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "STUB-NOT-IMPLEMENTED"
-          paths: ["scripts/check_sandbox_soak.sh"]
-          expect: absent
-  - label: "γ2"
-    task_id: null
-    title: "DF config flip — sandbox {enabled: true, backend: landlock}"
-    capabilities:
-      - name: "df-sandbox-config-flipped"
-        binding: "capability→producer (γ2) — value-anchored pattern; dark-factory-orchestrator.yaml has NO sandbox block today (verified absent)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^ +backend: landlock"
-          paths: ["dark-factory-orchestrator.yaml"]
-          expect: present
-  - label: "γ3"
-    task_id: null
-    title: "DF orchestrator restart deploy (deterministic, self-unit scheduled)"
-    capabilities:
-      - name: "df-restart-deployed"
-        binding: "DeterministicRunner phase-ε self-unit path — done_provenance='deterministic-deploy-scheduled' is the proof artifact"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "runtime deploy verified by the runner's own detached-restart machinery, not a repo grep"
-  - label: "γ4"
-    task_id: null
-    title: "Containment probe — committed denied-write errno report"
-    capabilities:
-      - name: "containment-probe-report-on-main"
-        binding: "capability→producer (γ4) — report at docs/sandbox-containment-probe-report.md with CONTAINMENT-PROBE-RESULT marker per denied row (D8 report-based, D9 errno-agnostic)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "CONTAINMENT-PROBE-RESULT"
-          paths: ["docs/"]
-          expect: present
-  - label: "γ5"
-    task_id: null
-    title: "Soak gate — 3-day delayed milestone + predicate"
-    capabilities:
-      - name: "soak-predicate-gate"
-        binding: "the task IS the check — before_done.kind='predicate' + milestone {delayed, 259200s}; resume re-runs the read-only check"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "predicate exit code drives done/escalate at runtime; nothing to grep"
-  - label: "γ6a"
-    task_id: null
-    title: "Reify config flip (reify registry)"
-    capabilities:
-      - name: "reify-sandbox-config-flipped"
-        binding: "capability→producer (γ6a, reify registry) — external dep dark_factory:<γ5> gates on canary soak"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry task; DF stamper/scheduler cannot carry this check — reify verify owns it"
-  - label: "γ6b"
-    task_id: null
-    title: "Reify orchestrator redeploy-restart (reify registry)"
-    capabilities:
-      - name: "reify-restart-deployed"
-        binding: "reify scripts/orchestrator-redeploy-restart.sh (verified present+executable; schedule mode) via DeterministicRunner"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry deterministic deploy; runner-verified at runtime"
-  - label: "γ7"
-    task_id: null
-    title: "Fleet-remainder census + dashboard config flip + docs"
-    capabilities:
-      - name: "dashboard-config-flipped"
-        binding: "capability→producer (γ7) — value-anchored pattern does NOT match the existing line-64 comment (verified absent today); comment removal is part of the task"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^ +backend: landlock"
-          paths: ["dashboard/orchestrator.yaml"]
-          expect: present
-  - label: "γ7a"
-    task_id: null
-    title: "autopilot-video sandbox flip (autopilot_video registry)"
-    capabilities:
-      - name: "autopilot-video-flip"
-        binding: "capability→producer (γ7a) — enabled: false block exists at config line 36; external dep reify:<γ6b>"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry task"
-  - label: "γ7b"
-    task_id: null
-    title: "know-live sandbox flip (know_live registry)"
-    capabilities:
-      - name: "know-live-flip"
-        binding: "capability→producer (γ7b) — enabled: false block exists at config line 39; external dep reify:<γ6b>"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry task"
-  - label: "γ7c"
-    task_id: null
-    title: "pump-web-ui sandbox flip (pump_web_ui registry)"
-    capabilities:
-      - name: "pump-web-ui-flip"
-        binding: "capability→producer (γ7c) — enabled: false block exists at config line 40; external dep reify:<γ6b>"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry task"
-  - label: "γ7d"
-    task_id: null
-    title: "solar-challenge sandbox flip (solar_challenge registry)"
-    capabilities:
-      - name: "solar-challenge-flip"
-        binding: "capability→producer (γ7d) — canonical config present, NO sandbox block (flip = add); runs under legacy-named unit orchestrator-my-solar-challenge.service; external dep reify:<γ6b>"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry task"
-  - label: "γ7e"
-    task_id: null
-    title: "solar-challenge-platform sandbox flip (solar_challenge_platform registry)"
-    capabilities:
-      - name: "solar-challenge-platform-flip"
-        binding: "capability→producer (γ7e) — canonical config present, NO sandbox block (flip = add); external dep reify:<γ6b>"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "foreign-registry task"
-  - label: "δ1"
-    task_id: null
-    title: "Plan-target-granularity analysis gate (pure L2 escalation)"
-    capabilities:
-      - name: "granularity-analysis-gate"
-        binding: "pure gate (always_escalates, no before_done) — the esc-2508-1 pattern, Leo Q1 ratification"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the deliverable is a pending L2 escalation, not repo content"
+- label: α1
+  task_id: 2903
+  title: Audit ~/.claude writers for sandboxed task agents (freeze the writable list)
+  capabilities:
+  - name: claude-home-writer-audit-committed
+    binding: capability→producer (α1) — findings doc with FINAL-WRITABLE-LIST marker;
+      α2 freezes carve-outs from it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: FINAL-WRITABLE-LIST
+      paths:
+      - plans/
+      expect: present
+- label: α2
+  task_id: 2904
+  title: compute_write_set() single-source writable-path derivation
+  capabilities:
+  - name: single-source-write-set
+    binding: capability→producer (α2) — new fn consumed by both backends via existing
+      writable_modules/writable_extras params (verified plumbed, no live caller today)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def compute_write_set
+      paths:
+      - orchestrator/src/orchestrator/agents/
+      expect: present
+- label: α3
+  task_id: 2905
+  title: Call-site wiring consumes compute_write_set(); SIMPLE_TASK sandboxed=True
+  capabilities:
+  - name: workflow-consumes-write-set
+    binding: capability→producer (α3) — workflow.py sandbox block switches self.modules
+      → compute_write_set()
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: compute_write_set
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: simple-task-sandboxed-flag
+    binding: capability→producer (α3) — sandboxed=True on SIMPLE_TASK, judged by test_agent_capability_wiring
+      pins
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: roles.py already contains sandboxed=True for implementer/debugger —
+        a grep cannot attribute the flag to SIMPLE_TASK; the wiring-pin suite owns
+        this
+- label: α4
+  task_id: 2906
+  title: Real-kernel enforcement-matrix suite (12 rows, landlock)
+  capabilities:
+  - name: enforcement-matrix-suite-exists
+    binding: capability→producer (α4) — module name mandated test_sandbox_enforcement_matrix;
+      prior art test_landlock.py:106-148 (real kernel, skip-if-no-landlock)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: test_sandbox_enforcement_matrix
+      paths:
+      - orchestrator/tests/
+      expect: present
+- label: α5
+  task_id: 2907
+  title: Shared-repo git maintenance discipline (gc.auto=0, maintenance.auto=false)
+  capabilities:
+  - name: maintenance-discipline-applied
+    binding: capability→producer (α5) — idempotent application on orchestrator-managed
+      shared repos
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: maintenance\.auto
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: β1
+  task_id: 2908
+  title: Fail-closed dispatch guard + deduplicated escalation
+  capabilities:
+  - name: fail-closed-refusal-exception
+    binding: capability→producer (β1) — exception name mandated SandboxUnavailable,
+      mirroring recon RemediationSandboxUnavailable (task 1935 posture)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class SandboxUnavailable
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: escalation-deduped-per-backend-state
+    binding: rejection-mechanism (INV-4) — one escalation across N refused invocations;
+      unit-tested
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dedup is a behavioural test property, not mechanically greppable
+- label: β2
+  task_id: 2909
+  title: sandbox_applied / sandbox_unavailable event emission
+  capabilities:
+  - name: sandbox-event-types-registered
+    binding: capability→producer (β2) — new EventTypes at event_store.py:44 enum;
+      digest of WriteSet stamped per invocation (INV-2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sandbox_applied
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+- label: γ1
+  task_id: 2910
+  title: Soak predicate implementation (replaces fail-safe stub)
+  capabilities:
+  - name: soak-predicate-stub-replaced
+    binding: 'capability→producer (γ1) — decompose-time stub exits 2 with STUB-NOT-IMPLEMENTED
+      marker; real predicate removes it (expect: absent is the mechanical inversion)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: STUB-NOT-IMPLEMENTED
+      paths:
+      - scripts/check_sandbox_soak.sh
+      expect: absent
+- label: γ2
+  task_id: 2911
+  title: 'DF config flip — sandbox {enabled: true, backend: landlock}'
+  capabilities:
+  - name: df-sandbox-config-flipped
+    binding: capability→producer (γ2) — value-anchored pattern; dark-factory-orchestrator.yaml
+      has NO sandbox block today (verified absent)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^ +backend: landlock'
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: present
+- label: γ3
+  task_id: 2912
+  title: DF orchestrator restart deploy (deterministic, self-unit scheduled)
+  capabilities:
+  - name: df-restart-deployed
+    binding: DeterministicRunner phase-ε self-unit path — done_provenance='deterministic-deploy-scheduled'
+      is the proof artifact
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: runtime deploy verified by the runner's own detached-restart machinery,
+        not a repo grep
+- label: γ4
+  task_id: 2913
+  title: Containment probe — committed denied-write errno report
+  capabilities:
+  - name: containment-probe-report-on-main
+    binding: capability→producer (γ4) — report at docs/sandbox-containment-probe-report.md
+      with CONTAINMENT-PROBE-RESULT marker per denied row (D8 report-based, D9 errno-agnostic)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CONTAINMENT-PROBE-RESULT
+      paths:
+      - docs/
+      expect: present
+- label: γ5
+  task_id: 2914
+  title: Soak gate — 3-day delayed milestone + predicate
+  capabilities:
+  - name: soak-predicate-gate
+    binding: the task IS the check — before_done.kind='predicate' + milestone {delayed,
+      259200s}; resume re-runs the read-only check
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: predicate exit code drives done/escalate at runtime; nothing to grep
+- label: γ6a
+  task_id: 5332
+  title: Reify config flip (reify registry)
+  capabilities:
+  - name: reify-sandbox-config-flipped
+    binding: capability→producer (γ6a, reify registry) — external dep dark_factory:<γ5>
+      gates on canary soak
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry task; DF stamper/scheduler cannot carry this check
+        — reify verify owns it
+- label: γ6b
+  task_id: 5333
+  title: Reify orchestrator redeploy-restart (reify registry)
+  capabilities:
+  - name: reify-restart-deployed
+    binding: reify scripts/orchestrator-redeploy-restart.sh (verified present+executable;
+      schedule mode) via DeterministicRunner
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry deterministic deploy; runner-verified at runtime
+- label: γ7
+  task_id: 2915
+  title: Fleet-remainder census + dashboard config flip + docs
+  capabilities:
+  - name: dashboard-config-flipped
+    binding: capability→producer (γ7) — value-anchored pattern does NOT match the
+      existing line-64 comment (verified absent today); comment removal is part of
+      the task
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^ +backend: landlock'
+      paths:
+      - dashboard/orchestrator.yaml
+      expect: present
+- label: γ7a
+  task_id: 649
+  title: autopilot-video sandbox flip (autopilot_video registry)
+  capabilities:
+  - name: autopilot-video-flip
+    binding: 'capability→producer (γ7a) — enabled: false block exists at config line
+      36; external dep reify:<γ6b>'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry task
+- label: γ7b
+  task_id: 592
+  title: know-live sandbox flip (know_live registry)
+  capabilities:
+  - name: know-live-flip
+    binding: 'capability→producer (γ7b) — enabled: false block exists at config line
+      39; external dep reify:<γ6b>'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry task
+- label: γ7c
+  task_id: 16
+  title: pump-web-ui sandbox flip (pump_web_ui registry)
+  capabilities:
+  - name: pump-web-ui-flip
+    binding: 'capability→producer (γ7c) — enabled: false block exists at config line
+      40; external dep reify:<γ6b>'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry task
+- label: γ7d
+  task_id: 95
+  title: solar-challenge sandbox flip (solar_challenge registry)
+  capabilities:
+  - name: solar-challenge-flip
+    binding: capability→producer (γ7d) — canonical config present, NO sandbox block
+      (flip = add); runs under legacy-named unit orchestrator-my-solar-challenge.service;
+      external dep reify:<γ6b>
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry task
+- label: γ7e
+  task_id: 164
+  title: solar-challenge-platform sandbox flip (solar_challenge_platform registry)
+  capabilities:
+  - name: solar-challenge-platform-flip
+    binding: capability→producer (γ7e) — canonical config present, NO sandbox block
+      (flip = add); external dep reify:<γ6b>
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: foreign-registry task
+- label: δ1
+  task_id: 2916
+  title: Plan-target-granularity analysis gate (pure L2 escalation)
+  capabilities:
+  - name: granularity-analysis-gate
+    binding: pure gate (always_escalates, no before_done) — the esc-2508-1 pattern,
+      Leo Q1 ratification
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the deliverable is a pending L2 escalation, not repo content
