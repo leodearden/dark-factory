@@ -7130,3 +7130,114 @@ class TestFilterEntityStandingDecisions:
         )
         assert result.kept_flags == []
         assert result.suppressed_by_decision == {_ESD_U1: 1}
+
+
+class TestFilterEntityStandingDecisionsFallback:
+    """FALLBACK (stamps-omitted) match + escape hatches (task 2896 step-5)."""
+
+    _PID = 'p'
+
+    @pytest.mark.asyncio
+    async def test_fallback_match_suppresses_by_text_and_family(self, ledger_memory_service):
+        """(a) No stamps, only-U text, size-family flag_type → suppressed via fallback."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        flag = {'flag_type': 'oversized_entity', 'description': f'entity {_ESD_U1} is huge'}
+
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [flag]
+        )
+        assert result.kept_flags == []
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
+        assert result.grounds_by_decision == {_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION}
+
+    @pytest.mark.asyncio
+    async def test_second_uuid_escape_keeps_flag(self, ledger_memory_service):
+        """(b) Text cites U AND a second (edge) UUID V → KEPT even for size-family."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        flag = {
+            'flag_type': 'oversized_entity',
+            'description': f'{_ESD_U1} conflated with edge to {_ESD_U2}',
+        }
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [flag]
+        )
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_decision == {}
+
+    @pytest.mark.asyncio
+    async def test_fallback_flag_type_not_in_family_keeps_flag(self, ledger_memory_service):
+        """(c) Only-U text but flag_type not in family → KEPT."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        flag = {'flag_type': 'stale_metadata', 'description': f'about {_ESD_U1}'}
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [flag]
+        )
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_decision == {}
+
+    @pytest.mark.asyncio
+    async def test_strong_grounds_mismatch_non_family_keeps_flag(self, ledger_memory_service):
+        """(d) Stamped entity_uuid=U but grounds mismatch AND flag_type not in family → KEPT.
+
+        Under-suppression bias: neither STRONG (grounds mismatch) nor FALLBACK
+        (flag_type not in family) fires.
+        """
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        flag = {
+            'entity_uuid': _ESD_U1,
+            'grounds': 'something_else',
+            'flag_type': 'stale_metadata',
+            'description': f'about {_ESD_U1}',
+        }
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [flag]
+        )
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_decision == {}
+
+    @pytest.mark.asyncio
+    async def test_strong_grounds_mismatch_but_family_fallback_suppresses(self, ledger_memory_service):
+        """(e) Grounds mismatch (no STRONG) BUT size-family flag_type + only-U text →
+        suppressed via FALLBACK — documents strong-OR-fallback independence."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1
+        )
+        flag = {
+            'entity_uuid': _ESD_U1,
+            'grounds': 'something_else',
+            'flag_type': 'oversized_entity',
+            'description': 'entity too large',
+        }
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [flag]
+        )
+        assert result.kept_flags == []
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
+        # Attribution grounds is the ROW's grounds, not the flag's mismatched stamp.
+        assert result.grounds_by_decision == {_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION}
+
+    @pytest.mark.asyncio
+    async def test_expired_row_does_not_suppress(self, ledger_memory_service):
+        """(f) An expired standing row never suppresses (only active rows are read)."""
+        await _seed_standing_decision(
+            ledger_memory_service.recon_ledger, self._PID, _ESD_U1, state='expired'
+        )
+        flag = {
+            'entity_uuid': _ESD_U1,
+            'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            'flag_type': 'oversized_entity',
+            'description': f'about {_ESD_U1}',
+        }
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [flag]
+        )
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_decision == {}
