@@ -21732,6 +21732,14 @@ class TestSpeculationSlotSemaphoreDepth:
     part (b) is the K=1 regression guard that already passes.
     """
 
+    # This test gates N's verify for up to 30s waiting for K=2 concurrency and
+    # builds 3 real git merge worktrees; under `-n auto` (32 workers on 32 CPUs)
+    # its wall-clock can drift past the global 60s per-test timeout, which the
+    # thread-method pytest-timeout answers by os._exit()ing the xdist worker
+    # ("node down: Not properly terminated"; see pyproject.toml addopts note).
+    # Opt out with a larger, still-bounded ceiling per the pyproject.toml
+    # "Slow tests opt out with @pytest.mark.timeout(N)" convention.
+    @pytest.mark.timeout(120)
     async def test_k2_builds_two_speculative_ahead(
         self,
         git_ops: GitOps,
