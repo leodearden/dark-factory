@@ -11563,6 +11563,7 @@ class TestRunInputText:
         assert out.startswith('git version')
 
 
+@pytest.mark.asyncio
 class TestDisableSharedRepoAutoMaintenance:
     """PRD plans/os-sandbox-worktree-containment-prd.md task α5 (D2 corollary).
 

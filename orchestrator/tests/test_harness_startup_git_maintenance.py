@@ -15,6 +15,7 @@ RuntimeError sentinel.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -87,4 +88,4 @@ async def test_startup_disables_shared_repo_auto_maintenance(
     with pytest.raises(RuntimeError, match='__loop_reached_sentinel__'):
         await h.run(prd_path=None)
 
-    h.git_ops.disable_shared_repo_auto_maintenance.assert_awaited()
+    cast(AsyncMock, h.git_ops.disable_shared_repo_auto_maintenance).assert_awaited()
