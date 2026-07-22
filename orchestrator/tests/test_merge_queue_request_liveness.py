@@ -37,7 +37,6 @@ import contextlib
 import logging
 import time
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -776,6 +775,11 @@ class TestDeadInflightVerifyAborts:
         to a genuine no-PROGRESS budget: step-4's elapsed-only trigger aborts
         this healthy, actively-writing verify exactly like a dead one, since
         it never looks at worktree content at all.
+
+        task 2921: the verify gate itself is now a plain release-event wait
+        (no real writer coroutine racing the budget under host load) — the
+        progress signal this test relies on instead is a deterministic
+        `newest_content_mtime` injection (patched alongside this gate).
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease
@@ -793,17 +797,8 @@ class TestDeadInflightVerifyAborts:
         worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
 
-        async def _healthy_writing_gate(*args: Any, **kwargs: object) -> MagicMock:
-            merge_wt_arg = Path(args[0])
-            target = merge_wt_arg / 'target'
-            target.mkdir(exist_ok=True)
-            i = 0
-            # Keep writing fresh content well past several budget windows so
-            # a working no-progress budget's clock is repeatedly reset.
-            while not release_event.is_set():
-                (target / f'{i}.tmp').write_text('progress')
-                i += 1
-                await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS)
+        async def _gate(*args: object, **kwargs: object) -> MagicMock:
+            await release_event.wait()
             return _pass_result()
 
         fake_local = MagicMock()
@@ -811,7 +806,7 @@ class TestDeadInflightVerifyAborts:
         fake_local.is_local = True
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _healthy_writing_gate):
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gate):
             verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
             # Let several budget windows elapse while content keeps writing.
             await asyncio.sleep(worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS * 4)
