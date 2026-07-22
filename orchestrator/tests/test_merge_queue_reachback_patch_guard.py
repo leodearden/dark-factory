@@ -245,6 +245,15 @@ def _find_merge_queue_private_patches(source: str, forbidden: set[str]) -> list[
 #   _run_drift_check                      merge_drift.py:254   (_maybe_run_drift_check)
 #   _run_shadow_compare                   merge_shadow.py:1012 (_maybe_schedule_shadow_compare)
 #
+# FIX 2 (task 2886, PRD leaf delta §3.4) locks two further reach-back names for
+# the map-less COARSE shadow-compare path.  Each is resolved via a function-local
+# `from orchestrator.merge_queue import X` (mirroring the _run_shadow_compare /
+# _run_cold_shadow_verify locks above), so the satellite copy is off the
+# resolution path and patching it directly would pass vacuously:
+#
+#   _run_coarse_shadow_compare            merge_shadow.py (_maybe_schedule_shadow_compare)
+#   _run_cold_shadow_verify_suite         merge_shadow.py (_run_coarse_shadow_compare)
+#
 # A name drops off this table -- and its ALLOWLIST pairs become genuine
 # repoint candidates -- once a later scope deletes the back-import that
 # locks it.
@@ -282,9 +291,12 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue_multihost_wiring.py', '_run_drift_check'),
     ('test_merge_queue_train_attribution.py', '_finalize_advanced_merge'),
     ('test_merge_queue_warm_cold_shadow.py', '_maybe_schedule_shadow_compare'),
+    ('test_merge_queue_warm_cold_shadow.py', '_run_coarse_shadow_compare'),
     ('test_merge_queue_warm_cold_shadow.py', '_run_cold_shadow_verify'),
     ('test_merge_queue_warm_cold_shadow.py', '_run_shadow_compare'),
+    ('test_merge_shadow.py', '_run_coarse_shadow_compare'),
     ('test_merge_shadow.py', '_run_cold_shadow_verify'),
+    ('test_merge_shadow.py', '_run_cold_shadow_verify_suite'),
     ('test_merge_shadow.py', '_run_shadow_compare'),
     ('test_merge_speculation.py', '_acquire_warm_verify_worktree'),
     ('test_merge_speculation.py', '_finalize_advanced_merge'),
