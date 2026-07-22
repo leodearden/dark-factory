@@ -1950,15 +1950,18 @@ class ReconReportState:
         Returns the helper's success dict on a write; the structured
         ``insufficient_evidence`` rejection (unmet_arms + hint) when the gate is
         not satisfied; ``_ERR_SERVICE_UNAVAILABLE`` when no memory_service is
-        wired; or ``_ERR_INVALID_GROUNDS`` (with the ledger's message as a hint)
-        when ``grounds`` is outside ``GROUNDS_ENUM``. A graphiti sampling failure
-        propagates loudly (INV-1) rather than persisting a poisoned row.
+        wired OR its ``recon_ledger`` is unset (an unwired ledger raises
+        :class:`LedgerUnavailable`, mapped here); or ``_ERR_INVALID_GROUNDS``
+        (with the ledger's message as a hint) when ``grounds`` is outside
+        ``GROUNDS_ENUM``. A graphiti sampling failure propagates loudly (INV-1)
+        rather than persisting a poisoned row.
         """
         if self._memory_service is None:
             return _ERR_SERVICE_UNAVAILABLE.copy()
 
         from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
             EvidenceGateRejected,
+            LedgerUnavailable,
         )
         from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
             write_entity_standing_decision as _write_helper,
@@ -1974,6 +1977,12 @@ class ReconReportState:
             )
         except EvidenceGateRejected as exc:
             return dict(exc.rejection)
+        except LedgerUnavailable:
+            # recon_ledger not wired on the memory service: a durable standing
+            # decision cannot be persisted, so surface the same structured
+            # service-unavailable error the docstring promises rather than
+            # letting the helper's loud failure propagate as a raw exception.
+            return _ERR_SERVICE_UNAVAILABLE.copy()
         except ValueError as exc:
             rejected = dict(_ERR_INVALID_GROUNDS)
             rejected['hint'] = str(exc)
