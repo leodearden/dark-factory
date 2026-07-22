@@ -1508,3 +1508,51 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
     assert kwargs["agent_transcript_roots"] == expected_roots
     # (3) the [start, end] window equals _census_window_dates' first/last.
     assert (start_date, end_date) == (window[0], window[-1])
+
+
+# ---------------------------------------------------------------------------
+# task 2953: _post_mcp_tool_call() streamable-HTTP Accept headers
+# ---------------------------------------------------------------------------
+
+class _FakeHttpxResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
+    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
+    lacking an Accept header covering both application/json and
+    text/event-stream (verified live against a local MCP /mcp endpoint --
+    shared by census.py's submit_task and escalate_info posters via this one
+    function). httpx is imported lazily and is not importable in this test
+    env, so a fake `httpx` module is injected via sys.modules."""
+    import sys
+
+    captured_kwargs = {}
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"structuredContent": {"ok": True}},
+    }
+
+    fake_httpx = type(sys)("httpx")
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse(rpc_response)
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
+
+    assert result == {"ok": True}
+    headers = captured_kwargs.get("headers") or {}
+    assert "application/json" in headers.get("Accept", "")
+    assert "text/event-stream" in headers.get("Accept", "")

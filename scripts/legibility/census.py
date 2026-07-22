@@ -1191,6 +1191,14 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": arguments},
         },
+        # Required by the streamable-HTTP MCP transport -- omitting either
+        # value 406s before the tools/call is even dispatched (verified
+        # live against a local MCP /mcp endpoint; see
+        # census_trigger.default_status_fetcher for the matching fix).
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
         timeout=30.0,
     )
     response.raise_for_status()

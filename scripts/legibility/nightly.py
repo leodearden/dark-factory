@@ -348,7 +348,19 @@ def _default_poster(url: str, envelope: dict) -> None:
     """
     import httpx
 
-    response = httpx.post(url, json=envelope, timeout=10.0)
+    response = httpx.post(
+        url,
+        json=envelope,
+        # Required by the streamable-HTTP MCP transport -- omitting either
+        # value 406s before the tools/call is even dispatched (verified
+        # live against a local MCP /mcp endpoint; see
+        # census_trigger.default_status_fetcher for the matching fix).
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        timeout=10.0,
+    )
     response.raise_for_status()
 
 

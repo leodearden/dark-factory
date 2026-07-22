@@ -522,6 +522,17 @@ def default_status_fetcher(project_root: str | Path):
                         "arguments": {"project_root": project_root_str},
                     },
                 },
+                # The streamable-HTTP MCP transport 406s ("Not Acceptable:
+                # Client must accept application/json") before even
+                # dispatching the tools/call if Accept doesn't include BOTH
+                # values -- verified live against localhost:8002. With this
+                # header present, the server's response Content-Type is
+                # `application/json` (not SSE-framed) for this call, so
+                # `response.json()` below needs no `data:`-line parsing.
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                },
                 timeout=10.0,
             )
             response.raise_for_status()

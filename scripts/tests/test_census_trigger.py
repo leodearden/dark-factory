@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -438,6 +439,50 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
 
     with pytest.raises(ct.StatusFetchUnavailable):
         fetcher()
+
+
+class _FakeHttpxResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, monkeypatch):
+    """Task 2953: the streamable-HTTP MCP transport 406s
+    ("Not Acceptable: Client must accept application/json") any tools/call
+    POST whose Accept header doesn't include both application/json and
+    text/event-stream -- verified live against a local MCP /mcp endpoint.
+    default_status_fetcher's httpx import is lazy (httpx is not a scripts/
+    dependency and is not importable in this test env), so a fake `httpx`
+    module is injected into sys.modules for the duration of this test."""
+    captured_kwargs = {}
+    rpc_response = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"structuredContent": {"statuses": {"1": "done"}}},
+    }
+
+    fake_httpx = type(sys)("httpx")
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse(rpc_response)
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    fetcher = ct.default_status_fetcher(tmp_path)
+    result = fetcher()
+
+    assert result == {"statuses": {"1": "done"}}
+    headers = captured_kwargs.get("headers") or {}
+    assert "application/json" in headers.get("Accept", "")
+    assert "text/event-stream" in headers.get("Accept", "")
 
 
 # ---------------------------------------------------------------------------
