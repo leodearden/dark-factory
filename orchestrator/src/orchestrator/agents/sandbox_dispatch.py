@@ -77,6 +77,70 @@ def resolve_active_backend() -> Backend:
     )
 
 
+class SandboxUnavailable(RuntimeError):
+    """Raised when confinement is required but no OS sandbox backend resolves.
+
+    Fail-CLOSED guard for the sandboxed-dispatch call-site (task 2908, PRD
+    plans/os-sandbox-worktree-containment-prd.md D4 / invariant INV-4). Mirrors
+    reconciliation's ``RemediationSandboxUnavailable`` (task 1935,
+    fused_memory/reconciliation/sandbox_guard.py): when sandboxing is required
+    (``config.sandbox.enabled`` + ``role.sandboxed``) but the configured
+    backend resolves to no available OS sandbox (landlock/bwrap), the caller
+    must REFUSE to launch the agent unconfined rather than silently fall
+    through to an unsandboxed run.
+
+    Attributes:
+        should_escalate: The process-global dedup decision — True on the first
+            refusal for a given backend state, False on subsequent refusals
+            (INV-4: exactly one escalation across N refused invocations).
+        backend_state: The configured backend that failed to resolve
+            (``_preferred``) — the dedup key and escalation detail.
+    """
+
+    def __init__(
+        self, message: str, *, should_escalate: bool, backend_state: str,
+    ) -> None:
+        super().__init__(message)
+        self.should_escalate = should_escalate
+        self.backend_state = backend_state
+
+
+def resolve_backend_or_refuse() -> Backend:
+    """Fail-CLOSED backend resolution for the sandboxed-dispatch call-site.
+
+    Unlike ``resolve_active_backend()`` (which returns ``'none'`` when the
+    configured backend is unavailable, leaving the caller free to run
+    unsandboxed), this REFUSES: it raises ``SandboxUnavailable`` when
+    confinement is required but no OS backend resolves.
+
+    - ``backend == 'none'`` short-circuits FIRST: the explicit operator escape
+      hatch. Returns ``'none'`` with a WARNING and never refuses (same effect
+      as ``sandbox.enabled = false``; PRD D4). No availability probe is run.
+    - Otherwise resolve via ``resolve_active_backend()``; return the real
+      backend when landlock/bwrap is available.
+    - RAISE ``SandboxUnavailable`` when the configured backend (auto/landlock/
+      bwrap) resolves to nothing.
+    """
+    if _preferred == 'none':
+        logger.warning(
+            'sandbox enabled + role sandboxed but backend=none — running '
+            'UNSANDBOXED (operator escape hatch)',
+        )
+        return 'none'
+    resolved = resolve_active_backend()
+    if resolved != 'none':
+        return resolved
+    raise SandboxUnavailable(
+        f'Sandboxing is required (sandbox.enabled + role.sandboxed) but the '
+        f'configured backend={_preferred!r} resolved to no available OS '
+        f'sandbox (landlock/bwrap). Refusing to launch the agent unconfined '
+        f'(fail-closed, PRD D4). Install/enable landlock or bwrap, or set '
+        f'sandbox.backend=none to explicitly run unsandboxed.',
+        should_escalate=True,
+        backend_state=_preferred,
+    )
+
+
 def wrap_command(
     inner_cmd: list[str],
     cwd: Path,
