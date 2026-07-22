@@ -299,6 +299,18 @@ auto-chains a gen-(n+1) MergeRequest for the delta.  After this many consecutive
 advances the chain is broken and the request is escalated to humans via a 'blocked'
 outcome using the :data:`POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX`.  Not configurable."""
 
+_DEAD_BASE_COMMITS_CAP = 256
+"""FIFO cap for the INV-3 dead-base ledger (``_dead_base_commits``).
+
+A merge commit is recorded dead when it is failed/ejected/superseded/re-merged
+(so it will never be on main), letting :meth:`SpeculativeMergeWorker._chain_dead_link`
+detect a speculative item whose ``base_sha`` points at it (a broken chain).  A
+dead commit only needs to stay catchable until its stragglers re-dispatch —
+which the prompt-invalidation cascade + the dispatch/adoption dead-base checks
+do promptly — so evicting very old entries is safe: a false-negative on an
+ancient dead commit is unreachable in practice (such an item is long since
+re-merged).  Overridable per-instance via ``worker._dead_base_commits_cap`` in tests."""
+
 _MERGE_AHEAD_BOUND = 1
 """Maximum number of counted (non-speculative, non-train) items that may sit in
 the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646).
@@ -7297,6 +7309,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # invalidation + RunnerUnavailable) go here and are drained before _verifier_queue
         # so they are re-verified in submission order ahead of newer arrivals.
         self._redispatch: collections.deque[SpeculativeItem] = collections.deque()
+        # INV-3 chain-liveness ledger (PRD merge-verdict-integrity §1/§3.3).  The
+        # SET of merge commits that were failed/ejected/superseded/re-merged since
+        # creation — orphaned speculative bases that will never land on main.  A
+        # speculative item whose base_sha ∈ this set has a BROKEN chain and its
+        # verdict is VOID (see _chain_dead_link).  Membership is the primary
+        # structure (checked in the hot path); _dead_base_order tracks FIFO
+        # insertion order so _record_dead_base can evict the oldest past the cap.
+        # Bounded so it cannot grow unboundedly across a long worker lifetime.
+        self._dead_base_commits: set[str] = set()
+        self._dead_base_order: collections.deque[str] = collections.deque()
+        # Overridable in tests for fast eviction checks (mirrors _shutdown_timeout).
+        self._dead_base_commits_cap: int = _DEAD_BASE_COMMITS_CAP
         # γ cross-iteration state promoted from loop-locals: set by finalize after
         # each head result; read by dispatch to decide chain re-merge.
         # Single-host: byte-identical (deque is always empty at dispatch point).
@@ -8532,6 +8556,71 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         tip = self._newest_frozen_commit()
         return tip if tip is not None else main_sha
+
+    def _record_dead_base(self, *shas: str) -> None:
+        """Record merge commit(s) as dead bases in the INV-3 chain-liveness ledger.
+
+        A commit passed here was failed/ejected/superseded/re-merged, so any
+        speculative item whose ``base_sha`` points at it has a BROKEN chain
+        (see :meth:`_chain_dead_link`).  Called at every invalidation site
+        (head-failure cascade, dispatch chain-invalidation discard,
+        RUNNER_UNAVAILABLE re-merge) so a built-awaiting-host straggler that the
+        cascade missed is still caught at its next dispatch.
+
+        Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
+        oldest recorded commit is evicted from BOTH the membership set and the
+        order deque.  Empty/blank SHAs and already-recorded duplicates are
+        no-ops.  Pure / synchronous.
+        """
+        for sha in shas:
+            if not sha:
+                continue
+            s = sha.strip()
+            if not s or s in self._dead_base_commits:
+                continue
+            self._dead_base_commits.add(s)
+            self._dead_base_order.append(s)
+            while len(self._dead_base_order) > self._dead_base_commits_cap:
+                evicted = self._dead_base_order.popleft()
+                self._dead_base_commits.discard(evicted)
+
+    def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
+        """Return the dead base link iff *item*'s chain is BROKEN, else None (INV-3).
+
+        The single shared chain-intact predicate behind all three enforcement
+        points (dispatch re-check, FAIL adoption, PASS adoption) — factored here
+        so the checks can never silently drift apart, mirroring how
+        :meth:`_frozen_base_chain` is the one shared walk behind the two §5.3
+        report surfaces.
+
+        A verdict is adoptable iff, at adoption time, the item's verified tree
+        still equals ``current-main ∘ S`` for an ordered sequence S of
+        STILL-LIVE pipeline items.  We enforce that by the base link only: the
+        chain is DEAD iff ``item.base_sha`` is a known-dead commit (recorded in
+        :attr:`_dead_base_commits`) AND is not current main.  Returns that dead
+        ``base_sha`` when broken, else None.
+
+        DEPTH-AGNOSTIC by construction: a LIVE deep base — a still-in-flight
+        predecessor's merge_commit — is NOT in the dead set, so a deep
+        multi-merge PASS with an intact chain returns None (never voided) and
+        the deep-frontier probe campaign stays unimpeded (PRD §6).  A benign
+        stale-but-LANDED base is likewise never in the dead set, so the existing
+        CAS-rebase path still handles it — only a genuinely orphaned base breaks
+        the chain.
+
+        Only a :class:`RealMergeItem` carries a verified tree to adopt; a
+        :class:`DecidedItem` / passthrough returns None.  Pure / synchronous.
+        """
+        if not isinstance(item, RealMergeItem):
+            return None
+        base = item.base_sha.strip() if item.base_sha else ''
+        if not base:
+            return None
+        if main_sha and base == main_sha.strip():
+            return None
+        if base in self._dead_base_commits:
+            return base
+        return None
 
     def _frozen_base_chain(self, main_sha: str) -> Iterator[tuple[str, str, str]]:
         """Walk the frozen prefix's expected-base chain, yielding (rid, expected, actual).

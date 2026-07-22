@@ -197,6 +197,14 @@ class EventType(StrEnum):
     # force-push arm.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
+    # INV-3 chain-intact enforcement (PRD plans/merge-verdict-integrity-prd.md
+    # §3.7 new vocab).  Emitted whenever a verdict (PASS or FAIL) is VOIDED
+    # because its verified tree no longer chains onto a still-live prefix — the
+    # item's base_sha points at a dead commit (failed/ejected/superseded/
+    # re-merged since verify dispatch).  A distinct type (not speculative_discard)
+    # so the phantom-block-avoided signal is separately countable via the event
+    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption')}.
+    verdict_voided = 'verdict_voided'
 
     # Task lifecycle
     task_started = 'task_started'
