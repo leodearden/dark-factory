@@ -155,7 +155,7 @@ class TestInv1LocalRunnerBoundary:
             run_scoped=run_scoped_verification,
             run_unscoped=_passing_unscoped_double(),
             task_id='t-2883',
-            event_store=event_store,
+            event_store=event_store,  # type: ignore[arg-type]
         )
 
         with patch('orchestrator.verify._run_cmd', side_effect=spy):
@@ -195,7 +195,7 @@ class TestInv1LocalRunnerBoundary:
             run_scoped=run_scoped_verification,
             run_unscoped=_passing_unscoped_double(),
             task_id='t-2883',
-            event_store=event_store,
+            event_store=event_store,  # type: ignore[arg-type]
         )
 
         with patch('orchestrator.verify._run_cmd', side_effect=spy):

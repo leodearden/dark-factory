@@ -8672,7 +8672,7 @@ class TestMergeGateClobberedWorktree:
                 task_files=self._CLOBBERED,
                 role='merge',
                 is_merge_verify=True,
-                event_store=rec,
+                event_store=rec,  # type: ignore[arg-type]
             )
 
         joined = ' | '.join(calls)
@@ -8703,7 +8703,7 @@ class TestMergeGateClobberedWorktree:
                 task_files=self._CLOBBERED,
                 role='merge',
                 is_merge_verify=True,
-                event_store=rec,
+                event_store=rec,  # type: ignore[arg-type]
             )
 
         assert result.passed is False
@@ -8748,7 +8748,7 @@ class TestTrivialPassEscalatedEventContract:
             await run_scoped_verification(
                 tmp_path, self._config_with_cmd(tmp_path), [],
                 task_files=['docs/x.md'], role='merge', is_merge_verify=True,
-                event_store=rec,
+                event_store=rec,  # type: ignore[arg-type]
             )
         evs = rec.events_of(EventType.trivial_pass_escalated)
         assert len(evs) == 1, rec.events
@@ -8770,7 +8770,7 @@ class TestTrivialPassEscalatedEventContract:
             await run_scoped_verification(
                 tmp_path, self._config_no_cmd(tmp_path), [],
                 task_files=['docs/x.md'], role='merge', is_merge_verify=True,
-                event_store=rec,
+                event_store=rec,  # type: ignore[arg-type]
             )
         evs = rec.events_of(EventType.trivial_pass_escalated)
         assert len(evs) == 1, rec.events
@@ -8789,7 +8789,7 @@ class TestTrivialPassEscalatedEventContract:
             result = await run_scoped_verification(
                 tmp_path, self._config_with_cmd(tmp_path), [],
                 task_files=['docs/x.md'], role='merge',  # is_merge_verify defaults False
-                event_store=rec,
+                event_store=rec,  # type: ignore[arg-type]
             )
         assert rec.events_of(EventType.trivial_pass_escalated) == []
         assert result.passed
@@ -8810,7 +8810,7 @@ class TestTrivialPassEscalatedEventContract:
             result = await run_scoped_verification(
                 tmp_path, self._config_with_cmd(tmp_path), [],
                 task_files=['docs/x.md'], role='task', is_merge_verify=True,
-                event_store=rec,
+                event_store=rec,  # type: ignore[arg-type]
             )
         assert rec.events_of(EventType.trivial_pass_escalated) == []
         assert result.trivial is True
