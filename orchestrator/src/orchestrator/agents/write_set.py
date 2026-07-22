@@ -74,6 +74,39 @@ class WriteSet:
         return deduped
 
 
+_GITDIR_PREFIX = 'gitdir:'
+
+
+def _parse_gitdir(worktree: Path) -> Path:
+    """Read ``<worktree>/.git`` (a linked-worktree gitdir file) and return
+    the resolved admindir it points at.
+
+    Raises ``ValueError`` (naming the ``.git`` path) if it is missing, is a
+    directory (a non-linked/main repo), or lacks a well-formed ``gitdir:``
+    line with a non-empty value. A relative gitdir value is resolved
+    against ``worktree`` — not the process cwd — matching git's own
+    convention for relocatable worktrees.
+    """
+    git_path = worktree / '.git'
+    if not git_path.is_file():
+        raise ValueError(
+            f'compute_write_set: expected a linked-worktree gitdir file at '
+            f'{git_path}, but it is missing or not a regular file'
+        )
+    content = git_path.read_text()
+    if not content.startswith(_GITDIR_PREFIX):
+        raise ValueError(
+            f"compute_write_set: {git_path} does not start with 'gitdir:': {content!r}"
+        )
+    value = content[len(_GITDIR_PREFIX):].strip()
+    if not value:
+        raise ValueError(f'compute_write_set: {git_path} has an empty gitdir value')
+    admindir = Path(value)
+    if not admindir.is_absolute():
+        admindir = worktree / admindir
+    return admindir.resolve()
+
+
 def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
     """Derive the full writable-path set for a sandboxed agent invocation
     rooted at ``worktree``.
@@ -81,16 +114,15 @@ def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
     Pure: reads ``<worktree>/.git`` and resolves symlinks, but performs no
     filesystem writes (no makedirs) — existence/creation remains the
     backend's job (landlock_exec's ``_add_path`` already skips non-existent
-    dirs).
+    dirs). Fails loudly (``ValueError``) on a missing/malformed/directory
+    ``.git`` — fail-closed-friendly, honoring the loud-over-silent norm.
 
     ``home`` defaults to ``Path.home()``; tests should inject a hermetic
     tmp dir.
     """
     home = home or Path.home()
 
-    content = (worktree / '.git').read_text()
-    _, _, value = content.partition('gitdir:')
-    admindir = Path(value.strip()).resolve()
+    admindir = _parse_gitdir(worktree)
     main_git = admindir.parent.parent
 
     return WriteSet(
