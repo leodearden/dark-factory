@@ -8077,6 +8077,16 @@ class GitOps:
         failures regardless of lease state, so there is nothing to
         serialize against.
 
+        On the tree-gone outcomes (``'removed'`` / ``'not_present'``) the
+        sibling ``<path>.lock`` flock file is unlinked while the flock is
+        still held (mirroring :meth:`ephemeral_worktree`), so an ephemeral
+        merge-worktree removal leaves no orphan ``_merge-<uuid>.lock`` behind.
+        The lock is NEVER unlinked on ``'skipped_lease_held'`` (this call did
+        not acquire it — a live holder's lock is left untouched) or on
+        ``'failed'`` (the tree, and thus its lane, survives). This differs
+        from :meth:`merge_verify_lease`, whose persistent-lane lock is
+        deliberately retained across attempts.
+
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
@@ -8087,7 +8097,8 @@ class GitOps:
             logger.debug('remove_merge_worktree_guarded: persistent offline-deep worktree retained: %s', path)
             return 'skipped_persistent'
 
-        fd = acquire_merge_verify_flock(lane_lock_path(path), 0.0)
+        lock_path = lane_lock_path(path)
+        fd = acquire_merge_verify_flock(lock_path, 0.0)
         if fd is None:
             holder = read_lock_holder_pgid(self.worktree_base)
             logger.warning(
@@ -8097,8 +8108,15 @@ class GitOps:
                 holder, path, reason,
             )
             return 'skipped_lease_held'
+        # Only unlink the sibling ``.lock`` file when THIS call both acquired
+        # the flock and drove the tree gone (removed/not_present) — never on
+        # 'failed' (the tree, and thus its lane, survives) and never on
+        # 'skipped_lease_held' (we did not acquire the lock, so we must never
+        # yank a live holder's lock file). See the unlink_lock finally below.
+        unlink_lock = False
         try:
             if not path.exists():
+                unlink_lock = True
                 return 'not_present'
             rc, _, err = await _run(
                 ['git', 'worktree', 'remove', str(path), '--force'],
@@ -8108,6 +8126,7 @@ class GitOps:
                 logger.info(
                     'remove_merge_worktree_guarded: removed %s (reason=%s)', path, reason,
                 )
+                unlink_lock = True
                 return 'removed'
             logger.warning(
                 'remove_merge_worktree_guarded: failed to remove %s (reason=%s): %s',
@@ -8115,6 +8134,17 @@ class GitOps:
             )
             return 'failed'
         finally:
+            # Unlink the lock file BEFORE releasing/closing the flock, mirroring
+            # ephemeral_worktree (git_ops.py ~1797): a contender that opens the
+            # path after our unlink necessarily creates a fresh inode, so it can
+            # never observe the lock we are about to drop. Unlinking on the
+            # tree-gone outcomes keeps the merge-worktree lane from leaving an
+            # orphan ``_merge-<uuid>.lock`` behind — the ephemeral lane no longer
+            # exists to serialize against, unlike merge_verify_lease's persistent
+            # lane whose lock is deliberately retained across attempts.
+            if unlink_lock:
+                with contextlib.suppress(Exception):
+                    os.unlink(lock_path)
             release_merge_verify_flock(fd)
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:

@@ -199,6 +199,49 @@ class TestRemoveMergeWorktreeGuarded:
 
         assert outcome == 'failed'
 
+    async def test_removal_unlinks_its_own_lock_file(self, git_ops: GitOps):
+        """The removing party unlinks the sibling ``<path>.lock`` on the
+        tree-gone outcomes, so an ephemeral removal leaves no orphan
+        ``_merge-<uuid>.lock`` behind (regression: the sibling lock file
+        matches test_git_ops.py's ``_merge-*`` no-leak glob). Mirrors the
+        task-2507 ephemeral_worktree precedent."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        lock_path = lane_lock_path(wt)
+
+        outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='t')
+
+        assert outcome == 'removed'
+        assert not wt.exists()
+        assert not lock_path.exists(), (
+            f'the removing party must unlink its own lock file; {lock_path} leaked'
+        )
+        assert not list(git_ops.worktree_base.glob('_merge-*')), (
+            'no _merge-* directory OR lock-file orphan may survive an '
+            'uncontended removal'
+        )
+
+    async def test_lease_held_skip_preserves_holders_lock_file(
+        self, git_ops: GitOps,
+    ):
+        """Safety property: a skipped_lease_held outcome must NEVER unlink the
+        lock file — this call did not acquire it, so yanking a live holder's
+        lock file would corrupt the serialization the holder relies on."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        lock_path = lane_lock_path(wt)
+        fd = acquire_merge_verify_flock(lock_path, 5.0)
+        assert fd is not None, 'test setup: must be able to acquire the tree lease itself'
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        try:
+            outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+            assert outcome == 'skipped_lease_held'
+            assert lock_path.exists(), (
+                'a lock we did not acquire must be left untouched for its live holder'
+            )
+        finally:
+            release_merge_verify_flock(fd)
+            remove_lock_holder_pgid(git_ops.worktree_base)
+
 
 # ---------------------------------------------------------------------------
 # step-9: cleanup_merge_worktree routes through the guarded primitive
