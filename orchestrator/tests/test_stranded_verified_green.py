@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -616,6 +617,173 @@ class TestReconcileStrandedDriverVerifiedGreen:
         assert filed[0].category == 'stranded_blocked'
         assert filed[0].agent_role == 'harness-stranded-blocked-reaper'
         assert harness._merge_queue.qsize() == 0
+
+
+def _marker(*, tip: str = _TIP, request_id: str = 'mr-prev1234', age_s: float = 0.0) -> dict:
+    """A ``stranded_merge_request`` metadata marker (step-16 race-guard).
+
+    ``age_s`` sets ``submitted_at`` that many seconds in the past — 0 is fresh,
+    a large value (beyond the recency grace) is stale.
+    """
+    return {
+        'tip_sha': tip,
+        'request_id': request_id,
+        'submitted_at': (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+class TestStrandedVerifiedGreenIdempotency:
+    """Metadata-marker dedup — no double-submit across sweeps (step-15).
+
+    A durable ``metadata.stranded_merge_request={tip_sha,request_id,submitted_at}``
+    marker guards against the periodic stranded sweep re-enqueuing the same
+    branch every tick while the merge is in-flight.  A fresh marker whose
+    ``tip_sha`` matches the current lane tip short-circuits the re-submit
+    (task stays blocked); a STALE marker or an ADVANCED lane tip re-drives a
+    fresh submit (self-healing, restart-safe — PRD leaf α §7).
+    """
+
+    async def test_submit_stamps_metadata_marker(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """A fresh submit stamps the durable marker via scheduler.update_task
+        (merge mode — only the ``stranded_merge_request`` key is written)."""
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(_TID, {})
+
+        assert result is True
+        assert harness._merge_queue.qsize() == 1
+        harness.scheduler.update_task.assert_awaited()
+        call = harness.scheduler.update_task.await_args
+        assert call.args[0] == _TID
+        # The single supplied key preserves siblings under merge mode.
+        payload = call.args[1]
+        assert list(payload.keys()) == ['stranded_merge_request']
+        marker = payload['stranded_merge_request']
+        assert marker['tip_sha'] == _TIP
+        assert marker['request_id'].startswith('mr-')
+        assert isinstance(marker['submitted_at'], str) and marker['submitted_at']
+
+    async def test_fresh_marker_same_tip_skips_resubmit(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Marker present, fresh, tip == current lane tip → return True WITHOUT
+        re-enqueuing, re-stamping, or filing any escalation (already in flight;
+        task stays blocked)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        metadata = {'stranded_merge_request': _marker(tip=_TIP)}
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path, tip=_TIP)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(
+                _TID, metadata,
+            )
+
+        assert result is True
+        assert harness._merge_queue.qsize() == 0  # NO additional MergeRequest
+        harness.scheduler.update_task.assert_not_awaited()  # no re-stamp
+        # No new escalation filed (neither a pending L1 nor a dismissed record).
+        assert queue.get_by_task(_TID, status='pending') == []
+        assert queue.get_by_task(_TID, status='dismissed') == []
+
+    async def test_stale_marker_resubmits(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Marker tip matches but submitted_at is older than the recency grace
+        → a fresh submit IS made (self-healing after a lost/hung in-flight)."""
+        metadata = {'stranded_merge_request': _marker(tip=_TIP, age_s=7200.0)}
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path, tip=_TIP)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(
+                _TID, metadata,
+            )
+
+        assert result is True
+        assert harness._merge_queue.qsize() == 1  # re-submit
+        harness.scheduler.update_task.assert_awaited()  # marker re-stamped
+
+    async def test_advanced_lane_tip_resubmits(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Marker is fresh but its tip_sha != the current lane tip (lane
+        advanced past the marker) → a fresh submit IS made for the new tip."""
+        new_tip = 'f' * 40
+        metadata = {'stranded_merge_request': _marker(tip=_TIP)}  # stale-vs-tip
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path, tip=new_tip)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(
+                _TID, metadata,
+            )
+
+        assert result is True
+        assert harness._merge_queue.qsize() == 1  # re-submit for the new tip
+        req = harness._merge_queue.get_nowait()
+        assert req.snapshot_tip == new_tip
+
+    async def test_malformed_marker_resubmits(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """A non-dict / unparseable marker fails safe → treat as absent and
+        submit (a benign re-submit, never a wedged skip)."""
+        metadata = {'stranded_merge_request': 'not-a-dict'}
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path, tip=_TIP)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(
+                _TID, metadata,
+            )
+
+        assert result is True
+        assert harness._merge_queue.qsize() == 1
+
+    async def test_first_sweep_stamps_marker_via_driver(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """End-to-end: the first _reconcile_stranded_in_progress() sweep submits
+        AND stamps the marker via scheduler.update_task (honours the two-sweep
+        idempotency framing — the stamp is what a second sweep reads)."""
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_drv')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+        harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({tid: 'blocked'}, None),
+        )
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 1
+        harness.scheduler.update_task.assert_awaited()
+        marker = harness.scheduler.update_task.await_args.args[1][
+            'stranded_merge_request'
+        ]
+        assert marker['tip_sha'] == _TIP
+        assert marker['request_id'].startswith('mr-')
 
 
 _DURABLE_FAILURE_STATUSES = [
