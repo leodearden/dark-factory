@@ -25,6 +25,7 @@ contract file — see the plan's design decisions.
 """
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -288,3 +289,27 @@ def find_missing_transcripts(
             )
         )
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Bonus preventer guard (pure; opt-in via --check-preventer)
+# ---------------------------------------------------------------------------
+
+_FORCE_PERSISTENCE_RE = re.compile(
+    r'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=\s*(["\']?)1\1(?![0-9])'
+)
+"""Matches ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` set to ``1`` in
+``export VAR=1`` / plain ``VAR=1`` / quoted ``VAR="1"`` forms, while rejecting
+``=0`` and any longer number (``=10``) via the closing backreference +
+no-trailing-digit lookahead."""
+
+
+def payload_exports_force_persistence(script_text: str) -> bool:
+    """Return True iff *script_text* sets ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``.
+
+    A PURE function over the script text — the detector's opt-in
+    (``--check-preventer``) guard that the separately-landing preventer is in
+    place. False when the token is absent or explicitly set to ``0``. Never
+    reads the real committed ``spawn-claude.sh``; callers pass its text in.
+    """
+    return bool(_FORCE_PERSISTENCE_RE.search(script_text))
