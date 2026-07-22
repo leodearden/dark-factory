@@ -435,6 +435,23 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
 _FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"
 _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_FUSED_MEMORY_URLS[0]
 
+# Single source of truth for the headers every legibility poster must send on
+# a `tools/call` POST to a local MCP `/mcp` endpoint. The streamable-HTTP MCP
+# transport 406s ("Not Acceptable: Client must accept application/json")
+# *before* even dispatching the tools/call if `Accept` doesn't include BOTH
+# media types -- verified live against localhost:8002 (and :8003). With this
+# header present the server's response Content-Type is `application/json` (not
+# SSE-framed) for these calls, so `response.json()` needs no `data:`-line
+# parsing. Kept load-bearing-constant-single-sourced here (census_trigger is
+# already imported by both census.py and nightly.py) so a future transport
+# change is a one-line edit, not three lockstep edits with a silent-406 risk
+# on any one that's missed. See nightly._default_poster and
+# census._post_mcp_tool_call for the other two consumers.
+MCP_STREAMABLE_HTTP_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
+
 
 def _extract_tool_result(rpc_response: dict) -> dict:
     """Unwrap a JSON-RPC `tools/call` response into the tool's actual
@@ -522,17 +539,11 @@ def default_status_fetcher(project_root: str | Path):
                         "arguments": {"project_root": project_root_str},
                     },
                 },
-                # The streamable-HTTP MCP transport 406s ("Not Acceptable:
-                # Client must accept application/json") before even
-                # dispatching the tools/call if Accept doesn't include BOTH
-                # values -- verified live against localhost:8002. With this
-                # header present, the server's response Content-Type is
-                # `application/json` (not SSE-framed) for this call, so
-                # `response.json()` below needs no `data:`-line parsing.
-                headers={
-                    "Accept": "application/json, text/event-stream",
-                    "Content-Type": "application/json",
-                },
+                # Required by the streamable-HTTP MCP transport (see
+                # MCP_STREAMABLE_HTTP_HEADERS above for why both values
+                # matter); omitting it 406s before the tools/call is
+                # dispatched.
+                headers=MCP_STREAMABLE_HTTP_HEADERS,
                 timeout=10.0,
             )
             response.raise_for_status()

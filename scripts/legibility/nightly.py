@@ -351,14 +351,10 @@ def _default_poster(url: str, envelope: dict) -> None:
     response = httpx.post(
         url,
         json=envelope,
-        # Required by the streamable-HTTP MCP transport -- omitting either
-        # value 406s before the tools/call is even dispatched (verified
-        # live against a local MCP /mcp endpoint; see
-        # census_trigger.default_status_fetcher for the matching fix).
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
+        # Required by the streamable-HTTP MCP transport -- single-sourced
+        # in census_trigger (already imported here) so a transport change is
+        # a one-line edit, not three lockstep edits with a silent-406 risk.
+        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
         timeout=10.0,
     )
     response.raise_for_status()
