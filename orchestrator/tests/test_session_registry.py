@@ -16,8 +16,10 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1204,6 +1206,32 @@ def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> 
     reloaded_terminal = sr.read_record('kept-terminal-mix', root=tmp_path)
     assert reloaded_terminal.status == sr.Status.EXITED
     assert reloaded_terminal.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 2934 step-1/2: _normalize_wm_window_id (decimal-vs-hex canonicalization)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_wm_window_id_decimal_and_padded_hex_collapse_to_same_canonical() -> None:
+    assert sr._normalize_wm_window_id('0x0000001a') == '0x1a'
+    assert sr._normalize_wm_window_id('26') == '0x1a'
+    # The crux: a decimal-captured id and a zero-padded-hex wmctrl id for the
+    # SAME window must compare equal after normalization.
+    assert sr._normalize_wm_window_id('26') == sr._normalize_wm_window_id('0x0000001a')
+
+
+def test_normalize_wm_window_id_already_canonical_round_trips() -> None:
+    assert sr._normalize_wm_window_id('0x1a') == '0x1a'
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [None, '', '   ', '0xZZ', 'nope', '-1'],
+    ids=['none', 'empty', 'whitespace', 'unparseable-hex', 'unparseable-decimal', 'negative'],
+)
+def test_normalize_wm_window_id_unparseable_or_negative_returns_none(raw: str | None) -> None:
+    assert sr._normalize_wm_window_id(raw) is None
 
 
 # ---------------------------------------------------------------------------
