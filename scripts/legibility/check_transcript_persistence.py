@@ -25,6 +25,7 @@ contract file — see the plan's design decisions.
 """
 from __future__ import annotations
 
+import logging
 import re
 import sys
 from collections.abc import Iterable, Iterator, Sequence
@@ -45,8 +46,10 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import inventory, sampling  # noqa: E402
+from legibility import config, inventory, sampling  # noqa: E402
 from orchestrator import session_registry  # noqa: E402
+
+logger = logging.getLogger('legibility.check_transcript_persistence')
 
 DEFAULT_LOOKBACK = timedelta(hours=48)
 """Default registry lookback window. Terminal records are reaped after the
@@ -313,3 +316,120 @@ def payload_exports_force_persistence(script_text: str) -> bool:
     reads the real committed ``spawn-claude.sh``; callers pass its text in.
     """
     return bool(_FORCE_PERSISTENCE_RE.search(script_text))
+
+
+# ---------------------------------------------------------------------------
+# escalation — self-contained best-effort escalate_info mirror
+# ---------------------------------------------------------------------------
+# Mirrors nightly.py's escalate_info shape by CONVENTION, not import: importing
+# nightly pulls the whole trickle pipeline at module load. Same JSON-RPC
+# tools/call envelope, escalate_info tool, infra_issue/info classification,
+# http://localhost:<port>/mcp URL, and best-effort never-raises contract.
+
+_ESCALATION_TOOL_NAME = 'escalate_info'
+_ESCALATION_AGENT_ROLE = 'legibility-transcript-check'
+_ESCALATION_CATEGORY = 'infra_issue'
+_ESCALATION_SEVERITY = 'info'
+
+
+def _build_escalation_arguments(
+    findings: Sequence[MissingTranscript],
+    cfg: config.LegibilityConfig,
+    *,
+    force_persistence_ok: bool | None = None,
+) -> dict:
+    """Build the ``escalate_info`` MCP tool arguments for a transcript-loss alarm.
+
+    A synthetic ``task_id`` (``legibility-transcript-check-<project_id>``)
+    labels the detector as the source since it is a timer-driven probe, not a
+    Taskmaster task. The ``summary`` names the count of lost sessions; the
+    ``detail`` names each finding's slug and real ``cwd`` (plus expected dir,
+    ``start_ts``, exit code, and prompt prefix) so a human can locate every
+    lost session. When *force_persistence_ok* is not ``None`` (the preventer
+    guard was evaluated), its verdict is appended — a MISSING preventer
+    strengthens the diagnosis (the known regression cause is present).
+    """
+    count = len(findings)
+    summary = (
+        f'legibility transcript-loss: {count} completed spawn session(s) ran '
+        f'with NO matching transcript (project {cfg.project_id})'
+    )
+    detail_lines = [
+        f'{count} completed spawn-launched interactive session(s) in project '
+        f'{cfg.project_id!r} produced no plausibly-matching transcript under '
+        f'~/.claude/projects — the "session ran, no transcript" regression. '
+        f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / prompt):',
+    ]
+    for finding in findings:
+        detail_lines.append(
+            f'  - {finding.session_slug}  cwd={finding.cwd}  '
+            f'start_ts={finding.start_ts}  exit_code={finding.exit_code}  '
+            f'expected_dir={finding.expected_dir}  prompt={finding.prompt_prefix!r}'
+        )
+    if force_persistence_ok is not None:
+        verdict = 'present' if force_persistence_ok else 'MISSING'
+        detail_lines.append(
+            f'preventer guard (CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 in '
+            f'spawn-claude.sh): {verdict}'
+        )
+    return {
+        'task_id': f'legibility-transcript-check-{cfg.project_id}',
+        'agent_role': _ESCALATION_AGENT_ROLE,
+        'category': _ESCALATION_CATEGORY,
+        'severity': _ESCALATION_SEVERITY,
+        'summary': summary,
+        'detail': '\n'.join(detail_lines),
+    }
+
+
+def _default_poster(url: str, envelope: dict) -> None:
+    """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
+
+    ``httpx`` is imported lazily since it is not a ``scripts/`` dependency —
+    mirrors ``nightly._default_poster``. Raises on any network/HTTP failure;
+    :func:`post_findings` wraps this best-effort.
+    """
+    import httpx
+
+    response = httpx.post(url, json=envelope, timeout=10.0)
+    response.raise_for_status()
+
+
+def post_findings(
+    cfg: config.LegibilityConfig,
+    findings: Sequence[MissingTranscript],
+    *,
+    force_persistence_ok: bool | None = None,
+    poster=None,
+) -> bool:
+    """Best-effort ``escalate_info`` POST for the transcript-loss alarm.
+
+    Posts an MCP ``tools/call`` JSON-RPC envelope for tool ``escalate_info``
+    to ``http://localhost:<cfg.escalation_port>/mcp`` (via *poster*, default
+    :func:`_default_poster`). NEVER raises: any failure (poster exception,
+    network error) is logged as a warning and swallowed, returning ``False``
+    — a down escalation server must not mask the finding, since
+    :func:`run_check`'s non-zero exit code is the authoritative loud signal
+    regardless of whether this POST succeeded. Returns ``True`` on a
+    successful post.
+    """
+    poster_fn = poster if poster is not None else _default_poster
+    url = f'http://localhost:{cfg.escalation_port}/mcp'
+    arguments = _build_escalation_arguments(
+        findings, cfg, force_persistence_ok=force_persistence_ok,
+    )
+    envelope = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'tools/call',
+        'params': {'name': _ESCALATION_TOOL_NAME, 'arguments': arguments},
+    }
+    try:
+        poster_fn(url, envelope)
+        return True
+    except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
+        logger.warning(
+            'legibility transcript-check: escalation post failed '
+            '(best-effort, run still exits non-zero): %s', exc,
+        )
+        return False
