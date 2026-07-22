@@ -51,6 +51,37 @@ def tmp_repo(tmp_path: Path) -> tuple[Path, str, str]:
     return repo, first, second
 
 
+class TestEvalWorktreeRoot:
+    """snapshots.eval_worktree_root must place eval worktrees OUTSIDE the repo.
+
+    Eval worktrees nested UNDER project_root let a pytest/pyright/ruff/cargo run
+    inside them walk up and collect the live main repo's ancestor config (root
+    conftest.py sys.path-injects + pre-imports CURRENT-main <subproject>/src,
+    shadowing the fixture's pinned pre_task_commit code — Defect B, task 2881).
+    Relocating to a sibling of the repo removes that ancestor chain entirely.
+    """
+
+    def test_returns_project_name_qualified_sibling(self) -> None:
+        assert snapshots.eval_worktree_root(Path('/a/b/repo')) == Path(
+            '/a/b/repo-eval-worktrees'
+        )
+
+    def test_result_is_outside_the_repo(self) -> None:
+        p = Path('/a/b/repo')
+        assert not snapshots.eval_worktree_root(p).is_relative_to(p)
+
+    def test_eval_worktree_substring_preserved(self) -> None:
+        # Guards fused-memory's reconciliation project-scope anchor
+        # (config/schema.py:457), which substring-matches 'eval-worktree'.
+        p = Path('/a/b/repo')
+        assert 'eval-worktree' in snapshots.eval_worktree_root(p).name
+
+    def test_accepts_str_or_path(self) -> None:
+        from_str = snapshots.eval_worktree_root('/a/b/repo')
+        from_path = snapshots.eval_worktree_root(Path('/a/b/repo'))
+        assert from_str == from_path == Path('/a/b/repo-eval-worktrees')
+
+
 class TestCreateEvalWorktreeHeadAssertion:
     """The defensive HEAD == pre_task_commit assertion in create_eval_worktree."""
 
