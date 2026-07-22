@@ -251,6 +251,30 @@ def test_never_ran_exits_nonzero(tmp_path):
     assert not git_marker.exists(), "check_transcript_check_liveness.sh must never invoke git"
 
 
+def test_unparseable_timestamp_exits_nonzero(tmp_path):
+    """A non-empty but unparseable ExecMainExitTimestamp must FAIL loud, not be
+    silently coerced into a benign (fresh) age. The never-ran guard only
+    catches empty / "n/a"; a garbage value like 'not-a-date' clears the Result
+    and ExecMainStatus checks and reaches the `date -d` parse, which must fail
+    the probe rather than let GNU date treat it as parseable. Guards the
+    parse-failure fail-loud branch (`if ! epoch="$(date -d ...)"`)."""
+    result, git_marker = _run_script(
+        tmp_path, "proj_a", 24,
+        fields={
+            "Result": "success",
+            "ExecMainStatus": "0",
+            "ExecMainExitTimestamp": "not-a-date",
+        },
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit for an unparseable ExecMainExitTimestamp "
+        f"(the parse-failure branch must fail loud, not treat it as fresh); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert not git_marker.exists(), "check_transcript_check_liveness.sh must never invoke git"
+
+
 def test_abnormal_result_exits_nonzero(tmp_path):
     """A within-window run whose Result is abnormal (e.g. timeout / signal /
     core-dump) did NOT run to a clean exit, so it is NOT alive -- even with a
