@@ -249,8 +249,8 @@ The orchestrator will:
 3. Recover crashed tasks from surviving worktrees — if a prior run crashed mid-task, it resumes from the last completed plan step rather than starting over
 4. Call `parse_prd` (no-op if tasks already exist in Taskmaster)
 5. Tag tasks with code modules via a classifier agent (if not already tagged)
-6. Execute tasks concurrently (default 12, configurable via `max_concurrent_tasks`), each following:
-   **PLAN** (architect) → **EXECUTE** (implementer, TDD) → **VERIFY** (pytest/ruff/pyright) → if verify fails: **DEBUG** (up to 5 cycles) → **REVIEW** (5 specialist reviewers) → **MERGE** (to main, with post-merge verification)
+6. Execute tasks concurrently (default 24, configurable via `max_concurrent_tasks`), each following:
+   **PLAN** (architect) → **EXECUTE** (implementer, TDD) → **VERIFY** (pytest/ruff/pyright) → if verify fails: **DEBUG** (up to 5 cycles) → **REVIEW** (one comprehensive reviewer; a separate deep-review checkpoint runs across recently-merged modules every ~40 merges) → **MERGE** (to main, with post-merge verification)
 7. If an agent encounters a problem outside its scope, it **escalates** rather than retrying.
    Escalations are handled in a **separate session** — do not attempt to handle them here.
 8. Print a summary report with per-task outcomes and costs
@@ -561,7 +561,7 @@ YAML values in the loaded config support `${VAR_NAME}` and `${VAR_NAME:default}`
 
 | Setting | config.yaml | What it controls |
 |---------|-------------|-----------------|
-| `max_concurrent_tasks` | 12 | Parallel task workflows |
+| `max_concurrent_tasks` | 24 | Parallel task workflows |
 | `max_per_module` | 1 | Tasks per code module (serialization) |
 | `max_execute_iterations` | 10 | Implementer retries before blocking |
 | `max_verify_attempts` | 5 | Debug-fix cycles before blocking |

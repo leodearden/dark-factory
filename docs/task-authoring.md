@@ -1,0 +1,678 @@
+# Task Authoring Reference
+
+Reference for anyone — human operator or agent — filing tasks into the
+dark-factory orchestrator: the metadata fields a task can carry, what each
+does, how the scheduler interprets it, and the validation rules enforced
+at write time. Field shapes and behavior, not day-to-day operation (see
+`OPERATIONS.md`), overall system shape (see `ARCHITECTURE.md`), or repo
+orientation (see `README.md`). For decomposing a PRD into a task batch,
+see `skills/prd/SKILL.md` — the primary producer of the batch-submission
+pattern in §1 and §9.
+
+Every field shape below is load-bearing: it mirrors the validated Pydantic
+models in `shared/src/shared/task_metadata.py` (and, for delivered-checks,
+`shared/src/shared/capability_manifest.py`) and the fused-memory/scheduler
+code that reads them. Treat each table and fenced shape as the contract,
+not a paraphrase.
+
+---
+
+## 1. How tasks enter the system
+
+**All task operations go through fused-memory MCP tools** — never the
+Taskmaster CLI or Taskmaster MCP server directly. Routing through
+fused-memory is what makes the `TaskInterceptor` emit reconciliation
+events for every state transition; a task created or transitioned any
+other way is invisible to reconciliation and the legibility tooling that
+depends on it.
+
+### Two creation paths
+
+**1. Ticket → curator (default, single-task path).** `submit_task`
+persists a ticket (`{"ticket": "tkt_<id>"}`) and returns immediately. The
+`TaskCurator` (an async worker) decides — dedupe, combine, or create — and
+lands the result in the SQLite task backend. Callers follow up with
+`resolve_ticket` to obtain the final `task_id`, polling or blocking.
+
+**2. `planning_mode=True` → `commit_planning` (batch path).** For
+decomposing a PRD into many cross-dependent tasks (`/prd` decompose),
+`submit_task(planning_mode=True)` bypasses the curator and writes the task
+directly in `deferred` status — one committed write, no transient
+`pending` state — so the scheduler can't claim a sibling before the rest
+of the batch and its dependency wiring exist. Once every task and
+dependency is in place, `commit_planning(task_ids="42,43,44",
+target_status="pending")` atomically flips the whole batch from
+`deferred` to `pending` (or to `cancelled` to discard it) under one
+per-project write lock, so the scheduler sees a coherent batch on its next
+poll rather than picking up siblings one at a time. A `pending` commit
+also indexes the batch into the curator's search corpus;
+`deferred`/`cancelled` commits are never indexed.
+
+Workflow agent roles (architect, implementer, steward, deep_reviewer) file
+their own follow-up tasks the same way, fire-and-forget, via `submit_task`.
+
+### Write-tagging convention
+
+Every write operation (task or memory) should carry:
+
+- **`project_id`** — the project's canonical id (e.g. `"dark_factory"`).
+- **`agent_id`** — a descriptive identifier for the writer, e.g.
+  `"claude-interactive"`, `"claude-task-7"`, `"reconciliation-stage-1"`.
+
+### `project_root` threading
+
+Every task tool call takes `project_root` — the absolute path to the
+target project's checkout (e.g. `/home/leo/src/dark-factory`). It's how
+fused-memory locates the right per-project task backend and write lock;
+pass the same value consistently for a given project across a session.
+
+---
+
+## 2. Task statuses & transitions
+
+**Vocabulary** (`shared/src/shared/task_statuses.py`):
+
+```
+pending, in-progress, blocked, deferred, review, merge-deferred, infra-hold, done, cancelled
+```
+
+- `TERMINAL = {done, cancelled}`
+- `WORKFLOW_PRESERVE = TERMINAL ∪ {deferred, blocked, merge-deferred}`
+
+Status transitions `done`, `blocked`, `cancelled`, and `deferred` trigger
+targeted reconciliation automatically.
+
+**Legal transitions** (`shared/src/shared/task_transitions.py`; every pair
+is annotated with its call site in code — this is a summary, not the full
+state machine. See `ARCHITECTURE.md` for the complete machine and the
+`WorkflowStateMachine`/`TaskInterceptor` enforcement layers):
+
+```
+pending ─dispatch→ in-progress ─merge→ done
+in-progress ─block→ blocked ─re-pend→ pending
+in-progress ─park(train)→ merge-deferred → done/blocked/cancelled/pending
+in-progress ─requeue→ pending
+pending → deferred (planning) → pending/done/blocked/cancelled
+any non-terminal → cancelled
+in-progress ⇄ infra-hold; in-progress ⇄ review
+blocked ─resume(infra)→ in-progress
+done/cancelled ─reopen (audit, requires reopen_reason)→ *
+```
+
+Load-bearing enforcement of who may perform which transition lives in
+fused-memory's `TaskInterceptor`, keyed by actor class — for example, a
+reconciliation actor may never transition a task away from `in-progress`.
+Within a live agent workflow, `set_task_status` is restricted to the
+steward role; every other role drives status changes indirectly through
+the workflow's own state machine.
+
+### `done_provenance` requirement
+
+Every `done` write must carry a `metadata.done_provenance` object naming
+its `kind`. This is server-side schema-enforced and backstopped by a
+`git merge-base --is-ancestor` check where applicable — a task cannot be
+marked `done` on the strength of an unverified claim.
+
+| `kind` | Meaning | Conditional requirements |
+|---|---|---|
+| `merged` | Landed via the normal merge queue | `commit` required |
+| `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required |
+| `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
+| `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run` | — |
+| `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | — |
+| `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
+| `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
+
+`operational-verified` is commitless like the `deterministic-*` kinds, so
+it is likewise exempt from the reopen-freshness gate (which only inspects
+`merged`/`found_on_main`). It is accepted only from non-recon-stage
+callers, on both the fresh `done` transition and the same-status
+`done`→`done` repair path — a recon stage may never self-authorize an
+operational close.
+
+---
+
+## 3. Dependencies
+
+### 3.1 Local dependencies
+
+A bare integer `depends_on` (e.g. `"5"`) records the dependency in the
+task's integer `dependencies` table — the original, same-project
+mechanism. A task dispatches only once every local dependency reaches a
+TERMINAL status (`done`/`cancelled`); an intra-atomic-train
+`merge-deferred` sibling is also accepted as satisfying.
+
+### 3.2 Cross-project external dependencies
+
+A task can declare a dependency on a task in **another** project using the
+qualified `"project_id:task_id"` form (e.g. `"dark_factory:42"`). When
+`add_dependency` receives a `depends_on` value containing `:`, it routes
+the dep to `metadata.external_deps` (a list of canonical
+`"project_id:task_id"` strings) instead of the integer `dependencies`
+table — no schema migration required.
+
+```python
+# Qualified form → appended to metadata.external_deps
+add_dependency(
+    id="<dependent_task_id>",
+    depends_on="dark_factory:42",   # project_id:task_id
+    project_root="<project_root>",
+)
+# Bare integer → existing integer dependencies table (unchanged)
+add_dependency(id="<id>", depends_on=13, project_root="<project_root>")
+```
+
+The foreign target is **not** verified at write time; existence is
+resolved at gate time.
+
+**Resolution: `get_external_statuses`**
+
+The scheduler resolves `metadata.external_deps` at each dispatch tick via
+the read-only fused-memory tool `get_external_statuses(deps: list[str]) ->
+dict[str, str]`. It takes a list of `"project_id:task_id"` strings, looks
+each up in the shared fused-memory registry, and returns a status per dep.
+Unresolvable deps return explicit sentinels:
+
+| Sentinel | Meaning |
+|---|---|
+| `"unknown_project"` | `project_id` not in the registry |
+| `"unknown_task"` | Project known; no top-level task with that id |
+| `"malformed"` | Not parseable as `project_id:task_id` |
+
+**Dispatch-time policy**
+
+The gate lives in the **dependent's** scheduler only — it does not affect
+the upstream project's orchestrator. External deps are checked at dispatch
+time; they are not re-evaluated after a task has been dispatched.
+
+| Resolved status | Scheduler action |
+|---|---|
+| `done` | Satisfied — counts toward dispatch |
+| `cancelled` | Not satisfied → `_mark_blocked(escalate_to_human=True)` immediately |
+| `unknown_project` / `unknown_task` / `malformed` | Not satisfied; grace period then escalate after repeated unresolved cycles |
+| Any other live status (`pending`, `in-progress`, …) | Not satisfied; keep waiting |
+| Resolver error (transient timeout / server hiccup) | Not satisfied this tick — fail-safe wait, no grace counter increment |
+
+A task is dispatched only when **all** local deps **and** all
+`metadata.external_deps` are `done`.
+
+Deterministic deploy and gate tasks (§5) use this same dependency
+mechanism, including cross-project deps. The older convention of filing
+deploy capstones in `dark_factory` with a `dark_factory`-internal
+dependency — a workaround for an external-dep gate bug since fixed — is
+retired; use a `task_kind='deterministic'` deploy or gate task with normal
+deps instead.
+
+### 3.3 Delivered-check dependency gate (`metadata.delivered_checks`)
+
+A **local** (same-project) dependency can additionally carry
+`metadata.delivered_checks` — a list of check descriptors asserting that
+the capability the dependency claims to deliver is actually present on the
+committed `main` tree, not just that the task record reached a terminal
+status. Every scheduler tick, `Scheduler._compute_delivered_check_cache`
+sweeps every distinct TERMINAL (`done`/`cancelled`) local dependency
+carrying this metadata against `main` and caches the result per
+`(dep_task_id, main_sha)` — a capability landing on `main` self-heals the
+very next tick with no operator action, since a new SHA prunes the stale
+cache entry.
+
+**Descriptor shape** (`shared.capability_manifest.DeliveredCheckMeta`; the
+`grep`/`script` fields are mutually exclusive and cross-validated):
+
+```
+{
+  name: str,                      # required; names the capability in escalations
+  kind: "grep" | "script",
+
+  # kind="grep" — evaluated against the COMMITTED tree at `main` via
+  # `git grep -E -e <pattern> <ref> [-- <paths...>]`
+  pattern: str,                    # required iff kind="grep"
+  expect: "present" | "absent",    # required iff kind="grep"
+  paths: [str],                    # optional, kind="grep" only
+
+  # kind="script" — evaluated against the WORKING CHECKOUT via
+  # `<project_root>/<script> <args>`, bounded by timeout_secs
+  script: str,                     # required iff kind="script"
+  args: [str],                     # optional, kind="script" only
+  timeout_secs: int,                # required (>0) iff kind="script"
+}
+```
+
+`grep` is the primary kind (reads exactly what's on `main`, immune to
+working-checkout dirtiness); `script` is the escape hatch for capabilities
+that can't be expressed as a pattern, at the cost of running against the
+working checkout rather than a materialized `main` tree.
+
+**Dispatch-time policy**
+
+| Check outcome | Scheduler action |
+|---|---|
+| All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
+| ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
+| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
+| A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
+| `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; the dep gate takes its legacy arm-off path as if the metadata didn't exist |
+
+The born-at-L2 escalation (`agent_role='orchestrator-scheduler'`,
+`severity='critical'`) bypasses the auto-watcher and routes straight to a
+human, mirroring the cross-project external-dep gate's L1 filer but one
+level up — a persistently false capability claim is a "someone must look
+at this now" condition, not a routine triage item.
+
+**Config knobs** (`delivered_checks.*`, all green-tier hot-reloadable):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Kill switch — set `false` to disable the gate entirely |
+| `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
+| `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
+| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps |
+
+**Manual re-pend recipe:** exactly like the external-dep gate, a dependent
+blocked by this escalation is **not auto-re-pended**. Once the underlying
+capability actually lands on `main` (or the check itself is fixed), an
+operator must manually set the dependent back to `pending` to reopen it —
+resolving the escalation records the human decision but does not by itself
+unblock the task.
+
+---
+
+## 4. Fast path (`metadata.complexity`)
+
+Set `metadata.complexity = "simple"` to route a task to the single-agent
+SIMPLE_TASK fast path (one Sonnet agent explores, plans, edits, and
+commits; the architect+implementer pair is skipped, but verify/review/merge
+still run). The only meaningful value is `"simple"` — absent or any other
+value routes to the full architect path.
+
+**When to declare `"simple"`:** the change is a single coherent edit — docs
+or comments, a rename, a localized behaviour-preserving refactor, a
+typo/wording fix, a one-spot bug fix — that needs **no new abstraction and
+no cross-module design**, and you can name the target file(s). A `simple`
+task may be high-priority and may touch several files/modules, as long as
+the *change* is mechanically simple. **When unsure, omit it** — the full
+path is the safe default, and a mis-declared task simply falls back to the
+architect.
+
+**Hard-blocker veto:** if the task description contains a hard-blocker
+token (`migration`, `architecture`, `integration test`, `design ... new`,
+`implement ... new feature`), the fast path is vetoed even if
+`complexity='simple'` is set.
+
+**Hard escape:** `metadata.force_full_path = true` always forces the full
+architect path regardless of `complexity`.
+
+---
+
+## 5. Deterministic tasks (`task_kind='deterministic'`)
+
+Set `task_kind='deterministic'` on `submit_task` to skip the LLM pipeline
+entirely (no worktree, no branch, no agent, no diff) and route to the
+**`DeterministicRunner`** — a small state machine that runs an optional
+committed action, escalates born-at-L2 when required, and marks the task
+`done` once both are satisfied. Dispatch eligibility uses the same
+dependency gate as every other task (§3).
+
+`task_kind` is a first-class `submit_task` parameter (`'normal'` default |
+`'deterministic'`), persisted to `metadata.task_kind`.
+
+**`metadata.before_done`** — committed-script reference (set at
+`submit_task`):
+
+```
+{
+  script: "<repo-relative path>",  # must exist & be executable
+  args: [],                         # list[str], default []
+  env: {},                          # dict[str,str], default {}
+  cwd: "<project_root>",            # default: project_root
+  timeout_secs: 120,                # int, required; runner kills + escalates on timeout
+  target_unit: None,                # str|None; None → cross-unit (no self-kill)
+  kind: "deploy",                   # "deploy" | "predicate"; default "deploy" — see §6 for "predicate"
+}
+```
+
+**`metadata.always_escalates`** (`bool`, default `false`) — file a
+born-at-L2 escalation after the action completes (or immediately if no
+action); task goes `blocked` until resolved.
+
+**Field-combo presets:**
+
+| `before_done` | `always_escalates` | Behaviour | Use for |
+|---|---|---|---|
+| present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
+| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask |
+| absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
+| absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
+
+**Validation (enforced at `submit_task`):** `task_kind='deterministic'`
+with `before_done=None` and `always_escalates=false` is **rejected**
+("ill-formed no-op"). `before_done` set on a `normal` task is also
+**rejected** ("before_done is only valid on deterministic tasks").
+
+**Born-at-L2 escalations:** all filed with `severity ∈ {critical, urgent}`
+and sentinel `agent_role='orchestrator-deterministic'`; the server retains
+`level=2` (no L0→L1→L2 climb). The task goes `blocked` while the L2 is
+open (quiescence guard — no re-dispatch, no churn).
+
+**Blocking vs detached self-kill — *determined*, not a knob:**
+
+- `before_done.target_unit` equals this orchestrator's own unit → detached
+  `systemd-run --user` with `--on-failure` (done = `scheduled`; the
+  dispatching orchestrator is **not** killed).
+- `before_done.target_unit` differs from own unit (or is `None`) →
+  blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
+  against a pre-run baseline (done = `deployed-and-verified`).
+
+**Runner stamps** (written by `DeterministicRunner`, never
+author-supplied): `before_done_ran_at`, `before_done_verified_at`,
+`gate_escalated_at`, `done_provenance` (`kind='deterministic-deploy'`
+cross-unit; `kind='deterministic-deploy-scheduled'` self-restart).
+
+**`done_provenance.kind='operational-verified'`** — a related but distinct
+closure path (see §2), used for `normal`-task no-code operational asks
+(e.g. a restart/redeploy/confirm) closed out via a resolved escalation
+rather than a `DeterministicRunner` action or a code merge.
+
+**Dep convention:** deterministic deploys and gates use **normal**
+dependencies — including cross-project `project_id:task_id` deps (§3.2).
+
+---
+
+## 6. Milestone tasks (dated / delayed)
+
+`metadata.milestone` is an orthogonal, time-based dispatch gate — **not**
+a new `task_kind`. Setting it holds a task out of dispatch until its time
+trigger fires; once fired, the task dispatches through its normal path
+unchanged. It is allowed on **both** `normal` and `deterministic` tasks
+(orthogonal to `task_kind`), so it can gate a normal LLM-agent task, a
+deterministic predicate check (below), or a pure human gate (a `dated`
+milestone on a deterministic task with `always_escalates=True` and no
+`before_done`).
+
+Two time modes:
+
+- **`dated`** — fires at an explicit wall-clock instant.
+- **`delayed`** — fires `after_secs` seconds after the task's own
+  dependencies (local deps **and** `metadata.external_deps`, §3) are
+  satisfied.
+
+**`metadata.milestone`** (set at `submit_task`; validated by the shared
+`Milestone` model):
+
+```
+{
+  mode: "dated" | "delayed",
+  at: "<ISO-8601 datetime>",  # required iff mode="dated"; datetime.fromisoformat-parseable; forbidden iff delayed
+  after_secs: <int>,          # required and > 0 iff mode="delayed"; forbidden iff dated
+}
+```
+
+The `mode`-conditional fields are a strict *iff*: a `dated` milestone must
+not also carry `after_secs`, and a `delayed` milestone must not also carry
+`at`. This is enforced by the shared `Milestone` model
+(`shared/src/shared/task_metadata.py`) and re-checked by the `submit_task`
+guard — a malformed spec (`delayed` with no `after_secs`, `dated` with an
+unparseable `at`) is rejected at submit with a structured `ValidationError`
+and never persisted.
+
+**Scheduler-stamped fields** (never author-supplied):
+`milestone_deps_satisfied_at` (`delayed` mode only — the frozen-once
+wall-clock UTC anchor, stamped the first tick all of the task's
+dependencies go `done`) and, only on a predicate check failure,
+`gate_escalated_at` (shared with §5).  A task author never sets either
+field.
+
+**Predicate exit-code contract (`before_done.kind`):** `before_done` gains
+a discriminator, `'deploy' | 'predicate'` (default `'deploy'` — every
+existing deterministic task is byte-identical). `kind='deploy'` is the
+existing act-then-done/ask behaviour in §5; `kind='predicate'` is
+check-then-done-or-escalate, and is only meaningful paired with a
+milestone. In `kind='predicate'` mode the `DeterministicRunner` runs the
+script and decides by **exit code only** — it parses no output:
+
+| Exit code | Outcome |
+|---|---|
+| `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (the script's stdout tail carried as `note`) |
+| non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
+| timeout | born-at-L2 `infra_issue` escalation (existing timeout path) + task `blocked`, **no** `gate_escalated_at` stamp |
+
+A predicate is **read-only**, so resolving the escalation (`resume`)
+safely **re-runs** the check rather than trusting the resolution blindly —
+it drives to `done` or re-files `milestone_check_failed` from whatever the
+check reports this time. `kind='predicate'` **forbids**
+`before_done.target_unit` (no unit to verify — no systemd inspect /
+PID-verify on a read-only check) and forbids top-level
+`always_escalates=True` (predicate escalation is already conditional on a
+non-zero exit); the `submit_task` guard enforces both. A predicate never
+stamps `before_done_ran_at` / `before_done_verified_at` — re-running a
+read-only check on crash-resume is harmless.
+
+**Frozen-once delayed-anchor semantics:** for `mode='delayed'`, the
+scheduler stamps `milestone_deps_satisfied_at` in a per-tick sweep the
+first tick ALL of the task's dependencies (local and external) are `done`;
+the timer then runs `after_secs` from that anchor. The anchor is a
+**persisted wall-clock UTC ISO string**, not an in-memory/monotonic timer,
+so a multi-day delay **survives orchestrator restarts** — it's recomputed
+each tick from the persisted value, with no in-memory timer to lose. It is
+frozen-once: a later dependency regression never rewrites the anchor or
+restarts the timer. Dispatch still re-checks *live* deps at eligibility,
+though — a milestone fires only when both the timer has elapsed **and**
+deps are currently satisfied, so a regressed dependency still withholds
+dispatch even after the timer elapses. A `delayed` milestone with no
+dependencies has them trivially satisfied at filing, so its timer starts
+immediately. `mode='dated'` simply withholds while `now < at`. A malformed
+or unrecognized `metadata.milestone` value fails safe — withhold dispatch
+indefinitely, with a one-time WARNING log — rather than dispatch early or
+crash the tick.
+
+**Exemplar** (autonomous — no human involvement unless the check fails):
+"one week after task X lands, check merge flakiness is under 5%, else
+escalate." A deterministic task depending on X, with:
+
+```
+{
+  "milestone": {"mode": "delayed", "after_secs": 604800},  # 7 days
+  "before_done": {
+    "kind": "predicate",
+    "script": "scripts/check_merge_flakiness.sh",
+    "args": ["--window-days", "7", "--threshold", "0.05", "--value", "0.03"],
+    "timeout_secs": 120
+  },
+  "always_escalates": false
+}
+```
+
+(`--value` is normally populated by a wrapper that computes the measured
+rate from CI logs — out of scope here; the script only owns the threshold
+comparison, per its header.) The anchor stamps when X reaches `done`;
+`after_secs` later the check runs. Exit `0` → `done`
+(`deterministic-milestone`); non-zero → `milestone_check_failed` at L2
+(same `agent_role` / severity / level as the born-at-L2 escalations in
+§5) — predicate mode reuses the `DeterministicRunner` (§5), and the
+delayed anchor waits on the same dependency gate described in §3.
+
+---
+
+## 7. Per-task model pins (`metadata.model_overrides`)
+
+Set `metadata.model_overrides` on a task to pin specific agent roles to a
+specific model for that task only — the highest-precedence layer in the
+orchestrator's route resolver (see `ARCHITECTURE.md`'s routing section for
+the full layered precedence and the operator-facing `routing.*` config
+block).
+
+**Shape:** an object mapping full role name → model string:
+
+```
+{
+  "implementer": "opus",
+  "reviewer_comprehensive": "haiku"
+}
+```
+
+**Validation split** — submit-time SHAPE guard vs. resolve-time model
+STRING check, because fused-memory does not know the orchestrator's
+allowlist:
+
+- `submit_task`/`update_task` shape-validate at write time via
+  `shared.task_metadata.validate_model_overrides` against
+  `KNOWN_ROLE_NAMES` — an unknown role name, or a non-string/empty-string
+  model value, raises `ValidationError` and the write is rejected. The
+  fused-memory `model_overrides_guard` mirrors this at both `submit_task`
+  and `update_task`.
+- The orchestrator resolver separately validates the model *string*
+  against `routing.allowed_models` (and any configured per-model ceiling)
+  at resolve time, fail-safe.
+
+**Fail-safe semantics:** a well-formed override naming a model outside
+`routing.allowed_models` (or past its configured daily ceiling) is skipped
+at resolve time, recorded in `RoutingDecision.rejected`, WARN-logged, and
+never blocks dispatch — the override is the resolver's highest-precedence
+layer (`metadata_override`) and sets `model` only (never
+effort/budget_usd/max_turns).
+
+**Role-name caveat:** keys must be the full dispatch role name from
+`orchestrator.agents.roles.ROLES` (e.g. `implementer`,
+`reviewer_comprehensive`), not a collapsed config key. `reviewer`,
+`triage`, and `module_tagger` are accepted by the shape guard
+(`KNOWN_ROLE_NAMES` is a superset covering both `ROLES` and
+`ModelsConfig`'s collapsed keys) but are accepted-but-**inert** as
+override keys — the resolver's layer-1 reader keys strictly on the literal
+`role_name` it was invoked with, never the collapsed config key, so an
+override authored under one of these three collapsed keys silently never
+matches at resolve time.
+
+The full known-role set today (`shared.task_metadata.KNOWN_ROLE_NAMES`):
+
+```
+architect, implementer, debugger, reviewer, reviewer_comprehensive,
+merger, steward, triage, module_tagger, deep_reviewer, judge, simple_task
+```
+
+Of these, `reviewer`, `triage`, and `module_tagger` are the accepted-but-
+inert collapsed-config-key names — never use them as a `model_overrides`
+key if you want the pin to actually take effect.
+
+---
+
+## 8. Task metadata vocabulary & census
+
+`parse_metadata` (`shared/src/shared/task_metadata.py`) validates every
+task's `metadata` blob on read and write and returns a list of
+`SchemaWarning`s for anything it can't reconcile; the write-boundary
+backend logs one WARNING line per warning via `_emit_schema_warning`
+(`fused-memory/src/fused_memory/backends/sqlite_task_backend.py`). This is
+the schema-drift census that enforce-gate runbooks grep for.
+
+**Census line and the `code=` discriminator:**
+
+```
+task_metadata.schema_warning task_id=<id> code=<class> field=<key> error=<message>
+```
+
+The literal `task_metadata.schema_warning` token is the stable grep
+anchor — never move or rename it. `code=` is the warning's class
+discriminator (`unknown_key`, `invalid_field`, `invalid_submodel`,
+`unparseable_json`, `not_an_object`, `invalid_metadata`). Separate
+enforcement-relevant classes from routine vocabulary noise with:
+
+```
+grep 'task_metadata.schema_warning' | grep -v code=unknown_key
+```
+
+### Tier-A: blessed keys
+
+A frozenset of load-bearing conventional metadata keys — already relied on
+by real writers (orchestrator, curator, `DeterministicRunner`, escalation
+flows) — is exempted from the `unknown_key` scan even though these are not
+(yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
+`shared/src/shared/task_metadata.py`:
+
+```
+source, modules, spawn_context, complexity, force_full_path,
+branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
+agent_id, escalation_id, suggestion_hash, prd_path, prd_task_label,
+user_observable_signal, consumer_ref, substrate_confirmed,
+human_decomposed, grammar_confirmed, invariants, optimistic_path,
+capability_manifest, curator_action, curator_justification, combined_at,
+gate_escalated_at, before_done_ran_at, before_done_verified_at,
+before_done_verified_pid, files_tagged_at, origin_finding_id,
+spawned_from, program, program_stream, stream
+```
+
+### Tier-B: canonical keys, not aliases
+
+These aliases are deliberately *not* on the Tier-A allowlist, so each still
+emits `code=unknown_key` as a greppable drift signal until the caller is
+fixed to use the canonical spelling:
+
+| Canonical | Aliases to avoid |
+|---|---|
+| `prd_path` + `prd_task_label` | `prd`, `prd_ref`, `prd_leaf` |
+| `invariants` | `inv` |
+| `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
+
+### Tier-C: ad-hoc keys
+
+One-off, timestamped, or id-suffixed annotation keys (e.g.
+`reconciliation_with_5123`) must never be filed as a bespoke top-level
+metadata key — that just adds another `code=unknown_key` census line. Use
+the `x_`-prefixed forward-compat namespace instead (e.g.
+`x_reconciliation_note`) — silently allowed, no warning — or fold the
+value into a single `annotations` field.
+
+### Promoting a convention
+
+A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
+frozenset in `shared/src/shared/task_metadata.py` (the Tier-A load-bearing
+allowlist — an allowlist rather than typed optional fields, so
+`model_dump()` doesn't grow `None`-valued noise on every task). Add a key
+there only for a genuinely load-bearing, stable convention; Tier-B/C drift
+should be fixed by renaming to the canonical key or moving under `x_`, not
+by blessing it.
+
+---
+
+## 9. Practical recipes
+
+**Wire cross-project deps via `planning_mode`, not `submit_task` +
+`add_dependency` back to back.** A plain `submit_task` followed
+immediately by `add_dependency` races the scheduler — the task can be
+picked up for dispatch in the window between the two calls, before the
+dependency is attached. Use `submit_task(planning_mode=True)` →
+`add_dependency` → `commit_planning` instead: the task sits in `deferred`
+(unreachable by the scheduler) until every dependency is wired, and only
+then is it committed to `pending` in one atomic flip.
+
+**Verify a batch is filed with `get_task`, not `search_tasks` /
+grep-equivalents.** `search_tasks` queries the curator's semantic-search
+corpus, which is only populated by tasks the curator has actually indexed
+— `deferred` and still-uncommitted `planning_mode` tasks are excluded, so
+a batch you just planned will not show up in `search_tasks` results even
+though it exists. Confirm a specific id landed with `get_task(id=...)`
+directly.
+
+**Change a filed task's kind in place with `update_task`, not
+remove+refile.** If a task's `task_kind`, `before_done`, or other metadata
+needs correcting after filing, update it in place via `update_task` rather
+than removing and resubmitting — resubmission loses the task's id (and
+anything depending on that id), history, and any escalations already
+attached to it. To retire a task instead of correcting it, cancel it
+(`status="cancelled"`) rather than removing it, so the record and its id
+remain resolvable by anything that referenced it.
+
+---
+
+## Cross-references
+
+- **`README.md`** — repo orientation and top-level entry points.
+- **`OPERATIONS.md`** — day-to-day operator workflows: running the
+  orchestrator, resolving escalations, config reload, fleet redeploy.
+- **`ARCHITECTURE.md`** — the full task status state machine, the
+  scheduler's per-tick phase pipeline, agent roles, the merge lane, and
+  model routing's layered precedence.
+- **`skills/prd/SKILL.md`** — the PRD authoring and decomposition pipeline;
+  the primary producer of `planning_mode` batch submissions (§1, §9) and
+  of `metadata.delivered_checks`-bearing capability tasks (§3.3).
+- **`docs/legibility/design-invariants.md`** — the design invariants gating
+  `/prd` decompose and `/review` phase 2.
