@@ -158,12 +158,30 @@ class Judge:
             elif verdict.severity == 'serious':
                 if self.config.halt_on_judge_serious:
                     verdict.action_taken = VerdictAction.halt
-                    await self._apply_halt(
-                        run.project_id,
-                        reason=f'Serious verdict in run {run_id}',
+                    # A serious verdict fabricated by _parse_verdict for
+                    # genuinely-malformed REACHABLE content (success, non-empty,
+                    # non-JSON) carries the code='unparseable_judge_response'
+                    # marker. It still halts (fail-closed preserved) but with a
+                    # truthful reason instead of the lying 'Serious verdict'
+                    # string. A genuine content severity=serious verdict has no
+                    # such marker and keeps the already-truthful reason. (Infra
+                    # failures never reach here — they are diverted to
+                    # _handle_infra_failure before _parse_verdict.)
+                    is_parse_failure = any(
+                        f.get('code') == 'unparseable_judge_response'
+                        for f in verdict.findings
                     )
+                    if is_parse_failure:
+                        halt_reason = (
+                            f'Unparseable judge response in run {run_id} '
+                            f'(judge output present but not valid JSON)'
+                        )
+                    else:
+                        halt_reason = f'Serious verdict in run {run_id}'
+                    await self._apply_halt(run.project_id, reason=halt_reason)
                     logger.error(
-                        f'Judge: SERIOUS issues in run {run_id}, halting project {run.project_id}'
+                        f'Judge: SERIOUS issues in run {run_id}, halting project '
+                        f'{run.project_id} — {halt_reason}'
                     )
 
             await self.journal.add_verdict(verdict)
@@ -473,6 +491,12 @@ Review this run and provide your verdict as JSON.
                 findings=[{
                     'issue': f'Judge response could not be parsed: {e}',
                     'severity': 'serious',
+                    # Machine-readable marker (task 2947 ask b): lets review_run
+                    # pick the truthful 'Unparseable judge response' halt reason
+                    # via a structured field rather than fragile substring
+                    # matching. Kept on this SINGLE finding so len(findings)==1
+                    # (the existing loud-not-fabricated test) still holds.
+                    'code': 'unparseable_judge_response',
                     'recommendation': (
                         'This verdict was not a real review — the judge output was '
                         'unparseable. Investigate the judge LLM/CLI output before '
