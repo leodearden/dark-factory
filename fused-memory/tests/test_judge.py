@@ -1262,3 +1262,146 @@ class TestCallJudgeCliTaxonomy:
         ):
             with pytest.raises(JudgeInfraError):
                 await judge._call_judge_cli('prompt')
+
+
+# ─────────────────────────────────────────────────────────────────────
+# review_run bounded-backoff handling of JudgeInfraError (task 2947 ask a)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestReviewRunInfraFailureHandling:
+    """review_run treats JudgeInfraError (transport/infra) as bounded backoff,
+    NOT a phantom serious verdict (task 2947 ask a).
+
+    Below judge_infra_max_consecutive_failures consecutive infra failures,
+    review_run returns None WITHOUT stamping a verdict or halting. At the
+    threshold it applies a TRUTHFUL 'judge-unreachable' halt (never the lying
+    'Serious verdict' reason, and never a persisted verdict). Any successful
+    transport resets the per-project streak. The infra halt is gated on the
+    same halt_on_judge_serious master switch as the serious-verdict halt.
+    """
+
+    def _setup(self, mock_journal, project_id, **cfg):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+
+        config = _make_judge_config(**cfg)
+        judge = Judge(config=config, journal=mock_journal)
+        now = datetime.now(UTC)
+        run = ReconciliationRun(
+            id='run-infra',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=now,
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        )
+        mock_journal.get_run = AsyncMock(return_value=run)
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+        return judge
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_infra_failures_do_not_halt_or_stamp(self, mock_journal):
+        """(a) The first two (< 3) consecutive infra failures return None, stamp
+        no verdict, and do not halt — bounded backoff, not a phantom verdict."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-a',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            v1 = await judge.review_run('run-infra')
+            v2 = await judge.review_run('run-infra')
+
+        assert v1 is None
+        assert v2 is None
+        mock_journal.set_halt.assert_not_called()
+        mock_journal.add_verdict.assert_not_called()
+        assert not judge.is_halted('proj-infra-a')
+
+    @pytest.mark.asyncio
+    async def test_threshold_infra_failure_applies_truthful_judge_unreachable_halt(
+        self, mock_journal
+    ):
+        """(b) The 3rd consecutive infra failure halts the project with a truthful
+        'judge-unreachable' reason — NOT the phantom 'Serious verdict' reason —
+        and persists no fabricated verdict."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-b',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            await judge.review_run('run-infra')
+            await judge.review_run('run-infra')
+            await judge.review_run('run-infra')
+
+        assert judge.is_halted('proj-infra-b')
+        mock_journal.set_halt.assert_called_once()
+        reason = mock_journal.set_halt.call_args.kwargs['reason']
+        assert 'judge-unreachable' in reason
+        assert 'Serious verdict' not in reason
+        mock_journal.add_verdict.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_review_resets_infra_streak(self, mock_journal):
+        """(c) A successful review between infra failures resets the per-project
+        streak, so a later lone infra failure is well below the threshold and
+        does not halt."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-c',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        # Two infra failures (streak → 2)
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            await judge.review_run('run-infra')
+            await judge.review_run('run-infra')
+        # A clean 'ok' verdict is a successful transport — resets the streak
+        with patch.object(
+            judge, '_call_llm',
+            AsyncMock(return_value='{"severity": "ok", "findings": []}'),
+        ):
+            await judge.review_run('run-infra')
+        # A further lone infra failure is streak #1, below threshold → no halt
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            v = await judge.review_run('run-infra')
+
+        assert v is None
+        assert not judge.is_halted('proj-infra-c')
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_infra_halt_when_halt_on_judge_serious_disabled(self, mock_journal):
+        """With halt_on_judge_serious=False, even many consecutive infra failures
+        past the threshold never halt (same master switch as the serious halt)."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-d',
+            halt_on_judge_serious=False, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(5):
+                await judge.review_run('run-infra')
+
+        assert not judge.is_halted('proj-infra-d')
+        mock_journal.set_halt.assert_not_called()
