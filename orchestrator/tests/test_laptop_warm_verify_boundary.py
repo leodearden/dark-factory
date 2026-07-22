@@ -529,6 +529,62 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def measure_uncontended_baseline_secs(
+    *,
+    sha: str,
+    spec: MergeVerifySpec,
+    cfg_file: Path,
+    timeout: float = 60.0,
+    _spawn=spawn_verify_merge,
+    _clock=time.monotonic,
+    _parse=result_from_json,
+) -> float:
+    """Time a genuinely uncontended, SAME-SHAPE verify-merge end-to-end.
+
+    Spawns a verify-merge subprocess with no holder flock held (so it can
+    never contend) via the SAME spawn path, spec, and config shape as the
+    contended run under test, and returns its wall-clock duration. Unlike
+    task 2921's bare ``python -c 'from orchestrator.cli import main'``
+    baseline -- which measures only module-import cost -- this captures the
+    FULL pre-flock-wait CLI startup the contended run also pays before it
+    ever reaches the flock gate: interpreter startup, the same import, Click
+    dispatch, config load (pydantic/YAML), and GitOps construction, plus the
+    trivial fast_spec build. Only a same-shape baseline cancels that whole
+    load-sensitive startup term when subtracted from the contended run's
+    elapsed time (see test_flock_wait_env_override_speeds_up_contention_result).
+
+    Guards that the baseline itself never contends: a contended baseline
+    would fold a flock wait into the subtrahend and silently corrupt the
+    discriminant it feeds, so that case is a hard AssertionError rather than
+    a silently-accepted value.
+
+    The ``_spawn``/``_clock``/``_parse`` seams exist ONLY so this helper can
+    be unit-tested deterministically with zero real subprocess/timing (see
+    the two ``test_measure_uncontended_baseline_secs_*`` tests below) --
+    mirroring :func:`wait_for_marker_stable`'s ``_read_mtime_ns`` seam (task
+    2819). Production callers use the real defaults.
+    """
+    t0 = _clock()
+    proc = _spawn(
+        sha=sha, spec=spec, cfg_file=cfg_file,
+        extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
+    )
+    stdout, stderr = proc.communicate(timeout=timeout)
+    elapsed = _clock() - t0
+    assert proc.returncode == 0, (
+        f'expected the uncontended baseline probe to exit 0, got '
+        f'{proc.returncode}; stderr={stderr.decode()[:2000]!r}'
+    )
+    result = _parse(stdout.decode())
+    assert result.category != FLOCK_CONTENTION_CATEGORY, (
+        f'baseline probe unexpectedly reported flock contention '
+        f'(category={result.category!r}) -- the uncontended baseline must '
+        f'never itself contend, or its measured duration would silently '
+        f'fold a flock wait into the flock_component discriminant'
+    )
+    return elapsed
+
+
 def test_measure_uncontended_baseline_secs_returns_elapsed_for_passed_result():
     """measure_uncontended_baseline_secs returns the _clock-measured elapsed duration.
 
