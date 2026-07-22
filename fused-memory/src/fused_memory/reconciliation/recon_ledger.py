@@ -31,9 +31,11 @@ import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_TTL,
     GROUNDS_ENUM,
     RECORD_KIND_ENTITY_STANDING_DECISION,
     STATE_ACTIVE,
+    STATE_EXPIRED,
 )
 
 logger = logging.getLogger(__name__)
@@ -337,13 +339,36 @@ class ReconLedgerStore:
         now: str,
         terminal_task_ids: list[str] | tuple[str, ...],
     ) -> int:
-        """Delete expired rows and terminal-task-referenced marker rows.
+        """Delete expired/terminal-referenced marker rows, and TTL-flip expired
+        ``entity_standing_decision`` rows.
 
         A row is deleted when EITHER ``expires_at < now`` (NULL ``expires_at``
         is never-expire and is naturally excluded — SQL three-valued logic
         means ``NULL < ?`` evaluates to NULL, not true) OR its ``record_kind``
         is one of :data:`MARKER_KINDS` and its ``task_id`` is in
-        ``terminal_task_ids``. Returns the number of rows deleted.
+        ``terminal_task_ids``.
+
+        **entity_standing_decision rows are FLIPPED, not deleted, on expiry**
+        (task 2894 α, INV-2): recurrence history must be preserved, so this
+        kind is excluded from the ``expires_at < now`` DELETE arm in *both*
+        branches, and instead — within the same transaction — every ACTIVE
+        standing row past its ``expires_at`` is flipped to
+        :data:`~fused_memory.reconciliation.standing_decision_constants.STATE_EXPIRED`
+        with ``payload_json`` ``expiry_reason`` stamped
+        :data:`~fused_memory.reconciliation.standing_decision_constants.EXPIRY_REASON_TTL`.
+        The flip is gated on ``state = active`` and so is idempotent — an
+        already-expired standing row is neither re-stamped nor deleted. The
+        expiry_reason stamp reuses :meth:`mark_addressed`'s per-row
+        read-modify-write (json.loads → defensive non-dict wrap → mutate →
+        UPDATE) rather than a SQLite ``json_set()``, keeping the module's
+        Python-json convention and avoiding a JSON1-extension dependency;
+        standing decisions are rare, so the per-row loop cost is negligible.
+
+        Returns ``deleted_count + flipped_count`` — the total number of rows
+        this pass acted on (deleted plus TTL-flipped). The sole caller
+        (``stages.task_knowledge_sync._gc_recon_markers``) uses the return
+        only for logging, and gc passes over a project with no standing rows
+        have ``flipped_count == 0``, so the sum is backward-compatible.
 
         **Multi-task (comma-joined) markers are intentionally NOT decomposed
         here** (task 2228 W5-κ, review finding robustness_regression): the
@@ -385,21 +410,61 @@ class ReconLedgerStore:
                     f"""
                     DELETE FROM recon_ledger
                     WHERE project_id = ? AND (
-                        expires_at < ?
+                        (expires_at < ? AND record_kind != ?)
                         OR (record_kind IN ({marker_placeholders}) AND task_id IN ({terminal_placeholders}))
                     )
                     """,
-                    (project_id, now, *MARKER_KINDS, *terminal_task_ids),
+                    (project_id, now, RECORD_KIND_ENTITY_STANDING_DECISION, *MARKER_KINDS, *terminal_task_ids),
                 )
             else:
                 cursor = await db.execute(
                     """
                     DELETE FROM recon_ledger
-                    WHERE project_id = ? AND expires_at < ?
+                    WHERE project_id = ? AND expires_at < ? AND record_kind != ?
                     """,
-                    (project_id, now),
+                    (project_id, now, RECORD_KIND_ENTITY_STANDING_DECISION),
                 )
-        return cursor.rowcount
+            deleted_count = cursor.rowcount
+
+            # TTL-flip: expired ACTIVE entity_standing_decision rows are kept
+            # (excluded from the DELETE above) and flipped to state='expired'
+            # with payload expiry_reason='ttl' (INV-2). Gated on state='active'
+            # → idempotent; per-row read-modify-write mirrors mark_addressed.
+            flip_cursor = await db.execute(
+                """
+                SELECT project_id, record_kind, task_id, flag_type, run_id, payload_json
+                FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ? AND state = ?
+                  AND expires_at IS NOT NULL AND expires_at < ?
+                """,
+                (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, STATE_ACTIVE, now),
+            )
+            flip_rows = await flip_cursor.fetchall()
+            flipped_count = 0
+            for flip_row in flip_rows:
+                payload = json.loads(flip_row['payload_json'])
+                # Defensively tolerate a non-object payload (see mark_addressed).
+                if not isinstance(payload, dict):
+                    payload = {'_payload': payload}
+                payload['expiry_reason'] = EXPIRY_REASON_TTL
+                await db.execute(
+                    """
+                    UPDATE recon_ledger SET state = ?, payload_json = ?
+                    WHERE project_id = ? AND record_kind = ? AND task_id = ?
+                      AND flag_type = ? AND run_id = ?
+                    """,
+                    (
+                        STATE_EXPIRED,
+                        json.dumps(payload),
+                        flip_row['project_id'],
+                        flip_row['record_kind'],
+                        flip_row['task_id'],
+                        flip_row['flag_type'],
+                        flip_row['run_id'],
+                    ),
+                )
+                flipped_count += 1
+        return deleted_count + flipped_count
 
     async def mark_addressed(
         self,
