@@ -46,10 +46,46 @@ GROUNDS_ENUM: frozenset[str] = frozenset({GROUNDS_STRUCTURAL_SIZE_CONFLATION})
 # bound token-family tuple. The seed token *contents* are γ-tactical (PRD Open
 # Question 5, decided in γ) — γ consumes this map for the Hook A/B fallback
 # match ("the flag_type matches the token-family list bound to the row's
-# grounds"). The seed below is a minimal, non-empty placeholder γ replaces.
+# grounds").
+#
+# γ (task 2896, PRD Open Question 5) finalizes the seed for
+# ``structural_size_conflation`` to a curated list of DISTINCTIVE stems covering
+# the "entity is too big / its edges conflate multiple topics" false-positive
+# class. Each entry is a lowercase substring stem matched (casefolded) against a
+# flag_type by :func:`~fused_memory.reconciliation.flag_dedup._flag_type_in_grounds_family`
+# — e.g. ``'conflat'`` matches ``topic_conflation``/``conflated_entity``,
+# ``'monolith'`` matches ``monolithic_entity``. Kept deliberately conservative
+# (distinctive stems, not generic filler words) so an unrelated flag_type citing
+# the entity uuid in free text is NOT fallback-suppressed — the under-suppression
+# bias (PRD decision 10): a fallback miss costs one cycle of noise, never a
+# hidden finding. Preserves α's structure invariant (keys == GROUNDS_ENUM; each
+# family a tuple of str), so test_standing_decision_constants.py stays green.
 GROUNDS_TOKEN_FAMILIES: dict[str, tuple[str, ...]] = {
-    GROUNDS_STRUCTURAL_SIZE_CONFLATION: ('size', 'large', 'count', 'magnitude'),
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION: (
+        'size',
+        'large',
+        'count',
+        'magnitude',
+        'conflat',
+        'topic',
+        'scope',
+        'broad',
+        'sprawl',
+        'bloat',
+        'monolith',
+        'overload',
+    ),
 }
+
+# --- Suppression-storm threshold (γ, task 2896; PRD Open Question 4) ---------
+# Hook A (Stage-1 filter, γ) files ONE recon "storm escape" escalation per
+# ACTIVE standing decision that suppresses MORE THAN this many flags in a single
+# reconciliation cycle (strict ``>``): an active decision hiding a flood of
+# flags in one cycle is a signal the decision may be over-broad or the entity's
+# situation has changed, warranting a human look. The parenthetical PRD variant
+# ("across a streak of cycles") requires persistent per-decision cross-cycle
+# state and is deferred; γ implements the self-contained per-cycle N.
+SUPPRESSION_STORM_THRESHOLD_PER_CYCLE = 5
 
 # --- Evidence mem0 kind (Arm 2 of the β authorization gate) -----------------
 # The ledger kind is the sole machine-consulted standing-decision form; the
