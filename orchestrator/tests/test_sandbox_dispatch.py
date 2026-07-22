@@ -42,12 +42,11 @@ def _reset_dedup():
     ``resolve_backend_or_refuse()`` keeps a module-global
     ``_escalated_backend_state`` so the fail-closed escalation fires exactly
     once across N refused invocations (INV-4). Clear it before and after each
-    test so the dedup decision never leaks between tests. Uses ``setattr`` so
-    the fixture is inert on the RED steps before the global exists.
+    test so the dedup decision never leaks between tests.
     """
-    setattr(sandbox_dispatch, '_escalated_backend_state', None)
+    sandbox_dispatch._escalated_backend_state = None
     yield
-    setattr(sandbox_dispatch, '_escalated_backend_state', None)
+    sandbox_dispatch._escalated_backend_state = None
 
 
 class TestSetBackendAcceptsValidValues:
@@ -148,12 +147,14 @@ class TestResolveBackendOrRefuse:
 
     def test_landlock_unavailable_refuses(self):
         sandbox_dispatch.set_backend('landlock')
-        with patch(
-            'orchestrator.agents.landlock.is_landlock_available',
-            return_value=False,
+        with (
+            patch(
+                'orchestrator.agents.landlock.is_landlock_available',
+                return_value=False,
+            ),
+            pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo,
         ):
-            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo:
-                sandbox_dispatch.resolve_backend_or_refuse()
+            sandbox_dispatch.resolve_backend_or_refuse()
         assert excinfo.value.should_escalate is True
         assert excinfo.value.backend_state == 'landlock'
 
@@ -179,9 +180,9 @@ class TestResolveBackendOrRefuse:
                 'orchestrator.agents.sandbox.is_bwrap_available',
                 return_value=False,
             ),
+            pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo,
         ):
-            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo:
-                sandbox_dispatch.resolve_backend_or_refuse()
+            sandbox_dispatch.resolve_backend_or_refuse()
         assert excinfo.value.backend_state == 'auto'
 
 
@@ -246,12 +247,14 @@ class TestResolveBackendDedup:
             assert first.value.should_escalate is True
 
         sandbox_dispatch.set_backend('bwrap')
-        with patch(
-            'orchestrator.agents.sandbox.is_bwrap_available',
-            return_value=False,
+        with (
+            patch(
+                'orchestrator.agents.sandbox.is_bwrap_available',
+                return_value=False,
+            ),
+            pytest.raises(sandbox_dispatch.SandboxUnavailable) as second,
         ):
-            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as second:
-                sandbox_dispatch.resolve_backend_or_refuse()
+            sandbox_dispatch.resolve_backend_or_refuse()
         assert second.value.should_escalate is True
         assert second.value.backend_state == 'bwrap'
 
@@ -272,10 +275,12 @@ class TestResolveBackendDedup:
 
         # Re-break under landlock: escalate again.
         sandbox_dispatch.set_backend('landlock')
-        with patch(
-            'orchestrator.agents.landlock.is_landlock_available',
-            return_value=False,
+        with (
+            patch(
+                'orchestrator.agents.landlock.is_landlock_available',
+                return_value=False,
+            ),
+            pytest.raises(sandbox_dispatch.SandboxUnavailable) as third,
         ):
-            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as third:
-                sandbox_dispatch.resolve_backend_or_refuse()
+            sandbox_dispatch.resolve_backend_or_refuse()
         assert third.value.should_escalate is True

@@ -9900,6 +9900,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         sandbox_modules = None
         if self.config.sandbox.enabled and role.sandboxed:
             sandbox_modules = self.modules
+            # Fail-CLOSED (task 2908, PRD D4 / INV-4): refuse to dispatch this
+            # sandboxed role when no OS backend resolves rather than silently
+            # running unconfined. backend=none is the explicit operator escape
+            # hatch (runs UNSANDBOXED with a WARN, no refusal); a
+            # required-yet-unavailable backend raises SandboxUnavailable, which
+            # propagates out of _invoke to refuse the invocation.
+            self._guard_sandbox(role.name)
 
         # Warn once per workflow instance when an escalation-capable role is
         # dispatched without an escalation queue wired up.
@@ -11078,6 +11085,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 data={'escalation_id': esc.id, 'category': esc.category,
                       'severity': esc.severity, 'summary': summary[:200]},
             )
+
+    def _guard_sandbox(self, role_name: str) -> None:
+        """Fail-CLOSED sandbox check for the sandboxed-dispatch call-site (task 2908).
+
+        Called from :meth:`_invoke` inside the ``config.sandbox.enabled +
+        role.sandboxed`` block. Delegates backend resolution to
+        ``sandbox_dispatch.resolve_backend_or_refuse``: a healthy backend and the
+        operator ``backend=none`` escape hatch both return without raising, but a
+        required-yet-unavailable backend raises ``SandboxUnavailable`` — at which
+        point we file a DEDUPED escalation (only when ``exc.should_escalate``, the
+        process-global dedup decision — INV-4) and re-raise to REFUSE the agent
+        invocation rather than run it unconfined (PRD D4). The re-raised exception
+        propagates out of ``_invoke`` to ``_drive``'s generic failure handler.
+        """
+        from orchestrator.agents.sandbox_dispatch import (
+            SandboxUnavailable,
+            resolve_backend_or_refuse,
+        )
+
+        try:
+            resolve_backend_or_refuse()
+        except SandboxUnavailable as exc:
+            if exc.should_escalate:
+                self._escalate_sandbox_unavailable(
+                    role_name, exc.backend_state, str(exc),
+                )
+            raise
 
     async def _check_scope_invariant(self) -> None:
         """Tripwire (task 2505): warn + escalate if ``plan.files`` and

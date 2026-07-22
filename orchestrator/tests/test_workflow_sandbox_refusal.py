@@ -20,10 +20,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from escalation.queue import EscalationQueue
-from unittest.mock import patch
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.workflow import TaskWorkflow
