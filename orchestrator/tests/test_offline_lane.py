@@ -1060,6 +1060,37 @@ async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures
     assert confirmed == []
 
 
+@pytest.mark.asyncio
+async def test_default_confirmation_run_rejects_verify_usage_dump(tmp_path: Path):
+    """The default numeric confirmation seam rejects a reify verify.sh
+    usage/help/error dump instead of turning every usage line into a bogus
+    confirmed test ID (task 5308; reify:5264 incident).
+
+    No confirmation_runner is injected, so the real ``_default_confirmation_run``
+    seam runs; ``run-offline-deep.sh`` merges stderr into stdout, so a malformed
+    verify.sh invocation floods this seam with usage() text.
+    ``create_subprocess_exec`` is mocked to emit that dump with returncode 64
+    (verify.sh's arg-error exit).
+
+    RED: pre-fix the seam's inline comprehension yields the non-blank usage
+    lines rather than ``[]``.
+    """
+    worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
+    mock_proc.returncode = 64
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == []
+
+
 # ---------------------------------------------------------------------------
 # _parse_confirmed_failures helper — numeric-seam usage/help guard (task 5308)
 # ---------------------------------------------------------------------------
