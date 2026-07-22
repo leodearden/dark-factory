@@ -8,9 +8,17 @@ merge-verify flock is HELD across the ``git worktree remove`` (acquire-then-
 remove, never check-then-remove). This module pins the full outcome
 vocabulary — 'removed', 'skipped_lease_held', 'skipped_persistent',
 'not_present', 'failed' — via real git worktrees (no mocking of git itself),
-mirroring test_inflight_verify_merge_lease.py's fixture pattern. No test
-bodies yet — this scaffolding adds only the shared real-git fixtures and
-helpers each subsequent step's test function builds on.
+mirroring test_inflight_verify_merge_lease.py's fixture pattern.
+
+TestRemoveMergeWorktreeGuarded exercises the primitive directly: uncontended
+removal; a lease-held skip that warns exactly once naming the holder pgid
+and reason (paired with a dead-holder fail-open positive control proving a
+stale pgid record never wedges removal); the persistent-lane exemption for
+both persistent worktrees; the not_present vs. failed outcome split; and the
+sibling ``<path>.lock`` file unlink-on-removal vs. retain-on-skip contract.
+TestCleanupMergeWorktreeRouting pins that cleanup_merge_worktree delegates
+to the guarded primitive, so a lease-held tree is skipped rather than
+force-removed, while uncontended removal is unchanged.
 """
 from __future__ import annotations
 
@@ -191,13 +199,22 @@ class TestRemoveMergeWorktreeGuarded:
     async def test_non_worktree_directory_returns_failed(self, git_ops: GitOps):
         """Positive control pinning the distinct 'failed' outcome: an
         existing directory that is NOT a registered git worktree makes
-        `git worktree remove --force` itself error."""
+        `git worktree remove --force` itself error. The directory must
+        survive (the remove failed) and the sibling lock file must be
+        retained -- unlink-on-tree-gone only fires for 'removed', never for
+        'failed'."""
         p = git_ops.worktree_base / '_merge-plain-dir'
         p.mkdir(parents=True)
+        lock_path = lane_lock_path(p)
 
         outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
 
         assert outcome == 'failed'
+        assert p.exists(), 'a failed removal must leave the directory intact'
+        assert lock_path.exists(), (
+            'the lock file (created as a side effect of acquiring the flock) '
+            'must be retained, not unlinked, when the lane survives a failed removal'
+        )
 
     async def test_removal_unlinks_its_own_lock_file(self, git_ops: GitOps):
         """The removing party unlinks the sibling ``<path>.lock`` on the
