@@ -275,6 +275,15 @@ class MergeVerifySpec:
                           laptop config's (possibly narrower) default.
     merge_verify_breadth   : 'scoped' | 'full' breadth of the merge gate (fix a,
                           task 2822) — same rationale.
+    global_verify_command  : the project's global full-gate commands, sourced by
+                          build_merge_verify_spec ONLY when module_configs is
+                          empty (a zero-module-config project, e.g. reify). It is
+                          applied onto the reconstructed remote config in
+                          run_merge_verify_on_worktree so the remote runs the
+                          SAME gate as local instead of its own (possibly stale)
+                          config globals — the fidelity fix for INV-1 (task 2883,
+                          incident 966f23a6). None when module_configs is
+                          non-empty (per-module verify_commands drive the gate).
 
     Note
     ----
@@ -297,6 +306,10 @@ class MergeVerifySpec:
     # field defaults (merge_verify_workspace=False, merge_verify_breadth='scoped').
     merge_verify_workspace: bool = False
     merge_verify_breadth: str = "scoped"
+    # INV-1, task 2883 — the global full-gate commands for a zero-module-config
+    # project, shipped so the remote runs the SAME gate as local. Narrow default
+    # None matches every existing spec (module_configs non-empty → not sourced).
+    global_verify_command: VerifyCommand | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -308,11 +321,19 @@ class MergeVerifySpec:
             "is_merge_verify": self.is_merge_verify,
             "merge_verify_workspace": self.merge_verify_workspace,
             "merge_verify_breadth": self.merge_verify_breadth,
+            "global_verify_command": (
+                self.global_verify_command.to_dict()
+                if self.global_verify_command is not None
+                else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> MergeVerifySpec:
         task_files_raw = d.get("task_files")
+        # Back-compat: a legacy spec dict (pre-task-2883) lacks this key, so
+        # default to None — same d.get idiom as merge_verify_workspace/breadth.
+        _gvc = d.get("global_verify_command")
         return cls(
             verify_commands=tuple(VerifyCommand.from_dict(vc) for vc in d["verify_commands"]),
             unscoped_typecheck=UnscopedTypecheckSpec.from_dict(d["unscoped_typecheck"]),
@@ -324,6 +345,9 @@ class MergeVerifySpec:
             # so default to the narrow merge gate — same d.get idiom as verify_env.
             merge_verify_workspace=d.get("merge_verify_workspace", False),
             merge_verify_breadth=d.get("merge_verify_breadth", "scoped"),
+            global_verify_command=(
+                VerifyCommand.from_dict(_gvc) if _gvc is not None else None
+            ),
         )
 
 
@@ -385,6 +409,22 @@ def build_merge_verify_spec(
             else 0.0
         )
     )
+    # INV-1, task 2883 — a zero-module-config project (reify) ships verify_commands=(),
+    # so the remote would reconstruct module_configs=[] and fall back to its own
+    # (possibly stale) config globals — the fidelity hole behind 966f23a6. Ship the
+    # dispatching side's LIVE global full-gate commands so the remote runs the SAME
+    # gate. Only sourced when the scope resolves to zero modules AND a global command
+    # exists; a non-empty module_configs leaves it None (verify_commands drive the gate).
+    global_verify_command: VerifyCommand | None = None
+    if not verify_commands and (
+        config.test_command or config.lint_command or config.type_check_command
+    ):
+        global_verify_command = VerifyCommand(
+            prefix='',
+            test_command=config.test_command,
+            lint_command=config.lint_command,
+            type_check_command=config.type_check_command,
+        )
     return MergeVerifySpec(
         verify_commands=verify_commands,
         unscoped_typecheck=UnscopedTypecheckSpec(commands=unscoped_commands, block_on_timeout=True),
@@ -400,6 +440,7 @@ def build_merge_verify_spec(
         # boundary; the remote host applies these over its own (laptop) config.
         merge_verify_workspace=config.merge_verify_workspace,
         merge_verify_breadth=config.merge_verify_breadth,
+        global_verify_command=global_verify_command,
     )
 
 
