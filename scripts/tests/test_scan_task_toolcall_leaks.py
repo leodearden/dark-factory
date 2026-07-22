@@ -18,7 +18,28 @@ false-positive prose mentions (tasks 2938/2939) — not invented shapes.
 """
 from __future__ import annotations
 
-from scan_task_toolcall_leaks import detect_leak
+import json
+import sqlite3
+
+from scan_task_toolcall_leaks import LeakMatch, detect_leak, scan_db
+
+# Minimal reproduction of the live tasks table schema (columns + NOT NULL
+# constraints only — see fused-memory's sqlite_task_backend.py _SCHEMA_SQL).
+# Only the columns scan_db actually reads/needs are included.
+_TASKS_SCHEMA = """
+CREATE TABLE tasks (
+    tag           TEXT NOT NULL DEFAULT 'master',
+    id            INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    description   TEXT,
+    details       TEXT,
+    test_strategy TEXT,
+    status        TEXT NOT NULL,
+    metadata      TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tag, id)
+);
+"""
 
 # ---------------------------------------------------------------------------
 # Genuine-leak fixtures: a stray closing tag, a REAL newline, then one or more
@@ -134,3 +155,92 @@ def test_trailing_whitespace_after_fragment_is_tolerated():
     does not defeat detection."""
     text_with_trailing_ws = GENUINE_DESCRIPTION_LEAK + "\n\n   \n"
     assert detect_leak(text_with_trailing_ws) == GENUINE_DESCRIPTION_LEAK_FRAGMENT
+
+
+# ---------------------------------------------------------------------------
+# scan_db(db_path) -> list[LeakMatch]
+# ---------------------------------------------------------------------------
+
+def _make_db(tmp_path, rows):
+    """Build a temp sqlite tasks.db at tmp_path/'tasks.db' seeded with *rows*.
+
+    Each row is a dict of column -> value; title/status/updated_at (the
+    NOT NULL columns) default to per-id placeholders when omitted.
+    """
+    db_path = tmp_path / "tasks.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_TASKS_SCHEMA)
+        for row in rows:
+            conn.execute(
+                "INSERT INTO tasks (tag, id, title, description, details, "
+                "test_strategy, status, metadata, updated_at) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("tag", "master"),
+                    row["id"],
+                    row.get("title", f"Task {row['id']}"),
+                    row.get("description"),
+                    row.get("details"),
+                    row.get("test_strategy"),
+                    row.get("status", "pending"),
+                    row.get("metadata"),
+                    row.get("updated_at", "2026-07-22T00:00:00+00:00"),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
+    rows = [
+        {"id": 1, "description": "Clean task, nothing wrong here."},
+        {"id": 2, "description": GENUINE_DESCRIPTION_LEAK},
+        {"id": 3, "description": "Clean prose.", "details": DETAILS_LEAK_TEXT},
+        {"id": 4, "description": SWALLOWED_DETAILS_LEAK, "details": ""},
+        {"id": 5, "description": PROSE_MENTION_FALSE_POSITIVE},
+        {
+            "id": 6,
+            "description": "Clean.",
+            "status": "done",
+            # Proves metadata is NOT scanned: this is exactly the shape task
+            # 2865's remediation record carries, and must be excluded.
+            "metadata": json.dumps(
+                {
+                    "stage2_description_corruption_fix": {
+                        "stripped_fragment": GENUINE_DESCRIPTION_LEAK_FRAGMENT,
+                    },
+                },
+            ),
+        },
+    ]
+    db_path = _make_db(tmp_path, rows)
+    before = db_path.read_bytes()
+
+    matches = scan_db(str(db_path))
+
+    after = db_path.read_bytes()
+    assert after == before, "scan_db must not mutate the database file"
+
+    by_task_id = {m.task_id: m for m in matches}
+    assert set(by_task_id) == {2, 3, 4}, (
+        "rows 1 (clean), 5 (prose mention), and 6 (metadata-only) must be excluded"
+    )
+
+    assert by_task_id[2].column == "description"
+    assert by_task_id[2].fragment == GENUINE_DESCRIPTION_LEAK_FRAGMENT
+    assert by_task_id[2].tag == "master"
+    assert by_task_id[2].db_path == str(db_path)
+
+    assert by_task_id[3].column == "details"
+    assert by_task_id[3].fragment == DETAILS_LEAK_FRAGMENT
+
+    assert by_task_id[4].column == "description"
+    assert by_task_id[4].fragment == SWALLOWED_DETAILS_FRAGMENT
+
+
+def test_scan_db_returns_empty_list_for_clean_db(tmp_path):
+    db_path = _make_db(tmp_path, [{"id": 1, "description": "All clean here."}])
+    assert scan_db(str(db_path)) == []
