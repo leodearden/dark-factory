@@ -1561,9 +1561,17 @@ def _run_compare_cmd(
 
 def _run_cleanup(base_config):
     """Remove all eval worktrees."""
-    from orchestrator.evals.snapshots import cleanup_eval_worktree
+    from orchestrator.evals.snapshots import (
+        cleanup_eval_worktree,
+        eval_worktree_root,
+    )
 
-    worktree_root = base_config.project_root / '.eval-worktrees'
+    # Eval worktrees live OUTSIDE project_root (a sibling of the repo) so a
+    # nested pytest/pyright/ruff/cargo run cannot collect the main repo's
+    # ancestor config (Defect B, task 2881). Discover them at that same
+    # relocated root — sharing eval_worktree_root with create_eval_worktree so
+    # placement and cleanup cannot drift.
+    worktree_root = eval_worktree_root(base_config.project_root)
     if not worktree_root.exists():
         click.echo('No eval worktrees found.')
         return
