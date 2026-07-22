@@ -120,6 +120,7 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     _maybe_schedule_shadow_compare,
     _nextest_reported_test_count,
     _persistent_alarm_tests,
+    _run_coarse_shadow_compare,
     _run_cold_shadow_verify,
     _run_shadow_compare,
     _save_shadow_compare_state,

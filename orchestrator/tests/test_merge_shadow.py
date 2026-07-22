@@ -412,6 +412,11 @@ class TestScheduleShadowCompareMapLess:
             git=GitConfig(
                 warm_verify_shadow_compare=True,
                 warm_verify_shadow_compare_every_n_merges=3,
+                # Isolate the count leg: push the nightly-timer leg far into the
+                # future so it never fires (last_shadow_run_at starts at 0.0, so
+                # a default 86400 s interval would trivially be "due" against a
+                # 2026 wall clock and mask the count-leg cadence under test).
+                warm_verify_shadow_compare_nightly_interval_secs=1e12,
             ),
         )
         req = MagicMock()

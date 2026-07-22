@@ -1110,6 +1110,22 @@ async def _run_shadow_compare(
             )
 
 
+async def _run_coarse_shadow_compare(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    escalation_queue: Any,
+    event_store: EventStore | None,
+) -> None:
+    """COARSE suite-level warm-vs-cold shadow compare for a MAP-LESS land.
+
+    FIX 2 (task 2886, PRD leaf δ §3.4).  Fleshed out in step-10 — this is a
+    thin stub so the FIX-2 scheduling seam (:func:`_maybe_schedule_shadow_compare`
+    branch + merge_queue shim re-export) can land and be exercised first.
+    """
+    return None
+
+
 async def _maybe_schedule_shadow_compare(
     worker: SpeculativeMergeWorker,
     git_ops: GitOps,
@@ -1149,17 +1165,25 @@ async def _maybe_schedule_shadow_compare(
         event_store: Optional event store for parity-ok event emission.
     """
     # Reach-back (deferred import): the existing test suite patches the
-    # spawned coroutine by string path at
-    # orchestrator.merge_queue._run_shadow_compare (this function used to
-    # live in merge_queue.py, alongside its sibling).  Resolving it
-    # dynamically from merge_queue's namespace at call time keeps those
-    # patches effective post-extraction.
-    from orchestrator.merge_queue import _run_shadow_compare
+    # spawned coroutine(s) by string path at
+    # orchestrator.merge_queue._run_shadow_compare /
+    # orchestrator.merge_queue._run_coarse_shadow_compare (these functions used
+    # to live in merge_queue.py, alongside their siblings).  Resolving them
+    # dynamically from merge_queue's namespace at call time keeps those patches
+    # effective post-extraction.
+    from orchestrator.merge_queue import (
+        _run_coarse_shadow_compare,
+        _run_shadow_compare,
+    )
 
-    # Early exits: knob off or no warm results to compare against
+    # Early exit: knob off.
+    #
+    # FIX 2 (task 2886, PRD leaf δ §3.4): the historical ``if not warm_results:
+    # return`` early-exit is intentionally GONE.  A MAP-LESS land (empty
+    # warm_results) is exactly the trivial-pass / remote-verdict population that
+    # CAN diverge, so it must be sampled — it is routed to the COARSE
+    # suite-level compare below instead of being silently skipped.
     if not req.config.git.warm_verify_shadow_compare:
-        return
-    if not warm_results:
         return
     # None-safe: _shadow_state_path is None on bare-harness workers (mirrors the
     # escalation_queue None-safety / bare-harness contract in __init__).
@@ -1204,11 +1228,21 @@ async def _maybe_schedule_shadow_compare(
 
     # Spawn the shadow compare OFF the serial lane — this call returns IMMEDIATELY
     # without awaiting the cold verify (detective/async control, PRD §10 invariant 6(b)).
-    t = asyncio.create_task(
-        _run_shadow_compare(
+    #
+    # FIX 2 branch: a land WITH a per-test warm map uses the per-test
+    # _run_shadow_compare (unchanged); a MAP-LESS land (empty warm_results —
+    # trivial-pass or remote-verdict) degrades to the COARSE suite-level
+    # _run_coarse_shadow_compare, which runs a cold FULL-gate verify and
+    # compares its suite verdict against the warm-passed (implicit) land.
+    if warm_results:
+        compare_coro = _run_shadow_compare(
             git_ops, req, merge_commit, warm_results, escalation_queue, event_store
         )
-    )
+    else:
+        compare_coro = _run_coarse_shadow_compare(
+            git_ops, req, merge_commit, escalation_queue, event_store
+        )
+    t = asyncio.create_task(compare_coro)
 
     def _discard_task(task: asyncio.Task) -> None:  # type: ignore[type-arg]
         worker._shadow_compare_tasks.discard(task)
