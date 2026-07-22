@@ -61,15 +61,34 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__update_edge',
 ]
 
+# Recon-report tools that perform DURABLE writes (disallowed outside Stage 2).
+# task 2895 β: write_entity_standing_decision is the first recon-report tool that
+# writes past in-process ReconReportState — it upserts a row into the durable
+# SQLite reconciliation ledger. It must be blocked in Stage 1 and Stage 3 but
+# remain callable in Stage 2 (where the entity standing decision is authored), so
+# it rides its own additive sublist rather than DISALLOW_MEMORY_WRITES (which
+# would miss Stage 1) or DISALLOW_TASK_WRITES (semantically wrong).
+DISALLOW_RECON_REPORT_LEDGER_WRITES = [
+    'mcp__recon-report__write_entity_standing_decision',
+]
+
 # Per-stage disallowed lists
-STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_BUILTIN
+STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_BUILTIN
 STAGE2_DISALLOWED = DISALLOW_BUILTIN  # Memory + task writes are allowed; only built-ins are blocked
-STAGE3_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_BUILTIN
-# NOTE: `mcp__recon-report__*` tools are intentionally NOT included in DISALLOW_MEMORY_WRITES
-# or DISALLOW_TASK_WRITES and therefore NOT in STAGE3_DISALLOWED.  These tools write only
-# to in-process ReconReportState (not Graphiti / Mem0 / Taskmaster) so they do not violate
-# Stage 3's read-only contract.  Do NOT add them to either disallow list.
+STAGE3_DISALLOWED = (
+    DISALLOW_TASK_WRITES
+    + DISALLOW_MEMORY_WRITES
+    + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_BUILTIN
+)
+# NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,
+# set_stat, cite_*, complete, …) are intentionally NOT in any disallow list: they write
+# only to in-process ReconReportState (not Graphiti / Mem0 / Taskmaster / the ledger), so
+# they do not violate Stage 3's read-only contract. Do NOT add those to any disallow list.
 # See PRD §9.1 / §11 task γ for the rationale.
+# CARVE-OUT (task 2895 β): write_entity_standing_decision is the exception — the first
+# recon-report tool with a durable SQLite-ledger write. It IS blocked in Stage 1 and
+# Stage 3 (via DISALLOW_RECON_REPORT_LEDGER_WRITES above) and callable only in Stage 2.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
