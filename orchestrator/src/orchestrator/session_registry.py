@@ -2018,27 +2018,32 @@ def parse_spawn_identity(
 def _run_launching(env: Mapping[str, str]) -> str:
     """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
 
-    Also opportunistically drives the liveness sweep
-    (``mark_orphaned_sessions_exited``) AND a bounded prune
-    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): neither sweep has a
-    periodic production driver of its own (CLI-only), so every spawn is
-    what drains prior orphaned (unclean-death) records to ``exited`` AND
-    reclaims terminal/stale record dirs from disk -- the backlog is bounded
-    by spawn rate and self-limits as it drains, over successive spawns for
-    the bounded prune. Wrapped in a fail-soft guard: a sweep fault must
-    never raise here and must never write to stdout, or it would corrupt
-    the printed record dir spawn-claude.sh captures into
-    ``SESSION_RECORD_DIR``.
+    Also opportunistically drives the liveness sweeps
+    (``mark_orphaned_sessions_exited`` and, task 2934,
+    ``mark_windowless_wm_sessions_exited``) AND a bounded prune
+    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): none of these sweeps has
+    a periodic production driver of its own (CLI-only), so every spawn is
+    what drains prior orphaned (unclean-death) and windowless-wm records to
+    ``exited`` AND reclaims terminal/stale record dirs from disk -- the
+    backlog is bounded by spawn rate and self-limits as it drains, over
+    successive spawns for the bounded prune. Each sweep is wrapped in its OWN
+    fail-soft guard: a sweep fault must never raise here and must never write
+    to stdout, or it would corrupt the printed record dir spawn-claude.sh
+    captures into ``SESSION_RECORD_DIR`` -- and one sweep's fault must not
+    skip the others.
 
-    Cost model (reviewer-flagged): the sweep is O(N) in the number of
+    Cost model (reviewer-flagged): the pid/TTL sweep is O(N) in the number of
     session directories -- one ``iterdir`` + one ``record.json`` parse per
     peer, plus a second read+write for each record it actually marks -- and
     runs synchronously in this call, so every spawn pays for scanning all
-    of its peers, not just its own write. This is a deliberate trade-off
-    given the sweep has no periodic/out-of-band driver to run on instead
-    (see above); it is bounded and self-limiting (the backlog this drains
-    only shrinks the cost over time), acceptable at today's fleet sizes, and
-    the right place to revisit if spawn latency ever becomes a problem is a
+    of its peers, not just its own write. The wm-window sweep adds ONE
+    ``wmctrl -l`` subprocess per spawn on top of that same O(N) scan (fail-
+    soft: a missing binary or nonzero rc just short-circuits it to a no-op,
+    per ``_wmctrl_live_window_ids``). This is a deliberate trade-off given
+    neither sweep has a periodic/out-of-band driver to run on instead (see
+    above); it is bounded and self-limiting (the backlog this drains only
+    shrinks the cost over time), acceptable at today's fleet sizes, and the
+    right place to revisit if spawn latency ever becomes a problem is a
     dedicated periodic timer (systemd/cron) rather than this synchronous
     call -- out of this task's module scope (would touch harness/systemd).
     The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
@@ -2073,6 +2078,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
     write_record(record)
     with contextlib.suppress(Exception):
         mark_orphaned_sessions_exited()
+    with contextlib.suppress(Exception):
+        mark_windowless_wm_sessions_exited()
     with contextlib.suppress(Exception):
         reap_stale_records(limit=REAP_BATCH_LIMIT)
     return str(record_dir)
@@ -2119,16 +2126,21 @@ def _run_set_display(
 
 
 def _run_reap() -> list[ReapedSessionRecord]:
-    """Run the canonical ``reap`` verb: mark orphans exited, THEN delete stale dirs.
+    """Run the canonical ``reap`` verb: mark orphans/windowless-wm exited, THEN delete stale dirs.
 
-    Mark-then-delete keeps `reap` complete: a record the liveness sweep
+    Mark-then-delete keeps `reap` complete: a record either liveness sweep
     would mark exited this same pass must not simultaneously be eligible
     for stale_pid deletion (marking bumps its mtime, so it lands back
     within reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) --
     it only becomes reapable later, once it ages past TERMINAL_TTL as any
-    other terminal record does.
+    other terminal record does. This is why ``mark_windowless_wm_sessions_exited``
+    (task 2934) runs here too, alongside ``mark_orphaned_sessions_exited`` --
+    it reaps exactly the live-pid / age<1h wm-display zombies (a closed
+    terminal window with a still-alive launcher_pid) the pid/TTL sweep is
+    forced to keep, so `reap` must drive both before deleting.
     """
     mark_orphaned_sessions_exited()
+    mark_windowless_wm_sessions_exited()
     return reap_stale_records()
 
 
