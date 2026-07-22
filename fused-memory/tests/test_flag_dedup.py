@@ -5,6 +5,7 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 from __future__ import annotations
 
 import json
+import logging
 import uuid as _uuid_mod
 from typing import Any
 from unittest.mock import AsyncMock

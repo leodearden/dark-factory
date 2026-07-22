@@ -175,6 +175,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, NotRequired, TypedDict
 
@@ -182,6 +183,7 @@ from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_TOKEN_FAMILIES,
+    STATE_ACTIVE,
 )
 from fused_memory.utils.async_utils import gather_collect
 
@@ -630,6 +632,143 @@ def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
         return False
     folded = flag_type.casefold()
     return any(stem.casefold() in folded for stem in family)
+
+
+@dataclass(frozen=True)
+class EntityStandingSuppressionResult:
+    """Outcome of :func:`filter_entity_standing_decisions` (task 2896 γ).
+
+    - ``kept_flags`` — the flags that survived (input order preserved), to be
+      assigned back to ``report.items_flagged``.
+    - ``suppressed_by_decision`` — ``{entity_uuid(lower): count}`` of flags
+      suppressed, attributed per active standing decision; its ``values()`` sum
+      is the ``entity_standing_decision_suppressed`` per-cycle stat, and it
+      drives the storm escalation (:func:`maybe_escalate_suppression_storm`).
+    - ``grounds_by_decision`` — ``{entity_uuid(lower): grounds}`` for each
+      decision that suppressed at least one flag (observability + escalation
+      detail).
+    """
+
+    kept_flags: list[dict[str, Any]]
+    suppressed_by_decision: dict[str, int]
+    grounds_by_decision: dict[str, str]
+
+
+def _match_entity_standing_decision(
+    flag: dict[str, Any], active_by_uuid: dict[str, ReconLedgerRecord]
+) -> str | None:
+    """Return the ``entity_uuid`` (lowercased) of the active standing decision
+    that suppresses *flag*, or ``None`` if none does.
+
+    STRONG path (this step): the flag carries a structured ``entity_uuid`` stamp
+    matching an active row AND its ``grounds`` stamp equals that row's grounds
+    (``row.flag_type`` — the α PK-slot mapping). A deliberate LLM-stamped
+    (entity, grounds) assertion is high-signal, so it is trusted even if the
+    flag text also cites another UUID.
+
+    (The FALLBACK stamps-omitted path is added in step-6; strong OR fallback,
+    strong wins attribution.)
+    """
+    stamped_uuid = flag.get('entity_uuid')
+    if isinstance(stamped_uuid, str) and stamped_uuid:
+        key = stamped_uuid.lower()
+        row = active_by_uuid.get(key)
+        if row is not None and flag.get('grounds') == row.flag_type:
+            return key
+    return None
+
+
+async def filter_entity_standing_decisions(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+) -> EntityStandingSuppressionResult:
+    """Drop recon flags already adjudicated by an ACTIVE ``entity_standing_decision``.
+
+    Hook A of the entity-standing-decision PRD (task 2896 γ). Does ONE indexed
+    ``recon_ledger.list_entity_standing_decisions(project_id, state=active)``
+    read per cycle, builds a ``{entity_uuid(lower): row}`` map, and suppresses
+    each flag matched by :func:`_match_entity_standing_decision`.
+
+    Whole-batch fail-open, mirroring :func:`filter_suppressed` exactly: when
+    *flags* is empty, or ``memory_service.recon_ledger`` is unset/``None``, or
+    the ledger read raises, NO suppression is applied this cycle (all flags
+    kept) — a ledger read failure must never hide a finding. The ledger-None
+    path logs DEBUG; the read-exception path logs WARNING.
+
+    Returns an :class:`EntityStandingSuppressionResult`; the caller assigns
+    ``kept_flags`` back to ``items_flagged`` and reads ``suppressed_by_decision``
+    for the stat / storm escalation. Suppression is NOT resolution — the caller
+    excludes suppressed flags' signatures from marker acknowledgment so
+    recurrence history is preserved (see the consolidator wiring).
+    """
+    if not flags:
+        return EntityStandingSuppressionResult(
+            kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        logger.debug(
+            'filter_entity_standing_decisions: no recon_ledger on memory_service '
+            'for project %s; passing %d flag(s) through unfiltered',
+            project_id,
+            len(flags),
+        )
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    try:
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+    except Exception as e:
+        logger.warning(
+            'filter_entity_standing_decisions: recon_ledger.'
+            'list_entity_standing_decisions failed for project %s: %s (best-effort'
+            ' — treating as no standing decision in effect, passing %d flag(s)'
+            ' through unfiltered)',
+            project_id,
+            e,
+            len(flags),
+            exc_info=True,
+        )
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    active_by_uuid: dict[str, ReconLedgerRecord] = {
+        row.entity_uuid.lower(): row for row in rows if row.entity_uuid
+    }
+    if not active_by_uuid:
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags), suppressed_by_decision={}, grounds_by_decision={}
+        )
+
+    kept: list[dict[str, Any]] = []
+    suppressed_by_decision: dict[str, int] = {}
+    grounds_by_decision: dict[str, str] = {}
+    for flag in flags:
+        matched_uuid = _match_entity_standing_decision(flag, active_by_uuid)
+        if matched_uuid is None:
+            kept.append(flag)
+            continue
+        row = active_by_uuid[matched_uuid]
+        suppressed_by_decision[matched_uuid] = suppressed_by_decision.get(matched_uuid, 0) + 1
+        grounds_by_decision[matched_uuid] = row.flag_type
+        logger.info(
+            'filter_entity_standing_decisions: suppressed flag_type=%r for project'
+            ' %s by active standing decision entity_uuid=%s grounds=%s',
+            flag.get('flag_type'),
+            project_id,
+            matched_uuid,
+            row.flag_type,
+        )
+
+    return EntityStandingSuppressionResult(
+        kept_flags=kept,
+        suppressed_by_decision=suppressed_by_decision,
+        grounds_by_decision=grounds_by_decision,
+    )
 
 
 # --------------------------------------------------------------------------- #
