@@ -211,6 +211,16 @@ _WARM_LANE_RECLAIM_PROTECTED_STATUSES: frozenset[str] = frozenset(
     {'merge-deferred', 'deferred'}
 )
 
+# Recency grace for the verified-green stranded-reaper's durable re-submit
+# guard (PRD leaf α §7).  A ``metadata.stranded_merge_request`` marker whose
+# tip_sha matches the current lane tip AND whose submitted_at is within this
+# window short-circuits a re-submit — the merge is presumed still in-flight,
+# so the periodic stranded sweep must not re-enqueue the same branch every
+# tick.  Once the window elapses (or the lane tip advances past the marker),
+# a fresh submit re-drives (self-healing).  Sized to comfortably cover an
+# in-flight merge+verify while still re-driving a genuinely lost/hung one.
+_STRANDED_MERGE_RESUBMIT_GRACE_S: float = 30 * 60.0  # 30 minutes
+
 # Prior auto-eval redo siblings (task 2075) are only safe to silently
 # supersede (cancel) when they are still idle and unclaimed by anyone.
 # Deliberately just {'pending'} — EXCLUDES five of the six members of
@@ -4192,6 +4202,37 @@ class Harness:
                 return assigned
         return self.git_ops.worktree_base / tid
 
+    @staticmethod
+    def _stranded_merge_marker_is_fresh(marker: Any, tip_sha: str) -> bool:
+        """Return True iff *marker* records a still-fresh submit for *tip_sha*.
+
+        The verified-green stranded-reaper's race-guard (PRD leaf α §7): a
+        ``metadata.stranded_merge_request`` marker suppresses a re-submit only
+        when it is a well-formed dict whose ``tip_sha`` equals the current lane
+        tip AND whose ``submitted_at`` is within ``_STRANDED_MERGE_RESUBMIT_
+        GRACE_S`` of now.  Fail-safe: any malformed / non-dict / unparseable
+        marker (or a mismatched tip / stale timestamp) returns False, so the
+        caller falls through to a fresh submit rather than a wedged skip — a
+        lost marker must never permanently strand the task.
+        """
+        if not isinstance(marker, dict):
+            return False
+        if marker.get('tip_sha') != tip_sha:
+            return False
+        submitted_at = marker.get('submitted_at')
+        if not isinstance(submitted_at, str) or not submitted_at:
+            return False
+        try:
+            ts = datetime.fromisoformat(submitted_at)
+        except (ValueError, TypeError):
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        # A future timestamp (clock skew) yields a negative age < grace → treated
+        # as fresh (skip), which is the safe side: never a duplicate submit.
+        age_s = (datetime.now(UTC) - ts).total_seconds()
+        return age_s < _STRANDED_MERGE_RESUBMIT_GRACE_S
+
     async def _maybe_submit_stranded_verified_green(
         self, tid: str, metadata: dict[str, Any],
     ) -> bool:
@@ -4235,6 +4276,24 @@ class Harness:
         if match is None:
             return False
 
+        # Idempotency / race-guard (PRD leaf α §7): a durable metadata marker
+        # records the tip_sha + request_id + submitted_at of the last submit.
+        # If a fresh marker for THIS lane tip is already present the merge is
+        # presumed still in-flight — return True WITHOUT re-enqueuing so the
+        # periodic sweep doesn't pile duplicate requests onto the same branch.
+        # A stale marker or an advanced lane tip falls through to a fresh
+        # submit (self-healing, restart-safe).
+        if self._stranded_merge_marker_is_fresh(
+            metadata.get('stranded_merge_request'), match.tip_sha,
+        ):
+            logger.info(
+                'Reconcile: task %s stranded verified-green already submitted '
+                '(marker tip=%s) — skipping re-submit (merge presumed '
+                'in-flight; task stays blocked)',
+                tid, match.tip_sha,
+            )
+            return True
+
         from orchestrator.merge_queue import enqueue_merge_request
         from orchestrator.merge_types import (
             MergeOutcome,
@@ -4265,6 +4324,30 @@ class Harness:
         await enqueue_merge_request(
             self._merge_queue, req, self.event_store, source='stranded-reaper',
         )
+
+        # Stamp the durable race-guard marker (PRD leaf α §7).  Best-effort:
+        # a lost marker only means a benign re-submit next sweep, so a failed
+        # write must never abort the remediation.  Merge-mode write (the
+        # scheduler default) touches ONLY this key, preserving siblings; the
+        # marker lives in metadata so the found_on_main MARK_DONE path ignores
+        # it entirely (non-interference).
+        try:
+            await self.scheduler.update_task(
+                tid,
+                {
+                    'stranded_merge_request': {
+                        'tip_sha': match.tip_sha,
+                        'request_id': req.request_id,
+                        'submitted_at': datetime.now(UTC).isoformat(),
+                    },
+                },
+            )
+        except Exception:
+            logger.warning(
+                'Reconcile: task %s — failed to stamp stranded_merge_request '
+                'marker (benign; only risks a re-submit next sweep)',
+                tid, exc_info=True,
+            )
 
         # Record the action (PRD §2.1): file a stranded_blocked escalation and
         # IMMEDIATELY auto-resolve it with a close_only/dismiss disposition.
