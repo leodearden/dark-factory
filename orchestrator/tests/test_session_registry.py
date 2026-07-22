@@ -1304,6 +1304,76 @@ def test_wmctrl_live_window_ids_titleless_short_line_still_contributes_id() -> N
 
 
 # ---------------------------------------------------------------------------
+# Task 2934 step-5/6: mark_windowless_wm_sessions_exited (happy path)
+# ---------------------------------------------------------------------------
+
+
+def test_mark_windowless_marks_wm_record_whose_window_id_is_absent(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='windowless-1',
+        status=sr.Status.AWAITING_INPUT,
+        display=sr.Display(kind='wm', wm_title='some title', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x0000ff99  0 host  some other window'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert {m.session_slug for m in marked} == {'windowless-1'}
+    record_path = sr.record_path_for_slug('windowless-1', root=tmp_path)
+    assert record_path.parent.is_dir()  # marked, NOT deleted
+    assert record_path.is_file()
+    reloaded = sr.read_record('windowless-1', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_mark_windowless_keeps_decimal_captured_id_matching_padded_hex_live_window(
+    tmp_path: Path,
+) -> None:
+    # DECIMAL-vs-hex KEEP: '26' (decimal) is the SAME window as the live,
+    # zero-padded-hex '0x0000001a' wmctrl reports -- must NOT be reaped.
+    r = _make_record(
+        session_slug='decimal-kept',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='26'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x0000001a  0 host  live window'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('decimal-kept', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='windowless-fields',
+        status=sr.Status.IDLE,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        launcher_pid=os.getpid(),
+        start_ts='2026-07-07T00:00:00+00:00',
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  other window'])
+
+    sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    reloaded = sr.read_record('windowless-fields', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    assert reloaded.role == 'unblock'
+    assert reloaded.project == 'df'
+    assert reloaded.task_id == '2085'
+    assert reloaded.launcher_pid == os.getpid()
+    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
+
+
+# ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
 
