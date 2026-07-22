@@ -707,6 +707,13 @@ class LocalRunner:
             role='merge',
             task_id=self._task_id,
             archive_root=self._archive_root,
+            # INV-1, task 2883 — thread the dispatching store so run_scoped's
+            # merge gate (role='merge' AND is_merge_verify) emits
+            # trivial_pass_escalated. None for the CLI/remote in-worktree path
+            # (run_merge_verify_on_worktree constructs LocalRunner without an
+            # event_store), which cannot reach the dispatching host's store —
+            # None-safe by construction, mirroring merge-flake suppression.
+            event_store=self._event_store,
         )
         if not scoped.passed:
             # PRD task α: single flake-retry gate. Re-run the named failing tests
