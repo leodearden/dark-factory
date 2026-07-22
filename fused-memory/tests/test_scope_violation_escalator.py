@@ -149,16 +149,33 @@ class TestEscalationEnabled:
         instead fold into the first.
         """
         esc = ScopeViolationEscalator()
-        kwargs = dict(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Human gate: consolidate tree-sitter cluster',
-            matched_paths=('corpus/',),
-            suggested_project='know_live',
+        project_root = str(tmp_path)
+        project_id = 'reify'
+        candidate_title = 'Human gate: consolidate tree-sitter cluster'
+        matched_paths = ('corpus/',)
+        suggested_project = 'know_live'
+
+        first = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
         )
-        first = esc.report_rejection(**kwargs)
-        second = esc.report_rejection(**kwargs)
-        third = esc.report_rejection(**kwargs)
+        second = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+        third = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
 
         assert first is not None
         assert second == first, 'second identical misroute must fold into the first'
@@ -182,15 +199,26 @@ class TestEscalationEnabled:
         pre-task-2946 behavior.
         """
         esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
-        kwargs = dict(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Human gate: consolidate tree-sitter cluster',
-            matched_paths=('corpus/',),
-            suggested_project='know_live',
+        project_root = str(tmp_path)
+        project_id = 'reify'
+        candidate_title = 'Human gate: consolidate tree-sitter cluster'
+        matched_paths = ('corpus/',)
+        suggested_project = 'know_live'
+
+        first = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
         )
-        first = esc.report_rejection(**kwargs)
-        second = esc.report_rejection(**kwargs)
+        second = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
 
         assert first is not None
         assert second is not None
