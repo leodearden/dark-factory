@@ -74,3 +74,30 @@ def git_ops(git_repo: Path) -> GitOps:
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     """Build a real ephemeral ``_merge-<uuid>`` worktree at the repo's HEAD."""
     return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+
+
+# ---------------------------------------------------------------------------
+# step-1: uncontended removal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoveMergeWorktreeGuarded:
+    """GitOps.remove_merge_worktree_guarded — lease-enforced removal (C1).
+
+    Acquire-then-remove, never check-then-remove: the primitive holds the
+    tree's merge-verify flock across the ``git worktree remove`` so no
+    verify can start in the window between the liveness check and the
+    delete (the incident's 23s TOCTOU).
+    """
+
+    async def test_uncontended_removal_returns_removed(self, git_ops: GitOps):
+        """Positive control paired with the lease-held skip test: an
+        uncontended tree must actually be removed, not just left alone by an
+        inert stub that always reports skipped."""
+        wt = await _make_ephemeral_worktree(git_ops)
+
+        outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='t')
+
+        assert outcome == 'removed'
+        assert not wt.exists()
