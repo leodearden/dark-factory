@@ -503,6 +503,90 @@ class TestReachBackRouting:
         )
 
 
+@pytest.mark.asyncio
+class TestDriftCheckFullGateSpec:
+    """Fix 1b (task 2886, PRD §8δ): the drift check must re-dispatch a
+    FULL-GATE spec (task_files=None) to both hosts, NOT the scoped/no-source
+    spec that produced the (trivial) pass under investigation.
+
+    Re-dispatching the SAME scoped spec trivially passes on both hosts and
+    structurally cannot catch the trivial-pass divergence class — so the drift
+    check must force the complete workspace gate on the local trust-anchor AND
+    the eligible remote.
+
+    RED (pre step-6): _run_drift_check scopes the spec to req.task_files (or the
+    git-derived task_files) instead of passing task_files=None.
+    """
+
+    async def test_run_drift_check_builds_full_gate_spec(self, tmp_path: Path) -> None:
+        import orchestrator.verify_runner as _vr
+        from orchestrator.merge_drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_throwaway_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-drift-fullgate'
+        # Scoping signal PRESENT: an explicit task_files list that the pre-fix
+        # code would tuple-ify and pass straight into build_merge_verify_spec.
+        req.task_files = ['src/foo.py']
+        req.module_configs = []
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[  # type: ignore[arg-type]
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            ],
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        spec_calls: list = []
+        orig_build_spec = _vr.build_merge_verify_spec
+
+        def spy_build_spec(config, module_configs, task_files, **kw):
+            spec_calls.append(task_files)
+            return orig_build_spec(config, module_configs, task_files, **kw)
+
+        with (
+            patch(
+                'orchestrator.merge_queue.build_merge_verify_spec',
+                side_effect=spy_build_spec,
+            ),
+            # A full-gate drift spec must NOT derive/scope task_files at all.
+            patch(
+                'orchestrator.merge_queue._derive_task_files_from_git',
+                AsyncMock(side_effect=AssertionError(
+                    'drift check must NOT derive task_files for a full-gate spec'
+                )),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', None, None, set(),
+                allocator=allocator,
+            )
+
+        assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
+        assert spec_calls[0] is None, (
+            f'drift spec must be FULL-GATE (task_files=None) so both hosts run the '
+            f'complete suite and CAN diverge; got task_files={spec_calls[0]!r}'
+        )
+
+
 def test_merge_queue_reexports_identical_objects() -> None:
     """merge_queue re-exports the SAME objects from merge_drift (shim identity).
 
