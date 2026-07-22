@@ -177,12 +177,20 @@ class ReconLedgerStore:
         # TABLE_SQL, so this ALTER fails ("duplicate column name") and is a
         # harmless rollback; on an old DB it adds the column. Runs BEFORE
         # INDEX_SQL so ix_recon_ledger_project_kind_entity can reference it.
+        #
+        # The catch is NARROWED to the expected "duplicate column name" case
+        # (loud-over-silent): a genuine migration failure — a locked/corrupt DB,
+        # a disk error — is re-raised here with its own message rather than
+        # swallowed and left to re-surface one statement later as a confusing
+        # "no such column: entity_uuid" from the INDEX_SQL that references it.
         try:
             await self._db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
             await self._db.commit()
-        except Exception:
+        except Exception as exc:
             with contextlib.suppress(Exception):
-                await self._db.rollback()  # Column already exists
+                await self._db.rollback()
+            if 'duplicate column name' not in str(exc).lower():
+                raise  # Not the benign "column already exists" case — surface it.
 
         await self._db.executescript(INDEX_SQL)
         await self._db.commit()
