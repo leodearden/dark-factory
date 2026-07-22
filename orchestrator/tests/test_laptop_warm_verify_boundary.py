@@ -653,29 +653,48 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    worktree_base = worktree_base_for(repo)
+
+    REQUEST_ID = 'env-seam-watchdog-test'
+    pgf = pgid_file(worktree_base, REQUEST_ID)
 
     proc = spawn_verify_merge(
         sha=head_sha,
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
-        request_id='env-seam-watchdog-test',
+        request_id=REQUEST_ID,
         extra_env={
             'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '0.5',
             'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.2',
         },
     )
     try:
+        # task 2921 (load-robustness): the child's ``from orchestrator.cli
+        # import main`` startup dominates wall-clock under a full-suite storm
+        # (~9s observed on a loaded host) and is unrelated to the watchdog
+        # window under test -- so the old bare ``proc.wait(timeout=9.0)`` was
+        # import-bound, not watchdog-bound, and flaked under parallel load.
+        # The --request-id run writes its pgid file at startup BEFORE doing any
+        # work (cli.py verify_merge) and the watchdog self-kills via
+        # ``os._exit(1)`` (which bypasses pgid-file cleanup), so waiting for
+        # the pgid file to appear absorbs the load-sensitive import cost; the
+        # subsequent ``fire_delay`` then measures only the watchdog fire delay.
+        wait_for_pgid_file(pgf, timeout=30.0)
+        armed = time.monotonic()
         # No heartbeat is ever written -- stdin stays open but silent, which
         # is sufficient to exercise the heartbeat-starvation timing path
-        # (Rows 1-3 later distinguish EOF vs. timeout precisely).
+        # (Rows 1-3 later distinguish EOF vs. timeout precisely). Wait well
+        # past the 15s production window so an un-wired override is OBSERVED
+        # self-exiting (not merely timed out) and caught by the delay
+        # assertion below rather than masked as a hang.
         try:
-            proc.wait(timeout=9.0)
+            proc.wait(timeout=30.0)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 9s of no heartbeats -- '
-                'watchdog env overrides are not wired up yet (production '
-                'window is 10s timeout + 5s grace = 15s)'
+                'verify-merge did not self-exit within 30s of startup -- '
+                'the watchdog did not fire at all'
             )
+        fire_delay = time.monotonic() - armed
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -686,6 +705,18 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
 
     assert proc.returncode != 0, (
         f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
+    )
+    # task 2921 discriminant: the override (0.5s heartbeat timeout + 0.2s kill
+    # grace, ~0.7s total) must fire the watchdog FAR faster than the
+    # 10s+5s=15s production window. Measured from pgid-appearance (post-import),
+    # so this ceiling is a genuine watchdog budget, not an import budget. The
+    # 10.0s value sits well above the ~0.7s override (with generous load
+    # headroom) yet well below the 15s production window, so it still catches a
+    # regression that un-wires the override.
+    assert fire_delay < 10.0, (
+        f'watchdog self-exit took {fire_delay:.2f}s after startup -- expected '
+        f'well under the 15s production window (env override=0.5s+0.2s); the '
+        f'watchdog env overrides are not wired up'
     )
 
 
@@ -1111,6 +1142,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(120)  # task 2921: two real verify-merge subprocesses (holder + waiter) under full-suite load
 def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     """SS9 Row 5: producer discriminant -> real consumer -> born-at-L2 + blocked.
 
@@ -1170,7 +1202,15 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
             request_id='row5-waiter',
             extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
         )
-        stdout, stderr = waiter.communicate(timeout=15)
+        # task 2921 (load-robustness): widened from 15s. The waiter is a full
+        # real verify-merge subprocess (Python import ~9s under a full-suite
+        # storm + config load + git worktree setup + the 0.5s flock wait), so a
+        # 15s ceiling is import-bound, not flock-bound, under parallel load and
+        # flaked (observed: this subprocess timed out at 15s under load). There
+        # is NO timing assertion on the waiter here -- the test asserts on the
+        # returned FLOCK_CONTENTION_CATEGORY discriminant, not on duration -- so
+        # widening the completion ceiling has zero discrimination cost.
+        stdout, stderr = waiter.communicate(timeout=60)
 
         assert waiter.returncode == 0, (
             f'expected exit 0 (contention result on stdout), got '
