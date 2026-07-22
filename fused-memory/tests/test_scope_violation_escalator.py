@@ -173,6 +173,33 @@ class TestEscalationEnabled:
         assert payload['dedupe_count'] == 2
         assert len(payload['dedupe_children']) == 2
 
+    def test_report_rejection_dedup_kill_switch_reproduces_legacy_behavior(self, tmp_path):
+        """scope_violation_dedupe_enabled=False disables folding (escape hatch).
+
+        Mirrors budget_misconfig_dedup_window_secs as an operator-facing
+        constructor knob: with dedup disabled, identical repeated misroutes
+        must each file their own distinct escalation, exactly like the
+        pre-task-2946 behavior.
+        """
+        esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
+        kwargs = dict(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        first = esc.report_rejection(**kwargs)
+        second = esc.report_rejection(**kwargs)
+
+        assert first is not None
+        assert second is not None
+        assert second != first, 'dedup disabled: each call must file a distinct escalation'
+
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 2, f'expected two distinct escalation files, found: {files}'
+
 
 @pytest.mark.skipif(
     not sve_mod.HAS_ESCALATION,
