@@ -8349,3 +8349,90 @@ class TestFailureReportUsesAnchoredExcerpt:
         report = vr.failure_report()
 
         assert '## Test Failures' in report
+
+
+# ---------------------------------------------------------------------------
+# INV-1 (task 2883, plans/merge-verdict-integrity-prd.md §1/§3.2/§7/§8α):
+# the merge gate (role='merge' AND is_merge_verify=True — the ADOPTABLE
+# post-merge verdict path) must never return a no-evidence TRIVIAL PASS. Any
+# "nothing to run" resolution (no source files, empty existing_files, empty
+# command set) escalates to the project's full gate, or FAILs loud if no gate
+# command exists. The narrow role=='merge' AND is_merge_verify gate leaves the
+# baseline-probe caller and every task-1774/task-2838 guard test byte-identical.
+# ---------------------------------------------------------------------------
+class TestMergeGateEscalatesTrivialPassSite1:
+    """Site 1 — module_configs branch (verify.py ~line 5011).
+
+    A merge-gate verify over a no-source (docs-only) diff, with module_configs
+    present that carry a real command, must ESCALATE to the per-subproject full
+    gate rather than trivially pass. Reuses the guard_spy _run_cmd-patch harness
+    and the ``__scope_all_cmd__`` sentinel — no guard script written and empty
+    backstop globs, so the existing should_override path is inert and, pre-fix,
+    this input trivially passed.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path)
+
+    def _module(self) -> ModuleConfig:
+        # prefix 'orchestrator' never matches the docs file, so the module is
+        # SKIPPED by derive_verify_plan → scoped is empty → the trivial-pass
+        # site is reached; but the module still carries a real (sentinel)
+        # command for the escalated per-subproject fan-out to execute.
+        return ModuleConfig(prefix='orchestrator', test_command='__scope_all_cmd__')
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_no_source_escalates_to_full_gate(self, tmp_path: Path, guard_spy):
+        """role='merge' AND is_merge_verify → no trivial pass; the module's full
+        gate command runs instead."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [self._module()],
+                task_files=['docs/x.md'],
+                role='merge',
+                is_merge_verify=True,
+            )
+
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, (
+            f'Expected escalated per-subproject full gate to run; got: {calls}'
+        )
+        assert result.passed
+        assert result.trivial is False, (
+            f'A merge-gate escalation must not be a trivial pass; got trivial={result.trivial}'
+        )
+        assert 'No source files' not in result.summary, (
+            f'Expected trivial-pass escalated; got summary: {result.summary!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_role_same_inputs_still_trivial_pass(self, tmp_path: Path, guard_spy):
+        """Negative gate: role='task' with identical inputs STILL trivially
+        passes (the new escalation is merge-gate-only)."""
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [self._module()],
+                task_files=['docs/x.md'],
+                role='task',  # not the merge gate
+            )
+
+        assert result.passed
+        assert result.trivial is True, (
+            f'task-role no-source diff must stay a trivial pass; got trivial={result.trivial}'
+        )
+        assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
