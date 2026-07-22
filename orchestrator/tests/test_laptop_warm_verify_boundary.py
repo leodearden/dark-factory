@@ -546,10 +546,21 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     cannot be made load-robust by widening alone (a ceiling >=
     import_cost + 0.5 loses the un-wired-override discrimination). Instead,
     `import_cost` measures a same-process bare-import baseline (step-7)
-    and this test asserts on `elapsed - import_cost` -- cancelling the
-    load-sensitive import term while still catching an un-wired override,
-    which would leave the flock component at the full ~10s production wait
-    instead of the ~0.5s override.
+    and this test asserts on `max(0, elapsed - import_cost)` -- cancelling
+    the load-sensitive import term while still catching an un-wired
+    override, which would leave the flock component at the full ~10s
+    production wait instead of the ~0.5s override.
+
+    task 2921 (reviewer amendment): the baseline probe runs cold, before
+    the contended run's own import benefits from a warm FS cache, and the
+    two subprocess measurements are sequential -- so under a full-suite
+    storm they can drift apart by a nontrivial fraction of a second on
+    their own. The fixed 5.0s ceiling is kept deliberately (rather than a
+    ratio of `import_cost`): the residual drift between the two
+    measurements is additive scheduler jitter, not a term proportional to
+    import_cost, so a fixed budget models it better than a ratio would,
+    and the 0.5s-honored vs ~10s-unwired gap leaves ample margin either
+    way.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     worktree_base = worktree_base_for(repo)
@@ -616,7 +627,12 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     # override leaves the full ~10s production wait (flock_component well
     # over 5.0) -- so this discriminant is both load-robust and still
     # catches a regression, unlike a bare absolute ceiling on `elapsed`.
-    flock_component = elapsed - import_cost
+    # Clamped at 0.0: the baseline is a separate, earlier subprocess (see
+    # the docstring's "reviewer amendment" note above), so under load it
+    # can occasionally run slower than the in-run import and drive the
+    # subtraction negative -- clamping keeps flock_component a well-formed
+    # non-negative duration instead of a confusing negative value.
+    flock_component = max(0.0, elapsed - import_cost)
     assert flock_component < 5.0, (
         f'expected the flock-wait component of the contended run to be '
         f'well under the 10s production wait (env override=0.5s) once the '
