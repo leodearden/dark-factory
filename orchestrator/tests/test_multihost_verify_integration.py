@@ -1563,8 +1563,9 @@ class TestPerLandCrossCheck:
     trust-anchor before the land (task 2822 fix b).  RED until step-8."""
 
     async def test_diverge_local_fail_withholds_land_quarantines_and_escalates(self, tmp_path):
-        """knob ON, remote PASS + local FAIL -> land withheld + quarantine + escalation + event."""
-        from unittest.mock import patch
+        """knob ON, remote PASS + local FAIL -> land withheld + quarantine + SYNCHRONOUS
+        halt + BORN-AT-L2 escalation + event (task 2886 fix 3)."""
+        from unittest.mock import Mock, patch
 
         from orchestrator.merge_queue import _run_post_merge_verify
 
@@ -1577,6 +1578,7 @@ class TestPerLandCrossCheck:
         eq = _FakeEscalationQueue()
         es = _RecordingEventStore()
         quarantine: set[str] = set()
+        halt_hook = Mock()
 
         lr_calls: list = []
         with patch('orchestrator.merge_queue.LocalRunner',
@@ -1592,6 +1594,7 @@ class TestPerLandCrossCheck:
                 runner=remote,
                 escalation_queue=eq,
                 quarantine=quarantine,
+                halt_hook=halt_hook,
             )
 
         # (1) land withheld — the local (failing) verdict is adopted, merge_wt cleaned up
@@ -1600,21 +1603,115 @@ class TestPerLandCrossCheck:
         git_ops.cleanup_merge_worktree.assert_awaited()
         assert len(lr_calls) == 1, 'cross-check must build exactly one local trust-anchor'
 
-        # (2) runner quarantined in the caller-owned set (fix (b)'s first use of `quarantine`)
+        # (2) the merge queue was HALTED SYNCHRONOUSLY exactly once (fix 3: the halt
+        #     precedes any FURTHER adoption — incident 83336a32 was +3s too late), with a
+        #     reason naming the merge_sha and the suspected-red-main condition.
+        halt_hook.assert_called_once()
+        halt_reason = halt_hook.call_args.args[0]
+        assert 'mergesha01' in halt_reason
+        assert 'suspected' in halt_reason.lower() and 'red' in halt_reason.lower()
+
+        # (3) runner quarantined in the caller-owned set (fix (b)'s first use of `quarantine`)
         assert 'laptop' in quarantine
 
-        # (3) exactly one dedup'd blocking escalation, category verify_cross_check_mismatch
+        # (4) exactly one dedup'd BORN-AT-L2 escalation, category verify_cross_check_mismatch
         assert len(eq.submitted) == 1
         esc = eq.submitted[0]
         assert esc.category == 'verify_cross_check_mismatch'
-        assert esc.level == 1
-        assert esc.severity == 'blocking'
+        assert esc.level == 2
+        assert esc.severity == 'critical'
         assert esc.agent_role == 'orchestrator-cross-check'
         assert 'mergesha01' in (esc.summary + esc.detail)
         assert 'laptop' in esc.detail
 
-        # (4) distinct mismatch telemetry emitted
+        # (5) distinct mismatch telemetry emitted
         assert es.events_of(EventType.verify_cross_check_mismatch)
+
+    async def test_diverge_halt_fires_before_escalation_and_return(self, tmp_path):
+        """fix 3 ordering: the synchronous halt MUST precede the escalation submit and the
+        blocked return, so no FURTHER adoption can occur before a human looks."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+        order: list[str] = []
+
+        class _OrderingEQ(_FakeEscalationQueue):
+            def submit(self, escalation):
+                order.append('submit')
+                super().submit(escalation)
+
+        eq = _OrderingEQ()
+
+        def halt_hook(reason: str) -> None:
+            order.append('halt')
+
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False))), \
+             patch('orchestrator.merge_queue._classify_main_health_red',
+                   new=AsyncMock(return_value=None)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha0h',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+                halt_hook=halt_hook,
+            )
+
+        assert outcome is not None and outcome.status == 'blocked'
+        assert 'halt' in order and 'submit' in order
+        assert order.index('halt') < order.index('submit'), (
+            f'halt must precede the escalation submit / adoption; got order={order}'
+        )
+
+    async def test_diverge_halt_hook_none_is_safe(self, tmp_path):
+        """fix 3 None-safety: non-production callers omit halt_hook (default None) — the
+        divergence still withholds the land + files a born-at-L2 escalation, no crash."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=_make_result(False))), \
+             patch('orchestrator.merge_queue._classify_main_health_red',
+                   new=AsyncMock(return_value=None)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha0n',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+                # halt_hook omitted -> None default (byte-identical non-production callers)
+            )
+
+        assert outcome is not None and outcome.status == 'blocked'
+        assert 'laptop' in quarantine
+        assert len(eq.submitted) == 1
+        assert eq.submitted[0].level == 2
+        assert eq.submitted[0].severity == 'critical'
 
     async def test_agree_local_pass_proceeds_and_emits_verdict_parity_ok(self, tmp_path):
         """knob ON, remote PASS + local PASS -> proceeds (None) + verdict_parity_ok."""
@@ -1971,12 +2068,21 @@ class TestTwoHostFalseGreenCapstone:
         # (the same set shared with the HostAllocator — task 2822 fix b's first use).
         assert 'leo-laptop' in worker._runner_quarantine
 
-        # (b3) a dedup'd blocking verify_cross_check_mismatch escalation was filed.
+        # (b3) a dedup'd BORN-AT-L2 verify_cross_check_mismatch escalation was filed
+        # (task 2886 fix 3: level=2/critical, no longer level=1/blocking).
         mismatch = [e for e in eq.submitted if getattr(e, 'category', None) == 'verify_cross_check_mismatch']
         assert len(mismatch) == 1, f'expected 1 cross-check escalation, got {eq.submitted}'
         assert mismatch[0].agent_role == 'orchestrator-cross-check'
-        assert mismatch[0].level == 1
+        assert mismatch[0].level == 2
+        assert mismatch[0].severity == 'critical'
         assert 'leo-laptop' in mismatch[0].detail
 
         # (b4) distinct mismatch telemetry emitted through the real caller.
         assert es.events_of(EventType.verify_cross_check_mismatch)
+
+        # (b5) fix 3: the concluded divergence SYNCHRONOUSLY halted the merge queue
+        # (worker.operator_halt threaded in as halt_hook) so no FURTHER adoption can
+        # occur before a human looks — the halt is not deferred to the async escalation
+        # gate (incident 83336a32: cross-check diverged +3s AFTER CAS-advance).
+        assert worker._operator_halt.is_set()
+        assert worker.is_wip_halted
