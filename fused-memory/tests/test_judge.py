@@ -1405,3 +1405,101 @@ class TestReviewRunInfraFailureHandling:
 
         assert not judge.is_halted('proj-infra-d')
         mock_journal.set_halt.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Truthful content-serious halt reasons (task 2947 ask b)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_parse_verdict_unparseable_tags_code_marker(mock_journal):
+    """_parse_verdict tags its single fabricated finding with a machine-readable
+    code='unparseable_judge_response' marker (severity stays serious).
+
+    The marker lets review_run pick a TRUTHFUL 'Unparseable judge response'
+    halt reason instead of the lying 'Serious verdict' one, via a structured
+    field rather than fragile substring matching. Keeping it on the SAME single
+    finding preserves len(findings)==1 (the existing
+    test_parse_verdict_unparseable_response_is_loud_not_fabricated contract).
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict('garbage {{{', 'run-code-marker')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('code') == 'unparseable_judge_response'
+
+
+@pytest.mark.asyncio
+async def test_review_run_unparseable_content_halts_with_unparseable_reason(mock_journal):
+    """Genuinely-malformed REACHABLE content (success, non-empty, non-JSON) still
+    halts loudly (fail-closed preserved), but with the truthful 'Unparseable
+    judge response' reason — NOT the phantom 'Serious verdict' reason."""
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-unparseable',
+        project_id='proj-unparseable',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    with patch.object(
+        judge, '_call_llm', AsyncMock(return_value='not valid json at all {{{')
+    ):
+        verdict = await judge.review_run('run-unparseable')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.serious
+    assert judge.is_halted('proj-unparseable')
+    mock_journal.set_halt.assert_called_once()
+    reason = mock_journal.set_halt.call_args.kwargs['reason']
+    assert 'Unparseable judge response' in reason
+    assert 'Serious verdict' not in reason
+
+
+@pytest.mark.asyncio
+async def test_review_run_genuine_serious_halts_with_serious_verdict_reason(mock_journal):
+    """A genuine content severity=serious verdict keeps the already-truthful
+    'Serious verdict in run X' reason (not the unparseable relabel)."""
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-genuine-serious',
+        project_id='proj-genuine-serious',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    serious_json = '{"severity": "serious", "findings": [{"issue": "real corruption"}]}'
+    with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_json)):
+        verdict = await judge.review_run('run-genuine-serious')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.serious
+    assert judge.is_halted('proj-genuine-serious')
+    mock_journal.set_halt.assert_called_once()
+    reason = mock_journal.set_halt.call_args.kwargs['reason']
+    assert 'Serious verdict in run' in reason
+    assert 'Unparseable' not in reason
