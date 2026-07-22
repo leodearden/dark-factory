@@ -7241,3 +7241,119 @@ class TestFilterEntityStandingDecisionsFallback:
         )
         assert result.kept_flags == [flag]
         assert result.suppressed_by_decision == {}
+
+
+# ---------------------------------------------------------------------------
+# maybe_escalate_suppression_storm (Hook A storm escape / γ, task 2896) — step-7
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock
+
+from fused_memory.reconciliation.standing_decision_constants import (
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+)
+
+
+def _fake_escalation_queue(*, has_open_l1: bool = False) -> MagicMock:
+    queue = MagicMock()
+    queue.make_id.return_value = 'esc-storm-id'
+    queue.has_open_l1.return_value = has_open_l1
+    queue.submit.return_value = None
+    return queue
+
+
+class TestMaybeEscalateSuppressionStorm:
+    """Per-cycle, per-decision storm escape escalation (task 2896 step-7)."""
+
+    _PID = 'p'
+    _RUN = 'run-1'
+
+    @pytest.mark.asyncio
+    async def test_over_threshold_files_one_escalation(self):
+        """(a) count > threshold → exactly one L1 storm escalation for that uuid."""
+        queue = _fake_escalation_queue()
+        result = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[],
+            suppressed_by_decision={_ESD_U1: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1},
+            grounds_by_decision={_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION},
+        )
+        escalated = await flag_dedup.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, result
+        )
+        assert escalated == [_ESD_U1]
+        queue.submit.assert_called_once()
+        esc = queue.submit.call_args.args[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == 'reconciliation_standing_decision_storm'
+        assert esc.agent_role == 'reconciliation-stage1'
+        blob = f'{esc.summary}\n{esc.detail}'
+        assert _ESD_U1 in blob
+        assert GROUNDS_STRUCTURAL_SIZE_CONFLATION in blob
+        assert str(SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1) in blob
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_does_not_escalate(self):
+        """(b) count == threshold (strict >) → no submit, returns []."""
+        queue = _fake_escalation_queue()
+        result = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[],
+            suppressed_by_decision={_ESD_U1: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE},
+            grounds_by_decision={_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION},
+        )
+        escalated = await flag_dedup.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, result
+        )
+        assert escalated == []
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_does_not_escalate(self):
+        """(b') count well below threshold → no submit, returns []."""
+        queue = _fake_escalation_queue()
+        result = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[],
+            suppressed_by_decision={_ESD_U1: 1},
+            grounds_by_decision={_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION},
+        )
+        escalated = await flag_dedup.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, result
+        )
+        assert escalated == []
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_open_l1_dedupes(self):
+        """(c) has_open_l1 True → deduped, no submit, returns []."""
+        queue = _fake_escalation_queue(has_open_l1=True)
+        result = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[],
+            suppressed_by_decision={_ESD_U1: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 5},
+            grounds_by_decision={_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION},
+        )
+        escalated = await flag_dedup.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, result
+        )
+        assert escalated == []
+        queue.submit.assert_not_called()
+        # deduped on the entity_uuid + storm category
+        queue.has_open_l1.assert_called_once()
+        _args, _kwargs = queue.has_open_l1.call_args
+        assert _ESD_U1 in _args or _ESD_U1 in _kwargs.values()
+        assert _kwargs.get('category') == 'reconciliation_standing_decision_storm'
+
+    @pytest.mark.asyncio
+    async def test_escalation_unavailable_returns_empty(self, monkeypatch):
+        """(d) Escalation package unavailable (None) → returns [], no raise, no submit."""
+        queue = _fake_escalation_queue()
+        monkeypatch.setattr(flag_dedup, 'Escalation', None, raising=False)
+        result = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[],
+            suppressed_by_decision={_ESD_U1: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1},
+            grounds_by_decision={_ESD_U1: GROUNDS_STRUCTURAL_SIZE_CONFLATION},
+        )
+        escalated = await flag_dedup.maybe_escalate_suppression_storm(
+            queue, self._PID, self._RUN, result
+        )
+        assert escalated == []
+        queue.submit.assert_not_called()
