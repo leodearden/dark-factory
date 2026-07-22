@@ -1503,3 +1503,60 @@ async def test_review_run_genuine_serious_halts_with_serious_verdict_reason(mock
     reason = mock_journal.set_halt.call_args.kwargs['reason']
     assert 'Serious verdict in run' in reason
     assert 'Unparseable' not in reason
+
+
+# ─────────────────────────────────────────────────────────────────────
+# halt_reason accessor exposes the real halt reason (task 2947 ask b)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_halt_reason_returns_truthful_reason_after_halt(mock_journal):
+    """halt_reason(project_id) returns the exact reason passed to _apply_halt so
+    the harness can thread the REAL reason into the on_judge_halt escalation;
+    it returns None for a never-halted project."""
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Never-halted project → None
+    assert judge.halt_reason('proj-halt-reason') is None
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-halt-reason',
+        project_id='proj-halt-reason',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    serious_json = '{"severity": "serious", "findings": [{"issue": "real corruption"}]}'
+    with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_json)):
+        await judge.review_run('run-halt-reason')
+
+    assert judge.is_halted('proj-halt-reason')
+    # Matches the reason _apply_halt was called with (verified via set_halt too).
+    expected = mock_journal.set_halt.call_args.kwargs['reason']
+    assert judge.halt_reason('proj-halt-reason') == expected
+    assert 'Serious verdict in run run-halt-reason' == expected
+    # A different, never-halted project still returns None.
+    assert judge.halt_reason('some-other-project') is None
+
+
+@pytest.mark.asyncio
+async def test_halt_reason_cleared_on_unhalt(mock_journal):
+    """unhalt(project_id) clears the stored halt reason (halt_reason → None)."""
+    judge = Judge(config=_make_judge_config(halt_on_judge_serious=True), journal=mock_journal)
+
+    await judge._apply_halt('proj-unhalt-reason', reason='judge-unreachable halt: test')
+    assert judge.halt_reason('proj-unhalt-reason') == 'judge-unreachable halt: test'
+
+    await judge.unhalt('proj-unhalt-reason')
+    assert judge.halt_reason('proj-unhalt-reason') is None

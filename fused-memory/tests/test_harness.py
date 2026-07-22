@@ -2274,6 +2274,70 @@ async def test_judge_unhalt_clears_halt_escalated(journal, event_buffer, mock_me
     assert 'test-project' not in harness._halt_escalated
 
 
+async def _drive_halt_notify(harness, event_buffer):
+    """Drive one run_loop iteration for a pre-halted project so the halt-check
+    branch (which calls _notify_judge_halt) fires. Mirrors
+    test_halted_project_skips_cycle's run_loop-driving setup."""
+    import asyncio
+    import contextlib
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+
+@pytest.mark.asyncio
+async def test_notify_judge_halt_threads_truthful_reason(
+    journal, event_buffer, mock_memory_service
+):
+    """The halt-check call site threads judge.halt_reason(project_id) into
+    backlog_policy.on_judge_halt — so an infra ('judge-unreachable …') halt
+    escalates with the REAL reason, not the hardcoded generic string."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+    harness.judge._halted_projects.add('test-project')
+    truthful = 'judge-unreachable halt: reconciliation judge outage (cap-storm/CLI failure)'
+    harness.judge.halt_reason = MagicMock(return_value=truthful)
+
+    harness._backlog_policy = MagicMock()
+    harness._backlog_policy.on_judge_halt = AsyncMock()
+    harness._halt_escalated.discard('test-project')
+
+    await _drive_halt_notify(harness, event_buffer)
+
+    harness._backlog_policy.on_judge_halt.assert_called_once()
+    args = harness._backlog_policy.on_judge_halt.call_args.args
+    assert args[0] == 'test-project'
+    assert args[1] == truthful
+
+
+@pytest.mark.asyncio
+async def test_notify_judge_halt_falls_back_to_generic_reason_when_none(
+    journal, event_buffer, mock_memory_service
+):
+    """When judge.halt_reason returns None the call site falls back to the
+    generic 'judge halted reconciliation' string (no crash, no empty reason)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+    harness.judge._halted_projects.add('test-project')
+    harness.judge.halt_reason = MagicMock(return_value=None)
+
+    harness._backlog_policy = MagicMock()
+    harness._backlog_policy.on_judge_halt = AsyncMock()
+    harness._halt_escalated.discard('test-project')
+
+    await _drive_halt_notify(harness, event_buffer)
+
+    harness._backlog_policy.on_judge_halt.assert_called_once()
+    args = harness._backlog_policy.on_judge_halt.call_args.args
+    assert args[0] == 'test-project'
+    assert args[1] == 'judge halted reconciliation'
+
+
 @pytest.mark.asyncio
 async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_memory_service):
     """_project_loop decrements post-unhalt grace before running a cycle."""
