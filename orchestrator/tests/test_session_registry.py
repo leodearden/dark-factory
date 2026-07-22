@@ -1235,6 +1235,75 @@ def test_normalize_wm_window_id_unparseable_or_negative_returns_none(raw: str | 
 
 
 # ---------------------------------------------------------------------------
+# Task 2934 step-3/4: _wmctrl_live_window_ids (single-probe live-window-id set)
+# ---------------------------------------------------------------------------
+
+
+def _fake_wmctrl_run(
+    stdout_lines: list[str], returncode: int = 0
+) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
+    """Build a fake ``run`` callable returning a canned ``wmctrl -l`` result."""
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, returncode=returncode, stdout='\n'.join(stdout_lines)
+        )
+
+    return _run
+
+
+def test_wmctrl_live_window_ids_rc0_multiline_returns_normalized_set() -> None:
+    run = _fake_wmctrl_run(
+        [
+            '0x0000001a  0 host  first window title',
+            '0x2b 1 host second-window-title',
+        ]
+    )
+    assert sr._wmctrl_live_window_ids(run) == {'0x1a', '0x2b'}
+
+
+def test_wmctrl_live_window_ids_collapses_mixed_casing_and_padding() -> None:
+    run = _fake_wmctrl_run(['0X0000002B  0 host  some window'])
+    assert sr._wmctrl_live_window_ids(run) == {'0x2b'}
+
+
+def test_wmctrl_live_window_ids_rc0_empty_stdout_returns_empty_set_not_none() -> None:
+    run = _fake_wmctrl_run([])
+    result = sr._wmctrl_live_window_ids(run)
+    assert result == set()
+    assert result is not None
+
+
+def test_wmctrl_live_window_ids_rc127_missing_binary_returns_none() -> None:
+    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=127)
+    assert sr._wmctrl_live_window_ids(run) is None
+
+
+def test_wmctrl_live_window_ids_rc124_transient_timeout_returns_none() -> None:
+    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=124)
+    assert sr._wmctrl_live_window_ids(run) is None
+
+
+def test_wmctrl_live_window_ids_other_nonzero_rc_returns_none() -> None:
+    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=1)
+    assert sr._wmctrl_live_window_ids(run) is None
+
+
+def test_wmctrl_live_window_ids_run_raising_returns_none() -> None:
+    def _boom(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        raise OSError('wmctrl exploded')
+
+    assert sr._wmctrl_live_window_ids(_boom) is None
+
+
+def test_wmctrl_live_window_ids_titleless_short_line_still_contributes_id() -> None:
+    # No desktop/host/title columns -- id-only leniency: a reaper must fail
+    # toward keeping live sessions, so column-0-only lines still count.
+    run = _fake_wmctrl_run(['0x3c'])
+    assert sr._wmctrl_live_window_ids(run) == {'0x3c'}
+
+
+# ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
 
