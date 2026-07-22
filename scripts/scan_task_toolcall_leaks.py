@@ -29,8 +29,10 @@ substring scan over-reports on exactly this shape.
 """
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
+from pathlib import Path
 from typing import NamedTuple
 
 LEAK_TAIL = re.compile(
@@ -103,3 +105,43 @@ def scan_db(db_path: str) -> list[LeakMatch]:
     finally:
         conn.close()
     return matches
+
+
+# Multi-project discovery fallback, mirroring
+# scripts/migrate_metadata_modules_to_files.py's DEFAULT_ROOTS.
+_DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
+
+
+def _tasks_db_path(project_root: str) -> str:
+    return str(Path(project_root) / ".taskmaster" / "tasks" / "tasks.db")
+
+
+def discover_db_paths(
+    explicit_dbs: list[str] | None = None,
+    project_roots: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Resolve the list of tasks.db paths to scan.
+
+    Precedence (first supplied wins): *explicit_dbs* > *project_roots* >
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (read from *env*, defaulting to the
+    real ``os.environ`` when *env* is None) > the dark-factory default root.
+
+    A resolved db path that does not exist on disk is silently skipped —
+    this never raises on a missing/not-yet-set-up project.
+    """
+    if explicit_dbs is not None:
+        candidates = list(explicit_dbs)
+    else:
+        if project_roots is not None:
+            roots = list(project_roots)
+        else:
+            environ = env if env is not None else os.environ
+            roots_env = (environ.get("DASHBOARD_KNOWN_PROJECT_ROOTS") or "").strip()
+            if roots_env:
+                roots = [r.strip() for r in roots_env.split(",") if r.strip()]
+            else:
+                roots = list(_DEFAULT_PROJECT_ROOTS)
+        candidates = [_tasks_db_path(root) for root in roots]
+
+    return [path for path in candidates if os.path.exists(path)]
