@@ -514,8 +514,19 @@ class TestRow2TaskRoleSignal:
 
 # ---------------------------------------------------------------------------
 # Row 3: "docs-only trivial, both roles" — R2 parity survives the inversion.
-# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at
-# BOTH role='task'/'merge', breadth-independent, producer AND consumer.
+# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at the
+# PRODUCER seam (``run_scoped_verification`` with is_merge_verify=False) for
+# BOTH role='task'/'merge', breadth-independent — zero commands.
+#
+# INV-1 (task 2883) UPDATE: the CONSUMER seam is the *adoptable* merge verdict
+# (``_run_post_merge_verify`` → is_merge_verify=True). INV-1 abolishes the
+# no-evidence trivial pass there: a docs-only ('no_source_files') diff at the
+# real merge gate no longer trivially passes — it escalates to the project's
+# full gate when a full-gate command exists (see
+# test_merge_verdict_integrity_inv1.py's
+# test_zero_module_global_command_runs_full_gate_and_emits_event). So the
+# consumer side of this row now runs exactly the escalated global full gate,
+# not zero commands; the producer/task-role trivial short-circuit is unchanged.
 # ---------------------------------------------------------------------------
 
 # A dedicated row-3 main SHA (see ROW1_MAIN_SHA's docstring note on why every
@@ -529,9 +540,17 @@ class TestRow3DocsOnlyTrivialBothRoles:
     module-config and fallback branches (verify_plan.derive_verify_plan) —
     zero ``run_verification`` calls, independent of role or
     ``merge_verify_breadth`` (R2). This row pins that the inversion (κ/λ)
-    never regresses this pre-existing invariant, at both the producer
-    (``run_scoped_verification``) and consumer (``_run_post_merge_verify``)
-    seams.
+    never regresses this pre-existing invariant at the PRODUCER
+    (``run_scoped_verification``, is_merge_verify=False) seam.
+
+    INV-1 (task 2883) amends the CONSUMER seam: the adoptable merge verdict
+    (``_run_post_merge_verify`` → is_merge_verify=True) no longer trivially
+    passes a no-evidence resolution. A docs-only diff at the real merge gate
+    now escalates to the project's full gate (a ``trivial_pass_escalated``
+    event with reason='no_source_files', resolution='full_gate') and runs the
+    escalated global command — so the consumer assertion below pins exactly
+    ONE escalated full-gate run, not zero. The producer/task-role trivial
+    short-circuit is untouched (INV-1 gates on is_merge_verify).
     """
 
     @pytest.mark.asyncio
@@ -557,9 +576,15 @@ class TestRow3DocsOnlyTrivialBothRoles:
         )
         assert executed == {}
 
-        # -- CONSUMER side: parity check — the SAME docs-only diff also
-        # executes zero commands at the real merge gate (always role='merge'
-        # under the hood, regardless of this test's parametrized role).
+        # -- CONSUMER side: INV-1 (task 2883). The SAME docs-only diff at the
+        # real *adoptable* merge gate (always is_merge_verify=True under the
+        # hood, regardless of this test's parametrized role) no longer
+        # trivially passes: with a zero-module-config project whose global
+        # command is non-empty (_make_config), the no-evidence resolution
+        # escalates to the project's full gate and runs it exactly once. The
+        # verdict still PASSES (the escalated global gate's fake returns pass),
+        # so the outcome is still the verify-passed sentinel (None) — but via
+        # real evidence, not a vacuous short-circuit.
         consumer_fake = _run_verification_spy()
         outcome = await _drive_merge_gate(
             tmp_path,
@@ -572,9 +597,10 @@ class TestRow3DocsOnlyTrivialBothRoles:
             run_verification_fake=consumer_fake,
         )
         assert outcome is None, f'expected the verify-passed sentinel (None); got {outcome!r}'
-        assert consumer_fake.await_count == 0, (
-            f'docs-only diff must execute zero commands at the merge gate; '
-            f'got {consumer_fake.await_count} call(s)'
+        assert consumer_fake.await_count == 1, (
+            f'INV-1: a docs-only diff at the adoptable merge gate must escalate '
+            f'to the global full gate and run it exactly once (never a '
+            f'no-evidence trivial pass); got {consumer_fake.await_count} call(s)'
         )
 
 
