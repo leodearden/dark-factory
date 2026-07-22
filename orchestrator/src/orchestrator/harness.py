@@ -94,6 +94,10 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.stranded_verified_green import (
+    VerifiedGreenMatch,
+    detect_verified_green,
+)
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
     _deterministic_deploy_health_verdict,
@@ -4187,6 +4191,93 @@ class Harness:
             if assigned is not None:
                 return assigned
         return self.git_ops.worktree_base / tid
+
+    async def _maybe_submit_stranded_verified_green(
+        self, tid: str, metadata: dict[str, Any],
+    ) -> bool:
+        """Detect the verified-green shape; on a match submit the lane branch
+        DIRECTLY to the merge queue instead of re-pending (PRD leaf α §2.1).
+
+        The incident (reify 5260): the stranded-blocked reaper re-pends a
+        verified-green task into a *paused* scheduler that never re-dispatches,
+        so the work sits stranded for hours.  When
+        :func:`stranded_verified_green.detect_verified_green` matches, we
+        instead submit a ``MergeRequest`` (tagged ``source='stranded-reaper'``)
+        to the merge queue — which runs even under a scheduler pause — and
+        leave the task ``blocked`` while the merge queue's own full verify runs
+        as the sole gate (never bypasses, PRD §2.2).
+
+        Returns ``True`` iff a MergeRequest was submitted (the caller then skips
+        today's ``stranded_blocked`` re-file and returns None).  Returns
+        ``False`` — leaving today's re-file/re-pend path byte-identical — when
+        the kill-switch is off, the event-store / merge-queue is unavailable,
+        or the shape does not match.  Naturally inert on non-pooled projects:
+        no ASSIGNED lane record → ``detect_verified_green`` returns None →
+        ``False``.
+
+        Marker/dedup (step-16) and the auto-resolved record escalation
+        (step-10) are wired in later steps; this method owns the detect +
+        submit + durable-fail-callback registration.
+        """
+        if (
+            not self.config.stranded_verified_green_merge_enabled
+            or self.event_store is None
+            or self._merge_queue is None
+        ):
+            return False
+
+        match = await detect_verified_green(
+            tid,
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            worktree_resolver=self._resolve_task_worktree,
+        )
+        if match is None:
+            return False
+
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.merge_types import (
+            MergeOutcome,
+            MergeRequest,
+            QueuedBranch,
+        )
+
+        future: asyncio.Future[MergeOutcome] = (
+            asyncio.get_running_loop().create_future()
+        )
+        req = MergeRequest(
+            task_id=tid,
+            branch=QueuedBranch.parse(tid, self.config.git.branch_prefix),
+            worktree=match.worktree,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            config=self.config,
+            result=future,
+            snapshot_tip=match.tip_sha,
+        )
+        # Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed; the
+        # callback body is wired in step-14 (a strict no-op for success /
+        # transient outcomes, so the branch + lane are preserved by omission).
+        req.result.add_done_callback(
+            lambda fut: self._on_stranded_merge_done(fut, tid=tid),
+        )
+        await enqueue_merge_request(
+            self._merge_queue, req, self.event_store, source='stranded-reaper',
+        )
+        return True
+
+    def _on_stranded_merge_done(
+        self, fut: asyncio.Future, *, tid: str,
+    ) -> None:
+        """Done-callback for a stranded-reaper MergeRequest (durable-fail → L2).
+
+        Sync (fires on the loop when the MergeRequest future resolves).  The
+        durable-failure born-at-L2 filing is wired in step-14; this placeholder
+        keeps the happy-submit path (step-8) self-contained and a strict no-op
+        on success / transient outcomes.
+        """
+        return
 
     async def _branch_is_degenerate(
         self, branch: str, metadata: dict[str, Any],
