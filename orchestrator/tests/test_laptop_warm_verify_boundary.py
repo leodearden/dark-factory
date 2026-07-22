@@ -528,6 +528,7 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(120)  # task 2921: two subprocesses now (import baseline + contended run)
 def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
 
@@ -535,7 +536,31 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     test_cli.py:1419 does, then spawns a real knob-on verify-merge with the
     override set small.  Today (RED) verify-merge ignores the env var and
     waits the full 10.0s production window; asserting completion in well
-    under that (< 3s) fails until cli.py reads the override.
+    under that fails until cli.py reads the override.
+
+    task 2921 (load-robustness): `elapsed` (the contended-run wall-clock) is
+    DOMINATED by the child's bare ``from orchestrator.cli import main``
+    import cost (~8.7s measured on a loaded host), not the 0.5s flock wait
+    -- so any absolute ceiling below the 10s production default
+    (MERGE_VERIFY_FLOCK_WAIT_SECS) is import-bound, not flock-bound, and
+    cannot be made load-robust by widening alone (a ceiling >=
+    import_cost + 0.5 loses the un-wired-override discrimination). Instead,
+    `import_cost` measures a same-process bare-import baseline (step-7)
+    and this test asserts on `max(0, elapsed - import_cost)` -- cancelling
+    the load-sensitive import term while still catching an un-wired
+    override, which would leave the flock component at the full ~10s
+    production wait instead of the ~0.5s override.
+
+    task 2921 (reviewer amendment): the baseline probe runs cold, before
+    the contended run's own import benefits from a warm FS cache, and the
+    two subprocess measurements are sequential -- so under a full-suite
+    storm they can drift apart by a nontrivial fraction of a second on
+    their own. The fixed 5.0s ceiling is kept deliberately (rather than a
+    ratio of `import_cost`): the residual drift between the two
+    measurements is additive scheduler jitter, not a term proportional to
+    import_cost, so a fixed budget models it better than a ratio would,
+    and the 0.5s-honored vs ~10s-unwired gap leaves ample margin either
+    way.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     worktree_base = worktree_base_for(repo)
@@ -543,6 +568,25 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
+
+    # task 2921: same-process-shaped bare-import baseline, spawned BEFORE
+    # the holder flock is acquired below -- measures the load-sensitive
+    # `from orchestrator.cli import main` import cost in isolation so it
+    # can be subtracted from the contended run's `elapsed` (see
+    # flock_component below).
+    import_started = time.monotonic()
+    import_proc = subprocess.Popen(
+        [sys.executable, '-c', 'from orchestrator.cli import main'],
+        env=subprocess_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    import_stdout, import_stderr = import_proc.communicate(timeout=45)
+    import_cost = time.monotonic() - import_started
+    assert import_proc.returncode == 0, (
+        f'expected the bare-import baseline probe to exit 0, got '
+        f'{import_proc.returncode}; stderr={import_stderr.decode()[:2000]!r}'
+    )
 
     write_lock_holder_pgid(worktree_base, 999999)
     lock_path = merge_verify_lock_path(worktree_base)
@@ -558,7 +602,8 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         )
         # task 2376: widened from 15s -- host oversubscription can delay
         # subprocess completion past a short deadline; the discriminating
-        # invariant is the `elapsed < 9.0` assertion below, not this ceiling.
+        # invariant is the `flock_component < 5.0` assertion below (task
+        # 2921), not this ceiling.
         stdout, stderr = proc.communicate(timeout=45)
         elapsed = time.monotonic() - started
     finally:
@@ -575,15 +620,25 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         f'expected flock-contention result, got category={result.category!r} '
         f'stdout={stdout.decode()[:2000]!r}'
     )
-    # task 2376: widened from 6.0s -- must stay STRICTLY below the 10.0s
-    # production flock-wait so this still detects an un-wired override
-    # (i.e. it fails to distinguish the 0.5s override from the 10s
-    # production default if raised to >= 10.0).
-    assert elapsed < 9.0, (
-        f'expected contention result well under the 10s production wait '
-        f'(env override=0.5s, generous ceiling for subprocess-startup '
-        f'jitter) -- took {elapsed:.2f}s; the env override is not wired up '
-        f'yet'
+    # task 2921: subtract the bare-import baseline (measured above, before
+    # the holder flock is acquired) to cancel the load-sensitive import
+    # term out of `elapsed`, isolating the flock-wait component. An honored
+    # 0.5s override keeps flock_component well under 5.0; an un-wired
+    # override leaves the full ~10s production wait (flock_component well
+    # over 5.0) -- so this discriminant is both load-robust and still
+    # catches a regression, unlike a bare absolute ceiling on `elapsed`.
+    # Clamped at 0.0: the baseline is a separate, earlier subprocess (see
+    # the docstring's "reviewer amendment" note above), so under load it
+    # can occasionally run slower than the in-run import and drive the
+    # subtraction negative -- clamping keeps flock_component a well-formed
+    # non-negative duration instead of a confusing negative value.
+    flock_component = max(0.0, elapsed - import_cost)
+    assert flock_component < 5.0, (
+        f'expected the flock-wait component of the contended run to be '
+        f'well under the 10s production wait (env override=0.5s) once the '
+        f'import-bound baseline is subtracted out -- elapsed={elapsed:.2f}s, '
+        f'import_cost={import_cost:.2f}s, flock_component={flock_component:.2f}s; '
+        f'the env override is not wired up yet'
     )
 
 
@@ -598,29 +653,48 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    worktree_base = worktree_base_for(repo)
+
+    REQUEST_ID = 'env-seam-watchdog-test'
+    pgf = pgid_file(worktree_base, REQUEST_ID)
 
     proc = spawn_verify_merge(
         sha=head_sha,
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
-        request_id='env-seam-watchdog-test',
+        request_id=REQUEST_ID,
         extra_env={
             'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '0.5',
             'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.2',
         },
     )
     try:
+        # task 2921 (load-robustness): the child's ``from orchestrator.cli
+        # import main`` startup dominates wall-clock under a full-suite storm
+        # (~9s observed on a loaded host) and is unrelated to the watchdog
+        # window under test -- so the old bare ``proc.wait(timeout=9.0)`` was
+        # import-bound, not watchdog-bound, and flaked under parallel load.
+        # The --request-id run writes its pgid file at startup BEFORE doing any
+        # work (cli.py verify_merge) and the watchdog self-kills via
+        # ``os._exit(1)`` (which bypasses pgid-file cleanup), so waiting for
+        # the pgid file to appear absorbs the load-sensitive import cost; the
+        # subsequent ``fire_delay`` then measures only the watchdog fire delay.
+        wait_for_pgid_file(pgf, timeout=30.0)
+        armed = time.monotonic()
         # No heartbeat is ever written -- stdin stays open but silent, which
         # is sufficient to exercise the heartbeat-starvation timing path
-        # (Rows 1-3 later distinguish EOF vs. timeout precisely).
+        # (Rows 1-3 later distinguish EOF vs. timeout precisely). Wait well
+        # past the 15s production window so an un-wired override is OBSERVED
+        # self-exiting (not merely timed out) and caught by the delay
+        # assertion below rather than masked as a hang.
         try:
-            proc.wait(timeout=9.0)
+            proc.wait(timeout=30.0)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 9s of no heartbeats -- '
-                'watchdog env overrides are not wired up yet (production '
-                'window is 10s timeout + 5s grace = 15s)'
+                'verify-merge did not self-exit within 30s of startup -- '
+                'the watchdog did not fire at all'
             )
+        fire_delay = time.monotonic() - armed
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -631,6 +705,18 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
 
     assert proc.returncode != 0, (
         f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
+    )
+    # task 2921 discriminant: the override (0.5s heartbeat timeout + 0.2s kill
+    # grace, ~0.7s total) must fire the watchdog FAR faster than the
+    # 10s+5s=15s production window. Measured from pgid-appearance (post-import),
+    # so this ceiling is a genuine watchdog budget, not an import budget. The
+    # 10.0s value sits well above the ~0.7s override (with generous load
+    # headroom) yet well below the 15s production window, so it still catches a
+    # regression that un-wires the override.
+    assert fire_delay < 10.0, (
+        f'watchdog self-exit took {fire_delay:.2f}s after startup -- expected '
+        f'well under the 15s production window (env override=0.5s+0.2s); the '
+        f'watchdog env overrides are not wired up'
     )
 
 
@@ -1056,6 +1142,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(120)  # task 2921: two real verify-merge subprocesses (holder + waiter) under full-suite load
 def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     """SS9 Row 5: producer discriminant -> real consumer -> born-at-L2 + blocked.
 
@@ -1115,7 +1202,15 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
             request_id='row5-waiter',
             extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
         )
-        stdout, stderr = waiter.communicate(timeout=15)
+        # task 2921 (load-robustness): widened from 15s. The waiter is a full
+        # real verify-merge subprocess (Python import ~9s under a full-suite
+        # storm + config load + git worktree setup + the 0.5s flock wait), so a
+        # 15s ceiling is import-bound, not flock-bound, under parallel load and
+        # flaked (observed: this subprocess timed out at 15s under load). There
+        # is NO timing assertion on the waiter here -- the test asserts on the
+        # returned FLOCK_CONTENTION_CATEGORY discriminant, not on duration -- so
+        # widening the completion ceiling has zero discrimination cost.
+        stdout, stderr = waiter.communicate(timeout=60)
 
         assert waiter.returncode == 0, (
             f'expected exit 0 (contention result on stdout), got '
