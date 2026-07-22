@@ -1161,6 +1161,101 @@ class TestPrewarmPool:
         assert await git_ops._is_registered_worktree(gone)
         assert (gone / 'target' / 'seeded.bin').exists()
 
+    async def test_all_seeds_fail_torn_down_and_shortfall_warned(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """Every seed failing: loop continues, half-created worktrees torn
+        down, all failures recorded, and a shortfall WARNING is emitted."""
+        import logging
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        base = git_ops.worktree_base
+
+        # Force every seed to fail (rc=1), mirroring test_git_ops.py's
+        # _failing_seed pattern. prewarm must NOT raise and must iterate ALL
+        # lanes despite each failure.
+        with patch.object(
+            git_ops, '_seed_warm_lane', new=AsyncMock(return_value=1),
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.prewarm_pool(start_ref)
+
+        # (a) iterated all 3 lanes despite the failures (never raised).
+        assert result.target == 3
+        # (c) all failed, none materialized, each recorded with its rc.
+        assert result.failed == 3
+        assert result.materialized == 0
+        assert result.already_resident == 0
+        assert len(result.failures) == 3
+        failed_lanes = {lane for lane, _rc in result.failures}
+        assert failed_lanes == {base / f'_lane-{k}' for k in range(3)}
+        assert all(rc == 1 for _lane, rc in result.failures)
+
+        # (b) each half-created worktree torn down — a failed lane must never
+        # masquerade as materialized (not left registered).
+        for k in range(3):
+            lane = base / f'_lane-{k}'
+            assert not await git_ops._is_registered_worktree(lane), (
+                f'{lane} must be torn down after a failed seed, not left registered'
+            )
+
+        # (d) shortfall WARNING emitted (resident+materialized < target).
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'prewarm_pool' in m and 'shortfall' in m.lower() for m in warnings
+        ), f'expected a prewarm_pool shortfall WARNING; got: {warnings!r}'
+
+    async def test_one_seed_fails_partial_materialize_still_warns(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """Only one lane's seed fails: that lane is torn down + counted failed,
+        the other two materialize, and a shortfall WARNING still fires."""
+        import logging
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        base = git_ops.worktree_base
+        real_seed = git_ops._seed_warm_lane
+
+        # Fail exactly the middle lane's seed; the other two seed for real.
+        async def _seed_middle_fails(lane, mode, **kwargs):
+            if lane == base / '_lane-1':
+                return 1
+            return await real_seed(lane, mode, **kwargs)
+
+        with patch.object(
+            git_ops, '_seed_warm_lane', new=AsyncMock(side_effect=_seed_middle_fails),
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.prewarm_pool(start_ref)
+
+        assert result.target == 3
+        assert result.materialized == 2
+        assert result.failed == 1
+        assert result.already_resident == 0
+        assert [lane for lane, _rc in result.failures] == [base / '_lane-1']
+
+        # The failed lane is torn down; the two good lanes are resident + seeded.
+        assert not await git_ops._is_registered_worktree(base / '_lane-1')
+        for k in (0, 2):
+            lane = base / f'_lane-{k}'
+            assert await git_ops._is_registered_worktree(lane)
+            assert (lane / 'target' / 'seeded.bin').exists()
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'prewarm_pool' in m and 'shortfall' in m.lower() for m in warnings
+        ), f'expected a prewarm_pool shortfall WARNING; got: {warnings!r}'
+
 
 @pytest.mark.asyncio
 class TestAcquireWarmLaneCreateOnce:
