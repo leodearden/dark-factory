@@ -10,7 +10,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -1092,6 +1092,74 @@ class TestPrewarmPool:
         assert branches.strip() == '', (
             f'prewarm must not fabricate any task/ branch; got: {branches!r}'
         )
+
+    async def test_second_prewarm_is_idempotent(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """A second prewarm on a fully-resident pool re-adds/reseeds nothing."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        # First pass materializes all 3.
+        first = await git_ops.prewarm_pool(start_ref)
+        assert first.materialized == 3
+
+        base = git_ops.worktree_base
+        # Snapshot each seeded.bin's mtime so we can prove no reseed happened.
+        pre_mtimes = {
+            k: (base / f'_lane-{k}' / 'target' / 'seeded.bin').stat().st_mtime_ns
+            for k in range(3)
+        }
+
+        # Second pass: install a spy that would fire if any resident lane were
+        # reseeded — it must NOT be called at all.
+        with patch.object(
+            git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0),
+        ) as seed_spy:
+            second = await git_ops.prewarm_pool(start_ref)
+
+        seed_spy.assert_not_called()
+        assert second.already_resident == 3
+        assert second.materialized == 0
+        assert second.failed == 0
+        assert second.target == 3
+        # seeded.bin untouched (no reseed) for every resident lane.
+        for k in range(3):
+            post = (base / f'_lane-{k}' / 'target' / 'seeded.bin').stat().st_mtime_ns
+            assert post == pre_mtimes[k], (
+                f'_lane-{k} seeded.bin must be untouched on idempotent re-prewarm'
+            )
+
+    async def test_mixed_rematerializes_only_missing_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After removing one lane, a re-prewarm materializes exactly that one."""
+        import shutil
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        await git_ops.prewarm_pool(start_ref)
+
+        # Tear one lane's dir out from under git + prune its registration.
+        base = git_ops.worktree_base
+        gone = base / '_lane-1'
+        shutil.rmtree(gone)
+        await _run(['git', 'worktree', 'prune'], cwd=wl_git_repo)
+        assert not await git_ops._is_registered_worktree(gone)
+
+        result = await git_ops.prewarm_pool(start_ref)
+
+        assert result.materialized == 1
+        assert result.already_resident == 2
+        assert result.failed == 0
+        # The removed lane is back: registered + seeded.
+        assert await git_ops._is_registered_worktree(gone)
+        assert (gone / 'target' / 'seeded.bin').exists()
 
 
 @pytest.mark.asyncio
