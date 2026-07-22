@@ -103,6 +103,7 @@ class ReconLedgerRecord:
     flag_type: str = ''
     run_id: str = ''
     expires_at: str | None = None
+    entity_uuid: str | None = None
 
 
 def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
@@ -117,6 +118,7 @@ def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
         state=row['state'],
         created_at=row['created_at'],
         expires_at=row['expires_at'],
+        entity_uuid=row['entity_uuid'],
     )
 
 
@@ -208,13 +210,14 @@ class ReconLedgerStore:
                 """
                 INSERT INTO recon_ledger
                     (project_id, record_kind, task_id, flag_type, run_id,
-                     payload_json, state, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payload_json, state, created_at, expires_at, entity_uuid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, record_kind, task_id, flag_type, run_id) DO UPDATE SET
                     payload_json = excluded.payload_json,
                     state = excluded.state,
                     created_at = excluded.created_at,
-                    expires_at = excluded.expires_at
+                    expires_at = excluded.expires_at,
+                    entity_uuid = excluded.entity_uuid
                 """,
                 (
                     record.project_id,
@@ -226,6 +229,7 @@ class ReconLedgerStore:
                     record.state,
                     record.created_at,
                     record.expires_at,
+                    record.entity_uuid,
                 ),
             )
 
