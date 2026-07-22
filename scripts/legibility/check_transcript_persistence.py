@@ -33,6 +33,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 # Self-bootstrap for standalone `python scripts/legibility/check_transcript_persistence.py`
 # runs (and any systemd ExecStart invoking this file directly) -- must run
@@ -183,6 +184,51 @@ def _usable_prompt_prefix(prompt: str | None) -> str | None:
     return prefix
 
 
+def _first_user_turn(path: Path) -> dict[str, Any] | None:
+    """Return *path*'s first non-sidechain/non-meta user-turn record, or None.
+
+    A LIGHT alternative to ``sampling._score_and_find_first_turn`` for the
+    STRONG match: that helper must read the WHOLE file to also compute the
+    5-class confusion score (tool_error/not_found/self_correct/df_guard/
+    interrupt) — all of which the strong match discards. This loop instead
+    early-returns on the first matching user record, so matching a record
+    against a busy encoded-cwd dir full of large sibling transcripts costs
+    O(bytes-until-first-user-turn) per candidate rather than O(filesize)
+    (reviewer_comprehensive/efficiency, task 2893 amendment). The
+    first-turn selection predicate is identical to the scorer's, so
+    ``sampling._first_user_turn_text`` flattens the result the same way.
+    Degrades to ``None`` on an unreadable file, mirroring the scorer's
+    ``except OSError`` contract.
+    """
+    try:
+        for record in inventory._iter_json_lines(path):
+            if (
+                record.get('type') == 'user'
+                and not record.get('isSidechain')
+                and not record.get('isMeta')
+            ):
+                return record
+    except OSError:
+        return None
+    return None
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse each run of whitespace to a single space (ends stripped).
+
+    The STRONG match is prompt-prefix containment in a transcript's first
+    user turn. Claude Code may reflow a stored prompt's whitespace (wrap long
+    lines, normalize newlines) WITHOUT altering its words, which would break a
+    raw substring check and FALSE-POSITIVE a present transcript as MISSING.
+    Normalizing both the needle and the candidate text means whitespace-only
+    differences never mask a real match. This does NOT normalize a prompt that
+    was semantically expanded/rewritten before storage (e.g. a slash-command
+    template) — that residual false-positive class is named in the escalation
+    detail so a human reading the alarm can rule it out.
+    """
+    return ' '.join(text.split())
+
+
 def find_matching_transcript(
     record: session_registry.SessionRecord,
     projects_root: Path | str,
@@ -198,10 +244,11 @@ def find_matching_transcript(
 
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir):
-      - STRONG (usable prompt): the record's prompt prefix is contained in a
-        candidate transcript's first-user-turn text (via the ``sampling``
-        helpers). This is the dominant path — spawn records carry a
-        substantive prompt — so a usable-prompt session with only sibling
+      - STRONG (usable prompt): the record's prompt prefix is contained
+        (whitespace-normalized) in a candidate transcript's first-user-turn
+        text — read via the light :func:`_first_user_turn` helper, not the
+        full confusion-scorer. This is the dominant path — spawn records carry
+        a substantive prompt — so a usable-prompt session with only sibling
         transcripts is correctly flagged MISSING (returns ``None``).
       - WEAK (prompt too short/empty to match reliably): the first candidate
         whose file mtime lies within ``[start_ts - skew, now + skew]``. Only
@@ -219,10 +266,15 @@ def find_matching_transcript(
 
     prefix = _usable_prompt_prefix(record.prompt)
     if prefix is not None:
+        # spawn-claude.sh persists record.prompt as the caller's ORIGINAL
+        # prompt, BEFORE appending its result-handback trailer, so the prompt
+        # prefix is genuinely a PREFIX of what claude received (the trailer is
+        # a suffix) — containment, not equality, is the right test. Both sides
+        # are whitespace-normalized so a reflowed transcript still matches.
+        needle = _normalize_ws(prefix)
         for path in candidates:
-            _counts, first_turn = sampling._score_and_find_first_turn(path)
-            text = sampling._first_user_turn_text(first_turn)
-            if prefix in text:
+            text = _normalize_ws(sampling._first_user_turn_text(_first_user_turn(path)))
+            if needle in text:
                 return path
         return None
 
@@ -310,12 +362,18 @@ def find_missing_transcripts(
 # ---------------------------------------------------------------------------
 
 _FORCE_PERSISTENCE_RE = re.compile(
-    r'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=\s*(["\']?)1\1(?![0-9])'
+    r'^[ \t]*(?:export[ \t]+)?CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=(["\']?)1\1(?![0-9])',
+    re.MULTILINE,
 )
 """Matches ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` set to ``1`` in
 ``export VAR=1`` / plain ``VAR=1`` / quoted ``VAR="1"`` forms, while rejecting
 ``=0`` and any longer number (``=10``) via the closing backreference +
-no-trailing-digit lookahead."""
+no-trailing-digit lookahead. Anchored to an ASSIGNMENT context (line start,
+optional indentation, optional ``export`` prefix) so a commented-out or
+documentary reference (``# do NOT set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``)
+or the token embedded in a larger identifier (``FOO_CLAUDE_..._PERSISTENCE=1``)
+does NOT falsely report the preventer as present. No ``\\s*`` after ``=`` — a
+space there (``VAR= 1``) is not a valid shell assignment."""
 
 
 def payload_exports_force_persistence(script_text: str) -> bool:
@@ -377,6 +435,13 @@ def _build_escalation_arguments(
             f'start_ts={finding.start_ts}  exit_code={finding.exit_code}  '
             f'expected_dir={finding.expected_dir}  prompt={finding.prompt_prefix!r}'
         )
+    detail_lines.append(
+        'NOTE: matching is prompt-prefix containment (whitespace-normalized) in '
+        'a transcript first user turn under expected_dir. A session whose prompt '
+        'was expanded/rewritten before storage (e.g. a slash-command template, '
+        'where record.prompt holds the literal argv rather than the stored text) '
+        'is a known false-positive class — inspect expected_dir before acting.'
+    )
     if force_persistence_ok is not None:
         verdict = 'present' if force_persistence_ok else 'MISSING'
         detail_lines.append(
