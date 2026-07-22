@@ -309,6 +309,31 @@ class TestWmBackendIsAlive:
 
         assert backend.is_alive(target) is True
 
+    def test_true_when_wm_window_id_is_decimal_but_column_is_equivalent_hex(self):
+        """Task 2933: a session captured from a DECIMAL $WINDOWID is still found.
+
+        Real terminal emulators export $WINDOWID as a bare decimal (e.g.
+        '52428807') while wmctrl -l always prints the canonical zero-padded
+        0x-hex ('0x03200007'). The two encode the SAME integer
+        (52428807 == 0x03200007), so is_alive must compare by integer
+        identity, not exact string. The title deliberately does NOT match, so
+        only the window-id path can succeed.
+        """
+        from cockpit.backends.base import CommandResult, DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner(
+            results={
+                ('wmctrl', '-l'): CommandResult(
+                    returncode=0, stdout='0x03200007 0 host session-a\n'
+                )
+            }
+        )
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='renamed-title', wm_window_id='52428807')
+
+        assert backend.is_alive(target) is True
+
 
 class TestWmBackendGoneTarget:
     """Every op no-ops + warns (never raises) on a gone/unaddressable target — PRD §6.2 invariant."""
