@@ -37,7 +37,13 @@ inventory this closes):
     into PRODUCTION dark_factory memory. This one profiled leaf neutralizes
     every such write at once: ``http://127.0.0.1:1`` is a non-routable null
     sentinel that fast-fails with an immediate ECONNREFUSED (no slow
-    DNS/timeout) and can never be production. This is the safe DEFAULT — the
+    DNS/timeout) and can never be production. The sentinel string is
+    single-sourced from ``fm_retry.FM_NULL_SENTINEL_URL`` (imported DOWN — that
+    module is stdlib-only) so it cannot drift from the McpSession transport
+    seam that fails FAST on it: eval-side FM traffic through McpSession would
+    otherwise spin the full ~120s fm-restart retry window against this
+    permanently-dead address on every logical call (task 2880). This is the
+    safe DEFAULT — the
     CLI/default eval path picks it up with zero extra wiring. A caller that
     wants to CAPTURE the intended writes (Boundary test B5, integration gate ι,
     or an operator) starts a ``RecordingMemorySink`` and passes its ``.url`` as
@@ -52,6 +58,7 @@ from __future__ import annotations
 from typing import Any
 
 from orchestrator.config import OrchestratorConfig, _iter_leaves
+from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 
 # The ONLY documented divergences from a fresh load_config() — dotted leaf
 # paths matching orchestrator.config._iter_leaves's output 1:1 (e.g.
@@ -63,7 +70,7 @@ EVAL_PROFILE: dict[str, bool | str] = {
     'unblock_auto.enabled': False,     # D4 — no unmetered $5 dry-run per block
     'auto_eval_enabled': False,        # eval never re-triggers itself
     'simple_task_enabled': False,      # fixtures route through the full path deterministically
-    'fused_memory.url': 'http://127.0.0.1:1',  # D8 — non-routable null sentinel; immediate ECONNREFUSED, never production
+    'fused_memory.url': FM_NULL_SENTINEL_URL,  # D8 — non-routable null sentinel; single-sourced from fm_retry so the McpSession transport fails fast on it
 }
 
 
