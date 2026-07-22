@@ -183,3 +183,99 @@ class TestResolveBackendOrRefuse:
             with pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo:
                 sandbox_dispatch.resolve_backend_or_refuse()
         assert excinfo.value.backend_state == 'auto'
+
+
+class TestResolveBackendDedup:
+    """Process-global escalation dedup + re-arm (task 2908, INV-4).
+
+    ``resolve_backend_or_refuse()`` must signal escalate exactly ONCE across N
+    consecutive refusals for a given backend state, and re-arm (signal again)
+    whenever the backend state changes — a recovery (backend becomes
+    available), a config change (set_backend to a different backend), or the
+    operator 'none' escape hatch. The dedup lives in a process-global keyed on
+    the configured backend, re-armed on ANY non-refusing return.
+    """
+
+    def test_dedup_across_n_refusals(self):
+        """Exactly one should_escalate=True across N (>=3) refused invocations."""
+        sandbox_dispatch.set_backend('landlock')
+        flags: list[bool] = []
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ):
+            for _ in range(4):
+                with pytest.raises(sandbox_dispatch.SandboxUnavailable) as excinfo:
+                    sandbox_dispatch.resolve_backend_or_refuse()
+                flags.append(excinfo.value.should_escalate)
+        assert flags[0] is True
+        assert all(flag is False for flag in flags[1:]), (
+            f'exactly one escalate-signal expected across N refusals; got {flags}'
+        )
+
+    def test_rearm_on_recovery(self):
+        """A healthy return between two breaks re-arms the escalate signal."""
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+        ) as mock_ll:
+            mock_ll.return_value = False
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as first:
+                sandbox_dispatch.resolve_backend_or_refuse()
+            assert first.value.should_escalate is True
+
+            # Recovery: backend becomes available -> healthy return re-arms.
+            mock_ll.return_value = True
+            assert sandbox_dispatch.resolve_backend_or_refuse() == 'landlock'
+
+            # Re-break: escalate again.
+            mock_ll.return_value = False
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as third:
+                sandbox_dispatch.resolve_backend_or_refuse()
+            assert third.value.should_escalate is True
+
+    def test_rearm_on_backend_state_change(self):
+        """Changing the configured backend (landlock->bwrap) re-arms the signal."""
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ):
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as first:
+                sandbox_dispatch.resolve_backend_or_refuse()
+            assert first.value.should_escalate is True
+
+        sandbox_dispatch.set_backend('bwrap')
+        with patch(
+            'orchestrator.agents.sandbox.is_bwrap_available',
+            return_value=False,
+        ):
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as second:
+                sandbox_dispatch.resolve_backend_or_refuse()
+        assert second.value.should_escalate is True
+        assert second.value.backend_state == 'bwrap'
+
+    def test_none_escape_path_rearms(self):
+        """The 'none' escape hatch is a non-refusing return -> re-arms the signal."""
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ):
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as first:
+                sandbox_dispatch.resolve_backend_or_refuse()
+            assert first.value.should_escalate is True
+
+        # 'none' escape hatch returns without refusing -> re-arms dedup.
+        sandbox_dispatch.set_backend('none')
+        assert sandbox_dispatch.resolve_backend_or_refuse() == 'none'
+
+        # Re-break under landlock: escalate again.
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ):
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as third:
+                sandbox_dispatch.resolve_backend_or_refuse()
+        assert third.value.should_escalate is True
