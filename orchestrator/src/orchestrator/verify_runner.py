@@ -541,12 +541,20 @@ async def run_merge_verify_on_worktree(
     # it. The local path is unaffected — its config already equals the spec's
     # source, so this is a value-preserving no-op there. (pydantic v2 model_copy;
     # values originate from a validated config via build_merge_verify_spec.)
-    config = config.model_copy(
-        update={
-            'merge_verify_workspace': spec.merge_verify_workspace,
-            'merge_verify_breadth': spec.merge_verify_breadth,
-        }
-    )
+    config_update: dict[str, Any] = {
+        'merge_verify_workspace': spec.merge_verify_workspace,
+        'merge_verify_breadth': spec.merge_verify_breadth,
+    }
+    # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
+    # global full-gate commands; apply them onto the reconstructed remote config
+    # so the remote runs the SAME gate as local (the module_configs=[] Site-2
+    # scoping path is preserved; only the global commands it reads are overridden).
+    # None (the common per-module merge) leaves the config's globals untouched.
+    if spec.global_verify_command is not None:
+        config_update['test_command'] = spec.global_verify_command.test_command
+        config_update['lint_command'] = spec.global_verify_command.lint_command
+        config_update['type_check_command'] = spec.global_verify_command.type_check_command
+    config = config.model_copy(update=config_update)
 
     runner = LocalRunner(
         merge_wt,
