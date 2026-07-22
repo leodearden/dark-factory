@@ -142,7 +142,12 @@ async def _drive_sandbox(inputs: dict[str, Any], cwd: Path) -> list[str]:
         captured.append(list(cmd))
         return _make_subprocess_result()
 
-    def fake_wrap_command(cmd: list[str], cwd: Path, sandbox_modules: list[str]) -> list[str]:
+    def fake_wrap_command(
+        cmd: list[str],
+        cwd: Path,
+        sandbox_modules: list[str],
+        writable_extras: list[str] | None = None,
+    ) -> list[str]:
         return _SANDBOX_SENTINEL_PREFIX + cmd
 
     with (

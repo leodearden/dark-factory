@@ -1031,7 +1031,7 @@ class TestSandboxPathForwardsSessionConfig:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1122,7 +1122,7 @@ class TestStartupGraceSecsForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1224,7 +1224,7 @@ class TestSpawnEnvForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1281,7 +1281,7 @@ class TestSpawnEnvForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1365,7 +1365,7 @@ class TestProgressExtensionParamsForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
