@@ -24,6 +24,38 @@ from collections.abc import Callable
 # _writeback_deploy_success budget — single source, no per-callsite copies.
 FM_RESTART_RETRY_WINDOW_SECS: float = 120.0
 
+# The D8 null sentinel — single-sourced here (below the transport; this module
+# is stdlib-only, so evals/profile.py can import it DOWN with no cycle). Eval
+# runs set EVAL_PROFILE['fused_memory.url'] to this non-routable address
+# (orchestrator/src/orchestrator/evals/profile.py) to neutralize every
+# orchestrator-side fused-memory write with an immediate ECONNREFUSED. Because
+# 127.0.0.1:1 can NEVER host a *restarting* fused-memory, the fm-restart retry
+# window above is inapplicable to it: riding the window out against a
+# permanently-dead sentinel just burns ~FM_RESTART_RETRY_WINDOW_SECS per
+# logical McpSession call (task 2880). Defined here so the McpSession
+# fail-fast seam and EVAL_PROFILE reference exactly one string and cannot drift.
+FM_NULL_SENTINEL_URL: str = 'http://127.0.0.1:1'
+
+
+def is_fm_null_sentinel(url: str | None) -> bool:
+    """Return True iff *url* is the D8 null sentinel (:data:`FM_NULL_SENTINEL_URL`).
+
+    Falsy input (``None`` / ``''``) is never the sentinel. Otherwise *url* is
+    normalized — a trailing ``'/'`` is stripped, then a trailing ``'/mcp'``
+    endpoint suffix (and any ``'/'`` it exposes) — before an exact compare, so
+    both the already-``rstrip('/')``-ed ``McpSession.base_url`` and a raw
+    ``memory_url + '/mcp'`` endpoint resolve to the sentinel. A real fm
+    endpoint (e.g. ``http://localhost:8002``) is never misclassified, so it
+    keeps the full fm-restart retry window.
+    """
+    if not url:
+        return False
+    normalized = url.rstrip('/')
+    if normalized.endswith('/mcp'):
+        normalized = normalized[: -len('/mcp')].rstrip('/')
+    return normalized == FM_NULL_SENTINEL_URL
+
+
 # Private tunables for the jittered-exponential schedule below.
 _FM_RETRY_BASE_SECS: float = 1.0
 _FM_RETRY_CAP_SECS: float = 20.0
