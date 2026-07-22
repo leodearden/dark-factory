@@ -52,6 +52,15 @@ class WmBackend:
         captured title snapshot unreliable within seconds. Falls back to
         `wmctrl -a <title>` then `xdotool windowactivate` when no id is
         available or activating by id fails.
+
+        A bare-DECIMAL `wm_window_id` (what a real terminal emulator exports
+        in `$WINDOWID`, e.g. '52428807') is normalized to canonical 0x-hex
+        ('0x03200007') before the `wmctrl -i -a` call, because `wmctrl -i`
+        parses its arg base-16 and would otherwise MIS-read the decimal as
+        hex and miss the window. An already-0x-prefixed id is passed
+        untouched (wmctrl already resolves it, and re-padding buys no
+        behavioural gain); an unparseable id falls through unchanged
+        (fail-soft).
         """
         if not target.wm_window_id and not target.wm_title:
             logger.warning(
@@ -60,7 +69,12 @@ class WmBackend:
             return FocusResult(ok=False, note='no target')
 
         if target.wm_window_id:
-            id_result = self._run(['wmctrl', '-i', '-a', target.wm_window_id])
+            focus_id = target.wm_window_id
+            if not focus_id.lower().startswith('0x'):
+                parsed = _window_id_int(focus_id)
+                if parsed is not None:
+                    focus_id = f'0x{parsed:08x}'
+            id_result = self._run(['wmctrl', '-i', '-a', focus_id])
             if id_result.returncode == 0:
                 return FocusResult(ok=True)
 
