@@ -112,3 +112,28 @@ def test_search_roots_use_relocated_eval_root():
     """
     assert eval_worktree_root(mod.REPO) in mod.SEARCH_ROOTS
     assert (mod.REPO / '.eval-worktrees') not in mod.SEARCH_ROOTS
+
+
+# ---------------------------------------------------------------------------
+# RED — task_label handles a relocated (out-of-REPO) eval reviews dir
+# ---------------------------------------------------------------------------
+
+def test_task_label_handles_relocated_eval_worktree(tmp_path, monkeypatch):
+    """task_label must not crash on a relocated (out-of-REPO) eval reviews dir.
+
+    Post-2881 eval worktrees live at eval_worktree_root(REPO) — a SIBLING of
+    REPO — so `reviews_dir.relative_to(REPO)` raises ValueError. task_label
+    must fall back to REPO.parent (the common ancestor of .worktrees and the
+    relocated eval sibling) and still produce a label naming the task and run
+    dirs. This is exactly the worktree the SEARCH_ROOTS fix newly discovers.
+    """
+    monkeypatch.setattr(mod, 'REPO', tmp_path)
+    reviews = (
+        tmp_path.parent / f'{tmp_path.name}-eval-worktrees'
+        / 'df_task_12' / 'run-abc' / '.task' / 'reviews'
+    )
+
+    label = mod.task_label(reviews)  # must NOT raise ValueError
+
+    assert 'df_task_12' in label
+    assert 'run-abc' in label
