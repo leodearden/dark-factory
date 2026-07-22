@@ -115,6 +115,15 @@ BARE_PARAMETER_MENTION = (
 
 CLEAN_TEXT = "This is a perfectly normal task description with no XML leakage at all."
 
+# Zero-whitespace adjacency: a closing tag immediately followed by
+# `<parameter name=...>` with no real whitespace character in between. No
+# live leak has ever been observed in this shape (the recon serialization
+# bug always emits a real newline — see the module docstring); LEAK_TAIL
+# requires `\s+` (one or more real whitespace chars), so this must NOT match.
+ZERO_WHITESPACE_ADJACENT_TAG = (
+    'Some clean lead-in text.</description><parameter name="priority">low'
+)
+
 
 # ---------------------------------------------------------------------------
 # detect_leak(text) -> str | None
@@ -164,6 +173,13 @@ def test_trailing_whitespace_after_fragment_is_tolerated():
     does not defeat detection."""
     text_with_trailing_ws = GENUINE_DESCRIPTION_LEAK + "\n\n   \n"
     assert detect_leak(text_with_trailing_ws) == GENUINE_DESCRIPTION_LEAK_FRAGMENT
+
+
+def test_detect_leak_returns_none_for_zero_whitespace_adjacent_tag():
+    """LEAK_TAIL requires >=1 real whitespace character between the closing
+    tag and the parameter fragment (`\\s+`, not `\\s*`); a zero-whitespace
+    adjacency — a shape no genuine leak has ever produced — must not match."""
+    assert detect_leak(ZERO_WHITESPACE_ADJACENT_TAG) is None
 
 
 # ---------------------------------------------------------------------------
@@ -448,3 +464,19 @@ def test_cli_no_resolvable_db_exits_2():
     result = _run_cli("--db", "/nonexistent.db")
 
     assert result.returncode == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+
+def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path):
+    """A corrupt/unreadable tasks.db (e.g. a stale WAL-less file, or a
+    genuinely non-sqlite file at that path) must not abort the whole sweep:
+    the CLI logs a warning naming the bad db to stderr and continues, still
+    reporting leaks found in the other, readable database(s)."""
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"not a sqlite database, just garbage bytes")
+    leaky_db = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+
+    result = _run_cli("--db", str(corrupt_db), "--db", str(leaky_db))
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "992" in result.stdout
+    assert str(corrupt_db) in result.stderr

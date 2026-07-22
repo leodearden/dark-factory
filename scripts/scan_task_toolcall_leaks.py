@@ -19,13 +19,19 @@ per a live read-only probe run while planning this task, on ~32 further
 tasks — hence this durable, re-runnable detector (task 2939) rather than a
 one-off manual fix.
 
-The discriminator (``LEAK_TAIL``) requires REAL whitespace between the
-stray closing tag and the ``<parameter name="...">`` fragment, and requires
-the fragment to run all the way to end-of-string. This deliberately excludes
-prose that merely *mentions* the leak shape (e.g. tasks 2938/2939, which
-quote the ESCAPED literal ``\\n`` — two characters, backslash then ``n`` —
-and continue with trailing prose afterward): a naive ``<parameter name=``
-substring scan over-reports on exactly this shape.
+The discriminator (``LEAK_TAIL``) requires one or more REAL whitespace
+characters (``\\s+``) between the stray closing tag and the
+``<parameter name="...">`` fragment — a closing tag immediately followed by
+``<parameter`` with zero whitespace in between does not match. This
+deliberately excludes prose that merely *mentions* the leak shape (e.g.
+tasks 2938/2939, which quote the ESCAPED literal ``\\n`` — two characters,
+backslash then ``n``, which is NOT a real whitespace character — and
+continue with trailing prose afterward): a naive ``<parameter name=``
+substring scan over-reports on exactly this shape. Once those two
+conditions hold (the closing-tag literal, then real whitespace), the
+capture group extends greedily to end-of-string (``.*$``); that greedy
+tail is simply where the fragment capture ends, not an independent
+discriminator in its own right.
 """
 from __future__ import annotations
 
@@ -39,7 +45,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 LEAK_TAIL = re.compile(
-    r'</(?:description|parameter|details)>\s*(<parameter\s+name="[^"]*">.*)$',
+    r'</(?:description|parameter|details)>\s+(<parameter\s+name="[^"]*">.*)$',
     re.DOTALL,
 )
 
@@ -57,9 +63,12 @@ def detect_leak(text: object) -> str | None:
     NULL column) — falsy input or anything that isn't a str returns None
     without raising, so callers can pass a raw sqlite3 row value straight
     through. The match starts at the stray closing tag
-    (``</description>``/``</parameter>``/``</details>``) and runs to
-    end-of-string (after ``text.rstrip()``, so trailing whitespace tacked
-    onto an otherwise-genuine leak does not defeat detection).
+    (``</description>``/``</parameter>``/``</details>``), requires one or
+    more real whitespace characters immediately after it (a closing tag with
+    ``<parameter`` adjacent and zero whitespace in between does not match),
+    and then runs to end-of-string (after ``text.rstrip()``, so trailing
+    whitespace tacked onto an otherwise-genuine leak does not defeat
+    detection).
     """
     if not text or not isinstance(text, str):
         return None
@@ -229,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db
     could be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS
     / the dark-factory default.
+
+    A single unreadable database (e.g. a stale/corrupt file, or a transient
+    "database is locked"/"file is not a database" condition) does not abort
+    the sweep: it is logged to stderr and skipped so every other resolvable
+    database is still scanned and reported.
     """
     args = _build_parser().parse_args(argv)
 
@@ -242,8 +256,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     matches: list[LeakMatch] = []
+    unreadable: list[str] = []
     for db_path in db_paths:
-        matches.extend(scan_db(db_path))
+        try:
+            matches.extend(scan_db(db_path))
+        except sqlite3.Error as exc:
+            print(f"warning: skipping unreadable database {db_path}: {exc}", file=sys.stderr)
+            unreadable.append(db_path)
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} database(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
 
     if args.json:
         print(format_json(matches))
