@@ -33,6 +33,13 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     ):
         h = Harness(mock_orch_config)
 
+    # Task 2878: h.scheduler is a MagicMock (Scheduler is patched above), so
+    # is_actively_held() would otherwise return a truthy Mock by default.
+    # Default to "not held" so the existing "no live holder -> promote"
+    # semantics are preserved for every test in this file; tests exercising
+    # the live-recheck gate override this explicitly.
+    h.scheduler.is_actively_held = MagicMock(return_value=False)
+
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     return h
 
@@ -205,6 +212,116 @@ class TestOrphanL0Reaper:
         harness._escalation_events['task-42'] = asyncio.Event()
 
         assert await harness._reap_orphan_l0_escalations() == 0
+
+    @pytest.mark.asyncio
+    async def test_live_holder_l0_not_promoted(self, harness: Harness):
+        """Task 2878: kill the stale-snapshot FP race against live
+        redispatches.
+
+        A divergence-class L0 (filed by
+        ``TaskWorkflow._check_scope_invariant`` when metadata.files trails
+        plan.files during in-flight scope reconciliation) is aged past
+        ``orphan_l0_timeout_secs`` and its task_id is no longer in
+        ``_escalation_events`` — the dict is popped on workflow-slot exit
+        and goes stale across a coordinated batch-redispatch tick, even
+        though the scheduler still shows the task actively holding its
+        metadata.files locks (a live/re-dispatched workflow). The reaper
+        must re-check live holder state via ``Scheduler.is_actively_held``
+        before promoting, and skip (fail-safe wait) when it is True.
+
+        RED on main: the reaper ignores live holder state and promotes the
+        L0 unconditionally once it's absent from ``_escalation_events`` and
+        aged out, so count == 1 and an L1 is filed instead of 0/none.
+        """
+        assert harness._escalation_queue is not None
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-42'),
+            task_id='task-42',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task task-42'
+            ),
+            detail='detail',
+            # MUST NOT be 'verify_wip_reconciliation' — that would route
+            # through _is_done_step_commit_orphan's get_task branch, which
+            # this test does not stub.
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Deliberately NOT added to harness._escalation_events, so the
+        # stale-snapshot gate alone would not skip it.
+
+        # Scheduler shows the task actively holding its metadata.files
+        # locks right now — a live/re-dispatched workflow.
+        harness.scheduler.is_actively_held = MagicMock(return_value=True)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+
+    @pytest.mark.asyncio
+    async def test_genuine_orphan_with_divergence_still_promoted(
+        self, harness: Harness,
+    ):
+        """Task 2878 boundary guard: the live-recheck gate must not
+        over-suppress a genuinely stranded orphan.
+
+        Same divergence-class aged L0 as
+        ``test_live_holder_l0_not_promoted``, but here the task has no
+        live holder (``is_actively_held`` stays at the pre-1 fixture
+        default of False — no dispatch slot, no module lock, no recent
+        cancel stamp): a genuinely dead workflow. It must still be
+        promoted, both before and after the step-2 impl — this pins that
+        the gate defers only live tasks, never drops a genuine orphan.
+        """
+        assert harness._escalation_queue is not None
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-77'),
+            task_id='task-77',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task task-77'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Not in _escalation_events, and is_actively_held stays False (the
+        # pre-1 fixture default) — genuinely stranded, no live holder.
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-77'
 
     @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):

@@ -8656,8 +8656,9 @@ class Harness:
 
         Extracted from the loop so tests can drive it deterministically.
         An escalation is an orphan when its ``task_id`` is not in
-        ``_escalation_events`` (no running workflow) and it is older than
-        ``orphan_l0_timeout_secs``.
+        ``_escalation_events`` (no running workflow) AND the scheduler does
+        not show it actively held (task 2878 — see the live-recheck note
+        below), and it is older than ``orphan_l0_timeout_secs``.
 
         Async (task 2725): the done-step-commit orphan class needs to
         ``await self.scheduler.get_task(...)`` to check whether its
@@ -8678,6 +8679,21 @@ class Harness:
                 continue
             if esc.task_id in self._escalation_events:
                 continue  # active workflow will handle it
+            # Task 2878: _escalation_events is a stale sweep-start snapshot
+            # — it's populated at dispatch and popped by the workflow
+            # slot's done-callback, so a task's id can vanish from it (slot
+            # rotation, a coordinated batch-redispatch tick) while a live
+            # or re-dispatched workflow is still actively holding exactly
+            # this task's metadata.files locks. That race produced false
+            # promotions for the plan.files/metadata.files divergence class
+            # (filed by TaskWorkflow._check_scope_invariant during genuine
+            # in-flight scope-reconciliation lag), which watchers then
+            # verified live and closed benign. Re-check live scheduler
+            # state at flag time via the same liveness signal the watchers
+            # use, and defer (not drop) promotion while it's live — the
+            # next sweep re-checks and promotes once genuinely idle.
+            if self.scheduler.is_actively_held(esc.task_id):
+                continue
             try:
                 age_secs = (now - datetime.fromisoformat(esc.timestamp)).total_seconds()
             except (ValueError, TypeError):
