@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily timer for the legibility transcript-persistence detector (%i)
+
+[Timer]
+# Daily at 04:00 local time -- staggered one hour off the legibility-trickle
+# timer's 03:00 so a project's two per-project timers don't fire at the same
+# instant. Persistent=true catches up a missed night (laptop asleep/offline
+# at 04:00) on next boot/login instead of silently skipping it. A small
+# randomized delay avoids every project's timer firing at the exact same
+# instant. Daily comfortably meets the "caught within ~a day" goal and
+# matches the detector's 48h default lookback (terminal session records are
+# reaped at a 24h TTL, so a 48h window with a daily probe never misses a
+# completed session).
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
