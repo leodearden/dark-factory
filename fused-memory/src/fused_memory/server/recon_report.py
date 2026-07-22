@@ -554,6 +554,14 @@ _ERR_SERVICE_UNAVAILABLE: dict[str, str] = {
     'error_type': 'ReconReportServiceUnavailable',
 }
 
+# task 2895 β: returned by write_entity_standing_decision when the grounds value
+# is outside GROUNDS_ENUM (the ledger's ValueError). A ``hint`` carrying the
+# ledger message is added at return time.
+_ERR_INVALID_GROUNDS: dict[str, str] = {
+    'error': 'invalid_grounds',
+    'error_type': 'StandingDecisionInvalidGrounds',
+}
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -1923,6 +1931,52 @@ class ReconReportState:
         self._persist_run(run_id)
         return citation
 
+    async def write_entity_standing_decision(
+        self,
+        *,
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        evidence: Any,
+    ) -> dict[str, Any]:
+        """Write an entity standing decision to α's ledger (Stage-2, always gated).
+
+        Delegates to
+        :func:`~fused_memory.reconciliation.standing_decision_writer.write_entity_standing_decision`
+        WITHOUT ``authorized_by`` — so the two-armed evidence gate is enforced on
+        this (the sole Stage-2) write path; the operator/backfill (η) bypass seam
+        lives on the helper, never on this tool.
+
+        Returns the helper's success dict on a write; the structured
+        ``insufficient_evidence`` rejection (unmet_arms + hint) when the gate is
+        not satisfied; ``_ERR_SERVICE_UNAVAILABLE`` when no memory_service is
+        wired; or ``_ERR_INVALID_GROUNDS`` (with the ledger's message as a hint)
+        when ``grounds`` is outside ``GROUNDS_ENUM``. A graphiti sampling failure
+        propagates loudly (INV-1) rather than persisting a poisoned row.
+        """
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
+            EvidenceGateRejected,
+            write_entity_standing_decision as _write_helper,
+        )
+
+        try:
+            return await _write_helper(
+                self._memory_service,
+                project_id=project_id,
+                entity_uuid=entity_uuid,
+                grounds=grounds,
+                evidence=evidence,
+            )
+        except EvidenceGateRejected as exc:
+            return dict(exc.rejection)
+        except ValueError as exc:
+            rejected = dict(_ERR_INVALID_GROUNDS)
+            rejected['hint'] = str(exc)
+            return rejected
+
     # ------------------------------------------------------------------
     # Reaper
     # ------------------------------------------------------------------
@@ -2277,6 +2331,42 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         """
         return await state.cite_run(
             run_id=run_id, finding_id=finding_id, cited_run_id=cited_run_id
+        )
+
+    @mcp.tool()
+    async def write_entity_standing_decision(
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        evidence: list[dict] | None = None,
+    ) -> dict:
+        """Write an entity standing decision to the reconciliation ledger (task 2895 β).
+
+        Stage-2 ONLY (blocked in Stage 1 / Stage 3 — the first recon-report tool
+        with durable SQLite-ledger writes). Records that a class of complaint
+        about *entity_uuid* — identified by *grounds* (a closed-enum value) — has
+        been investigated and dismissed, so γ/δ can filter/annotate future recon
+        flags instead of re-raising them.
+
+        This path is ALWAYS evidence-gated (there is deliberately no
+        ``authorized_by`` parameter): the write succeeds only if EITHER arm holds
+        — arm 1: ≥1 cited, locally-resolvable, human-authored mem0 evidence
+        record; arm 2: ≥3 investigation_outcome mem0 records for this entity with
+        actionable=false and distinct run_ids. *evidence* is a list of cited-ref
+        dicts ({type, id, ...}); mem0 refs are resolved for provenance, foreign
+        refs (escalation/task ids) are recorded but never count toward a gate arm.
+
+        Returns {status:'written', entity_uuid, grounds, edge_count_at_decision,
+        expires_at, decided_at} on success, or a structured error dict:
+        insufficient_evidence (unmet_arms + hint) when neither arm is satisfied,
+        invalid_grounds when grounds is outside the enum, or service_not_configured
+        when the memory service is unavailable.
+        """
+        return await state.write_entity_standing_decision(
+            project_id=project_id,
+            entity_uuid=entity_uuid,
+            grounds=grounds,
+            evidence=evidence or [],
         )
 
     return mcp
