@@ -2,6 +2,13 @@
 
 Software factory with unified memory + task management. Three subsystems — Graphiti (temporal knowledge graph), Mem0 (vector memory), Taskmaster AI (task management) — unified behind the **fused-memory** MCP server.
 
+This file is the agent-facing operating context for sessions working in
+this repo. The user-facing documentation lives in `README.md` (entry
+point), `SETUP.md` (install), `OPERATIONS.md` (operator runbook),
+`ARCHITECTURE.md` (system design), `docs/task-authoring.md` (task metadata
+reference), and `CONTRIBUTING.md` — prefer pointing humans there, and
+consult those docs yourself rather than re-deriving what they cover.
+
 ## Repo Map
 
 Package dirs follow a `<pkg>/src/<pkg>/` double-nesting convention:
@@ -26,7 +33,7 @@ for new ones.
 ## Prerequisites
 
 ```bash
-# Start backing stores (Neo4j/FalkorDB + Qdrant)
+# Start backing stores (FalkorDB + Qdrant)
 cd fused-memory/docker && docker-compose up -d
 
 # Python environment
@@ -35,6 +42,8 @@ cd fused-memory && uv sync
 # Required env vars (inherit from shell):
 # OPENAI_API_KEY  (for embeddings; ANTHROPIC_API_KEY is NOT needed — agents use OAuth)
 ```
+
+Full fresh-machine walkthrough: `SETUP.md`.
 
 ## Memory Usage
 
@@ -76,582 +85,44 @@ Always pass these parameters on write operations:
 
 ## Task Routing
 
-All task operations go through **fused-memory MCP tools** — not the Taskmaster CLI or Taskmaster MCP directly. This ensures the TaskInterceptor emits reconciliation events for state transitions.
-
-Use `project_root: "/home/leo/src/dark-factory"` for all task operations.
-
-Status transitions (`done`, `blocked`, `cancelled`, `deferred`) trigger targeted reconciliation automatically.
-
-### Cross-project task dependencies
-
-A task can declare a dependency on a task in **another** project using the qualified `"project_id:task_id"` form (e.g. `"dark_factory:42"`). When `add_dependency` receives a `depends_on` value that contains `:`, it routes the dep to `metadata.external_deps` (a list of canonical `"project_id:task_id"` strings) instead of the integer `dependencies` table — no schema migration required.
-
-```python
-# Qualified form → appended to metadata.external_deps
-mcp__fused-memory__add_dependency(
-    id="<dependent_task_id>",
-    depends_on="dark_factory:42",   # project_id:task_id
-    project_root="<project_root>",
-)
-# Bare integer → existing integer dependencies table (unchanged)
-mcp__fused-memory__add_dependency(id="<id>", depends_on=13, project_root="<project_root>")
-```
-
-The foreign target is **not** verified at write time; existence is resolved at gate time.
-
-**Resolution: `get_external_statuses`**
-
-The scheduler resolves `metadata.external_deps` at each dispatch tick via the read-only fused-memory tool `get_external_statuses(deps: list[str]) -> dict[str, str]`. It takes a list of `"project_id:task_id"` strings, looks each up in the shared fused-memory registry, and returns a status per dep. Unresolvable deps return explicit sentinels:
-
-| Sentinel | Meaning |
-|---|---|
-| `"unknown_project"` | `project_id` not in the registry |
-| `"unknown_task"` | Project known; no top-level task with that id |
-| `"malformed"` | Not parseable as `project_id:task_id` |
-
-**Dispatch-time policy**
-
-The gate lives in the **dependent's** scheduler only — it does not affect the upstream project's orchestrator. External deps are checked at dispatch time; they are not re-evaluated after a task has been dispatched.
-
-| Resolved status | Scheduler action |
-|---|---|
-| `done` | Satisfied — counts toward dispatch |
-| `cancelled` | Not satisfied → `_mark_blocked(escalate_to_human=True)` immediately |
-| `unknown_project` / `unknown_task` / `malformed` | Not satisfied; grace period then escalate after repeated unresolved cycles |
-| Any other live status (`pending`, `in-progress`, …) | Not satisfied; keep waiting |
-| Resolver error (transient timeout / server hiccup) | Not satisfied this tick — fail-safe wait, no grace counter increment |
-
-A task is dispatched only when **all** local deps **and** all `metadata.external_deps` are `done`.
-
-**Deterministic deploy and gate tasks use this same dep mechanism** — including
-cross-project `"project_id:task_id"` deps. The older convention of filing
-deploy capstones in `dark_factory` with a `dark_factory`-internal dependency
-— a workaround for an external-dep gate bug fixed by tasks 1854/1855/1799 — is
-**retired**. Use a `task_kind='deterministic'` deploy or gate task with normal
-deps instead. See "Deterministic task kind" below.
-
-### Delivered-check dependency gate (`metadata.delivered_checks`)
-
-A **local** (same-project) dep can additionally carry `metadata.delivered_checks`
-— a list of check descriptors (`name`, `kind: 'grep'|'script'`, and either a
-`pattern`+`paths` or a `script`+`args`, plus an `expect`) asserting that the
-capability the dep claims to deliver is actually present on the committed
-`main` tree, not just that the task record reached a terminal status. Every
-scheduler tick, `Scheduler._compute_delivered_check_cache` sweeps every
-distinct TERMINAL (`done`/`cancelled`) local dep carrying this metadata
-against `main` and caches the result per `(dep_task_id, main_sha)` — a
-capability landing on `main` self-heals the very next tick with no operator
-action, since a new SHA prunes the stale cache entry.
-
-**Dispatch-time policy**
-
-| Check outcome | Scheduler action |
-|---|---|
-| All checks DELIVERED on `main@SHA` | Satisfied — dep counts toward dispatch |
-| ≥1 check FAILED, consecutive-fail streak `< grace_cycles` | Withheld; `delivered_check_gate_held` event emitted each held tick (hold-visibility only) |
-| ≥1 check FAILED, streak reaches `grace_cycles` | Born-at-L2 `dependency_capability` escalation naming the failed check/pattern-or-script/dep id/`main` SHA; dependent → `blocked`; streak cleared (re-fires on a later re-crossing) |
-| A check ERRORS (git/script failure) or exceeds `check_timeout_secs` | Fail-safe wait — dep left uncached, **no** streak bump on either counter, retried next tick |
-| `delivered_checks.enabled = false` | Gate entirely inert — no sweep, no cache, no streaks, no escalation; `_deps_satisfied` takes its legacy arm-off path as if the metadata didn't exist |
-
-The born-at-L2 escalation (`agent_role='orchestrator-scheduler'`, `severity='critical'`)
-bypasses the auto-watcher and routes straight to a human, mirroring the
-cross-project external-dep gate's L1 filer but one level up — a persistently
-false capability claim is a "someone must look at this now" condition, not a
-routine triage item.
-
-**Config knobs** (`delivered_checks.*`, all green-tier hot-reloadable via
-`mcp__escalation__reload_config`):
-
-| Knob | Default | Meaning |
-|---|---|---|
-| `enabled` | `true` | Kill switch — set `false` to disable the gate entirely |
-| `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
-| `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
-| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps (task 2580, delta) |
-
-**Manual re-pend recipe:** exactly like the external-dep gate, a dependent
-blocked by this escalation is **not auto-re-pended**. Once the underlying
-capability actually lands on `main` (or the check itself is fixed), an
-operator must manually set the dependent back to `pending` to reopen it —
-`resolve_issue` on the escalation records the human decision but does not by
-itself unblock the task.
-
-### Simple-task fast path (`metadata.complexity`)
-
-Set `metadata.complexity = "simple"` to route a task to the single-agent
-SIMPLE_TASK fast path (one Sonnet agent explores, plans, edits, and commits;
-the architect+implementer pair is skipped, but verify/review/merge still run).
-The only meaningful value is `"simple"` — absent or any other value routes to
-the full architect path.
-
-**When to declare `"simple"`:** the change is a single coherent edit — docs or
-comments, a rename, a localized behaviour-preserving refactor, a typo/wording
-fix, a one-spot bug fix — that needs **no new abstraction and no cross-module
-design**, and you can name the target file(s). A `simple` task may be
-high-priority and may touch several files/modules, as long as the *change* is
-mechanically simple. **When unsure, omit it** — the full path is the safe
-default, and a mis-declared task simply falls back to the architect.
-
-**Hard-blocker veto:** if the task description contains a hard-blocker token
-(`migration`, `architecture`, `integration test`, `design ... new`,
-`implement ... new feature`), the fast path is vetoed even if
-`complexity='simple'` is set.
-
-**Hard escape:** `metadata.force_full_path = true` always forces the full
-architect path regardless of `complexity`.
-
-### Deterministic task kind (`task_kind='deterministic'`)
-
-Set `task_kind='deterministic'` on `submit_task` to skip the LLM pipeline
-entirely (no worktree, no branch, no agent, no diff) and route to the
-**`DeterministicRunner`** — a small state machine that runs an optional
-committed action, escalates born-at-L2 when required, and marks the task
-`done` once both are satisfied. Dispatch eligibility uses the same dep-gate as
-every other task.
-
-**`task_kind`** is a first-class `submit_task` parameter (`'normal'` default
-| `'deterministic'`), persisted to `metadata.task_kind`.
-
-**`metadata.before_done`** — committed-script reference (set at `submit_task`):
-
-```
-{
-  script: "<repo-relative path>",  # must exist & be executable
-  args: [],                         # list[str], default []
-  env: {},                          # dict[str,str], default {}
-  cwd: "<project_root>",            # default: project_root
-  timeout_secs: 120,                # int, required; runner kills + escalates on timeout
-  target_unit: None                 # str|None; None → cross-unit (no self-kill)
-}
-```
-
-**`metadata.always_escalates`** (`bool`, default `false`) — file a born-at-L2
-escalation after the action completes (or immediately if no action); task goes
-`blocked` until resolved via `resolve_issue`.
-
-**Field-combo presets:**
-
-| `before_done` | `always_escalates` | Behaviour | Use for |
-|---|---|---|---|
-| present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
-| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
-| absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
-
-**Validation (enforced at `submit_task`):** `task_kind='deterministic'` with
-`before_done=None` and `always_escalates=false` is **rejected** ("ill-formed
-no-op"). `before_done` set on a `normal` task is also **rejected** ("before_done
-is only valid on deterministic tasks").
-
-**Born-at-L2 escalations:** all filed with `severity ∈ {critical, urgent}` and
-sentinel `agent_role='orchestrator-deterministic'`; the server retains `level=2`
-(no L0→L1→L2 climb). The task goes `blocked` while the L2 is open (quiescence
-guard — no re-dispatch, no churn).
-
-**Blocking vs detached self-kill — *determined*, not a knob:**
-- `before_done.target_unit` equals this orchestrator's own unit → detached
-  `systemd-run --user` with `--on-failure` (done = `scheduled`; the dispatching
-  orchestrator is **not** killed).
-- `before_done.target_unit` differs from own unit (or is `None`) → blocking
-  subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify against a
-  pre-run baseline (done = `deployed-and-verified`).
-
-**Runner stamps** (written by `DeterministicRunner`, never author-supplied):
-`before_done_ran_at`, `before_done_verified_at`, `gate_escalated_at`,
-`done_provenance` (`kind='deterministic-deploy'` cross-unit;
-`kind='deterministic-deploy-scheduled'` self-restart).
-
-**`done_provenance.kind='operational-verified'`** — a related but distinct
-closure path, used for `normal`-task no-code operational asks (e.g. a
-restart/redeploy/confirm) closed out via a resolved escalation rather than a
-`DeterministicRunner` action or a code merge. Commitless like the
-`deterministic-*` kinds above, so it is likewise exempt from the
-reopen-freshness gate (that gate only inspects `merged`/`found_on_main`).
-Requires `escalation_id` (the resolving escalation id, recorded **verbatim**
-for Stage-2 audit — no live cross-service lookup) and `note`; accepted only
-from non-recon-stage callers, both on the fresh `done` transition and on the
-same-status `done`→`done` repair path — a recon stage may not self-authorize
-an operational close.
-
-**Dep convention:** deterministic deploys and gates use **normal** deps —
-including cross-project `project_id:task_id` deps. See "Cross-project task
-dependencies" above.
-
-### Milestone tasks (dated / delayed)
-
-`metadata.milestone` is an orthogonal, time-based dispatch gate — **not** a
-new `task_kind`. Setting it holds a task out of dispatch until its time
-trigger fires; once fired, the task dispatches through its normal path
-unchanged. It is allowed on **both** `normal` and `deterministic` tasks
-(orthogonal to `task_kind`), so it can gate a normal LLM-agent task, a
-deterministic predicate check (below), or a pure human gate (a `dated`
-milestone on a deterministic task with `always_escalates=True` and no
-`before_done`).
-
-Two time modes:
-- **`dated`** — fires at an explicit wall-clock instant.
-- **`delayed`** — fires `after_secs` seconds after the task's own
-  dependencies (local deps **and** `metadata.external_deps` — see
-  "Cross-project task dependencies" above) are satisfied.
-
-**`metadata.milestone`** (set at `submit_task`; validated by the shared
-`Milestone` model):
-
-```
-{
-  mode: "dated" | "delayed",
-  at: "<ISO-8601 datetime>",  # required iff mode="dated"; datetime.fromisoformat-parseable; forbidden iff delayed
-  after_secs: <int>,          # required and > 0 iff mode="delayed"; forbidden iff dated
-}
-```
-
-The `mode`-conditional fields are a strict *iff*: a `dated` milestone must
-not also carry `after_secs`, and a `delayed` milestone must not also carry
-`at`. This is enforced by the shared `Milestone` model
-(`shared/src/shared/task_metadata.py`) and re-checked by the `submit_task`
-guard — a malformed spec (`delayed` with no `after_secs`, `dated` with an
-unparseable `at`) is rejected at submit with a structured `ValidationError`
-and never persisted.
-
-**Scheduler-stamped fields** (never author-supplied):
-`milestone_deps_satisfied_at` (`delayed` mode only — the frozen-once
-wall-clock UTC anchor, stamped the first tick all of the task's dependencies
-go `done`) and, only on a predicate check failure, `gate_escalated_at`
-(shared with "Deterministic task kind" above). A task author never sets
-either field.
-
-**Predicate exit-code contract (`before_done.kind`):** `before_done` gains a
-discriminator, `'deploy' | 'predicate'` (default `'deploy'` — every existing
-deterministic task is byte-identical). `kind='deploy'` is the existing
-act-then-done/ask behaviour above; `kind='predicate'` is check-then-done-or-
-escalate, new. In `kind='predicate'` mode the `DeterministicRunner` runs the
-script and decides by **exit code only** — it parses no output:
-
-| Exit code | Outcome |
-|---|---|
-| `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (the script's stdout tail carried as `note`) |
-| non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
-| timeout | born-at-L2 `infra_issue` escalation (existing timeout path) + task `blocked`, **no** `gate_escalated_at` stamp |
-
-A predicate is **read-only**, so resolving the escalation (`resume`) safely
-**re-runs** the check rather than trusting the resolution blindly — it drives
-to `done` or re-files `milestone_check_failed` from whatever the check
-reports this time. `kind='predicate'` **forbids** `before_done.target_unit`
-(no unit to verify — no systemd inspect / PID-verify on a read-only check)
-and forbids top-level `always_escalates=True` (predicate escalation is
-already conditional on a non-zero exit); the `submit_task` guard enforces
-both. A predicate never stamps `before_done_ran_at` / `before_done_verified_at`
-— re-running a read-only check on crash-resume is harmless.
-
-**Frozen-once delayed-anchor semantics:** for `mode='delayed'`, the scheduler
-stamps `milestone_deps_satisfied_at` in a per-tick sweep the first tick ALL
-of the task's dependencies (local and external) are `done`; the timer then
-runs `after_secs` from that anchor. The anchor is a **persisted wall-clock
-UTC ISO string**, not an in-memory/monotonic timer, so a multi-day delay
-**survives orchestrator restarts** — it's recomputed each tick from the
-persisted value, with no in-memory timer to lose. It is frozen-once: a later
-dependency regression never rewrites the anchor or restarts the timer.
-Dispatch still re-checks *live* deps at eligibility, though — a milestone
-fires only when both the timer has elapsed **and** deps are currently
-satisfied, so a regressed dependency still withholds dispatch even after the
-timer elapses. A `delayed` milestone with no dependencies has them trivially
-satisfied at filing, so its timer starts immediately. `mode='dated'` simply
-withholds while `now < at`. A malformed or unrecognized `metadata.milestone`
-value fails safe — withhold dispatch indefinitely, with a one-time WARNING
-log — rather than dispatch early or crash the tick.
-
-**Exemplar** (autonomous — no human involvement unless the check fails):
-"one week after task X lands, check merge flakiness is under 5%, else
-escalate." A deterministic task depending on X, with:
-
-```
-{
-  "milestone": {"mode": "delayed", "after_secs": 604800},  # 7 days
-  "before_done": {
-    "kind": "predicate",
-    "script": "scripts/check_merge_flakiness.sh",
-    "args": ["--window-days", "7", "--threshold", "0.05", "--value", "0.03"],
-    "timeout_secs": 120
-  },
-  "always_escalates": false
-}
-```
-
-(`--value` is normally populated by a wrapper that computes the measured
-rate from CI logs — out of scope here; the script only owns the threshold
-comparison, per its header.) The anchor stamps when X reaches `done`;
-`after_secs` later the check runs. Exit `0` → `done`
-(`deterministic-milestone`); non-zero → `milestone_check_failed` at L2 (same
-`agent_role` / severity / level as "Born-at-L2 escalations" above).
-
-**Cross-refs:** predicate mode is a new `before_done.kind` alongside
-`deploy` and reuses the `DeterministicRunner` — see "Deterministic task
-kind" above. The delayed anchor waits on the same local +
-`metadata.external_deps` dependency gate described in "Cross-project task
-dependencies" above.
-
-### Per-task model pin (`metadata.model_overrides`)
-
-Set `metadata.model_overrides` on a task to pin specific agent roles to a
-specific model for that task only — the highest-precedence layer in the
-orchestrator's route resolver (see "Model Routing" below).
-
-**Shape:** an object mapping full role name → model string:
-
-```
-{
-  "implementer": "opus",
-  "reviewer_comprehensive": "haiku"
-}
-```
-
-**Validation split** — submit-time SHAPE guard vs. resolve-time model
-STRING check, because fused-memory does not know the orchestrator's
-allowlist:
-- `submit_task`/`update_task` shape-validate at write time via
-  `shared.task_metadata.validate_model_overrides` against
-  `KNOWN_ROLE_NAMES` — an unknown role name, or a non-string/empty-string
-  model value, raises `ValidationError` and the write is rejected. The
-  fused-memory `model_overrides_guard` mirrors this at both `submit_task`
-  and `update_task`.
-- The orchestrator resolver separately validates the model *string*
-  against `routing.allowed_models` (and any configured per-model ceiling)
-  at resolve time, fail-safe — see "Model Routing" below.
-
-**Fail-safe semantics:** a well-formed override naming a model outside
-`routing.allowed_models` (or past its configured daily ceiling) is skipped
-at resolve time, recorded in `RoutingDecision.rejected`, WARN-logged, and
-never blocks dispatch — the override is the resolver's highest-precedence
-layer (`metadata_override`) and sets `model` only (never
-effort/budget_usd/max_turns).
-
-**Role-name caveat:** keys must be the full dispatch role name from
-`orchestrator.agents.roles.ROLES` (e.g. `implementer`,
-`reviewer_comprehensive`), not a collapsed config key. `reviewer`,
-`triage`, and `module_tagger` are accepted by the shape guard (
-`KNOWN_ROLE_NAMES` is a superset covering both `ROLES` and `ModelsConfig`'s
-collapsed keys) but are accepted-but-**inert** as override keys — the
-resolver's layer-1 reader keys strictly on the literal `role_name` it was
-invoked with, never the collapsed config key, so an override authored
-under one of these three collapsed keys silently never matches at resolve
-time.
-
-### Task metadata vocabulary & census
-
-`parse_metadata` (`shared/src/shared/task_metadata.py`) validates every
-task's `metadata` blob on read and write and returns a list of
-`SchemaWarning`s for anything it can't reconcile; the write-boundary
-backend logs one WARNING line per warning via `_emit_schema_warning`
-(`fused-memory/src/fused_memory/backends/sqlite_task_backend.py`). This is
-the schema-drift census the enforce-gate runbooks grep.
-
-**Census line and the `code=` discriminator:**
-
-```
-task_metadata.schema_warning task_id=<id> code=<class> field=<key> error=<message>
-```
-
-The literal `task_metadata.schema_warning` token is the stable grep
-anchor — never move or rename it. `code=` is the warning's class
-discriminator (`unknown_key`, `invalid_field`, `invalid_submodel`,
-`unparseable_json`, `not_an_object`, `invalid_metadata`). Separate
-enforcement-relevant classes from routine vocabulary noise with:
-
-`grep 'task_metadata.schema_warning' | grep -v code=unknown_key`
-
-**Tier-B: canonical keys, not aliases.** These aliases are deliberately
-*not* on the blessed allowlist below, so each still emits
-`code=unknown_key` as a greppable drift signal until the caller is fixed
-to use the canonical spelling:
-
-| Canonical | Aliases to avoid |
-|---|---|
-| `prd_path` + `prd_task_label` | `prd`, `prd_ref`, `prd_leaf` |
-| `invariants` | `inv` |
-| `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
-
-**Tier-C: ad-hoc keys.** One-off, timestamped, or id-suffixed annotation
-keys (e.g. `reconciliation_with_5123`) must never be filed as a bespoke
-top-level metadata key — that just adds another `code=unknown_key` census
-line. Use the `x_`-prefixed forward-compat namespace instead (e.g.
-`x_reconciliation_note`) — silently allowed, no warning — or fold the
-value into a single `annotations` field.
-
-**Promoting a convention:** a key only stops warning once it's added to
-the `_BLESSED_METADATA_KEYS` frozenset in
-`shared/src/shared/task_metadata.py` (the Tier-A load-bearing allowlist —
-an allowlist rather than typed optional fields, so `model_dump()` doesn't
-grow `None`-valued noise on every task). Add a key there only for a
-genuinely load-bearing, stable convention; Tier-B/C drift should be fixed
-by renaming to the canonical key or moving under `x_`, not by blessing it.
+All task operations go through **fused-memory MCP tools** — not the
+Taskmaster CLI or Taskmaster MCP directly. This ensures the
+TaskInterceptor emits reconciliation events for state transitions. Use
+`project_root: "/home/leo/src/dark-factory"` for all task operations on
+this repo. Status transitions (`done`, `blocked`, `cancelled`, `deferred`)
+trigger targeted reconciliation automatically.
+
+**When filing a task with dependencies, wire them under
+`planning_mode=True` → `add_dependency` → `commit_planning`** — a plain
+`submit_task` followed by `add_dependency` races the scheduler. Verify a
+filed batch with `get_task` (not `search_tasks`, whose corpus excludes
+`deferred`/uncommitted tasks).
+
+The full task-authoring reference — field shapes, validation rules, and
+dispatch policies for cross-project `"project_id:task_id"` external deps,
+`metadata.delivered_checks` capability gates, the `complexity='simple'`
+fast path, `task_kind='deterministic'` (before_done, always_escalates,
+predicate checks), `metadata.milestone` (dated/delayed), per-task
+`metadata.model_overrides` pins, `done_provenance` kinds, and the
+metadata vocabulary/census (Tier-A blessed keys, Tier-B canonical
+spellings, Tier-C `x_` namespace) — lives in **`docs/task-authoring.md`**.
+Consult it before authoring any of those fields; the shapes are
+validated at write time and a malformed spec is rejected.
 
 ## Model Routing
 
 The orchestrator resolves `(model, effort, budget_usd, max_turns)` for
-every LLM invocation through a single layered resolver,
-`orchestrator.routing.resolve_route` (adopted by `TaskWorkflow._invoke`).
-This section documents the operator-facing `routing.*` config block; see
-"Per-task model pin (`metadata.model_overrides`)" above for the task-author
-knob.
-
-### Config block (`routing.*`)
-
-```yaml
-routing:
-  allowed_models: [haiku, sonnet, opus]   # fail-fast admission list
-  ladder: [haiku, sonnet, opus]           # weakest -> strongest, for "+N" bumps
-  per_model_daily_ceiling_usd: {}         # optional per-model trailing-24h USD ceiling
-  rules: []                               # ordered policy table, first match wins
-```
-
-- **`allowed_models`** — the fail-fast admission list. Defaults to
-  `routing.DEFAULT_ALLOWED_MODELS` (`haiku`, `sonnet`, `opus`) — the
-  single-sourced "allowlist home" both this schema's default and the
-  fail-fast validator read from. Every claude-backend role's configured
-  model (`models.<role>`) and `unblock_auto.model` is validated against
-  this list by `OrchestratorConfig._validate_models_in_allowlist` — a
-  model string outside the list raises a `ValidationError` at config load
-  or reload. `claude-fable-5` is deliberately **not** yet admitted (see
-  "Adaptive-routing substrate" below).
-- **`ladder`** — models ordered weakest → strongest. Defaults to
-  `routing.DEFAULT_LADDER` (same order as `allowed_models` at stock
-  config). Consulted **only** for a policy rule's ladder-relative `"+N"`
-  bump (below); irrelevant to every other layer. A bump clamps at the
-  ladder top; a model absent from `ladder` cannot be bumped from.
-- **`per_model_daily_ceiling_usd`** — optional per-model trailing-24h USD
-  spend ceiling. Empty by default, so the ceiling check never trips and no
-  extra `cost_store` read fires at stock config.
-- **`rules`** — the ordered policy-rule table (first match wins), empty in
-  the schema default — the shipped default rule
-  (`rust-large-plan-implementer`) lives in `defaults.yaml`, not here, so it
-  can be retuned without a code change.
-
-### Closed condition/override vocabulary
-
-Each `RoutingRule` is `{id, match, set}`. Both `match` and `set` use
-`extra='forbid'` — an unrecognized key (e.g. a typo) raises a structured
-`ValidationError` naming the key, at both initial config load and
-hot-reload time. A mis-typed rule condition fails loud, never silently
-matches nothing (or everything).
-
-`match` (all optional; a rule matches iff every condition it sets holds):
-
-| Condition | Matches when |
-|---|---|
-| `role` | `role_name` is a member of this list |
-| `task_complexity` | `task_metadata['complexity']` equals this value |
-| `task_priority` | `task_metadata['priority']` equals this value — **caveat:** reads `metadata['priority']`, NOT the task's top-level `priority` field (where priority actually lives elsewhere in this codebase); populate `metadata['priority']` explicitly if you need this condition to fire |
-| `plan_min_steps` | the task's plan has at least this many steps (requires a plan — a `None` plan_shape fails this and the other two plan conditions) |
-| `plan_min_modules` | the plan touches at least this many modules — counts only `module_prefix`-matched modules when both are set (reproduces the pre-resolver Rust heuristic exactly) |
-| `module_prefix` | at least one plan module path starts with this string |
-| `min_routing_tier` | the task's persisted `routing_tier` counter is at least this value |
-| `min_dispatch_count` | the task's dispatch count is at least this value |
-| `simple_saturated` | `metadata.routing.simple_saturated` equals this bool |
-
-`set` (all optional — a rule may set any subset; unset fields fall through
-to the next-lower layer):
-
-| Field | Notes |
-|---|---|
-| `model` | absolute model string, or ladder-relative `"+N"` (resolved against `ladder`, clamped at the top) |
-| `effort` | reasoning effort |
-| `budget_usd` | per-invocation USD budget |
-| `max_turns` | per-invocation turn cap |
-
-### Layered precedence
-
-`resolve_route` resolves highest-precedence first; each of
-`effort`/`budget_usd`/`max_turns` is resolved independently, field-by-field,
-from the highest layer that specifies it — `source_layer` tracks only
-`model`'s provenance:
-
-1. **`metadata_override`** — `task.metadata.model_overrides[role_name]`, if
-   present (see "Per-task model pin" above). Sets `model` only.
-2. **`policy_rule`** — the first matching rule in `routing.rules` (list
-   order). `rule_id` is recorded as soon as a rule matches, independent of
-   whether its `set.model` goes on to apply.
-3. **`config`** — `config.models` / `budgets` / `max_turns` / `effort`,
-   keyed by role (the `reviewer*` → `reviewer` config-key collapse applies
-   here too).
-4. **`role_default`** — the role's own dataclass defaults. Always
-   available and unconditional — this is the only layer never subject to
-   fail-safe validation, which is why `resolve_route` never raises.
-
-### Fail-safe validation
-
-Whenever layer 3, 2, or 1 would set `model`, the candidate (after
-ladder-relative resolution, if applicable) is checked against
-`routing.allowed_models` and `per_model_daily_ceiling_usd`. On failure,
-that layer's model assignment is skipped — `model`/`source_layer` keep
-whatever the next-lower-precedence layer already validated — and a
-namespaced `"<layer>:<reason>"` string (`model-not-in-allowlist`,
-`model-ceiling-exhausted`, or `model-capacity-exhausted` — the last is the
-per-scope account-capacity check, see "Model-scoped account caps" below) is
-appended to `RoutingDecision.rejected`. **A dispatch is never blocked by a
-routing mis-config.** This validation is scoped to claude-backend roles
-only — a non-claude-backend role's model string is the harness-backend
-PRD's axis and is never checked against this claude-centric
-allowlist/ceiling.
-
-### Model-scoped account caps (`usage_cap.scoped_cap_models`)
-
-`usage_cap.scoped_cap_models: list[str]` (default `['claude-fable-5']`)
-gives the `UsageGate` (`shared/src/shared/usage_gate.py`) a per-(account,
-model) cap dimension layered on top of its existing per-account failover.
-An invocation's **scope** is its model string if that string is listed in
-`scoped_cap_models`, else `None` (general). `scoped_cap_models: []` is the
-**kill switch** — no scope state is ever allocated and every invocation
-resolves to scope `None`, so the gate behaves byte-identically to the
-pre-scope gate.
-
-Scope semantics:
-- **A fable cap-hit does not cap the account's general capacity.** A cap
-  detected on a scoped invocation marks only that account's
-  `scope_caps[model]`; the account-level phase machine is left untouched,
-  so the account keeps serving non-scoped (general) dispatches normally.
-- **Scoped failover.** `before_invoke(scope=m)` skips any account whose
-  scope `m` is capped (and not past its `resets_at`), landing on an account
-  with headroom in that scope; the resulting `failover` cost event's
-  `details` carries `scope: m`.
-- **Account cap dominates.** An account-level CAPPED/AUTH_FAILED excludes
-  the account for **every** scope, including general; a scope cap only ever
-  excludes that one scope. A general cap-hit never writes scope state (the
-  account-level exclusion already covers every scope).
-- **All-scope-capped never freezes the fleet.** If every account is capped
-  for scope `m`, a scoped caller waits on its own wake mechanism (or, at
-  resolve time, the routing resolver degrades — see "Fail-safe validation"
-  above) — it never clears the fleet's pause gate and never delays a
-  concurrent general caller.
-
-`usage_cap.*` is **not** in `RELOADABLE_FIELDS` — like the rest of the
-multi-account failover config, `scoped_cap_models` is restart-tier; a change
-requires a full orchestrator restart, not `mcp__escalation__reload_config`
-(see "Orchestrator Config Reload" above and
-`skills/orchestrate/SKILL.md`'s "Multi-account failover" section).
-
-### Observability
-
-Every resolved invocation emits a `routing_decision` event (`event_store`
-`EventType.routing_decision`) carrying the full `RoutingDecision`
-(model/effort/budget_usd/max_turns, `source_layer`, `rule_id`, `rejected`)
-plus an inputs digest, and mirrors the latest decision to
-`task.metadata.routing` via `TaskWorkflow._record_routing_decision`. The
-mirror (`shared.task_metadata.RoutingState`) stores the latest decision, a
-bounded history (newest 5), a `routing_tier` counter, and a
-`simple_saturated` flag.
-
-### Adaptive-routing substrate (forthcoming automation)
-
-The resolver already supports the `min_routing_tier` and
-`simple_saturated` match conditions and ladder-relative `"+N"` bumps, and
-`metadata.routing` already stores `routing_tier`/`simple_saturated` — this
-is the substrate a later fleet rule (retry-tier escalation, saturation →
-full-path) will consume. **Not yet active on `main`:** the automatic
-retry-tier increment, the `simple_task` saturation auto-stamp,
-`claude-fable-5` admission, and the per-(model×role) rollup in the
-digest/dashboard (done/blocked/cap-hit rates, $/done). Today, operators see
-`routing_decision` events and `metadata.routing` per invocation — not yet
-an auto-escalating ladder or a rendered rollup panel.
+every LLM invocation through a single layered resolver
+(`orchestrator.routing.resolve_route`): per-task
+`metadata.model_overrides` pin → first matching `routing.rules` policy
+rule → per-role config → role default, each layer validated fail-safe
+against `routing.allowed_models` (a dispatch is never blocked by a
+routing mis-config; rejections are recorded on the `routing_decision`
+event and `task.metadata.routing`). `claude-fable-5` is deliberately not
+yet in the stock allowlist. The operator-facing `routing.*` config
+reference (rule vocabulary, ladder bumps, per-model ceilings,
+`usage_cap.scoped_cap_models`) is in **`OPERATIONS.md` §"Model routing"**;
+the task-author pin is in `docs/task-authoring.md`.
 
 ## Session Lifecycle
 
@@ -674,86 +145,32 @@ Use `/memory` for detailed guidance on writing effective memories.
 
 ## Orchestrator Config Reload
 
-`mcp__escalation__reload_config` hot-applies an `orchestrator.yaml` edit to
-a **running** orchestrator process without a restart. It takes no
-arguments — it always re-reads that process's own `ORCH_CONFIG_PATH`,
-never another project's.
-
-**Green tier** (hot-reloadable): per-role `models` / `budgets` /
-`max_turns` / `effort` / `timeouts` / `backends`, `routing.*`
-(`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules` —
-see "Model Routing" above), steward grace (`steward_completion_timeout`,
-`steward_lifetime_budget`), scheduler + watcher tuning, `review.*`
-checkpoint knobs, `unblock_auto.*`, `verify_env`, and the
-`git.offline_lane_*` leaf tunables.
-
-**Red tier** (restart-only — edit is accepted but has no effect until
-restart): `max_concurrent_tasks`, pool sizes / `verify_runners`,
-`escalation` bind host/port, `sandbox.backend`, `project_root`, and the
-merge-lane `git.*` structural fields.
-
-**Reloaded ≠ everything took effect** — always read the returned
-`applied` / `restart_required` dispositions, not just the top-level
-`reloaded` flag. See `plans/config-hot-reload-prd.md` for the full
-allowlist and `skills/orchestrate/SKILL.md`'s "Reload Config (vs Restart)"
-section for the operator workflow.
+`mcp__escalation__reload_config` hot-applies an
+`dark-factory-orchestrator.yaml` edit to a **running** orchestrator
+without a restart (it always re-reads that process's own
+`ORCH_CONFIG_PATH`, never another project's). Green tier (hot-reloadable)
+covers per-role models/budgets/max_turns/effort/timeouts/backends,
+`routing.*`, steward grace, scheduler + watcher tuning, `review.*`,
+`unblock_auto.*`, `verify_env`, and `git.offline_lane_*` leaves; red tier
+(restart-only) covers `max_concurrent_tasks`, pool sizes, escalation
+host/port, `sandbox.backend`, `project_root`, merge-lane `git.*`
+structural fields, and `usage_cap.*`. **Reloaded ≠ everything took
+effect** — always read the returned `applied` / `restart_required`
+dispositions, not just the top-level `reloaded` flag. Full tier lists and
+workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
+`plans/config-hot-reload-prd.md`.
 
 ## Orchestrator Fleet Redeploy
 
-Three restart mechanisms act on the orchestrator fleet and are
-deliberately kept orthogonal — don't conflate them when debugging a
-restart:
-
-- **Liveness = brokenness.** `scripts/orchestrator-watchdog.py`'s `main()`
-  port-probe pass revives a wedged/port-down unit immediately: per-unit,
-  uncapped, not gated by the fleet-deploy clock, and it never stamps that
-  clock. A single wedged-unit revive is not a fleet deploy.
-- **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
-  is the backstop: capped to at most one fleet-wide redeploy per 8h
-  (`orchestrator_restart_min_interval_secs`) via the shared fleet-deploy
-  clock (`data/orchestrator/last_redeploy_orchestrator.json`), and it
-  delegates the actual restart to `scripts/restart-all-orchestrators.sh
-  --drain` — which is drain-aware (defers a unit that's mid-merge,
-  force-restarts it after ~75 min of continuous busy) and stamps the
-  clock only once the restart is fully verified (script exit 0).
-- **Coordinator = the polite, event-driven trigger for that same
-  deploy.** It fires on a clean window, or force-fires after
-  `orchestrator_restart_force_fire_after_secs` (default 4500s / 75 min)
-  of eligibility — bypassing the idle/debounce gates — but honors the
-  identical shared 8h clock, so the coordinator and the watchdog backstop
-  never both redeploy inside the same window.
-
-Both staleness and the coordinator funnel through the single
-`restart-all-orchestrators.sh --drain` chokepoint, so drain behavior and
-clock-stamping are defined once and can't drift between the two triggers.
-
-**Reading `--report`.** Run `scripts/orchestrator-watchdog.py --report`
-to inspect fleet state without touching it — it is strictly read-only
-(zero mutating `systemctl` calls, no clock write). Alongside the existing
-UNIT / START / NEWEST WATCHED COMMIT / VERDICT columns it prints:
-
-- **DEPLOY-AGE** — time since the last *verified* fleet deploy (the
-  shared clock), fleet-wide, rendered in hours; `unknown` if the clock
-  has never been stamped.
-- **MERGE-IDLE** — the unit's current heartbeat classification
-  (`idle` / `busy` / `stale` / `absent`) — the same classification the
-  drain gate itself uses.
-- **WOULD-DEFER** — `yes` iff MERGE-IDLE is `busy`: the one case the next
-  drain-aware deploy would actually hold back. `idle` proceeds
-  immediately; `stale` / `absent` proceed after the drain gate's short
-  unknown-grace.
-
-Reach for `--report` before manually restarting a unit, or to check
-whether an upcoming deploy is likely to be held up by an in-flight merge.
-
-**Soak signal to monitor (not a code premise).** The scheme assumes the
-8h window comfortably exceeds the longest single merge-verify (today,
-Reify verifies run >30 min but well under 8h). If any verify ever
-approaches 8h, the anti-livelock guarantee — a merge started right after
-a deploy survives to the next boundary — weakens. Treat this as an
-operational soak signal to watch, not something enforced in code; see
-`plans/orchestrator-fleet-redeploy-throughput-prd.md` (G6) for the full
-rationale.
+Three deliberately orthogonal restart mechanisms act on the fleet:
+watchdog **liveness** probes (revive a wedged unit immediately, no clock),
+the watchdog **staleness** backstop and the merge-landed **coordinator**
+(both funnel through `scripts/restart-all-orchestrators.sh --drain` and
+share one 8h fleet-deploy clock). Don't conflate them when debugging a
+restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
+read-only) before manually restarting anything. Full model, `--report`
+column reference, and the soak signal to watch:
+**`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
 
 ## Working in the main checkout
 
@@ -774,7 +191,15 @@ directly, not just interactive agents.
 
 ## Reference
 
-- **Design docs**: `DESIGN.md` (architecture), `fused-memory/src/fused_memory/reconciliation/prompts/` (reconciliation stage/judge prompt sources)
+- **User docs**: `README.md` (entry point) · `SETUP.md` (install/onboard)
+  · `OPERATIONS.md` (runbook: skills map, merging, resolve_issue, config
+  reload, model routing, fleet redeploy, troubleshooting)
+  · `ARCHITECTURE.md` (process topology, task lifecycle, agent roles,
+  escalation ladder, merge lane) · `docs/task-authoring.md` (task metadata
+  reference) · `CONTRIBUTING.md` (conventions, quality gates, git workflow)
+- **Design docs**: `DESIGN.md` (fused-memory architecture),
+  `fused-memory/src/fused_memory/reconciliation/prompts/` (reconciliation
+  stage/judge prompt sources), `RECONCILIATION_PLAN.md`
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
-- **Design invariants**: docs/legibility/design-invariants.md — five checkable invariants gating /prd decompose (G7) and /review phase 2
+- **Design invariants**: `docs/legibility/design-invariants.md` — five checkable invariants gating `/prd` decompose (G7) and `/review` phase 2

@@ -387,13 +387,24 @@ declare -A SKILLS=(
   ["orchestrate-references"]="$REPO_ROOT/skills/orchestrate/references"
   ["reflect.md"]="$REPO_ROOT/skills/reflect/SKILL.md"
   ["unblock.md"]="$REPO_ROOT/skills/unblock/SKILL.md"
+  ["unblock-low-risk.md"]="$REPO_ROOT/skills/unblock-low-risk/SKILL.md"
   ["review.md"]="$REPO_ROOT/skills/review/SKILL.md"
   ["review-references"]="$REPO_ROOT/skills/review/references"
   ["review-briefing.md"]="$REPO_ROOT/skills/review-briefing/SKILL.md"
   ["review-briefing-references"]="$REPO_ROOT/skills/review-briefing/references"
   ["escalation-watcher.md"]="$REPO_ROOT/skills/escalation-watcher/SKILL.md"
+  ["recon-escalation-watcher.md"]="$REPO_ROOT/skills/recon-escalation-watcher/SKILL.md"
   ["merge-queue.md"]="$REPO_ROOT/skills/merge-queue/SKILL.md"
+  ["merge-queue-references"]="$REPO_ROOT/skills/merge-queue/references"
+  ["spawn.md"]="$REPO_ROOT/skills/spawn/SKILL.md"
+  ["study.md"]="$REPO_ROOT/skills/study/SKILL.md"
+  ["do.md"]="$REPO_ROOT/skills/do/SKILL.md"
+  ["census.md"]="$REPO_ROOT/skills/census/SKILL.md"
+  ["warm.md"]="$REPO_ROOT/skills/warm/SKILL.md"
 )
+# Deliberately NOT wired: escalation-watcher-auto and unblock-auto are
+# sub-agent-only skills loaded programmatically by the orchestrator/watcher —
+# they are never invoked as slash commands by an operator.
 
 for name in "${!SKILLS[@]}"; do
   target="${SKILLS[$name]}"
@@ -403,6 +414,23 @@ for name in "${!SKILLS[@]}"; do
     ok "$name -> $(basename "$target")"
   else
     warn "Skipping $name — target does not exist: $target"
+  fi
+done
+
+# Directory-form skills (the newer Claude Code Skill mechanism): these three
+# are wired as whole-directory symlinks under ~/.claude/skills/<name> so their
+# references/ and scripts/ travel with them (convention documented in
+# skills/prd/references/project-overlay.md).
+SKILLS_DIR="$HOME/.claude/skills"
+mkdir -p "$SKILLS_DIR"
+for name in factory-init prd hotspot-survey; do
+  target="$REPO_ROOT/skills/$name"
+  link="$SKILLS_DIR/$name"
+  if [ -d "$target" ]; then
+    ln -sfn "$target" "$link"
+    ok "skills/$name -> ~/.claude/skills/$name"
+  else
+    warn "Skipping skills/$name — target does not exist: $target"
   fi
 done
 
