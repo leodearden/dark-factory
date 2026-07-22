@@ -25,6 +25,7 @@ contract file — see the plan's design decisions.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import re
 import sys
@@ -57,6 +58,16 @@ DEFAULT_LOOKBACK = timedelta(hours=48)
 
 DEFAULT_SKEW = timedelta(hours=6)
 """Default clock-skew tolerance for the WEAK mtime fallback window."""
+
+DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
+"""Default transcript archive root — the encoded-cwd dirs Claude Code writes.
+Injected in tests so the real ``~/.claude`` tree is never touched."""
+
+DEFAULT_SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
+"""Default spawn script the ``--check-preventer`` guard reads. Tests always
+pass an explicit ``spawn_script_path`` fixture — never the real committed file
+(which does not carry the ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` token on
+this branch; the preventer lands separately)."""
 
 PREFIX_LEN = 200
 """Number of leading prompt characters used as the strong-match needle. A
@@ -433,3 +444,199 @@ def post_findings(
             '(best-effort, run still exits non-zero): %s', exc,
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# run_check — the timer-invocable check + its CheckResult + main() CLI
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CheckResult:
+    """The outcome of one :func:`run_check` pass.
+
+    ``exit_code`` is the authoritative loud signal (0 healthy, 1 = at least
+    one lost session OR — under ``--check-preventer`` — a failed preventer
+    guard) a systemd/watcher probe surfaces. ``missing`` is the finding list,
+    ``escalated`` whether the best-effort POST succeeded,
+    ``force_persistence_ok`` the preventer verdict (``None`` when not checked),
+    and ``reason`` a human-readable one-line summary.
+    """
+
+    exit_code: int
+    missing: list[MissingTranscript]
+    escalated: bool
+    force_persistence_ok: bool | None
+    reason: str
+
+
+def _load_config(
+    *, config_path: Path | str | None, project_id: str | None,
+) -> config.LegibilityConfig:
+    """Load the project's :class:`LegibilityConfig` from *config_path* or *project_id*.
+
+    ``--config`` takes precedence. Resolving a bare *project_id* lazily
+    imports ``nightly.resolve_config_path`` — only when needed — so the common
+    ``--config`` path never pulls the trickle pipeline (census/codebook/coder/
+    digest) at module load. Raises ``ValueError`` if neither is given.
+    """
+    if config_path is not None:
+        return config.load_config(config_path)
+    if project_id is not None:
+        from legibility import nightly  # lazy: avoid pulling the trickle pipeline
+        return config.load_config(nightly.resolve_config_path(project_id))
+    raise ValueError('run_check requires config_path or project_id')
+
+
+def _read_spawn_script(spawn_script_path: Path | str | None) -> str:
+    """Read the spawn script text best-effort (empty string on any read error).
+
+    An unreadable script yields ``''`` — for which
+    :func:`payload_exports_force_persistence` is ``False``, i.e. the preventer
+    guard fails safe (a missing/unreadable spawn script is not evidence the
+    preventer is in place)."""
+    path = Path(spawn_script_path) if spawn_script_path is not None else DEFAULT_SPAWN_SCRIPT
+    try:
+        return path.read_text(encoding='utf-8')
+    except OSError:
+        return ''
+
+
+def _build_reason(
+    missing: Sequence[MissingTranscript],
+    force_persistence_ok: bool | None,
+    check_preventer: bool,
+) -> str:
+    """Compose the one-line human-readable :attr:`CheckResult.reason`."""
+    parts: list[str] = []
+    if missing:
+        parts.append(
+            f'{len(missing)} completed spawn session(s) ran with NO transcript'
+        )
+    else:
+        parts.append('no lost transcripts detected')
+    if check_preventer:
+        if force_persistence_ok:
+            parts.append('preventer guard present')
+        else:
+            parts.append(
+                'preventer guard FAILED '
+                '(CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 not exported)'
+            )
+    return '; '.join(parts)
+
+
+def run_check(
+    *,
+    config_path: Path | str | None = None,
+    project_id: str | None = None,
+    fleet_root: Path | str | None = None,
+    projects_root: Path | str | None = None,
+    now: datetime | None = None,
+    lookback: timedelta = DEFAULT_LOOKBACK,
+    poster=None,
+    check_preventer: bool = False,
+    spawn_script_path: Path | str | None = None,
+) -> CheckResult:
+    """Run one registry↔transcript reconciliation pass and return a :class:`CheckResult`.
+
+    Loads the project config (``config_path`` preferred; else *project_id*
+    resolved lazily), enumerates the fleet registry under *fleet_root*
+    (default real ``~/.claude/fleet``), and computes the lost-session findings
+    scoped to ``cfg.cwd_prefixes`` against *projects_root* (default
+    ``~/.claude/projects``). When there are findings, best-effort escalates via
+    :func:`post_findings`. When *check_preventer*, additionally evaluates the
+    bonus guard on the spawn script (``spawn_script_path`` or the default);
+    a failed guard is a loud (non-zero exit) signal even with no lost sessions,
+    and — when there are also lost sessions — enriches the escalation detail.
+
+    ``exit_code`` is 1 iff there is at least one lost session OR (under
+    *check_preventer*) the guard fails; else 0. Escalation failure never
+    changes the exit code (the non-zero code is the authoritative signal).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    cfg = _load_config(config_path=config_path, project_id=project_id)
+    root = Path(projects_root) if projects_root is not None else DEFAULT_PROJECTS_ROOT
+
+    records = iter_registry_records(fleet_root=fleet_root)
+    missing = find_missing_transcripts(
+        records, root, cfg.cwd_prefixes, now=now, lookback=lookback,
+    )
+
+    force_persistence_ok: bool | None = None
+    if check_preventer:
+        force_persistence_ok = payload_exports_force_persistence(
+            _read_spawn_script(spawn_script_path)
+        )
+    preventer_failed = check_preventer and force_persistence_ok is False
+
+    escalated = False
+    if missing:
+        escalated = post_findings(
+            cfg, missing, force_persistence_ok=force_persistence_ok, poster=poster,
+        )
+
+    exit_code = 1 if (missing or preventer_failed) else 0
+    reason = _build_reason(missing, force_persistence_ok, check_preventer)
+    return CheckResult(
+        exit_code=exit_code,
+        missing=missing,
+        escalated=escalated,
+        force_persistence_ok=force_persistence_ok,
+        reason=reason,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entrypoint — what a systemd ``ExecStart`` / operator / watcher runs.
+
+    Mirrors ``nightly.py``'s ``run`` subcommand flags. Exactly one of
+    ``--config`` or ``--project-id`` identifies the project. Prints the
+    one-line reason (to stderr on a non-zero exit, stdout otherwise) and
+    returns :attr:`CheckResult.exit_code`. Uses the default (real httpx)
+    poster — a down escalation server is swallowed best-effort, the non-zero
+    exit remains the authoritative loud signal.
+    """
+    parser = argparse.ArgumentParser(
+        prog='check_transcript_persistence.py',
+        description='Legibility registry<->transcript reconciliation detector (task 2893).',
+    )
+    parser.add_argument('--config', default=None, help="Path to the project's legibility.yaml.")
+    parser.add_argument(
+        '--project-id', default=None, help='Project id, resolved via resolve_config_path.',
+    )
+    parser.add_argument(
+        '--projects-root', default=None,
+        help='Root dir of encoded session transcripts (default: ~/.claude/projects).',
+    )
+    parser.add_argument(
+        '--fleet-root', default=None,
+        help='Fleet session-registry root (default: ~/.claude/fleet).',
+    )
+    parser.add_argument(
+        '--lookback-hours', default=48.0, type=float,
+        help='Registry lookback window in hours (default: 48).',
+    )
+    parser.add_argument(
+        '--check-preventer', action='store_true',
+        help='Also assert spawn-claude.sh exports CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1.',
+    )
+    args = parser.parse_args(argv)
+
+    if not args.config and not args.project_id:
+        parser.error('requires --config or --project-id')
+
+    result = run_check(
+        config_path=args.config,
+        project_id=args.project_id,
+        projects_root=args.projects_root,
+        fleet_root=args.fleet_root,
+        lookback=timedelta(hours=args.lookback_hours),
+        check_preventer=args.check_preventer,
+    )
+    print(result.reason, file=sys.stderr if result.exit_code else sys.stdout)
+    return result.exit_code
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
