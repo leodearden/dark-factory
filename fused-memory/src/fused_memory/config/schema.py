@@ -807,6 +807,17 @@ class ReconciliationConfig(BaseModel):
     # do not re-halt within this window. Belt-and-braces on top of grace_cycles
     # in case the operator intervenes mid-cycle.
     halt_cooldown_seconds: float = Field(default=1800.0)
+    # Judge transport/infra-failure tolerance (task 2947 ask a). Bounds the
+    # number of CONSECUTIVE judge CLI transport/infra failures (api_error,
+    # timeout, cap-wait exhaustion, etc. — NOT genuinely-malformed reachable
+    # content) a project may accumulate before review_run applies a truthful
+    # judge-unreachable halt and routes an infra_issue escalation. Below this
+    # threshold each infra failure is bounded backoff: no verdict is stamped
+    # and no halt fires (the transient outage is given room to recover). Any
+    # successful transport (a parsed verdict) resets the per-project counter.
+    # Gated on halt_on_judge_serious, same master switch as the serious-verdict
+    # halt. ge=1 → a value of 1 halts on the first infra failure.
+    judge_infra_max_consecutive_failures: int = Field(default=3, ge=1)
 
     # Escalation
     escalation_port: int = Field(default=8103)
