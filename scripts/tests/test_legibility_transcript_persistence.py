@@ -149,3 +149,70 @@ def test_find_completed_spawn_records_filters(tmp_path):
     )
 
     assert {r.session_slug for r in kept} == {"good-exited", "good-failed"}
+
+
+# ---------------------------------------------------------------------------
+# step-3/4: STRONG prompt-prefix matching (find_matching_transcript)
+# ---------------------------------------------------------------------------
+
+_USABLE_PROMPT = (
+    "Investigate the flaky merge on task 2500 and report your findings "
+    "back to the orchestrator."
+)
+
+
+def _spawn_record(slug: str, cwd: str, prompt: str, *, start_offset_hours: int = 1):
+    return session_registry.SessionRecord(
+        session_slug=slug,
+        status=session_registry.Status.EXITED,
+        prompt=prompt,
+        cwd=cwd,
+        start_ts=_iso(FIXED_NOW - timedelta(hours=start_offset_hours)),
+        exit_code=0,
+    )
+
+
+def test_find_matching_transcript_strong_prompt_prefix(tmp_path):
+    projects = tmp_path / "projects"
+    cwd = "/home/leo/src/dark-factory/.worktrees/2500"
+    rec = _spawn_record("sess-strong", cwd, _USABLE_PROMPT)
+
+    match_path = _write_transcript(projects, cwd, "sess-strong.jsonl", _USABLE_PROMPT)
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == match_path
+
+
+def test_find_matching_transcript_sibling_only_returns_none(tmp_path):
+    # Same-cwd confound: a SIBLING headless-agent transcript in the SAME
+    # encoded-cwd dir, with a DIFFERENT first user turn, must NOT satisfy the
+    # per-session match — the usable-prompt record is correctly flagged MISSING.
+    projects = tmp_path / "projects"
+    cwd = "/home/leo/src/dark-factory/.worktrees/2500"
+    rec = _spawn_record("sess-missing", cwd, _USABLE_PROMPT)
+
+    _write_transcript(
+        projects, cwd, "sibling-agent.jsonl",
+        "You are a TDD implementer. Execute the structured plan step by step.",
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
+
+
+def test_find_matching_transcript_missing_dir_returns_none(tmp_path):
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    rec = _spawn_record(
+        "sess-nodir", "/home/leo/src/some-other-project",
+        "A substantive prompt that is definitely long enough to be usable.",
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got is None
