@@ -222,6 +222,8 @@ def _build_env(
 class TestDetectVerifiedGreen:
     """Async shape check for detect_verified_green (PRD §2.1)."""
 
+    pytestmark = pytest.mark.asyncio
+
     async def test_positive_match(self, tmp_path: Path) -> None:
         from orchestrator.stranded_verified_green import (
             VerifiedGreenMatch,
