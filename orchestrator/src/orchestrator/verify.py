@@ -1835,6 +1835,19 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
 _MERGE_NO_EVIDENCE_CATEGORY = 'merge_no_evidence'
 
 
+def _trivial_pass_reason(existing_files: list[str]) -> str:
+    """INV-1 (task 2883) escalation reason for a no-source merge-gate resolution.
+
+    Single source of truth so Site 1 (module_configs branch) and Site 2
+    (no-module_configs branch) label the escalation IDENTICALLY:
+    ``'empty_existing_files'`` when the changed set resolved to nothing on disk
+    (e.g. an ENOENT-clobbered worktree, incident 83336a32) — distinguishing
+    evidence-absence from a genuine ``'no_source_files'`` docs-only diff.
+    (The global-tail backstop uses its own fixed ``'empty_command_set'`` reason.)
+    """
+    return 'empty_existing_files' if not existing_files else 'no_source_files'
+
+
 def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
     """Build the INV-1 loud-FAIL VerifyResult for a merge gate that resolved to
     'nothing to run' with no full-gate command to escalate to (task 2883).
@@ -5055,10 +5068,7 @@ async def run_scoped_verification(
                             # when at least one module carries a real command;
                             # otherwise it FAILs loud rather than vouching for a
                             # tree no gate ever ran on.
-                            reason = (
-                                'empty_existing_files' if not existing_files
-                                else 'no_source_files'
-                            )
+                            reason = _trivial_pass_reason(existing_files)
                             if any(
                                 mc.test_command or mc.lint_command
                                 or mc.type_check_command
@@ -5236,10 +5246,7 @@ async def run_scoped_verification(
                     # tail which runs config.test_command/lint/type). If NO global
                     # command exists, FAIL loud INLINE so the global-tail backstop
                     # never double-emits.
-                    reason = (
-                        'empty_existing_files' if not existing_files
-                        else 'no_source_files'
-                    )
+                    reason = _trivial_pass_reason(existing_files)
                     if (
                         config.test_command
                         or config.lint_command
