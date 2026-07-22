@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.reconciliation.standing_decision_constants import (
+    MEM0_KIND_INVESTIGATION_OUTCOME,
+)
 from fused_memory.reconciliation.standing_decision_writer import (
     evaluate_evidence_gate,
 )
@@ -17,6 +20,15 @@ from fused_memory.reconciliation.standing_decision_writer import (
 _PROJECT_ID = 'dark_factory'
 _ENTITY_UUID = 'aaaaaaaa-1111-1111-1111-111111111111'
 _MEM0_REF_ID = 'bbbbbbbb-2222-2222-2222-222222222222'
+
+
+def _outcome(run_id):
+    """An investigation_outcome mem0 record dict as returned by the metadata
+    scroll; *run_id* of None models a record whose metadata omits run_id."""
+    metadata = {'kind': MEM0_KIND_INVESTIGATION_OUTCOME, 'actionable': False}
+    if run_id is not None:
+        metadata['run_id'] = run_id
+    return {'id': f'oc-{run_id}', 'created_at': '2026-07-01T00:00:00+00:00', 'metadata': metadata}
 
 
 def _memory_service(*, memory_record=None, metadata_records=None):
@@ -118,3 +130,96 @@ class TestEvidenceGateArm1:
         assert result.satisfied is False
         stamped = result.resolved_evidence[0]
         assert stamped['locally_resolved'] is False
+
+
+class TestEvidenceGateArm2:
+    """Arm 2 — ≥3 DISTINCT investigation_outcome run_ids for this entity."""
+
+    @pytest.mark.asyncio
+    async def test_filters_the_scroll_on_kind_entity_and_actionable_false(self):
+        """The arm-2 scroll queries get_memories_by_metadata with exactly
+        {kind: investigation_outcome, entity_uuid, actionable: False}."""
+        service = _memory_service(metadata_records=[])
+        await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        service.get_memories_by_metadata.assert_called_once_with(
+            _PROJECT_ID,
+            {
+                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+                'entity_uuid': _ENTITY_UUID,
+                'actionable': False,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_three_distinct_run_ids_satisfy_arm2_without_evidence(self):
+        """3 investigation_outcome records with 3 distinct run_ids satisfy arm 2
+        (count==3) and thus the whole gate, even with empty cited evidence."""
+        service = _memory_service(
+            metadata_records=[_outcome('run-a'), _outcome('run-b'), _outcome('run-c')]
+        )
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        assert result.arm2_distinct_run_count == 3
+        assert result.arm2_satisfied is True
+        assert result.satisfied is True
+
+    @pytest.mark.asyncio
+    async def test_three_records_two_distinct_run_ids_does_not_satisfy_arm2(self):
+        """3 records collapsing to only 2 distinct run_ids do NOT satisfy arm 2."""
+        service = _memory_service(
+            metadata_records=[_outcome('run-a'), _outcome('run-a'), _outcome('run-b')]
+        )
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        assert result.arm2_distinct_run_count == 2
+        assert result.arm2_satisfied is False
+        assert result.satisfied is False
+
+    @pytest.mark.asyncio
+    async def test_records_missing_run_id_are_not_counted(self):
+        """Records whose metadata omits (or empties) run_id cannot establish
+        independence and are excluded from the distinct count."""
+        service = _memory_service(
+            metadata_records=[
+                _outcome('run-a'),
+                _outcome('run-b'),
+                _outcome(None),
+                _outcome(''),
+            ]
+        )
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        assert result.arm2_distinct_run_count == 2
+        assert result.arm2_satisfied is False
+
+    @pytest.mark.asyncio
+    async def test_no_investigation_outcomes_yields_zero(self):
+        """An empty investigation_outcome pool (day-one) yields count 0, arm 2
+        unsatisfied."""
+        service = _memory_service(metadata_records=[])
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        assert result.arm2_distinct_run_count == 0
+        assert result.arm2_satisfied is False
+        assert result.satisfied is False
