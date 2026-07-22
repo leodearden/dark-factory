@@ -1837,6 +1837,7 @@ async def _run_post_merge_verify(
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
+    halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
     depth: int | None = None,
@@ -1909,6 +1910,20 @@ async def _run_post_merge_verify(
             (``is_flock_contention_failure``); has no effect on any other
             failure path.  None-safe — omitting it keeps every existing
             call site byte-identical.
+        halt_hook: Optional synchronous all-lane merge-queue halt (task 2886
+            fix 3, PRD §3.4 / decision 4).  Invoked with a human-readable
+            reason string the instant a CONCLUDED cross-check divergence
+            (remote PASS / local trust-anchor FAIL) is detected — BEFORE the
+            local FAIL is adopted and the blocked outcome returns — so no
+            FURTHER adoption can occur before a human looks.  Only the
+            production ``SpeculativeMergeWorker._run_inflight_verify`` call
+            site passes ``self.operator_halt``; every other (module-level,
+            test-local) caller omits it (default ``None`` → no halt), keeping
+            them byte-identical.  Cross-check REMAINS a trailing detector, not
+            a pre-adoption gate (pre-gating every remote-sole verdict would
+            double Lever-C cost); the halt is synchronous purely so it
+            precedes any further adoption — incident 83336a32 halted +3s too
+            late via the async escalation gate.
         dry_run_handles: Opaque bundle of scheduler/mcp/usage_gate/cost_store
             (task η, AFK coverage gap).  ``None`` (default) keeps the
             solo-reverify and train module-level callers byte-identical (no
@@ -2320,9 +2335,32 @@ async def _run_post_merge_verify(
                     )
             else:
                 # DIVERGE — remote PASS / local trust-anchor FAIL.  Fail-closed:
-                # quarantine the remote, file a dedup'd blocking escalation
-                # (mirrors DriftDetector's shape), and adopt the local FAIL
-                # verdict so the not-passed path below withholds the land.
+                # HALT the queue synchronously, quarantine the remote, file a
+                # dedup'd born-at-L2 escalation (mirrors the shadow-divergence
+                # shape), and adopt the local FAIL verdict so the not-passed path
+                # below withholds the land.
+                #
+                # task 2886 fix 3 (PRD §3.4 / decision 4): a CONCLUDED divergence
+                # means main is SUSPECTED-RED — a 'human must look now' condition
+                # (INV-5).  Call halt_hook FIRST, synchronously, right here —
+                # BEFORE quarantine/escalation and BEFORE adopting the local FAIL
+                # / returning the blocked outcome — so no FURTHER adoption can
+                # occur before a human looks.  The async escalation-queue gate is
+                # only checked at the NEXT merger iteration, so it TRAILS adoption:
+                # incident 83336a32 diverged +3s AFTER CAS-advance.  Fire it
+                # unconditionally (before the escalation dedup guard) — a re-halt
+                # is idempotent, and every concluded divergence must halt even if
+                # a prior alarm is still open.  Cross-check REMAINS a TRAILING
+                # detector, not a pre-adoption gate (pre-gating every remote-sole
+                # verdict would double Lever-C cost); the halt is synchronous
+                # purely so it precedes any further adoption.  None-safe: only the
+                # production worker call site threads self.operator_halt.
+                if halt_hook is not None:
+                    halt_hook(
+                        f'cross-check divergence for {merge_sha}: remote '
+                        f'{runner.name} PASS / local trust-anchor FAIL — '
+                        f'suspected red main'
+                    )
                 if quarantine is not None:
                     quarantine.add(runner.name)
                 if (
@@ -2336,12 +2374,17 @@ async def _run_post_merge_verify(
                         id=escalation_queue.make_id(_CROSS_CHECK_SENTINEL),
                         task_id=_CROSS_CHECK_SENTINEL,
                         agent_role='orchestrator-cross-check',
-                        severity='blocking',
-                        level=1,
+                        # Born-at-L2 (task 2886 fix 3): a suspected-red main is a
+                        # human-must-look-now condition — critical severity is in
+                        # BORN_AT_L2_SEVERITIES so it is born at level 2, mirroring
+                        # the warm/cold shadow-divergence alarm.
+                        severity='critical',
+                        level=2,
                         category='verify_cross_check_mismatch',
                         summary=(
                             f'Cross-check divergence for {merge_sha}: '
-                            f'remote={runner.name!r} PASS / local trust-anchor FAIL'
+                            f'remote={runner.name!r} PASS / local trust-anchor FAIL '
+                            f'— merge queue HALTED, main suspected-red'
                         ),
                         detail=(
                             f'merge_sha={merge_sha!r} remote_runner={runner.name!r} '
@@ -2349,11 +2392,17 @@ async def _run_post_merge_verify(
                             f'(summary={local_verify.summary!r}, '
                             f'category={local_verify.category!r}). A remote PASS / local '
                             f'FAIL split can land unverified code on main; the land is '
-                            f'withheld and {runner.name!r} is quarantined.'
+                            f'withheld and {runner.name!r} is quarantined.  The merge '
+                            f'queue has been HALTED synchronously and main is SUSPECTED '
+                            f'RED pending human review — no further land can proceed '
+                            f'until an operator confirms main is green and un-halts the '
+                            f'queue.'
                         ),
                         suggested_action=(
-                            'Re-prove the remote host env (run_verdict_parity) and clear '
-                            'its quarantine once parity is restored; investigate why the '
+                            'Confirm whether main is actually red at this commit; if so, '
+                            'roll it back.  Re-prove the remote host env '
+                            '(run_verdict_parity) and clear its quarantine once parity is '
+                            'restored, then un-halt the merge queue.  Investigate why the '
                             'remote green disagreed with the local trust-anchor.'
                         ),
                     ))
@@ -12914,6 +12963,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
+                # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
+                # all-lane halt so a CONCLUDED cross-check divergence stops the
+                # queue the instant it is detected — BEFORE any further adoption —
+                # instead of trailing it via the async escalation gate (incident
+                # 83336a32 halted +3s too late).  Cross-check stays a trailing
+                # detector; the halt is synchronous only to precede further lands.
+                halt_hook=self.operator_halt,
                 dry_run_handles=self._dry_run_handles,
                 main_health_probe_handles=_MainHealthProbeHandles(
                     background_tasks=self._background_tasks,
