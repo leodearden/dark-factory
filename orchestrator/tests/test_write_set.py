@@ -78,6 +78,7 @@ class TestComputeWriteSetHappyPath:
 
     def test_writeset_is_frozen(self, worktree: Path, tmp_home: Path):
         ws = compute_write_set(worktree, home=tmp_home)
+        assert isinstance(ws, WriteSet)
         with pytest.raises(dataclasses.FrozenInstanceError):
             ws.worktree = Path('/tmp/other')  # type: ignore[misc]
 
