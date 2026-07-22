@@ -8714,3 +8714,103 @@ class TestMergeGateClobberedWorktree:
         assert len(evs) == 1, f'Expected exactly one escalation event; got {rec.events}'
         assert evs[0][3]['reason'] == 'empty_existing_files', evs[0][3]
         assert evs[0][3]['resolution'] == 'loud_fail', evs[0][3]
+
+
+class TestTrivialPassEscalatedEventContract:
+    """Pins the trivial_pass_escalated event data shape AND that the gate is
+    exactly role=='merge' AND is_merge_verify — the baseline-probe shape
+    (role='merge', is_merge_verify=False) and the task role emit NO event and
+    keep the legacy should_override / _trivial_pass behaviour."""
+
+    def _config_with_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, test_command='__scope_all_cmd__')
+
+    def _config_no_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path, test_command='', lint_command='', type_check_command='',
+        )
+
+    def _write_docs(self, tmp_path: Path) -> None:
+        docs = tmp_path / 'docs'
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / 'x.md').write_text('# doc\n')
+
+    @pytest.mark.asyncio
+    async def test_full_gate_event_shape(self, tmp_path: Path, guard_spy):
+        """(a) merge gate + no-source diff + global command → one event
+        {reason:'no_source_files', resolution:'full_gate'}, measured_at present."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, _calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                tmp_path, self._config_with_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='merge', is_merge_verify=True,
+                event_store=rec,
+            )
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, rec.events
+        _etype, _tid, erole, data = evs[0]
+        assert data['reason'] == 'no_source_files', data
+        assert data['resolution'] == 'full_gate', data
+        assert data.get('measured_at'), data
+        assert erole == 'merge', erole
+
+    @pytest.mark.asyncio
+    async def test_loud_fail_event_shape(self, tmp_path: Path, guard_spy):
+        """(b) merge gate + no command → event resolution='loud_fail'."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, _calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                tmp_path, self._config_no_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='merge', is_merge_verify=True,
+                event_store=rec,
+            )
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, rec.events
+        assert evs[0][3]['resolution'] == 'loud_fail', evs[0][3]
+
+    @pytest.mark.asyncio
+    async def test_baseline_probe_shape_no_event_and_trivial_passes(self, tmp_path: Path, guard_spy):
+        """(c) role='merge' but is_merge_verify=False (baseline-probe shape) →
+        NO event; the legacy guard-absent trivial pass is preserved."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, self._config_with_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='merge',  # is_merge_verify defaults False
+                event_store=rec,
+            )
+        assert rec.events_of(EventType.trivial_pass_escalated) == []
+        assert result.passed
+        assert result.trivial is True, (
+            f'baseline-probe shape must keep the legacy trivial pass; got {result.trivial}'
+        )
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_task_role_no_event(self, tmp_path: Path, guard_spy):
+        """(d) role='task' → NO event."""
+        from orchestrator.event_store import EventType
+
+        self._write_docs(tmp_path)
+        fake_run_cmd, _calls = guard_spy
+        rec = _RecordingEventStore()
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path, self._config_with_cmd(tmp_path), [],
+                task_files=['docs/x.md'], role='task', is_merge_verify=True,
+                event_store=rec,
+            )
+        assert rec.events_of(EventType.trivial_pass_escalated) == []
+        assert result.trivial is True
