@@ -12616,6 +12616,7 @@ class TestMemoryConsolidatorEntityStandingDecision:
         assert matching not in (report.items_flagged or [])
         # …but it must NOT be acknowledged as resolved (recurrence preserved).
         ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
         resolved = ack_mock.await_args.kwargs.get('resolved_flags', [])
         assert matching not in resolved
 

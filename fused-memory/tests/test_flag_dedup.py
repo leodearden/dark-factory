@@ -8,7 +8,7 @@ import json
 import logging
 import uuid as _uuid_mod
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -18,6 +18,10 @@ from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation import flag_dedup
 from fused_memory.reconciliation.flag_dedup import build_suppression_payload
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -6863,11 +6867,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
 #
 # _extract_uuids / _flag_text_blob / _flag_type_in_grounds_family are the three
 # pure, sync building blocks the FALLBACK (stamps-omitted) match path composes.
-# RED until step-2 defines the regex + helpers.
-
-from fused_memory.reconciliation.standing_decision_constants import (
-    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-)
+# (Constants imported at module top.)
 
 # Deterministic sample UUIDs (canonical 8-4-4-4-12 hex form).
 _ESD_U1 = 'b0057f3d-1234-4abc-8def-0123456789ab'
@@ -7246,12 +7246,7 @@ class TestFilterEntityStandingDecisionsFallback:
 # ---------------------------------------------------------------------------
 # maybe_escalate_suppression_storm (Hook A storm escape / γ, task 2896) — step-7
 # ---------------------------------------------------------------------------
-
-from unittest.mock import MagicMock
-
-from fused_memory.reconciliation.standing_decision_constants import (
-    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-)
+# (MagicMock and SUPPRESSION_STORM_THRESHOLD_PER_CYCLE imported at module top.)
 
 
 def _fake_escalation_queue(*, has_open_l1: bool = False) -> MagicMock:
