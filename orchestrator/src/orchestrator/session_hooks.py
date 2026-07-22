@@ -867,6 +867,33 @@ def _resolve_wm_window_id(
     return None
 
 
+def _canonical_window_id(raw: str | None) -> str | None:
+    """Canonicalize a window id to wmctrl -l's zero-padded ``0x%08x`` form.
+
+    ``int(raw, 0)`` base-autodetects, so a bare DECIMAL ``$WINDOWID`` (what a
+    real terminal emulator exports, e.g. ``'52428807'``) and an already-hex
+    id (e.g. ``'0x3200007'``) both parse to the same integer, which is then
+    reformatted as ``0x%08x`` -- byte-identical to wmctrl -l's own
+    ``0x%08lx`` first column (e.g. ``'0x03200007'``). This makes a captured
+    id self-consistent with the marker path (``_resolve_wm_window_id``, which
+    already returns wmctrl's canonical column) and with every string-consumer
+    (the window-gone reaper, dashboards). Fail-soft: a missing (``None``) or
+    unparseable id returns ``None`` so the caller can fall back to the raw
+    value rather than crashing the hook.
+
+    NOTE: this parse/canonicalize logic is mirrored (duplicated, not
+    shared/imported, since cockpit must never import orchestrator -- see
+    ``cockpit/src/cockpit/backends/base.py``'s docstring) in
+    ``cockpit/src/cockpit/backends/wm.py::_window_id_int``, which keys on the
+    identical ``int(s, 0)`` contract (there returning the int; here the
+    canonical string). Keep the two in sync.
+    """
+    try:
+        return f'0x{int(raw, 0):08x}'  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
 def _resolve_display(
     env: Mapping[str, str],
     title: str,
@@ -909,10 +936,12 @@ def _resolve_display(
             tmux_target=env.get('TMUX_PANE') or None,
         )
     if env.get('WINDOWID'):
+        # Canonicalize to wmctrl's 0x%08x column form (a real emulator exports
+        # $WINDOWID DECIMAL); fall back to the raw value if it won't parse.
         return session_registry.Display(
             kind=session_registry.DisplayKind.WM.value,
             wm_title=title,
-            wm_window_id=env.get('WINDOWID'),
+            wm_window_id=_canonical_window_id(env.get('WINDOWID')) or env.get('WINDOWID'),
         )
     marker = env.get('CLAUDE_SPAWN_WM_TITLE') if allow_spawn_marker else None
     if marker:
