@@ -222,6 +222,20 @@ class WarmLanePool:
 
     # ── Read-only helpers ──────────────────────────────────────────────────
 
+    def lane_paths(self) -> list[Path]:
+        """Return every pool lane Path in insertion order (``_lane-0 .. _lane-{N-1}``).
+
+        A public, git-free snapshot of the lane keys used by
+        ``GitOps.prewarm_pool`` to iterate EVERY lane — including the
+        high-numbered ones a lazy acquire never demands — without reaching
+        into the private ``_lanes`` dict.  The list is a fresh copy of the
+        dict keys (dict insertion order is stable), so the caller may iterate
+        it freely; ``list(...)`` contains no ``await`` point, so no concurrent
+        acquire/release coroutine can interleave during the copy (single
+        asyncio loop) and no lock is needed.  Returns ``[]`` for a size-0 pool.
+        """
+        return list(self._lanes.keys())
+
     def is_lane(self, path: Path) -> bool:
         """Return True if *path* (resolved) is a known pool lane."""
         return self._match_lane(path) is not None

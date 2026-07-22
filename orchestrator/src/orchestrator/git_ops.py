@@ -50,7 +50,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -612,6 +612,42 @@ class WorktreeInfo:
     base_commit: str
     stale_commits: int | None = None
     reify_debug_port: int | None = None
+
+
+@dataclass
+class PoolPrewarmResult:
+    """Structured outcome of :meth:`GitOps.prewarm_pool` (task 2879).
+
+    Makes an under-provisioned warm-lane pool observable at startup — the
+    VISIBLE SIGNAL the task requires so a disk/floor shortfall can never
+    silently cap the pool below ``effective_N``:
+
+    * ``target`` — the number of pool lanes prewarm attempted to materialize
+      (``len(warm_lane_pool.lane_paths())`` == ``effective_N``).
+    * ``already_resident`` — lanes already registered on disk, left untouched
+      (no worktree add, no reseed) — the idempotent resident-skip count.
+    * ``materialized`` — lanes freshly created + seeded this pass.
+    * ``failed`` — lanes that could not be materialized (worktree-add or seed
+      failure); each half-created worktree is torn down and NOT left resident.
+    * ``failures`` — per-lane ``(lane, rc)`` diagnostics for every failed lane
+      (``rc`` is the ``git worktree add`` exit code or the ``_seed_warm_lane``
+      rc — e.g. 75 disk-pressure, 127 seed-script-absent).
+
+    Invariant: ``already_resident + materialized + failed == target`` after a
+    full pass.  Two early returns are the exceptions: the disabled-pool no-op
+    (``warm_lane_pool is None``) returns ``PoolPrewarmResult(target=0)``, and
+    the ABSENT-base short-circuit returns ``target == len(lanes)`` with all
+    three counters zeroed — no lane is touched because the CoW seed base is
+    provably missing, so that early return does NOT satisfy the invariant (it
+    logs its own dedicated base-absent WARNING instead of the shortfall one).
+    When ``already_resident + materialized < target`` after a full pass the
+    pool could not reach ``effective_N`` and prewarm logs a shortfall WARNING.
+    """
+    target: int
+    already_resident: int = 0
+    materialized: int = 0
+    failed: int = 0
+    failures: list[tuple[Path, int]] = field(default_factory=list)
 
 
 # Validation for create_interactive_worktree's slug argument.  slug is
@@ -4137,6 +4173,235 @@ class GitOps:
         return await self._acquire_warm_lane_impl(
             branch_name, start_ref, expected_title=expected_title,
         )
+
+    async def prewarm_pool(self, start_ref: str) -> PoolPrewarmResult:
+        """Eagerly materialize every pool lane to its at-rest idle state (task 2879).
+
+        ROOT CAUSE this addresses: the warm-lane pool is provisioned LAZILY —
+        ``WarmLanePool`` builds ``effective_N`` FREE lanes in memory, but the
+        on-disk ``git worktree add`` for each ``_lane-k`` happens only inside
+        the acquire create-once branch, the first time that specific lane is
+        acquired.  Since acquire hands out the lowest-numbered FREE lane first,
+        a high-numbered lane materializes on disk only when that many lanes are
+        simultaneously ASSIGNED — so on a host peaking below ``effective_N``
+        the spare lanes are never demanded, never created, and the intended
+        headroom is a phantom (present in the in-memory state machine, absent
+        on disk).
+
+        ``prewarm_pool`` closes that gap: for each lane not already registered
+        it runs ``git worktree add --detach <lane> <start_ref>`` then
+        :meth:`_seed_warm_lane` ``--fresh-checkout``, leaving the pool slot
+        FREE.  A prewarmed lane is byte-identical to a RELEASED idle lane (a
+        registered worktree on a DETACHED HEAD — no ``task/...`` branch — with
+        a seeded ``target/``), so the EXISTING reset-in-place acquire path
+        adopts it unchanged: a brand-new task id has no orphan commits, so
+        ``_reset_warm_lane`` does ``checkout -f -B task/<id> start_ref`` from
+        the detached HEAD.
+
+        Contract:
+        - **No-op when the pool is disabled** (``warm_lane_pool is None``) —
+          returns ``PoolPrewarmResult(target=0)``.  Callers still gate on
+          ``warm_lane_pool is not None``; this keeps the method safe to call
+          unconditionally.
+        - **ABSENT-base short-circuit** — mirrors acquire's pre-acquire gate:
+          when :meth:`_warm_lane_base_resolvable` is
+          :attr:`WarmBaseHealth.ABSENT` (a provably missing/empty CoW seed
+          base — a HOST-SCOPED condition, one base serves every lane), logs a
+          WARNING and returns without touching any lane
+          (``materialized == 0``).
+        - **SEQUENTIAL** — ``git worktree add`` serializes on a repo-level
+          administrative lock and concurrent adds from the same
+          ``project_root`` transiently fail during a warm-up burst (the
+          codebase already guards this for ``_spec-`` lanes via
+          ``_spec_wt_create_lock``).  Startup is not latency-critical, and
+          sequential creation also bounds the transient disk pressure of a
+          create+seed burst.
+        - **Idempotent** — a lane already registered on disk is counted
+          ``already_resident`` and left completely untouched (no worktree add,
+          no reseed), so prewarm is safely re-entrant across restarts and
+          after the startup reconcile sweeps have restored existing lanes.
+        - **Leaves every slot FREE** — prewarm materializes, it does NOT
+          assign; it never calls ``acquire_for``/``note_assignment``.
+
+        Returns a :class:`PoolPrewarmResult` (target / already_resident /
+        materialized / failed / failures).
+
+        Fail-open by contract — this method never raises.  A per-lane
+        worktree-add or seed failure is logged, the half-created worktree
+        torn down (:meth:`_teardown_prewarm_lane`), recorded in ``failures``,
+        counted, and the loop continues to the next lane.  After the loop, a
+        shortfall (``already_resident + materialized < target``) emits ONE
+        summary WARNING — the VISIBLE SIGNAL that the pool could not reach
+        ``effective_N``.
+        """
+        pool = self.warm_lane_pool
+        if pool is None:
+            return PoolPrewarmResult(target=0)
+
+        lanes = pool.lane_paths()
+        result = PoolPrewarmResult(target=len(lanes))
+
+        # ABSENT-base gate — mirror acquire's pre-acquire short-circuit; touch
+        # no lane when the CoW seed base is provably absent/empty.
+        if self._warm_lane_base_resolvable() is WarmBaseHealth.ABSENT:
+            logger.warning(
+                'prewarm_pool: warm-lane CoW seed base %s is absent/empty — '
+                'skipping prewarm of %d lane(s) (host-scoped pool condition); '
+                'run reify/scripts/ensure-warm-base.sh to rebuild it',
+                self.warm_lane_base_target_path, result.target,
+            )
+            return result
+
+        for lane in lanes:
+            # Idempotent resident-skip: leave an already-registered lane
+            # completely untouched (no `git worktree add`, no `_seed_warm_lane`)
+            # and count it `already_resident`. This is the sole re-entrancy
+            # guard — it makes prewarm safe to call on every boot after the
+            # startup reconcile sweeps have already restored existing lanes,
+            # and makes a second prewarm on a fully-resident pool a pure no-op.
+            if await self._is_registered_worktree(lane):
+                result.already_resident += 1
+                logger.debug(
+                    'prewarm_pool: lane %s already resident — skipping '
+                    '(no worktree add, no reseed)', lane,
+                )
+                continue
+            # Wrap each lane's materialization so one bad lane never aborts the
+            # loop or wedges startup — a per-lane failure is logged, the
+            # half-created worktree torn down, counted, and the loop continues.
+            try:
+                # Create-once NEUTRAL: --detach (NOT -b task/...) so the lane
+                # carries no task branch — byte-identical to a released idle
+                # lane. Then CoW-seed target/ so the resident spare is a genuine
+                # warm lane. Leave the pool slot FREE (never acquire_for/
+                # note_assignment).
+                add_rc, _, add_err = await _run(
+                    ['git', 'worktree', 'add', '--detach', str(lane), start_ref],
+                    cwd=self.project_root,
+                )
+                if add_rc != 0:
+                    # The add itself failed — no worktree was created, so there
+                    # is nothing to tear down.
+                    logger.warning(
+                        'prewarm_pool: git worktree add --detach failed (rc=%d) '
+                        'for lane %s: %s', add_rc, lane, add_err.strip(),
+                    )
+                    result.failures.append((lane, add_rc))
+                    result.failed += 1
+                    continue
+
+                seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
+                if seed_rc != 0:
+                    # The add succeeded but the seed failed — tear the
+                    # half-created worktree back down so a cold shell is never
+                    # left registered-but-unseeded (a failed lane must not
+                    # masquerade as a materialized warm lane, and would
+                    # otherwise be adopted by acquire as if it were warm).
+                    # rc sentinels mirror acquire's seed messages: 127 =
+                    # seed-warm-lane.sh absent (deploy error); 75 = EX_TEMPFAIL
+                    # disk pressure; any other non-zero = generic fault.
+                    if seed_rc == 127:
+                        logger.warning(
+                            'prewarm_pool: seed script absent (rc=127) for lane '
+                            '%s — check seed-warm-lane.sh deployment; tearing '
+                            'down the half-created worktree', lane,
+                        )
+                    elif seed_rc == 75:
+                        logger.warning(
+                            'prewarm_pool: seed reported disk pressure (rc=75) '
+                            'for lane %s — tearing down the half-created '
+                            'worktree', lane,
+                        )
+                    else:
+                        logger.warning(
+                            'prewarm_pool: seed failed (rc=%d) for lane %s — '
+                            'tearing down the half-created worktree',
+                            seed_rc, lane,
+                        )
+                    await self._teardown_prewarm_lane(lane)
+                    result.failures.append((lane, seed_rc))
+                    result.failed += 1
+                    continue
+
+                result.materialized += 1
+            except Exception as e:
+                # Unexpected fault (e.g. a git subprocess raising) — never
+                # propagate out of prewarm. Best-effort teardown of any
+                # half-created worktree, count it failed, and continue so the
+                # remaining lanes still get their chance. rc=-1 marks an
+                # unexpected exception (distinct from any real git/seed rc).
+                logger.warning(
+                    'prewarm_pool: unexpected error materializing lane %s: %s '
+                    '— counting as failed and continuing', lane, e, exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await self._teardown_prewarm_lane(lane)
+                result.failures.append((lane, -1))
+                result.failed += 1
+                continue
+
+        # VISIBLE SIGNAL (task requirement): a disk/floor shortfall must never
+        # silently cap the pool below effective_N. When fewer lanes are
+        # resident than targeted, emit ONE loud structured-facts WARNING naming
+        # the shortfall and the failing lanes, so an under-provisioned pool is
+        # observable at startup rather than only surfacing later as downstream
+        # acquire exhaustion.
+        reached = result.already_resident + result.materialized
+        if reached < result.target:
+            logger.warning(
+                'prewarm_pool: SHORTFALL — only %d/%d warm lane(s) resident '
+                'after prewarm (already_resident=%d, materialized=%d, '
+                'failed=%d); pool is below effective_N. Failing lanes: %s',
+                reached, result.target, result.already_resident,
+                result.materialized, result.failed,
+                ', '.join(
+                    f'{lane.name}(rc={rc})' for lane, rc in result.failures
+                ) or '(none)',
+            )
+        else:
+            logger.info(
+                'prewarm_pool: pool fully materialized — %d/%d warm lane(s) '
+                'resident (already_resident=%d, materialized=%d)',
+                reached, result.target, result.already_resident,
+                result.materialized,
+            )
+
+        return result
+
+    async def _teardown_prewarm_lane(self, lane: Path) -> None:
+        """Best-effort teardown of a half-created prewarm lane (task 2879).
+
+        Used when ``git worktree add --detach`` succeeded but the subsequent
+        seed failed: ``git worktree remove --force <lane>`` drops the worktree
+        and its checkout, then a registration-global
+        :meth:`_prune_registrations` clears any stale ``.git/worktrees`` admin
+        entry left behind, so the failed lane is NOT left registered-but-cold
+        (which acquire would otherwise adopt as if it were a warm lane).
+
+        Never raises — teardown is best-effort by contract; a removal failure
+        is logged and the prewarm loop still continues to the next lane. A
+        prewarmed lane carries a DETACHED HEAD (no ``task/...`` branch), so
+        there is never a branch ref to preserve/delete here — unlike acquire's
+        ``_abort_lane_acquisition``, which must gate branch deletion.
+        """
+        try:
+            rc, _, err = await _run(
+                ['git', 'worktree', 'remove', '--force', str(lane)],
+                cwd=self.project_root,
+            )
+            if rc != 0:
+                logger.warning(
+                    'prewarm_pool: worktree remove --force failed (rc=%d) for '
+                    'lane %s: %s', rc, lane, err.strip(),
+                )
+        except Exception as e:
+            logger.warning(
+                'prewarm_pool: worktree remove --force raised for lane %s: %s',
+                lane, e,
+            )
+        # Registration-global prune clears any stale admin entry (routed
+        # through the guarded chokepoint so the pool-storage guard applies).
+        await self._prune_registrations(context='prewarm_pool-teardown')
 
     async def _acquire_warm_lane_impl(
         self,

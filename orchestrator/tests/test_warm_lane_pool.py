@@ -10,7 +10,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -60,6 +60,35 @@ class TestWarmLanePoolConstruction:
         """A pool of size 0 is valid — try_acquire always returns None."""
         pool = _make_pool(tmp_path, size=0)
         assert pool.size == 0
+
+
+# ---------------------------------------------------------------------------
+# lane_paths — public git-free accessor over every pool lane (task 2879 step-01)
+# ---------------------------------------------------------------------------
+
+
+class TestLanePaths:
+    """``lane_paths()`` exposes the full lane list in insertion order.
+
+    Gives ``GitOps.prewarm_pool`` a public, git-free way to iterate EVERY lane
+    (including the never-demanded high-numbered ones) rather than reaching into
+    the private ``_lanes`` dict.
+    """
+
+    def test_lane_paths_returns_all_lanes_in_order(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=4)
+        base = tmp_path / 'worktrees'
+        expected = [base / f'_lane-{k}' for k in range(4)]
+        assert pool.lane_paths() == expected
+
+    def test_lane_paths_size_one(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=1)
+        base = tmp_path / 'worktrees'
+        assert pool.lane_paths() == [base / '_lane-0']
+
+    def test_lane_paths_empty_for_zero_size(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=0)
+        assert pool.lane_paths() == []
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1017,313 @@ async def _add_seed_and_debug_port_scripts(repo: Path, port: int = 39411) -> Pat
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'add stub seed + debug-port scripts'], cwd=repo)
     return scripts_dir
+
+
+async def _head_is_detached(lane: Path) -> bool:
+    """True iff *lane*'s HEAD is detached (``git symbolic-ref -q HEAD`` fails)."""
+    rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane)
+    return rc != 0
+
+
+@pytest.mark.asyncio
+class TestPrewarmPool:
+    """GitOps.prewarm_pool eagerly materializes every pool lane to the same
+    at-rest state a released idle lane has: a registered worktree on a DETACHED
+    HEAD with a seeded target/, left FREE (task 2879)."""
+
+    async def test_fresh_pool_materializes_all_lanes(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """On a fresh pool (no on-disk lanes) prewarm materializes all N lanes."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.prewarm_pool(start_ref)
+
+        base = git_ops.worktree_base
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        for k in range(3):
+            lane = base / f'_lane-{k}'
+            # (a) registered worktree on disk
+            assert await git_ops._is_registered_worktree(lane), (
+                f'{lane} must be a registered worktree after prewarm'
+            )
+            # (b) DETACHED HEAD, no task/... branch, at start_ref
+            assert await _head_is_detached(lane), (
+                f'{lane} HEAD must be detached (no task branch) after prewarm'
+            )
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+            assert head_sha.strip() == start_ref
+            # (c) seeded target/seeded.bin (proof _seed_warm_lane ran)
+            assert (lane / 'target' / 'seeded.bin').exists(), (
+                f'{lane}/target/seeded.bin must exist (seed ran)'
+            )
+            # (d) pool slot still FREE — prewarm must NOT acquire
+            assert pool.state(lane) == LaneState.FREE, (
+                f'{lane} pool slot must stay FREE after prewarm'
+            )
+
+        # (e) structured accounting
+        assert result.target == 3
+        assert result.materialized == 3
+        assert result.already_resident == 0
+        assert result.failed == 0
+
+    async def test_prewarm_creates_no_task_branch(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """No ``task/...`` branch is fabricated for any prewarmed lane."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        await git_ops.prewarm_pool(start_ref)
+
+        # No branch named after any lane exists; the branch namespace carries no
+        # task/_lane-* refs (prewarm uses --detach, never -b).
+        _, branches, _ = await _run(
+            ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads/task/'],
+            cwd=wl_git_repo,
+        )
+        assert branches.strip() == '', (
+            f'prewarm must not fabricate any task/ branch; got: {branches!r}'
+        )
+
+    async def test_second_prewarm_is_idempotent(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """A second prewarm on a fully-resident pool re-adds/reseeds nothing."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        # First pass materializes all 3.
+        first = await git_ops.prewarm_pool(start_ref)
+        assert first.materialized == 3
+
+        base = git_ops.worktree_base
+        # Snapshot each seeded.bin's mtime so we can prove no reseed happened.
+        pre_mtimes = {
+            k: (base / f'_lane-{k}' / 'target' / 'seeded.bin').stat().st_mtime_ns
+            for k in range(3)
+        }
+
+        # Second pass: install a spy that would fire if any resident lane were
+        # reseeded — it must NOT be called at all.
+        with patch.object(
+            git_ops, '_seed_warm_lane', new=AsyncMock(return_value=0),
+        ) as seed_spy:
+            second = await git_ops.prewarm_pool(start_ref)
+
+        seed_spy.assert_not_called()
+        assert second.already_resident == 3
+        assert second.materialized == 0
+        assert second.failed == 0
+        assert second.target == 3
+        # seeded.bin untouched (no reseed) for every resident lane.
+        for k in range(3):
+            post = (base / f'_lane-{k}' / 'target' / 'seeded.bin').stat().st_mtime_ns
+            assert post == pre_mtimes[k], (
+                f'_lane-{k} seeded.bin must be untouched on idempotent re-prewarm'
+            )
+
+    async def test_mixed_rematerializes_only_missing_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """After removing one lane, a re-prewarm materializes exactly that one."""
+        import shutil
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        await git_ops.prewarm_pool(start_ref)
+
+        # Tear one lane's dir out from under git + prune its registration.
+        base = git_ops.worktree_base
+        gone = base / '_lane-1'
+        shutil.rmtree(gone)
+        await _run(['git', 'worktree', 'prune'], cwd=wl_git_repo)
+        assert not await git_ops._is_registered_worktree(gone)
+
+        result = await git_ops.prewarm_pool(start_ref)
+
+        assert result.materialized == 1
+        assert result.already_resident == 2
+        assert result.failed == 0
+        # The removed lane is back: registered + seeded.
+        assert await git_ops._is_registered_worktree(gone)
+        assert (gone / 'target' / 'seeded.bin').exists()
+
+    async def test_all_seeds_fail_torn_down_and_shortfall_warned(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """Every seed failing: loop continues, half-created worktrees torn
+        down, all failures recorded, and a shortfall WARNING is emitted."""
+        import logging
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        base = git_ops.worktree_base
+
+        # Force every seed to fail (rc=1), mirroring test_git_ops.py's
+        # _failing_seed pattern. prewarm must NOT raise and must iterate ALL
+        # lanes despite each failure.
+        with patch.object(
+            git_ops, '_seed_warm_lane', new=AsyncMock(return_value=1),
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.prewarm_pool(start_ref)
+
+        # (a) iterated all 3 lanes despite the failures (never raised).
+        assert result.target == 3
+        # (c) all failed, none materialized, each recorded with its rc.
+        assert result.failed == 3
+        assert result.materialized == 0
+        assert result.already_resident == 0
+        assert len(result.failures) == 3
+        failed_lanes = {lane for lane, _rc in result.failures}
+        assert failed_lanes == {base / f'_lane-{k}' for k in range(3)}
+        assert all(rc == 1 for _lane, rc in result.failures)
+
+        # (b) each half-created worktree torn down — a failed lane must never
+        # masquerade as materialized (not left registered).
+        for k in range(3):
+            lane = base / f'_lane-{k}'
+            assert not await git_ops._is_registered_worktree(lane), (
+                f'{lane} must be torn down after a failed seed, not left registered'
+            )
+
+        # (d) shortfall WARNING emitted (resident+materialized < target).
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'prewarm_pool' in m and 'shortfall' in m.lower() for m in warnings
+        ), f'expected a prewarm_pool shortfall WARNING; got: {warnings!r}'
+
+    async def test_one_seed_fails_partial_materialize_still_warns(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """Only one lane's seed fails: that lane is torn down + counted failed,
+        the other two materialize, and a shortfall WARNING still fires."""
+        import logging
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        base = git_ops.worktree_base
+        real_seed = git_ops._seed_warm_lane
+
+        # Fail exactly the middle lane's seed; the other two seed for real.
+        async def _seed_middle_fails(lane, mode, **kwargs):
+            if lane == base / '_lane-1':
+                return 1
+            return await real_seed(lane, mode, **kwargs)
+
+        with patch.object(
+            git_ops, '_seed_warm_lane', new=AsyncMock(side_effect=_seed_middle_fails),
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.prewarm_pool(start_ref)
+
+        assert result.target == 3
+        assert result.materialized == 2
+        assert result.failed == 1
+        assert result.already_resident == 0
+        assert [lane for lane, _rc in result.failures] == [base / '_lane-1']
+
+        # The failed lane is torn down; the two good lanes are resident + seeded.
+        assert not await git_ops._is_registered_worktree(base / '_lane-1')
+        for k in (0, 2):
+            lane = base / f'_lane-{k}'
+            assert await git_ops._is_registered_worktree(lane)
+            assert (lane / 'target' / 'seeded.bin').exists()
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'prewarm_pool' in m and 'shortfall' in m.lower() for m in warnings
+        ), f'expected a prewarm_pool shortfall WARNING; got: {warnings!r}'
+
+    async def test_absent_base_short_circuits_touching_no_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """The feature's primary fail-open safety property: when the CoW seed
+        base is ABSENT, prewarm short-circuits BEFORE creating any worktree
+        (materialized==0, nothing registered) and logs the base-absent
+        WARNING — it must NEVER mass-create lanes against a missing base."""
+        import logging
+
+        from orchestrator.git_ops import WarmBaseHealth
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        base = git_ops.worktree_base
+        # Force the base-health gate to read ABSENT (mirrors acquire's
+        # pre-acquire gate); prewarm must touch no lane.
+        with patch.object(
+            git_ops, '_warm_lane_base_resolvable',
+            return_value=WarmBaseHealth.ABSENT,
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.prewarm_pool(start_ref)
+
+        # No lane touched: none created, none materialized. target reflects the
+        # configured pool size (len(lanes)), with all counters zeroed — the
+        # documented ABSENT-path exception to the accounting invariant.
+        assert result.target == 3
+        assert result.materialized == 0
+        assert result.already_resident == 0
+        assert result.failed == 0
+        assert result.failures == []
+        for k in range(3):
+            lane = base / f'_lane-{k}'
+            assert not await git_ops._is_registered_worktree(lane), (
+                f'{lane} must NOT be created when the CoW base is ABSENT'
+            )
+
+        # The dedicated base-absent WARNING is the visible signal here.
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'prewarm_pool' in m and 'absent' in m.lower() for m in warnings
+        ), f'expected a prewarm_pool base-absent WARNING; got: {warnings!r}'
+
+    async def test_disabled_pool_is_a_noop(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """With no warm-lane pool (warm_lane_pool is None) prewarm is a pure
+        no-op returning PoolPrewarmResult(target=0)."""
+        from orchestrator.git_ops import PoolPrewarmResult
+
+        # No warm_lane_pool_size → GitOps.warm_lane_pool is None.
+        git_ops = GitOps(wl_git_config_on, wl_git_repo)
+        assert git_ops.warm_lane_pool is None
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.prewarm_pool(start_ref)
+
+        assert result == PoolPrewarmResult(target=0)
+        assert result.target == 0
+        assert result.materialized == 0
+        assert result.already_resident == 0
+        assert result.failed == 0
+        assert result.failures == []
 
 
 @pytest.mark.asyncio
