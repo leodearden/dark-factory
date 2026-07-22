@@ -101,3 +101,57 @@ class TestRemoveMergeWorktreeGuarded:
 
         assert outcome == 'removed'
         assert not wt.exists()
+
+    async def test_lease_held_skip_returns_skipped_lease_held_and_warns_once(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A LIVE holder of the tree's merge-verify flock makes removal skip
+        rather than force through — the fix for the incident's TOCTOU. The
+        skip must be OBSERVED via both the returned outcome and a single
+        WARNING naming the holder pgid and the caller's reason, never merely
+        inferred from the tree surviving."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        fd = acquire_merge_verify_flock(lane_lock_path(wt), 5.0)
+        assert fd is not None, 'test setup: must be able to acquire the tree lease itself'
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+            assert outcome == 'skipped_lease_held'
+            assert wt.exists(), 'a live lease holder must leave the tree intact'
+
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1, (
+                f'expected exactly one WARNING, got {len(warnings)}: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+            message = warnings[0].getMessage()
+            assert str(os.getpgrp()) in message, message
+            assert 'sweep' in message, message
+        finally:
+            release_merge_verify_flock(fd)
+            remove_lock_holder_pgid(git_ops.worktree_base)
+
+    async def test_dead_holder_pgid_fails_open_and_removes(
+        self, git_ops: GitOps, caplog,
+    ):
+        """Fail-open positive control: a STALE holder-pgid record (no live
+        process actually holding the flock) must never wedge removal. The
+        kernel auto-releases a crashed holder's flock, so the non-blocking
+        acquire simply succeeds — proving the primitive gates on the flock
+        itself, never on the (fail-open, best-effort) pgid rendezvous file."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        write_lock_holder_pgid(git_ops.worktree_base, 999999)
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+            assert outcome == 'removed'
+            assert not wt.exists()
+            assert not caplog.records, (
+                f'a stale holder-pgid record must never block removal or emit a '
+                f'skip warning; got: {[r.getMessage() for r in caplog.records]}'
+            )
+        finally:
+            remove_lock_holder_pgid(git_ops.worktree_base)
