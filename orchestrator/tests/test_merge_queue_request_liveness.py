@@ -1165,15 +1165,22 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         assert q.empty(), 'the MAX-th dead abort must NOT be re-queued (busy-loop guard)'
 
         # ── Attempt 3: a SUCCESSFUL verify for the SAME task_id clears the counter ──
+        # task 2921: patches _run_post_merge_verify directly (not
+        # run_scoped_verification) so the real main-SHA/git work
+        # run_scoped_verification's caller does under merge_wt never races
+        # the tiny 0.2s budget under host load — mirrors
+        # test_repeated_remote_coast_converts_to_blocked_and_success_resets_counter's
+        # Attempt 3 below.
         req3, item3 = await _make_merged_item(
             git_ops, config, 'dead-repeat-branch-3', 'dr3.py', 'c=3\n', task_id=task_id,
         )
         worker._register_owned_merge_worktree(item3.merge_wt)
         lease3 = HostLease(name='local', runner=fake_local, is_local=True)
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            AsyncMock(return_value=_pass_result()),
-        ):
+
+        async def _pass_fast(*args: object, **kwargs: object) -> None:
+            return None
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _pass_fast):
             result3 = await asyncio.wait_for(
                 worker._run_inflight_verify(item3, lease3), timeout=5.0,
             )
