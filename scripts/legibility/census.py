@@ -1385,16 +1385,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    invoke = coder._invoke_cli
+    # Each census stage gets its OWN claude-CLI subprocess timeout: the
+    # shared coder default (120s) fits mining/headroom but fatally short-cut
+    # the per-cluster Sonnet verify and the large Fable synthesis — the bug
+    # that killed the first dark_factory census.
+    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
 
     try:
         outcome = run_census(
             batch_source=default_batch_source(
                 cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
             ),
-            invoke=invoke,
-            verify_fn=_build_default_verify_fn(str(project_root), invoke),
-            synthesize_fn=_build_default_synthesize_fn(invoke),
+            invoke=mining_invoke,
+            verify_fn=_build_default_verify_fn(str(project_root), verify_invoke),
+            synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
             escalate_fn=_build_default_escalate_fn(cfg),
             status_fetcher=status_fetcher,
