@@ -370,3 +370,84 @@ def test_payload_exports_force_persistence_false_when_zero():
     assert mod.payload_exports_force_persistence(
         "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0\n"
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# step-11/12: escalation envelope + best-effort poster
+# ---------------------------------------------------------------------------
+
+def _missing_finding(
+    slug: str = "sess-lost",
+    cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
+) -> "mod.MissingTranscript":
+    return mod.MissingTranscript(
+        session_slug=slug,
+        cwd=cwd,
+        prompt_prefix="Diagnose the stuck reconciliation on task 2701.",
+        start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
+        exit_code=0,
+        expected_dir=Path("/tmp/projects") / mod.inventory.encode_cwd(cwd),
+    )
+
+
+class _RecordingPoster:
+    """A fake poster capturing (url, envelope) calls (never posts anything)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, url: str, envelope: dict) -> None:
+        self.calls.append((url, envelope))
+
+
+def test_build_escalation_arguments_shape(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    findings = [
+        _missing_finding("sess-lost-1", "/home/leo/src/dark-factory/.worktrees/2701"),
+        _missing_finding("sess-lost-2", "/home/leo/src/dark-factory/.worktrees/2702"),
+    ]
+
+    args = mod._build_escalation_arguments(findings, cfg, force_persistence_ok=None)
+
+    assert args["task_id"] == "legibility-transcript-check-proj_a"
+    assert args["agent_role"] == "legibility-transcript-check"
+    assert args["category"] == "infra_issue"
+    assert args["severity"] == "info"
+    # summary names the count of missing transcripts.
+    assert "2" in args["summary"]
+    # detail names each finding's slug AND cwd.
+    assert "sess-lost-1" in args["detail"]
+    assert "sess-lost-2" in args["detail"]
+    assert "/home/leo/src/dark-factory/.worktrees/2701" in args["detail"]
+    assert "/home/leo/src/dark-factory/.worktrees/2702" in args["detail"]
+
+
+def test_post_findings_posts_envelope_and_returns_true(tmp_path):
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a", escalation_port=8271))
+    findings = [_missing_finding()]
+    poster = _RecordingPoster()
+
+    ok = mod.post_findings(cfg, findings, poster=poster)
+
+    assert ok is True
+    assert len(poster.calls) == 1
+    url, envelope = poster.calls[0]
+    assert url == "http://localhost:8271/mcp"
+    # A JSON-RPC tools/call envelope for the escalate_info tool.
+    assert envelope["jsonrpc"] == "2.0"
+    assert envelope["method"] == "tools/call"
+    assert envelope["params"]["name"] == "escalate_info"
+    assert envelope["params"]["arguments"]["agent_role"] == "legibility-transcript-check"
+    assert envelope["params"]["arguments"]["task_id"] == "legibility-transcript-check-proj_a"
+
+
+def test_post_findings_best_effort_swallows_poster_exception(tmp_path):
+    cfg = load_config(_write_config(tmp_path))
+    findings = [_missing_finding()]
+
+    def _raising(url: str, envelope: dict) -> None:
+        raise RuntimeError("escalation server down")
+
+    # Best-effort contract: a raising poster -> False, never propagates.
+    ok = mod.post_findings(cfg, findings, poster=_raising)
+    assert ok is False
