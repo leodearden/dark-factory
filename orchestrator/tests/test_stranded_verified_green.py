@@ -814,13 +814,49 @@ class TestStrandedVerifiedGreenIdempotency:
         assert marker['request_id'].startswith('mr-')
 
 
-_DURABLE_FAILURE_STATUSES = [
-    'conflict', 'blocked', 'error', 'unknown_branch',
-    'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
-]
-_SUCCESS_TRANSIENT_STATUSES = [
-    'done', 'already_merged', 'done_wip_recovery', 'superseded', 'wip_halted',
-]
+# Parametrization derives from the PRODUCTION classification sets so a new
+# MergeOutcome.status can never drift out of test coverage — and
+# test_status_sets_exhaust_merge_outcome_vocabulary (below) fails CI if the two
+# sets ever stop partitioning the full MergeOutcome.status vocabulary.
+_DURABLE_FAILURE_STATUSES = sorted(Harness._DURABLE_MERGE_FAILURE_STATUSES)
+_SUCCESS_TRANSIENT_STATUSES = sorted(Harness._SUCCESS_TRANSIENT_MERGE_STATUSES)
+
+
+def test_status_sets_exhaust_merge_outcome_vocabulary() -> None:
+    """The two classification frozensets MUST partition MergeOutcome.status.
+
+    Guards the loud-over-silent norm (PRD leaf α §2.2): if a new value is added
+    to ``MergeOutcome.status`` without being sorted into exactly one of
+    ``_DURABLE_MERGE_FAILURE_STATUSES`` / ``_SUCCESS_TRANSIENT_MERGE_STATUSES``,
+    the runtime ``_on_stranded_merge_done`` backstop has to guess — so fail CI
+    here and force the author to classify it deliberately.  Also asserts the two
+    sets are disjoint (no status is both a durable failure and a success) and
+    that neither carries a phantom status ``MergeOutcome`` no longer declares.
+    """
+    from typing import get_args, get_type_hints
+
+    from orchestrator.merge_types import MergeOutcome
+
+    vocabulary = set(get_args(get_type_hints(MergeOutcome)['status']))
+    assert vocabulary, 'MergeOutcome.status is not a Literal — cannot derive vocabulary'
+
+    durable = Harness._DURABLE_MERGE_FAILURE_STATUSES
+    transient = Harness._SUCCESS_TRANSIENT_MERGE_STATUSES
+
+    assert not (durable & transient), (
+        'statuses classified as BOTH durable and success/transient: '
+        f'{sorted(durable & transient)}'
+    )
+    unclassified = vocabulary - durable - transient
+    assert not unclassified, (
+        f'MergeOutcome.status value(s) {sorted(unclassified)} are unclassified '
+        '— add each to Harness._DURABLE_MERGE_FAILURE_STATUSES or '
+        'Harness._SUCCESS_TRANSIENT_MERGE_STATUSES'
+    )
+    phantom = (durable | transient) - vocabulary
+    assert not phantom, (
+        f'classified status(es) {sorted(phantom)} are not in MergeOutcome.status'
+    )
 
 
 @pytest.mark.asyncio
@@ -907,6 +943,44 @@ class TestStrandedMergeFailedL2:
             agent_role='harness-stranded-blocked-reaper',
         )
         assert len(l2s) == 1  # scoped dedup — no duplicate born-at-L2
+
+    async def test_unclassified_status_files_l2_and_logs_loud(
+        self, harness: Harness, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A status in NEITHER classification set is treated LOUDLY as a failure.
+
+        Runtime backstop for the exhaustiveness test: if a new MergeOutcome
+        status ever reaches the callback unclassified, it must still file the
+        born-at-L2 (never a silent strand) AND log at ERROR — honoring the
+        loud-over-silent norm rather than defaulting to a silent no-op.
+        """
+        import logging
+
+        from orchestrator.merge_types import MergeOutcome
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        req = await self._submit_and_get_req(harness, tmp_path, queue)
+        # A status that is in neither _DURABLE_MERGE_FAILURE_STATUSES nor
+        # _SUCCESS_TRANSIENT_MERGE_STATUSES (MergeOutcome is a plain dataclass —
+        # no runtime Literal validation, so an arbitrary string is accepted).
+        unknown = 'brand_new_unclassified_status'
+        assert unknown not in Harness._DURABLE_MERGE_FAILURE_STATUSES
+        assert unknown not in Harness._SUCCESS_TRANSIENT_MERGE_STATUSES
+        with caplog.at_level(logging.ERROR, logger='orchestrator.harness'):
+            req.result.set_result(MergeOutcome(status=cast(Any, unknown)))
+            await self._drive_callback(harness)
+
+        l2s = queue.get_by_task(
+            _TID, status='pending', level=2,
+            agent_role='harness-stranded-blocked-reaper',
+        )
+        assert len(l2s) == 1  # unknown outcome → born-at-L2, not a silent strand
+        assert l2s[0].category == 'stranded_merge_failed'
+        assert any(
+            'UNCLASSIFIED' in r.getMessage() and unknown in r.getMessage()
+            for r in caplog.records
+        ), 'expected a loud ERROR log naming the unclassified status'
 
 
 @pytest.mark.asyncio

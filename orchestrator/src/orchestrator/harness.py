@@ -4420,15 +4420,30 @@ class Harness:
             )
         return True
 
+    # Every MergeOutcome.status is classified into exactly one of the two
+    # frozensets below; the pair MUST exhaust MergeOutcome's status Literal.
+    # That partition is enforced at CI time by
+    # test_stranded_verified_green.test_status_sets_exhaust_merge_outcome_vocabulary
+    # (adding a new status without classifying it fails that test), and — as a
+    # runtime backstop — a status found in NEITHER set is treated LOUDLY as a
+    # durable failure in _on_stranded_merge_done.  Together these guarantee a
+    # new/unclassified outcome can never silently no-op into a stranded task
+    # with no operator signal (the exact silent-strand class PRD leaf α fixes).
+    #
     # Durable merge/verify failure outcomes for a stranded-reaper submission —
     # a stale-green branch failing the merge queue's own verify lands here and
-    # warrants a born-at-L2 (PRD leaf α §2.2).  Success/transient outcomes
-    # ('done', 'already_merged', 'done_wip_recovery', 'superseded',
-    # 'wip_halted') are a strict no-op — the happy done is delivered by the
-    # existing found_on_main path.
+    # warrants a born-at-L2 (PRD leaf α §2.2).
     _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
         'conflict', 'blocked', 'error', 'unknown_branch',
         'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
+    })
+    # Success / transient outcomes — a strict no-op: the happy 'done' is
+    # delivered by the existing found_on_main path, and a transient/superseded
+    # outcome is re-driven by a later sweep.  The branch + lane are preserved
+    # by omission (the callback never touches them).
+    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
+        'done', 'already_merged', 'done_wip_recovery', 'superseded',
+        'wip_halted',
     })
 
     def _on_stranded_merge_done(
@@ -4456,12 +4471,28 @@ class Harness:
                 )
             else:
                 outcome = fut.result()
-            if outcome.status not in self._DURABLE_MERGE_FAILURE_STATUSES:
+            status = outcome.status
+            if status in self._SUCCESS_TRANSIENT_MERGE_STATUSES:
                 return  # success/transient → strict no-op (branch+lane preserved)
+            if status not in self._DURABLE_MERGE_FAILURE_STATUSES:
+                # UNCLASSIFIED status — a new MergeOutcome.status reached the
+                # callback without being sorted into either set (the
+                # exhaustiveness test guards this at CI time; this is the
+                # runtime backstop).  Treat an unknown outcome as a durable
+                # failure and file the L2 rather than silently no-op'ing: a
+                # stale-green branch that fails the merge-queue verify must
+                # never strand with no operator signal (loud-over-silent — the
+                # exact class PRD leaf α exists to fix).
+                logger.error(
+                    '_on_stranded_merge_done: UNCLASSIFIED merge status %r for '
+                    'task %s — treating as a durable failure and filing a '
+                    'born-at-L2 (classify it into _DURABLE_MERGE_FAILURE_STATUSES '
+                    'or _SUCCESS_TRANSIENT_MERGE_STATUSES)', status, tid,
+                )
             self._schedule_coro_threadsafe(
                 self._file_stranded_merge_failed(tid, outcome),
                 label=(
-                    f'stranded-merge-failed task {tid} (status={outcome.status})'
+                    f'stranded-merge-failed task {tid} (status={status})'
                 ),
             )
         except Exception:
