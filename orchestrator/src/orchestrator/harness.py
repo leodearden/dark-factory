@@ -1585,6 +1585,21 @@ class Harness:
         # 0. Singleton lock — prevent concurrent orchestrators on same project
         self._lock_file = _acquire_project_lock(self.config.project_root)
 
+        # 0-gc. Disable auto-gc/maintenance on the managed shared repo.
+        # PRD os-sandbox α5 (D2 corollary): set gc.auto=0 / maintenance.auto=false
+        # at startup — before the first dispatch — so background auto-gc never
+        # fires under the narrow shared-.git write-set (create_worktree reasserts
+        # it per-dispatch too). Best-effort: the method never raises on a git rc,
+        # and this try/except additionally guarantees a git_ops fault (or a bare
+        # MagicMock git_ops in unrelated harness tests) can never block startup.
+        try:
+            await self.git_ops.disable_shared_repo_auto_maintenance()
+        except Exception as e:
+            logger.warning(
+                'Failed to disable shared-repo auto-gc/maintenance at startup '
+                '(non-fatal, auto-gc left enabled): %s', e,
+            )
+
         # 0a. Create event store and run store for this run
         import uuid
 
