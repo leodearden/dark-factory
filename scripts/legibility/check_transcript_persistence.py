@@ -187,6 +187,11 @@ def find_matching_transcript(
         helpers). This is the dominant path — spawn records carry a
         substantive prompt — so a usable-prompt session with only sibling
         transcripts is correctly flagged MISSING (returns ``None``).
+      - WEAK (prompt too short/empty to match reliably): the first candidate
+        whose file mtime lies within ``[start_ts - skew, now + skew]``. Only
+        reached when the prompt is NOT usable, so a usable-prompt session
+        never falls through to this confound-tolerant path. An unparseable
+        ``start_ts`` cannot bound the window, so the fallback yields ``None``.
 
     Candidates are scanned in sorted order; the first match's ``Path`` is
     returned.
@@ -205,4 +210,17 @@ def find_matching_transcript(
                 return path
         return None
 
+    # WEAK fallback — prompt too short/empty for a reliable content match.
+    start = _parse_start_ts(record.start_ts)
+    if start is None:
+        return None
+    window_start = start - skew
+    window_end = now + skew
+    for path in candidates:
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        except OSError:
+            continue
+        if window_start <= mtime <= window_end:
+            return path
     return None
