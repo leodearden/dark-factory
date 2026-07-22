@@ -39,6 +39,7 @@ mirroring task β's test_merge_gates.py:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -70,6 +71,103 @@ def test_merge_drift_logger_name_is_merge_queue() -> None:
     import orchestrator.merge_drift as merge_drift
 
     assert merge_drift.logger.name == 'orchestrator.merge_queue'
+
+
+class TestDriftCheckStatePersistence:
+    """Unit tests for DriftCheckState + _load_drift_check_state + _save_drift_check_state.
+
+    Fix 1a (task 2886): the drift-check cadence counter must be PERSISTED so it
+    survives the ~8h fleet redeploy that resets the in-memory worker counter
+    (which is why the drift check has NEVER fired).  The persistence primitive
+    is an EXACT mirror of merge_shadow's ShadowCompareState +
+    _load_shadow_compare_state/_save_shadow_compare_state (fail-safe JSON), the
+    same contract asserted by
+    test_merge_queue_warm_cold_shadow.py::TestShadowCompareStatePersistence.
+
+    RED (pre-impl): DriftCheckState / _load_drift_check_state /
+    _save_drift_check_state do not exist yet in orchestrator.merge_drift.
+    """
+
+    def test_drift_check_state_defaults_land_count_zero(self) -> None:
+        from orchestrator.merge_drift import DriftCheckState
+
+        assert DriftCheckState().land_count == 0
+
+    def test_load_returns_default_when_file_missing(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        state = _load_drift_check_state(tmp_path / 'nonexistent.json')
+        assert state == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_corrupt_json(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{ not valid json !!!')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_empty_json_object(self, tmp_path: Path) -> None:
+        # Missing keys → fail-safe default (mirror shadow's empty-object test).
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{}')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_wrong_typed_key(self, tmp_path: Path) -> None:
+        # int("not-an-int") raises ValueError → fail-safe default.
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{"land_count": "not-an-int"}')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_load_returns_default_on_null_key(self, tmp_path: Path) -> None:
+        # int(None) raises TypeError → fail-safe default.
+        from orchestrator.merge_drift import DriftCheckState, _load_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        path.write_text('{"land_count": null}')
+        assert _load_drift_check_state(path) == DriftCheckState(land_count=0)
+
+    def test_round_trip_preserves_count(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import (
+            DriftCheckState,
+            _load_drift_check_state,
+            _save_drift_check_state,
+        )
+
+        path = tmp_path / 'drift.json'
+        _save_drift_check_state(path, DriftCheckState(land_count=19))
+        assert _load_drift_check_state(path).land_count == 19
+
+    def test_round_trip_count_zero(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import (
+            DriftCheckState,
+            _load_drift_check_state,
+            _save_drift_check_state,
+        )
+
+        path = tmp_path / 'drift.json'
+        original = DriftCheckState(land_count=0)
+        _save_drift_check_state(path, original)
+        assert _load_drift_check_state(path) == original
+
+    def test_save_creates_parent_dirs(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _save_drift_check_state
+
+        path = tmp_path / 'a' / 'b' / 'c' / 'drift.json'
+        _save_drift_check_state(path, DriftCheckState(land_count=5))
+        assert path.exists()
+
+    def test_save_writes_valid_json(self, tmp_path: Path) -> None:
+        from orchestrator.merge_drift import DriftCheckState, _save_drift_check_state
+
+        path = tmp_path / 'drift.json'
+        _save_drift_check_state(path, DriftCheckState(land_count=3))
+        data = json.loads(path.read_text())
+        assert 'land_count' in data
+        assert data['land_count'] == 3
 
 
 @pytest.mark.asyncio
