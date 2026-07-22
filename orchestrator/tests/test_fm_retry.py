@@ -14,8 +14,10 @@ import pytest
 from orchestrator.fm_retry import (
     _FM_RETRY_CAP_SECS,
     _FM_RETRY_MAX_SLEEPS,
+    FM_NULL_SENTINEL_URL,
     FM_RESTART_RETRY_WINDOW_SECS,
     fm_retry_backoffs,
+    is_fm_null_sentinel,
 )
 
 
@@ -103,6 +105,46 @@ class TestFmRetryBackoffsDefaultAttempts:
         schedule = fm_retry_backoffs()
         attempts = len(schedule) + 1
         assert attempts > 6
+
+
+class TestNullSentinel:
+    """FM_NULL_SENTINEL_URL + is_fm_null_sentinel — the D8 null-sentinel the
+    McpSession transport must fail fast on (task 2880).
+
+    The sentinel is a non-routable address (immediate ECONNREFUSED) that can
+    never host a *restarting* fused-memory, so the fm-restart retry window is
+    inapplicable to it. This constant is the single authority for the sentinel
+    string; evals/profile.py imports it DOWN so the profile value and the
+    transport predicate cannot drift.
+    """
+
+    def test_sentinel_constant_matches_documented_d8_value(self):
+        # The exact D8 value documented in evals/profile.py's EVAL_PROFILE.
+        assert FM_NULL_SENTINEL_URL == 'http://127.0.0.1:1'
+
+    def test_recognizes_bare_sentinel(self):
+        assert is_fm_null_sentinel('http://127.0.0.1:1') is True
+
+    def test_recognizes_trailing_slash(self):
+        # McpSession.__init__ already rstrip('/')-es base_url; the predicate
+        # normalizes the same way so a raw endpoint still matches.
+        assert is_fm_null_sentinel('http://127.0.0.1:1/') is True
+
+    def test_recognizes_mcp_suffix(self):
+        # mcp_call passes memory_url + '/mcp'; the predicate strips it
+        # defensively for any caller that hands over a raw /mcp endpoint.
+        assert is_fm_null_sentinel('http://127.0.0.1:1/mcp') is True
+
+    def test_real_endpoint_not_misclassified(self):
+        # A live fm endpoint must NOT be classified as the sentinel — it keeps
+        # the full fm-restart retry window.
+        assert is_fm_null_sentinel('http://localhost:8002') is False
+
+    def test_none_is_not_sentinel(self):
+        assert is_fm_null_sentinel(None) is False
+
+    def test_empty_string_is_not_sentinel(self):
+        assert is_fm_null_sentinel('') is False
 
 
 class TestFmRetryBackoffsLengthCapGuard:
