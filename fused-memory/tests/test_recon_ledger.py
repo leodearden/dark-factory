@@ -22,10 +22,18 @@ from __future__ import annotations
 
 import json
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_TTL,
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
+    STATE_ACTIVE,
+    STATE_EXPIRED,
+)
 from fused_memory.server import main as server_main
 from fused_memory.services.memory_service import MemoryService
 
@@ -39,12 +47,33 @@ EXPECTED_COLUMNS = {
     'state',
     'created_at',
     'expires_at',
+    'entity_uuid',
 }
 
 EXPECTED_INDEXES = {
     'ix_recon_ledger_project_kind_state',
     'ix_recon_ledger_project_expires',
+    'ix_recon_ledger_project_kind_entity',
 }
+
+# The pre-migration recon_ledger schema (before task 2894 α added the nullable
+# entity_uuid column) — used to construct an "old" DB and prove
+# ReconLedgerStore.initialize() adds entity_uuid via its idempotent ADD COLUMN
+# migration for pre-existing databases.
+PRE_MIGRATION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS recon_ledger (
+    project_id   TEXT NOT NULL,
+    record_kind  TEXT NOT NULL,
+    task_id      TEXT NOT NULL DEFAULT '',
+    flag_type    TEXT NOT NULL DEFAULT '',
+    run_id       TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL,
+    state        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT,
+    PRIMARY KEY (project_id, record_kind, task_id, flag_type, run_id)
+);
+"""
 
 
 @pytest_asyncio.fixture
@@ -87,6 +116,89 @@ async def test_initialize_creates_schema_with_expected_columns_and_indexes(tmp_p
         )
     finally:
         await s.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_pre_existing_db_adding_entity_uuid_column(tmp_path):
+    """A recon_ledger DB created WITHOUT entity_uuid (pre-migration schema)
+    gains the column after ReconLedgerStore.initialize() runs its idempotent
+    ADD COLUMN migration; a second initialize() is a safe no-op (journal.py
+    ALTER-TABLE house pattern)."""
+    db_path = tmp_path / 'reconciliation.db'
+    # Build a pre-migration DB: raw-connect and CREATE TABLE with the OLD column set.
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.executescript(PRE_MIGRATION_TABLE_SQL)
+        await conn.commit()
+        cursor = await conn.execute('PRAGMA table_info(recon_ledger)')
+        pre_cols = {row[1] for row in await cursor.fetchall()}
+        # Sanity: the DB is genuinely pre-migration.
+        assert 'entity_uuid' not in pre_cols
+    finally:
+        await conn.close()
+
+    store = ReconLedgerStore(db_path)
+    await store.initialize()
+    try:
+        db = store._db
+        assert db is not None
+        cursor = await db.execute('PRAGMA table_info(recon_ledger)')
+        cols_after = {row[1] for row in await cursor.fetchall()}
+        assert 'entity_uuid' in cols_after
+
+        # Idempotent: a second initialize() re-runs the ADD COLUMN as a no-op
+        # (does not raise, does not duplicate the column).
+        await store.initialize()
+        db = store._db
+        assert db is not None
+        cursor = await db.execute('PRAGMA table_info(recon_ledger)')
+        cols_reinit = {row[1] for row in await cursor.fetchall()}
+        assert cols_reinit == cols_after
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_round_trips_entity_uuid_set_and_none(store):
+    """A generic ReconLedgerRecord round-trips entity_uuid through
+    upsert→get_by_identity both when set to a uuid string and when left None
+    (the trailing-field default)."""
+    with_uuid = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-1',
+        flag_type='drift_flag',
+        run_id='run-1',
+        entity_uuid='uuid-abc',
+    )
+    await store.upsert(with_uuid)
+    fetched = await store.get_by_identity(
+        'proj-a', 'stage1_flag_marker', task_id='task-1', flag_type='drift_flag', run_id='run-1'
+    )
+    assert fetched is not None
+    assert fetched.entity_uuid == 'uuid-abc'
+    assert fetched == with_uuid
+
+    without_uuid = ReconLedgerRecord(
+        project_id='proj-b',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-2',
+        flag_type='drift_flag',
+        run_id='run-2',
+    )
+    await store.upsert(without_uuid)
+    fetched_none = await store.get_by_identity(
+        'proj-b', 'stage1_flag_marker', task_id='task-2', flag_type='drift_flag', run_id='run-2'
+    )
+    assert fetched_none is not None
+    assert fetched_none.entity_uuid is None
+    assert fetched_none == without_uuid
 
 
 @pytest.mark.asyncio
@@ -624,3 +736,427 @@ def test_memory_service_set_recon_ledger_wires_store(mock_config, tmp_path):
     svc.set_recon_ledger(store)
 
     assert svc.recon_ledger is store
+
+
+# ---------------------------------------------------------------------------
+# entity_standing_decision write/list/lookup API (task 2894 α, step-5/6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_entity_standing_decision_writes_and_reads_back(store):
+    """upsert_entity_standing_decision writes a row discoverable via both
+    list_entity_standing_decisions and get_active_entity_standing_decision:
+    the entity_uuid column is set, created_at mirrors decided_at, expires_at
+    is set, state is active, and payload_json canonically carries grounds +
+    edge_count_at_decision + evidence."""
+    evidence = [{'type': 'edge', 'id': 'edge-1', 'locally_resolved': True}]
+    await store.upsert_entity_standing_decision(
+        project_id='proj-a',
+        entity_uuid='uuid-abc',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=7,
+        evidence=evidence,
+        state=STATE_ACTIVE,
+    )
+
+    listed = await store.list_entity_standing_decisions('proj-a')
+    assert len(listed) == 1
+    row = listed[0]
+    assert row.record_kind == RECORD_KIND_ENTITY_STANDING_DECISION
+    assert row.entity_uuid == 'uuid-abc'
+    assert row.created_at == '2026-07-01T00:00:00+00:00'
+    assert row.expires_at == '2026-09-29T00:00:00+00:00'
+    assert row.state == STATE_ACTIVE
+
+    payload = json.loads(row.payload_json)
+    assert payload['grounds'] == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+    assert payload['edge_count_at_decision'] == 7
+    assert payload['evidence'] == evidence
+
+    active = await store.get_active_entity_standing_decision('proj-a', 'uuid-abc')
+    assert active is not None
+    assert active == row
+
+
+@pytest.mark.asyncio
+async def test_get_active_entity_standing_decision_none_for_unknown_and_non_active(store):
+    """get_active_entity_standing_decision returns None for an unknown/other
+    entity_uuid and for a decision that is not in the active state."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-a',
+        entity_uuid='uuid-active',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=3,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+    await store.upsert_entity_standing_decision(
+        project_id='proj-a',
+        entity_uuid='uuid-expired',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=3,
+        evidence=[],
+        state=STATE_EXPIRED,
+    )
+
+    # Unknown entity_uuid → None.
+    assert await store.get_active_entity_standing_decision('proj-a', 'uuid-nope') is None
+    # Known project but wrong project scope → None.
+    assert await store.get_active_entity_standing_decision('proj-other', 'uuid-active') is None
+    # A non-active (expired) row is NOT returned by the active lookup.
+    assert await store.get_active_entity_standing_decision('proj-a', 'uuid-expired') is None
+
+
+@pytest.mark.asyncio
+async def test_get_active_entity_standing_decision_fast_fails_on_multiple_active(store):
+    """get_active_entity_standing_decision raises (loud-over-silent, INV-1)
+    instead of silently returning an arbitrary row when an entity_uuid carries
+    more than one ACTIVE standing decision. This cannot arise through
+    upsert_entity_standing_decision today (single-member GROUNDS_ENUM ⇒ at most
+    one active grounds per entity), so two rows sharing an entity_uuid but
+    differing in the grounds/flag_type PK slot are written via a raw upsert() to
+    simulate a future multi-grounds enum. Guards against the γ/δ hooks getting
+    non-deterministic results before a second grounds value is admitted."""
+    for grounds in ('structural_size_conflation', 'some_future_grounds'):
+        await store.upsert(
+            ReconLedgerRecord(
+                project_id='proj-a',
+                record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+                payload_json='{}',
+                state=STATE_ACTIVE,
+                created_at='2026-07-01T00:00:00+00:00',
+                task_id='',
+                flag_type=grounds,  # distinct grounds → distinct PK, same entity_uuid
+                run_id='uuid-dup',
+                entity_uuid='uuid-dup',
+            )
+        )
+
+    with pytest.raises(ValueError, match='more than one ACTIVE'):
+        await store.get_active_entity_standing_decision('proj-a', 'uuid-dup')
+
+
+@pytest.mark.asyncio
+async def test_list_entity_standing_decisions_scoped_to_kind_project_and_state(store):
+    """list_entity_standing_decisions returns only entity_standing_decision
+    rows, scoped to the project, optionally filtered by state — never a
+    marker-kind row and never another project's decision."""
+    # A non-standing marker row in the same project must be excluded.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-a',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-07-01T00:00:00+00:00',
+            task_id='task-1',
+            flag_type='drift_flag',
+        )
+    )
+    await store.upsert_entity_standing_decision(
+        project_id='proj-a',
+        entity_uuid='uuid-1',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=1,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+    await store.upsert_entity_standing_decision(
+        project_id='proj-a',
+        entity_uuid='uuid-2',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=2,
+        evidence=[],
+        state=STATE_EXPIRED,
+    )
+    # A decision in another project must be excluded.
+    await store.upsert_entity_standing_decision(
+        project_id='proj-b',
+        entity_uuid='uuid-3',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=3,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+
+    all_rows = await store.list_entity_standing_decisions('proj-a')
+    assert {r.entity_uuid for r in all_rows} == {'uuid-1', 'uuid-2'}
+    assert all(r.record_kind == RECORD_KIND_ENTITY_STANDING_DECISION for r in all_rows)
+
+    active_only = await store.list_entity_standing_decisions('proj-a', state=STATE_ACTIVE)
+    assert {r.entity_uuid for r in active_only} == {'uuid-1'}
+
+    expired_only = await store.list_entity_standing_decisions('proj-a', state=STATE_EXPIRED)
+    assert {r.entity_uuid for r in expired_only} == {'uuid-2'}
+
+
+@pytest.mark.asyncio
+async def test_upsert_entity_standing_decision_uniqueness_last_write_wins(store):
+    """Re-upsert for the same (entity_uuid, grounds) is last-write-wins (one
+    row); two distinct entity_uuids yield two rows."""
+    common = dict(
+        project_id='proj-a',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+    await store.upsert_entity_standing_decision(
+        entity_uuid='uuid-1', edge_count_at_decision=1, **common
+    )
+    await store.upsert_entity_standing_decision(
+        entity_uuid='uuid-1', edge_count_at_decision=42, **common
+    )
+    rows = await store.list_entity_standing_decisions('proj-a')
+    assert len(rows) == 1
+    assert json.loads(rows[0].payload_json)['edge_count_at_decision'] == 42
+
+    await store.upsert_entity_standing_decision(
+        entity_uuid='uuid-2', edge_count_at_decision=5, **common
+    )
+    rows2 = await store.list_entity_standing_decisions('proj-a')
+    assert {r.entity_uuid for r in rows2} == {'uuid-1', 'uuid-2'}
+
+
+@pytest.mark.asyncio
+async def test_upsert_entity_standing_decision_validation_raises(store):
+    """Structured loud failure (INV-1): empty entity_uuid, expires_at=None, and
+    a grounds value outside GROUNDS_ENUM each raise ValueError with a hint
+    naming the failing field — never a silent no-op or a malformed row."""
+    valid = dict(
+        project_id='proj-a',
+        entity_uuid='uuid-ok',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=1,
+        evidence=[],
+    )
+
+    with pytest.raises(ValueError, match='entity_uuid'):
+        await store.upsert_entity_standing_decision(**{**valid, 'entity_uuid': ''})
+
+    with pytest.raises(ValueError, match='expires_at'):
+        await store.upsert_entity_standing_decision(**{**valid, 'expires_at': None})
+
+    with pytest.raises(ValueError, match='grounds'):
+        await store.upsert_entity_standing_decision(**{**valid, 'grounds': 'not_a_real_grounds'})
+
+    # No malformed row was written by any rejected call.
+    assert await store.list_entity_standing_decisions('proj-a') == []
+
+
+# ---------------------------------------------------------------------------
+# gc() TTL-flip for entity_standing_decision (task 2894 α, step-7/8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gc_flips_expired_standing_decision_to_expired_with_ttl_reason(store):
+    """An ACTIVE entity_standing_decision past its expires_at is NOT deleted by
+    gc() (unlike marker kinds) — it is flipped to state='expired' with
+    payload_json expiry_reason='ttl' (INV-2), and get_active then returns None.
+    Exercises the empty-terminal_task_ids gc branch."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-old',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-04-01T00:00:00+00:00',
+        expires_at='2026-06-30T00:00:00+00:00',  # < now
+        edge_count_at_decision=4,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+
+    count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    # Not deleted — still discoverable, but now expired with a ttl reason.
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1
+    row = listed[0]
+    assert row.state == STATE_EXPIRED
+    assert json.loads(row.payload_json)['expiry_reason'] == EXPIRY_REASON_TTL
+    # No longer active.
+    assert await store.get_active_entity_standing_decision('proj-p', 'uuid-old') is None
+    # gc acted on exactly one row (the flip).
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_gc_leaves_unexpired_active_standing_decision_untouched(store):
+    """An ACTIVE entity_standing_decision whose expires_at is in the future is
+    left fully untouched by gc() — still active, no expiry_reason stamped."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-live',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-12-01T00:00:00+00:00',  # > now
+        edge_count_at_decision=2,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+
+    count = await store.gc('proj-p', now='2026-08-01T00:00:00+00:00', terminal_task_ids=[])
+
+    active = await store.get_active_entity_standing_decision('proj-p', 'uuid-live')
+    assert active is not None
+    assert active.state == STATE_ACTIVE
+    assert 'expiry_reason' not in json.loads(active.payload_json)
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_gc_leaves_already_expired_standing_decision_idempotent(store):
+    """An already state='expired' standing row with a past expires_at is left
+    untouched — the flip is gated on state='active', so gc() neither deletes it
+    nor re-stamps expiry_reason (idempotent)."""
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-already',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-04-01T00:00:00+00:00',
+        expires_at='2026-06-30T00:00:00+00:00',  # < now
+        edge_count_at_decision=1,
+        evidence=[],
+        state=STATE_EXPIRED,
+    )
+
+    count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1  # not deleted
+    assert listed[0].state == STATE_EXPIRED
+    # Not re-stamped: the row carried no expiry_reason and still carries none.
+    assert 'expiry_reason' not in json.loads(listed[0].payload_json)
+    assert count == 0  # nothing acted on
+
+
+@pytest.mark.asyncio
+async def test_gc_mixed_flips_standing_and_deletes_markers_with_terminal_ids(store):
+    """Mixed pass over the non-empty terminal_task_ids branch: an expired
+    standing decision FLIPS (kept), an expired marker DELETES, a
+    terminal-referenced marker DELETES; the returned count == deleted +
+    flipped."""
+    # Standing decision (active, past expires_at) → FLIP, not delete.
+    await store.upsert_entity_standing_decision(
+        project_id='proj-p',
+        entity_uuid='uuid-flip',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-04-01T00:00:00+00:00',
+        expires_at='2026-06-30T00:00:00+00:00',
+        edge_count_at_decision=9,
+        evidence=[],
+        state=STATE_ACTIVE,
+    )
+    # Expired marker-kind row → DELETE via the expiry arm.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='task-expired',
+            flag_type='drift_flag',
+            expires_at='2026-06-15T00:00:00+00:00',
+        )
+    )
+    # Terminal-referenced marker (not time-expired) → DELETE via the terminal arm.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind='stage2_persistence_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='task-terminal',
+            flag_type='persistence_flag',
+            expires_at='2026-12-01T00:00:00+00:00',
+        )
+    )
+
+    count = await store.gc(
+        'proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=['task-terminal']
+    )
+
+    # Standing row flipped, not deleted.
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1
+    assert listed[0].state == STATE_EXPIRED
+    assert json.loads(listed[0].payload_json)['expiry_reason'] == EXPIRY_REASON_TTL
+    assert await store.get_active_entity_standing_decision('proj-p', 'uuid-flip') is None
+    # Both markers deleted.
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-expired', flag_type='drift_flag'
+        )
+        is None
+    )
+    assert (
+        await store.get_by_identity(
+            'proj-p',
+            'stage2_persistence_marker',
+            task_id='task-terminal',
+            flag_type='persistence_flag',
+        )
+        is None
+    )
+    # Count == deleted (2 markers) + flipped (1 standing decision).
+    assert count == 3
+
+
+@pytest.mark.asyncio
+async def test_gc_flip_defensively_wraps_non_dict_standing_payload(store):
+    """The gc() TTL-flip tolerates a non-object payload_json on an
+    entity_standing_decision row the same way mark_addressed does: a JSON
+    scalar/list is wrapped as {'_payload': <value>} before expiry_reason='ttl'
+    is stamped, and the row still flips to state='expired' (INV-2). Written via
+    a raw upsert() because upsert_entity_standing_decision always builds a dict
+    payload, so this defensive branch is otherwise unexercised."""
+    # Raw upsert of a standing-decision-kind row whose payload_json is a JSON
+    # list (valid JSON, but not an object). The entity_standing_decision PK-slot
+    # layout (task_id='', flag_type=grounds, run_id=entity_uuid) is mirrored so
+    # gc()'s flip SELECT — keyed on record_kind + state + expires_at — matches.
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+            payload_json='[1, 2, 3]',
+            state=STATE_ACTIVE,
+            created_at='2026-04-01T00:00:00+00:00',
+            task_id='',
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id='uuid-scalar',
+            expires_at='2026-06-30T00:00:00+00:00',  # < now
+            entity_uuid='uuid-scalar',
+        )
+    )
+
+    count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    listed = await store.list_entity_standing_decisions('proj-p')
+    assert len(listed) == 1  # flipped, not deleted
+    row = listed[0]
+    assert row.state == STATE_EXPIRED
+    # Non-dict payload defensively wrapped under '_payload', then ttl-stamped.
+    assert json.loads(row.payload_json) == {
+        '_payload': [1, 2, 3],
+        'expiry_reason': EXPIRY_REASON_TTL,
+    }
+    assert await store.get_active_entity_standing_decision('proj-p', 'uuid-scalar') is None
+    assert count == 1

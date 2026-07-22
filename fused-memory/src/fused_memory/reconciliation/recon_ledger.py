@@ -30,6 +30,14 @@ from pathlib import Path
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_TTL,
+    GROUNDS_ENUM,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
+    STATE_ACTIVE,
+    STATE_EXPIRED,
+)
+
 logger = logging.getLogger(__name__)
 
 # Table creation runs first; index creation runs after so both are safe to
@@ -45,6 +53,7 @@ CREATE TABLE IF NOT EXISTS recon_ledger (
     state        TEXT NOT NULL,
     created_at   TEXT NOT NULL,
     expires_at   TEXT,
+    entity_uuid  TEXT,
     PRIMARY KEY (project_id, record_kind, task_id, flag_type, run_id)
 );
 """
@@ -55,6 +64,9 @@ CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_kind_state
 
 CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_expires
     ON recon_ledger (project_id, expires_at);
+
+CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_kind_entity
+    ON recon_ledger (project_id, record_kind, entity_uuid);
 """
 
 SCHEMA_SQL = TABLE_SQL + INDEX_SQL
@@ -99,6 +111,7 @@ class ReconLedgerRecord:
     flag_type: str = ''
     run_id: str = ''
     expires_at: str | None = None
+    entity_uuid: str | None = None
 
 
 def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
@@ -113,6 +126,7 @@ def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
         state=row['state'],
         created_at=row['created_at'],
         expires_at=row['expires_at'],
+        entity_uuid=row['entity_uuid'],
     )
 
 
@@ -138,6 +152,15 @@ class ReconLedgerStore:
         * **Schema-level** — ``CREATE TABLE IF NOT EXISTS`` and
           ``CREATE INDEX IF NOT EXISTS`` make repeated calls safe on an
           already-initialised database.
+
+        The schema is applied in three ordered phases — ``TABLE_SQL`` (create
+        the table), the idempotent ``entity_uuid`` ADD COLUMN migration
+        (task 2894 α), then ``INDEX_SQL`` — rather than a single
+        ``executescript(SCHEMA_SQL)``. The migration MUST run before index
+        creation because ``ix_recon_ledger_project_kind_entity`` references
+        ``entity_uuid``: on a pre-migration DB the column does not exist until
+        the ALTER adds it, so building the index first would raise. This
+        mirrors the TABLE→INDEX split in ``middleware/ticket_store.py``.
         """
         if self._db is not None:
             await self.close()
@@ -145,7 +168,31 @@ class ReconLedgerStore:
         self._db = await connect_daemon(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.executescript(SCHEMA_SQL)
+        await self._db.executescript(TABLE_SQL)
+        await self._db.commit()
+
+        # Safe migration: add the nullable entity_uuid column to pre-existing
+        # recon_ledger tables (task 2894 α, journal.py:214-249 ALTER-TABLE
+        # house pattern). On a fresh DB the column is already created by
+        # TABLE_SQL, so this ALTER fails ("duplicate column name") and is a
+        # harmless rollback; on an old DB it adds the column. Runs BEFORE
+        # INDEX_SQL so ix_recon_ledger_project_kind_entity can reference it.
+        #
+        # The catch is NARROWED to the expected "duplicate column name" case
+        # (loud-over-silent): a genuine migration failure — a locked/corrupt DB,
+        # a disk error — is re-raised here with its own message rather than
+        # swallowed and left to re-surface one statement later as a confusing
+        # "no such column: entity_uuid" from the INDEX_SQL that references it.
+        try:
+            await self._db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
+            await self._db.commit()
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await self._db.rollback()
+            if 'duplicate column name' not in str(exc).lower():
+                raise  # Not the benign "column already exists" case — surface it.
+
+        await self._db.executescript(INDEX_SQL)
         await self._db.commit()
         logger.info('ReconLedgerStore initialized at %s', self._db_path)
 
@@ -179,13 +226,14 @@ class ReconLedgerStore:
                 """
                 INSERT INTO recon_ledger
                     (project_id, record_kind, task_id, flag_type, run_id,
-                     payload_json, state, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payload_json, state, created_at, expires_at, entity_uuid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, record_kind, task_id, flag_type, run_id) DO UPDATE SET
                     payload_json = excluded.payload_json,
                     state = excluded.state,
                     created_at = excluded.created_at,
-                    expires_at = excluded.expires_at
+                    expires_at = excluded.expires_at,
+                    entity_uuid = excluded.entity_uuid
                 """,
                 (
                     record.project_id,
@@ -197,6 +245,7 @@ class ReconLedgerStore:
                     record.state,
                     record.created_at,
                     record.expires_at,
+                    record.entity_uuid,
                 ),
             )
 
@@ -298,13 +347,36 @@ class ReconLedgerStore:
         now: str,
         terminal_task_ids: list[str] | tuple[str, ...],
     ) -> int:
-        """Delete expired rows and terminal-task-referenced marker rows.
+        """Delete expired/terminal-referenced marker rows, and TTL-flip expired
+        ``entity_standing_decision`` rows.
 
         A row is deleted when EITHER ``expires_at < now`` (NULL ``expires_at``
         is never-expire and is naturally excluded — SQL three-valued logic
         means ``NULL < ?`` evaluates to NULL, not true) OR its ``record_kind``
         is one of :data:`MARKER_KINDS` and its ``task_id`` is in
-        ``terminal_task_ids``. Returns the number of rows deleted.
+        ``terminal_task_ids``.
+
+        **entity_standing_decision rows are FLIPPED, not deleted, on expiry**
+        (task 2894 α, INV-2): recurrence history must be preserved, so this
+        kind is excluded from the ``expires_at < now`` DELETE arm in *both*
+        branches, and instead — within the same transaction — every ACTIVE
+        standing row past its ``expires_at`` is flipped to
+        :data:`~fused_memory.reconciliation.standing_decision_constants.STATE_EXPIRED`
+        with ``payload_json`` ``expiry_reason`` stamped
+        :data:`~fused_memory.reconciliation.standing_decision_constants.EXPIRY_REASON_TTL`.
+        The flip is gated on ``state = active`` and so is idempotent — an
+        already-expired standing row is neither re-stamped nor deleted. The
+        expiry_reason stamp reuses :meth:`mark_addressed`'s per-row
+        read-modify-write (json.loads → defensive non-dict wrap → mutate →
+        UPDATE) rather than a SQLite ``json_set()``, keeping the module's
+        Python-json convention and avoiding a JSON1-extension dependency;
+        standing decisions are rare, so the per-row loop cost is negligible.
+
+        Returns ``deleted_count + flipped_count`` — the total number of rows
+        this pass acted on (deleted plus TTL-flipped). The sole caller
+        (``stages.task_knowledge_sync._gc_recon_markers``) uses the return
+        only for logging, and gc passes over a project with no standing rows
+        have ``flipped_count == 0``, so the sum is backward-compatible.
 
         **Multi-task (comma-joined) markers are intentionally NOT decomposed
         here** (task 2228 W5-κ, review finding robustness_regression): the
@@ -346,21 +418,61 @@ class ReconLedgerStore:
                     f"""
                     DELETE FROM recon_ledger
                     WHERE project_id = ? AND (
-                        expires_at < ?
+                        (expires_at < ? AND record_kind != ?)
                         OR (record_kind IN ({marker_placeholders}) AND task_id IN ({terminal_placeholders}))
                     )
                     """,
-                    (project_id, now, *MARKER_KINDS, *terminal_task_ids),
+                    (project_id, now, RECORD_KIND_ENTITY_STANDING_DECISION, *MARKER_KINDS, *terminal_task_ids),
                 )
             else:
                 cursor = await db.execute(
                     """
                     DELETE FROM recon_ledger
-                    WHERE project_id = ? AND expires_at < ?
+                    WHERE project_id = ? AND expires_at < ? AND record_kind != ?
                     """,
-                    (project_id, now),
+                    (project_id, now, RECORD_KIND_ENTITY_STANDING_DECISION),
                 )
-        return cursor.rowcount
+            deleted_count = cursor.rowcount
+
+            # TTL-flip: expired ACTIVE entity_standing_decision rows are kept
+            # (excluded from the DELETE above) and flipped to state='expired'
+            # with payload expiry_reason='ttl' (INV-2). Gated on state='active'
+            # → idempotent; per-row read-modify-write mirrors mark_addressed.
+            flip_cursor = await db.execute(
+                """
+                SELECT project_id, record_kind, task_id, flag_type, run_id, payload_json
+                FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ? AND state = ?
+                  AND expires_at IS NOT NULL AND expires_at < ?
+                """,
+                (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, STATE_ACTIVE, now),
+            )
+            flip_rows = await flip_cursor.fetchall()
+            flipped_count = 0
+            for flip_row in flip_rows:
+                payload = json.loads(flip_row['payload_json'])
+                # Defensively tolerate a non-object payload (see mark_addressed).
+                if not isinstance(payload, dict):
+                    payload = {'_payload': payload}
+                payload['expiry_reason'] = EXPIRY_REASON_TTL
+                await db.execute(
+                    """
+                    UPDATE recon_ledger SET state = ?, payload_json = ?
+                    WHERE project_id = ? AND record_kind = ? AND task_id = ?
+                      AND flag_type = ? AND run_id = ?
+                    """,
+                    (
+                        STATE_EXPIRED,
+                        json.dumps(payload),
+                        flip_row['project_id'],
+                        flip_row['record_kind'],
+                        flip_row['task_id'],
+                        flip_row['flag_type'],
+                        flip_row['run_id'],
+                    ),
+                )
+                flipped_count += 1
+        return deleted_count + flipped_count
 
     async def mark_addressed(
         self,
@@ -417,6 +529,170 @@ class ReconLedgerStore:
                 """,
                 (json.dumps(payload), project_id, record_kind, task_id, flag_type, run_id),
             )
+
+    async def upsert_entity_standing_decision(
+        self,
+        *,
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        decided_at: str,
+        expires_at: str,
+        edge_count_at_decision: int,
+        evidence: object,
+        state: str = STATE_ACTIVE,
+        expiry_reason: str | None = None,
+    ) -> None:
+        """Write (last-write-wins) one ``entity_standing_decision`` ledger row.
+
+        A standing decision records that a class of complaint about a specific
+        entity — identified by ``grounds`` (a closed-enum value in
+        :data:`~fused_memory.reconciliation.standing_decision_constants.GROUNDS_ENUM`)
+        — has been investigated and dismissed, so future recon flags matching
+        that (entity, grounds) can be filtered/annotated (γ/δ) rather than
+        re-raised. The record kind is
+        :data:`~fused_memory.reconciliation.standing_decision_constants.RECORD_KIND_ENTITY_STANDING_DECISION`.
+
+        **PK-slot mapping** (PRD Open Question 3, decided in α): the ledger PK
+        is fixed at ``(project_id, record_kind, task_id, flag_type, run_id)``,
+        so standing rows encode their natural identity by reusing slots —
+        ``task_id=''`` (entity-scoped, no task anchor), ``flag_type=grounds``
+        (the closed-enum sub-classification → per-(entity, grounds)
+        uniqueness), ``run_id=entity_uuid`` (per-entity uniqueness). The new
+        first-class ``entity_uuid`` column mirrors ``run_id`` and is the
+        indexed field Hook A/B/sweeps (γ/δ/ζ) query on. ``grounds`` is mirrored
+        canonically into ``payload_json`` (it is a COMPARED field, never a
+        WHERE-queried column). ``decided_at`` is stored as the row's
+        ``created_at``; ``edge_count_at_decision``/``evidence`` (and an optional
+        ``expiry_reason``) ride in ``payload_json``.
+
+        **Loud-over-silent validation (INV-1):** ``entity_uuid`` must be a
+        non-empty string, ``expires_at`` must not be ``None`` (the never-None
+        expires_at invariant — α enforces it at the write boundary while the β
+        writer computes ``decided_at + STANDING_DECISION_TTL_DAYS``), and
+        ``grounds`` must be a member of ``GROUNDS_ENUM``. A violation raises
+        ``ValueError`` naming the failing field rather than writing a malformed
+        row.
+        """
+        if not entity_uuid:
+            raise ValueError(
+                'upsert_entity_standing_decision: entity_uuid must be a non-empty '
+                f'string (got {entity_uuid!r})'
+            )
+        if expires_at is None:
+            raise ValueError(
+                'upsert_entity_standing_decision: expires_at must not be None '
+                '(never-None-expires_at invariant; standing decisions carry a '
+                'decided_at + STANDING_DECISION_TTL_DAYS expiry)'
+            )
+        if grounds not in GROUNDS_ENUM:
+            raise ValueError(
+                'upsert_entity_standing_decision: grounds must be a member of '
+                f'GROUNDS_ENUM {sorted(GROUNDS_ENUM)} (got {grounds!r})'
+            )
+        payload: dict[str, object] = {
+            'grounds': grounds,
+            'decided_at': decided_at,
+            'edge_count_at_decision': edge_count_at_decision,
+            'evidence': evidence,
+        }
+        if expiry_reason:
+            payload['expiry_reason'] = expiry_reason
+        record = ReconLedgerRecord(
+            project_id=project_id,
+            record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+            task_id='',
+            flag_type=grounds,
+            run_id=entity_uuid,
+            entity_uuid=entity_uuid,
+            payload_json=json.dumps(payload),
+            state=state,
+            created_at=decided_at,
+            expires_at=expires_at,
+        )
+        await self.upsert(record)
+
+    async def list_entity_standing_decisions(
+        self, project_id: str, *, state: str | None = None
+    ) -> list[ReconLedgerRecord]:
+        """Return the ``entity_standing_decision`` rows for a project.
+
+        Scoped to ``record_kind = entity_standing_decision`` and *project_id*;
+        optionally further filtered to a single ``state``. This is the ζ
+        growth/merge sweep source and the round-trip read for α's own tests.
+        """
+        db = self._require_db()
+        if state is None:
+            cursor = await db.execute(
+                """
+                SELECT * FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ?
+                """,
+                (project_id, RECORD_KIND_ENTITY_STANDING_DECISION),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT * FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ? AND state = ?
+                """,
+                (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, state),
+            )
+        rows = await cursor.fetchall()
+        return [_record_from_row(row) for row in rows]
+
+    async def get_active_entity_standing_decision(
+        self, project_id: str, entity_uuid: str
+    ) -> ReconLedgerRecord | None:
+        """Return the single ACTIVE ``entity_standing_decision`` for
+        ``(project_id, entity_uuid)``, or ``None``.
+
+        The shared active-decision-by-uuid lookup Hook A (γ) and Hook B (δ)
+        consume (INV-5). Keyed on the indexed ``entity_uuid`` column and
+        gated on ``state = active`` — an expired/revoked row (or an unknown
+        entity) yields ``None``.
+
+        **At-most-one-active-grounds-per-entity assumption + fast-fail
+        (loud-over-silent, INV-1):** an ``entity_uuid`` occupies the ``run_id``
+        PK slot while ``grounds`` occupies ``flag_type``, so a single entity
+        *can* carry several rows — one per grounds — and, once ``GROUNDS_ENUM``
+        grows past its single seed value, more than one of them could be ACTIVE
+        at the same time. This helper collapses to a single row, so silently
+        returning an arbitrary one of several (an unordered ``LIMIT 1``) would
+        make the γ/δ hooks non-deterministic. Rather than pick one under an
+        unstated ordering, it fetches up to two active rows and raises
+        ``ValueError`` if more than one exists, naming the entity and the
+        conflicting grounds. This guard is latent — it cannot fire today
+        (single-member ``GROUNDS_ENUM`` ⇒ at most one active row per entity) —
+        and the design question it flags (whether this lookup should take an
+        explicit ``grounds`` argument) MUST be resolved before a second grounds
+        value is admitted to ``GROUNDS_ENUM``.
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND entity_uuid = ? AND state = ?
+            ORDER BY flag_type
+            LIMIT 2
+            """,
+            (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, entity_uuid, STATE_ACTIVE),
+        )
+        # aiosqlite types fetchall() as Iterable[Row] (not Sized); materialize
+        # to a list so len()/indexing below type-check (it's already a list at
+        # runtime).
+        rows = list(await cursor.fetchall())
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise ValueError(
+                'get_active_entity_standing_decision: found more than one ACTIVE '
+                f'entity_standing_decision for entity_uuid={entity_uuid!r} in '
+                f'project {project_id!r} (grounds={[row["flag_type"] for row in rows]}). '
+                'This lookup assumes at most one active grounds per entity; add an '
+                'explicit grounds argument before growing GROUNDS_ENUM past one value.'
+            )
+        return _record_from_row(rows[0])
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
