@@ -1556,3 +1556,11 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
     headers = captured_kwargs.get("headers") or {}
     assert "application/json" in headers.get("Accept", "")
     assert "text/event-stream" in headers.get("Accept", "")
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get("Content-Type") == "application/json"
+    # The JSON-RPC tools/call body (name + arguments) must still ride along.
+    envelope = captured_kwargs.get("json") or {}
+    assert envelope.get("method") == "tools/call"
+    assert envelope.get("params", {}).get("name") == "submit_task"
+    assert envelope.get("params", {}).get("arguments") == {"a": 1}

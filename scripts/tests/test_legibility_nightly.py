@@ -453,6 +453,11 @@ def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
     headers = captured_kwargs.get('headers') or {}
     assert 'application/json' in headers.get('Accept', '')
     assert 'text/event-stream' in headers.get('Accept', '')
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get('Content-Type') == 'application/json'
+    # The envelope must still ride along unchanged on the same POST.
+    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
 
 
 # ---------------------------------------------------------------------------

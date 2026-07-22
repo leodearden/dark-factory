@@ -483,6 +483,13 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
     headers = captured_kwargs.get("headers") or {}
     assert "application/json" in headers.get("Accept", "")
     assert "text/event-stream" in headers.get("Accept", "")
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get("Content-Type") == "application/json"
+    # The JSON-RPC tools/call body must still ride along on the same call.
+    envelope = captured_kwargs.get("json") or {}
+    assert envelope.get("method") == "tools/call"
+    assert envelope.get("params", {}).get("name") == "get_statuses"
 
 
 # ---------------------------------------------------------------------------
