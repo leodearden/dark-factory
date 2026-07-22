@@ -11012,6 +11012,73 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                       'severity': esc.severity, 'summary': summary[:200]},
             )
 
+    def _escalate_sandbox_unavailable(
+        self, role_name: str, backend_state: str, detail: str,
+    ) -> None:
+        """Submit a blocking escalation when the sandboxed-dispatch guard refuses.
+
+        Filed at the fail-CLOSED refusal point in :meth:`_guard_sandbox` (task
+        2908, PRD plans/os-sandbox-worktree-containment-prd.md D4 / invariant
+        INV-4): sandboxing is required (``config.sandbox.enabled`` +
+        ``role.sandboxed``) but the configured backend resolved to no available
+        OS sandbox (landlock/bwrap), so the agent invocation is REFUSED rather
+        than run unconfined — mirroring reconciliation's
+        ``RemediationSandboxUnavailable`` (task 1935). The escalation is DEDUPED
+        upstream by the process-global dedup in ``sandbox_dispatch`` (exactly one
+        filing across N refused invocations, re-armed on any backend-state
+        change), so this method is only ever called for the one refusal that
+        should escalate.
+
+        Filed by the orchestrator (not a harness sentinel): ``agent_role``
+        'orchestrator', ``severity`` 'blocking' (L0->steward), ``category``
+        'infra_issue' — an unavailable host sandbox backend is an infra
+        condition. Submission shape mirrors the sibling
+        :meth:`_escalate_plan_overwrite`.
+        """
+        summary = (
+            f'sandbox unavailable — refused {role_name} dispatch for task '
+            f'{self.task_id} (backend={backend_state})'
+        )
+        detail_msg = (
+            f'Role {role_name!r} requires sandboxing (sandbox.enabled + '
+            f'role.sandboxed) but the configured backend={backend_state!r} '
+            f'resolved to no available OS sandbox (landlock/bwrap). Refused to '
+            f'launch the agent unconfined (fail-closed; PRD D4, mirrors recon '
+            f'RemediationSandboxUnavailable / task 1935). This escalation is '
+            f'deduped process-wide: exactly one filing across N refused '
+            f'invocations, re-armed on any backend-state change (INV-4). '
+            f'Remediation: install/enable landlock or bwrap on this host, or '
+            f'set sandbox.backend=none to explicitly run UNSANDBOXED. '
+            f'Underlying refusal: {detail}'
+        )
+        logger.error(f'Task {self.task_id}: {summary}')
+
+        if not self.escalation_queue:
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail_msg,
+            suggested_action='install_sandbox_backend_or_set_backend_none',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': esc.category,
+                      'severity': esc.severity, 'summary': summary[:200]},
+            )
+
     async def _check_scope_invariant(self) -> None:
         """Tripwire (task 2505): warn + escalate if ``plan.files`` and
         ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
