@@ -11603,3 +11603,23 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val2.strip() == '0'
         assert rc_mt2 == 0
         assert mt_val2.strip() == 'false'
+
+    async def test_create_worktree_disables_auto_maintenance(
+        self, git_ops: GitOps,
+    ):
+        """The worktree-create path applies the config to the shared repo, so a
+        dispatch (and any config drift/re-clone) reasserts gc.auto=0 /
+        maintenance.auto=false — mirrors the create_worktree reify-debug-port
+        tests' 'call create_worktree, then assert a side effect' shape."""
+        await git_ops.create_worktree('gc-1')
+
+        rc_gc, gc_val, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt, mt_val, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc == 0
+        assert gc_val.strip() == '0'
+        assert rc_mt == 0
+        assert mt_val.strip() == 'false'
