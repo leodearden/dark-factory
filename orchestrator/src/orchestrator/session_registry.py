@@ -1289,6 +1289,40 @@ def mark_orphaned_sessions_exited(
     return marked
 
 
+def _normalize_wm_window_id(raw: str | None) -> str | None:
+    """Canonicalize a window id to unpadded ``0x<hex>``, or ``None`` if unprovable.
+
+    ``_resolve_display``'s WINDOWID branch (session_hooks.py) can persist a
+    DECIMAL window id (e.g. ``'26'``), while ``wmctrl -l`` always prints
+    zero-padded hex (e.g. ``'0x0000001a'``). Comparing the two raw strings
+    would treat a live decimal-captured window as "gone" and falsely reap
+    it -- avoiding exactly that is ``mark_windowless_wm_sessions_exited``'s
+    whole reason for calling this. This parses *raw* as base-16 when it
+    starts with ``'0x'``/``'0X'``, else base-10, and re-renders the parsed
+    value as unpadded ``f'0x{value:x}'`` -- so ``'26'`` and ``'0x0000001a'``
+    both normalize to ``'0x1a'`` and compare equal; an already-canonical
+    ``'0x1a'`` round-trips unchanged.
+
+    Fails toward "keep, don't reap": returns ``None`` for ``None``/empty/
+    whitespace-only input, a value that doesn't parse as an int in the
+    selected base, or a negative value. Callers must treat ``None`` as
+    "cannot prove this window is gone" -- never as a wildcard match against
+    another ``None``.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        value = int(text, 16) if text.startswith(('0x', '0X')) else int(text, 10)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return f'0x{value:x}'
+
+
 # ---------------------------------------------------------------------------
 # Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
 # ---------------------------------------------------------------------------
