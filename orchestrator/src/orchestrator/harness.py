@@ -4335,17 +4335,135 @@ class Harness:
             )
         return True
 
+    # Durable merge/verify failure outcomes for a stranded-reaper submission —
+    # a stale-green branch failing the merge queue's own verify lands here and
+    # warrants a born-at-L2 (PRD leaf α §2.2).  Success/transient outcomes
+    # ('done', 'already_merged', 'done_wip_recovery', 'superseded',
+    # 'wip_halted') are a strict no-op — the happy done is delivered by the
+    # existing found_on_main path.
+    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
+        'conflict', 'blocked', 'error', 'unknown_branch',
+        'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
+    })
+
     def _on_stranded_merge_done(
         self, fut: asyncio.Future, *, tid: str,
     ) -> None:
         """Done-callback for a stranded-reaper MergeRequest (durable-fail → L2).
 
-        Sync (fires on the loop when the MergeRequest future resolves).  The
-        durable-failure born-at-L2 filing is wired in step-14; this placeholder
-        keeps the happy-submit path (step-8) self-contained and a strict no-op
-        on success / transient outcomes.
+        Sync (fires on the loop when the MergeRequest future resolves).  Derives
+        the terminal outcome and, on a DURABLE merge/verify failure, schedules
+        :meth:`_file_stranded_merge_failed` (a born-at-L2) via
+        ``_schedule_coro_threadsafe``; success / transient outcomes (and a
+        cancelled/abandoned future) are a strict no-op, so the branch + lane are
+        preserved by omission.  Wrapped fail-safe: any error is logged and never
+        propagated (mirrors ``enqueue_merge_request._on_finalized``).
         """
-        return
+        try:
+            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+
+            if fut.cancelled():
+                return  # abandoned/superseded — transient, no-op
+            exc = fut.exception()
+            if exc is not None:
+                outcome = MergeOutcome(
+                    status='error', reason=f'merge future raised: {exc}',
+                )
+            else:
+                outcome = fut.result()
+            if outcome.status not in self._DURABLE_MERGE_FAILURE_STATUSES:
+                return  # success/transient → strict no-op (branch+lane preserved)
+            self._schedule_coro_threadsafe(
+                self._file_stranded_merge_failed(tid, outcome),
+                label=(
+                    f'stranded-merge-failed task {tid} (status={outcome.status})'
+                ),
+            )
+        except Exception:
+            logger.warning(
+                '_on_stranded_merge_done: failed to process merge outcome for '
+                'task %s — no L2 filed (fail-safe)', tid, exc_info=True,
+            )
+
+    async def _file_stranded_merge_failed(
+        self, tid: str, outcome: Any,
+    ) -> None:
+        """File a BORN-AT-L2 ``stranded_merge_failed`` for a durably-failed
+        stranded-reaper merge (PRD leaf α §2.2; mirrors
+        :meth:`_block_and_escalate_delivered_check`).
+
+        ``agent_role='harness-stranded-blocked-reaper'`` (a harness-sentinel
+        role) + ``severity='critical'`` + ``level=2`` make the record BORN AT
+        L2 — it bypasses the auto-watcher and routes straight to a human.  A
+        persistently-false verified-green claim is a "someone must look now"
+        condition.
+
+        Unlike ``_block_and_escalate_delivered_check`` this does NOT touch task
+        status, the lane, or the branch: the task is already ``blocked`` and the
+        branch + lane are preserved for inspection (preservation by omission).
+        Deduped via a scoped ``get_by_task(tid, status='pending', level=2,
+        agent_role=...)`` read filtered to this category.  No-ops when no
+        escalation queue is attached (bare-Harness unit tests stay green).
+        """
+        if self._escalation_queue is None:
+            return
+
+        existing = self._escalation_queue.get_by_task(
+            tid, status='pending', level=2,
+            agent_role='harness-stranded-blocked-reaper',
+        )
+        if any(e.category == 'stranded_merge_failed' for e in existing):
+            logger.warning(
+                'stranded_merge_failed L2 already open for task %s — '
+                'suppressing duplicate', tid,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        status = getattr(outcome, 'status', 'unknown')
+        reason = getattr(outcome, 'reason', '') or ''
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role='harness-stranded-blocked-reaper',
+            severity='critical',
+            category='stranded_merge_failed',
+            summary=(
+                f'Verified-green stranded merge FAILED for task {tid} '
+                f'(status={status}) — manual intervention.'
+            )[:200],
+            detail=(
+                f'The verified-green stranded remediation submitted task {tid}\'s '
+                f'branch directly to the merge queue, but the merge/verify failed '
+                f'durably: status={status}, reason={reason!r}.  The task remains '
+                f'blocked and the branch + lane are preserved (untouched) for '
+                f'inspection.  A stale-green branch failing the merge queue\'s '
+                f'own full verify lands here — the remediation never bypasses '
+                f'that gate (PRD leaf α §2.2).  Investigate and re-drive or '
+                f'triage manually.'
+            ),
+            suggested_action='manual_intervention',
+            level=2,
+        )
+        self._escalation_queue.submit(esc)
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=tid,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'stranded_merge_failed',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': f'stranded-merge-{status}',
+                },
+            )
+        logger.warning(
+            'Filed born-at-L2 stranded_merge_failed %s for task %s '
+            '(status=%s) — task stays blocked, branch+lane preserved',
+            esc.id, tid, status,
+        )
 
     async def _branch_is_degenerate(
         self, branch: str, metadata: dict[str, Any],
