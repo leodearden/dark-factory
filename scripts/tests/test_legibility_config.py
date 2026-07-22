@@ -282,6 +282,22 @@ class TestShippedDarkFactoryConfig:
         assert cfg.models.census_verify
         assert cfg.models.census_synthesis
 
+    def test_shipped_config_timeouts_set_live(self):
+        # The per-census-stage claude-CLI budgets are pinned EXPLICITLY in the
+        # shipped config, not merely riding the schema defaults, so a future
+        # change to Timeouts' defaults cannot silently alter dark_factory's
+        # census budgets. The raw-text assertion is load-bearing: the schema
+        # defaults happen to equal these values, so without an explicit
+        # ``timeouts:`` block the loaded-value asserts alone would pass on
+        # defaults — the text check is what pins the block's in-file presence.
+        raw = self.SHIPPED_CONFIG_PATH.read_text(encoding='utf-8')
+        assert 'timeouts:' in raw, 'shipped config must carry an explicit timeouts: block'
+
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):
         # the shipped config ships the fleet archive root SET (live), not empty,
