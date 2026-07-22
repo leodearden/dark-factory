@@ -177,3 +177,24 @@ class TestRemoveMergeWorktreeGuarded:
 
         assert outcome == 'skipped_persistent'
         assert p.exists()
+
+    async def test_never_created_path_returns_not_present(self, git_ops: GitOps):
+        """A path that was never created (uncontended flock, nothing to
+        remove) must report 'not_present' distinctly from a git-remove
+        failure on an existing-but-unregistered directory."""
+        p = git_ops.worktree_base / '_merge-never-created'
+
+        outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
+
+        assert outcome == 'not_present'
+
+    async def test_non_worktree_directory_returns_failed(self, git_ops: GitOps):
+        """Positive control pinning the distinct 'failed' outcome: an
+        existing directory that is NOT a registered git worktree makes
+        `git worktree remove --force` itself error."""
+        p = git_ops.worktree_base / '_merge-plain-dir'
+        p.mkdir(parents=True)
+
+        outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
+
+        assert outcome == 'failed'
