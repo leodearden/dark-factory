@@ -1256,6 +1256,75 @@ class TestPrewarmPool:
             'prewarm_pool' in m and 'shortfall' in m.lower() for m in warnings
         ), f'expected a prewarm_pool shortfall WARNING; got: {warnings!r}'
 
+    async def test_absent_base_short_circuits_touching_no_lane(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """The feature's primary fail-open safety property: when the CoW seed
+        base is ABSENT, prewarm short-circuits BEFORE creating any worktree
+        (materialized==0, nothing registered) and logs the base-absent
+        WARNING — it must NEVER mass-create lanes against a missing base."""
+        import logging
+
+        from orchestrator.git_ops import WarmBaseHealth
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        base = git_ops.worktree_base
+        # Force the base-health gate to read ABSENT (mirrors acquire's
+        # pre-acquire gate); prewarm must touch no lane.
+        with patch.object(
+            git_ops, '_warm_lane_base_resolvable',
+            return_value=WarmBaseHealth.ABSENT,
+        ), caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.prewarm_pool(start_ref)
+
+        # No lane touched: none created, none materialized. target reflects the
+        # configured pool size (len(lanes)), with all counters zeroed — the
+        # documented ABSENT-path exception to the accounting invariant.
+        assert result.target == 3
+        assert result.materialized == 0
+        assert result.already_resident == 0
+        assert result.failed == 0
+        assert result.failures == []
+        for k in range(3):
+            lane = base / f'_lane-{k}'
+            assert not await git_ops._is_registered_worktree(lane), (
+                f'{lane} must NOT be created when the CoW base is ABSENT'
+            )
+
+        # The dedicated base-absent WARNING is the visible signal here.
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'prewarm_pool' in m and 'absent' in m.lower() for m in warnings
+        ), f'expected a prewarm_pool base-absent WARNING; got: {warnings!r}'
+
+    async def test_disabled_pool_is_a_noop(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """With no warm-lane pool (warm_lane_pool is None) prewarm is a pure
+        no-op returning PoolPrewarmResult(target=0)."""
+        from orchestrator.git_ops import PoolPrewarmResult
+
+        # No warm_lane_pool_size → GitOps.warm_lane_pool is None.
+        git_ops = GitOps(wl_git_config_on, wl_git_repo)
+        assert git_ops.warm_lane_pool is None
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.prewarm_pool(start_ref)
+
+        assert result == PoolPrewarmResult(target=0)
+        assert result.target == 0
+        assert result.materialized == 0
+        assert result.already_resident == 0
+        assert result.failed == 0
+        assert result.failures == []
+
 
 @pytest.mark.asyncio
 class TestAcquireWarmLaneCreateOnce:
