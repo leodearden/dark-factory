@@ -1273,20 +1273,16 @@ def _parse_cli_date(value: str) -> date:
 
 def _build_stage_invokes(cfg):
     """Build the three per-stage ``invoke(prompt, model)`` seams, each
-    carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``.
+    carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
+    (see ``config.Timeouts`` for the rationale — why each stage needs its
+    own budget).
 
     Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
     census stage calls its invoke as ``invoke(prompt, model)`` with two
     positional args and no kwargs, so a ``functools.partial`` that
-    pre-binds the keyword-only ``timeout`` is a drop-in ``invoke``. This is
-    the whole fix: the shared ``coder._invoke_cli`` default of 120s (sized
-    for one Haiku trickle-coding call) is fine for mining and the tiny
-    headroom probe, but fatally short for the per-cluster Sonnet
-    verify-vs-``main`` calls and the one large Fable synthesis call — it
-    killed the first dark_factory census. ``mining_invoke`` also backs the
-    headroom probe (``run_census`` routes both through its single
-    ``invoke`` param); both are short round trips that fit the mining
-    budget.
+    pre-binds the keyword-only ``timeout`` is a drop-in ``invoke``.
+    ``mining_invoke`` also backs the headroom probe (``run_census`` routes
+    both through its single ``invoke`` param).
 
     ``coder._invoke_cli`` is looked up here at call time (inside this
     function, invoked from ``main``), never bound at import, so
@@ -1385,10 +1381,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    # Each census stage gets its OWN claude-CLI subprocess timeout: the
-    # shared coder default (120s) fits mining/headroom but fatally short-cut
-    # the per-cluster Sonnet verify and the large Fable synthesis — the bug
-    # that killed the first dark_factory census.
+    # Each census stage gets its OWN claude-CLI subprocess timeout; see
+    # config.Timeouts for the rationale.
     mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
 
     try:
