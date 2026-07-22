@@ -3196,6 +3196,18 @@ class OrchestratorConfig(BaseSettings):
     # is resolved.  Self-dedupes via the pending-escalation check.
     stranded_blocked_escalate_enabled: bool = Field(default=True)
 
+    # Kill-switch for the verified-green merge-queue-direct remediation
+    # (stranding-remediation-scheduler-ergonomics-prd.md leaf α).  When enabled
+    # (default), a stranded-`blocked` task whose warm lane holds an ASSIGNED,
+    # verified-green branch (all steps done, lane tip == last passed
+    # workflow_verify tip) is submitted DIRECTLY to the merge queue instead of
+    # re-filed/re-pended — the merge queue runs even under a scheduler pause, so
+    # this rescues work that a paused scheduler would never re-dispatch.
+    # Disabling it falls back byte-identically to today's stranded_blocked
+    # re-file/re-pend path (above): the verified-green detector is never
+    # consulted and no merge_request is submitted.
+    stranded_verified_green_merge_enabled: bool = Field(default=True)
+
     # Task 2408 — claimant-liveness gate.  Two mechanisms share one liveness
     # signal (shared.task_claimant): mechanism 1 refuses dispatch into a
     # `pending` task that currently has a LIVE claimant (has_live_claimant,
