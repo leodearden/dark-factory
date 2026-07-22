@@ -155,3 +155,25 @@ class TestRemoveMergeWorktreeGuarded:
             )
         finally:
             remove_lock_holder_pgid(git_ops.worktree_base)
+
+    async def test_persistent_merge_worktree_path_is_skipped(self, git_ops: GitOps):
+        """Persistent lanes are never removed regardless of lease — the
+        skip fires before any flock is even touched."""
+        p = git_ops.persistent_merge_worktree_path
+        p.mkdir(parents=True)
+
+        outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
+
+        assert outcome == 'skipped_persistent'
+        assert p.exists()
+
+    async def test_persistent_offline_deep_worktree_path_is_skipped(self, git_ops: GitOps):
+        """Mirrors test_persistent_merge_worktree_path_is_skipped for the
+        second persistent lane (_offline-deep)."""
+        p = git_ops.persistent_offline_deep_worktree_path
+        p.mkdir(parents=True)
+
+        outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
+
+        assert outcome == 'skipped_persistent'
+        assert p.exists()
