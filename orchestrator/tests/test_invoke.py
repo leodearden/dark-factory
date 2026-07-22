@@ -1392,6 +1392,95 @@ class TestProgressExtensionParamsForwarding:
         )
 
 
+@pytest.mark.asyncio
+class TestSandboxExtrasForwarding:
+    """invoke_agent and _invoke_claude_with_sandbox must thread sandbox_extras
+    → wrap_command(writable_extras=...) (task 2905 step-3).
+
+    sandbox_extras is the carve-out vehicle carrying compute_write_set()'s
+    absolute contract paths (worktree root + carve-outs) into the sandbox —
+    distinct from sandbox_modules/writable_modules (relative, join-to-worktree,
+    makedirs). RED: fails until invoke.py threads sandbox_extras through
+    invoke_agent and the four sub-invokers to wrap_command's writable_extras.
+    """
+
+    async def test_sandbox_path_forwards_sandbox_extras_to_wrap_command(self, tmp_path):
+        """_invoke_claude_with_sandbox passes sandbox_extras to wrap_command as
+        writable_extras=, with sandbox_modules=[] the positional writable_modules.
+
+        Fails today: _invoke_claude_with_sandbox has no sandbox_extras param →
+        TypeError.
+        """
+        captured: dict = {}
+
+        def capturing_wrap_command(cmd, cwd, mods, writable_extras=None):
+            captured['writable_modules'] = mods
+            captured['writable_extras'] = writable_extras
+            return cmd
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        with (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=capturing_wrap_command,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=[],
+                effort=None, timeout_seconds=30.0,
+                sandbox_extras=['/abs/carveout'],
+            )
+
+        assert captured.get('writable_extras') == ['/abs/carveout'], (
+            f"Expected wrap_command called with writable_extras=['/abs/carveout']; "
+            f"got {captured.get('writable_extras')!r}"
+        )
+        assert captured.get('writable_modules') == [], (
+            f'Expected positional writable_modules=[] (sandbox_modules=[]); '
+            f"got {captured.get('writable_modules')!r}"
+        )
+
+    async def test_invoke_agent_forwards_sandbox_extras_to_claude_subinvoker(self, tmp_path):
+        """invoke_agent(backend='claude') forwards sandbox_extras to
+        _invoke_claude_with_sandbox.
+
+        Fails today: invoke_agent has no sandbox_extras param → TypeError.
+        """
+        with patch(
+            'orchestrator.agents.invoke._invoke_claude_with_sandbox',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_claude:
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='claude', sandbox_modules=[],
+                sandbox_extras=['/abs/carveout'],
+            )
+
+        assert mock_claude.await_args is not None, 'await_args must be set after one await'
+        assert mock_claude.await_args.kwargs.get('sandbox_extras') == ['/abs/carveout'], (
+            f'sandbox_extras not forwarded to _invoke_claude_with_sandbox; '
+            f'captured={mock_claude.await_args.kwargs!r}'
+        )
+
+
 # ===================================================================
 # TestReleaseProbeSlotOnException (orchestrator invoke_with_cap_retry)
 # ===================================================================
