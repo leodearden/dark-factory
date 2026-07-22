@@ -63,6 +63,35 @@ class TestWarmLanePoolConstruction:
 
 
 # ---------------------------------------------------------------------------
+# lane_paths — public git-free accessor over every pool lane (task 2879 step-01)
+# ---------------------------------------------------------------------------
+
+
+class TestLanePaths:
+    """``lane_paths()`` exposes the full lane list in insertion order.
+
+    Gives ``GitOps.prewarm_pool`` a public, git-free way to iterate EVERY lane
+    (including the never-demanded high-numbered ones) rather than reaching into
+    the private ``_lanes`` dict.
+    """
+
+    def test_lane_paths_returns_all_lanes_in_order(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=4)
+        base = tmp_path / 'worktrees'
+        expected = [base / f'_lane-{k}' for k in range(4)]
+        assert pool.lane_paths() == expected
+
+    def test_lane_paths_size_one(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=1)
+        base = tmp_path / 'worktrees'
+        assert pool.lane_paths() == [base / '_lane-0']
+
+    def test_lane_paths_empty_for_zero_size(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=0)
+        assert pool.lane_paths() == []
+
+
+# ---------------------------------------------------------------------------
 # try_acquire
 # ---------------------------------------------------------------------------
 
