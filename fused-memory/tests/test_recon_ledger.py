@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
@@ -39,12 +40,33 @@ EXPECTED_COLUMNS = {
     'state',
     'created_at',
     'expires_at',
+    'entity_uuid',
 }
 
 EXPECTED_INDEXES = {
     'ix_recon_ledger_project_kind_state',
     'ix_recon_ledger_project_expires',
+    'ix_recon_ledger_project_kind_entity',
 }
+
+# The pre-migration recon_ledger schema (before task 2894 α added the nullable
+# entity_uuid column) — used to construct an "old" DB and prove
+# ReconLedgerStore.initialize() adds entity_uuid via its idempotent ADD COLUMN
+# migration for pre-existing databases.
+PRE_MIGRATION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS recon_ledger (
+    project_id   TEXT NOT NULL,
+    record_kind  TEXT NOT NULL,
+    task_id      TEXT NOT NULL DEFAULT '',
+    flag_type    TEXT NOT NULL DEFAULT '',
+    run_id       TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL,
+    state        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT,
+    PRIMARY KEY (project_id, record_kind, task_id, flag_type, run_id)
+);
+"""
 
 
 @pytest_asyncio.fixture
@@ -87,6 +109,89 @@ async def test_initialize_creates_schema_with_expected_columns_and_indexes(tmp_p
         )
     finally:
         await s.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_pre_existing_db_adding_entity_uuid_column(tmp_path):
+    """A recon_ledger DB created WITHOUT entity_uuid (pre-migration schema)
+    gains the column after ReconLedgerStore.initialize() runs its idempotent
+    ADD COLUMN migration; a second initialize() is a safe no-op (journal.py
+    ALTER-TABLE house pattern)."""
+    db_path = tmp_path / 'reconciliation.db'
+    # Build a pre-migration DB: raw-connect and CREATE TABLE with the OLD column set.
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.executescript(PRE_MIGRATION_TABLE_SQL)
+        await conn.commit()
+        cursor = await conn.execute('PRAGMA table_info(recon_ledger)')
+        pre_cols = {row[1] for row in await cursor.fetchall()}
+        # Sanity: the DB is genuinely pre-migration.
+        assert 'entity_uuid' not in pre_cols
+    finally:
+        await conn.close()
+
+    store = ReconLedgerStore(db_path)
+    await store.initialize()
+    try:
+        db = store._db
+        assert db is not None
+        cursor = await db.execute('PRAGMA table_info(recon_ledger)')
+        cols_after = {row[1] for row in await cursor.fetchall()}
+        assert 'entity_uuid' in cols_after
+
+        # Idempotent: a second initialize() re-runs the ADD COLUMN as a no-op
+        # (does not raise, does not duplicate the column).
+        await store.initialize()
+        db = store._db
+        assert db is not None
+        cursor = await db.execute('PRAGMA table_info(recon_ledger)')
+        cols_reinit = {row[1] for row in await cursor.fetchall()}
+        assert cols_reinit == cols_after
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_round_trips_entity_uuid_set_and_none(store):
+    """A generic ReconLedgerRecord round-trips entity_uuid through
+    upsert→get_by_identity both when set to a uuid string and when left None
+    (the trailing-field default)."""
+    with_uuid = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-1',
+        flag_type='drift_flag',
+        run_id='run-1',
+        entity_uuid='uuid-abc',
+    )
+    await store.upsert(with_uuid)
+    fetched = await store.get_by_identity(
+        'proj-a', 'stage1_flag_marker', task_id='task-1', flag_type='drift_flag', run_id='run-1'
+    )
+    assert fetched is not None
+    assert fetched.entity_uuid == 'uuid-abc'
+    assert fetched == with_uuid
+
+    without_uuid = ReconLedgerRecord(
+        project_id='proj-b',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-2',
+        flag_type='drift_flag',
+        run_id='run-2',
+    )
+    await store.upsert(without_uuid)
+    fetched_none = await store.get_by_identity(
+        'proj-b', 'stage1_flag_marker', task_id='task-2', flag_type='drift_flag', run_id='run-2'
+    )
+    assert fetched_none is not None
+    assert fetched_none.entity_uuid is None
+    assert fetched_none == without_uuid
 
 
 @pytest.mark.asyncio
