@@ -208,6 +208,10 @@ CATEGORIES = [
     'review_suggestions',
     # Stranded-blocked recovery (PRD-3 D5 / C6)
     'stranded_blocked',
+    # Verified-green stranded remediation: durable merge/verify failure of a
+    # reaper-submitted branch (stranding-remediation-scheduler-ergonomics-prd.md
+    # leaf α).  Inert/unvalidated (action_effects.py:23) — vocabulary parity only.
+    'stranded_merge_failed',
 ]
 
 # Fields returned by get_pending_escalations(compact=True) — the triage-relevant
