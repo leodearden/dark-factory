@@ -2016,8 +2016,26 @@ def test_run_session_start_windowid_env_stamps_wm_display(tmp_path: Path) -> Non
     record = sr.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_window_id == '0x03200007'
     assert record.display.wm_title == 'session:dark-factory'
+
+
+def test_run_session_start_decimal_windowid_stamps_canonical_hex_display(tmp_path: Path) -> None:
+    # Real terminal emulators export $WINDOWID as a bare DECIMAL (e.g.
+    # '52428807'), not hex. Capture must canonicalize it to wmctrl -l's
+    # 0x%08x column form ('0x03200007') so string-consumers (the window-gone
+    # reaper, dashboards) and the wm backend agree. 52428807 == 0x03200007
+    # is an exact identity.
+    hook_input = {'session_id': 'sess-d2b', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '52428807'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x03200007'
 
 
 def test_run_session_start_tmux_takes_precedence_over_windowid(tmp_path: Path) -> None:
@@ -2069,7 +2087,7 @@ def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Pa
     assert record.status == sr.Status.RUNNING
     assert record.display is not None
     assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_window_id == '0x03200007'
     # wm_title resolves from the persisted record title (hook_display_title's
     # existing precedence), not a freshly-derived role:project fallback.
     assert record.display.wm_title == 'unblock:df#2085 routing-mechanism'
@@ -2138,7 +2156,7 @@ def test_run_session_start_windowid_wins_over_marker_title_resolver_not_called(
     record = sr.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_window_id == '0x03200007'
 
 
 def test_run_session_start_tmux_wins_over_marker_title_resolver_not_called(
