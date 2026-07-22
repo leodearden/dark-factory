@@ -1556,3 +1556,46 @@ def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
     # Each stage's own timeout threads through, in [mining, verify, synth]
     # order — proving every stage carries its distinct budget.
     assert recorded == [111, 222, 333]
+
+
+def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
+    # REGRESSION for the exact bug: main() once handed the raw
+    # coder._invoke_cli (120s module default) to EVERY stage, so every
+    # per-cluster Sonnet verify-vs-main call and the large Fable synthesis
+    # call died at 120s and census-state.json never advanced. Pin that each
+    # stage now receives its own budget.
+    #
+    # DEFAULT config — NO timeouts block — so cfg.timeouts falls back to the
+    # schema defaults (120/900/1800). This is exactly the shape of a
+    # pre-existing legibility.yaml.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    recorded = []
+
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+        recorded.append({"model": model, "timeout": timeout})
+        return '{"verified": true}'
+
+    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
+
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    # --force must never reach the gate.
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    assert exit_code == 0
+
+    kwargs = fake_run_census.calls[0]
+
+    # (1) mining/headroom invoke -> mining budget 120 (unchanged; short calls).
+    kwargs["invoke"]("ping", "haiku")
+    assert recorded[-1] == {"model": "haiku", "timeout": 120}
+
+    # (2) verify_fn -> per-cluster Sonnet call carries 900 (was the fatal 120).
+    kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
+    assert recorded[-1] == {"model": "sonnet", "timeout": 900}
+
+    # (3) synthesize_fn -> the one large Fable call carries 1800.
+    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+    assert recorded[-1] == {"model": "fable", "timeout": 1800}
