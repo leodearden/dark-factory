@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -515,6 +516,66 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
     with pytest.raises(AssertionError):
         wait_for_marker_stable(
             marker, timeout=0.05, interval=0, _read_mtime_ns=fake_read_mtime_ns,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2941 -- deterministic unit coverage for measure_uncontended_baseline_secs,
+# the same-shape uncontended-verify-merge baseline helper that replaces task
+# 2921's bare-import baseline in test_flock_wait_env_override_speeds_up_
+# contention_result below.  Both tests inject _spawn/_clock/_parse seams so
+# there is ZERO real subprocess/timing -- mirrors wait_for_marker_stable's
+# _read_mtime_ns seam (task 2819) above.
+# ---------------------------------------------------------------------------
+
+
+def test_measure_uncontended_baseline_secs_returns_elapsed_for_passed_result():
+    """measure_uncontended_baseline_secs returns the _clock-measured elapsed duration.
+
+    Injects a fake proc (MagicMock) that exits 0 with empty stdout/stderr, a
+    scripted _clock yielding a start then end reading (100.0 -> 100.75), and
+    a fake _parse returning a passed-category result.  The helper must
+    return the clock delta (0.75) -- only reachable via the injected seams,
+    since nothing here touches a real subprocess or a real clock.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b'', b'')
+    clock_values = iter([100.0, 100.75])
+
+    result = measure_uncontended_baseline_secs(
+        sha='deadbeef',
+        spec=fast_spec(),
+        cfg_file=Path('unused-config.yaml'),
+        _spawn=lambda **kw: proc,
+        _clock=lambda: next(clock_values),
+        _parse=lambda _s: SimpleNamespace(category='passed'),
+    )
+
+    assert result == pytest.approx(0.75)
+
+
+def test_measure_uncontended_baseline_secs_rejects_contended_baseline():
+    """measure_uncontended_baseline_secs raises if the baseline run itself contended.
+
+    A contended baseline would fold its own flock wait into the subtrahend
+    and silently corrupt the flock_component discriminant it feeds -- so an
+    accidentally-contended baseline must be a hard AssertionError, never a
+    silently-accepted value.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b'', b'')
+    clock_values = iter([100.0, 100.75])
+
+    with pytest.raises(AssertionError):
+        measure_uncontended_baseline_secs(
+            sha='deadbeef',
+            spec=fast_spec(),
+            cfg_file=Path('unused-config.yaml'),
+            _spawn=lambda **kw: proc,
+            _clock=lambda: next(clock_values),
+            _parse=lambda _s: SimpleNamespace(category=FLOCK_CONTENTION_CATEGORY),
         )
 
 
