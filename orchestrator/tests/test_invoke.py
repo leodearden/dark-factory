@@ -1480,6 +1480,44 @@ class TestSandboxExtrasForwarding:
             f'captured={mock_claude.await_args.kwargs!r}'
         )
 
+    @pytest.mark.parametrize(
+        ('backend', 'subinvoker'),
+        [
+            ('codex', '_invoke_codex'),
+            ('gemini', '_invoke_gemini'),
+            ('pi', '_invoke_pi'),
+        ],
+    )
+    async def test_invoke_agent_forwards_sandbox_extras_to_nonclaude_subinvoker(
+        self, tmp_path, backend, subinvoker,
+    ):
+        """invoke_agent(backend=codex|gemini|pi) forwards sandbox_extras to the
+        matching _invoke_<backend> sub-invoker.
+
+        The claude path is covered by
+        test_invoke_agent_forwards_sandbox_extras_to_claude_subinvoker; this
+        parametrized guard exercises the identical sandbox_extras →
+        wrap_command(writable_extras=...) forwarding threaded through the other
+        three sub-invokers (task 2905 step-4), so a future edit that drops the
+        kwarg from codex/gemini/pi is caught here too.
+        """
+        with patch(
+            f'orchestrator.agents.invoke.{subinvoker}',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_subinvoker:
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend=backend, sandbox_modules=[],
+                sandbox_extras=['/abs/carveout'],
+            )
+
+        assert mock_subinvoker.await_args is not None, 'await_args must be set after one await'
+        assert mock_subinvoker.await_args.kwargs.get('sandbox_extras') == ['/abs/carveout'], (
+            f'sandbox_extras not forwarded to {subinvoker}; '
+            f'captured={mock_subinvoker.await_args.kwargs!r}'
+        )
+
 
 # ===================================================================
 # TestReleaseProbeSlotOnException (orchestrator invoke_with_cap_retry)
