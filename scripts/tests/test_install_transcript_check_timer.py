@@ -207,28 +207,39 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     timer_path = unit_dir / "legibility-transcript-check@.timer"
     assert service_path.is_file(), f"Expected {service_path} to exist after install"
     assert timer_path.is_file(), f"Expected {timer_path} to exist after install"
-    assert service_path.read_bytes() == (TEMPLATES_DIR / "legibility-transcript-check@.service").read_bytes()
-    assert timer_path.read_bytes() == (TEMPLATES_DIR / "legibility-transcript-check@.timer").read_bytes()
-
-    # The installed @.service's ExecStart references the DETECTOR
-    # (check_transcript_persistence.py) + the %i instance placeholder
-    # (systemd itself expands %i at instantiation time -- the template is
-    # copied verbatim, never per-instance edited). It must NOT pass
-    # --check-preventer (DD2: the 2893 preventer regex false-negatives
-    # against the real spawn-claude.sh, so passing it would exit 1 every run).
-    service_text = service_path.read_text()
-    assert "check_transcript_persistence.py" in service_text
-    assert "--project-id %i" in service_text
-    assert "--check-preventer" not in service_text, (
-        "The transcript-check service must NOT pass --check-preventer (DD2): "
-        "the 2893 preventer-guard regex false-negatives against the real "
-        "spawn-claude.sh, which would make the timer exit 1 on every run."
-    )
+    # Byte-equality with the committed templates above already proves the
+    # install copied them verbatim; the @.service ExecStart *shape* invariant
+    # (references the detector, passes %i, and — DD2 — never --check-preventer)
+    # is asserted directly against the committed template in
+    # test_service_template_execstart_shape, independent of install behavior.
 
     calls = _systemctl_calls(tmp_path)
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", "legibility-transcript-check@proj_a.timer"] in calls, f"calls={calls!r}"
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
+
+
+def test_service_template_execstart_shape():
+    """Template-content invariant (NOT install behavior): the committed
+    @.service's ExecStart must target the DETECTOR
+    (check_transcript_persistence.py) with the %i instance placeholder
+    (systemd expands %i at instantiation — the template is copied verbatim,
+    never per-instance edited) and must NOT pass --check-preventer.
+
+    DD2: the 2893 preventer-guard regex false-negatives against the real
+    spawn-claude.sh, so passing --check-preventer would make the timer exit 1
+    on EVERY run (a perpetual false alarm). This pins the ExecStart shape at
+    its source, so a future template edit that reintroduced --check-preventer
+    fails here regardless of the install path.
+    """
+    service_text = (TEMPLATES_DIR / "legibility-transcript-check@.service").read_text()
+    assert "check_transcript_persistence.py" in service_text
+    assert "--project-id %i" in service_text
+    assert "--check-preventer" not in service_text, (
+        "The transcript-check service template must NOT pass --check-preventer "
+        "(DD2): the 2893 preventer-guard regex false-negatives against the real "
+        "spawn-claude.sh, which would make the timer exit 1 on every run."
+    )
 
 
 def test_install_is_idempotent(tmp_path):
