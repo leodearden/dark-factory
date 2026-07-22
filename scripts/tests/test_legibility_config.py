@@ -111,6 +111,51 @@ class TestNestedDefaults:
         assert cfg.models.census_synthesis == 'fable'
 
 
+class TestTimeouts:
+    """The ``timeouts:`` block — per-census-stage claude-CLI subprocess
+    budgets (census_mining_secs / census_verify_secs / census_synthesis_secs).
+
+    An omitted block loads with all three defaults (120/900/1800), so an
+    existing legibility.yaml that predates this block keeps working
+    unchanged — the driving acceptance criterion of the fix that gave
+    verify/synthesis their own budgets after the shared 120s coder default
+    killed the first dark_factory census.
+    """
+
+    def test_timeouts_defaults_when_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert isinstance(cfg.timeouts, mod.Timeouts)
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_timeouts_defaults_when_block_present_but_empty(self, tmp_path):
+        text = MINIMAL_YAML + 'timeouts: {}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_partial_timeouts_block_keeps_other_defaults(self, tmp_path):
+        # Only census_verify_secs is overridden; mining and synthesis must
+        # still default rather than becoming required or vanishing.
+        text = MINIMAL_YAML + 'timeouts: {census_verify_secs: 1200}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_verify_secs == 1200
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_full_timeouts_override_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + (
+            'timeouts: {census_mining_secs: 60, census_verify_secs: 1200, '
+            'census_synthesis_secs: 2400}\n'
+        )
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_mining_secs == 60
+        assert cfg.timeouts.census_verify_secs == 1200
+        assert cfg.timeouts.census_synthesis_secs == 2400
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
