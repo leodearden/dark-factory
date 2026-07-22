@@ -1508,3 +1508,94 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
     assert kwargs["agent_transcript_roots"] == expected_roots
     # (3) the [start, end] window equals _census_window_dates' first/last.
     assert (start_date, end_date) == (window[0], window[-1])
+
+
+# ---------------------------------------------------------------------------
+# _build_stage_invokes — each census stage gets its OWN claude-CLI subprocess
+# timeout, threaded through the invoke(prompt, model) seam via
+# functools.partial(coder._invoke_cli, timeout=...). The shared 120s coder
+# default is fine for mining/headroom but fatal for the per-cluster Sonnet
+# verify-vs-main and the one large Fable synthesis; this is where that split
+# is bound.
+# ---------------------------------------------------------------------------
+
+def _config_with_timeouts(mining, verify, synthesis):
+    """A minimal valid LegibilityConfig carrying explicit stage timeouts."""
+    return config_mod.LegibilityConfig(
+        project_id="dark_factory",
+        project_root="/home/leo/src/dark-factory",
+        escalation_port=8103,
+        cwd_prefixes=["/home/leo/src/dark-factory"],
+        timeouts=config_mod.Timeouts(
+            census_mining_secs=mining,
+            census_verify_secs=verify,
+            census_synthesis_secs=synthesis,
+        ),
+    )
+
+
+def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
+    # Record the timeout every stage invoke threads to coder._invoke_cli.
+    recorded = []
+
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+        recorded.append(timeout)
+        return "dummy"
+
+    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
+
+    cfg = _config_with_timeouts(111, 222, 333)
+    mining, verify, synth = mod._build_stage_invokes(cfg)
+
+    # Drive each partial exactly as its census seam does: two positional
+    # args, no kwargs (invoke(prompt, model)).
+    mining("p", "haiku")
+    verify("p", "sonnet")
+    synth("p", "fable")
+
+    # Each stage's own timeout threads through, in [mining, verify, synth]
+    # order — proving every stage carries its distinct budget.
+    assert recorded == [111, 222, 333]
+
+
+def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
+    # REGRESSION for the exact bug: main() once handed the raw
+    # coder._invoke_cli (120s module default) to EVERY stage, so every
+    # per-cluster Sonnet verify-vs-main call and the large Fable synthesis
+    # call died at 120s and census-state.json never advanced. Pin that each
+    # stage now receives its own budget.
+    #
+    # DEFAULT config — NO timeouts block — so cfg.timeouts falls back to the
+    # schema defaults (120/900/1800). This is exactly the shape of a
+    # pre-existing legibility.yaml.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    recorded = []
+
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+        recorded.append({"model": model, "timeout": timeout})
+        return '{"verified": true}'
+
+    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
+
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    # --force must never reach the gate.
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    assert exit_code == 0
+
+    kwargs = fake_run_census.calls[0]
+
+    # (1) mining/headroom invoke -> mining budget 120 (unchanged; short calls).
+    kwargs["invoke"]("ping", "haiku")
+    assert recorded[-1] == {"model": "haiku", "timeout": 120}
+
+    # (2) verify_fn -> per-cluster Sonnet call carries 900 (was the fatal 120).
+    kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
+    assert recorded[-1] == {"model": "sonnet", "timeout": 900}
+
+    # (3) synthesize_fn -> the one large Fable call carries 1800.
+    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+    assert recorded[-1] == {"model": "fable", "timeout": 1800}
