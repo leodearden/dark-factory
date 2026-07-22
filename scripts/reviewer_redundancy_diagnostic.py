@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Phase-1 diagnostic for the reviewer panel restructuring trial.
 
-Walks every `.task/reviews/reviewer_*.json` under .worktrees and
-.eval-worktrees, computes per-reviewer activity, redundancy/uniqueness,
-and pairwise overlap stats.
+Walks every `.task/reviews/reviewer_*.json` under REPO/.worktrees and the
+relocated eval-worktree root (eval_worktree_root(REPO), a sibling of REPO —
+task 2881), computes per-reviewer activity, redundancy/uniqueness, and
+pairwise overlap stats.
 
 Two notions of "same issue":
 1. coarse  — same file path (stripping :line)
@@ -26,7 +27,21 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 REPO = Path('/home/leo/src/dark-factory')
-SEARCH_ROOTS = [REPO / '.worktrees', REPO / '.eval-worktrees']
+
+# Make the canonical relocated-eval-worktree-root helper importable. Resolve
+# orchestrator/src via a __file__-relative path (NOT a hardcoded absolute) so
+# we bind to the SAME checkout as this script — this works standalone (`python
+# scripts/...`) and avoids a main-checkout path shadowing a worktree's
+# orchestrator when imported under pytest (task 2882 / 2881).
+_ORCH_SRC = Path(__file__).resolve().parent.parent / 'orchestrator' / 'src'
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
+from orchestrator.evals.snapshots import eval_worktree_root  # noqa: E402
+
+# Post-2881 eval worktrees live at eval_worktree_root(REPO) — a SIBLING of REPO,
+# not the in-repo REPO/.eval-worktrees — so nested runs can't walk up into the
+# live repo's ancestor config (Defect B).
+SEARCH_ROOTS = [REPO / '.worktrees', eval_worktree_root(REPO)]
 
 REVIEWER_NAMES = [
     'test_analyst',
