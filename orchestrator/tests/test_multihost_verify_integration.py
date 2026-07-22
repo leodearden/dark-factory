@@ -1627,6 +1627,69 @@ class TestPerLandCrossCheck:
         # (5) distinct mismatch telemetry emitted
         assert es.events_of(EventType.verify_cross_check_mismatch)
 
+    async def test_diverge_local_infra_fail_withholds_without_fleet_halt(self, tmp_path):
+        """knob ON, remote PASS + local FAIL whose category is INFRA-TRANSIENT
+        (e.g. semaphore_timeout) — a LOCAL hiccup, NOT a genuine main-red
+        divergence: the land is still withheld + the remote quarantined, but the
+        FLEET is NOT halted and the escalation is L1 blocking (not born-at-L2)
+        (task 2886 reviewer robustness amendment — bound the halt blast radius so
+        one flaky local verify cannot block every merge lane fleet-wide)."""
+        from unittest.mock import Mock, patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        # Local trust-anchor FAILs with an INFRA-TRANSIENT category — a local
+        # semaphore-timeout / OOM-class hiccup, not evidence main is red.
+        local_infra_fail = _make_result(False, category='semaphore_timeout')
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+        halt_hook = Mock()
+
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=local_infra_fail)), \
+             patch('orchestrator.merge_queue._classify_main_health_red',
+                   new=AsyncMock(return_value=None)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha='mergesha07',
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+                halt_hook=halt_hook,
+            )
+
+        # (1) the land is STILL withheld — fail-closed for THIS land.
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+        # (2) the FLEET is NOT halted — a local infra hiccup must not block every
+        #     lane and force an operator un-halt (reviewer robustness amendment).
+        halt_hook.assert_not_called()
+
+        # (3) the diverging remote is still quarantined.
+        assert 'laptop' in quarantine
+
+        # (4) exactly one escalation, L1 BLOCKING (pre-fix-3 shape), NOT born-at-L2.
+        assert len(eq.submitted) == 1
+        esc = eq.submitted[0]
+        assert esc.category == 'verify_cross_check_mismatch'
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert 'infra' in esc.detail.lower()
+        assert 'not halted' in (esc.summary + esc.detail).lower()
+
+        # (5) mismatch telemetry still emitted (the divergence IS still recorded).
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+
     async def test_diverge_halt_fires_before_escalation_and_return(self, tmp_path):
         """fix 3 ordering: the synchronous halt MUST precede the escalation submit and the
         blocked return, so no FURTHER adoption can occur before a human looks."""
