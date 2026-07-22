@@ -198,3 +198,50 @@ class TestRemoveMergeWorktreeGuarded:
         outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
 
         assert outcome == 'failed'
+
+
+# ---------------------------------------------------------------------------
+# step-9: cleanup_merge_worktree routes through the guarded primitive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCleanupMergeWorktreeRouting:
+    """cleanup_merge_worktree delegates to remove_merge_worktree_guarded (C1).
+
+    The only intended behavior change: a lease-held tree is now skipped
+    instead of force-removed out from under a live verify (the incident's
+    bug). Uncontended and persistent-lane behavior are unchanged.
+    """
+
+    async def test_cleanup_skips_tree_under_held_lease(self, git_ops: GitOps, caplog):
+        """Pre-routing, cleanup_merge_worktree force-removes unconditionally
+        -- this IS the incident's TOCTOU bug. Post-routing it must leave a
+        lease-held tree intact and emit exactly one skip WARNING, rather
+        than force through."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        fd = acquire_merge_verify_flock(lane_lock_path(wt), 5.0)
+        assert fd is not None, 'test setup: must be able to acquire the tree lease itself'
+        write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                await git_ops.cleanup_merge_worktree(wt)
+
+            assert wt.exists(), 'a live lease holder must leave the tree intact'
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1, (
+                f'expected exactly one WARNING, got {len(warnings)}: '
+                f'{[r.getMessage() for r in warnings]}'
+            )
+        finally:
+            release_merge_verify_flock(fd)
+            remove_lock_holder_pgid(git_ops.worktree_base)
+
+    async def test_cleanup_still_removes_uncontended_tree(self, git_ops: GitOps):
+        """Positive control paired with the lease-held skip: an uncontended
+        tree must still actually be removed by cleanup_merge_worktree."""
+        wt = await _make_ephemeral_worktree(git_ops)
+
+        await git_ops.cleanup_merge_worktree(wt)
+
+        assert not wt.exists()
