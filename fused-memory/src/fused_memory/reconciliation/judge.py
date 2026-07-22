@@ -72,6 +72,10 @@ class Judge:
         # successful transport or once a judge-unreachable halt fires. Bounds
         # the phantom-halt blast radius (task 2947 ask a).
         self._consecutive_infra_failures: dict[str, int] = {}
+        # Last halt reason per project (task 2947 ask b), so the harness can
+        # thread the REAL reason into the on_judge_halt escalation instead of a
+        # hardcoded generic string. Set in _apply_halt, cleared in unhalt.
+        self._halt_reason: dict[str, str] = {}
         self._usage_gate = usage_gate
         self._on_unhalt_cb = on_unhalt_cb
 
@@ -580,6 +584,9 @@ Review this run and provide your verdict as JSON.
         self._halted_projects.add(project_id)
         self._halt_cooldown_until[project_id] = cooldown_until
         self._unhalt_grace_remaining.pop(project_id, None)
+        # Remember the reason in-memory so the harness can thread the REAL reason
+        # into the on_judge_halt escalation (task 2947 ask b).
+        self._halt_reason[project_id] = reason
         try:
             await self.journal.set_halt(
                 project_id,
@@ -592,6 +599,15 @@ Review this run and provide your verdict as JSON.
 
     def is_halted(self, project_id: str) -> bool:
         return project_id in self._halted_projects
+
+    def halt_reason(self, project_id: str) -> str | None:
+        """The reason the project was last halted, or None if not halted.
+
+        Threaded by the harness into the on_judge_halt escalation so an infra
+        ('judge-unreachable …') or unparseable-content halt surfaces with its
+        real reason instead of a hardcoded generic string (task 2947 ask b).
+        """
+        return self._halt_reason.get(project_id)
 
     def unhalt_grace_remaining(self, project_id: str) -> int:
         return self._unhalt_grace_remaining.get(project_id, 0)
@@ -629,6 +645,7 @@ Review this run and provide your verdict as JSON.
         was_halted = project_id in self._halted_projects
         self._halted_projects.discard(project_id)
         self._halt_cooldown_until.pop(project_id, None)
+        self._halt_reason.pop(project_id, None)
 
         grace = max(int(self.config.halt_grace_cycles), 0)
         if grace > 0:

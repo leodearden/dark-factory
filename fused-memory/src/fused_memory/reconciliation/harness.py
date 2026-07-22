@@ -2197,7 +2197,15 @@ class ReconciliationHarness:
                 if self.judge and self.judge.is_halted(project_id):
                     logger.warning(f'Skipping cycle for halted project {project_id}')
                     await self._notify_judge_halt(
-                        project_id, reason='judge halted reconciliation',
+                        project_id,
+                        # Thread the REAL halt reason (infra 'judge-unreachable …',
+                        # 'Unparseable judge response …', or 'Serious verdict …')
+                        # into the escalation instead of a hardcoded generic
+                        # string (task 2947 ask b). Falls back when unset.
+                        reason=(
+                            self.judge.halt_reason(project_id)
+                            or 'judge halted reconciliation'
+                        ),
                     )
                     try:
                         await self._replay_deferred_writes(ProjectId(project_id))
