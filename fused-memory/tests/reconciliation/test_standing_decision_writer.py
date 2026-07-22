@@ -223,3 +223,71 @@ class TestEvidenceGateArm2:
         assert result.arm2_distinct_run_count == 0
         assert result.arm2_satisfied is False
         assert result.satisfied is False
+
+
+class TestEvidenceGateRejection:
+    """The structured rejection payload when the gate is not satisfied."""
+
+    @pytest.mark.asyncio
+    async def test_neither_arm_builds_structured_rejection(self):
+        """Neither arm: satisfied False and rejection is a structured dict naming
+        BOTH unmet arms + a hint that names each arm's remedy and embeds the
+        observed distinct-run count."""
+        service = _memory_service(memory_record=None, metadata_records=[])
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        assert result.satisfied is False
+        rej = result.rejection
+        assert isinstance(rej, dict)
+        assert rej['error'] == 'insufficient_evidence'
+        assert rej['error_type'] == 'StandingDecisionEvidenceInsufficient'
+        # Both arms are unmet.
+        assert isinstance(rej['unmet_arms'], list)
+        assert len(rej['unmet_arms']) == 2
+        hint = rej['hint']
+        assert isinstance(hint, str)
+        assert 'arm 1' in hint.lower()
+        assert 'arm 2' in hint.lower()
+        assert 'human-authored' in hint.lower()
+        assert 'investigation_outcome' in hint
+        # The observed distinct-run count (0 here) is embedded in the hint.
+        assert str(result.arm2_distinct_run_count) in hint
+
+    @pytest.mark.asyncio
+    async def test_arm2_satisfied_has_no_rejection(self):
+        """Exactly one arm (arm 2) satisfied ⇒ satisfied True, rejection None."""
+        service = _memory_service(
+            metadata_records=[_outcome('run-a'), _outcome('run-b'), _outcome('run-c')]
+        )
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[],
+        )
+        assert result.satisfied is True
+        assert result.rejection is None
+
+    @pytest.mark.asyncio
+    async def test_arm1_satisfied_has_no_rejection(self):
+        """Exactly one arm (arm 1) satisfied ⇒ satisfied True, rejection None."""
+        service = _memory_service(
+            memory_record={
+                'id': _MEM0_REF_ID,
+                'content': 'operator note',
+                'metadata': {'agent_id': 'claude-interactive-leo'},
+            },
+            metadata_records=[],
+        )
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[{'type': 'mem0', 'id': _MEM0_REF_ID}],
+        )
+        assert result.satisfied is True
+        assert result.rejection is None
