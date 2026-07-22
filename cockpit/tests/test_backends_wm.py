@@ -99,6 +99,24 @@ class TestWmBackendFocusPrefersWindowId:
         assert result.ok is True
         assert runner.calls == [['wmctrl', '-i', '-a', '0x123']]
 
+    def test_focus_converts_decimal_window_id_to_canonical_hex(self):
+        """Task 2933: a DECIMAL wm_window_id is converted to canonical 0x-hex
+        before `wmctrl -i -a`, since `wmctrl -i` parses its arg base-16 — a
+        bare decimal '52428807' would be MIS-read as hex and miss the window.
+        52428807 == 0x03200007 is an exact identity.
+        """
+        from cockpit.backends.base import DisplayTarget
+        from cockpit.backends.wm import WmBackend
+
+        runner = ScriptedRunner()
+        backend = WmBackend(run=runner)
+        target = DisplayTarget(kind='wm', wm_title='session-a', wm_window_id='52428807')
+
+        result = backend.focus(target)
+
+        assert result.ok is True
+        assert runner.calls == [['wmctrl', '-i', '-a', '0x03200007']]
+
     def test_focus_falls_back_to_title_when_window_id_activate_fails(self):
         from cockpit.backends.base import CommandResult, DisplayTarget
         from cockpit.backends.wm import WmBackend
