@@ -6728,6 +6728,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._shadow_state_path: Path | None = (
             _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
         ) if _root is not None else None
+        # Drift-check cadence persistence (task 2886 fix 1a) — same None-safe
+        # project_root-derived pattern as _shadow_state_path above.  Persisting
+        # the drift land counter here (authoritative over the in-memory
+        # _drift_land_count below) is what makes the drift-check cadence survive
+        # the ~8h fleet redeploy that used to reset the counter before it ever
+        # reached verify_drift_check_every_n_lands (root cause: the drift check
+        # had NEVER fired in any runs.db).  None on bare-harness workers so
+        # _maybe_run_drift_check falls back to the in-memory counter there.
+        self._drift_state_path: Path | None = (
+            _root / 'data' / 'orchestrator' / 'drift_check_state.json'
+        ) if _root is not None else None
         # Durable landed-row journal (task 2153 / W1 α): survives until the
         # scheduler's consult-before-dispatch gate (δ, separate task) confirms
         # the task is done and calls consume(). None-safe (mirrors

@@ -341,8 +341,34 @@ async def _maybe_run_drift_check(
         # instead of raising ZeroDivisionError on every land.  Mirrors the
         # every_n > 0 guard in _safety_valve_due (merge_liveness.py).
         return
-    worker._drift_land_count += 1
-    if worker._drift_land_count % every_n == 0:
+
+    # Cadence counter (task 2886 fix 1a): use the PERSISTED DriftCheckState when
+    # worker._drift_state_path is wired so the count survives the ~8h fleet
+    # redeploy (the in-memory counter reset before ever reaching every_n is why
+    # the drift check had NEVER fired).  Fall back to the in-memory
+    # worker._drift_land_count on bare-harness workers where _drift_state_path
+    # is None — mirrors _maybe_schedule_shadow_compare's _shadow_state_path
+    # None-safety.  DriftCheckState / _load / _save are referenced module-local
+    # (not reached back) exactly like _maybe_schedule_shadow_compare references
+    # ShadowCompareState / _load / _save; only the spawned _run_drift_check
+    # coroutine is monkeypatched by tests and therefore reached back below.
+    if worker._drift_state_path is None:
+        worker._drift_land_count += 1
+        count = worker._drift_land_count
+    else:
+        state = _load_drift_check_state(worker._drift_state_path)
+        count = state.land_count + 1
+        # Persist on BOTH the fire and no-fire paths so every land is counted
+        # (the counter is additive across the worker lifetime — never reset —
+        # mirroring the in-memory _drift_land_count it supersedes).
+        _save_drift_check_state(
+            worker._drift_state_path, DriftCheckState(land_count=count)
+        )
+        # Keep the in-memory mirror in lockstep for observability / back-compat
+        # (existing tests and log lines still read worker._drift_land_count).
+        worker._drift_land_count = count
+
+    if count % every_n == 0:
         _coro = _run_drift_check(
             git_ops, req, merge_commit,
             worker._escalation_queue, worker._event_store,

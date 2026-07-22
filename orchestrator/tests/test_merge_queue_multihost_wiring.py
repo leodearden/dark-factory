@@ -1059,6 +1059,11 @@ class TestMaybeRunDriftCheck:
         worker._runner_quarantine = set()
         worker._escalation_queue = MagicMock()
         worker._event_store = MagicMock()
+        # Bare-worker (no project_root): _drift_state_path is None, so the drift
+        # cadence uses the in-memory _drift_land_count (task 2886 fix 1a
+        # None-safe fallback).  The persisted-path cadence + restart survival
+        # is covered by test_merge_drift.py::TestDriftCheckCadencePersistence.
+        worker._drift_state_path = None
         return worker
 
     async def test_no_trigger_when_no_enabled_runners(self, tmp_path):
@@ -1197,6 +1202,8 @@ class TestDriftCheckTaskGCSafety:
         worker._drift_check_tasks = set()
         worker._escalation_queue = MagicMock()
         worker._event_store = MagicMock()
+        # Bare-worker: _drift_state_path None → in-memory cadence (fix 1a).
+        worker._drift_state_path = None
         return worker
 
     async def test_worker_init_has_drift_check_tasks_attr(self):
