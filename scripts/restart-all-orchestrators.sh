@@ -77,6 +77,30 @@ VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 # critical) seconds before the unit actually came up fresh. Give a unit that
 # is still not fresh at the VERIFY_TIMEOUT deadline this many additional
 # seconds to re-probe into before genuinely declaring it failed.
+#
+# Serial-latency tradeoff (amend, task 2961): restart_and_verify() runs once
+# per unit in series, so a genuinely-dead unit now costs VERIFY_TIMEOUT +
+# VERIFY_GRACE (default 30s + 120s) to surface as a failure, and a whole-fleet
+# outage (e.g. a host reboot with every unit down) adds ~VERIFY_GRACE per dead
+# unit before the caller can escalate. Confirmed acceptable against the
+# fleet-deploy cadence, so the 120s default is deliberately kept:
+#   1. The escalating callers (deploy task before_done.script, merge-landed
+#      coordinator, watchdog backstop) fire this script DETACHED via
+#      `systemd-run --user ... --collect` (service_restart.py) -- a Type=simple
+#      transient unit with no runtime timeout -- so the extra grace only DELAYS
+#      a genuine FAILED verdict; it never manufactures a new kill/timeout.
+#   2. This same chokepoint's --drain gate already tolerates
+#      ORCH_RESTART_FORCE_FIRE_AFTER_SECS (default 4500s = 75m) of deferral PER
+#      busy unit, so the caller's runtime budget already dwarfs an added
+#      ~120s/unit for the (rarer) dead-unit case.
+#   3. The fleet redeploy re-fires at most once per
+#      orchestrator_restart_min_interval_secs (default 28800s = 8h), so even a
+#      ~7-unit outage's ~14m of added serial latency is <4% of one interval and
+#      only postpones an escalation that is not time-critical (a dead fleet
+#      stays dead until repaired regardless).
+# A cumulative per-run grace cap was considered and deliberately NOT added: it
+# could starve a legitimately slow-draining unit restarted late in the run of
+# its full grace, reintroducing the exact false-FAILED escalation this fixes.
 VERIFY_GRACE="${RESTART_VERIFY_GRACE_SECS:-120}"
 SELF_UNIT="${SELF_UNIT:-orchestrator-dark-factory.service}"
 
