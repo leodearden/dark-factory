@@ -26,7 +26,8 @@ contract file — see the plan's design decisions.
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -224,3 +225,66 @@ def find_matching_transcript(
         if window_start <= mtime <= window_end:
             return path
     return None
+
+
+# ---------------------------------------------------------------------------
+# find_missing_transcripts — the finding list
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MissingTranscript:
+    """One "session ran, no transcript" finding.
+
+    Carries the identifying facts the escalation detail names so a human (or
+    a follow-up probe) can locate the lost session: its registry slug, real
+    ``cwd``, prompt prefix, ``start_ts``, exit code, and the encoded
+    ``~/.claude/projects/<enc>`` dir the transcript should have lived in.
+    """
+
+    session_slug: str
+    cwd: str
+    prompt_prefix: str
+    start_ts: str
+    exit_code: int | None
+    expected_dir: Path
+
+
+def find_missing_transcripts(
+    records: Iterable[session_registry.SessionRecord],
+    projects_root: Path | str,
+    cwd_prefixes: Sequence[str],
+    *,
+    now: datetime,
+    lookback: timedelta,
+    skew: timedelta = DEFAULT_SKEW,
+) -> list[MissingTranscript]:
+    """Return a :class:`MissingTranscript` for every lost session in *records*.
+
+    Scopes the fleet-wide registry to THIS project — a record is checked only
+    when it is a completed in-window spawn
+    (:func:`find_completed_spawn_records`) AND its real ``cwd`` is a project
+    member (``inventory.is_member`` against *cwd_prefixes*, path-component
+    semantics that exclude a ``-cockpit`` sibling). For each such record with
+    no matching transcript (:func:`find_matching_transcript` returns
+    ``None``), one finding is emitted. In-flight, promptless, out-of-window,
+    and foreign-project records never produce a finding.
+    """
+    projects_root = Path(projects_root)
+    completed = find_completed_spawn_records(records, now=now, lookback=lookback)
+    findings: list[MissingTranscript] = []
+    for record in completed:
+        if not inventory.is_member(record.cwd, cwd_prefixes):
+            continue
+        if find_matching_transcript(record, projects_root, now=now, skew=skew) is not None:
+            continue
+        findings.append(
+            MissingTranscript(
+                session_slug=record.session_slug,
+                cwd=record.cwd,
+                prompt_prefix=record.prompt.strip()[:PREFIX_LEN],
+                start_ts=record.start_ts,
+                exit_code=record.exit_code,
+                expected_dir=projects_root / inventory.encode_cwd(record.cwd),
+            )
+        )
+    return findings
