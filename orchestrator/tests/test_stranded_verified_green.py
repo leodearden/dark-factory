@@ -12,12 +12,17 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import wire_scheduler_liveness_mock
+from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+from orchestrator.stranded_verified_green import VerifiedGreenMatch
 
 
 def _emit_verify(
@@ -354,3 +359,127 @@ class TestDetectVerifiedGreen:
         assert await detect_verified_green(
             _TID, git_ops=git_ops, event_store=event_store, worktree_resolver=resolver,
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# Harness wiring — _maybe_submit_stranded_verified_green (PRD §2.1 ON MATCH)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def harness(tmp_path: Path, mock_orch_config):
+    """Harness with mocked internals for the verified-green submit wiring.
+
+    Mirrors test_reconcile_stranded.py / test_stranded_blocked_sweep.py: mocked
+    scheduler, real ``self._merge_queue`` (an asyncio.Queue built in __init__),
+    and a real EventStore so the merge_queued row is queryable.
+    """
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(mock_orch_config)
+
+    h.scheduler = MagicMock()
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.update_task = AsyncMock(return_value=True)
+    wire_scheduler_liveness_mock(h.scheduler)
+
+    # Real event store so merge_queued rows are queryable via the event API.
+    h.event_store = EventStore(tmp_path / 'harness-runs.db', 'run-1')
+    # module_configs_or_empty is a @property (exposed by pydantic_spec) — force
+    # an empty mapping so list(...values()) yields [] for the MergeRequest.
+    h.config.module_configs_or_empty = {}
+    h.config.stranded_verified_green_merge_enabled = True
+    return h
+
+
+def _match(tmp_path: Path, *, tip: str = _TIP) -> VerifiedGreenMatch:
+    """A VerifiedGreenMatch describing the happy verified-green shape for _TID."""
+    return VerifiedGreenMatch(
+        lane=_LANE, branch='task/7', tip_sha=tip, worktree=tmp_path / 'wt',
+    )
+
+
+@pytest.mark.asyncio
+class TestMaybeSubmitStrandedVerifiedGreen:
+    """Harness._maybe_submit_stranded_verified_green — the happy submit (step-7)."""
+
+    async def test_happy_submit_enqueues_one_merge_request(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """On a match: exactly one MergeRequest (branch.bare_id==tid,
+        snapshot_tip==match.tip_sha) is enqueued and the method returns True."""
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(_TID, {})
+
+        assert result is True
+        assert harness._merge_queue.qsize() == 1
+        req = harness._merge_queue.get_nowait()
+        assert req.branch.bare_id == _TID
+        assert req.snapshot_tip == _TIP
+
+    async def test_submit_tags_merge_queued_event_source(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """The submission's merge_queued event carries data.source='stranded-reaper'
+        (PRD §6α acceptance signal)."""
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._maybe_submit_stranded_verified_green(_TID, {})
+
+        rows = harness.event_store.fetch_events_by_type_all_runs(
+            EventType.merge_queued, task_id=_TID,
+        )
+        assert len(rows) == 1
+        assert (rows[0].get('data') or {}).get('source') == 'stranded-reaper'
+
+    async def test_submit_files_no_stranded_blocked_l1_itself(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """The submit method itself files NO pending stranded_blocked L1 — the
+        record escalation is a separate step (step-10)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=_match(tmp_path)),
+        ):
+            await harness._maybe_submit_stranded_verified_green(_TID, {})
+
+        assert queue.get_by_task(_TID, status='pending') == []
+
+    async def test_no_match_returns_false_and_enqueues_nothing(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """detect_verified_green → None ⇒ return False, enqueue nothing."""
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            result = await harness._maybe_submit_stranded_verified_green(_TID, {})
+
+        assert result is False
+        assert harness._merge_queue.qsize() == 0
+
+    async def test_kill_switch_off_returns_false_without_detecting(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """config.stranded_verified_green_merge_enabled=False short-circuits
+        BEFORE detection: returns False, enqueues nothing, never calls detect."""
+        harness.config.stranded_verified_green_merge_enabled = False
+        detect = AsyncMock(return_value=_match(tmp_path))
+        with patch('orchestrator.harness.detect_verified_green', detect):
+            result = await harness._maybe_submit_stranded_verified_green(_TID, {})
+
+        assert result is False
+        assert harness._merge_queue.qsize() == 0
+        detect.assert_not_awaited()
