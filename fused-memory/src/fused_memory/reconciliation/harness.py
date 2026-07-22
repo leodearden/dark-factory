@@ -2385,6 +2385,21 @@ class ReconciliationHarness:
         pending = await self.journal.get_pending_judge_runs()
         if not pending:
             return
+        # Account-availability gate (task 2947 ask c): if a usage gate is wired
+        # and every account is capped/auth-failed (active_account_name is None),
+        # re-firing judges now would fail transport under the same fully-capped
+        # pool — churning infra-failure counters and (pre-fix) minting phantom
+        # halts — for no benefit. Defer the whole recovery pass: the judge_pending
+        # markers are left intact, so recovery resumes naturally on a later restart
+        # once capacity returns. When capacity exists (or no gate is configured),
+        # recovery proceeds unchanged.
+        if self.usage_gate is not None and self.usage_gate.active_account_name is None:
+            logger.warning(
+                f'Deferring recovery of {len(pending)} pending judge review(s) — '
+                'all accounts capped; will retry on a later restart / when '
+                'capacity returns'
+            )
+            return
         # Bound the fan-out (task 2708 amendment): get_pending_judge_runs is
         # ordered oldest-marked first, so the oldest markers are re-fired first
         # and any excess is deferred to a later restart. This caps the burst of
