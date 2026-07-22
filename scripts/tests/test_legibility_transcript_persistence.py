@@ -451,3 +451,141 @@ def test_post_findings_best_effort_swallows_poster_exception(tmp_path):
     # Best-effort contract: a raising poster -> False, never propagates.
     ok = mod.post_findings(cfg, findings, poster=_raising)
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# step-13/14: run_check integration + CheckResult + main()
+# ---------------------------------------------------------------------------
+
+def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
+    """Set up a tmp fleet_root + projects_root with a canonical record mix.
+
+    Always present: a completed spawn WITH a matching transcript (no finding),
+    an in-flight non-terminal spawn (tolerated), and a foreign-project
+    completed spawn (excluded). When *include_lost*, also a completed
+    member-project spawn with NO transcript (the one finding).
+
+    Returns ``(fleet_root, projects_root, config_path)``.
+    """
+    fleet = tmp_path / "fleet"
+    projects = tmp_path / "projects"
+    member_present = "/home/leo/src/dark-factory/.worktrees/2700"
+    member_lost = "/home/leo/src/dark-factory/.worktrees/2701"
+    foreign_cwd = "/home/leo/src/some-other-project"
+
+    # completed + transcript present (strong match) -> no finding.
+    _write_session_record(
+        fleet, "sess-present", status=session_registry.Status.EXITED,
+        prompt=_USABLE_PROMPT, cwd=member_present,
+        start_ts=FIXED_NOW - timedelta(hours=1),
+    )
+    _write_transcript(projects, member_present, "sess-present.jsonl", _USABLE_PROMPT)
+
+    # in-flight (non-terminal) -> tolerated, no finding.
+    _write_session_record(
+        fleet, "sess-inflight", status=session_registry.Status.RUNNING,
+        prompt="An in-flight interactive session still running right now.",
+        cwd=member_present, start_ts=FIXED_NOW - timedelta(hours=1),
+    )
+
+    # foreign-project completed spawn -> excluded (not is_member).
+    _write_session_record(
+        fleet, "sess-foreign", status=session_registry.Status.EXITED,
+        prompt="A completed spawn in a different project entirely, not a member here.",
+        cwd=foreign_cwd, start_ts=FIXED_NOW - timedelta(hours=1),
+    )
+
+    if include_lost:
+        _write_session_record(
+            fleet, "sess-lost", status=session_registry.Status.EXITED,
+            prompt=(
+                "Diagnose the stuck reconciliation on task 2701 and summarise "
+                "the root cause."
+            ),
+            cwd=member_lost, start_ts=FIXED_NOW - timedelta(hours=1),
+        )
+
+    config_path = _write_config(
+        tmp_path, project_id="proj_a", escalation_port=8199,
+        cwd_prefixes=["/home/leo/src/dark-factory"],
+    )
+    return fleet, projects, config_path
+
+
+def test_run_check_flags_lost_and_escalates(tmp_path):
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=True)
+    poster = _RecordingPoster()
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=poster,
+    )
+
+    assert result.exit_code == 1
+    assert [m.session_slug for m in result.missing] == ["sess-lost"]
+    assert result.escalated is True
+    assert len(poster.calls) == 1
+
+
+def test_run_check_healthy_no_escalation(tmp_path):
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+    poster = _RecordingPoster()
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=poster,
+    )
+
+    assert result.exit_code == 0
+    assert result.missing == []
+    assert result.escalated is False
+    assert poster.calls == []
+
+
+def test_run_check_preventer_guard_toggles_force_persistence_ok(tmp_path):
+    # A tmp spawn-script fixture MISSING the token -> force_persistence_ok False;
+    # a fixture WITH the token -> True. Fixtures only — never the real
+    # committed spawn-claude.sh (which does not carry the token on this branch).
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    missing_token = tmp_path / "spawn-no-token.sh"
+    missing_token.write_text(
+        "#!/usr/bin/env bash\nexport CLAUDE_CODE_CHILD_SESSION=1\nclaude\n",
+        encoding="utf-8",
+    )
+    present_token = tmp_path / "spawn-with-token.sh"
+    present_token.write_text(
+        "#!/usr/bin/env bash\nexport CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1\nclaude\n",
+        encoding="utf-8",
+    )
+
+    missing_result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+        check_preventer=True, spawn_script_path=missing_token,
+    )
+    assert missing_result.force_persistence_ok is False
+    # A failed preventer guard is itself a loud (non-zero) signal.
+    assert missing_result.exit_code == 1
+
+    present_result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+        check_preventer=True, spawn_script_path=present_token,
+    )
+    assert present_result.force_persistence_ok is True
+    assert present_result.exit_code == 0
+
+
+def test_main_healthy_returns_zero(tmp_path):
+    # main() wiring: argparse -> run_check -> exit code, fully offline (no
+    # findings -> no escalation POST, no --check-preventer -> no real-file read).
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    rc = mod.main([
+        "--config", str(config_path),
+        "--fleet-root", str(fleet),
+        "--projects-root", str(projects),
+        "--lookback-hours", "48",
+    ])
+    assert rc == 0
