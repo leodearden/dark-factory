@@ -1374,6 +1374,157 @@ def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Task 2934 step-7/8: mark_windowless_wm_sessions_exited fail-soft, scope,
+# and pid/age-independence
+# ---------------------------------------------------------------------------
+
+
+def test_mark_windowless_fail_soft_when_wmctrl_unavailable(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='no-wmctrl',
+        status=sr.Status.AWAITING_INPUT,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run([], returncode=127)  # missing binary -- no window evidence
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    # A headless run reaps NOTHING, even though this record's window would
+    # (if we could prove it) be gone -- "no evidence" != "window gone".
+    assert sr.read_record('no-wmctrl', root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+
+def test_mark_windowless_never_touches_tmux_display(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='tmux-session',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('tmux-session', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_never_touches_displayless_record(tmp_path: Path) -> None:
+    r = _make_record(session_slug='headless', status=sr.Status.RUNNING, display=None)
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('headless', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_leaves_already_terminal_wm_record_untouched(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='already-exited-wm',
+        status=sr.Status.EXITED,
+        exit_code=0,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])  # window gone, but already terminal
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    reloaded = sr.read_record('already-exited-wm', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
+
+
+@pytest.mark.parametrize(
+    'wm_window_id', [None, '0xZZ', 'nope'], ids=['none', 'unparseable-hex', 'unparseable-decimal']
+)
+def test_mark_windowless_skips_unparseable_or_missing_window_id(
+    wm_window_id: str | None, tmp_path: Path
+) -> None:
+    r = _make_record(
+        session_slug='no-id',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id=wm_window_id),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('no-id', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_reaps_regardless_of_live_pid_and_fresh_age(tmp_path: Path) -> None:
+    """THE CRUX: window-gone is definitive death evidence, independent of
+    launcher_pid liveness or record age -- proving this sweep reaps exactly
+    the zombies mark_orphaned_sessions_exited's pid/TTL guards currently keep.
+    """
+    r = _make_record(
+        session_slug='live-pid-fresh-but-windowless',
+        status=sr.Status.AWAITING_INPUT,
+        launcher_pid=os.getpid(),  # ALIVE
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug('live-pid-fresh-but-windowless', root=tmp_path)
+    _set_mtime(record_path, _NOW, timedelta(minutes=1))  # far under NON_TERMINAL_HEARTBEAT_TTL
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert {m.session_slug for m in marked} == {'live-pid-fresh-but-windowless'}
+    reloaded = sr.read_record('live-pid-fresh-but-windowless', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
+    windowless_wm = _make_record(
+        session_slug='mix-windowless',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    present_window_wm = _make_record(
+        session_slug='mix-present',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t2', wm_window_id='0x99'),
+    )
+    tmux_session = _make_record(
+        session_slug='mix-tmux',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
+    )
+    headless = _make_record(session_slug='mix-headless', status=sr.Status.RUNNING, display=None)
+    terminal_wm = _make_record(
+        session_slug='mix-terminal',
+        status=sr.Status.EXITED,
+        exit_code=0,
+        display=sr.Display(kind='wm', wm_title='t3', wm_window_id='0x1a'),
+    )
+    for r in (windowless_wm, present_window_wm, tmux_session, headless, terminal_wm):
+        sr.write_record(r, root=tmp_path)
+
+    run = _fake_wmctrl_run(['0x99  0 host  still-open'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert {m.session_slug for m in marked} == {'mix-windowless'}
+    assert sr.read_record('mix-windowless', root=tmp_path).status == sr.Status.EXITED
+    assert sr.read_record('mix-present', root=tmp_path).status == sr.Status.RUNNING
+    assert sr.read_record('mix-tmux', root=tmp_path).status == sr.Status.RUNNING
+    assert sr.read_record('mix-headless', root=tmp_path).status == sr.Status.RUNNING
+    reloaded_terminal = sr.read_record('mix-terminal', root=tmp_path)
+    assert reloaded_terminal.status == sr.Status.EXITED
+    assert reloaded_terminal.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
 
