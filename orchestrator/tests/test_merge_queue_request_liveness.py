@@ -698,6 +698,21 @@ class TestDeadInflightVerifyAborts:
     under merge_wt must NOT be aborted (progress resets the clock), and a
     REMOTE lease must NEVER be progress-aborted (scope fence — remote
     verify-hang is owned by task 2362's ssh keepalive).
+
+    task 2921 (load-robustness): the sub-1s budget tunables set by every
+    test below (VERIFY_ABANDON_POLL_SECS=0.02,
+    INFLIGHT_VERIFY_PROGRESS_PROBE_SECS=0.02,
+    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS=0.2) stay load-safe for the
+    must-ABORT (positive) tests: host load only DELAYS a bounded, expected
+    abort, it never turns a genuinely dead/coasting verify into a false
+    non-abort. The must-NOT-abort test instead removes the real-time
+    dependency entirely via deterministic injection rather than relying on
+    a widened budget (see test_healthy_writing_local_verify_is_not_aborted's
+    newest_content_mtime patch). The one residual full-storm risk is a >5s
+    cumulative event-loop stall during a single _run_inflight_verify call
+    exceeding the outer asyncio.wait_for — every must-abort call site's
+    timeout below is widened 5.0 -> 15.0 to guard against that (still
+    comfortably under the 60s pytest default timeout).
     """
 
     async def test_dead_local_verify_is_aborted_and_requeued_within_budget(
@@ -745,7 +760,7 @@ class TestDeadInflightVerifyAborts:
             caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
         ):
             result = await asyncio.wait_for(
-                worker._run_inflight_verify(item, lease), timeout=5.0,
+                worker._run_inflight_verify(item, lease), timeout=15.0,
             )
 
         assert result.status == InflightStatus.REQUEUED, (
@@ -891,7 +906,7 @@ class TestDeadInflightVerifyAborts:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             result = await asyncio.wait_for(
-                worker._run_inflight_verify(item, lease), timeout=5.0,
+                worker._run_inflight_verify(item, lease), timeout=15.0,
             )
 
         assert result.status == InflightStatus.REQUEUED, (
@@ -1094,6 +1109,20 @@ class TestRepeatedDeadVerifyBusyLoopCap:
     RED until step-8 GREEN adds the per-task _inflight_dead_verify_aborts
     counter — step-6 re-queues an arbitrary number of consecutive dead
     verifies unconditionally.
+
+    task 2921 (load-robustness): same rationale as
+    TestDeadInflightVerifyAborts above — the sub-1s budget tunables each
+    test sets are load-safe for the dead/coast (must-eventually-abort-or-
+    convert) attempts below, since host load only delays a bounded,
+    expected outcome, never suppresses it. The SUCCESS attempt in every
+    4-attempt test patches _run_post_merge_verify directly (not
+    run_scoped_verification), so it completes synchronously and never
+    races the budget with real git work. Every outer asyncio.wait_for(...)
+    wrapping a _run_inflight_verify call below is widened from 5.0 to
+    15.0, guarding against a >5s cumulative event-loop stall
+    under a full-suite storm raising TimeoutError instead of letting the
+    (still-bounded) dead-verify machinery resolve — even 4 widened waits
+    in one test stays comfortably under the 60s pytest default timeout.
     """
 
     async def test_repeated_dead_verify_converts_to_blocked_and_success_resets_counter(
@@ -1125,7 +1154,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease1 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result1 = await asyncio.wait_for(
-                worker._run_inflight_verify(item1, lease1), timeout=5.0,
+                worker._run_inflight_verify(item1, lease1), timeout=15.0,
             )
         assert result1.status == InflightStatus.REQUEUED
         assert not req1.result.done()
@@ -1142,7 +1171,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease2 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result2 = await asyncio.wait_for(
-                worker._run_inflight_verify(item2, lease2), timeout=5.0,
+                worker._run_inflight_verify(item2, lease2), timeout=15.0,
             )
 
         assert result2.status is None, (
@@ -1182,7 +1211,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
 
         with patch('orchestrator.merge_queue._run_post_merge_verify', _pass_fast):
             result3 = await asyncio.wait_for(
-                worker._run_inflight_verify(item3, lease3), timeout=5.0,
+                worker._run_inflight_verify(item3, lease3), timeout=15.0,
             )
         assert result3.status is None and result3.outcome is None, (
             f'expected a clean pass, got {result3!r}'
@@ -1199,7 +1228,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease4 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result4 = await asyncio.wait_for(
-                worker._run_inflight_verify(item4, lease4), timeout=5.0,
+                worker._run_inflight_verify(item4, lease4), timeout=15.0,
             )
         assert result4.status == InflightStatus.REQUEUED, (
             'after a successful verify clears the counter, the next dead verify '
@@ -1244,7 +1273,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease1 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result1 = await asyncio.wait_for(
-                worker._run_inflight_verify(item1, lease1), timeout=5.0,
+                worker._run_inflight_verify(item1, lease1), timeout=15.0,
             )
         assert result1.status == InflightStatus.REQUEUED
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 1
@@ -1266,7 +1295,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease2 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue._run_post_merge_verify', _fail_fast):
             result2 = await asyncio.wait_for(
-                worker._run_inflight_verify(item2, lease2), timeout=5.0,
+                worker._run_inflight_verify(item2, lease2), timeout=15.0,
             )
         assert result2.status is None, (
             f'a real (non-hung) failure must resolve via the normal fail '
@@ -1288,7 +1317,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease3 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result3 = await asyncio.wait_for(
-                worker._run_inflight_verify(item3, lease3), timeout=5.0,
+                worker._run_inflight_verify(item3, lease3), timeout=15.0,
             )
         assert result3.status == InflightStatus.REQUEUED, (
             'after the intervening real failure cleared the counter, this '
@@ -1333,7 +1362,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease1 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result1 = await asyncio.wait_for(
-                worker._run_inflight_verify(item1, lease1), timeout=5.0,
+                worker._run_inflight_verify(item1, lease1), timeout=15.0,
             )
         assert result1.status == InflightStatus.REQUEUED
 
@@ -1345,7 +1374,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease2 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result2 = await asyncio.wait_for(
-                worker._run_inflight_verify(item2, lease2), timeout=5.0,
+                worker._run_inflight_verify(item2, lease2), timeout=15.0,
             )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
@@ -1363,7 +1392,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         lease3 = HostLease(name='local', runner=fake_local, is_local=True)
         with patch('orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns):
             result3 = await asyncio.wait_for(
-                worker._run_inflight_verify(item3, lease3), timeout=5.0,
+                worker._run_inflight_verify(item3, lease3), timeout=15.0,
             )
         assert result3.status == InflightStatus.REQUEUED, (
             'a task_id resubmitted right after its blocked resolution must '
@@ -1416,7 +1445,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_gate)
         lease1 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
         result1 = await asyncio.wait_for(
-            worker._run_inflight_verify(item1, lease1), timeout=5.0,
+            worker._run_inflight_verify(item1, lease1), timeout=15.0,
         )
         assert result1.status == InflightStatus.REQUEUED
         assert not req1.result.done()
@@ -1433,7 +1462,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_gate)
         lease2 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
         result2 = await asyncio.wait_for(
-            worker._run_inflight_verify(item2, lease2), timeout=5.0,
+            worker._run_inflight_verify(item2, lease2), timeout=15.0,
         )
 
         assert result2.status is None, (
@@ -1471,7 +1500,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
 
         with patch('orchestrator.merge_queue._run_post_merge_verify', _pass_fast):
             result3 = await asyncio.wait_for(
-                worker._run_inflight_verify(item3, lease3), timeout=5.0,
+                worker._run_inflight_verify(item3, lease3), timeout=15.0,
             )
         assert result3.status is None and result3.outcome is None, (
             f'expected a clean pass, got {result3!r}'
@@ -1489,7 +1518,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         fake_remote.run_merge_verify = AsyncMock(side_effect=_dead_remote_gate)
         lease4 = HostLease(name='remote-host', runner=fake_remote, is_local=False)
         result4 = await asyncio.wait_for(
-            worker._run_inflight_verify(item4, lease4), timeout=5.0,
+            worker._run_inflight_verify(item4, lease4), timeout=15.0,
         )
         assert result4.status == InflightStatus.REQUEUED, (
             'after a successful verify clears the counter, the next remote '
