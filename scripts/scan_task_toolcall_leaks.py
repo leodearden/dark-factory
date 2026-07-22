@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Detect leaked serialized tool-call XML fragments in Taskmaster task text.
 
-READ-ONLY / DETECTION-ONLY: this module (and its CLI, added in a later
-step) never mutates task text. Every database connection it opens is a
-read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
+READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task text.
+Every database connection it opens is a read-only SQLite URI
+(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
 so the sweep is structurally incapable of the auto-mutation this tool is
 explicitly forbidden from doing. Remediation of any match this tool finds is
 a separate, manual, individually-reviewed follow-up (matching the
@@ -29,10 +29,12 @@ substring scan over-reports on exactly this shape.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -187,3 +189,69 @@ def format_report(matches: list[LeakMatch], max_fragment_len: int = _DEFAULT_MAX
 def format_json(matches: list[LeakMatch]) -> str:
     """Render *matches* as a JSON array, carrying the FULL untruncated fragment."""
     return json.dumps([m._asdict() for m in matches])
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "READ-ONLY sweep for leaked serialized tool-call XML fragments in "
+            "Taskmaster task text (e.g. a stray </description> followed by a "
+            'serialized <parameter name="..."> tool-call fragment). '
+            "Detection/reporting only -- never mutates task text."
+        ),
+    )
+    parser.add_argument(
+        "--db", dest="dbs", action="append",
+        help="Explicit tasks.db path to scan. May be repeated.",
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to scan (maps to <root>/.taskmaster/tasks/tasks.db). "
+            "May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON array (full untruncated fragments) instead of a report.",
+    )
+    parser.add_argument(
+        "--max-fragment-len", type=int, default=_DEFAULT_MAX_FRAGMENT_LEN,
+        help="Truncate fragments in the human-readable report to this length "
+        "(default: %(default)s). Ignored with --json.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db
+    could be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS
+    / the dark-factory default.
+    """
+    args = _build_parser().parse_args(argv)
+
+    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    if not db_paths:
+        print(
+            "no tasks.db resolvable (checked --db / --project-root / "
+            "DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)",
+            file=sys.stderr,
+        )
+        return 2
+
+    matches: list[LeakMatch] = []
+    for db_path in db_paths:
+        matches.extend(scan_db(db_path))
+
+    if args.json:
+        print(format_json(matches))
+    else:
+        print(format_report(matches, max_fragment_len=args.max_fragment_len))
+
+    return 1 if matches else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
