@@ -1,146 +1,178 @@
-# Machine-readable twin of stage1-entity-standing-decision-prd.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc, schema v1).
-# task_id values stamped by commit_planning at decompose (2578 stamper, live).
 prd: plans/stage1-entity-standing-decision-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Standing decisions α: recon_ledger entity_standing_decision record kind, grounds enum, lifecycle + TTL-flip gc"
-    capabilities:
-      - name: "ledger-record-kind-and-lifecycle"
-        binding: "capability→producer (wired) — recon_ledger.py gc/upsert machinery :295; α adds kind + entity_uuid column + expired/ttl flip arm"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "entity_standing_decision"
-          paths: ["fused-memory/src/fused_memory/reconciliation/recon_ledger.py"]
-          expect: present
-      - name: "grounds-enum-single-source"
-        binding: "capability→producer — α ships the closed enum + token-family list + investigation_outcome kind constant (INV-5 single source)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "structural_size_conflation"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-  - label: "β"
-    task_id: null
-    title: "Standing decisions β: write_entity_standing_decision helper + evidence-gated Stage-2 MCP tool + stage disallow lists"
-    capabilities:
-      - name: "writer-helper-and-tool"
-        binding: "capability→producer (wired) — helper template flag_dedup.py:1086; tool factory server/recon_report.py:2099"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "write_entity_standing_decision"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "stage-visibility-disallow-entries"
-        binding: "capability→producer (wired) — cli_stage_runner.py:65-67 lists; β adds tool to STAGE1_DISALLOWED + STAGE3_DISALLOWED and amends the :68-72 NOTE"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "write_entity_standing_decision"
-          paths: ["fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py"]
-          expect: present
-      - name: "evidence-gate-structured-rejection"
-        binding: "rejection-mechanism — built + bound by β; tests observe the rejection name the unmet arm (boundary row 1)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "rejection quality judged by β's own test fixtures, not a grep"
-  - label: "γ"
-    task_id: null
-    title: "Standing decisions γ: Hook A Stage-1 filter + suppression stat + storm escape"
-    capabilities:
-      - name: "hook-a-filter-and-stat"
-        binding: "capability→producer (wired) — consolidator chain stages/memory_consolidator.py:260,:280 precedents; filter_suppressed sibling flag_dedup.py:344"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "entity_standing_decision_suppressed"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "second-uuid-escape-and-storm-counter"
-        binding: "rejection-mechanism — under-suppression bias (PRD decision 10) + per-decision storm escalation (INV-4); γ's tests observe both"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "match-bias and storm behavior are test properties, not mechanically greppable"
-  - label: "δ"
-    task_id: null
-    title: "Standing decisions δ: Hook B recon_report annotation + Stage-2 no-reinvestigation prompt rule"
-    capabilities:
-      - name: "annotation-on-cite-and-finding"
-        binding: "capability→producer (wired) — add_finding recon_report.py:922, cite_entity :1553; verbatim payload render stages/task_knowledge_sync.py:3238,:3268"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "standing_decision_id"
-          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
-          expect: present
-      - name: "never-drops-count-invariance"
-        binding: "rejection-mechanism — decision 3 permanent; δ's tests assert finding-count identity ± active decision (boundary row 7)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "count-invariance is a test property, not mechanically greppable"
-  - label: "ε"
-    task_id: null
-    title: "Standing decisions ε: prompt/self-model schema renderer (stage1+stage2) + investigation_outcome convention + demotion"
-    capabilities:
-      - name: "schema-renderer-both-stages"
-        binding: "capability→producer (wired) — precedent recon_self_model.py:310 render_suppression_schema_section → prompts/stage1.py:498-560; stage2 consumption is ε's new wiring, bound by drift/pinning test (house 2559)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "render_entity_standing_decision_schema_section"
-          paths: ["fused-memory/src/fused_memory/"]
-          expect: present
-      - name: "investigation-outcome-prompt-instruction"
-        binding: "capability→producer — kind constant from α (upstream); ε ships the Stage-2 prompt instruction + schema section feeding β's arm 2"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "investigation_outcome"
-          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
-          expect: present
-  - label: "ζ"
-    task_id: null
-    title: "Standing decisions ζ: growth-freshness sweep (Stage-2 tail) + merge_entities invalidation + streak escalation"
-    capabilities:
-      - name: "growth-sweep-at-stage2-tail"
-        binding: "capability→producer (wired) — sweep seam stages/task_knowledge_sync.py:659-1092 (+gc callsite :827); edge fetch backends/graphiti_client.py:945; snapshot field from α (upstream)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "edge_count_at_decision"
-          paths: ["fused-memory/src/fused_memory/reconciliation/stages/"]
-          expect: present
-      - name: "merge-invalidation-hook"
-        binding: "capability→producer (wired) — merge site services/memory_service.py:4204; expire on EITHER uuid, reason='merge'"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "entity_standing_decision"
-          paths: ["fused-memory/src/fused_memory/services/memory_service.py"]
-          expect: present
-  - label: "η"
-    task_id: null
-    title: "Standing decisions η: b0057f3d backfill (reify) + end-to-end integration gate"
-    capabilities:
-      - name: "backfill-migration-script-committed"
-        binding: "capability→producer — source record verified live 2026-07-22 (mem0 b0057f3d-dc53-4cf8-9d1f-9959bd0897bd, reify, sole record of kind); η commits the migration script"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "b0057f3d"
-          paths: ["fused-memory/"]
-          expect: present
-      - name: "boundary-sketch-e2e-green"
-        binding: "DAG-direction — all legs produced upstream (β writer, γ Hook A, δ Hook B, ζ sweep); η IS the check suite (boundary rows 1-14)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the task IS the E2E check suite; its signal is the boundary matrix green"
+- label: α
+  task_id: 2894
+  title: 'Standing decisions α: recon_ledger entity_standing_decision record kind,
+    grounds enum, lifecycle + TTL-flip gc'
+  capabilities:
+  - name: ledger-record-kind-and-lifecycle
+    binding: capability→producer (wired) — recon_ledger.py gc/upsert machinery :295;
+      α adds kind + entity_uuid column + expired/ttl flip arm
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: entity_standing_decision
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/recon_ledger.py
+      expect: present
+  - name: grounds-enum-single-source
+    binding: capability→producer — α ships the closed enum + token-family list + investigation_outcome
+      kind constant (INV-5 single source)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: structural_size_conflation
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+- label: β
+  task_id: 2895
+  title: 'Standing decisions β: write_entity_standing_decision helper + evidence-gated
+    Stage-2 MCP tool + stage disallow lists'
+  capabilities:
+  - name: writer-helper-and-tool
+    binding: capability→producer (wired) — helper template flag_dedup.py:1086; tool
+      factory server/recon_report.py:2099
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: write_entity_standing_decision
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: stage-visibility-disallow-entries
+    binding: capability→producer (wired) — cli_stage_runner.py:65-67 lists; β adds
+      tool to STAGE1_DISALLOWED + STAGE3_DISALLOWED and amends the :68-72 NOTE
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: write_entity_standing_decision
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: present
+  - name: evidence-gate-structured-rejection
+    binding: rejection-mechanism — built + bound by β; tests observe the rejection
+      name the unmet arm (boundary row 1)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality judged by β's own test fixtures, not a grep
+- label: γ
+  task_id: 2896
+  title: 'Standing decisions γ: Hook A Stage-1 filter + suppression stat + storm escape'
+  capabilities:
+  - name: hook-a-filter-and-stat
+    binding: capability→producer (wired) — consolidator chain stages/memory_consolidator.py:260,:280
+      precedents; filter_suppressed sibling flag_dedup.py:344
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: entity_standing_decision_suppressed
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: second-uuid-escape-and-storm-counter
+    binding: rejection-mechanism — under-suppression bias (PRD decision 10) + per-decision
+      storm escalation (INV-4); γ's tests observe both
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: match-bias and storm behavior are test properties, not mechanically
+        greppable
+- label: δ
+  task_id: 2897
+  title: 'Standing decisions δ: Hook B recon_report annotation + Stage-2 no-reinvestigation
+    prompt rule'
+  capabilities:
+  - name: annotation-on-cite-and-finding
+    binding: capability→producer (wired) — add_finding recon_report.py:922, cite_entity
+      :1553; verbatim payload render stages/task_knowledge_sync.py:3238,:3268
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: standing_decision_id
+      paths:
+      - fused-memory/src/fused_memory/server/recon_report.py
+      expect: present
+  - name: never-drops-count-invariance
+    binding: rejection-mechanism — decision 3 permanent; δ's tests assert finding-count
+      identity ± active decision (boundary row 7)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: count-invariance is a test property, not mechanically greppable
+- label: ε
+  task_id: 2898
+  title: 'Standing decisions ε: prompt/self-model schema renderer (stage1+stage2)
+    + investigation_outcome convention + demotion'
+  capabilities:
+  - name: schema-renderer-both-stages
+    binding: capability→producer (wired) — precedent recon_self_model.py:310 render_suppression_schema_section
+      → prompts/stage1.py:498-560; stage2 consumption is ε's new wiring, bound by
+      drift/pinning test (house 2559)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: render_entity_standing_decision_schema_section
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: investigation-outcome-prompt-instruction
+    binding: capability→producer — kind constant from α (upstream); ε ships the Stage-2
+      prompt instruction + schema section feeding β's arm 2
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: investigation_outcome
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/prompts/
+      expect: present
+- label: ζ
+  task_id: 2899
+  title: 'Standing decisions ζ: growth-freshness sweep (Stage-2 tail) + merge_entities
+    invalidation + streak escalation'
+  capabilities:
+  - name: growth-sweep-at-stage2-tail
+    binding: capability→producer (wired) — sweep seam stages/task_knowledge_sync.py:659-1092
+      (+gc callsite :827); edge fetch backends/graphiti_client.py:945; snapshot field
+      from α (upstream)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: edge_count_at_decision
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/stages/
+      expect: present
+  - name: merge-invalidation-hook
+    binding: capability→producer (wired) — merge site services/memory_service.py:4204;
+      expire on EITHER uuid, reason='merge'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: entity_standing_decision
+      paths:
+      - fused-memory/src/fused_memory/services/memory_service.py
+      expect: present
+- label: η
+  task_id: 2900
+  title: 'Standing decisions η: b0057f3d backfill (reify) + end-to-end integration
+    gate'
+  capabilities:
+  - name: backfill-migration-script-committed
+    binding: capability→producer — source record verified live 2026-07-22 (mem0 b0057f3d-dc53-4cf8-9d1f-9959bd0897bd,
+      reify, sole record of kind); η commits the migration script
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: b0057f3d
+      paths:
+      - fused-memory/
+      expect: present
+  - name: boundary-sketch-e2e-green
+    binding: DAG-direction — all legs produced upstream (β writer, γ Hook A, δ Hook
+      B, ζ sweep); η IS the check suite (boundary rows 1-14)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the E2E check suite; its signal is the boundary matrix green
