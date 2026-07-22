@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+from pathlib import Path
 
 from scan_task_toolcall_leaks import (
     LeakMatch,
@@ -391,3 +393,58 @@ def test_format_json_is_parseable_and_carries_full_untruncated_fragment():
 
 def test_format_json_empty_list_is_empty_array():
     assert json.loads(format_json([])) == []
+
+
+# ---------------------------------------------------------------------------
+# CLI (main), driven via subprocess.run — mirrors test_recon_busy_check.py
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
+
+
+def _run_cli(*args, timeout=10):
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(tmp_path):
+    db_path = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+    before = db_path.read_bytes()
+
+    result = _run_cli("--db", str(db_path))
+
+    after = db_path.read_bytes()
+    assert after == before, "CLI run must not mutate the database file"
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "992" in result.stdout
+
+
+def test_cli_clean_db_exits_0_with_no_leaks_message(tmp_path):
+    db_path = _make_db(tmp_path, [{"id": 1, "description": "Nothing wrong here."}])
+
+    result = _run_cli("--db", str(db_path))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "no leaked tool-call fragments found" in result.stdout
+
+
+def test_cli_json_flag_exits_1_and_emits_parseable_json(tmp_path):
+    db_path = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+
+    result = _run_cli("--db", str(db_path), "--json")
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    parsed = json.loads(result.stdout)
+    assert len(parsed) == 1
+    assert parsed[0]["task_id"] == 992
+    assert parsed[0]["fragment"] == GENUINE_DESCRIPTION_LEAK_FRAGMENT
+
+
+def test_cli_no_resolvable_db_exits_2():
+    result = _run_cli("--db", "/nonexistent.db")
+
+    assert result.returncode == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
