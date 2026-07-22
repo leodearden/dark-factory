@@ -7446,6 +7446,7 @@ class TestEnqueueMergeRequest:
         source marker distinguishing them from workflow/MCP submissions.
         """
         import json
+
         from orchestrator.merge_queue import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -7477,6 +7478,7 @@ class TestEnqueueMergeRequest:
     ):
         """Existing callers (no source=) emit NO 'source' key — byte-identical."""
         import json
+
         from orchestrator.merge_queue import enqueue_merge_request
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()

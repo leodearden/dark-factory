@@ -94,10 +94,7 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
-from orchestrator.stranded_verified_green import (
-    VerifiedGreenMatch,
-    detect_verified_green,
-)
+from orchestrator.stranded_verified_green import detect_verified_green
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
     _deterministic_deploy_health_verdict,

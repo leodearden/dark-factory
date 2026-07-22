@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
+from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,9 +23,10 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
-from orchestrator.lane_lifecycle import LaneRecord, LaneState
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.lane_lifecycle import LaneRecord, LaneState
 from orchestrator.stranded_verified_green import VerifiedGreenMatch
 
 
@@ -216,7 +218,7 @@ def _build_env(
     steps: list[dict] | None = None,
     empty_records: bool = False,
     raise_on_resolve: bool = False,
-) -> tuple[_FakeGitOps, EventStore, Callable[[str], Path], Path]:
+) -> tuple[GitOps, EventStore, Callable[[str], Path], Path]:
     """Build (git_ops, event_store, worktree_resolver, worktree) for the detector.
 
     Defaults describe the POSITIVE verified-green shape; override one knob per
@@ -249,7 +251,7 @@ def _build_env(
     def _resolver(tid: str) -> Path:
         return worktree
 
-    return git_ops, event_store, _resolver, worktree
+    return cast(GitOps, git_ops), event_store, _resolver, worktree
 
 
 class TestDetectVerifiedGreen:
@@ -418,7 +420,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # db_status reflects the same status the sweep loop reads (mirrors
     # test_stranded_blocked_sweep.py's identically-purposed default).
     def _default_get_task(tid: str) -> dict | None:
-        ret = h.scheduler.get_statuses.return_value
+        ret = cast(AsyncMock, h.scheduler.get_statuses).return_value
         try:
             statuses, _err = ret
         except (TypeError, ValueError):
@@ -432,7 +434,7 @@ def harness(tmp_path: Path, mock_orch_config):
     h.event_store = EventStore(tmp_path / 'harness-runs.db', 'run-1')
     # module_configs_or_empty is a @property (exposed by pydantic_spec) — force
     # an empty mapping so list(...values()) yields [] for the MergeRequest.
-    h.config.module_configs_or_empty = {}
+    cast(Any, h.config).module_configs_or_empty = {}
     h.config.stranded_verified_green_merge_enabled = True
     return h
 
@@ -476,6 +478,7 @@ class TestMaybeSubmitStrandedVerifiedGreen:
         ):
             await harness._maybe_submit_stranded_verified_green(_TID, {})
 
+        assert harness.event_store is not None
         rows = harness.event_store.fetch_events_by_type_all_runs(
             EventType.merge_queued, task_id=_TID,
         )
@@ -560,12 +563,13 @@ class TestStrandedVerifiedGreenRecordEscalation:
         rec = dismissed[0]
         assert rec.category == 'stranded_blocked'
         assert rec.agent_role == 'harness-stranded-blocked-reaper'
+        assert rec.resolution is not None
         assert 'source=stranded-reaper' in rec.resolution
         assert 'request_id=mr-' in rec.resolution
 
         # CRITICALLY: the record must NOT re-pend the task (close_only →
         # WORKFLOW_NONE, not a resume-resolution).
-        for call in harness.scheduler.set_task_status.await_args_list:
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             assert tuple(call.args[:2]) != (_TID, 'pending'), (
                 'verified-green record must NOT re-pend the task'
             )
@@ -611,7 +615,7 @@ class TestReconcileStrandedDriverVerifiedGreen:
         # No pending stranded_blocked L1 remains — the record was auto-dismissed.
         assert queue.get_by_task(tid, status='pending') == []
         # The task was NOT re-pended.
-        for call in harness.scheduler.set_task_status.await_args_list:
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             assert tuple(call.args[:2]) != (tid, 'pending')
 
     async def test_b_non_matching_preserves_today_refile_path(
@@ -681,8 +685,8 @@ class TestStrandedVerifiedGreenIdempotency:
 
         assert result is True
         assert harness._merge_queue.qsize() == 1
-        harness.scheduler.update_task.assert_awaited()
-        call = harness.scheduler.update_task.await_args
+        harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
+        call = harness.scheduler.update_task.await_args  # type: ignore[attr-defined]
         assert call.args[0] == _TID
         # The single supplied key preserves siblings under merge mode.
         payload = call.args[1]
@@ -712,7 +716,7 @@ class TestStrandedVerifiedGreenIdempotency:
 
         assert result is True
         assert harness._merge_queue.qsize() == 0  # NO additional MergeRequest
-        harness.scheduler.update_task.assert_not_awaited()  # no re-stamp
+        harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]  # no re-stamp
         # No new escalation filed (neither a pending L1 nor a dismissed record).
         assert queue.get_by_task(_TID, status='pending') == []
         assert queue.get_by_task(_TID, status='dismissed') == []
@@ -734,7 +738,7 @@ class TestStrandedVerifiedGreenIdempotency:
 
         assert result is True
         assert harness._merge_queue.qsize() == 1  # re-submit
-        harness.scheduler.update_task.assert_awaited()  # marker re-stamped
+        harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]  # marker re-stamped
 
     async def test_advanced_lane_tip_resubmits(
         self, harness: Harness, tmp_path: Path,
@@ -802,8 +806,8 @@ class TestStrandedVerifiedGreenIdempotency:
         await asyncio.gather(*list(harness._background_tasks))
 
         assert harness._merge_queue.qsize() == 1
-        harness.scheduler.update_task.assert_awaited()
-        marker = harness.scheduler.update_task.await_args.args[1][
+        harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
+        marker = harness.scheduler.update_task.await_args.args[1][  # type: ignore[attr-defined]
             'stranded_merge_request'
         ]
         assert marker['tip_sha'] == _TIP
@@ -852,7 +856,7 @@ class TestStrandedMergeFailedL2:
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
-        req.result.set_result(MergeOutcome(status=status, reason='durable-fail'))
+        req.result.set_result(MergeOutcome(status=cast(Any, status), reason='durable-fail'))
         await self._drive_callback(harness)
 
         l2s = queue.get_by_task(
@@ -865,7 +869,7 @@ class TestStrandedMergeFailedL2:
         assert rec.severity == 'critical'
         assert rec.level == 2
         # Task NOT flipped (stays blocked; branch + lane preserved by omission).
-        for call in harness.scheduler.set_task_status.await_args_list:
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             assert tuple(call.args[:2]) != (_TID, 'pending')
 
     @pytest.mark.parametrize('status', _SUCCESS_TRANSIENT_STATUSES)
@@ -876,7 +880,7 @@ class TestStrandedMergeFailedL2:
 
         queue = EscalationQueue(tmp_path / 'esc')
         req = await self._submit_and_get_req(harness, tmp_path, queue)
-        req.result.set_result(MergeOutcome(status=status))
+        req.result.set_result(MergeOutcome(status=cast(Any, status)))
         await self._drive_callback(harness)
 
         assert queue.get_by_task(
@@ -948,8 +952,8 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
         assert harness._merge_queue.qsize() == 1
         # Record auto-dismissed → NO pending escalation left to block the flip.
         assert queue.get_by_task(tid, status='pending') == []
-        harness.scheduler.update_task.assert_awaited()
-        marker = harness.scheduler.update_task.await_args.args[1][
+        harness.scheduler.update_task.assert_awaited()  # type: ignore[attr-defined]
+        marker = harness.scheduler.update_task.await_args.args[1][  # type: ignore[attr-defined]
             'stranded_merge_request'
         ]
 
@@ -985,14 +989,14 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             await harness._reconcile_stranded_in_progress()
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_any_await(
+        harness.scheduler.set_task_status.assert_any_await(  # type: ignore[attr-defined]
             tid, 'done',
             done_provenance={
                 'kind': 'found_on_main', 'commit': advanced_sha, 'note': ANY,
             },
         )
         # The task was NOT re-pended anywhere along the way.
-        for call in harness.scheduler.set_task_status.await_args_list:
+        for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
             assert tuple(call.args[:2]) != (tid, 'pending')
         # No stranded_merge_failed L2 was ever filed (success path is a no-op).
         l2s = [

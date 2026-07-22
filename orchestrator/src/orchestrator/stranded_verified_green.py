@@ -24,9 +24,10 @@ projects (no ASSIGNED lane record → ``None`` → today's re-file path).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventStore, EventType
