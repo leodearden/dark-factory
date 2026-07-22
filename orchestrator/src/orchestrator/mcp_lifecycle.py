@@ -69,6 +69,26 @@ def apply_mcp_startup_env(
 _PLAN_TOOLS_FAST_START_FLAGS: tuple[str, ...] = ('--no-sync', '--frozen')
 
 
+# Quiet-env for the stdio MCP servers (plan-tools AND verdict-tools).  FastMCP
+# 3.x defaults to printing a decorative startup banner, and rendering that
+# banner runs a SYNCHRONOUS PyPI update-check (log_server_banner ->
+# check_for_newer_version -> httpx.get('https://pypi.org/pypi/fastmcp/json',
+# timeout=2.0)) on the server's startup path, BEFORE it begins serving stdio.
+# On a fresh worktree / differing HOME / sandbox the version cache is cold or
+# unwritable, so the network call re-fires every launch; under network or
+# concurrent-launch pressure that latency can push the MCP `initialize`
+# handshake past the CLI's MCP_TIMEOUT, and the CLI then silently DROPS the
+# server (the intermittent plan-tools/verdict-tools absence, task 2942).
+# Setting both env vars disables the banner and the update-check, so the
+# server makes no network call before serving.  Declarative at the launch site
+# and FastMCP-version-independent; complemented by show_banner=False in each
+# server's main() as an in-code, env-independent guarantee.
+_FASTMCP_STDIO_QUIET_ENV: dict[str, str] = {
+    'FASTMCP_SHOW_SERVER_BANNER': 'false',
+    'FASTMCP_CHECK_FOR_UPDATES': 'off',
+}
+
+
 def _stdio_mcp_server(
     module_path: str,
     orch_project_dir: Path,
@@ -129,6 +149,12 @@ def _stdio_mcp_server(
                 *meta_root_args,
                 *extra_args,
             ],
+            # Suppress FastMCP's banner + synchronous PyPI update-check so the
+            # stdio server makes no network call before serving (task 2942).
+            # A fresh dict() copy per call — never the shared module constant —
+            # so a caller mutating the returned env can't corrupt the next
+            # launch's env.
+            'env': dict(_FASTMCP_STDIO_QUIET_ENV),
         }
     # uv fallback: backward-compatible form with fast-start flags (task 1775).
     return {
@@ -141,6 +167,9 @@ def _stdio_mcp_server(
             *meta_root_args,
             *extra_args,
         ],
+        # Same FastMCP banner/update-check suppression as the hot path above;
+        # fresh dict() copy per call (task 2942).
+        'env': dict(_FASTMCP_STDIO_QUIET_ENV),
     }
 
 
@@ -234,10 +263,16 @@ def verdict_tools_mcp_server(
     :func:`plan_tools_mcp_server`, differing only by module path and the
     added ``('--verdict-role', role)`` extra-args tail.
 
-    No ``env`` is set on the returned dict: ``MCP_TIMEOUT`` is injected
+    The returned dict carries the shared ``_FASTMCP_STDIO_QUIET_ENV``
+    (``FASTMCP_SHOW_SERVER_BANNER='false'`` / ``FASTMCP_CHECK_FOR_UPDATES=
+    'off'``) via ``_stdio_mcp_server`` — the same env applied to
+    ``plan_tools_mcp_server`` — suppressing FastMCP 3.x's startup banner and
+    its synchronous PyPI update-check so the stdio server makes no network
+    call before serving (task 2942).  ``MCP_TIMEOUT`` is still injected
     process-wide for every claude subprocess by ``apply_mcp_startup_env``
-    (invoke.py), inherited by all stdio MCP servers it spawns — the same
-    reasoning that already applies to ``plan_tools_mcp_server``.
+    (invoke.py) and inherited by all stdio MCP servers it spawns; the CLI
+    merges (does not replace) this per-server ``env`` into that inherited
+    environment, so both coexist.
 
     No ``--session-id`` is threaded through here (nor by
     ``_inject_verdict_tools_mcp`` in workflow.py): α made ``--session-id``

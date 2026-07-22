@@ -590,6 +590,78 @@ class TestVerdictToolsLaunchMetaRoot:
 
 
 # ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2942): _stdio_mcp_server launch dicts carry the FastMCP
+# banner/update-check quiet-env
+# ---------------------------------------------------------------------------
+
+
+class TestStdioMcpQuietEnv:
+    """Both plan_tools_mcp_server() and verdict_tools_mcp_server() return a
+    launch dict whose 'env' disables FastMCP 3.x's startup banner AND its
+    synchronous PyPI update-check, so the stdio MCP server makes NO network
+    call before it begins serving (task 2942).
+
+    The update-check (log_server_banner -> check_for_newer_version ->
+    httpx.get(pypi), 2s timeout) runs on the startup hot path BEFORE the MCP
+    initialize handshake; under a cold/unwritable version cache or network
+    pressure it can delay startup past the CLI's MCP_TIMEOUT and get the
+    server silently dropped. The env is set on BOTH the no-uv hot path and
+    the uv fallback, for both servers, via the shared _stdio_mcp_server
+    helper.
+    """
+
+    def test_plan_tools_direct_interpreter_env_disables_banner_and_update_check(self):
+        """no-uv hot path (python_executable set): env carries both quiet keys."""
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_plan_tools_uv_fallback_env_disables_banner_and_update_check(self):
+        """uv fallback (python_executable None): env carries both quiet keys."""
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_verdict_tools_direct_interpreter_env_disables_banner_and_update_check(self):
+        """verdict-tools no-uv hot path: env carries both quiet keys (shared helper)."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            role='judge',
+            python_executable='/venv/bin/python',
+        )
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_verdict_tools_uv_fallback_env_disables_banner_and_update_check(self):
+        """verdict-tools uv fallback: env carries both quiet keys (shared helper)."""
+        cfg = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge',
+        )
+        assert cfg['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+        assert cfg['env']['FASTMCP_CHECK_FOR_UPDATES'] == 'off'
+
+    def test_env_dict_is_fresh_per_call_not_shared_reference(self):
+        """Mutating one launch dict's env must NOT bleed into another's — guards
+        against handing out a shared module-constant dict reference."""
+        cfg1 = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        cfg2 = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        cfg3 = verdict_tools_mcp_server(
+            orch_project_dir=Path('/orch'), worktree=Path('/wt'), role='judge',
+        )
+        # A shared reference would leak this mutation into every other dict.
+        cfg1['env']['FASTMCP_SHOW_SERVER_BANNER'] = 'MUTATED'
+        cfg1['env']['EXTRA_KEY'] = 'x'
+        for other in (cfg2, cfg3):
+            assert other['env']['FASTMCP_SHOW_SERVER_BANNER'] == 'false'
+            assert 'EXTRA_KEY' not in other['env']
+
+
+# ---------------------------------------------------------------------------
 # Step-1/Step-2 (task 2439): managed_runtime_data_dirs() pure helper
 # ---------------------------------------------------------------------------
 
