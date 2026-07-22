@@ -8060,16 +8060,27 @@ class GitOps:
         between a liveness check and the delete (the incident's 23s
         TOCTOU). A live holder makes the non-blocking acquire fail
         immediately, in which case removal is skipped
-        (``'skipped_lease_held'``) rather than deferred or retried; a dead
-        or stale holder's flock is auto-released by the kernel, so the
-        acquire simply succeeds and removal proceeds (fail-open, intrinsic
-        to flock — this method never consults holder liveness directly).
+        (``'skipped_lease_held'``, logged as a single WARNING naming the
+        holder pgid) rather than deferred or retried; a dead or stale
+        holder's flock is auto-released by the kernel, so the acquire
+        simply succeeds and removal proceeds (fail-open, intrinsic to
+        flock — this method never consults holder liveness directly). The
+        holder-pgid rendezvous file is read ONLY to name the holder in
+        that WARNING — a best-effort, fail-open diagnostic hint, never a
+        removal gate.
 
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
         fd = acquire_merge_verify_flock(lane_lock_path(path), 0.0)
         if fd is None:
+            holder = read_lock_holder_pgid(self.worktree_base)
+            logger.warning(
+                'remove_merge_worktree_guarded: merge-verify lease held by live '
+                'holder (pgid=%s); skipping removal of %s (reason=%s) -- leaving '
+                'for the merge reaper',
+                holder, path, reason,
+            )
             return 'skipped_lease_held'
         try:
             rc, _, err = await _run(
