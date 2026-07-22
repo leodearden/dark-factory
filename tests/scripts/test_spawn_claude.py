@@ -270,6 +270,11 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
     env["CLAUDE_TERMINAL_CMD"] = terminal_name
     env.pop("ESCALATION_TERMINAL_CMD", None)
+    # The host's ~/.claude/settings.json env block (belt-and-braces layer of
+    # the transcript-persistence fix) injects this into every Bash subprocess
+    # -- including this pytest run. Drop it so the persistence-export tests
+    # assert spawn-claude.sh's OWN unconditional export, not an ambient leak.
+    env.pop("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", None)
     # Keep the genuine-launcher-failure grace short so tests don't hang.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     # Isolate the session-registry writes spawn-claude.sh now performs
@@ -1473,13 +1478,15 @@ def _write_fake_claude_capturing_env(
     bin_dir: pathlib.Path, capture_file: pathlib.Path
 ) -> None:
     """Write a fake ``claude`` that captures its own CLAUDE_SPAWN_SESSION_ID,
-    CLAUDE_SPAWN_PARENT_ID, and CLAUDE_SPAWN_WM_TITLE env vars to
-    *capture_file*, then exits 0.
+    CLAUDE_SPAWN_PARENT_ID, CLAUDE_SPAWN_WM_TITLE, and
+    CLAUDE_CODE_FORCE_SESSION_PERSISTENCE env vars to *capture_file*, then
+    exits 0.
 
     Modeled on ``_write_fake_claude_capturing_prompt`` -- lets a test inspect
     exactly what the Fleet Cockpit C1 identity exports (and, since task 2510,
-    the C10-fix window-title marker export) resolved to for the spawned
-    child process.
+    the C10-fix window-title marker export; and the unconditional
+    transcript-persistence override) resolved to for the spawned child
+    process.
     """
     p = bin_dir / "claude"
     p.write_text(
@@ -1488,6 +1495,7 @@ def _write_fake_claude_capturing_env(
         '  echo "SESSION=${CLAUDE_SPAWN_SESSION_ID:-}"\n'
         '  echo "PARENT=${CLAUDE_SPAWN_PARENT_ID:-}"\n'
         '  echo "CLAUDE_SPAWN_WM_TITLE=${CLAUDE_SPAWN_WM_TITLE:-}"\n'
+        '  echo "PERSIST=${CLAUDE_CODE_FORCE_SESSION_PERSISTENCE:-}"\n'
         f"}} > {capture_file!s}\n"
         "exit 0\n"
     )
@@ -1533,6 +1541,12 @@ def test_spawn_exports_session_and_parent_ids(tmp_path: pathlib.Path) -> None:
     )
     assert captured.get("PARENT") == "root-df-1-1", (
         f"expected the spawner's own inherited session id as the parent, got {captured!r}"
+    )
+    # Transcript-persistence override: exported unconditionally so a spawned
+    # interactive session inheriting CLAUDE_CODE_CHILD_SESSION still saves its
+    # ~/.claude/projects transcript (Claude Code >=2.1.208 suppression).
+    assert captured.get("PERSIST") == "1", (
+        f"expected the unconditional persistence override, got {captured!r}"
     )
 
 
@@ -1608,6 +1622,12 @@ def test_spawn_id_exports_fail_soft_when_registry_faults(tmp_path: pathlib.Path)
     captured = _parse_captured_env(capture_file)
     assert captured.get("SESSION") == "", f"expected a clean no-op export, got {captured!r}"
     assert captured.get("PARENT") == "", f"expected a clean no-op export, got {captured!r}"
+    # The persistence override is deliberately NOT gated on the registry: it
+    # must still be exported on the fail-soft path, or a registry fault would
+    # silently reintroduce transcript loss.
+    assert captured.get("PERSIST") == "1", (
+        f"persistence override must survive a registry fault, got {captured!r}"
+    )
 
 
 # ===========================================================================
