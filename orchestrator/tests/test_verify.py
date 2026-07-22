@@ -8360,6 +8360,34 @@ class TestFailureReportUsesAnchoredExcerpt:
 # command exists. The narrow role=='merge' AND is_merge_verify gate leaves the
 # baseline-probe caller and every task-1774/task-2838 guard test byte-identical.
 # ---------------------------------------------------------------------------
+class _RecordingEventStore:
+    """Minimal EventStore stand-in capturing emit() calls in-memory.
+
+    Mirrors the double in test_multihost_verify_integration.py; each recorded
+    entry is ``(event_type, task_id, role, data)``.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, str | None, str | None, dict[str, Any]]] = []
+
+    def emit(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        phase: str | None = None,
+        role: str | None = None,
+        data: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
+        duration_ms: float | None = None,
+        **kw: Any,
+    ) -> None:
+        self.events.append((event_type, task_id, role, dict(data or {})))
+
+    def events_of(self, event_type: Any) -> list[tuple[Any, str | None, str | None, dict[str, Any]]]:
+        return [e for e in self.events if e[0] == event_type]
+
+
 class TestMergeGateEscalatesTrivialPassSite1:
     """Site 1 — module_configs branch (verify.py ~line 5011).
 
@@ -8602,3 +8630,87 @@ class TestMergeGateEscalatesTrivialPassSite2:
             f'task-role no-source diff must stay a trivial pass; got trivial={result.trivial}'
         )
         assert calls == [], f'No command should run for the task-role trivial pass; got: {calls}'
+
+
+class TestMergeGateClobberedWorktree:
+    """Incident 83336a32 — an ENOENT-clobbered merge worktree: task_files is
+    non-empty but every path is missing on disk, so existing_files resolves
+    empty and the pre-fix guards failed open into a 0ms LOCAL trivial pass.
+
+    The merge gate must NEVER trivial-pass this: it escalates to the full gate
+    (when a command exists) or FAILs loud, and the emitted trivial_pass_escalated
+    event carries reason='empty_existing_files' — distinguishing evidence-absence
+    from a genuine docs-only diff. The trivial_pass_escalated event is captured
+    via a recording event_store threaded through run_scoped_verification.
+    """
+
+    def _config_with_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(project_root=tmp_path, test_command='__scope_all_cmd__')
+
+    def _config_no_cmd(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path, test_command='', lint_command='', type_check_command='',
+        )
+
+    # A source path deliberately NOT created on disk → existing_files empty.
+    _CLOBBERED = ['orchestrator/src/orchestrator/foo.py']
+
+    @pytest.mark.asyncio
+    async def test_clobbered_with_command_runs_full_gate(self, tmp_path: Path, guard_spy):
+        """Clobbered worktree + a configured command → the full gate runs; not a
+        0ms trivial pass; event reason='empty_existing_files', resolution='full_gate'."""
+        from orchestrator.event_store import EventType
+
+        fake_run_cmd, calls = guard_spy
+        rec = _RecordingEventStore()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._config_with_cmd(tmp_path),
+                [],
+                task_files=self._CLOBBERED,
+                role='merge',
+                is_merge_verify=True,
+                event_store=rec,
+            )
+
+        joined = ' | '.join(calls)
+        assert '__scope_all_cmd__' in joined, f'Expected full gate to run; got: {calls}'
+        assert result.passed
+        assert result.trivial is False, (
+            f'Clobbered worktree must never yield a trivial PASS; got trivial={result.trivial}'
+        )
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, f'Expected exactly one escalation event; got {rec.events}'
+        assert evs[0][3]['reason'] == 'empty_existing_files', evs[0][3]
+        assert evs[0][3]['resolution'] == 'full_gate', evs[0][3]
+
+    @pytest.mark.asyncio
+    async def test_clobbered_no_command_loud_fails(self, tmp_path: Path, guard_spy):
+        """Clobbered worktree + NO command → loud FAIL (merge_no_evidence); event
+        reason='empty_existing_files', resolution='loud_fail'."""
+        from orchestrator.event_store import EventType
+
+        fake_run_cmd, calls = guard_spy
+        rec = _RecordingEventStore()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_scoped_verification(
+                tmp_path,
+                self._config_no_cmd(tmp_path),
+                [],
+                task_files=self._CLOBBERED,
+                role='merge',
+                is_merge_verify=True,
+                event_store=rec,
+            )
+
+        assert result.passed is False
+        assert result.trivial is False
+        assert result.category == 'merge_no_evidence', result.category
+        assert calls == [], f'No command should execute for a loud FAIL; got: {calls}'
+        evs = rec.events_of(EventType.trivial_pass_escalated)
+        assert len(evs) == 1, f'Expected exactly one escalation event; got {rec.events}'
+        assert evs[0][3]['reason'] == 'empty_existing_files', evs[0][3]
+        assert evs[0][3]['resolution'] == 'loud_fail', evs[0][3]
