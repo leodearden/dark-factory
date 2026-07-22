@@ -443,10 +443,11 @@ _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_
 # header present the server's response Content-Type is `application/json` (not
 # SSE-framed) for these calls, so `response.json()` needs no `data:`-line
 # parsing. Kept load-bearing-constant-single-sourced here (census_trigger is
-# already imported by both census.py and nightly.py) so a future transport
-# change is a one-line edit, not three lockstep edits with a silent-406 risk
-# on any one that's missed. See nightly._default_poster and
-# census._post_mcp_tool_call for the other two consumers.
+# already imported by census.py, nightly.py, and check_transcript_persistence.py)
+# so a future transport change is a one-line edit, not four lockstep edits
+# with a silent-406 risk on any one that's missed. See nightly._default_poster,
+# census._post_mcp_tool_call, and check_transcript_persistence._default_poster
+# for the other three consumers.
 MCP_STREAMABLE_HTTP_HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Content-Type": "application/json",

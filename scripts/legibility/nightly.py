@@ -353,7 +353,7 @@ def _default_poster(url: str, envelope: dict) -> None:
         json=envelope,
         # Required by the streamable-HTTP MCP transport -- single-sourced
         # in census_trigger (already imported here) so a transport change is
-        # a one-line edit, not three lockstep edits with a silent-406 risk.
+        # a one-line edit, not four lockstep edits with a silent-406 risk.
         headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
         timeout=10.0,
     )
