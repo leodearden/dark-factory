@@ -87,3 +87,53 @@ class TestEscalateSandboxUnavailable:
         wf = _make_bare_workflow(tmp_path, with_queue=False)
         # Must not raise when there is no escalation queue wired up.
         wf._escalate_sandbox_unavailable('debugger', 'auto', 'detail')
+
+
+class TestGuardSandbox:
+    """_guard_sandbox refuses fail-closed and files a single deduped escalation."""
+
+    def test_refuse_files_single_escalation_across_n(self, tmp_path):
+        """N refusals raise SandboxUnavailable each; the queue holds exactly one (INV-4)."""
+        wf = _make_bare_workflow(tmp_path, worktree=tmp_path)
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=False,
+        ):
+            for _ in range(3):
+                with pytest.raises(sandbox_dispatch.SandboxUnavailable):
+                    wf._guard_sandbox('implementer')
+
+        assert wf.escalation_queue is not None
+        pending = wf.escalation_queue.get_pending()
+        assert len(pending) == 1, (
+            f'exactly one escalation expected across N refusals; got {len(pending)}'
+        )
+        assert 'implementer' in pending[0].summary
+        assert 'landlock' in pending[0].detail
+
+    def test_none_escape_returns_without_escalation(self, tmp_path, caplog):
+        """backend='none' returns None (no raise), files nothing, logs a WARNING."""
+        wf = _make_bare_workflow(tmp_path, worktree=tmp_path)
+        sandbox_dispatch.set_backend('none')
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.agents.sandbox_dispatch',
+        ):
+            assert wf._guard_sandbox('implementer') is None
+
+        assert wf.escalation_queue is not None
+        assert wf.escalation_queue.get_pending() == []
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_healthy_backend_returns_without_escalation(self, tmp_path):
+        """A resolvable backend returns None, no raise, files nothing."""
+        wf = _make_bare_workflow(tmp_path, worktree=tmp_path)
+        sandbox_dispatch.set_backend('landlock')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            assert wf._guard_sandbox('implementer') is None
+
+        assert wf.escalation_queue is not None
+        assert wf.escalation_queue.get_pending() == []
