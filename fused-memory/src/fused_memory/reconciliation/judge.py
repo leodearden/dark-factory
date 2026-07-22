@@ -6,7 +6,13 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from shared.cli_invoke import build_failure_message, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AllAccountsCappedException,
+    build_failure_message,
+    classify_agent_failure,
+    invoke_with_cap_retry,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -23,6 +29,26 @@ logger = logging.getLogger(__name__)
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
+
+
+class JudgeInfraError(Exception):
+    """Judge CLI transport/infra failure signal (task 2947 ask a).
+
+    Raised by ``_call_judge_cli`` when the judge invocation fails for a
+    transport/infra reason — api_error, timeout, model-not-found, max-turns,
+    ended-awaiting-background, cap-wait exhaustion, or an otherwise-unknown
+    non-success — as opposed to a genuinely-malformed *reachable* judge
+    response (which stays fail-closed serious via ``_parse_verdict``) or a
+    benign exit-0/empty-stdout run (which stays the benign ``''`` contract).
+
+    The distinction matters because an infra failure carries NO verdict: prior
+    to this taxonomy a cap-storm CLI failure was fabricated into a phantom
+    ``severity=serious`` halt whose reason ("Serious verdict in run X") lied
+    about a review that never happened. ``review_run`` catches this exception,
+    applies bounded backoff, and only halts (truthfully, "judge-unreachable")
+    after ``judge_infra_max_consecutive_failures`` consecutive occurrences.
+    Carries a human-readable message (the ``build_failure_message`` dump).
+    """
 
 
 class Judge:
@@ -241,45 +267,62 @@ Review this run and provide your verdict as JSON.
         Judge output is free-form text — no output_schema is passed.
         InvokeSlot owns probe-slot release and terminate_process_group on timeout.
         """
-        result = await invoke_with_cap_retry(
-            usage_gate=self._usage_gate,
-            label=f'Reconciliation judge ({self.config.judge_llm_model})',
-            prompt=prompt,
-            system_prompt=JUDGE_SYSTEM_PROMPT,
-            model=self.config.judge_llm_model,
-            disallowed_tools=['*'],
-            # max_turns=1: the judge is deliberately single-shot.  One turn is
-            # sufficient to produce a free-form verdict; allowing more would
-            # widen cost/duration exposure with no benefit.
-            max_turns=1,
-            permission_mode='bypassPermissions',
-            timeout_seconds=float(self.config.judge_cli_timeout_seconds),
-            # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-            # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
-            # grounding/proportionality ("were codebase verifications used
-            # when appropriate?"), which plausibly draws on the auto-loaded
-            # CLAUDE.md's project architecture context.
-            cwd=Path(self.config.explore_codebase_root),
-            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
-        )
+        try:
+            result = await invoke_with_cap_retry(
+                usage_gate=self._usage_gate,
+                label=f'Reconciliation judge ({self.config.judge_llm_model})',
+                prompt=prompt,
+                system_prompt=JUDGE_SYSTEM_PROMPT,
+                model=self.config.judge_llm_model,
+                disallowed_tools=['*'],
+                # max_turns=1: the judge is deliberately single-shot.  One turn is
+                # sufficient to produce a free-form verdict; allowing more would
+                # widen cost/duration exposure with no benefit.
+                max_turns=1,
+                permission_mode='bypassPermissions',
+                timeout_seconds=float(self.config.judge_cli_timeout_seconds),
+                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
+                # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
+                # grounding/proportionality ("were codebase verifications used
+                # when appropriate?"), which plausibly draws on the auto-loaded
+                # CLAUDE.md's project architecture context.
+                cwd=Path(self.config.explore_codebase_root),
+                cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            )
+        except AllAccountsCappedException as e:
+            # Cap-wait exhaustion (all accounts capped past the 1800s recon
+            # sanity bound) is a transport/infra failure, not a verdict. Re-raise
+            # as JudgeInfraError so review_run counts/backs-off/escalates it
+            # identically to other transport failures, instead of letting it
+            # propagate opaquely into review_run's broad except (which would
+            # swallow it as a generic failure with no infra-failure accounting).
+            raise JudgeInfraError(f'Claude CLI judge cap-wait exhausted: {e}') from e
 
-        # Preserve legacy "empty stdout = valid empty verdict" semantics.
-        # _parse_claude_output maps empty stdout → success=False / subtype
-        # 'error_empty_output'.  Treat that as a benign empty string rather
-        # than an error so callers remain consistent with the prior subprocess
-        # implementation that returned '' on exit-0 + empty stdout.  This
-        # benign contract depends on _parse_verdict special-casing empty
-        # text (see its early-return below) rather than routing it through
-        # the loud severity=serious parse-failure path — otherwise a quiet,
-        # successful CLI run would be indistinguishable from a systemic
-        # judge/CLI outage and could halt the project.
-        if not result.success and result.subtype == 'error_empty_output':
+        if result.success:
+            return result.output.strip()
+
+        # Not successful: distinguish a genuine benign empty verdict from a
+        # transport/infra failure via the shared failure taxonomy
+        # (classify_agent_failure), so infra failures never reach
+        # _parse_verdict's fabricated severity=serious path (the phantom-halt
+        # defect this task fixes).
+        #
+        # EMPTY_OUTPUT (genuine exit-0/empty-stdout) preserves the legacy
+        # "empty stdout = valid empty verdict" semantics: return '' so
+        # _parse_verdict's empty-text short-circuit yields a benign minor
+        # verdict.  Crucially, classify_agent_failure orders API_ERROR (rule 6)
+        # ABOVE EMPTY_OUTPUT (rule 7): a cap-storm run whose stdout is empty but
+        # whose api_error_status is set classifies as API_ERROR, so it is
+        # correctly treated as infra rather than a benign empty verdict.
+        #
+        # Every other failure kind (API_ERROR / TIMED_OUT / MODEL_NOT_FOUND /
+        # MAX_TURNS / ENDED_AWAITING_BACKGROUND / UNKNOWN) is a transport/infra
+        # failure: raise JudgeInfraError (replacing the previous generic
+        # RuntimeError) so review_run can branch on it explicitly.
+        if classify_agent_failure(result).kind == AgentFailureKind.EMPTY_OUTPUT:
             return ''
 
-        if not result.success:
-            raise RuntimeError(build_failure_message('Claude CLI judge', result))
-
-        return result.output.strip()
+        raise JudgeInfraError(build_failure_message('Claude CLI judge', result))
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""

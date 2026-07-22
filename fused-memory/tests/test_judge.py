@@ -1064,27 +1064,32 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
 
 
 # ---------------------------------------------------------------------------
-# CLI failure path surfaces stderr + summary in RuntimeError
+# CLI failure path surfaces stderr + summary in JudgeInfraError
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_error(
+async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_judge_infra_error(
     mock_journal,
 ):
-    """_call_judge_cli embeds stderr and classify_agent_failure summary in the RuntimeError.
+    """_call_judge_cli embeds stderr and classify_agent_failure summary in the JudgeInfraError.
 
-    Red test (step-3): the current code raises RuntimeError(f'Claude CLI judge
-    failed: {result.output[:500]}').  When result.output is '' (e.g. a JSON
-    parse crash), the message is empty and the diagnostic signal lives in
-    result.stderr.  This test asserts the RuntimeError message after the fix:
+    Task 2947 (ask a) replaced the previous generic RuntimeError on the
+    not-result.success path with a typed JudgeInfraError (transport/infra
+    signal). The message is still build_failure_message('Claude CLI judge',
+    result), so when result.output is '' (e.g. a JSON parse crash) the
+    diagnostic signal still lives in result.stderr. This test asserts the
+    JudgeInfraError message:
       - starts with 'Claude CLI judge failed:'
       - contains the stderr content ('Traceback: JSONDecodeError in line 42')
       - contains 'error_unexpected' (the subtype, present in diagnostic_detail)
-    The subtype is NOT 'error_empty_output', so the early-return on lines
-    264-265 does not apply — the not-result.success branch must fire.
+    The subtype is NOT 'error_empty_output' (it classifies UNKNOWN, not
+    EMPTY_OUTPUT), so the benign '' short-circuit does not apply — the
+    infra-failure branch must fire.
     """
     from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JudgeInfraError
 
     fake_gate = make_gate_mock()
     config = _make_judge_config(
@@ -1106,7 +1111,7 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
     ) as mock_invoke:
         mock_invoke.return_value = failing_result
 
-        with pytest.raises(RuntimeError) as excinfo:
+        with pytest.raises(JudgeInfraError) as excinfo:
             await judge._call_judge_cli('Evaluate this run.')
 
     msg = str(excinfo.value)
