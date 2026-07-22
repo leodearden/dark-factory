@@ -184,8 +184,20 @@ from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_TOKEN_FAMILIES,
     STATE_ACTIVE,
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 from fused_memory.utils.async_utils import gather_collect
+
+# Optional escalation dependency (mirrors stage1_stall_detector's pattern): the
+# reconciliation package must import cleanly even where the escalation package
+# is not installed. maybe_escalate_suppression_storm no-ops when Escalation is
+# None.
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    _HAS_ESCALATION = True
+except ImportError:
+    Escalation = None  # type: ignore[assignment,misc]
+    _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -788,6 +800,96 @@ async def filter_entity_standing_decisions(
         suppressed_by_decision=suppressed_by_decision,
         grounds_by_decision=grounds_by_decision,
     )
+
+
+async def maybe_escalate_suppression_storm(
+    escalation_queue: Any,
+    project_id: str,
+    run_id: str,
+    result: EntityStandingSuppressionResult,
+    *,
+    threshold: int = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+) -> list[str]:
+    """File a per-cycle "storm escape" L1 escalation per over-active standing decision.
+
+    For each ``(entity_uuid, count)`` in ``result.suppressed_by_decision`` whose
+    *count* exceeds *threshold* (strict ``>``): skip if the queue already has an
+    open L1 for that entity in the storm category (dedup via
+    ``has_open_l1(entity_uuid, category=...)``), else submit one
+    ``Escalation(level=1, severity='blocking',
+    category='reconciliation_standing_decision_storm',
+    agent_role='reconciliation-stage1', ...)`` naming the entity, its grounds,
+    and the per-cycle count. An active decision hiding a flood of flags in one
+    cycle is a signal it may be over-broad or the entity's situation changed —
+    worth a human look.
+
+    Best-effort, mirroring :func:`~fused_memory.reconciliation.stage1_stall_detector.maybe_escalate_stalled_tasks`:
+    returns ``[]`` immediately when the ``escalation`` package is unavailable
+    (``Escalation is None``); any per-decision id-gen/construction/submit failure
+    logs WARNING and excludes that entity from the returned list. Returns the
+    list of entity_uuids that actually received a new escalation this cycle.
+
+    (The PRD's parenthetical cross-cycle-streak variant needs persistent
+    per-decision state and is deferred; this is the self-contained per-cycle N.)
+    """
+    if Escalation is None:
+        return []
+
+    escalated: list[str] = []
+    for entity_uuid, count in result.suppressed_by_decision.items():
+        if count <= threshold:
+            continue
+        if escalation_queue.has_open_l1(
+            entity_uuid, category='reconciliation_standing_decision_storm'
+        ):
+            logger.info(
+                'maybe_escalate_suppression_storm: entity_uuid=%s already has an '
+                'open level-1 storm escalation; skipping (project %s)',
+                entity_uuid,
+                project_id,
+                extra={'project_id': project_id},
+            )
+            continue
+
+        grounds = result.grounds_by_decision.get(entity_uuid, 'unknown')
+        summary = (
+            f'Standing decision for entity {entity_uuid} suppressed {count} recon '
+            f'flag(s) in a single cycle (> {threshold})'
+        )
+        detail = '\n'.join([
+            f'project_id: {project_id}',
+            f'run_id: {run_id}',
+            f'entity_uuid: {entity_uuid}',
+            f'grounds: {grounds}',
+            f'suppressed_this_cycle: {count}',
+            f'threshold: {threshold}',
+        ])
+
+        try:
+            # make_id()/Escalation() inside the try so id-gen or constructor
+            # failures are caught and logged rather than escaping.
+            esc = Escalation(
+                id=escalation_queue.make_id(entity_uuid),
+                task_id='',
+                agent_role='reconciliation-stage1',
+                severity='blocking',
+                category='reconciliation_standing_decision_storm',
+                summary=summary,
+                detail=detail,
+                level=1,
+            )
+            escalation_queue.submit(esc)
+            escalated.append(entity_uuid)
+        except Exception as exc:
+            logger.warning(
+                'maybe_escalate_suppression_storm: failed to escalate entity_uuid=%s '
+                '(id-gen, construction, or submit): %s',
+                entity_uuid,
+                exc,
+                extra={'project_id': project_id},
+            )
+
+    return escalated
 
 
 # --------------------------------------------------------------------------- #
