@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
@@ -1289,6 +1290,266 @@ def mark_orphaned_sessions_exited(
     return marked
 
 
+def _normalize_wm_window_id(raw: str | None) -> str | None:
+    """Canonicalize a window id to unpadded ``0x<hex>``, or ``None`` if unprovable.
+
+    ``_resolve_display``'s WINDOWID branch (session_hooks.py) can persist a
+    DECIMAL window id (e.g. ``'26'``), while ``wmctrl -l`` always prints
+    zero-padded hex (e.g. ``'0x0000001a'``). Comparing the two raw strings
+    would treat a live decimal-captured window as "gone" and falsely reap
+    it -- avoiding exactly that is ``mark_windowless_wm_sessions_exited``'s
+    whole reason for calling this. This parses *raw* as base-16 when it
+    starts with ``'0x'``/``'0X'``, else base-10, and re-renders the parsed
+    value as unpadded ``f'0x{value:x}'`` -- so ``'26'`` and ``'0x0000001a'``
+    both normalize to ``'0x1a'`` and compare equal; an already-canonical
+    ``'0x1a'`` round-trips unchanged.
+
+    Fails toward "keep, don't reap": returns ``None`` for ``None``/empty/
+    whitespace-only input, a value that doesn't parse as an int in the
+    selected base, or a negative value. Callers must treat ``None`` as
+    "cannot prove this window is gone" -- never as a wildcard match against
+    another ``None``.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        value = int(text, 16) if text.startswith(('0x', '0X')) else int(text, 10)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return f'0x{value:x}'
+
+
+_WMCTRL_TIMEOUT_SECS = 2
+"""Per-probe ``wmctrl -l`` timeout for ``_wmctrl_list``, seconds. Mirrors
+``session_hooks._WMCTRL_TIMEOUT_SECS`` -- kept as a separate module-level
+constant (not imported) per this module's stdlib-only/import-free
+constraint; see ``_wmctrl_list``'s docstring."""
+
+
+def _wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Fail-soft ``wmctrl -l`` runner -- default for ``_wmctrl_live_window_ids``.
+
+    DUPLICATED (not imported) from ``session_hooks._wmctrl_list``: this
+    module is deliberately stdlib-only and import-free of the rest of the
+    orchestrator (see module docstring), and ``session_hooks`` already
+    imports ``session_registry``, so importing back would be circular. Keep
+    this in sync with ``session_hooks._wmctrl_list`` if either changes.
+
+    Never raises: a genuinely-missing ``wmctrl`` binary (``FileNotFoundError``)
+    yields a permanent-failure rc=127 sentinel; any other ``OSError``/
+    ``subprocess.SubprocessError`` (notably a timeout) yields a distinct,
+    transient rc=124 sentinel. Both sentinels -- and every other nonzero
+    return code -- are treated identically (fail-soft: no window evidence)
+    by ``_wmctrl_live_window_ids``; they are only distinguished here in case
+    a future caller ever needs to react to them differently.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=_WMCTRL_TIMEOUT_SECS)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(argv, returncode=124, stdout='')
+
+
+def _wmctrl_live_window_ids(
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> set[str] | None:
+    """Return the set of normalized window ids ``wmctrl -l`` currently reports.
+
+    HARD fail-soft: returns ``None`` -- never an empty set -- for a missing
+    ``wmctrl`` binary, ANY nonzero return code, or any exception raised by
+    *run* itself. Callers MUST treat ``None`` ("no window evidence") as
+    distinct from an empty set (a successful probe that legitimately found
+    zero windows) -- only a successful run (rc=0, however many windows)
+    authorizes ``mark_windowless_wm_sessions_exited`` to reap anything.
+
+    Each ``wmctrl -l`` line is parsed via ``split(None, 3)`` -- the same
+    idiom as ``WmBackend.is_alive`` (cockpit/src/cockpit/backends/wm.py) and
+    ``session_hooks._resolve_wm_window_id`` -- but, unlike both of those,
+    this takes column 0 (the window id) of ANY non-empty line, even a
+    titleless line with fewer than 4 columns. A reaper must fail toward
+    keeping live sessions: the stricter >=4-column gate those two use would
+    silently drop a live-but-titleless window from the live set, risking a
+    false reap. ``wmctrl -l`` has no header and every line begins with a
+    window id, so this can't admit a phantom id. Each id is normalized via
+    ``_normalize_wm_window_id`` before being added to the set (a column 0
+    that fails to parse is simply skipped, not an error).
+
+    NOTE (reviewer-flagged): this parse is now duplicated across THREE call
+    sites -- ``WmBackend.is_alive``, ``session_hooks._resolve_wm_window_id``,
+    and this function -- keep all three in sync if the ``wmctrl -l`` column
+    layout ever changes. The three already diverge in one respect (this
+    function's deliberate any-non-empty-line/column-0 leniency vs. the other
+    two's stricter >=4-column gate, documented above), which raises the odds
+    of further drift the next time any one of them changes. No change is
+    needed now given this module's stdlib-only/import-free constraint (see
+    module docstring); if/when that constraint is ever relaxed, extracting
+    this parse and ``_wmctrl_list`` into one shared stdlib-only helper all
+    three call sites import would remove the drift risk entirely.
+
+    *run* defaults to ``None``, which resolves to the real ``_wmctrl_list``
+    at CALL time -- a plain name lookup in this function's body, not a bound
+    default-parameter value -- so a test's
+    ``monkeypatch.setattr(session_registry, '_wmctrl_list', fake)`` takes
+    effect even when reached indirectly via
+    ``mark_windowless_wm_sessions_exited()``'s own default ``run``
+    passthrough.
+    """
+    if run is None:
+        run = _wmctrl_list
+    try:
+        result = run(['wmctrl', '-l'])
+    except Exception:
+        logger.warning('_wmctrl_live_window_ids: wmctrl -l invocation raised', exc_info=True)
+        return None
+    if result.returncode != 0:
+        return None
+    live_ids: set[str] = set()
+    for line in result.stdout.splitlines():
+        columns = line.split(None, 3)
+        if not columns:
+            continue
+        normalized = _normalize_wm_window_id(columns[0])
+        if normalized is not None:
+            live_ids.add(normalized)
+    return live_ids
+
+
+def mark_windowless_wm_sessions_exited(
+    root: Path | str | None = None,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> list[SessionRecord]:
+    """Sweep ``<root>/sessions/*/`` and mark EXITED any wm-display session whose window is gone.
+
+    A SEPARATE liveness sweep from ``mark_orphaned_sessions_exited`` above,
+    not a folded-in extension of it: a closed terminal window is DEFINITIVE
+    evidence the session is dead/un-interactable, so this sweep is
+    deliberately PID- and AGE-INDEPENDENT -- it reaps exactly the zombies
+    the pid/TTL sweep is forced to keep (a live ``launcher_pid``, or a
+    record younger than ``NON_TERMINAL_HEARTBEAT_TTL``). Folding the two
+    predicates together would muddy ``mark_orphaned_sessions_exited``'s
+    "mirrors reap_stale_records' stale_pid predicate EXACTLY" contract, and
+    would run ``wmctrl -l`` on every liveness check instead of once per
+    sweep.
+
+    Scope: only records with ``display is not None and display.kind ==
+    DisplayKind.WM.value`` are ever considered. A ``display=None`` (headless
+    fleet-agent) or ``display.kind == 'tmux'`` record is untouched here --
+    both stay on the existing pid/TTL path (a closed tmux pane is not
+    "window gone" in the X11 sense this sweep checks). A wm record whose
+    captured ``wm_window_id`` is missing or fails to parse
+    (``_normalize_wm_window_id`` returns ``None``) is ALSO left untouched --
+    we cannot prove the window is gone, so we fail toward keep and defer to
+    the pid/TTL sweep.
+
+    HARD fail-soft: resolves ``live_ids = _wmctrl_live_window_ids(run)``
+    exactly once per sweep; if that is ``None`` (missing ``wmctrl`` binary, a
+    nonzero return code, or any exception -- see its docstring), this
+    returns ``[]`` immediately and marks NOTHING. "No window evidence" (a
+    headless host, an X11 hiccup) must never be treated as "every window is
+    gone" -- that would mass-mark every wm session on the fleet EXITED.
+
+    Self-correction trade-off (mirrors ``mark_orphaned_sessions_exited``): a
+    single missed/late ``wmctrl`` probe (e.g. racing a window remap) can mark
+    a still-live session EXITED. This is deliberately accepted -- the
+    session's next hook event calls ``refresh_record`` and flips status back
+    -- rather than adding retries here, keeping this sweep a single
+    fail-soft decision point per call.
+
+    Known trade-off for a multi-DISPLAY fleet (reviewer-flagged): ``wmctrl
+    -l`` only reports windows on the single X ``DISPLAY`` the invoking
+    process is connected to -- whatever ``_run_launching``/``_run_reap`` (or
+    a directly-invoked CLI) happens to inherit as ``$DISPLAY`` -- never
+    every display a fleet's sessions might be spread across. A session
+    whose window genuinely lives on a DIFFERENT display than the one this
+    sweep's probe ran under is indistinguishable here from one that is
+    actually gone -- its id is simply absent from ``live_ids`` -- so a
+    multi-display fleet risks a false reap of a still-live session on
+    another display. This is accepted for the same reason as the
+    self-correction trade-off above (a live session's next hook event flips
+    it back), and single-DISPLAY is this sweep's assumed common case. To
+    keep a suspected cross-display false reap diagnosable rather than
+    silent, any sweep that marks at least one record logs the ``DISPLAY``
+    value it probed under.
+
+    Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
+    a matching record EXITED (exit_code=``ORPHAN_EXIT_CODE``), preserving
+    every other field, and leaves its directory in place;
+    ``reap_stale_records``'s existing ``terminal_ttl`` rule reclaims it
+    later, unchanged. An already-terminal record is left fully untouched
+    (idempotent -- never re-stamped with the sentinel).
+
+    A per-record try/except means one bad record (a corrupt body, a
+    concurrent-reap race vanishing the file mid-sweep, an unwritable record)
+    never aborts the sweep -- it is logged and skipped, exactly like
+    ``mark_orphaned_sessions_exited``'s own fault handling.
+
+    *run* is the injectable ``wmctrl -l`` runner passed through to
+    ``_wmctrl_live_window_ids`` (``None``, the default, resolves to the real
+    ``_wmctrl_list`` at call time).
+    """
+    live_ids = _wmctrl_live_window_ids(run)
+    if live_ids is None:
+        return []  # HARD fail-soft: no window evidence -- mark nothing.
+
+    base = sessions_dir(root)
+    marked: list[SessionRecord] = []
+    if not base.is_dir():
+        return marked
+
+    for slug_dir in sorted(base.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        slug = slug_dir.name
+
+        try:
+            record = read_record(slug, root=root)
+        except (FileNotFoundError, CorruptSessionRecord):
+            continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
+        if record.status in TERMINAL_STATUSES:
+            continue  # already terminal -- idempotent, never re-stamped
+        if record.display is None or record.display.kind != DisplayKind.WM.value:
+            continue  # tmux / headless -- stays on the pid/TTL path
+        normalized = _normalize_wm_window_id(record.display.wm_window_id)
+        if normalized is None or normalized in live_ids:
+            continue  # unprovable, or the window is still live
+
+        try:
+            marked_record = _mark_exited_if_still_non_terminal(
+                slug, root, exit_code=ORPHAN_EXIT_CODE
+            )
+        except (FileNotFoundError, CorruptSessionRecord, OSError):
+            # A single unmarkable record (a concurrent-reap race, an
+            # unwritable record) must not abort the sweep -- log and move on
+            # to the next candidate.
+            logger.error(
+                'mark_windowless_wm_sessions_exited: failed to mark %s', slug, exc_info=True
+            )
+            continue
+        if marked_record is None:
+            continue  # lost the race: a concurrent writer already made this terminal
+        marked.append(marked_record)
+
+    if marked:
+        # Diagnostic breadcrumb for the multi-DISPLAY trade-off documented
+        # above: ties every mark to the DISPLAY the probe actually ran
+        # under, so a suspected cross-display false reap is diagnosable
+        # after the fact instead of silent. Only logged when this sweep
+        # actually marked something, to stay quiet on the common no-op call.
+        logger.info(
+            'mark_windowless_wm_sessions_exited: marked %d session(s) EXITED (probed under DISPLAY=%r)',
+            len(marked),
+            os.environ.get('DISPLAY'),
+        )
+    return marked
+
+
 # ---------------------------------------------------------------------------
 # Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
 # ---------------------------------------------------------------------------
@@ -1791,27 +2052,32 @@ def parse_spawn_identity(
 def _run_launching(env: Mapping[str, str]) -> str:
     """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
 
-    Also opportunistically drives the liveness sweep
-    (``mark_orphaned_sessions_exited``) AND a bounded prune
-    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): neither sweep has a
-    periodic production driver of its own (CLI-only), so every spawn is
-    what drains prior orphaned (unclean-death) records to ``exited`` AND
-    reclaims terminal/stale record dirs from disk -- the backlog is bounded
-    by spawn rate and self-limits as it drains, over successive spawns for
-    the bounded prune. Wrapped in a fail-soft guard: a sweep fault must
-    never raise here and must never write to stdout, or it would corrupt
-    the printed record dir spawn-claude.sh captures into
-    ``SESSION_RECORD_DIR``.
+    Also opportunistically drives the liveness sweeps
+    (``mark_orphaned_sessions_exited`` and, task 2934,
+    ``mark_windowless_wm_sessions_exited``) AND a bounded prune
+    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): none of these sweeps has
+    a periodic production driver of its own (CLI-only), so every spawn is
+    what drains prior orphaned (unclean-death) and windowless-wm records to
+    ``exited`` AND reclaims terminal/stale record dirs from disk -- the
+    backlog is bounded by spawn rate and self-limits as it drains, over
+    successive spawns for the bounded prune. Each sweep is wrapped in its OWN
+    fail-soft guard: a sweep fault must never raise here and must never write
+    to stdout, or it would corrupt the printed record dir spawn-claude.sh
+    captures into ``SESSION_RECORD_DIR`` -- and one sweep's fault must not
+    skip the others.
 
-    Cost model (reviewer-flagged): the sweep is O(N) in the number of
+    Cost model (reviewer-flagged): the pid/TTL sweep is O(N) in the number of
     session directories -- one ``iterdir`` + one ``record.json`` parse per
     peer, plus a second read+write for each record it actually marks -- and
     runs synchronously in this call, so every spawn pays for scanning all
-    of its peers, not just its own write. This is a deliberate trade-off
-    given the sweep has no periodic/out-of-band driver to run on instead
-    (see above); it is bounded and self-limiting (the backlog this drains
-    only shrinks the cost over time), acceptable at today's fleet sizes, and
-    the right place to revisit if spawn latency ever becomes a problem is a
+    of its peers, not just its own write. The wm-window sweep adds ONE
+    ``wmctrl -l`` subprocess per spawn on top of that same O(N) scan (fail-
+    soft: a missing binary or nonzero rc just short-circuits it to a no-op,
+    per ``_wmctrl_live_window_ids``). This is a deliberate trade-off given
+    neither sweep has a periodic/out-of-band driver to run on instead (see
+    above); it is bounded and self-limiting (the backlog this drains only
+    shrinks the cost over time), acceptable at today's fleet sizes, and the
+    right place to revisit if spawn latency ever becomes a problem is a
     dedicated periodic timer (systemd/cron) rather than this synchronous
     call -- out of this task's module scope (would touch harness/systemd).
     The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
@@ -1846,6 +2112,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
     write_record(record)
     with contextlib.suppress(Exception):
         mark_orphaned_sessions_exited()
+    with contextlib.suppress(Exception):
+        mark_windowless_wm_sessions_exited()
     with contextlib.suppress(Exception):
         reap_stale_records(limit=REAP_BATCH_LIMIT)
     return str(record_dir)
@@ -1892,16 +2160,21 @@ def _run_set_display(
 
 
 def _run_reap() -> list[ReapedSessionRecord]:
-    """Run the canonical ``reap`` verb: mark orphans exited, THEN delete stale dirs.
+    """Run the canonical ``reap`` verb: mark orphans/windowless-wm exited, THEN delete stale dirs.
 
-    Mark-then-delete keeps `reap` complete: a record the liveness sweep
+    Mark-then-delete keeps `reap` complete: a record either liveness sweep
     would mark exited this same pass must not simultaneously be eligible
     for stale_pid deletion (marking bumps its mtime, so it lands back
     within reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) --
     it only becomes reapable later, once it ages past TERMINAL_TTL as any
-    other terminal record does.
+    other terminal record does. This is why ``mark_windowless_wm_sessions_exited``
+    (task 2934) runs here too, alongside ``mark_orphaned_sessions_exited`` --
+    it reaps exactly the live-pid / age<1h wm-display zombies (a closed
+    terminal window with a still-alive launcher_pid) the pid/TTL sweep is
+    forced to keep, so `reap` must drive both before deleting.
     """
     mark_orphaned_sessions_exited()
+    mark_windowless_wm_sessions_exited()
     return reap_stale_records()
 
 
