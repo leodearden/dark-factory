@@ -26,9 +26,12 @@ Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalato
 Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
 window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
 budget exhaustion files ONE escalation per window rather than flooding the
-operator queue.  :meth:`report_rejection` remains unthrottled — observed
-misroute volume is in the single digits per day, well below the noise floor
-a per-project rate limiter would target.
+operator queue.  :meth:`report_rejection` folds repeated identical misroutes
+(same rejecting project + matched paths + suggested owner) into a single
+on-disk pending parent via ``escalation.dedupe.submit_or_dedupe`` — the
+first occurrence still escalates, but re-proposals of the same misroute
+(e.g. a daily reconciliation consolidation round) increment the parent's
+``dedupe_count`` instead of filing a fresh escalation (task 2946).
 """
 
 from __future__ import annotations
@@ -45,6 +48,12 @@ if TYPE_CHECKING:
 # the escalator silently no-ops when the escalation package is unavailable
 # (minimal CI / unit-test envs, deployments that haven't installed it yet).
 try:
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        content_fingerprint_key,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
     HAS_ESCALATION = True
@@ -82,7 +91,9 @@ class ScopeViolationEscalator:
     Handles two distinct categories:
 
     * **scope_violation** (:meth:`report_rejection`) — filed for every rejected
-      task-creation misroute detected by the path-scope guard.  Unthrottled.
+      task-creation misroute detected by the path-scope guard.  Repeated
+      identical misroutes fold into one pending parent (content-fingerprint
+      dedup, unbounded window); the first occurrence always escalates.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
@@ -137,6 +148,15 @@ class ScopeViolationEscalator:
         raises — escalation is additive to the existing rejection error
         dict, so a queue write failure must not turn a guard rejection
         into a guard exception.
+
+        Routes through :func:`escalation.dedupe.submit_or_dedupe` keyed on a
+        content fingerprint over the misroute *shape* (rejecting project_id +
+        sorted matched_paths + suggested_project), with an unbounded dedup
+        window.  A recurring identical misroute (e.g. the same reconciliation
+        consolidation candidate re-proposed every round) therefore folds into
+        the first pending escalation — this method then returns the EXISTING
+        parent id, not a freshly-minted one — until a human resolves it, at
+        which point a later recurrence re-escalates.
 
         Sync because :meth:`escalation.queue.EscalationQueue.submit` is a
         synchronous filesystem write (atomic ``rename``); no await needed,
@@ -201,8 +221,23 @@ class ScopeViolationEscalator:
                 detail=detail,
                 suggested_action=suggested_action,
                 level=1,
+                dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+                    'scope_violation',
+                    'path_guard_misroute',
+                    affected_ids=sorted([
+                        *matched_paths,
+                        f'suggested:{suggested_project or "none"}',
+                        f'project:{project_id}',
+                    ]),
+                ),
             )
-            esc_id = queue.submit(esc)
+            config = DedupeConfig(  # type: ignore[possibly-unbound]
+                infra_dedupe_enabled=True,
+                infra_dedupe_window_secs=float('inf'),
+                infra_dedupe_categories=(_CATEGORY,),
+                key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
+            )
+            esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
         except Exception:
             # Queue I/O failure must not propagate — the rejection error
             # dict is still returned by the guard, the operator just
