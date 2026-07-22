@@ -116,6 +116,49 @@ def _parse_infra_failures(text: str) -> list[str]:
     }
     return sorted(names)
 
+
+# Markers of reify verify.sh's usage()/error output (task 5308): a whole
+# stripped line that is exactly ``Usage:`` or ``Options:`` — verify.sh's
+# usage() section headers, which survive its ``# `` strip verbatim — or any
+# ``verify.sh: ERROR`` banner line.  run-offline-deep.sh merges stderr into
+# stdout, so a malformed/usage-dumping invocation floods the numeric
+# confirmation seam with this text; real confirmed-failing test-ID output
+# never contains these markers.
+_VERIFY_USAGE_MARKER_RE = re.compile(
+    r'^\s*(?:Usage|Options):\s*$|^\s*verify\.sh:\s*ERROR\b'
+)
+
+
+def _parse_confirmed_failures(text: str) -> list[str]:
+    """Parse the numeric confirmation seam's stdout into confirmed test IDs.
+
+    Normal output is newline-separated test IDs, one per line
+    (blank/whitespace-only lines are skipped so trailing/blank output never
+    becomes a spurious "confirmed" entry).  But ``run-offline-deep.sh`` merges
+    stderr into stdout, so a malformed reify ``verify.sh`` invocation dumps its
+    ``usage()``/error text here; without a guard every non-blank usage line
+    would become a bogus "confirmed" test ID and file a corrupt fix task (task
+    5308; reify:5264 incident).  If any line matches
+    :data:`_VERIFY_USAGE_MARKER_RE` the whole output is rejected — a
+    usage/help/error dump is not a set of failing tests — logging a warning and
+    returning ``[]`` (which routes into :meth:`OfflineLaneWorker._handle_red_run`'s
+    existing empty-``confirmed`` guard: log-only, no fix task, no escalation).
+
+    The sibling infra seam (:func:`_parse_infra_failures`) is exempt and left
+    unchanged: it only captures ``RESULT: FAIL (<name>)`` lines, which a
+    usage/help/error dump never contains.  Kept module-level so it is trivially
+    unit-testable in isolation (mirrors :func:`_parse_infra_failures`).
+    """
+    if any(_VERIFY_USAGE_MARKER_RE.search(line) for line in text.splitlines()):
+        logger.warning(
+            'offline-lane: numeric confirmation re-run output looked like '
+            'reify verify.sh usage/help/error text, not a list of failing '
+            'tests; rejecting it and confirming no failures (task 5308)'
+        )
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 #: Signature of the injectable heavy-suite seam: (worktree path, head SHA,
 #: test-thread count) -> (return code, output tail).
 SuiteRunner = Callable[[Path, str, int], Awaitable[tuple[int, str]]]
