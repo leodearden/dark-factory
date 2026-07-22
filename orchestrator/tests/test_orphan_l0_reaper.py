@@ -274,6 +274,56 @@ class TestOrphanL0Reaper:
         assert len(l1s) == 0
 
     @pytest.mark.asyncio
+    async def test_genuine_orphan_with_divergence_still_promoted(
+        self, harness: Harness,
+    ):
+        """Task 2878 boundary guard: the live-recheck gate must not
+        over-suppress a genuinely stranded orphan.
+
+        Same divergence-class aged L0 as
+        ``test_live_holder_l0_not_promoted``, but here the task has no
+        live holder (``is_actively_held`` stays at the pre-1 fixture
+        default of False — no dispatch slot, no module lock, no recent
+        cancel stamp): a genuinely dead workflow. It must still be
+        promoted, both before and after the step-2 impl — this pins that
+        the gate defers only live tasks, never drops a genuine orphan.
+        """
+        assert harness._escalation_queue is not None
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-77'),
+            task_id='task-77',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task task-77'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Not in _escalation_events, and is_actively_held stays False (the
+        # pre-1 fixture default) — genuinely stranded, no live holder.
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-77'
+
+    @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
