@@ -95,6 +95,11 @@ def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
 
     return WriteSet(
         worktree=worktree.resolve(),
+        # .resolve() walks EVERY intermediate path component (not just the
+        # trailing one), so a symlinked lane base (e.g. reify's symlinked
+        # `.worktrees` mount, or a symlinked `<base>/.task-meta`) collapses
+        # to the real directory landlock enforces on — see
+        # TestTaskMetaSymlinkResolution in test_write_set.py.
         task_meta=TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve(),
         git_objects=(main_git / 'objects').resolve(),
         git_task_refs=(main_git / 'refs' / 'heads' / 'task').resolve(),
