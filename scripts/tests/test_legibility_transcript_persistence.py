@@ -20,6 +20,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
 from orchestrator import session_registry
@@ -206,6 +208,26 @@ def test_find_matching_transcript_sibling_only_returns_none(tmp_path):
     assert got is None
 
 
+def test_find_matching_transcript_tolerates_whitespace_reflow(tmp_path):
+    # A transcript that stores the SAME prompt words but with reflowed
+    # whitespace (runs of spaces / newlines instead of single spaces) must
+    # still match — the STRONG containment check normalizes whitespace on both
+    # sides, so a raw substring mismatch does not FALSE-POSITIVE a present
+    # transcript as MISSING (reviewer_comprehensive/correctness, task 2893).
+    projects = tmp_path / "projects"
+    cwd = "/home/leo/src/dark-factory/.worktrees/2500"
+    rec = _spawn_record("sess-reflow", cwd, _USABLE_PROMPT)
+
+    reflowed = "   ".join(_USABLE_PROMPT.split())  # single spaces -> triple spaces
+    assert reflowed != _USABLE_PROMPT  # the raw substring check would miss this
+    match_path = _write_transcript(projects, cwd, "sess-reflow.jsonl", reflowed)
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == match_path
+
+
 # ---------------------------------------------------------------------------
 # step-5/6: WEAK file-mtime time-window fallback (short/empty prompts only)
 # ---------------------------------------------------------------------------
@@ -370,6 +392,40 @@ def test_payload_exports_force_persistence_false_when_zero():
     assert mod.payload_exports_force_persistence(
         "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0\n"
     ) is False
+
+
+def test_payload_exports_force_persistence_false_when_commented_out():
+    # A commented-out / documentary reference must NOT satisfy the guard — the
+    # match is anchored to an assignment context, not an unanchored substring
+    # (reviewer_comprehensive/robustness, task 2893).
+    script = (
+        "#!/usr/bin/env bash\n"
+        "# do NOT set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 in the child env\n"
+        "  ## CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1  (historical note)\n"
+        'claude --prompt "$PROMPT"\n'
+    )
+    assert mod.payload_exports_force_persistence(script) is False
+
+
+def test_payload_exports_force_persistence_false_when_embedded_in_identifier():
+    # The token embedded in a LARGER identifier is not a real assignment.
+    assert mod.payload_exports_force_persistence(
+        "MY_CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1\n"
+    ) is False
+
+
+def test_payload_exports_force_persistence_false_when_space_after_equals():
+    # `VAR= 1` is not a valid bash assignment; the `\\s*`-after-`=` gap is gone.
+    assert mod.payload_exports_force_persistence(
+        "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE= 1\n"
+    ) is False
+
+
+def test_payload_exports_force_persistence_true_for_indented_assignment():
+    # A genuinely indented assignment (inside an if/block) still matches.
+    assert mod.payload_exports_force_persistence(
+        "if true; then\n    export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1\nfi\n"
+    ) is True
 
 
 # ---------------------------------------------------------------------------
@@ -589,3 +645,72 @@ def test_main_healthy_returns_zero(tmp_path):
         "--lookback-hours", "48",
     ])
     assert rc == 0
+
+
+def test_run_check_enriches_escalation_detail_with_preventer_verdict(tmp_path):
+    # run_check with BOTH lost findings AND --check-preventer: the escalation
+    # detail is enriched with the preventer verdict via force_persistence_ok,
+    # so the loud alarm names the known regression cause when it is present
+    # (reviewer_comprehensive/test-coverage, task 2893).
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=True)
+    poster = _RecordingPoster()
+    missing_token = tmp_path / "spawn-no-token.sh"
+    missing_token.write_text(
+        "#!/usr/bin/env bash\nexport CLAUDE_CODE_CHILD_SESSION=1\nclaude\n",
+        encoding="utf-8",
+    )
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=poster,
+        check_preventer=True, spawn_script_path=missing_token,
+    )
+
+    assert result.exit_code == 1
+    assert result.force_persistence_ok is False
+    assert len(poster.calls) == 1
+    _url, envelope = poster.calls[0]
+    detail = envelope["params"]["arguments"]["detail"]
+    assert "preventer guard" in detail
+    # The verdict for a missing token is the loud 'MISSING' marker.
+    assert "MISSING" in detail
+
+
+def test_main_errors_when_no_config_or_project_id():
+    # Neither --config nor --project-id -> parser.error -> SystemExit(2).
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main(["--lookback-hours", "48"])
+    assert excinfo.value.code == 2
+
+
+def test_load_config_via_project_id_lazy_resolution(tmp_path, monkeypatch):
+    # The --project-id branch of _load_config lazily imports
+    # nightly.resolve_config_path and loads the resolved legibility.yaml.
+    config_path = _write_config(tmp_path, project_id="proj_lazy")
+    from legibility import nightly
+
+    monkeypatch.setattr(nightly, "resolve_config_path", lambda pid: config_path)
+
+    cfg = mod._load_config(config_path=None, project_id="proj_lazy")
+    assert cfg.project_id == "proj_lazy"
+
+
+def test_load_config_requires_config_or_project_id():
+    # Neither given at the function boundary -> ValueError (main() guards this
+    # earlier via parser.error, but the loader is defensive too).
+    with pytest.raises(ValueError):
+        mod._load_config(config_path=None, project_id=None)
+
+
+def test_read_spawn_script_unreadable_returns_empty(tmp_path):
+    # A missing/unreadable spawn script fails SAFE: '' -> guard False, i.e. a
+    # missing script is NOT evidence the preventer is in place
+    # (reviewer_comprehensive/test-coverage, task 2893).
+    missing = tmp_path / "does-not-exist.sh"
+    assert mod._read_spawn_script(missing) == ""
+    assert mod.payload_exports_force_persistence(mod._read_spawn_script(missing)) is False
+
+    # A directory path also raises OSError on read_text -> same fail-safe.
+    a_dir = tmp_path / "a_dir"
+    a_dir.mkdir()
+    assert mod._read_spawn_script(a_dir) == ""
