@@ -158,6 +158,38 @@ class TestWriteEntityStandingDecisionTool:
         )
         assert result['error'] == 'service_not_configured'
 
+    @pytest.mark.asyncio
+    async def test_service_unavailable_when_recon_ledger_none(self):
+        """memory_service present but its recon_ledger unset ⇒ the tool returns
+        the same structured service-unavailable error (mapped from the helper's
+        LedgerUnavailable) and attempts no durable write — even though the gate
+        would otherwise pass (arm 2 satisfied)."""
+        service = AsyncMock()
+        service.recon_ledger = None
+        service.get_memory_by_id = AsyncMock(return_value=None)
+        service.get_memories_by_metadata = AsyncMock(
+            return_value=[_outcome('run-a'), _outcome('run-b'), _outcome('run-c')]
+        )
+        service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['mirror-id'])
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e1'}, {'uuid': 'e2'}]
+        )
+        state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0, memory_service=service)
+        mcp = create_recon_report_server(state)
+        result = await mcp._tool_manager.call_tool(
+            _TOOL,
+            {
+                'project_id': _PROJECT_ID,
+                'entity_uuid': _ENTITY_UUID,
+                'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+                'evidence': [],
+            },
+        )
+        assert result['error'] == 'service_not_configured'
+        service.add_memory.assert_not_called()
+
     def test_tool_signature_has_no_authorized_by(self):
         """The Stage-2 tool exposes project_id/entity_uuid/grounds/evidence and
         NO authorized_by — Stage 2 cannot bypass the evidence gate."""

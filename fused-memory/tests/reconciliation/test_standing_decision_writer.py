@@ -24,6 +24,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
 )
 from fused_memory.reconciliation.standing_decision_writer import (
     EvidenceGateRejected,
+    LedgerUnavailable,
     evaluate_evidence_gate,
     write_entity_standing_decision,
 )
@@ -141,6 +142,32 @@ class TestEvidenceGateArm1:
         assert result.satisfied is False
         stamped = result.resolved_evidence[0]
         assert stamped['locally_resolved'] is False
+
+    @pytest.mark.asyncio
+    async def test_arm1_satisfied_short_circuits_arm2_scroll(self):
+        """When arm 1 is already satisfied the arm-2 investigation_outcome scroll
+        is SKIPPED (efficiency): get_memories_by_metadata is never called even
+        though its pool would satisfy arm 2, and the arm-2 result fields report
+        the not-evaluated sentinel (0 / False)."""
+        service = _memory_service(
+            memory_record={
+                'id': _MEM0_REF_ID,
+                'content': 'operator note',
+                'metadata': {'agent_id': 'claude-interactive-leo'},
+            },
+            metadata_records=[_outcome('run-a'), _outcome('run-b'), _outcome('run-c')],
+        )
+        result = await evaluate_evidence_gate(
+            service,
+            project_id=_PROJECT_ID,
+            entity_uuid=_ENTITY_UUID,
+            evidence=[{'type': 'mem0', 'id': _MEM0_REF_ID}],
+        )
+        assert result.arm1_satisfied is True
+        assert result.satisfied is True
+        service.get_memories_by_metadata.assert_not_called()
+        assert result.arm2_distinct_run_count == 0
+        assert result.arm2_satisfied is False
 
 
 class TestEvidenceGateArm2:
@@ -469,3 +496,33 @@ class TestWriteEntityStandingDecision:
         assert result['status'] == 'written'
         rows = await service.recon_ledger.list_entity_standing_decisions(_PROJECT_ID)
         assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_none_recon_ledger_raises_ledger_unavailable(self):
+        """An unwired ledger (memory_service.recon_ledger is None) raises
+        LedgerUnavailable loudly — BEFORE any edge sampling or mem0 mirror — so a
+        durable standing decision never degrades to a silent mem0-only mirror.
+        authorized_by bypasses the gate, isolating the ledger guard as the sole
+        raiser."""
+        service = AsyncMock()
+        service.recon_ledger = None
+        service.get_memory_by_id = AsyncMock(return_value=None)
+        service.get_memories_by_metadata = AsyncMock(return_value=[])
+        service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(memory_ids=['mirror-id'])
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': 'e1'}]
+        )
+        with pytest.raises(LedgerUnavailable):
+            await write_entity_standing_decision(
+                service,
+                project_id=_PROJECT_ID,
+                entity_uuid=_ENTITY_UUID,
+                grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+                evidence=[],
+                authorized_by='operator-x',
+            )
+        # Fail-fast: no edge-count sampling and no best-effort mem0 mirror ran.
+        service.graphiti.get_valid_edges_for_node.assert_not_called()
+        service.add_memory.assert_not_called()

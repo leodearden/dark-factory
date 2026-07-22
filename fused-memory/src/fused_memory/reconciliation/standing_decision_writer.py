@@ -176,6 +176,10 @@ class EvidenceGateResult:
     rejection (neither arm), ``rejection`` carries the structured
     ``_ERR_*``-style dict the Stage-2 tool returns to the LLM; it is ``None``
     when satisfied.
+
+    ``arm2_satisfied`` / ``arm2_distinct_run_count`` are meaningful only when
+    arm 1 is NOT satisfied: when arm 1 already authorizes the write the arm-2
+    scroll is short-circuited and both report ``False`` / ``0`` (not-evaluated).
     """
 
     satisfied: bool
@@ -199,7 +203,11 @@ async def evaluate_evidence_gate(
       AND authored by a human (:func:`_is_human_authored`).
     * **Arm 2** — ≥``ARM2_MIN_DISTINCT_RUNS`` DISTINCT investigation_outcome
       run_ids for this entity (``actionable=False``), counted Python-side after
-      the metadata scroll.
+      the metadata scroll. Evaluated ONLY when arm 1 did not already authorize
+      the write: the arm-2 scroll is short-circuited on the arm-1 path — its
+      count is needed only to build the rejection payload, which is assembled
+      solely when NEITHER arm holds — so on that path ``arm2_satisfied`` /
+      ``arm2_distinct_run_count`` report ``False`` / ``0`` (not-evaluated).
 
     The gate is satisfied when EITHER arm holds.
     """
@@ -215,21 +223,31 @@ async def evaluate_evidence_gate(
     # (actionable=False) investigation_outcome records. Qdrant filters the three
     # metadata fields; run_id dedup is Python-side. A record lacking a run_id
     # cannot establish independence and is not counted.
-    outcomes = await memory_service.get_memories_by_metadata(
-        project_id,
-        {
-            'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
-            'entity_uuid': entity_uuid,
-            'actionable': False,
-        },
-    )
-    distinct_run_ids: set[str] = set()
-    for record in outcomes or []:
-        run_id = (record.get('metadata') or {}).get('run_id')
-        if isinstance(run_id, str) and run_id:
-            distinct_run_ids.add(run_id)
-    arm2_distinct_run_count = len(distinct_run_ids)
-    arm2_satisfied = arm2_distinct_run_count >= ARM2_MIN_DISTINCT_RUNS
+    #
+    # Short-circuit: when arm 1 already authorizes the write the gate is met
+    # (satisfied = arm1 OR arm2) and the arm-2 distinct-run count is needed ONLY
+    # to build the rejection payload — which is assembled solely when NEITHER arm
+    # holds. Skipping the Qdrant scroll on the arm-1 path avoids an unnecessary
+    # round-trip; arm2_distinct_run_count/arm2_satisfied then report 0/False
+    # (not-evaluated) rather than a scanned value.
+    arm2_distinct_run_count = 0
+    arm2_satisfied = False
+    if not arm1_satisfied:
+        outcomes = await memory_service.get_memories_by_metadata(
+            project_id,
+            {
+                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
+                'entity_uuid': entity_uuid,
+                'actionable': False,
+            },
+        )
+        distinct_run_ids: set[str] = set()
+        for record in outcomes or []:
+            run_id = (record.get('metadata') or {}).get('run_id')
+            if isinstance(run_id, str) and run_id:
+                distinct_run_ids.add(run_id)
+        arm2_distinct_run_count = len(distinct_run_ids)
+        arm2_satisfied = arm2_distinct_run_count >= ARM2_MIN_DISTINCT_RUNS
 
     satisfied = arm1_satisfied or arm2_satisfied
     rejection = (
@@ -279,6 +297,23 @@ class EvidenceGateRejected(Exception):
         super().__init__(message or 'insufficient_evidence')
 
 
+class LedgerUnavailable(RuntimeError):
+    """Raised by :func:`write_entity_standing_decision` when no ``recon_ledger``
+    is wired on the memory service (``memory_service.recon_ledger`` is ``None``).
+
+    ``MemoryService`` defaults ``recon_ledger`` to ``None`` and only attaches the
+    store via external wiring, so an unwired-ledger deployment would otherwise
+    surface an opaque ``AttributeError`` at the upsert call. A standing decision
+    is an AUTHORITATIVE durable write, so — unlike the fail-open ``flag_dedup``
+    suppression path — an absent ledger must NOT degrade to a silent mem0-only
+    mirror. Raising loudly BEFORE any evidence resolution, gate evaluation, or
+    edge-count sampling lets the Stage-2 tool map this to the structured
+    ``service_not_configured`` error (``_ERR_SERVICE_UNAVAILABLE``) the tool
+    docstring promises, and gives operator/backfill (η) direct callers a typed
+    failure instead of an ``AttributeError``.
+    """
+
+
 async def write_entity_standing_decision(
     memory_service: Any,
     *,
@@ -292,6 +327,12 @@ async def write_entity_standing_decision(
 
     Mirrors ``flag_dedup.write_suppression_record``: authoritative SQLite-ledger
     write + a best-effort mem0 mirror (reads never consult mem0 for the RECORD).
+
+    Fails loudly with :class:`LedgerUnavailable` when
+    ``memory_service.recon_ledger`` is ``None`` (unwired ledger), BEFORE any
+    evidence resolution / gate / edge sampling — a durable standing decision
+    must not silently degrade to a mem0-only mirror the way fail-open
+    suppression does.
 
     Flow:
 
@@ -316,6 +357,19 @@ async def write_entity_standing_decision(
     Returns ``{status:'written', entity_uuid, grounds, edge_count_at_decision,
     expires_at, decided_at}``.
     """
+    # Guard the authoritative durable write first: an unwired ledger is a
+    # service-configuration failure, not an evidence problem, so fail loudly
+    # (INV-1) before resolving evidence, running the gate, or sampling graphiti
+    # — never a silent mem0-only mirror.
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        raise LedgerUnavailable(
+            'write_entity_standing_decision: no recon_ledger wired on '
+            f'memory_service for project {project_id!r} — a standing decision '
+            'is an authoritative durable write and must not degrade to a silent '
+            'mem0-only mirror.'
+        )
+
     if authorized_by:
         resolved = await resolve_evidence_refs(memory_service, project_id, evidence)
         resolved.append(
@@ -347,7 +401,7 @@ async def write_entity_standing_decision(
     decided_at = decided_dt.isoformat()
     expires_at = (decided_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
 
-    await memory_service.recon_ledger.upsert_entity_standing_decision(
+    await ledger.upsert_entity_standing_decision(
         project_id=project_id,
         entity_uuid=entity_uuid,
         grounds=grounds,
