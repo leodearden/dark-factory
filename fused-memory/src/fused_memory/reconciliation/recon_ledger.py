@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS recon_ledger (
     state        TEXT NOT NULL,
     created_at   TEXT NOT NULL,
     expires_at   TEXT,
+    entity_uuid  TEXT,
     PRIMARY KEY (project_id, record_kind, task_id, flag_type, run_id)
 );
 """
@@ -55,6 +56,9 @@ CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_kind_state
 
 CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_expires
     ON recon_ledger (project_id, expires_at);
+
+CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_kind_entity
+    ON recon_ledger (project_id, record_kind, entity_uuid);
 """
 
 SCHEMA_SQL = TABLE_SQL + INDEX_SQL
@@ -138,6 +142,15 @@ class ReconLedgerStore:
         * **Schema-level** — ``CREATE TABLE IF NOT EXISTS`` and
           ``CREATE INDEX IF NOT EXISTS`` make repeated calls safe on an
           already-initialised database.
+
+        The schema is applied in three ordered phases — ``TABLE_SQL`` (create
+        the table), the idempotent ``entity_uuid`` ADD COLUMN migration
+        (task 2894 α), then ``INDEX_SQL`` — rather than a single
+        ``executescript(SCHEMA_SQL)``. The migration MUST run before index
+        creation because ``ix_recon_ledger_project_kind_entity`` references
+        ``entity_uuid``: on a pre-migration DB the column does not exist until
+        the ALTER adds it, so building the index first would raise. This
+        mirrors the TABLE→INDEX split in ``middleware/ticket_store.py``.
         """
         if self._db is not None:
             await self.close()
@@ -145,7 +158,23 @@ class ReconLedgerStore:
         self._db = await connect_daemon(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.executescript(SCHEMA_SQL)
+        await self._db.executescript(TABLE_SQL)
+        await self._db.commit()
+
+        # Safe migration: add the nullable entity_uuid column to pre-existing
+        # recon_ledger tables (task 2894 α, journal.py:214-249 ALTER-TABLE
+        # house pattern). On a fresh DB the column is already created by
+        # TABLE_SQL, so this ALTER fails ("duplicate column name") and is a
+        # harmless rollback; on an old DB it adds the column. Runs BEFORE
+        # INDEX_SQL so ix_recon_ledger_project_kind_entity can reference it.
+        try:
+            await self._db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
+            await self._db.commit()
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self._db.rollback()  # Column already exists
+
+        await self._db.executescript(INDEX_SQL)
         await self._db.commit()
         logger.info('ReconLedgerStore initialized at %s', self._db_path)
 
