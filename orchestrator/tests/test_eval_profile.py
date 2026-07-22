@@ -32,6 +32,7 @@ from orchestrator.evals.profile import (
     resolve_eval_profile_update,
 )
 from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.fm_retry import FM_NULL_SENTINEL_URL, is_fm_null_sentinel
 
 
 def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str]:
@@ -56,6 +57,27 @@ def test_eval_profile_documented_keys():
         'simple_task_enabled': False,
         'fused_memory.url': 'http://127.0.0.1:1',
     }
+
+
+def test_eval_profile_sentinel_single_sourced_from_fm_retry():
+    """The D8 fused_memory.url sentinel is the shared fm_retry constant (task 2880).
+
+    The eval profile neutralizes FM writes with a non-routable sentinel; the
+    McpSession transport (mcp_lifecycle._retry_backoffs) must recognize exactly
+    that same string to fail fast on it instead of spinning the ~120s
+    fm-restart window. Single-sourcing the string in fm_retry — with
+    evals/profile.py importing it DOWN — makes profile<->transport drift
+    structurally impossible.
+    """
+    # (a) Value agreement — a durable drift guard even if identity were lost.
+    assert EVAL_PROFILE['fused_memory.url'] == FM_NULL_SENTINEL_URL
+    # (b) The transport predicate recognizes exactly the profile's sentinel —
+    # the live cross-module contract that makes the fail-fast actually fire.
+    assert is_fm_null_sentinel(EVAL_PROFILE['fused_memory.url']) is True
+    # (c) Identity — proves profile.py references the shared constant object
+    # rather than holding a second copy of the literal (CPython does not intern
+    # URL-shaped literals, so a distinct copy would fail `is` while passing ==).
+    assert EVAL_PROFILE['fused_memory.url'] is FM_NULL_SENTINEL_URL
 
 
 def test_resolve_eval_profile_update_maps_dotted_to_submodel_copy(tmp_path):
