@@ -634,10 +634,14 @@ class PoolPrewarmResult:
       rc — e.g. 75 disk-pressure, 127 seed-script-absent).
 
     Invariant: ``already_resident + materialized + failed == target`` after a
-    full pass (the ABSENT-base short-circuit and the disabled-pool no-op both
-    return ``target == 0``).  When ``already_resident + materialized <
-    target`` the pool could not reach ``effective_N`` and prewarm logs a
-    shortfall WARNING.
+    full pass.  Two early returns are the exceptions: the disabled-pool no-op
+    (``warm_lane_pool is None``) returns ``PoolPrewarmResult(target=0)``, and
+    the ABSENT-base short-circuit returns ``target == len(lanes)`` with all
+    three counters zeroed — no lane is touched because the CoW seed base is
+    provably missing, so that early return does NOT satisfy the invariant (it
+    logs its own dedicated base-absent WARNING instead of the shortfall one).
+    When ``already_resident + materialized < target`` after a full pass the
+    pool could not reach ``effective_N`` and prewarm logs a shortfall WARNING.
     """
     target: int
     already_resident: int = 0
@@ -4222,9 +4226,13 @@ class GitOps:
         Returns a :class:`PoolPrewarmResult` (target / already_resident /
         materialized / failed / failures).
 
-        NOTE (task 2879): per-lane failure teardown, the ``failures`` list,
-        and the shortfall summary WARNING (the VISIBLE SIGNAL) are completed
-        in a follow-on step; this method never raises.
+        Fail-open by contract — this method never raises.  A per-lane
+        worktree-add or seed failure is logged, the half-created worktree
+        torn down (:meth:`_teardown_prewarm_lane`), recorded in ``failures``,
+        counted, and the loop continues to the next lane.  After the loop, a
+        shortfall (``already_resident + materialized < target``) emits ONE
+        summary WARNING — the VISIBLE SIGNAL that the pool could not reach
+        ``effective_N``.
         """
         pool = self.warm_lane_pool
         if pool is None:
