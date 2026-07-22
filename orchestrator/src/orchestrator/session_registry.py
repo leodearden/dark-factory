@@ -1413,6 +1413,93 @@ def _wmctrl_live_window_ids(
     return live_ids
 
 
+def mark_windowless_wm_sessions_exited(
+    root: Path | str | None = None,
+    *,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> list[SessionRecord]:
+    """Sweep ``<root>/sessions/*/`` and mark EXITED any wm-display session whose window is gone.
+
+    A SEPARATE liveness sweep from ``mark_orphaned_sessions_exited`` above,
+    not a folded-in extension of it: a closed terminal window is DEFINITIVE
+    evidence the session is dead/un-interactable, so this sweep is
+    deliberately PID- and AGE-INDEPENDENT -- it reaps exactly the zombies
+    the pid/TTL sweep is forced to keep (a live ``launcher_pid``, or a
+    record younger than ``NON_TERMINAL_HEARTBEAT_TTL``). Folding the two
+    predicates together would muddy ``mark_orphaned_sessions_exited``'s
+    "mirrors reap_stale_records' stale_pid predicate EXACTLY" contract, and
+    would run ``wmctrl -l`` on every liveness check instead of once per
+    sweep.
+
+    Scope: only records with ``display is not None and display.kind ==
+    DisplayKind.WM.value`` are ever considered. A ``display=None`` (headless
+    fleet-agent) or ``display.kind == 'tmux'`` record is untouched here --
+    both stay on the existing pid/TTL path (a closed tmux pane is not
+    "window gone" in the X11 sense this sweep checks). A wm record whose
+    captured ``wm_window_id`` is missing or fails to parse
+    (``_normalize_wm_window_id`` returns ``None``) is ALSO left untouched --
+    we cannot prove the window is gone, so we fail toward keep and defer to
+    the pid/TTL sweep.
+
+    HARD fail-soft: resolves ``live_ids = _wmctrl_live_window_ids(run)``
+    exactly once per sweep; if that is ``None`` (missing ``wmctrl`` binary, a
+    nonzero return code, or any exception -- see its docstring), this
+    returns ``[]`` immediately and marks NOTHING. "No window evidence" (a
+    headless host, an X11 hiccup) must never be treated as "every window is
+    gone" -- that would mass-mark every wm session on the fleet EXITED.
+
+    Self-correction trade-off (mirrors ``mark_orphaned_sessions_exited``): a
+    single missed/late ``wmctrl`` probe (e.g. racing a window remap) can mark
+    a still-live session EXITED. This is deliberately accepted -- the
+    session's next hook event calls ``refresh_record`` and flips status back
+    -- rather than adding retries here, keeping this sweep a single
+    fail-soft decision point per call.
+
+    Unlike ``reap_stale_records``, this does NOT delete anything -- it marks
+    a matching record EXITED (exit_code=``ORPHAN_EXIT_CODE``), preserving
+    every other field, and leaves its directory in place;
+    ``reap_stale_records``'s existing ``terminal_ttl`` rule reclaims it
+    later, unchanged. An already-terminal record is left fully untouched
+    (idempotent -- never re-stamped with the sentinel).
+
+    *run* is the injectable ``wmctrl -l`` runner passed through to
+    ``_wmctrl_live_window_ids`` (``None``, the default, resolves to the real
+    ``_wmctrl_list`` at call time).
+    """
+    live_ids = _wmctrl_live_window_ids(run)
+    if live_ids is None:
+        return []  # HARD fail-soft: no window evidence -- mark nothing.
+
+    base = sessions_dir(root)
+    marked: list[SessionRecord] = []
+    if not base.is_dir():
+        return marked
+
+    for slug_dir in sorted(base.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        slug = slug_dir.name
+
+        try:
+            record = read_record(slug, root=root)
+        except (FileNotFoundError, CorruptSessionRecord):
+            continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
+        if record.status in TERMINAL_STATUSES:
+            continue  # already terminal -- idempotent, never re-stamped
+        if record.display is None or record.display.kind != DisplayKind.WM.value:
+            continue  # tmux / headless -- stays on the pid/TTL path
+        normalized = _normalize_wm_window_id(record.display.wm_window_id)
+        if normalized is None or normalized in live_ids:
+            continue  # unprovable, or the window is still live
+
+        marked_record = _mark_exited_if_still_non_terminal(slug, root, exit_code=ORPHAN_EXIT_CODE)
+        if marked_record is None:
+            continue  # lost the race: a concurrent writer already made this terminal
+        marked.append(marked_record)
+
+    return marked
+
+
 # ---------------------------------------------------------------------------
 # Role leases: single-owner-per-role (Attention Rail T7; PRD T7 §4.1-4.2, §6 G5)
 # ---------------------------------------------------------------------------
