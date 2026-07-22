@@ -678,7 +678,10 @@ class ReconLedgerStore:
             """,
             (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, entity_uuid, STATE_ACTIVE),
         )
-        rows = await cursor.fetchall()
+        # aiosqlite types fetchall() as Iterable[Row] (not Sized); materialize
+        # to a list so len()/indexing below type-check (it's already a list at
+        # runtime).
+        rows = list(await cursor.fetchall())
         if not rows:
             return None
         if len(rows) > 1:
