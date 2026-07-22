@@ -38,6 +38,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    'VerifiedGreenMatch',
+    'detect_verified_green',
+    'last_verified_green_tip',
+]
+
 
 def last_verified_green_tip(
     event_store: EventStore | None, task_id: str | None,

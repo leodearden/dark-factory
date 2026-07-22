@@ -4256,9 +4256,14 @@ class Harness:
         no ASSIGNED lane record → ``detect_verified_green`` returns None →
         ``False``.
 
-        Marker/dedup (step-16) and the auto-resolved record escalation
-        (step-10) are wired in later steps; this method owns the detect +
-        submit + durable-fail-callback registration.
+        This method owns the full ON-MATCH sequence (PRD leaf α §2.1): the
+        durable-marker dedup (skip a re-submit while the merge is presumed
+        in-flight), the ``MergeRequest`` build + durable-fail done-callback
+        registration + ``enqueue_merge_request``, the durable
+        ``metadata.stranded_merge_request`` marker stamp, and the
+        auto-dismissed ``stranded_blocked`` record escalation.  Done-on-success
+        is delegated to the EXISTING found_on_main MARK_DONE path (the marker
+        lives in metadata, ignored there — non-interference).
         """
         if (
             not self.config.stranded_verified_green_merge_enabled
