@@ -535,7 +535,20 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     test_cli.py:1419 does, then spawns a real knob-on verify-merge with the
     override set small.  Today (RED) verify-merge ignores the env var and
     waits the full 10.0s production window; asserting completion in well
-    under that (< 3s) fails until cli.py reads the override.
+    under that fails until cli.py reads the override.
+
+    task 2921 (load-robustness): `elapsed` (the contended-run wall-clock) is
+    DOMINATED by the child's bare ``from orchestrator.cli import main``
+    import cost (~8.7s measured on a loaded host), not the 0.5s flock wait
+    -- so any absolute ceiling below the 10s production default
+    (MERGE_VERIFY_FLOCK_WAIT_SECS) is import-bound, not flock-bound, and
+    cannot be made load-robust by widening alone (a ceiling >=
+    import_cost + 0.5 loses the un-wired-override discrimination). Instead,
+    `import_cost` measures a same-process bare-import baseline (step-7)
+    and this test asserts on `elapsed - import_cost` -- cancelling the
+    load-sensitive import term while still catching an un-wired override,
+    which would leave the flock component at the full ~10s production wait
+    instead of the ~0.5s override.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     worktree_base = worktree_base_for(repo)
@@ -558,7 +571,8 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         )
         # task 2376: widened from 15s -- host oversubscription can delay
         # subprocess completion past a short deadline; the discriminating
-        # invariant is the `elapsed < 9.0` assertion below, not this ceiling.
+        # invariant is the `flock_component < 5.0` assertion below (task
+        # 2921), not this ceiling.
         stdout, stderr = proc.communicate(timeout=45)
         elapsed = time.monotonic() - started
     finally:
@@ -575,15 +589,20 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         f'expected flock-contention result, got category={result.category!r} '
         f'stdout={stdout.decode()[:2000]!r}'
     )
-    # task 2376: widened from 6.0s -- must stay STRICTLY below the 10.0s
-    # production flock-wait so this still detects an un-wired override
-    # (i.e. it fails to distinguish the 0.5s override from the 10s
-    # production default if raised to >= 10.0).
-    assert elapsed < 9.0, (
-        f'expected contention result well under the 10s production wait '
-        f'(env override=0.5s, generous ceiling for subprocess-startup '
-        f'jitter) -- took {elapsed:.2f}s; the env override is not wired up '
-        f'yet'
+    # task 2921: subtract the bare-import baseline (measured above, before
+    # the holder flock is acquired) to cancel the load-sensitive import
+    # term out of `elapsed`, isolating the flock-wait component. An honored
+    # 0.5s override keeps flock_component well under 5.0; an un-wired
+    # override leaves the full ~10s production wait (flock_component well
+    # over 5.0) -- so this discriminant is both load-robust and still
+    # catches a regression, unlike a bare absolute ceiling on `elapsed`.
+    flock_component = elapsed - import_cost
+    assert flock_component < 5.0, (
+        f'expected the flock-wait component of the contended run to be '
+        f'well under the 10s production wait (env override=0.5s) once the '
+        f'import-bound baseline is subtracted out -- elapsed={elapsed:.2f}s, '
+        f'import_cost={import_cost:.2f}s, flock_component={flock_component:.2f}s; '
+        f'the env override is not wired up yet'
     )
 
 
