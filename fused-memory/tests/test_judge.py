@@ -1192,9 +1192,8 @@ class TestCallJudgeCliTaxonomy:
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
-        ):
-            with pytest.raises(JudgeInfraError):
-                await judge._call_judge_cli('prompt')
+        ), pytest.raises(JudgeInfraError):
+            await judge._call_judge_cli('prompt')
 
     @pytest.mark.asyncio
     async def test_timed_out_raises_judge_infra_error(self):
@@ -1208,9 +1207,8 @@ class TestCallJudgeCliTaxonomy:
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
-        ):
-            with pytest.raises(JudgeInfraError):
-                await judge._call_judge_cli('prompt')
+        ), pytest.raises(JudgeInfraError):
+            await judge._call_judge_cli('prompt')
 
     @pytest.mark.asyncio
     async def test_genuine_empty_output_stays_benign(self):
@@ -1259,9 +1257,8 @@ class TestCallJudgeCliTaxonomy:
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
-        ):
-            with pytest.raises(JudgeInfraError):
-                await judge._call_judge_cli('prompt')
+        ), pytest.raises(JudgeInfraError):
+            await judge._call_judge_cli('prompt')
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1545,7 +1542,7 @@ async def test_halt_reason_returns_truthful_reason_after_halt(mock_journal):
     # Matches the reason _apply_halt was called with (verified via set_halt too).
     expected = mock_journal.set_halt.call_args.kwargs['reason']
     assert judge.halt_reason('proj-halt-reason') == expected
-    assert 'Serious verdict in run run-halt-reason' == expected
+    assert expected == 'Serious verdict in run run-halt-reason'
     # A different, never-halted project still returns None.
     assert judge.halt_reason('some-other-project') is None
 
