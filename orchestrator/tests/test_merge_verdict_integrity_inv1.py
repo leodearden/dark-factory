@@ -174,6 +174,56 @@ class TestInv1LocalRunnerBoundary:
         assert data['reason'] == 'no_source_files'
         assert data['resolution'] == 'full_gate'
 
+    async def test_clobbered_worktree_escalates_with_empty_existing_files_reason(
+        self, tmp_path: Path,
+    ):
+        """Incident 83336a32 — an ENOENT-clobbered merge worktree: task_files is
+        non-empty but every path is MISSING on disk, so existing_files resolves
+        EMPTY. Driven end-to-end through the REAL LocalRunner.run_merge_verify
+        substrate (not just the run_scoped unit in test_verify.py), the merge gate
+        must escalate to the full gate — never a 0ms trivial PASS — and the recorded
+        trivial_pass_escalated event must carry reason='empty_existing_files',
+        distinguishing evidence-absence from a genuine docs-only ('no_source_files')
+        diff. This is the specific failure mode that motivated the task; the docs-only
+        cases above never resolve existing_files empty, so only this test pins it."""
+        spy, calls = _run_cmd_spy()
+        event_store = _RecordingEventStore()
+        # A source path deliberately NOT created on disk under merge_wt=tmp_path,
+        # so existing_files resolves EMPTY (the clobbered-worktree failure mode).
+        clobbered = ('orchestrator/src/orchestrator/foo.py',)
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=_SENTINEL_CMD, lint_command='', type_check_command='',
+        )
+        spec = build_merge_verify_spec(config, [], clobbered)
+        runner = LocalRunner(
+            merge_wt=tmp_path,
+            config=config,
+            module_configs=[],
+            task_files=clobbered,
+            run_scoped=run_scoped_verification,
+            run_unscoped=_passing_unscoped_double(),
+            task_id='t-2883',
+            event_store=event_store,  # type: ignore[arg-type]
+        )
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy):
+            result = await runner.run_merge_verify('sha-clobbered', spec)
+
+        # The full gate RAN — evidence-absence never yields a bare 0ms trivial pass.
+        assert _SENTINEL_CMD in ' | '.join(calls), (
+            f'Expected the escalated global full gate to run for a clobbered '
+            f'worktree; got calls={calls}'
+        )
+        assert result.passed is True
+        assert result.trivial is False
+        # ... and the escalation reason distinguishes the clobbered-worktree mode.
+        escalated = event_store.events_of(EventType.trivial_pass_escalated)
+        assert len(escalated) == 1, f'Expected exactly one escalation event; got {escalated}'
+        _, _, data = escalated[0]
+        assert data['reason'] == 'empty_existing_files', data
+        assert data['resolution'] == 'full_gate', data
+
     async def test_zero_module_no_command_loud_fails_and_emits_event(
         self, tmp_path: Path,
     ):
