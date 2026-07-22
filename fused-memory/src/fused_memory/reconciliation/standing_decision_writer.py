@@ -63,6 +63,58 @@ HUMAN_AUTHORED_AGENT_ID_PREFIXES: tuple[str, ...] = ('claude-interactive',)
 # distinct count is computed Python-side after the scroll.
 ARM2_MIN_DISTINCT_RUNS = 3
 
+# ---------------------------------------------------------------------------
+# Rejection payload vocabulary (single-source; INV-1 ValidationError+hint)
+# ---------------------------------------------------------------------------
+
+# Structured rejection returned to the Stage-2 LLM when neither arm is met, so
+# the agent can self-correct mid-cycle rather than persisting a poisoned row.
+STANDING_DECISION_INSUFFICIENT_EVIDENCE = 'insufficient_evidence'
+STANDING_DECISION_INSUFFICIENT_EVIDENCE_ERROR_TYPE = 'StandingDecisionEvidenceInsufficient'
+
+# Arm identifiers + their remedies — the single source both ``unmet_arms`` and
+# the human-readable ``hint`` derive from (no lockstep-duplicated wording).
+ARM1_KEY = 'human_authored_mem0_evidence'
+ARM2_KEY = 'independent_investigation_outcomes'
+_ARM1_REMEDY = (
+    'cite at least one locally-resolvable, human-authored mem0 evidence record '
+    '(agent_id starting with ' + ', '.join(HUMAN_AUTHORED_AGENT_ID_PREFIXES) + ')'
+)
+_ARM2_REMEDY = (
+    f'accumulate at least {ARM2_MIN_DISTINCT_RUNS} investigation_outcome mem0 records '
+    'for this entity_uuid with actionable=false and distinct run_ids'
+)
+
+
+def _build_rejection(*, arm1_satisfied: bool, arm2_satisfied: bool, arm2_distinct_run_count: int) -> dict[str, Any]:
+    """Assemble the structured ``insufficient_evidence`` rejection dict.
+
+    Lists every UNMET arm and its remedy, and embeds the observed distinct-run
+    count so the caller sees exactly how far arm 2 fell short.
+    """
+    unmet_arms: list[dict[str, Any]] = []
+    if not arm1_satisfied:
+        unmet_arms.append({'arm': ARM1_KEY, 'needs': _ARM1_REMEDY})
+    if not arm2_satisfied:
+        unmet_arms.append(
+            {
+                'arm': ARM2_KEY,
+                'needs': _ARM2_REMEDY,
+                'observed_distinct_run_count': arm2_distinct_run_count,
+            }
+        )
+    hint = (
+        'Insufficient evidence to authorize an entity standing decision — satisfy at '
+        f'least ONE arm. Arm 1: {_ARM1_REMEDY}. Arm 2: {_ARM2_REMEDY} '
+        f'(found {arm2_distinct_run_count} distinct run_id(s) so far).'
+    )
+    return {
+        'error': STANDING_DECISION_INSUFFICIENT_EVIDENCE,
+        'error_type': STANDING_DECISION_INSUFFICIENT_EVIDENCE_ERROR_TYPE,
+        'unmet_arms': unmet_arms,
+        'hint': hint,
+    }
+
 
 def _is_human_authored(agent_id: Any) -> bool:
     """True iff *agent_id* is a string starting with a human-authored prefix."""
@@ -173,11 +225,20 @@ async def evaluate_evidence_gate(
     arm2_satisfied = arm2_distinct_run_count >= ARM2_MIN_DISTINCT_RUNS
 
     satisfied = arm1_satisfied or arm2_satisfied
+    rejection = (
+        None
+        if satisfied
+        else _build_rejection(
+            arm1_satisfied=arm1_satisfied,
+            arm2_satisfied=arm2_satisfied,
+            arm2_distinct_run_count=arm2_distinct_run_count,
+        )
+    )
     return EvidenceGateResult(
         satisfied=satisfied,
         arm1_satisfied=arm1_satisfied,
         arm2_satisfied=arm2_satisfied,
         arm2_distinct_run_count=arm2_distinct_run_count,
         resolved_evidence=resolved,
-        rejection=None,
+        rejection=rejection,
     )
