@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
@@ -1321,6 +1322,95 @@ def _normalize_wm_window_id(raw: str | None) -> str | None:
     if value < 0:
         return None
     return f'0x{value:x}'
+
+
+_WMCTRL_TIMEOUT_SECS = 2
+"""Per-probe ``wmctrl -l`` timeout for ``_wmctrl_list``, seconds. Mirrors
+``session_hooks._WMCTRL_TIMEOUT_SECS`` -- kept as a separate module-level
+constant (not imported) per this module's stdlib-only/import-free
+constraint; see ``_wmctrl_list``'s docstring."""
+
+
+def _wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """Fail-soft ``wmctrl -l`` runner -- default for ``_wmctrl_live_window_ids``.
+
+    DUPLICATED (not imported) from ``session_hooks._wmctrl_list``: this
+    module is deliberately stdlib-only and import-free of the rest of the
+    orchestrator (see module docstring), and ``session_hooks`` already
+    imports ``session_registry``, so importing back would be circular. Keep
+    this in sync with ``session_hooks._wmctrl_list`` if either changes.
+
+    Never raises: a genuinely-missing ``wmctrl`` binary (``FileNotFoundError``)
+    yields a permanent-failure rc=127 sentinel; any other ``OSError``/
+    ``subprocess.SubprocessError`` (notably a timeout) yields a distinct,
+    transient rc=124 sentinel. Both sentinels -- and every other nonzero
+    return code -- are treated identically (fail-soft: no window evidence)
+    by ``_wmctrl_live_window_ids``; they are only distinguished here in case
+    a future caller ever needs to react to them differently.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=_WMCTRL_TIMEOUT_SECS)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, returncode=127, stdout='')
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(argv, returncode=124, stdout='')
+
+
+def _wmctrl_live_window_ids(
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> set[str] | None:
+    """Return the set of normalized window ids ``wmctrl -l`` currently reports.
+
+    HARD fail-soft: returns ``None`` -- never an empty set -- for a missing
+    ``wmctrl`` binary, ANY nonzero return code, or any exception raised by
+    *run* itself. Callers MUST treat ``None`` ("no window evidence") as
+    distinct from an empty set (a successful probe that legitimately found
+    zero windows) -- only a successful run (rc=0, however many windows)
+    authorizes ``mark_windowless_wm_sessions_exited`` to reap anything.
+
+    Each ``wmctrl -l`` line is parsed via ``split(None, 3)`` -- the same
+    idiom as ``WmBackend.is_alive`` (cockpit/src/cockpit/backends/wm.py) and
+    ``session_hooks._resolve_wm_window_id`` -- but, unlike both of those,
+    this takes column 0 (the window id) of ANY non-empty line, even a
+    titleless line with fewer than 4 columns. A reaper must fail toward
+    keeping live sessions: the stricter >=4-column gate those two use would
+    silently drop a live-but-titleless window from the live set, risking a
+    false reap. ``wmctrl -l`` has no header and every line begins with a
+    window id, so this can't admit a phantom id. Each id is normalized via
+    ``_normalize_wm_window_id`` before being added to the set (a column 0
+    that fails to parse is simply skipped, not an error).
+
+    NOTE: this parse is now duplicated across THREE call sites --
+    ``WmBackend.is_alive``, ``session_hooks._resolve_wm_window_id``, and this
+    function -- keep all three in sync if the ``wmctrl -l`` column layout
+    ever changes.
+
+    *run* defaults to ``None``, which resolves to the real ``_wmctrl_list``
+    at CALL time -- a plain name lookup in this function's body, not a bound
+    default-parameter value -- so a test's
+    ``monkeypatch.setattr(session_registry, '_wmctrl_list', fake)`` takes
+    effect even when reached indirectly via
+    ``mark_windowless_wm_sessions_exited()``'s own default ``run``
+    passthrough.
+    """
+    if run is None:
+        run = _wmctrl_list
+    try:
+        result = run(['wmctrl', '-l'])
+    except Exception:
+        logger.warning('_wmctrl_live_window_ids: wmctrl -l invocation raised', exc_info=True)
+        return None
+    if result.returncode != 0:
+        return None
+    live_ids: set[str] = set()
+    for line in result.stdout.splitlines():
+        columns = line.split(None, 3)
+        if not columns:
+            continue
+        normalized = _normalize_wm_window_id(columns[0])
+        if normalized is not None:
+            live_ids.add(normalized)
+    return live_ids
 
 
 # ---------------------------------------------------------------------------
