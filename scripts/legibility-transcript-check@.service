@@ -1,0 +1,27 @@
+[Unit]
+Description=Legibility transcript-persistence detector for %i (task 2893/2901)
+Documentation=file:///home/leo/src/dark-factory/plans/confusion-reduction-prd.md
+
+[Service]
+Type=oneshot
+# All generic legibility CODE lives in the dark-factory checkout (PRD §5);
+# only the target project varies, via the %i instance name.
+WorkingDirectory=/home/leo/src/dark-factory
+# check_transcript_persistence.py resolves its sibling `from legibility
+# import ...` modules via scripts/ on sys.path; PYTHONPATH is set explicitly
+# so that import resolves even if the module's self-bootstrap ever changes.
+Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
+# The DETECTOR from task 2893 only: NO `run` subcommand (unlike nightly.py's
+# ExecStart) and deliberately WITHOUT the optional preventer-guard flag. The
+# 2893 preventer-guard regex is anchored to line-start and false-negatives
+# against spawn-claude.sh's real mid-line `export
+# CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, so enabling that guard would make
+# this timer exit 1 on EVERY run -- a perpetual false alarm (task 2901 DD2).
+# The core lost-transcript detector is authoritative and correct without the
+# guard; the regex false-negative is a separate, out-of-scope 2893 bug.
+ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/check_transcript_persistence.py --project-id %i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target
