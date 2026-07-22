@@ -456,6 +456,43 @@ class _RecordingPoster:
         self.calls.append((url, envelope))
 
 
+class _FakeHttpxResponse:
+    def raise_for_status(self):
+        pass
+
+
+def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
+    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
+    lacking an Accept header covering both application/json and
+    text/event-stream (verified live against a local MCP /mcp endpoint).
+    `_default_poster`'s httpx import is lazy (httpx is not importable in
+    this test env), so a fake `httpx` module is injected via sys.modules.
+    Mirrors nightly.py's identical test for its own `_default_poster`."""
+    import sys
+
+    captured_kwargs = {}
+
+    fake_httpx = type(sys)('httpx')
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse()
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+
+    mod._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
+
+    headers = captured_kwargs.get('headers') or {}
+    assert 'application/json' in headers.get('Accept', '')
+    assert 'text/event-stream' in headers.get('Accept', '')
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get('Content-Type') == 'application/json'
+    # The envelope must still ride along unchanged on the same POST.
+    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
+
+
 def test_build_escalation_arguments_shape(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
     findings = [
