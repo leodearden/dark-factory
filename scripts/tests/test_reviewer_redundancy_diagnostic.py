@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 import reviewer_redundancy_diagnostic as mod
+from orchestrator.evals.snapshots import eval_worktree_root
 
 
 # ---------------------------------------------------------------------------
@@ -94,3 +95,20 @@ def test_corrupt_review_counted_and_reported(tmp_path, monkeypatch, capsys):
     )
     # Happy path still works: normal summary present
     assert 'PER-REVIEWER SUMMARY' in captured.out
+
+
+# ---------------------------------------------------------------------------
+# RED — SEARCH_ROOTS point at the relocated (sibling) eval-worktree root
+# ---------------------------------------------------------------------------
+
+def test_search_roots_use_relocated_eval_root():
+    """SEARCH_ROOTS must scan eval_worktree_root(REPO), not REPO/.eval-worktrees.
+
+    Post-2881 eval worktrees live at eval_worktree_root(REPO) — a SIBLING of
+    REPO — not the in-repo REPO/.eval-worktrees. If SEARCH_ROOTS still points
+    at the old in-repo path, the diagnostic silently discovers zero relocated
+    worktrees. Asserts against the real module-level SEARCH_ROOTS computed
+    from the hardcoded REPO.
+    """
+    assert eval_worktree_root(mod.REPO) in mod.SEARCH_ROOTS
+    assert (mod.REPO / '.eval-worktrees') not in mod.SEARCH_ROOTS
