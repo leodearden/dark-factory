@@ -29,6 +29,7 @@ substring scan over-reports on exactly this shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -145,3 +146,44 @@ def discover_db_paths(
         candidates = [_tasks_db_path(root) for root in roots]
 
     return [path for path in candidates if os.path.exists(path)]
+
+
+_DEFAULT_MAX_FRAGMENT_LEN = 80
+
+
+def format_report(matches: list[LeakMatch], max_fragment_len: int = _DEFAULT_MAX_FRAGMENT_LEN) -> str:
+    """Render *matches* as a grouped, human-readable report.
+
+    Groups lines by ``db_path``; each line shows task_id/tag/column and the
+    fragment truncated to *max_fragment_len* characters (the full fragment
+    is only ever emitted by :func:`format_json`). Ends with a summary line
+    counting fragments found and distinct tasks affected (a task leaking in
+    two columns counts once toward "tasks"). An empty *matches* list yields
+    an explicit no-leaks message instead of a blank report.
+    """
+    if not matches:
+        return "no leaked tool-call fragments found"
+
+    by_db: dict[str, list[LeakMatch]] = {}
+    for m in matches:
+        by_db.setdefault(m.db_path, []).append(m)
+
+    lines: list[str] = []
+    for db_path in sorted(by_db):
+        lines.append(f"{db_path}:")
+        for m in by_db[db_path]:
+            fragment = m.fragment
+            if len(fragment) > max_fragment_len:
+                fragment = fragment[:max_fragment_len] + "..."
+            lines.append(
+                f"  task_id={m.task_id} tag={m.tag} column={m.column} fragment={fragment!r}"
+            )
+
+    distinct_tasks = {(m.db_path, m.tag, m.task_id) for m in matches}
+    lines.append(f"{len(matches)} leaked fragments across {len(distinct_tasks)} tasks")
+    return "\n".join(lines)
+
+
+def format_json(matches: list[LeakMatch]) -> str:
+    """Render *matches* as a JSON array, carrying the FULL untruncated fragment."""
+    return json.dumps([m._asdict() for m in matches])
