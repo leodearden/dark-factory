@@ -140,7 +140,7 @@ async def detect_verified_green(
             return None
         lane_name, record = assigned
 
-        branch = record.branch or f'{git_ops.config.git.branch_prefix}{task_id}'
+        branch = record.branch or f'{git_ops.config.branch_prefix}{task_id}'
         tip = await git_ops.resolve_branch_sha(branch)
         if tip is None:
             return None

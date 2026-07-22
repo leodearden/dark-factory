@@ -145,7 +145,9 @@ class _FakeGitOps:
         self._lane_lifecycle = _FakeLaneLifecycle(records)
         self._branch_shas = branch_shas
         self._raise_on_resolve = raise_on_resolve
-        self.config = SimpleNamespace(git=SimpleNamespace(branch_prefix='task/'))
+        # git_ops.config is a GitConfig (branch_prefix lives directly on it),
+        # NOT the full OrchestratorConfig — mirror that shape exactly.
+        self.config = SimpleNamespace(branch_prefix='task/')
 
     async def resolve_branch_sha(self, branch_name: str) -> str | None:
         if self._raise_on_resolve:
