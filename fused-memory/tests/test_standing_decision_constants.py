@@ -19,7 +19,7 @@ def test_grounds_enum_is_closed_frozenset_with_structural_size_conflation():
     assert isinstance(sdc.GROUNDS_ENUM, frozenset)
     assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION == 'structural_size_conflation'
     assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION in sdc.GROUNDS_ENUM
-    assert sdc.GROUNDS_ENUM == frozenset({sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION})
+    assert frozenset({sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION}) == sdc.GROUNDS_ENUM
 
 
 def test_grounds_token_families_covers_every_grounds_value_with_str_tokens():
@@ -46,7 +46,7 @@ def test_persisted_contract_string_values():
 def test_state_vocabulary_and_members():
     """STANDING_DECISION_STATES is the closed {active, expired, revoked} set and
     each STATE_* constant is a member of it."""
-    assert sdc.STANDING_DECISION_STATES == {'active', 'expired', 'revoked'}
+    assert {'active', 'expired', 'revoked'} == sdc.STANDING_DECISION_STATES
     assert sdc.STATE_ACTIVE == 'active'
     assert sdc.STATE_EXPIRED == 'expired'
     assert sdc.STATE_REVOKED == 'revoked'
@@ -58,7 +58,7 @@ def test_expiry_reason_vocabulary_and_members():
     """EXPIRY_REASONS is the closed {ttl, growth, merge, operator} set and each
     EXPIRY_REASON_* constant is a member of it (INV-2: structured expiry_reason
     stamped at the state transition)."""
-    assert sdc.EXPIRY_REASONS == {'ttl', 'growth', 'merge', 'operator'}
+    assert {'ttl', 'growth', 'merge', 'operator'} == sdc.EXPIRY_REASONS
     assert sdc.EXPIRY_REASON_TTL == 'ttl'
     assert sdc.EXPIRY_REASON_GROWTH == 'growth'
     assert sdc.EXPIRY_REASON_MERGE == 'merge'
