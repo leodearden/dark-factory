@@ -469,6 +469,19 @@ def test_payload_exports_force_persistence_false_for_commented_midline_continuat
     ) is False
 
 
+def test_payload_exports_force_persistence_false_for_quoted_echo():
+    # A merely-quoted/echoed token must NOT satisfy the guard — `"`/`'` are
+    # deliberately excluded from the mid-line boundary set, since including
+    # them would match an `echo "export ...=1"` that never actually exports
+    # anything (reviewer_comprehensive/robustness, task 2923 amendment).
+    assert mod.payload_exports_force_persistence(
+        'echo "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"\n'
+    ) is False
+    assert mod.payload_exports_force_persistence(
+        "echo 'export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1'\n"
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # step-11/12: escalation envelope + best-effort poster
 # ---------------------------------------------------------------------------

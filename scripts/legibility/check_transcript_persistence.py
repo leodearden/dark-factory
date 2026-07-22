@@ -363,7 +363,7 @@ def find_missing_transcripts(
 
 _FORCE_PERSISTENCE_RE = re.compile(
     r'(?:^[ \t]*(?:export[ \t]+)?'
-    r'|(?<=[;{}"\'])[ \t]*export[ \t]+)'
+    r'|(?<=[;{}])[ \t]*export[ \t]+)'
     r'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=(["\']?)1\1(?![0-9])',
     re.MULTILINE,
 )
@@ -379,16 +379,20 @@ NOT falsely report the preventer as present:
 
 1. Line start (optional indentation, optional ``export`` prefix) — the
    original anchored form, for a script that sets the var on its own line.
-2. Mid-line, immediately after a ``;``, ``{``, ``}``, ``"``, or ``'``
-   boundary (optional indentation), with a MANDATORY ``export`` keyword —
-   covers a payload built by string concatenation, e.g.
-   ``skills/spawn/spawn-claude.sh``'s
+2. Mid-line, immediately after a ``;``, ``{``, or ``}`` boundary (optional
+   indentation), with a MANDATORY ``export`` keyword — covers a payload
+   built by string concatenation, e.g. ``skills/spawn/spawn-claude.sh``'s
    ``${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd ...``
    (task 2923), where the real export is neither at line start nor preceded
    by whitespace. Requiring ``export`` (not optional, unlike alternative 1)
    on this branch keeps a bare mid-line ``VAR=1`` embedded in prose from
    matching, and the explicit boundary-char lookbehind keeps a ``# ...``
    comment continuation from matching (a space is not a boundary char).
+   ``"``/``'`` are deliberately EXCLUDED from the boundary set — including
+   them would match a merely-quoted/echoed token, e.g.
+   ``echo "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"``, as if it were
+   a real export (reviewer_comprehensive/robustness, task 2923 amendment);
+   the shipped ``spawn-claude.sh`` payload only ever needs ``;``/``{``/``}``.
 
 No ``\\s*`` after ``=`` — a space there (``VAR= 1``) is not a valid shell
 assignment."""
