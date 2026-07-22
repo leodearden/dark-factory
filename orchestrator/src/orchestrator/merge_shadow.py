@@ -43,6 +43,7 @@ from orchestrator.merge_types import MergeRequest
 # body).  They are imported here only so TestReachBackRouting has a "naive"
 # orchestrator.merge_shadow.<name> patch target to assert is NOT what governs.
 from orchestrator.verify import run_scoped_verification  # noqa: F401
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_runner import (  # noqa: F401
     LocalRunner,
     VerifyRunnerPool,
@@ -1249,6 +1250,27 @@ async def _run_shadow_compare(
             )
 
 
+# Cold FULL-gate failure categories where the suite NEVER BUILT — the landed
+# commit's build/compile stage failed, so verify emits build/compile errors but
+# ZERO parseable test lines (an empty per-test map).  For the map-less COARSE
+# path (the SOLE detector for trivial-pass / remote-verdict lands) this is a
+# GENUINE red-main signal, NOT a throwaway-worktree infra hiccup, so it must
+# alarm rather than be swallowed by the empty-map inconclusive guard (task 2886
+# reviewer robustness amendment — otherwise a red main whose landed commit does
+# not even compile is silently undetected for this population).  Scoped to the
+# build-STAGE categories only (a compile/CLI/tree-sitter/npm build break, where
+# zero test lines is EXPECTED); TEST_FAILURE-class categories with an empty map
+# stay inconclusive since a genuine test failure normally DOES emit parseable
+# lines and an empty map there is more likely a transport/parse hiccup.  Derived
+# from FailureCategory so a new build-stage category can't drift out of the set.
+_COARSE_BUILD_FAILURE_CATEGORIES: frozenset[str] = frozenset({
+    FailureCategory.COMPILE_ERROR.value,
+    FailureCategory.CARGO_CLI_ERROR.value,
+    FailureCategory.TREE_SITTER_GENERATE_ERROR.value,
+    FailureCategory.NPM_ERROR.value,
+})
+
+
 async def _run_coarse_shadow_compare(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1273,13 +1295,21 @@ async def _run_coarse_shadow_compare(
        :func:`_run_cold_shadow_verify_suite` (``task_files=None`` — the cold leg
        runs the COMPLETE suite so a trivial-pass land cannot be re-confirmed by a
        same-scope trivial pass; PRD §8δ).
-    2. **Inconclusive** (cold produced no parseable test output → build/compile/
-       OOM/infra hiccup in the throwaway worktree): no alarm, no event — mirrors
+    2. **Build-never-built FAIL** (cold produced no parseable test output but
+       FAILED with a build/compile category in
+       :data:`_COARSE_BUILD_FAILURE_CATEGORIES`): the landed commit does not
+       compile ⇒ born-at-L2 suspected-red alarm — this is a GENUINE red-main
+       signal, not an infra hiccup, and the coarse path is the SOLE detector for
+       the map-less population (task 2886 reviewer robustness amendment).
+    3. **Inconclusive** (cold produced no parseable test output and is NOT a
+       recognised build failure → OOM/transport/disk hiccup in the throwaway
+       worktree, or a cold PASS that ran nothing): no alarm, no event — mirrors
        :func:`_run_shadow_compare`'s inconclusive guard (avoids alarming on
-       transport failure).
-    3. **cold FULL-gate FAIL** vs the warm-passed land ⇒ born-at-L2 suspected-red
-       alarm via :func:`_submit_coarse_shadow_divergence_escalation`.
-    4. **cold FULL-gate PASS** ⇒ emit ``verdict_parity_ok`` (``coarse=True``).
+       transport failure).  Logged with cold_passed + category for observability.
+    4. **cold FULL-gate FAIL** (with a parseable map) vs the warm-passed land ⇒
+       born-at-L2 suspected-red alarm via
+       :func:`_submit_coarse_shadow_divergence_escalation`.
+    5. **cold FULL-gate PASS** ⇒ emit ``verdict_parity_ok`` (``coarse=True``).
 
     The coarse threshold (suite verdict gated by per-test parseability of the cold
     output, rather than a per-command exit comparison) is tactical per PRD §9 open
@@ -1316,19 +1346,46 @@ async def _run_coarse_shadow_compare(
         return
 
     # Inconclusive guard (mirrors _run_shadow_compare): a cold FULL-gate that
-    # produced NO parseable test output usually signals a build/compile/OOM/infra
+    # produced NO parseable test output usually signals an OOM/transport/disk
     # hiccup in the throwaway worktree, not a genuine warm-pass/cold-fail flip.
     # The coarse threshold is "did the suite actually run?" (per-test
     # parseability) gating the suite-level verdict; an empty parse is inconclusive
     # (neither alarm nor parity-ok), avoiding a false-positive born-at-L2 alarm on
-    # transport/build failure.
+    # transport/infra failure.
+    #
+    # EXCEPT the build-never-built class (task 2886 reviewer robustness
+    # amendment): a cold FULL-gate that FAILED with a build/compile category
+    # (:data:`_COARSE_BUILD_FAILURE_CATEGORIES`) legitimately emits ZERO parseable
+    # test lines because the suite never built — yet the landed commit genuinely
+    # does not compile, which IS a red main.  For the map-less population this
+    # coarse path is the SOLE detector, so that class must ALARM instead of being
+    # swallowed as an "infra hiccup".  Category-based (not an output-regex
+    # heuristic) to honour verify_categories' closed-domain classification norm.
     cold_map = parse_per_test_results(cold.test_output or '')
     if not cold_map:
+        cold_cat = cold.category or ''
+        if not cold.passed and cold_cat in _COARSE_BUILD_FAILURE_CATEGORIES:
+            logger.warning(
+                'Coarse shadow compare on %s: cold FULL-gate produced no '
+                'parseable test results but FAILED with a build/compile category '
+                '(%s) — the landed commit did not build; alarming as a suspected '
+                'red main (map-less coarse path is the sole detector)',
+                merge_commit[:8], cold_cat,
+            )
+            _submit_coarse_shadow_divergence_escalation(
+                escalation_queue, merge_commit, cold
+            )
+            return
+        # Genuinely inconclusive: no parseable map AND not a recognised build
+        # failure (a transport/OOM/disk hiccup, or a cold PASS that ran nothing).
+        # Log WITH cold_passed + category so the swallowed cases are observable in
+        # the merge-worker logs (the plan deliberately keeps this off event_store —
+        # a new inconclusive EventType is out of scope for this task's locks).
         logger.warning(
             'Coarse shadow compare inconclusive for %s: cold FULL-gate produced '
-            'no parseable test results (possible build/compile/infra failure in '
-            'the throwaway worktree); not alarming',
-            merge_commit[:8],
+            'no parseable test results (cold_passed=%s, category=%r; possible '
+            'OOM/transport/disk hiccup in the throwaway worktree); not alarming',
+            merge_commit[:8], cold.passed, cold_cat,
         )
         return
 

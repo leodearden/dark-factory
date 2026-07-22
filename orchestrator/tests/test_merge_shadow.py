@@ -549,7 +549,8 @@ class TestCoarseShadowCompare:
         )
 
     async def test_empty_cold_is_inconclusive_no_alarm_no_event(self) -> None:
-        """Empty/unparseable cold (build/compile/infra hiccup) ⇒ inconclusive no-op."""
+        """Empty/unparseable cold with NO build category (OOM/transport/disk
+        hiccup in the throwaway worktree) ⇒ inconclusive no-op."""
         from orchestrator.merge_shadow import _run_coarse_shadow_compare
 
         git_ops = MagicMock()
@@ -557,11 +558,14 @@ class TestCoarseShadowCompare:
         esc_queue = self._esc_queue()
         event_store = MagicMock()
 
-        # Full-gate FAILED to run any test (compile error) → no parseable map.
+        # Cold leg produced no parseable map AND carries no recognised build
+        # category (an OOM/transport/disk hiccup in the throwaway worktree, not a
+        # genuine warm-pass/cold-fail flip) → must NOT alarm.
         cold_broken = VerifyResult(
             passed=False,
-            test_output='error[E0433]: failed to resolve: use of undeclared crate\n',
-            lint_output='', type_output='', summary='cold build failed',
+            test_output='Killed (OOM): the throwaway verify worktree ran out of memory\n',
+            lint_output='', type_output='', summary='cold verify infra hiccup',
+            category='',
         )
         with patch(
             'orchestrator.merge_queue._run_cold_shadow_verify_suite',
@@ -569,6 +573,77 @@ class TestCoarseShadowCompare:
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'facefeed12345678', esc_queue, event_store,
+            )
+
+        esc_queue.submit.assert_not_called()
+        event_store.emit.assert_not_called()
+
+    async def test_cold_build_failure_no_map_alarms_born_at_l2(self) -> None:
+        """A cold FULL-gate FAIL with a build/compile category but ZERO parseable
+        test lines (the landed commit does not build) ⇒ born-at-L2 alarm, NOT a
+        swallowed inconclusive (task 2886 reviewer robustness amendment).
+
+        For the map-less population this coarse path is the SOLE detector, so a
+        red main whose commit never compiled must not be silently dropped.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        # Suite NEVER BUILT: compile error emits build errors + zero test lines,
+        # so parse_per_test_results() is empty — but the category identifies a
+        # genuine build failure of the landed commit.
+        cold_build_fail = VerifyResult(
+            passed=False,
+            test_output='error[E0433]: failed to resolve: use of undeclared crate\n',
+            lint_output='', type_output='', summary='cold FULL-gate build failed',
+            category='compile_error',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_build_fail), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'badc0de099887766', esc_queue, event_store,
+            )
+
+        # Born-at-L2 alarm fired despite the empty per-test map.
+        esc_queue.submit.assert_called_once()
+        esc = esc_queue.submit.call_args.args[0]
+        assert esc.level == 2, 'a build-never-built cold FAIL must be born at L2'
+        assert esc.severity == 'critical'
+        assert 'badc0de0' in f'{esc.summary}\n{esc.detail}'
+        # It is an alarm, not a parity-ok.
+        for call in event_store.emit.call_args_list:
+            assert call.args[0] != EventType.verdict_parity_ok
+
+    async def test_infra_category_no_map_is_inconclusive_no_alarm(self) -> None:
+        """A cold FAIL with an INFRA-transient category (e.g. disk_full) and no
+        parseable map stays inconclusive — infra hiccups must NOT alarm even
+        though they carry a category (guards against over-alarming)."""
+        from orchestrator.merge_shadow import _run_coarse_shadow_compare
+
+        git_ops = MagicMock()
+        req = self._req()
+        esc_queue = self._esc_queue()
+        event_store = MagicMock()
+
+        cold_infra = VerifyResult(
+            passed=False,
+            test_output='No space left on device while writing target/\n',
+            lint_output='', type_output='', summary='cold verify disk full',
+            category='disk_full',
+        )
+        with patch(
+            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            AsyncMock(return_value=cold_infra), create=True,
+        ):
+            await _run_coarse_shadow_compare(
+                git_ops, req, 'd15cfull01020304', esc_queue, event_store,
             )
 
         esc_queue.submit.assert_not_called()
