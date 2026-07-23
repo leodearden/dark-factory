@@ -94,6 +94,7 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.stranded_verified_green import detect_verified_green
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
     _deterministic_deploy_health_verdict,
@@ -206,6 +207,16 @@ _RECONCILE_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 _WARM_LANE_RECLAIM_PROTECTED_STATUSES: frozenset[str] = frozenset(
     {'merge-deferred', 'deferred'}
 )
+
+# Recency grace for the verified-green stranded-reaper's durable re-submit
+# guard (PRD leaf α §7).  A ``metadata.stranded_merge_request`` marker whose
+# tip_sha matches the current lane tip AND whose submitted_at is within this
+# window short-circuits a re-submit — the merge is presumed still in-flight,
+# so the periodic stranded sweep must not re-enqueue the same branch every
+# tick.  Once the window elapses (or the lane tip advances past the marker),
+# a fresh submit re-drives (self-healing).  Sized to comfortably cover an
+# in-flight merge+verify while still re-driving a genuinely lost/hung one.
+_STRANDED_MERGE_RESUBMIT_GRACE_S: float = 30 * 60.0  # 30 minutes
 
 # Prior auto-eval redo siblings (task 2075) are only safe to silently
 # supersede (cancel) when they are still idle and unclaimed by anyone.
@@ -4188,6 +4199,388 @@ class Harness:
                 return assigned
         return self.git_ops.worktree_base / tid
 
+    @staticmethod
+    def _stranded_merge_marker_is_fresh(marker: Any, tip_sha: str) -> bool:
+        """Return True iff *marker* records a still-fresh submit for *tip_sha*.
+
+        The verified-green stranded-reaper's race-guard (PRD leaf α §7): a
+        ``metadata.stranded_merge_request`` marker suppresses a re-submit only
+        when it is a well-formed dict whose ``tip_sha`` equals the current lane
+        tip AND whose ``submitted_at`` is within ``_STRANDED_MERGE_RESUBMIT_
+        GRACE_S`` of now.  Fail-safe: any malformed / non-dict / unparseable
+        marker (or a mismatched tip / stale timestamp) returns False, so the
+        caller falls through to a fresh submit rather than a wedged skip — a
+        lost marker must never permanently strand the task.
+        """
+        if not isinstance(marker, dict):
+            return False
+        if marker.get('tip_sha') != tip_sha:
+            return False
+        submitted_at = marker.get('submitted_at')
+        if not isinstance(submitted_at, str) or not submitted_at:
+            return False
+        try:
+            ts = datetime.fromisoformat(submitted_at)
+        except (ValueError, TypeError):
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        # A future timestamp (clock skew) yields a negative age < grace → treated
+        # as fresh (skip), which is the safe side: never a duplicate submit.
+        age_s = (datetime.now(UTC) - ts).total_seconds()
+        return age_s < _STRANDED_MERGE_RESUBMIT_GRACE_S
+
+    async def _maybe_submit_stranded_verified_green(
+        self, tid: str, metadata: dict[str, Any],
+    ) -> bool:
+        """Detect the verified-green shape; on a match submit the lane branch
+        DIRECTLY to the merge queue instead of re-pending (PRD leaf α §2.1).
+
+        The incident (reify 5260): the stranded-blocked reaper re-pends a
+        verified-green task into a *paused* scheduler that never re-dispatches,
+        so the work sits stranded for hours.  When
+        :func:`stranded_verified_green.detect_verified_green` matches, we
+        instead submit a ``MergeRequest`` (tagged ``source='stranded-reaper'``)
+        to the merge queue — which runs even under a scheduler pause — and
+        leave the task ``blocked`` while the merge queue's own full verify runs
+        as the sole gate (never bypasses, PRD §2.2).
+
+        Returns ``True`` iff a MergeRequest was submitted (the caller then skips
+        today's ``stranded_blocked`` re-file and returns None).  Returns
+        ``False`` — leaving today's re-file/re-pend path byte-identical — when
+        the kill-switch is off, the event-store / merge-queue is unavailable,
+        or the shape does not match.  Naturally inert on non-pooled projects:
+        no ASSIGNED lane record → ``detect_verified_green`` returns None →
+        ``False``.
+
+        This method owns the full ON-MATCH sequence (PRD leaf α §2.1): the
+        durable-marker dedup (skip a re-submit while the merge is presumed
+        in-flight), the ``MergeRequest`` build + durable-fail done-callback
+        registration + ``enqueue_merge_request``, the durable
+        ``metadata.stranded_merge_request`` marker stamp, and the
+        auto-dismissed ``stranded_blocked`` record escalation.  Done-on-success
+        is delegated to the EXISTING found_on_main MARK_DONE path (the marker
+        lives in metadata, ignored there — non-interference).
+        """
+        if (
+            not self.config.stranded_verified_green_merge_enabled
+            or self.event_store is None
+            or self._merge_queue is None
+        ):
+            return False
+
+        match = await detect_verified_green(
+            tid,
+            git_ops=self.git_ops,
+            event_store=self.event_store,
+            worktree_resolver=self._resolve_task_worktree,
+        )
+        if match is None:
+            return False
+
+        # Idempotency / race-guard (PRD leaf α §7): a durable metadata marker
+        # records the tip_sha + request_id + submitted_at of the last submit.
+        # If a fresh marker for THIS lane tip is already present the merge is
+        # presumed still in-flight — return True WITHOUT re-enqueuing so the
+        # periodic sweep doesn't pile duplicate requests onto the same branch.
+        # A stale marker or an advanced lane tip falls through to a fresh
+        # submit (self-healing, restart-safe).
+        if self._stranded_merge_marker_is_fresh(
+            metadata.get('stranded_merge_request'), match.tip_sha,
+        ):
+            logger.info(
+                'Reconcile: task %s stranded verified-green already submitted '
+                '(marker tip=%s) — skipping re-submit (merge presumed '
+                'in-flight; task stays blocked)',
+                tid, match.tip_sha,
+            )
+            return True
+
+        from orchestrator.merge_queue import enqueue_merge_request
+        from orchestrator.merge_types import (
+            MergeOutcome,
+            MergeRequest,
+            QueuedBranch,
+        )
+
+        future: asyncio.Future[MergeOutcome] = (
+            asyncio.get_running_loop().create_future()
+        )
+        req = MergeRequest(
+            task_id=tid,
+            branch=QueuedBranch.parse(tid, self.config.git.branch_prefix),
+            worktree=match.worktree,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            config=self.config,
+            result=future,
+            snapshot_tip=match.tip_sha,
+        )
+        # Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed; the
+        # callback body is wired in step-14 (a strict no-op for success /
+        # transient outcomes, so the branch + lane are preserved by omission).
+        req.result.add_done_callback(
+            lambda fut: self._on_stranded_merge_done(fut, tid=tid),
+        )
+        await enqueue_merge_request(
+            self._merge_queue, req, self.event_store, source='stranded-reaper',
+        )
+
+        # Stamp the durable race-guard marker (PRD leaf α §7).  Best-effort:
+        # a lost marker only means a benign re-submit next sweep, so a failed
+        # write must never abort the remediation.  Merge-mode write (the
+        # scheduler default) touches ONLY this key, preserving siblings; the
+        # marker lives in metadata so the found_on_main MARK_DONE path ignores
+        # it entirely (non-interference).
+        try:
+            await self.scheduler.update_task(
+                tid,
+                {
+                    'stranded_merge_request': {
+                        'tip_sha': match.tip_sha,
+                        'request_id': req.request_id,
+                        'submitted_at': datetime.now(UTC).isoformat(),
+                    },
+                },
+            )
+        except Exception:
+            logger.warning(
+                'Reconcile: task %s — failed to stamp stranded_merge_request '
+                'marker (benign; only risks a re-submit next sweep)',
+                tid, exc_info=True,
+            )
+
+        # Record the action (PRD §2.1): file a stranded_blocked escalation and
+        # IMMEDIATELY auto-resolve it with a close_only/dismiss disposition.
+        # dismiss=True → _resolve_escalation_action maps status='dismissed' to
+        # 'close_only' → _on_escalation_resolved's WORKFLOW_NONE branch → NO
+        # blocked→pending flip (unlike a resume-resolution, which would trigger
+        # the exact Fix #1a re-pend we are replacing).  The dismissed record
+        # still lands in the archive as an audit trail, and leaving NO pending
+        # escalation keeps the later found_on_main MARK_DONE flip unblocked
+        # (its report.open_escalations guard).
+        if self._escalation_queue is not None:
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            esc = Escalation(
+                id=self._escalation_queue.make_id(tid),
+                task_id=tid,
+                agent_role='harness-stranded-blocked-reaper',
+                severity='blocking',
+                category='stranded_blocked',
+                summary=(
+                    f'Verified-green stranded remediation: task {tid} branch '
+                    f'submitted directly to the merge queue (no re-pend).'
+                )[:200],
+                detail=(
+                    f'Task {tid} was blocked with verified-green, all-steps-done '
+                    f'lane work (branch tip {match.tip_sha}) but no open '
+                    f'escalation and no live claimant — the stranded-verified-'
+                    f'green shape (PRD leaf α §2.1).  Rather than re-pend it into '
+                    f'a possibly-paused scheduler, the branch was submitted '
+                    f'directly to the merge queue (request_id={req.request_id}, '
+                    f'source=stranded-reaper).  The merge queue\'s own full '
+                    f'verify is the sole gate; the task stays blocked and is '
+                    f'marked done by the existing found_on_main path once the '
+                    f'merge lands (or a stranded_merge_failed L2 is filed on a '
+                    f'durable merge/verify failure).'
+                ),
+                suggested_action='manual_intervention',
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            self._escalation_queue.resolve(
+                esc.id,
+                resolution=(
+                    f'submitted branch to merge queue '
+                    f'(request_id={req.request_id}, source=stranded-reaper); '
+                    f'merge-queue verify is the gate — task stays blocked'
+                ),
+                dismiss=True,
+                resolved_by='harness-stranded-blocked-reaper',
+            )
+            if self.event_store is not None:
+                self.event_store.emit(
+                    EventType.escalation_created,
+                    task_id=tid,
+                    data={
+                        'escalation_id': esc.id,
+                        'category': 'stranded_blocked',
+                        'severity': 'blocking',
+                        'level': 1,
+                        'reason': 'stranded-verified-green-submitted',
+                    },
+                )
+            logger.warning(
+                'Reconcile: task %s stranded verified-green — submitted branch '
+                'to merge queue (request_id=%s, source=stranded-reaper); filed+'
+                'dismissed record L1 %s (task stays blocked, no re-pend)',
+                tid, req.request_id, esc.id,
+            )
+        return True
+
+    # Every MergeOutcome.status is classified into exactly one of the two
+    # frozensets below; the pair MUST exhaust MergeOutcome's status Literal.
+    # That partition is enforced at CI time by
+    # test_stranded_verified_green.test_status_sets_exhaust_merge_outcome_vocabulary
+    # (adding a new status without classifying it fails that test), and — as a
+    # runtime backstop — a status found in NEITHER set is treated LOUDLY as a
+    # durable failure in _on_stranded_merge_done.  Together these guarantee a
+    # new/unclassified outcome can never silently no-op into a stranded task
+    # with no operator signal (the exact silent-strand class PRD leaf α fixes).
+    #
+    # Durable merge/verify failure outcomes for a stranded-reaper submission —
+    # a stale-green branch failing the merge queue's own verify lands here and
+    # warrants a born-at-L2 (PRD leaf α §2.2).
+    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
+        'conflict', 'blocked', 'error', 'unknown_branch',
+        'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
+    })
+    # Success / transient outcomes — a strict no-op: the happy 'done' is
+    # delivered by the existing found_on_main path, and a transient/superseded
+    # outcome is re-driven by a later sweep.  The branch + lane are preserved
+    # by omission (the callback never touches them).
+    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
+        'done', 'already_merged', 'done_wip_recovery', 'superseded',
+        'wip_halted',
+    })
+
+    def _on_stranded_merge_done(
+        self, fut: asyncio.Future, *, tid: str,
+    ) -> None:
+        """Done-callback for a stranded-reaper MergeRequest (durable-fail → L2).
+
+        Sync (fires on the loop when the MergeRequest future resolves).  Derives
+        the terminal outcome and, on a DURABLE merge/verify failure, schedules
+        :meth:`_file_stranded_merge_failed` (a born-at-L2) via
+        ``_schedule_coro_threadsafe``; success / transient outcomes (and a
+        cancelled/abandoned future) are a strict no-op, so the branch + lane are
+        preserved by omission.  Wrapped fail-safe: any error is logged and never
+        propagated (mirrors ``enqueue_merge_request._on_finalized``).
+        """
+        try:
+            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+
+            if fut.cancelled():
+                return  # abandoned/superseded — transient, no-op
+            exc = fut.exception()
+            if exc is not None:
+                outcome = MergeOutcome(
+                    status='error', reason=f'merge future raised: {exc}',
+                )
+            else:
+                outcome = fut.result()
+            status = outcome.status
+            if status in self._SUCCESS_TRANSIENT_MERGE_STATUSES:
+                return  # success/transient → strict no-op (branch+lane preserved)
+            if status not in self._DURABLE_MERGE_FAILURE_STATUSES:
+                # UNCLASSIFIED status — a new MergeOutcome.status reached the
+                # callback without being sorted into either set (the
+                # exhaustiveness test guards this at CI time; this is the
+                # runtime backstop).  Treat an unknown outcome as a durable
+                # failure and file the L2 rather than silently no-op'ing: a
+                # stale-green branch that fails the merge-queue verify must
+                # never strand with no operator signal (loud-over-silent — the
+                # exact class PRD leaf α exists to fix).
+                logger.error(
+                    '_on_stranded_merge_done: UNCLASSIFIED merge status %r for '
+                    'task %s — treating as a durable failure and filing a '
+                    'born-at-L2 (classify it into _DURABLE_MERGE_FAILURE_STATUSES '
+                    'or _SUCCESS_TRANSIENT_MERGE_STATUSES)', status, tid,
+                )
+            self._schedule_coro_threadsafe(
+                self._file_stranded_merge_failed(tid, outcome),
+                label=(
+                    f'stranded-merge-failed task {tid} (status={status})'
+                ),
+            )
+        except Exception:
+            logger.warning(
+                '_on_stranded_merge_done: failed to process merge outcome for '
+                'task %s — no L2 filed (fail-safe)', tid, exc_info=True,
+            )
+
+    async def _file_stranded_merge_failed(
+        self, tid: str, outcome: Any,
+    ) -> None:
+        """File a BORN-AT-L2 ``stranded_merge_failed`` for a durably-failed
+        stranded-reaper merge (PRD leaf α §2.2; mirrors
+        :meth:`_block_and_escalate_delivered_check`).
+
+        ``agent_role='harness-stranded-blocked-reaper'`` (a harness-sentinel
+        role) + ``severity='critical'`` + ``level=2`` make the record BORN AT
+        L2 — it bypasses the auto-watcher and routes straight to a human.  A
+        persistently-false verified-green claim is a "someone must look now"
+        condition.
+
+        Unlike ``_block_and_escalate_delivered_check`` this does NOT touch task
+        status, the lane, or the branch: the task is already ``blocked`` and the
+        branch + lane are preserved for inspection (preservation by omission).
+        Deduped via a scoped ``get_by_task(tid, status='pending', level=2,
+        agent_role=...)`` read filtered to this category.  No-ops when no
+        escalation queue is attached (bare-Harness unit tests stay green).
+        """
+        if self._escalation_queue is None:
+            return
+
+        existing = self._escalation_queue.get_by_task(
+            tid, status='pending', level=2,
+            agent_role='harness-stranded-blocked-reaper',
+        )
+        if any(e.category == 'stranded_merge_failed' for e in existing):
+            logger.warning(
+                'stranded_merge_failed L2 already open for task %s — '
+                'suppressing duplicate', tid,
+            )
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        status = getattr(outcome, 'status', 'unknown')
+        reason = getattr(outcome, 'reason', '') or ''
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role='harness-stranded-blocked-reaper',
+            severity='critical',
+            category='stranded_merge_failed',
+            summary=(
+                f'Verified-green stranded merge FAILED for task {tid} '
+                f'(status={status}) — manual intervention.'
+            )[:200],
+            detail=(
+                f'The verified-green stranded remediation submitted task {tid}\'s '
+                f'branch directly to the merge queue, but the merge/verify failed '
+                f'durably: status={status}, reason={reason!r}.  The task remains '
+                f'blocked and the branch + lane are preserved (untouched) for '
+                f'inspection.  A stale-green branch failing the merge queue\'s '
+                f'own full verify lands here — the remediation never bypasses '
+                f'that gate (PRD leaf α §2.2).  Investigate and re-drive or '
+                f'triage manually.'
+            ),
+            suggested_action='manual_intervention',
+            level=2,
+        )
+        self._escalation_queue.submit(esc)
+        if self.event_store is not None:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=tid,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'stranded_merge_failed',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': f'stranded-merge-{status}',
+                },
+            )
+        logger.warning(
+            'Filed born-at-L2 stranded_merge_failed %s for task %s '
+            '(status=%s) — task stays blocked, branch+lane preserved',
+            esc.id, tid, status,
+        )
+
     async def _branch_is_degenerate(
         self, branch: str, metadata: dict[str, Any],
     ) -> bool:
@@ -4590,6 +4983,19 @@ class Harness:
                 and self._escalation_queue is not None
                 and metadata.get('task_kind') != 'deterministic'
             ):
+                # Verified-green stranded remediation (PRD leaf α §2.1): BEFORE
+                # re-filing, check whether this blocked task's warm lane holds
+                # verified-green, all-steps-done work.  On a match we submit the
+                # branch DIRECTLY to the merge queue (which runs even under a
+                # scheduler pause — the incident's root cause) and record the
+                # action via an auto-dismissed escalation, leaving the task
+                # blocked; return None to SKIP today's re-file/re-pend.  On a
+                # non-match (or kill-switch off / non-pooled project) this
+                # returns False and we fall through to the unchanged re-file
+                # path below — byte-identical for every non-matching task.
+                if await self._maybe_submit_stranded_verified_green(tid, metadata):
+                    return None
+
                 from escalation.models import Escalation
 
                 esc = Escalation(

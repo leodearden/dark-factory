@@ -1752,6 +1752,10 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.
+    @pytest.mark.timeout(120)
     async def test_cas_retry_limit_exhausted(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -1774,7 +1778,10 @@ class TestMergeWorker:
         ):
             req = _make_request('7', 'cas-limit', worktree, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            # 90s (not the file's common 30s): the worker performs MAX_CAS_RETRIES
+            # real git-rebase retries here, which can exceed 30s wall-clock under
+            # `-n auto` host load with no logic fault (the assertion is unchanged).
+            outcome = await asyncio.wait_for(req.result, timeout=90)
 
         assert outcome.status == 'blocked'
         assert 'cas retry limit' in outcome.reason.lower()
@@ -1865,6 +1872,10 @@ class TestMergeWorker:
         with pytest.raises(asyncio.CancelledError):
             await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.
+    @pytest.mark.timeout(120)
     async def test_merge_worker_emits_duration_ms_on_non_done_outcomes(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -3449,6 +3460,10 @@ class TestSpeculativeMergeWorker:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=15)
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.
+    @pytest.mark.timeout(120)
     async def test_speculative_chain_invalidation_propagates(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -3986,6 +4001,10 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.
+    @pytest.mark.timeout(120)
     async def test_speculative_merger_phase_emits_duration_ms(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -5281,6 +5300,10 @@ class TestSpeculativeMergeWorker:
 
     # ── Mechanism 2 × chain-invalidation: speculative follower (task 1646 amend) ─
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.
+    @pytest.mark.timeout(120)
     async def test_speculative_follower_chain_invalidated_after_pickup_rebase(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
@@ -5356,7 +5379,12 @@ class TestSpeculativeMergeWorker:
 
             # Wait for both N+1 and N+2 to sit in the verifier queue — proves the
             # two-deep speculative prefetch ran (only possible at K=2).
-            deadline = time.monotonic() + 15
+            # 30s (not the file's more common 15s poll budget): under heavy
+            # `-n auto` host load the real git-subprocess merges backing N+1/N+2
+            # can exceed 15s wall-clock with no logic fault (mirrors the sibling
+            # test_chain_invalidated_pre_rebased_n2_verify_runs).  The assertion
+            # — N+1 and N+2 must both reach the verifier queue — is unchanged.
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if worker._verifier_queue.qsize() >= 2:
                     break
@@ -5364,7 +5392,7 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail(
                     'N+1 and N+2 did not both appear in the verifier queue within '
-                    '15 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
+                    '30 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
                 )
 
             # Release gate → N passes verify → main advances; N+1 and N+2 land in
@@ -5408,6 +5436,11 @@ class TestSpeculativeMergeWorker:
 
     # ── BUG #1687: pre_rebased N+2 + chain_invalidated must verify on tree change ─
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  (The internal poll is
+    # already widened to 30s below; the pytest-timeout cap needs raising too.)
+    @pytest.mark.timeout(120)
     async def test_chain_invalidated_pre_rebased_n2_verify_runs(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
@@ -5523,6 +5556,10 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.
+    @pytest.mark.timeout(120)
     async def test_chain_invalidated_pre_rebased_n2_red_tree_blocked(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
@@ -5580,7 +5617,12 @@ class TestSpeculativeMergeWorker:
             queue.put_nowait(req_n1)
             queue.put_nowait(req_n2)
 
-            deadline = time.monotonic() + 15
+            # 30s (not the file's more common 15s poll budget): under heavy
+            # `-n auto` host load the real git-subprocess merges backing N+1/N+2
+            # can exceed 15s wall-clock with no logic fault (mirrors the sibling
+            # test_chain_invalidated_pre_rebased_n2_verify_runs).  The assertion
+            # — N+1 and N+2 must both reach the verifier queue — is unchanged.
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if worker._verifier_queue.qsize() >= 2:
                     break
@@ -5588,7 +5630,7 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail(
                     'N+1 and N+2 did not both appear in the verifier queue within '
-                    '15 s.  N+2 must be speculatively prefetched after N+1 is built.'
+                    '30 s.  N+2 must be speculatively prefetched after N+1 is built.'
                 )
 
             gate_open.set()
@@ -7435,6 +7477,71 @@ class TestEnqueueMergeRequest:
         assert rows[0][1] == '42'
         assert rows[0][2] == 'merge'
         assert rows[0][3] == '42'
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_threads_source_into_merge_queued(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """source='stranded-reaper' surfaces as data['source'] on merge_queued.
+
+        PRD leaf α §6α acceptance signal: reaper-submitted merges carry a
+        source marker distinguishing them from workflow/MCP submissions.
+        """
+        import json
+
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(
+            queue, req, event_store, source='stranded-reaper',
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        data = json.loads(rows[0][0])
+        assert data['source'] == 'stranded-reaper'
+        assert data['branch'] == '42'
+
+    @pytest.mark.asyncio
+    async def test_enqueue_helper_omits_source_key_when_unset(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ):
+        """Existing callers (no source=) emit NO 'source' key — byte-identical."""
+        import json
+
+        from orchestrator.merge_queue import enqueue_merge_request
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        db_path = tmp_path / 'runs.db'
+        event_store = EventStore(db_path, 'run-1')
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('42', 'task/42', wt, config)
+
+        await enqueue_merge_request(queue, req, event_store)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT data FROM events WHERE event_type = 'merge_queued'"
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        data = json.loads(rows[0][0])
+        assert 'source' not in data
 
     @pytest.mark.asyncio
     async def test_enqueue_helper_with_none_event_store_still_enqueues(
@@ -21667,6 +21774,14 @@ class TestSpeculationSlotSemaphoreDepth:
     part (b) is the K=1 regression guard that already passes.
     """
 
+    # This test gates N's verify for up to 30s waiting for K=2 concurrency and
+    # builds 3 real git merge worktrees; under `-n auto` (32 workers on 32 CPUs)
+    # its wall-clock can drift past the global 60s per-test timeout, which the
+    # thread-method pytest-timeout answers by os._exit()ing the xdist worker
+    # ("node down: Not properly terminated"; see pyproject.toml addopts note).
+    # Opt out with a larger, still-bounded ceiling per the pyproject.toml
+    # "Slow tests opt out with @pytest.mark.timeout(N)" convention.
+    @pytest.mark.timeout(120)
     async def test_k2_builds_two_speculative_ahead(
         self,
         git_ops: GitOps,
@@ -21789,6 +21904,13 @@ class TestSpeculationPermitLeakOnMergerError:
        verifier queue, so N+3 hangs.
     """
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  Builds 4 real
+    # worktrees and drives a full SpeculativeMergeWorker through two merge
+    # phases; cumulative wall-clock (not any single 30s wait_for) can exceed 60s
+    # under host load with no logic fault.
+    @pytest.mark.timeout(120)
     async def test_worktree_missing_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -21857,6 +21979,13 @@ class TestSpeculationPermitLeakOnMergerError:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  Builds 4 real
+    # worktrees and drives a full SpeculativeMergeWorker through two merge
+    # phases; cumulative wall-clock (not any single 30s wait_for) can exceed 60s
+    # under host load with no logic fault.
+    @pytest.mark.timeout(120)
     async def test_merger_exception_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -21917,6 +22046,13 @@ class TestSpeculationPermitLeakOnMergerError:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
+    # Slow (real git merge worktrees): opt out of the 60s per-test timeout that
+    # `-n auto` CPU contention can trip (worker os._exit) — see the detailed
+    # rationale on test_k2_builds_two_speculative_ahead.  Builds 4 real
+    # worktrees and drives a full SpeculativeMergeWorker; cumulative wall-clock
+    # (not any single 30s wait_for) can exceed 60s under host load with no logic
+    # fault — same shape as sibling (a)/(b), which crashed a worker this way.
+    @pytest.mark.timeout(120)
     async def test_abandoned_speculative_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):

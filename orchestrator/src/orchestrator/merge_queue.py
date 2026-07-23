@@ -3318,6 +3318,7 @@ def _emit_merge_queued(
     *,
     queue_depth: int | None = None,
     position: int | None = None,
+    source: str | None = None,
 ) -> None:
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
@@ -3330,8 +3331,12 @@ def _emit_merge_queued(
     *queue_depth* (when provided) records how deep the main queue was at the
     moment of enqueue — O(1) qsize() from the call site.  *position* (when
     provided) records the front-of-line position for urgent re-inserts (0 ==
-    head).  Each key is omitted when None so the shape remains backward-
-    compatible with existing consumers.
+    head).  *source* (when provided) tags the submission origin — e.g.
+    ``'stranded-reaper'`` for the verified-green stranded remediation
+    (stranding-remediation-scheduler-ergonomics-prd.md leaf α §6α) —
+    distinguishing reaper submissions from workflow/MCP ones.  Each key is
+    omitted when None so the shape remains backward-compatible with existing
+    consumers.
     """
     if event_store is None:
         return
@@ -3342,6 +3347,8 @@ def _emit_merge_queued(
         data['queue_depth'] = queue_depth
     if position is not None:
         data['position'] = position
+    if source is not None:
+        data['source'] = source
     event_store.emit(
         EventType.merge_queued,
         task_id=req.task_id,
@@ -3500,8 +3507,14 @@ async def enqueue_merge_request(
     event_store: EventStore | None,
     *,
     retention: TerminalOutcomeRetention | None = None,
+    source: str | None = None,
 ) -> None:
     """Enqueue a MergeRequest and emit a merge_queued event.
+
+    *source* (when provided) tags the merge_queued event's ``data['source']``
+    with the submission origin (e.g. ``'stranded-reaper'``); default None
+    keeps every existing caller's event shape byte-identical — the key is
+    omitted when unset.
 
     Puts the request on *queue* first so that a cancellation between put and
     emit (or any emit error) does not leave a dangling ``merge_queued`` row
@@ -3590,7 +3603,7 @@ async def enqueue_merge_request(
 
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
-    _emit_merge_queued(event_store, req, queue_depth=queue.qsize())
+    _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
 
 
 async def register_and_enqueue_merge_request(
