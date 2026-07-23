@@ -21,6 +21,7 @@ Adoption / dispatch / cascade enforcement land in later steps.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -486,3 +487,233 @@ class TestDispatchDeadBaseRecheck:
         worker._run_inflight_verify.assert_called_once()  # verify launched normally
         assert worker._event_store.speculative_events(EventType.verdict_voided) == []
         assert entry is not None
+
+
+# ── Head-failure cascade dangling-successor-edge population (enforcement (c)) ──
+
+# Fake SHAs for the 5260 cascade topology, mutually distinct from the module
+# constants above so base==main / base∈dead-set are unambiguous:
+_HEAD_C = 'c' * 40   # the FAILED head's merge commit — dead once the head fails.
+_DOWN_C = 'f' * 40   # the downstream speculative's OLD merge commit — dead once
+#                      the cascade re-merges it away (a straggler stacked on it
+#                      is left with a DANGLING successor edge).
+_STRAG_C = '9' * 40  # a built-awaiting-host straggler's own merge commit.
+
+
+def _make_remerge_to_decided_stub() -> AsyncMock:
+    """AsyncMock for ``worker._remerge`` returning a DecidedItem passthrough.
+
+    A re-merged item that is a :class:`DecidedItem` dispatches as a passthrough
+    (verify_task=None) — no host is acquired and ``_run_inflight_verify`` is
+    NEVER called — so the cascade / dispatch re-check can drive to a clean rest
+    without a real repo or a real verify.  Bound to the request passed to
+    ``_remerge`` so lifecycle/registry bookkeeping stays coherent.
+    """
+
+    def _side(request: object, started_monotonic: object = None) -> DecidedItem:
+        return DecidedItem(
+            request=request,  # type: ignore[arg-type]
+            immediate_outcome=MergeOutcome('conflict', reason='remerged-stub'),
+            base_sha=_MAIN,
+            speculative=False,
+        )
+
+    return AsyncMock(side_effect=_side)
+
+
+async def _drive_cascade_recording(
+    worker: object, *, timeout_s: float = 5.0,
+) -> None:
+    """Drive ``_verifier_loop`` until the head-failure cascade calls ``_remerge``.
+
+    The cascade is INLINE in ``_verifier_loop`` (not a callable method), so it is
+    driven by pre-populating ``worker._inflight`` with a FAILED head + a
+    downstream entry (both with ALREADY-RESOLVED verify_tasks so DISPATCH-FILL
+    breaks straight to FINALIZE-HEAD) and running the loop as a task.  The loop
+    is cancelled as soon as the cascade has awaited ``_remerge`` once — at which
+    point step-10's ``_record_dead_base`` calls (which run BEFORE that remerge)
+    have populated the ledger.  A persistent verifier-getter, if one was armed,
+    is cancelled too so no pending task leaks.
+    """
+    loop_task = asyncio.ensure_future(worker._verifier_loop())  # type: ignore[attr-defined]
+    try:
+        for _ in range(int(timeout_s / 0.01)):
+            if worker._remerge.await_count >= 1:  # type: ignore[attr-defined]
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(BaseException):
+            await loop_task
+        _pvg = getattr(worker, '_pending_verifier_get', None)
+        if _pvg is not None:
+            _pvg.cancel()
+            with contextlib.suppress(BaseException):
+                await _pvg
+
+
+@pytest.mark.asyncio
+class TestCascadeRecordsDeadBase:
+    """(enforcement point (c), the PRD §3.3 prompt-invalidation optimization.)
+
+    When the head FAILs, the head-failure cascade re-merges every downstream
+    in-flight entry — but a straggler that was BUILT-AWAITING-HOST (parked on
+    ``_redispatch``, NOT in ``_inflight``) is invisible to the cascade and keeps
+    a DANGLING successor edge (base_sha → a commit that has been re-merged away).
+    The 5260 fix: the cascade must ``_record_dead_base`` the invalidated
+    predecessor commits (the failed head's merge commit AND each downstream's OLD
+    merge commit) so that straggler is caught at its next dispatch by the INV-3
+    dead-base re-check (enforcement (a)).
+
+    RED: the cascade records nothing today, so ``_dead_base_commits`` is empty
+    after it runs.  GREEN (step-10): both invalidated commits are recorded.
+    """
+
+    async def test_cascade_records_head_and_downstream_dead_bases(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._host_allocator = _make_mock_allocator()
+        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
+        # Stub the FS/host-touching helpers so the cascade drives on fake SHAs.
+        worker._release_or_cleanup = AsyncMock()  # type: ignore[method-assign]
+        worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
+        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
+        worker._remerge = _make_remerge_to_decided_stub()  # type: ignore[method-assign]
+
+        # HEAD: base == main (a GENUINE fail, not a dead-base void), merge_commit
+        # = HEAD_C.  Its verify resolves to a FAIL so FINALIZE-HEAD returns False
+        # and the cascade fires.
+        _, head_item = _make_fake_item(
+            'cascade-head', base_sha=_MAIN, merge_commit=_HEAD_C,
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(head_item, RealMergeItem)
+        head_lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        head_entry = _make_fail_entry(
+            head_item, head_lease,
+            MergeOutcome('blocked', reason='head verify fail'), head_item.merge_wt,
+        )
+
+        # DOWNSTREAM speculative: base == HEAD_C (stacked on the head's commit),
+        # merge_commit = DOWN_C.  A PASS verify (already resolved) — the cascade
+        # cancels + re-merges it regardless of its verdict.
+        _, down_item = _make_fake_item(
+            'cascade-down', base_sha=_HEAD_C, merge_commit=_DOWN_C,
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(down_item, RealMergeItem)
+        down_lease = HostLease(name='remote', runner=MagicMock(), is_local=False)
+        down_entry = _make_pass_entry(down_item, down_lease, down_item.merge_wt)
+
+        worker._inflight.append(head_entry)
+        worker._inflight.append(down_entry)
+        # Let the (trivial) verify-task coroutines resolve so DISPATCH-FILL sees
+        # no running in-flight verify and breaks straight to FINALIZE-HEAD.
+        await asyncio.sleep(0.05)
+
+        await _drive_cascade_recording(worker)
+
+        # The cascade DID re-merge the downstream (proves it ran to the remerge).
+        assert worker._remerge.await_count >= 1
+        # RED: the ledger is empty (cascade records nothing).
+        # GREEN (step-10): both invalidated predecessor commits are recorded so a
+        # straggler stacked on either is now catchable at dispatch.
+        assert _HEAD_C in worker._dead_base_commits, (
+            'the FAILED head\'s merge commit must be recorded dead by the cascade'
+        )
+        assert _DOWN_C in worker._dead_base_commits, (
+            'the downstream\'s OLD (re-merged-away) merge commit must be recorded '
+            'dead by the cascade so a built-awaiting-host straggler stacked on it '
+            'is caught at its next dispatch'
+        )
+
+
+@pytest.mark.asyncio
+class TestCascadeStragglerCaughtComposition:
+    """The headline 5260 end-to-end: the cascade's dead-base recording (c)
+    composes with the dispatch-time dead-base re-check (a) so a built-awaiting-
+    host straggler is CAUGHT — re-merged against real main, NOT verified for
+    43 min against a base the cascade already re-merged away.
+
+    Two phases in one deterministic drive (no fragile host-availability timing):
+      · Phase 1 — drive the head-failure cascade so the downstream's OLD merge
+        commit DOWN_C is recorded dead (enforcement (c)).
+      · Phase 2 — the straggler (base_sha == DOWN_C) finally gets a host and
+        dispatches; the INV-3 dispatch re-check (enforcement (a)) reads the
+        ledger DOWN_C landed in and VOIDs it.
+
+    RED: phase 1 records nothing → in phase 2 ``_chain_dead_link`` returns None →
+    the straggler burns a verify against the dead base (no ``verdict_voided``,
+    ``_run_inflight_verify`` called).  GREEN (step-10): the straggler is caught.
+    ``two_layer_invariants`` stays empty throughout (§5.3 monitored → enforced).
+    """
+
+    async def test_straggler_on_dead_downstream_base_caught_at_dispatch(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._host_allocator = _make_mock_allocator()
+        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
+        worker._release_or_cleanup = AsyncMock()  # type: ignore[method-assign]
+        worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
+        worker._abort_remote_verify = AsyncMock()  # type: ignore[method-assign]
+        worker._remerge = _make_remerge_to_decided_stub()  # type: ignore[method-assign]
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
+        )
+
+        # ── Phase 1: drive the cascade so DOWN_C is recorded dead ─────────────
+        _, head_item = _make_fake_item(
+            'comp-head', base_sha=_MAIN, merge_commit=_HEAD_C,
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(head_item, RealMergeItem)
+        head_entry = _make_fail_entry(
+            head_item, HostLease(name='local', runner=MagicMock(), is_local=True),
+            MergeOutcome('blocked', reason='head verify fail'), head_item.merge_wt,
+        )
+        _, down_item = _make_fake_item(
+            'comp-down', base_sha=_HEAD_C, merge_commit=_DOWN_C,
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(down_item, RealMergeItem)
+        down_entry = _make_pass_entry(
+            down_item, HostLease(name='remote', runner=MagicMock(), is_local=False),
+            down_item.merge_wt,
+        )
+        worker._inflight.append(head_entry)
+        worker._inflight.append(down_entry)
+        await asyncio.sleep(0.05)
+        await _drive_cascade_recording(worker)
+
+        assert _DOWN_C in worker._dead_base_commits  # precondition for phase 2
+
+        # ── Phase 2: the built-awaiting-host straggler finally dispatches ─────
+        # Its base_sha is DOWN_C — the commit the cascade re-merged away.  Give it
+        # a free host slot (host-acquisition time) and a fresh event store so only
+        # the straggler's dispatch events are asserted.
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._host_allocator = _fake_local_allocator()
+        worker._remerge = _make_remerge_to_decided_stub()  # reset await_count
+        _, straggler = _make_fake_item(
+            'comp-straggler', base_sha=_DOWN_C, merge_commit=_STRAG_C,
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(straggler, RealMergeItem)
+
+        await worker._dispatch_item(straggler)
+
+        # Caught at dispatch: re-merged against real main, NO verify burned.
+        worker._remerge.assert_awaited_once()
+        worker._run_inflight_verify.assert_not_called()
+        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        assert len(voided) == 1
+        assert voided[0]['data']['dead_link'] == _DOWN_C
+        assert voided[0]['data']['reason'] == 'chain_dead'
+        assert voided[0]['data']['point'] == 'dispatch'
+
+        # §5.3 stays clean throughout (monitored → enforced upgrade).
+        assert worker.two_layer_invariants(_MAIN) == []
