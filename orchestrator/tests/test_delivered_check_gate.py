@@ -865,6 +865,89 @@ class TestPhaseBackfillTerminalDepRecords:
         assert scheduler.get_task.await_count == 2
         assert ctx.terminal_dep_records == records
 
+    # --- (h) warmed record carrying delivered_checks -> re-fetched, not stale --
+
+    @pytest.mark.asyncio
+    async def test_warmed_record_carrying_delivered_checks_is_refetched_not_served_stale(
+        self, scheduler: Scheduler
+    ):
+        """Task 2977: a cached TERMINAL dep record that carries a non-empty
+        ``metadata.delivered_checks`` must be treated as a cache MISS (and
+        re-fetched) every sweep, not served straight from
+        ``_terminal_dep_record_cache`` — otherwise an operator's in-place
+        correction of a DONE dep's check descriptor at a fixed main SHA is
+        never observed, and task 2975's descriptor-digest self-heal (which
+        is computed from whatever this phase serves into
+        ``ctx.terminal_dep_records``) can never fire."""
+        stale_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [
+                    {'kind': 'grep', 'name': 'c', 'pattern': 'OLD_BAD_PATTERN'}
+                ]
+            },
+        }
+        scheduler._terminal_dep_record_cache['20'] = stale_record
+        corrected_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [
+                    {'kind': 'grep', 'name': 'c', 'pattern': 'FIXED_PATTERN'}
+                ]
+            },
+        }
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        scheduler.get_task = AsyncMock(return_value=corrected_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == corrected_record
+        assert scheduler._terminal_dep_record_cache['20'] == corrected_record
+
+    # --- (i) warmed CHECKLESS record -> still served from cache, no re-fetch --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cached_metadata',
+        [
+            {'delivered_checks': []},
+            {},  # no 'delivered_checks' key at all
+        ],
+        ids=['empty-list', 'key-absent'],
+    )
+    async def test_warmed_record_without_delivered_checks_still_served_from_cache_no_refetch(
+        self, scheduler: Scheduler, cached_metadata: dict
+    ):
+        """Boundary/regression guard pinning the cache's entire performance
+        rationale: a warmed record that carries NO delivered_checks (the
+        overwhelming common case) must still be served for free, with no
+        get_task call — this must keep passing after the task 2977 fix, or
+        that fix has become an over-broad 'always re-fetch'."""
+        cached_record = {'id': '20', 'status': 'done', 'metadata': cached_metadata}
+        scheduler._terminal_dep_record_cache['20'] = cached_record
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'should': 'not-be-used'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records['20'] is cached_record
+
 
 # ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
