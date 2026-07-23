@@ -410,6 +410,24 @@ class EventType(StrEnum):
     # data keys: {amendment_round:int, recovery:'auto_commit', wip_sha:str|None}
     amendment_uncommitted_recovered = 'amendment_uncommitted_recovered'
 
+    # OS-sandbox worktree containment (plans/os-sandbox-worktree-containment-prd.md
+    # task β2, §Goal 3 / INV-2). Gives operators (and γ1's soak predicate) a
+    # mechanical, per-invocation record of whether OS containment was active for
+    # each sandboxed dispatch: every sandboxed invocation emits exactly one of
+    # these two — a real/none-escape wrap emits sandbox_applied, a fail-closed
+    # refusal emits sandbox_unavailable.
+    #
+    # sandbox_unavailable — emitted in TaskWorkflow._guard_sandbox's
+    #   except-SandboxUnavailable branch on the β1 fail-closed refusal, ONCE PER
+    #   REFUSAL (deliberately NOT deduped — unlike the accompanying blocking
+    #   escalation, which stays deduped per backend-state change, INV-4). The
+    #   event store is the per-invocation structured record γ1 queries ("0
+    #   sandbox-attributed blocks" must see EACH refusal), so suppressing repeat
+    #   events would blind the soak predicate. role/task_id are first-class
+    #   columns. Payload: {backend} — the configured backend that failed to
+    #   resolve (SandboxUnavailable.backend_state).
+    sandbox_unavailable = 'sandbox_unavailable'
+
 
 class EventStore:
     """Append-only SQLite event store.
