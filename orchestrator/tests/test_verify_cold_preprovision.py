@@ -199,3 +199,57 @@ class TestColdPreprovisionFailOpen:
         assert any(
             'pre-provision' in m.lower() and 'uv sync' in m for m in warnings
         ), f'a WARNING must name the pre-provision failure: {warnings!r}'
+
+
+class TestColdPreprovisionCoalesce:
+    """Under a concurrent fan-out (post-merge per-module type-only pyright /
+    task-role multi-subproject) the provision must be coalesced to EXACTLY ONCE
+    per worktree — never N concurrent ``uv sync`` on the same cold venv, which is
+    itself the concurrent-uv-on-cold-venv operation this task eliminates."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fanout_provisions_exactly_once(self, tmp_path: Path):
+        """Two run_verification calls race on the SAME cold worktree with the
+        knob set; the provision ``_run_cmd`` blocks until both calls have reached
+        the guard, so they genuinely overlap.  The provision must execute exactly
+        once across both, while each call still runs its own three checks.  RED
+        today: step-2/4 run the provision once per call (== 2)."""
+        wt = tmp_path
+        config = _make_config(wt, preprovision=PROVISION_CMD)
+        invoked: list[str] = []
+        counts = {'provision': 0}
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked.append(cmd)
+            if _is_provision(cmd):
+                counts['provision'] += 1
+                first_entered.set()
+                # Block so a concurrent provision (RED) — or a concurrent caller
+                # blocked on the per-worktree lock (GREEN) — genuinely overlaps
+                # this in-flight one rather than serialising behind it.
+                await release.wait()
+                return 0, '', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            t1 = asyncio.create_task(
+                verify.run_verification(wt, config, is_merge_verify=True)
+            )
+            t2 = asyncio.create_task(
+                verify.run_verification(wt, config, is_merge_verify=True)
+            )
+            await first_entered.wait()  # one provision is in-flight (blocked)
+            for _ in range(5):          # let the sibling reach its guard/lock
+                await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(t1, t2)
+
+        assert counts['provision'] == 1, (
+            f'provision must be coalesced to exactly one across the concurrent '
+            f'fan-out, got {counts["provision"]}: {invoked!r}'
+        )
+        # Each call still ran its own three checks (2 calls × 3 legs = 6).
+        assert len([c for c in invoked if _is_check(c)]) == 6, invoked
+        assert all(r.passed for r in results), results
