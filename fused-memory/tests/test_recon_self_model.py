@@ -457,25 +457,26 @@ class TestRenderEntityStandingDecisionSchemaSection:
         assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION in text
         assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION == 'structural_size_conflation'
 
-    def test_demotion_prose_names_ad_hoc_kinds_as_evidence_only(self):
-        """Item 4: the entity_standing_decision ledger kind is the SOLE
-        machine-consulted standing-decision form; the ad-hoc mem0 kinds are
-        demoted to evidence-only."""
+    def test_demotion_names_both_ad_hoc_kind_identifiers(self):
+        """Item 4: the demotion prose names the two exact ad-hoc mem0 kind
+        identifiers it demotes to evidence-only. These are specific identifier
+        tokens (not free-form prose), so pinning them guards that the renderer
+        keeps naming both demoted kinds. The weaker 'evidence-only'/'sole'
+        wording pin is intentionally dropped — it can pass on unrelated prose,
+        and the demotion prose is already pinned byte-identically into both
+        assembled prompts by test_standing_decision_prompt_drift.py."""
         text = m.render_entity_standing_decision_schema_section()
         assert 'recurring_flag_standing_decision' in text
         assert 'stage1_finding_correction' in text
-        assert 'evidence-only' in text or 'sole' in text
 
-    def test_advisory_check_prose(self):
-        """Item 2: a pre-emission advisory get_memories_by_metadata check against
-        the mem0 mirror; advisory ONLY — the authoritative gate is Stage 1's
-        filter, and reads never consult mem0 for authority."""
+    def test_advisory_check_names_the_mem0_read_tool(self):
+        """Item 2: the pre-emission advisory check names the specific mem0-read
+        tool (`get_memories_by_metadata`) — the one real-invariant instruction
+        token worth pinning intentionally. The surrounding advisory wording
+        ('advisory', 'authoritative', 'never consult mem0') is left to the
+        byte-identical drift guard rather than pinned here as churny prose."""
         text = m.render_entity_standing_decision_schema_section()
         assert 'get_memories_by_metadata' in text
-        assert 'advisory' in text
-        assert 'authoritative' in text
-        assert 'Stage 1' in text
-        assert 'never consult mem0' in text
 
 
 # --------------------------------------------------------------------------- #
@@ -500,20 +501,16 @@ class TestRenderInvestigationOutcomeSection:
         assert sdc.MEM0_KIND_INVESTIGATION_OUTCOME in text
         assert sdc.MEM0_KIND_INVESTIGATION_OUTCOME == 'investigation_outcome'
 
-    def test_describes_record_metadata(self):
-        """The record metadata: entity_uuid, actionable=false, and a run id."""
+    def test_names_record_schema_field_identifiers(self):
+        """The record schema is defined by three exact metadata field
+        identifiers (`entity_uuid`, `actionable`, `run_id`) — structural schema
+        tokens, not free-form prose — so pinning them guards the record
+        convention this section introduces. The weaker prose pins the original
+        draft carried ('false', 'not-actionable', 'arm'/'authorization'/
+        'evidence') are dropped: they can pass on unrelated prose, and the full
+        section text is already pinned byte-identically into the Stage-2 prompt
+        by test_standing_decision_prompt_drift.py."""
         text = m.render_investigation_outcome_section()
         assert 'entity_uuid' in text
         assert 'actionable' in text
-        assert 'false' in text
-        assert 'run_id' in text or 'run id' in text
-
-    def test_write_on_not_actionable_conclusion(self):
-        """The write is triggered on a not-actionable investigation conclusion."""
-        text = m.render_investigation_outcome_section()
-        assert 'not-actionable' in text or 'not actionable' in text
-
-    def test_feeds_authorization_arm2_evidence_pool(self):
-        """The records feed the β authorization arm-2 evidence pool."""
-        text = m.render_investigation_outcome_section()
-        assert 'arm' in text or 'authorization' in text or 'evidence' in text
+        assert 'run_id' in text
