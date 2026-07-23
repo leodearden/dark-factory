@@ -2702,6 +2702,18 @@ def create_mcp_server(
         """Get durable write queue statistics — pending, retry, dead, completed
         counts and oldest pending item age. Use to monitor queue health.
 
+        Two DISTINCT backlogs are reported and must NOT be confused (conflating
+        them drove the 2026-07-20 judge-halt mis-triage — task 2920):
+
+        * The top-level ``counts`` are the DURABLE WRITE queue — a separate
+          subsystem that stays ~0 in steady state.
+        * ``reconciliation_backlog`` (present only when a ``project_id`` is
+          supplied and a backlog policy is wired) is the reconciliation EVENT
+          backlog = buffered events + event-queue depth + in-flight retries.
+          This is the metric that governs backlog escalations and the one a
+          watcher MUST probe to confirm a drain. It is per-project, so the
+          global (``project_id``-less) call omits it — probe per-project.
+
         Args:
             project_id: Scope counts to a specific project (optional). When
                 omitted, returns global counts across all projects. This
@@ -2726,7 +2738,23 @@ def create_mcp_server(
                 return err
         if memory_service.durable_queue is None:
             return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
-        return await memory_service.durable_queue.get_stats(group_id=project_id)
+        stats = await memory_service.durable_queue.get_stats(group_id=project_id)
+        # task 2920 (b): enrich with the reconciliation event backlog — the
+        # metric backlog escalations govern and the one a watcher must probe to
+        # confirm a drain (the counts above are the durable-write-queue, a
+        # distinct subsystem that stays ~0). current_backlog is per-project;
+        # gating on backlog_policy-not-None keeps the no-policy exact-equality
+        # tests byte-identical, while production always wires backlog_policy.
+        if (
+            backlog_policy is not None
+            and project_id is not None
+            and isinstance(stats, dict)
+            and 'error' not in stats
+        ):
+            stats['reconciliation_backlog'] = await backlog_policy.current_backlog(
+                project_id,
+            )
+        return stats
 
     @mcp.tool()
     @mcp_tool_errors()
