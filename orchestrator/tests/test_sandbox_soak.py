@@ -83,3 +83,102 @@ def test_distinct_only_counts_sandboxed_done():
     status = {"t0": "done", "t1": "done", "t99": "done"}
     v = sandbox_soak.evaluate_soak(applied, status, set(), [], True, min_done=10)
     assert v.metrics["done_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Condition (c): sandbox-attribution heuristic (PRD Open Q2). A >=10-done +
+# report-present base isolates condition (c) as the sole verdict driver.
+# ---------------------------------------------------------------------------
+
+def _green_base(extra_status=None):
+    """10 distinct done sandboxed tasks — a base where only condition (c) can
+    flip the verdict. *extra_status* injects additional (non-sandboxed) tasks."""
+    applied = {f"s{i}" for i in range(10)}
+    status = {f"s{i}": "done" for i in range(10)}
+    if extra_status:
+        status.update(extra_status)
+    return applied, status
+
+
+def test_arm1_blocked_with_sandbox_unavailable_is_attributed():
+    applied, status = _green_base({"b1": "blocked"})
+    v = sandbox_soak.evaluate_soak(applied, status, {"b1"}, [], True, min_done=10)
+    assert v.ok is False
+    assert "b1" in v.reason
+    assert v.metrics["attributable_block_count"] == 1
+
+
+def test_arm2_blocked_with_eacces_escalation_is_attributed():
+    applied, status = _green_base({"b2": "blocked"})
+    escalations = [
+        {"task_id": "b2", "summary": "write denied: EACCES on /etc/foo",
+         "category": "sandbox_denial"},
+    ]
+    v = sandbox_soak.evaluate_soak(applied, status, set(), escalations, True, min_done=10)
+    assert v.ok is False
+    assert "b2" in v.reason
+
+
+def test_arm2_blocked_with_erofs_escalation_is_attributed():
+    applied, status = _green_base({"b3": "blocked"})
+    escalations = [
+        {"task_id": "b3", "summary": "EROFS: read-only file system", "category": "x"},
+    ]
+    v = sandbox_soak.evaluate_soak(applied, status, set(), escalations, True, min_done=10)
+    assert v.ok is False
+    assert "b3" in v.reason
+
+
+def test_blocked_with_neither_signal_is_not_attributed():
+    applied, status = _green_base({"b4": "blocked"})
+    v = sandbox_soak.evaluate_soak(applied, status, set(), [], True, min_done=10)
+    assert v.ok is True
+    assert v.metrics["attributable_block_count"] == 0
+
+
+def test_recovered_sandbox_unavailable_task_is_not_attributed():
+    # In sandbox_unavailable_task_ids but current status is `done` — recovered.
+    applied, status = _green_base({"r1": "done"})
+    v = sandbox_soak.evaluate_soak(applied, status, {"r1"}, [], True, min_done=10)
+    assert v.ok is True
+    assert v.metrics["attributable_block_count"] == 0
+
+
+def test_sandbox_word_without_errno_token_is_not_attributed():
+    # Arm 2 matches only the EACCES/EROFS tokens, never the word "sandbox".
+    applied, status = _green_base({"b5": "blocked"})
+    escalations = [
+        {"task_id": "b5", "summary": "sandbox worktree containment note",
+         "category": "sandbox"},
+    ]
+    v = sandbox_soak.evaluate_soak(applied, status, set(), escalations, True, min_done=10)
+    assert v.ok is True
+    assert v.metrics["attributable_block_count"] == 0
+
+
+def test_multiple_attributable_blocks_named_and_counted():
+    applied, status = _green_base({"b1": "blocked", "b2": "blocked"})
+    escalations = [{"task_id": "b2", "summary": "EACCES denied", "category": "x"}]
+    v = sandbox_soak.evaluate_soak(applied, status, {"b1"}, escalations, True, min_done=10)
+    assert v.ok is False
+    assert "b1" in v.reason and "b2" in v.reason
+    assert v.metrics["attributable_block_count"] == 2
+
+
+def test_attributable_blocks_helper_arms_and_exclusions():
+    task_status = {
+        "b1": "blocked",   # arm 1 (sandbox_unavailable)
+        "b2": "blocked",   # arm 2 (EACCES escalation)
+        "b3": "blocked",   # neither signal -> excluded
+        "r1": "done",      # in unavailable but recovered -> excluded
+        "b5": "blocked",   # 'sandbox' word only -> excluded
+    }
+    unavailable = {"b1", "r1"}
+    escalations = [
+        {"task_id": "b2", "summary": "write denied EACCES", "category": "x"},
+        {"task_id": "b5", "summary": "sandbox containment", "category": "x"},
+    ]
+    blocks = sandbox_soak._sandbox_attributable_blocks(
+        task_status, unavailable, escalations
+    )
+    assert blocks == ["b1", "b2"]
