@@ -13,8 +13,11 @@ records — never transcript-grep (INV-2).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -383,3 +386,125 @@ def test_unknown_ref_raises_soak_input_error(tmp_path):
         sandbox_soak._report_present_on_main(
             repo, ref="no-such-branch", path=PROBE_REPORT_PATH
         )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end CLI exit-code contract (0 green / 1 not-yet-green / 2 infra) via
+# `python -m orchestrator.sandbox_soak` over fixture DBs + a tmp git repo.
+# ---------------------------------------------------------------------------
+
+def _insert_applied(events_db, task_ids, run_id="run-A"):
+    conn = sqlite3.connect(str(events_db))
+    try:
+        conn.executemany(
+            "INSERT INTO events (timestamp, run_id, task_id, event_type, data) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [("2026-07-23T00:00:00+00:00", run_id, str(t),
+              EventType.sandbox_applied.value, "{}") for t in task_ids],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _make_green_fixture(tmp_path, n_done=12, commit_report=True):
+    """A fully-green fixture set: n_done distinct sandboxed tasks, all `done`,
+    with the probe report committed on main."""
+    events_db = tmp_path / "runs.db"
+    tasks_db = tmp_path / "tasks.db"
+    repo = tmp_path / "repo"
+    conn = sqlite3.connect(str(events_db))
+    conn.executescript(_event_store._SCHEMA)
+    conn.commit()
+    conn.close()
+    _insert_applied(events_db, range(n_done))
+    _build_tasks_db(tasks_db, [(i, "done") for i in range(n_done)])
+    _init_repo_on_main(repo)
+    if commit_report:
+        _write_report(repo)
+        _git(repo, "add", PROBE_REPORT_PATH)
+        _git(repo, "commit", "-q", "-m", "add probe report")
+    return events_db, tasks_db, repo
+
+
+def _run_cli(events_db, tasks_db, repo, *extra):
+    orch_src = Path(__file__).resolve().parents[1] / "src"
+    shared_src = Path(__file__).resolve().parents[2] / "shared" / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(orch_src), str(shared_src), env.get("PYTHONPATH", "")]
+    )
+    return subprocess.run(
+        [sys.executable, "-m", "orchestrator.sandbox_soak",
+         "--events-db", str(events_db),
+         "--tasks-db", str(tasks_db),
+         "--repo-root", str(repo),
+         *extra],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+
+
+def _nonblank(text):
+    return [ln for ln in text.splitlines() if ln.strip()]
+
+
+def test_cli_all_green_returns_0_with_single_pass_line(tmp_path):
+    e, t, r = _make_green_fixture(tmp_path)
+    res = _run_cli(e, t, r)
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    lines = _nonblank(res.stdout)
+    assert len(lines) == 1
+    assert "PASS" in lines[0]
+
+
+def test_cli_pre_soak_shortfall_returns_1_naming_shortfall(tmp_path):
+    e, t, r = _make_green_fixture(tmp_path, n_done=3)
+    res = _run_cli(e, t, r)
+    assert res.returncode == 1, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    lines = _nonblank(res.stdout)
+    assert len(lines) == 1
+    assert "FAIL" in lines[0]
+    assert "3/10" in lines[0]
+
+
+def test_cli_report_absent_returns_1(tmp_path):
+    e, t, r = _make_green_fixture(tmp_path, n_done=12, commit_report=False)
+    res = _run_cli(e, t, r)
+    assert res.returncode == 1, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "FAIL" in res.stdout
+
+
+def test_cli_attributable_block_returns_1_naming_task(tmp_path):
+    e, t, r = _make_green_fixture(tmp_path, n_done=12)  # green base
+    # A blocked task with a sandbox_unavailable event -> attributable block.
+    conn = sqlite3.connect(str(e))
+    conn.execute(
+        "INSERT INTO events (timestamp, run_id, task_id, event_type, data) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("2026-07-23T00:00:00+00:00", "run-A", "99",
+         EventType.sandbox_unavailable.value, "{}"),
+    )
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(str(t))
+    conn.execute("INSERT INTO tasks (tag, id, status) VALUES (?, ?, ?)", ("master", 99, "blocked"))
+    conn.commit()
+    conn.close()
+    res = _run_cli(e, t, r)
+    assert res.returncode == 1, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "FAIL" in res.stdout
+    assert "99" in res.stdout
+
+
+def test_cli_missing_events_db_returns_2_with_stderr_reason(tmp_path):
+    e, t, r = _make_green_fixture(tmp_path)
+    missing = tmp_path / "gone.db"
+    res = _run_cli(missing, t, r)
+    assert res.returncode == 2, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert res.stderr.strip() != ""
+
+
+def test_cli_unknown_arg_returns_2(tmp_path):
+    e, t, r = _make_green_fixture(tmp_path)
+    res = _run_cli(e, t, r, "--bogus-flag")
+    assert res.returncode == 2, f"stdout={res.stdout!r} stderr={res.stderr!r}"
