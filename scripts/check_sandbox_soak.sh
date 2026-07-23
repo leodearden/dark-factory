@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
 # scripts/check_sandbox_soak.sh — OS-sandbox rollout soak predicate (PRD γ1/γ5).
 #
-# Exit-code contract (before_done.kind='predicate', consumed by the γ5 soak
-# gate task of plans/os-sandbox-worktree-containment-prd.md): exit 0 iff the
-# DF sandbox canary soak is green —
-#   * >=10 distinct tasks with sandbox_applied events reached done, AND
-#   * the containment probe report is present on main at
-#     docs/sandbox-containment-probe-report.md, AND
-#   * 0 sandbox-attributable blocks
-# — via structured queries over the event store + task records (never
-# transcript-grep; INV-2). Non-zero exit => milestone_check_failed born-at-L2.
+# The before_done.kind='predicate' check consumed by the γ5 soak gate task of
+# plans/os-sandbox-worktree-containment-prd.md. A thin wrapper delegating to the
+# orchestrator module `orchestrator.sandbox_soak`, which derives the verdict
+# from STRUCTURED queries over the event store + task records — never
+# transcript-grep (INV-2).
 #
-# STUB-NOT-IMPLEMENTED: this is the decompose-time fail-safe stub, committed
-# so the γ5 predicate gate could be filed (the submit_task guard requires
-# before_done.script to exist and be executable at filing time). Task γ1
-# replaces this file with the real implementation (and removes the marker
-# above — the delivered-check on γ1 greps for its absence). Until then this
-# stub always exits 2: a premature run escalates loudly rather than
-# false-passing (fail-safe, INV-4).
+# EXIT-CODE CONTRACT (the DeterministicRunner parses the exit code ONLY; mirrors
+# scripts/recon_predicate_check.sh / scripts/check_merge_flakiness.sh):
+#   0  GREEN — all three hold: >=10 DISTINCT tasks with a `sandbox_applied`
+#      event reached `done`; the containment probe report is tracked on main at
+#      docs/sandbox-containment-probe-report.md; and 0 sandbox-attributable
+#      blocks. -> task done.
+#   1  measured-but-NOT-yet-green (the legitimate pre-soak state: too few done
+#      sandboxed tasks, report absent, or >=1 attributable block). γ5 `resume`
+#      re-runs the check = wait longer.
+#   2  usage/infra error (missing/unreadable events or tasks DB, bad args, git
+#      error resolving the report) — kept DISTINCT from the exit-1 verdict so an
+#      infra failure is never misread as a soak verdict.
+# Both non-zero codes surface as milestone_check_failed born-at-L2 on γ5. Every
+# non-zero exit prints one reason line (0/1 verdict to stdout, 2 error to
+# stderr).
+#
+# The python invocation is overridable via CHECK_SANDBOX_SOAK_PY (mirrors
+# fused-memory-flag-marker-check.sh's FLAG_MARKER_SWEEP_CMD) so tests can
+# substitute a lightweight stub command without spinning up uv.
+set -euo pipefail
 
-echo "check_sandbox_soak: NOT IMPLEMENTED — decompose-time stub. PRD task γ1 (plans/os-sandbox-worktree-containment-prd.md) must land the real soak predicate before this gate can pass." >&2
-exit 2
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+# shellcheck disable=SC2086  # CHECK_SANDBOX_SOAK_PY is a command word list.
+exec ${CHECK_SANDBOX_SOAK_PY:-uv run --frozen --project "$REPO_ROOT/orchestrator" python -m orchestrator.sandbox_soak} \
+    --repo-root "$REPO_ROOT" "$@"
