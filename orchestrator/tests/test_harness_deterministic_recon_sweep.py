@@ -70,6 +70,7 @@ from orchestrator.harness import (
     Harness,
     _deterministic_deploy_health_verdict,
     _deterministic_deploy_stranded,
+    _deterministic_gate_stranded,
     _recon_inspect_unit,
 )
 
@@ -435,6 +436,83 @@ def test_is_stranded_deterministic_shape_no_longer_exists() -> None:
     import orchestrator.harness as harness_module
 
     assert not hasattr(harness_module, '_is_stranded_deterministic_shape')
+
+
+# ---------------------------------------------------------------------------
+# step-1/step-2 (task 2954): harness._deterministic_gate_stranded — the
+# pure-gate / always_escalates GATE-strand detector, disjoint from the deploy
+# detector above.
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicGateStranded:
+    """step-1: harness._deterministic_gate_stranded — the pure-gate /
+    ``always_escalates`` GATE-strand detector.
+
+    Keys solely on ``task_kind=='deterministic'`` + a truthy
+    ``gate_escalated_at`` (the sole signal a human-decision gate was supposed
+    to be filed).  Deliberately DISJOINT from ``_deterministic_deploy_stranded``
+    (which requires ``deploy_state.phase==RAN`` and explicitly excludes
+    ``gate_escalated_at``) so no task is ever matched by both.  Metadata-only —
+    the empty-escalation-queue I/O check is the caller's job, mirroring the
+    deploy predicate's contract.
+    """
+
+    _ISO = '2026-07-01T00:05:00+00:00'
+
+    def test_true_for_pure_gate_with_gate_escalated_at(self) -> None:
+        """(a) pure gate that stamped its gate escalation → True."""
+        assert _deterministic_gate_stranded({
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'before_done': None,
+            'gate_escalated_at': self._ISO,
+        }) is True
+
+    def test_false_for_pure_gate_without_gate_escalated_at(self) -> None:
+        """(b) pure gate that never stamped (no gate filed yet) → False."""
+        assert _deterministic_gate_stranded({
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'before_done': None,
+        }) is False
+
+    def test_true_for_act_then_ask_deploy_gate_that_stamped(self) -> None:
+        """(c) an act-then-ask deploy that reached its human gate
+        (gate_escalated_at stamped, phase escalated) is a GATE strand — and is
+        NOT a deploy RAN-strand, so the two detectors stay disjoint here too."""
+        md = {
+            'task_kind': 'deterministic',
+            'before_done': {'target_unit': 'fused-memory.service'},
+            'gate_escalated_at': self._ISO,
+            'deploy_state': {'phase': DeployPhase.ESCALATED},
+        }
+        assert _deterministic_gate_stranded(md) is True
+        assert _deterministic_deploy_stranded(md) is False
+
+    def test_deploy_ran_strand_is_disjoint_from_gate_strand(self) -> None:
+        """(d) a deploy RAN-strand (target_unit set, phase==RAN, NO
+        gate_escalated_at) is owned by the deploy detector ONLY — pins that the
+        two detectors never both match the same task."""
+        ran_strand = _strand_metadata(phase=DeployPhase.RAN)
+        assert _deterministic_gate_stranded(ran_strand) is False
+        assert _deterministic_deploy_stranded(ran_strand) is True
+
+    def test_false_when_task_kind_not_deterministic(self) -> None:
+        """(e) task_kind != 'deterministic' → False even with gate_escalated_at."""
+        assert _deterministic_gate_stranded({
+            'task_kind': 'normal',
+            'gate_escalated_at': self._ISO,
+        }) is False
+
+    def test_false_for_none_metadata(self) -> None:
+        """(f) None metadata → False (no raise)."""
+        assert _deterministic_gate_stranded(None) is False
+
+    def test_false_for_non_dict_metadata(self) -> None:
+        """(f) non-dict metadata → False (no raise)."""
+        assert _deterministic_gate_stranded('not-a-dict') is False
+        assert _deterministic_gate_stranded(123) is False
 
 
 # ---------------------------------------------------------------------------
