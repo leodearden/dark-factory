@@ -618,3 +618,109 @@ class TestBacklogPolicyPerProjectOverride:
         err = verdict.to_error_dict()
         assert err['threshold'] == 20
         assert 'limit 20' in err['error']
+
+
+# ── Deliverable (a): distinct, un-suppressible judge-halt escalation ────────
+
+
+class TestDistinctLoudHaltEscalation:
+    """A judge halt must escalate LOUDLY and DURABLY, never absorbed into
+    generic backlog-overflow noise. Two independent defects caused that
+    absorption on the base branch: (1) the escalation id was hardcoded
+    ``esc-reconciliation-backlog-`` for every kind, so a halt was literally
+    filed as 'backlog'; (2) a single shared per-project rate-limit bucket
+    meant a backlog escalation inside the 900s window silently suppressed the
+    judge-halt escalation. These tests pin the fix: a distinct id prefix AND a
+    distinct per-kind rate-limit bucket."""
+
+    @pytest.mark.asyncio
+    async def test_halt_escalation_has_distinct_id_prefix(self, event_buffer, tmp_path):
+        """on_judge_halt writes an escalation whose id starts
+        ``esc-reconciliation-halt-`` (NOT ``-backlog-``), and whose summary
+        names both the halt and the reason."""
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,  # orchestrator live
+            hard_limit=500,
+        )
+        policy.register_project_root('proj', str(project_root))
+        reason = 'Serious verdict in run e87d8e4a'
+        verdict = await policy.on_judge_halt('proj', reason=reason)
+
+        assert verdict.outcome == 'escalated'
+        assert verdict.escalation_path is not None
+        body = json.loads(Path(verdict.escalation_path).read_text())
+        assert body['id'].startswith('esc-reconciliation-halt-'), body['id']
+        assert not body['id'].startswith('esc-reconciliation-backlog-'), body['id']
+        assert 'halt' in body['summary'].lower(), body['summary']
+        assert reason in body['summary'], body['summary']
+
+    @pytest.mark.asyncio
+    async def test_halt_not_rate_limited_by_backlog_bucket(self, event_buffer, tmp_path):
+        """A backlog escalation must NOT suppress a judge-halt escalation raised
+        within the same rate-limit window — they use independent per-kind
+        buckets, so BOTH files land."""
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        clock = {'now': 1_000_000.0}
+
+        def now() -> float:
+            return clock['now']
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=now,
+        )
+        # 1) backlog escalation (writes an esc-reconciliation-backlog-* file)
+        v_backlog = await policy.check('proj', project_root=str(project_root))
+        # 2) judge halt WITHIN the same window (no clock advance) — must still write.
+        v_halt = await policy.on_judge_halt(
+            'proj', reason='Serious verdict in run e87d8e4a',
+        )
+
+        assert v_backlog.outcome == 'escalated'
+        assert v_halt.outcome == 'escalated'
+        assert v_halt.escalation_path is not None
+        esc_files = sorted((project_root / 'data' / 'escalations').iterdir())
+        assert len(esc_files) == 2, [p.name for p in esc_files]
+        ids = [json.loads(p.read_text())['id'] for p in esc_files]
+        assert any(i.startswith('esc-reconciliation-halt-') for i in ids), ids
+        assert any(i.startswith('esc-reconciliation-backlog-') for i in ids), ids
+
+    @pytest.mark.asyncio
+    async def test_backlog_bucket_still_rate_limits(self, event_buffer, tmp_path):
+        """Two backlog check()s within the window still collapse to ONE backlog
+        file — per-kind buckets must PRESERVE per-project backlog rate-limiting."""
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+        clock = {'now': 1_000_000.0}
+
+        def now() -> float:
+            return clock['now']
+
+        policy = BacklogPolicy(
+            event_buffer,
+            _StubQueue(),
+            lambda _: True,
+            hard_limit=10,
+            rate_limit_seconds=900.0,
+            time_provider=now,
+        )
+        v1 = await policy.check('proj', project_root=str(project_root))
+        clock['now'] += 60.0  # within window
+        v2 = await policy.check('proj', project_root=str(project_root))
+
+        assert v1.escalation_path is not None
+        assert v2.escalation_path is None
+        esc_files = list((project_root / 'data' / 'escalations').iterdir())
+        assert len(esc_files) == 1
