@@ -3131,6 +3131,22 @@ class Scheduler:
         # _note_delivered_hold both already accept detail=None.
         fail_detail_by_dep: dict[str, dict | None] = {}
 
+        # Per-dep index of existing cache keys, built ONCE per sweep in a
+        # single O(cache_size) pass (task 2975 amendment,
+        # reviewer_comprehensive perf note): the stale-digest-variant prune
+        # below previously re-scanned the WHOLE self._delivered_check_cache
+        # for every dep in checked_deps — with the cache bounded to
+        # roughly one entry per (dep, sha) (see the class docstring above),
+        # that per-dep full scan was effectively O(deps^2) per sweep.
+        # Looking up this index instead makes the prune O(1) amortized per
+        # dep. checked_deps is keyed by dep_id (each dep_id appears exactly
+        # once in the loop below), so a dep's slice of the index is never
+        # consulted again after its own iteration and does not need to be
+        # kept in sync with deletions made for OTHER deps.
+        keys_by_dep: dict[str, list[tuple[str, str, str]]] = {}
+        for k in self._delivered_check_cache:
+            keys_by_dep.setdefault(k[0], []).append(k)
+
         for dep_id, dep_task in checked_deps.items():
             # Read the descriptor and fold its digest into the cache key
             # BEFORE the cache-hit check (task 2975): an operator editing
@@ -3144,13 +3160,16 @@ class Scheduler:
             # Prune any stale digest variant(s) left behind by an earlier
             # descriptor for this SAME (dep, sha) (task 2975): bounds cache
             # growth to one variant per (dep, sha) rather than accumulating
-            # one entry per historical descriptor edit. Materialize the
-            # matching keys first — deleting from self._delivered_check_cache
-            # while iterating it directly would raise.
+            # one entry per historical descriptor edit. Scoped to this
+            # dep's own keys via the keys_by_dep index built above instead
+            # of scanning self._delivered_check_cache in full. The
+            # comprehension materializes the matches into a list first —
+            # deleting from self._delivered_check_cache while iterating a
+            # view of it directly would raise.
             stale_variant_keys = [
                 k
-                for k in self._delivered_check_cache
-                if k[0] == dep_id and k[1] == main_sha and k[2] != descriptor_digest
+                for k in keys_by_dep.get(dep_id, ())
+                if k[1] == main_sha and k[2] != descriptor_digest
             ]
             for stale_key in stale_variant_keys:
                 del self._delivered_check_cache[stale_key]
