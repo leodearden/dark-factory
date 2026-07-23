@@ -948,6 +948,52 @@ class TestPhaseBackfillTerminalDepRecords:
         scheduler.get_task.assert_not_awaited()
         assert ctx.terminal_dep_records['20'] is cached_record
 
+    # --- (j) budget contention: new dep_ids win over re-validation churn ---
+
+    @pytest.mark.asyncio
+    async def test_budget_prioritizes_new_dep_over_revalidation_dep(
+        self, scheduler: Scheduler
+    ):
+        """Task 2977 (reviewer_comprehensive performance amendment): when
+        the per-tick fetch budget can't cover both a genuinely-NEW dep_id
+        (never cached) and an already-warmed checks-carrying dep_id up for
+        re-validation, the new dep_id must win the budget — otherwise
+        steady-state re-validation churn of already-known checks-carrying
+        deps could chronically starve a brand-new dep out of the budget
+        tick after tick. Dep ids are chosen so plain alphabetical sort
+        ('21' < '29') would pick the WRONG (re-validation) dep first
+        without the fix, proving this isn't an accident of sort order."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        stale_record = {
+            'id': '21',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'OLD'}]
+            },
+        }
+        scheduler._terminal_dep_record_cache['21'] = stale_record
+        task_a = self._dependent(task_id='10', dep_id='21')  # re-validation candidate
+        task_b = self._dependent(task_id='11', dep_id='29')  # genuinely new candidate
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'21': 'done', '29': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},  # both deps absent
+        )
+        new_record = {'id': '29', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=new_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('29')
+        assert ctx.terminal_dep_records == {'29': new_record}
+        assert '21' not in ctx.terminal_dep_records, (
+            'the deferred re-validation dep is not served this tick — '
+            'unchanged fail-open-on-deferral semantics, same as before task 2977'
+        )
+        # the stale cache entry is untouched (not overwritten, not evicted)
+        assert scheduler._terminal_dep_record_cache['21'] == stale_record
+
 
 # ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)
