@@ -81,6 +81,7 @@ from orchestrator.verify_cancel import (
     remove_lock_holder_pgid,
     write_lock_holder_pgid,
 )
+from orchestrator.warm_lane_pool import WarmLanePoolCensus
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -4263,6 +4264,55 @@ class GitOps:
             lane, victim_branch, branch_name,
         )
         return lane
+
+    def _assemble_warm_lane_census(self) -> WarmLanePoolCensus:
+        """Assemble the typed warm-lane pool census (PRD α / W2a).
+
+        The SINGLE census assembler (INV-5 / PRD dec.7): reads
+        ``self.warm_lane_pool`` + ``self.warm_lane_dispatched_predicate`` and
+        counts durable QUARANTINED records via
+        ``self._lane_lifecycle.all_records()``, then delegates the pure
+        classification to :meth:`WarmLanePool.census`.  Both α consumers — the
+        WARNING at the EXHAUSTED return and the ``WarmLanePoolExhausted``
+        message at the raise site — call this; PRD β (MCP tool) and ε
+        (structural-exhaustion L2) will too, so the four consumers cannot drift
+        in how the counts are derived.
+
+        Never raises: this is a diagnostic on the error path and must not mask
+        the EXHAUSTED signal.
+        - Pool disabled (``warm_lane_pool is None``): returns an all-zero
+          census (defensive; the α call sites only reach here with the pool
+          enabled, but the assembler stays total for β/ε reuse).
+        - Durable-record scan I/O error (``OSError``): logs a WARNING and
+          counts ``n_quarantined`` as 0 rather than letting a disk hiccup
+          crash the census (loud-over-silent, but never mis-loud).
+        """
+        if self.warm_lane_pool is None:
+            return WarmLanePoolCensus(
+                size=0,
+                n_free=0,
+                n_assigned_dispatched=0,
+                n_pinned_non_dispatched=0,
+                n_unknown_dispatch=0,
+                n_quarantined=0,
+            )
+        try:
+            n_quarantined = sum(
+                1
+                for record in self._lane_lifecycle.all_records().values()
+                if record.state is LaneState.QUARANTINED
+            )
+        except OSError:
+            logger.warning(
+                'acquire_warm_lane: census could not scan durable lane '
+                'records for QUARANTINED count — reporting n_quarantined=0',
+                exc_info=True,
+            )
+            n_quarantined = 0
+        return self.warm_lane_pool.census(
+            is_dispatched=self.warm_lane_dispatched_predicate,
+            n_quarantined=n_quarantined,
+        )
 
     async def acquire_warm_lane(
         self,
