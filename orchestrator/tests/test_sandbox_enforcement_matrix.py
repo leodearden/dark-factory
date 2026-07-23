@@ -1,0 +1,89 @@
+"""Real-kernel Landlock enforcement-matrix suite.
+
+Pins the 12 rows of ``plans/os-sandbox-worktree-containment-prd.md``'s
+§Enforcement matrix (task alpha4; D9; INV-1 machine-pin of the §Write-set
+contract) against the REAL production chain: ``compute_write_set()`` ->
+``build_landlock_command()`` -> ``landlock_exec.py``, driven on a real
+landlock-capable kernel (skip-gated elsewhere).
+
+This is a pure characterization / machine-pin suite: no production code
+changes ship with it. Every row already passes against the landed
+alpha2 (``compute_write_set``) / alpha3 (workflow.py call-site wiring) /
+2970 (``~/.claude`` grant narrowing) stack — the "implementation under
+test" is the existing sandbox stack, not new code. The RED->GREEN here is
+driven by the shared test harness (the ``landlock_matrix_scaffold``
+fixture + ``_run_sandboxed``/``_assert_denied`` helpers) growing per row
+group, one PRD row group per test-file step pair.
+
+Modeled on ``test_landlock.py``'s ``TestLandlockEnforcement`` /
+``TestLandlockClaudeHomeNarrowing``: class-level skip-if-no-landlock,
+``/var/tmp`` scaffolding, the ``_reset_landlock_probe`` autouse fixture,
+and driving ``build_landlock_command`` directly (not the backend-agnostic
+``wrap_command`` dispatcher).
+
+Everything is built under ``/var/tmp``, never ``/tmp``: ``landlock_exec.py``
+blanket-grants ``/tmp`` (``FS_V1_ALL``) for agent scratch, so a scaffold
+placed under ``/tmp`` would be writable regardless of the ruleset under
+test — silently nullifying every denial row (see ``test_landlock.py``'s
+matching rationale at its ``TestLandlockEnforcement`` docstring).
+"""
+from __future__ import annotations
+
+import uuid
+from pathlib import Path
+
+import pytest
+
+from orchestrator.agents.landlock import (
+    _reset_probe as _landlock_reset_probe,
+)
+from orchestrator.agents.landlock import is_landlock_available
+
+
+@pytest.fixture(autouse=True)
+def _reset_landlock_probe():
+    """Reset cached probe before and after each test (mirrors test_landlock.py)."""
+    _landlock_reset_probe()
+    yield
+    _landlock_reset_probe()
+
+
+@pytest.mark.skipif(
+    not is_landlock_available(),
+    reason='landlock not supported on this kernel',
+)
+class TestSandboxEnforcementMatrix:
+    """The 12 §Enforcement-matrix rows, each driven against the real
+    ``compute_write_set()`` -> ``build_landlock_command()`` ->
+    ``landlock_exec`` production chain via the ``landlock_matrix_scaffold``
+    fixture and ``_run_sandboxed`` helper (grown in the paired impl steps).
+    """
+
+    # -- Group 1: base filesystem (rows 1/3/11) --------------------------
+
+    def test_row01_worktree_write_allowed(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.worktree / 'src' / 'x.py'
+        result = _run_sandboxed(
+            scaffold,
+            ['/bin/sh', '-c', f'mkdir -p {target.parent} && printf X > {target}'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == 'X'
+
+    def test_row03_main_canary_denied(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.main / 'CANARY'
+        result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
+        assert not target.exists()
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row11_tmp_scratch_allowed(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        scratch = Path(f'/tmp/landlock-matrix-row11-{uuid.uuid4().hex}')
+        try:
+            result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {scratch}'])
+            assert result.returncode == 0, result.stderr
+            assert scratch.read_text() == 'X'
+        finally:
+            scratch.unlink(missing_ok=True)
