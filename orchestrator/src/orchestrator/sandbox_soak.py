@@ -33,11 +33,30 @@ PROBE_REPORT_PATH = "docs/sandbox-containment-probe-report.md"
 # PRD-D6 spec constant: the soak requires >=10 distinct done sandboxed tasks.
 MIN_DONE_DEFAULT = 10
 
-# Arm-2 attribution token: an out-of-set path denial (D9 errnos) surfaced
-# through a structured escalation summary — matched on the errno token only
-# (never the word "sandbox"), keeping arm 2 precise and non-overlapping with
-# arm 1.
+# Arm-2 attribution: an out-of-set path denial (D9 errnos) surfaced through a
+# structured escalation summary. Requires BOTH the errno token below AND a
+# sandbox-related escalation category (see _SANDBOX_DENIAL_CATEGORIES) so an
+# unrelated errno quote — a build/test failure that merely mentions EACCES —
+# does not false-attribute a block and hold the >=3-day soak red. Matches the
+# errno token itself, never the word "sandbox", keeping arm 2 non-overlapping
+# with arm 1.
 _ERRNO_RE = re.compile(r"\b(EACCES|EROFS)\b")
+
+# Escalation categories that plausibly tag a sandbox path-denial (arm 2). This
+# set is deliberately INCLUSIVE: a category we wrongly OMIT would turn a
+# fail-safe false-FAIL into a dangerous false-PASS (the soak going green on an
+# unaddressed sandbox block), so it carries the confirmed sandbox-refusal
+# category (`infra_issue` — see workflow._escalate_sandbox_unavailable), the
+# scope-denial category (`scope_violation`), and, via _is_sandbox_denial_category,
+# any explicit `sandbox*`-prefixed category. Arm 1 (a `sandbox_unavailable`
+# event) still catches the fail-closed refusal independently of this set.
+_SANDBOX_DENIAL_CATEGORIES = frozenset({"infra_issue", "scope_violation"})
+
+
+def _is_sandbox_denial_category(category) -> bool:
+    """True iff *category* plausibly tags a sandbox path-denial escalation."""
+    cat = (category or "").strip()
+    return cat in _SANDBOX_DENIAL_CATEGORIES or cat.lower().startswith("sandbox")
 
 
 class SoakInputError(Exception):
@@ -72,7 +91,12 @@ def _sandbox_attributable_blocks(task_status, sandbox_unavailable_task_ids, esca
       * arm 1 — its task_id has a ``sandbox_unavailable`` event (a fail-closed
         refusal), or
       * arm 2 — it has an ``escalation_created`` event whose structured summary
-        matches ``\b(EACCES|EROFS)\b`` (a denial on an out-of-set path).
+        matches ``\b(EACCES|EROFS)\b`` AND whose category is sandbox-related
+        (``_is_sandbox_denial_category``) — a denial on an out-of-set path.
+
+    Requiring a sandbox-related category on arm 2 (not the errno token alone)
+    keeps an unrelated errno quote — a build/test failure that merely mentions
+    EACCES — from false-attributing a block.
 
     Correlation is strictly by task_id — both event types carry task_id as a
     first-class column, so no fuzzy timestamp window is needed (INV-2). A
@@ -85,7 +109,9 @@ def _sandbox_attributable_blocks(task_status, sandbox_unavailable_task_ids, esca
         tid = esc.get("task_id")
         if tid is None:
             continue
-        if _ERRNO_RE.search(esc.get("summary") or ""):
+        if _ERRNO_RE.search(esc.get("summary") or "") and _is_sandbox_denial_category(
+            esc.get("category")
+        ):
             errno_task_ids.add(str(tid))
     blocked = {str(t) for t, status in task_status.items() if status == "blocked"}
     attributable = {t for t in blocked if t in unavailable or t in errno_task_ids}

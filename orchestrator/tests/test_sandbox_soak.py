@@ -133,7 +133,8 @@ def test_arm2_blocked_with_eacces_escalation_is_attributed():
 def test_arm2_blocked_with_erofs_escalation_is_attributed():
     applied, status = _green_base({"b3": "blocked"})
     escalations = [
-        {"task_id": "b3", "summary": "EROFS: read-only file system", "category": "x"},
+        {"task_id": "b3", "summary": "EROFS: read-only file system",
+         "category": "infra_issue"},
     ]
     v = sandbox_soak.evaluate_soak(applied, status, set(), escalations, True, min_done=10)
     assert v.ok is False
@@ -167,9 +168,24 @@ def test_sandbox_word_without_errno_token_is_not_attributed():
     assert v.metrics["attributable_block_count"] == 0
 
 
+def test_arm2_errno_under_non_sandbox_category_is_not_attributed():
+    # Arm 2 consults the escalation CATEGORY, not merely the errno token: a
+    # build/test failure that quotes EACCES for an unrelated reason must NOT be
+    # counted as a sandbox-attributable block — else a spurious errno quote
+    # would hold the >=3-day soak red indefinitely.
+    applied, status = _green_base({"b6": "blocked"})
+    escalations = [
+        {"task_id": "b6", "summary": "build failed: EACCES from npm cache",
+         "category": "test_failure"},
+    ]
+    v = sandbox_soak.evaluate_soak(applied, status, set(), escalations, True, min_done=10)
+    assert v.ok is True
+    assert v.metrics["attributable_block_count"] == 0
+
+
 def test_multiple_attributable_blocks_named_and_counted():
     applied, status = _green_base({"b1": "blocked", "b2": "blocked"})
-    escalations = [{"task_id": "b2", "summary": "EACCES denied", "category": "x"}]
+    escalations = [{"task_id": "b2", "summary": "EACCES denied", "category": "infra_issue"}]
     v = sandbox_soak.evaluate_soak(applied, status, {"b1"}, escalations, True, min_done=10)
     assert v.ok is False
     assert "b1" in v.reason and "b2" in v.reason
@@ -179,15 +195,17 @@ def test_multiple_attributable_blocks_named_and_counted():
 def test_attributable_blocks_helper_arms_and_exclusions():
     task_status = {
         "b1": "blocked",   # arm 1 (sandbox_unavailable)
-        "b2": "blocked",   # arm 2 (EACCES escalation)
+        "b2": "blocked",   # arm 2 (EACCES under a sandbox category)
         "b3": "blocked",   # neither signal -> excluded
         "r1": "done",      # in unavailable but recovered -> excluded
-        "b5": "blocked",   # 'sandbox' word only -> excluded
+        "b5": "blocked",   # 'sandbox' word only, no errno -> excluded
+        "b6": "blocked",   # errno token under a non-sandbox category -> excluded
     }
     unavailable = {"b1", "r1"}
     escalations = [
-        {"task_id": "b2", "summary": "write denied EACCES", "category": "x"},
-        {"task_id": "b5", "summary": "sandbox containment", "category": "x"},
+        {"task_id": "b2", "summary": "write denied EACCES", "category": "infra_issue"},
+        {"task_id": "b5", "summary": "sandbox containment", "category": "sandbox"},
+        {"task_id": "b6", "summary": "build failed EACCES", "category": "test_failure"},
     ]
     blocks = sandbox_soak._sandbox_attributable_blocks(
         task_status, unavailable, escalations
