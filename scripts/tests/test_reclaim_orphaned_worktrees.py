@@ -403,3 +403,32 @@ def test_park_commit_uses_no_verify_bypassing_failing_hook(tmp_path):
 
     assert sha is not None, "park_commit must bypass the failing hook via --no-verify"
     assert _git(parking, "status", "--porcelain").stdout.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# step-11: remove_worktree(repo, path) — BRANCH-INTACT invariant
+# ---------------------------------------------------------------------------
+
+def test_remove_worktree_removes_registered_parking_branch_intact(tmp_path):
+    """Removing a registered, clean parking: (a) the dir is gone; (b) it is no
+    longer listed by ``git worktree list``; and CRUCIALLY (c) the parking branch
+    STILL resolves — remove must NEVER delete the branch."""
+    repo = _init_repo(tmp_path)
+    name = f"2920-{TS_OLD}"
+    branch = f"task/{name}"
+    parking = _add_parking(repo, name)
+    assert parking.resolve() in _worktree_paths(repo)
+
+    assert row.remove_worktree(repo, parking) is True
+
+    assert not parking.exists()  # (a)
+    assert parking.resolve() not in _worktree_paths(repo)  # (b)
+    assert _branch_resolves(repo, branch)  # (c) branch survives — content safe
+
+
+def test_remove_worktree_bogus_path_returns_false_no_raise(tmp_path):
+    """remove_worktree on a nonexistent/bogus path returns False without
+    raising."""
+    repo = _init_repo(tmp_path)
+    bogus = _parking_root(repo) / "does-not-exist"
+    assert row.remove_worktree(repo, bogus) is False
