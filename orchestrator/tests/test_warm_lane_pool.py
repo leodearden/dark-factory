@@ -3714,6 +3714,33 @@ class TestCreateWorktreeWarmLaneRouting:
         assert 'n_free=0' in msg, msg
         assert 'n_pinned_non_dispatched=' in msg, msg
 
+    async def test_create_worktree_exhausted_message_carries_census(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Task 2984 step-09/10: the WarmLanePoolExhausted message APPENDS the
+        census while preserving the existing prefix (so bare pytest.raises
+        sites with no match= stay green)."""
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.create_worktree('task-first')
+        assert isinstance(info_a, WorktreeInfo), (
+            f'Prerequisite: first create must succeed, got {info_a!r}'
+        )
+
+        with pytest.raises(WarmLanePoolExhausted) as excinfo:
+            await git_ops.create_worktree('task-second')
+
+        message = str(excinfo.value)
+        # Existing prefix preserved.
+        assert 'warm-lane pool exhausted for branch' in message, message
+        # Census appended, keyed on the contract-fixed token.
+        assert 'n_pinned_non_dispatched=' in message, message
+        assert 'size=1' in message, message
+        assert 'n_free=0' in message, message
+
     async def test_create_worktree_fault_raises_runtime_error(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
