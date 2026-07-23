@@ -3779,7 +3779,20 @@ async def _preprovision_shared_venv(
     if not cmd:
         return
     logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
-    await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+    rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+    if rc != 0:
+        # Fail-open + loud (honours the loud-over-silent-degradation norm;
+        # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL sync
+        # is what closes the race; a FAILED sync is a real infra problem the
+        # gather's own tool spawn + existing failure classification will surface,
+        # so the pre-provision must NEVER become a NEW failure source — warn and
+        # return normally, always proceeding to the gather, never raising.
+        tail = out[-500:] if out else ''
+        logger.warning(
+            'Cold-verify shared-venv pre-provision failed (rc=%d), proceeding to '
+            'the verify gather anyway: %r\noutput tail: %s',
+            rc, cmd, tail,
+        )
 
 
 async def run_verification(
