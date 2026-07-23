@@ -432,3 +432,129 @@ def test_remove_worktree_bogus_path_returns_false_no_raise(tmp_path):
     repo = _init_repo(tmp_path)
     bogus = _parking_root(repo) / "does-not-exist"
     assert row.remove_worktree(repo, bogus) is False
+
+
+# ---------------------------------------------------------------------------
+# step-13: reclaim_worktrees(repo, records, *, dry_run) + ReclaimOutcome
+# ---------------------------------------------------------------------------
+
+def _resolved(paths) -> list[Path]:
+    return [Path(p).resolve() for p in paths]
+
+
+def test_reclaim_clean_eligible_removed_branch_intact(tmp_path):
+    """(a) A CLEAN eligible parking is removed, branch intact, in reclaimed."""
+    repo = _init_repo(tmp_path)
+    name = f"2920-{TS_OLD}"
+    branch = f"task/{name}"
+    parking = _add_parking(repo, name)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=False)
+
+    assert _resolved(outcome.reclaimed) == [parking.resolve()]
+    assert outcome.park_committed == []
+    assert outcome.skipped == []
+    assert outcome.failed == []
+    assert not parking.exists()
+    assert _branch_resolves(repo, branch)
+
+
+def test_reclaim_dirty_eligible_park_committed_then_removed(tmp_path):
+    """(b) A DIRTY eligible parking is park-committed FIRST (content recoverable
+    from the branch) THEN removed — in reclaimed AND park_committed."""
+    repo = _init_repo(tmp_path)
+    name = f"2920-{TS_OLD}"
+    branch = f"task/{name}"
+    parking = _add_parking(repo, name, dirty=True, modify_tracked=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=False)
+
+    assert _resolved(outcome.reclaimed) == [parking.resolve()]
+    assert _resolved(outcome.park_committed) == [parking.resolve()]
+    assert not parking.exists()
+    assert _branch_resolves(repo, branch)
+    # Content provably recoverable from the branch even though the tree is gone.
+    assert _git(repo, "show", f"{branch}:wip.txt").stdout == "uncommitted work\n"
+    assert _git(repo, "show", f"{branch}:README.md").stdout == "modified in parking\n"
+
+
+def test_reclaim_detached_parking_skipped_not_removed(tmp_path, caplog):
+    """(c) A DETACHED parking (branch=None) is SKIPPED + LOUD, NOT removed —
+    the data-loss guard (content not provably on a ref)."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", detached=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+    assert records and records[0].branch is None
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=False)
+
+    assert _resolved(outcome.skipped) == [parking.resolve()]
+    assert outcome.reclaimed == []
+    assert parking.exists()  # never removed
+    warn = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(LOG_PREFIX in m and str(parking.resolve()) in m for m in warn)
+
+
+def test_reclaim_unresolvable_branch_skipped_not_removed(tmp_path):
+    """(c') A record naming a branch that does NOT resolve is SKIPPED, NOT
+    removed (guard fires even when the path is a real registered parking)."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    bogus = row.ParkedWorktree(
+        path=parking.resolve(), branch="task/no-such-branch", parked_at=PARKED_AT_OLD
+    )
+
+    outcome = row.reclaim_worktrees(repo, [bogus], dry_run=False)
+
+    assert _resolved(outcome.skipped) == [parking.resolve()]
+    assert outcome.reclaimed == []
+    assert parking.exists()
+
+
+def test_reclaim_dry_run_removes_and_commits_nothing(tmp_path, caplog):
+    """(d) dry_run=True removes/commits NOTHING and logs 'would reclaim'."""
+    caplog.set_level(logging.INFO, logger="reclaim_orphaned_worktrees")
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=True)
+
+    assert parking.exists()  # nothing removed
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == head_before  # nothing committed
+    assert outcome.reclaimed == []
+    assert outcome.park_committed == []
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        LOG_PREFIX in m and "would reclaim" in m and str(parking.resolve()) in m
+        for m in msgs
+    ), f"missing 'would reclaim' line; got {msgs}"
+
+
+def test_reclaim_remove_failure_counted_siblings_continue(tmp_path, monkeypatch):
+    """(e) One worktree whose remove fails is counted in failed; its sibling is
+    still reclaimed and the call never raises."""
+    repo = _init_repo(tmp_path)
+    good = _add_parking(repo, f"2920-{TS_OLD}")
+    bad = _add_parking(repo, f"_lane-0-{TS_LANE}")
+    records = row.list_parked_worktrees(repo, _parking_root(repo))
+
+    real_remove = row.remove_worktree
+
+    def fake_remove(repo_arg, path):
+        if Path(path).resolve() == bad.resolve():
+            return False  # simulate `git worktree remove` failing
+        return real_remove(repo_arg, path)
+
+    monkeypatch.setattr(row, "remove_worktree", fake_remove)
+
+    outcome = row.reclaim_worktrees(repo, records, dry_run=False)  # must not raise
+
+    assert good.resolve() in _resolved(outcome.reclaimed)
+    assert bad.resolve() in _resolved(outcome.failed)
+    assert not good.exists()  # sibling still reclaimed
+    assert bad.exists()  # the failed one is left in place
