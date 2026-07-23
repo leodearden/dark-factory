@@ -121,6 +121,15 @@ reconciliation:
   judge_enabled: true
   judge_llm_provider: "claude_cli"
   judge_llm_model: "sonnet"
+  # Auto-resume-after-cooldown (task 2920). On 2026-07-20 the judge halted
+  # dark_factory (08:34:36Z) and the halt sat unhalted for ~2 days — its
+  # cooldown_until (09:04:36Z) expired and nothing acted on the expiry, so the
+  # reconciliation backlog grew monotonically (501→1548). Enacting true here
+  # closes that gap: once a halt's cooldown expires the project auto-resumes
+  # with the normal post-unhalt grace, and a genuinely-sick pipeline re-halts on
+  # the next serious verdict — re-firing a distinct, now-loud halt escalation —
+  # instead of resuming silently. Restart-tier (read each cycle; not hot-reloadable).
+  auto_unhalt_after_cooldown: true
   explore_codebase_root: "${PROJECT_ROOT:.}"
   # Escalation
   escalation_port: ${RECON_ESCALATION_PORT:8103}
