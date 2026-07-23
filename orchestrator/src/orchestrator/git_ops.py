@@ -2563,8 +2563,14 @@ class GitOps:
             # β: pool is enabled — no cold-path fall-through.  Route discriminant
             # to the appropriate exception so callers get typed failure signals.
             if pool_info is WarmLaneUnavailable.EXHAUSTED:
+                # Task 2984 (PRD α): APPEND the typed census to the message
+                # (prefix preserved so bare pytest.raises sites with no match=
+                # stay green) via the single render() shared with the WARNING
+                # at the EXHAUSTED return.
+                census = self._assemble_warm_lane_census()
                 raise WarmLanePoolExhausted(
-                    f'warm-lane pool exhausted for branch {branch_name!r}; requeue'
+                    f'warm-lane pool exhausted for branch {branch_name!r}; '
+                    f'requeue — {census.render()}'
                 )
             if pool_info is WarmLaneUnavailable.DISK_PRESSURE:
                 raise WarmLaneDiskPressure(
