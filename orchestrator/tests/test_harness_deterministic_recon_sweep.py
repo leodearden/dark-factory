@@ -63,9 +63,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.deploy_state import DeployPhase
+from orchestrator.event_store import EventType
 from orchestrator.harness import (
     Harness,
     _deterministic_deploy_health_verdict,
@@ -586,6 +588,105 @@ class TestRecoverStrandedDeterministicTask:
 
         h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
         h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# step-3/step-4 (task 2954): Harness._recover_stranded_deterministic_gate
+# (Source A — pure-gate / always_escalates GATE strand recovery)
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverStrandedDeterministicGate:
+    """step-3 (task 2954): RE-FILE-NEVER-FLIP recovery for pure-gate /
+    always_escalates GATE strands.
+
+    Uses a REAL EscalationQueue on tmp_path so the re-filed record is
+    queryable. Re-files a born-at-L2 milestone_gate escalation mirroring what
+    DeterministicRunner._file_milestone_gate_and_block itself would have filed
+    (agent_role='orchestrator-deterministic', level=2, severity='critical',
+    category='milestone_gate') so the runner's resume quiescence/resolve-to-done
+    machinery (which scopes on that agent_role) integrates cleanly — never flips
+    the task status (the gate is a human decision).
+    """
+
+    @staticmethod
+    def _gate_task(tid: str = 'task-2954') -> tuple[dict, dict]:
+        metadata = {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'before_done': None,
+            'gate_escalated_at': '2026-07-01T00:05:00+00:00',
+            'gate_options': ['approve', 'reject'],
+        }
+        task = {
+            'id': tid,
+            'title': 'Human milestone gate for reify 5330',
+            'description': 'Approve the reify milestone before the run proceeds.',
+            'metadata': metadata,
+        }
+        return task, metadata
+
+    @pytest.mark.asyncio
+    async def test_refiles_l2_milestone_gate_never_flips_status(self, tmp_path: Path) -> None:
+        h = _make_recon_harness()
+        h.event_store = MagicMock()
+        h.scheduler.set_task_status = AsyncMock()
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        tid = 'task-2954'
+        task, metadata = self._gate_task(tid)
+
+        await h._recover_stranded_deterministic_gate(tid, task, metadata)
+
+        # (a) exactly one born-at-L2 milestone_gate escalation, correct fields
+        pending = queue.get_by_task(tid, status='pending')
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.category == 'milestone_gate'
+        assert esc.summary == task['title']
+        assert task['description'] in esc.detail
+        assert esc.options == metadata['gate_options']
+        assert esc.task_id == tid
+        # (b) RE-FILE-NEVER-FLIP: the task is already blocked — no status change.
+        h.scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emits_escalation_created_event(self, tmp_path: Path) -> None:
+        h = _make_recon_harness()
+        h.event_store = MagicMock()
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        tid = 'task-2954'
+        task, metadata = self._gate_task(tid)
+
+        await h._recover_stranded_deterministic_gate(tid, task, metadata)
+
+        # (c) emits an escalation_created event with the gate-strand reason
+        h.event_store.emit.assert_called_once()
+        args, kwargs = h.event_store.emit.call_args
+        assert args[0] == EventType.escalation_created
+        assert kwargs['task_id'] == tid
+        assert kwargs['data']['reason'] == 'deterministic-recon-sweep-gate-strand-recovery'
+        assert kwargs['data']['level'] == 2
+        assert kwargs['data']['category'] == 'milestone_gate'
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_escalation_queue(self, tmp_path: Path) -> None:
+        h = _make_recon_harness()
+        h.event_store = MagicMock()
+        h._escalation_queue = None
+        h.scheduler.set_task_status = AsyncMock()
+        tid = 'task-2954'
+        task, metadata = self._gate_task(tid)
+
+        # (d) graceful no-op when the queue is unavailable
+        await h._recover_stranded_deterministic_gate(tid, task, metadata)  # must not raise
+
+        h.event_store.emit.assert_not_called()
+        h.scheduler.set_task_status.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
