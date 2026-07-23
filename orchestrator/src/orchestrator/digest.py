@@ -612,6 +612,13 @@ class DigestInputs:
     # Per-(model×role) outcome rollup (task 2534 δ, boundary test 12).
     # Defaulted so existing constructors/call sites remain valid.
     model_role_rollup: ModelRoleRollup = field(default_factory=ModelRoleRollup)
+    # Stale non-terminal warm-lane assignments (leaf γ, task 2891).  Each entry
+    # is a rendered census line for a durable ASSIGNED/IN_USE record whose live
+    # (pending/in-progress/blocked) task has been idle past lane_stale_report_days.
+    # Defaulted (placed after model_role_rollup) so every existing constructor
+    # stays valid.  These lanes are NEVER auto-reclaimed (WIP-preserving) — the
+    # census only surfaces them for operator attention.
+    stale_lane_census: list[str] = field(default_factory=list)
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -731,6 +738,17 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         for role, saturation in sorted(rollup.turn_cap_saturation.items()):
             saturation_str = f'{saturation * 100:.1f}%' if saturation is not None else 'n/a'
             lines.append(f'- {role}: {saturation_str}')
+    else:
+        lines.append('_none_')
+    lines.append('')
+
+    # Stale lane assignments (leaf γ, task 2891) — non-terminal warm-lane
+    # records idle past lane_stale_report_days; surfaced for operator attention,
+    # never auto-reclaimed (WIP-preserving invariant).
+    lines.append('## Stale lane assignments')
+    if inputs.stale_lane_census:
+        for line in inputs.stale_lane_census:
+            lines.append(f'- {line}')
     else:
         lines.append('_none_')
     lines.append('')
