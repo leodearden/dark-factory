@@ -260,6 +260,35 @@ routing:
       set:
         model: opus
         max_turns: 120
+    # Task nu (Phase 4, boundary test 8): simple-task turn-cap saturation.
+    # Once a SIMPLE_TASK dispatch exhausts its turn cap without completing,
+    # workflow._stamp_simple_saturated stamps
+    # metadata.routing.simple_saturated=true (nu's non-default flag). THIS rule
+    # turns that flag into a policy-rule attribution on the architect -- always
+    # the first agent on the full path -- so its routing_decision reliably
+    # NAMES the saturation (boundary test 8's observable). The actual re-route
+    # to the full path is done by the SIMPLE_TASK gate
+    # (_should_run_simple_task skips a saturated task); this rule only makes the
+    # attribution legible.
+    #
+    # set.model=opus is byte-equivalent today (the architect's config model is
+    # already opus), so it changes no behaviour -- it only makes
+    # source_layer=policy_rule for unambiguous attribution and expresses "treat
+    # a demonstrably-hard task at full strength".
+    #
+    # Inert unless simple_saturated is stamped (a non-default state), so the
+    # default-state resolution is byte-equivalent to pre-nu (invariant 3) -- a
+    # normal task never matches this rule. Placed immediately BEFORE
+    # retry-tier-up (which stays LAST): saturation is the more-specific
+    # attribution for a saturated+retried architect, and the architect already
+    # clamps at opus under either rule, so first-match-wins here changes no
+    # model outcome.
+    - id: simple-saturated-full-path
+      match:
+        role: [architect]
+        simple_saturated: true
+      set:
+        model: opus
     # Task mu (Phase 4): retry-escalation rung. On a re-dispatch after a
     # failed dispatch the harness bumps metadata.routing.routing_tier (gamma's
     # harness-owned, monotonic counter), and THIS rule turns that tier>=1 into

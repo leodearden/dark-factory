@@ -27,6 +27,7 @@ from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
 from pydantic import ValidationError
 from shared.cli_invoke import (
+    AgentFailureKind,
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
@@ -2428,14 +2429,7 @@ class TaskWorkflow:
             # any failure (no plan written, unactionable artifact, no steps
             # marked done).  metadata.force_full_path is the hard escape
             # that always forces the full path.
-            from orchestrator.agents.triage import is_declared_simple_task
-            if (
-                not self.initial_plan
-                and self.config.simple_task_enabled
-                and not (self.task.get('metadata') or {}).get('auto_eval_redo')
-                and not (self.task.get('metadata') or {}).get('force_full_path')
-                and is_declared_simple_task(self.task)
-            ):
+            if self._should_run_simple_task():
                 self._enter_phase(WorkflowState.PLAN)
                 simple_outcome = await self._run_simple_task()
                 if simple_outcome == WorkflowOutcome.PLANNED:
@@ -4177,6 +4171,35 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    def _should_run_simple_task(self) -> bool:
+        """Whether this dispatch should take the Lever C SIMPLE_TASK path.
+
+        Extracted verbatim from the inline gate in ``_drive`` — a
+        behaviour-preserving refactor that makes the gate unit-testable —
+        plus ONE new AND term for task ν: ``not
+        RoutingState.from_metadata(metadata).simple_saturated``.
+
+        The pre-existing conditions are unchanged: no ``initial_plan`` (not
+        eval mode), ``simple_task_enabled``, and the RUNTIME dispatch vetoes
+        ``auto_eval_redo`` / ``force_full_path``, plus the author-declaration
+        predicate ``is_declared_simple_task``. ``simple_saturated`` joins the
+        runtime vetoes here (NOT inside ``is_declared_simple_task``, which its
+        own docstring keeps a pure author-declaration predicate): once a
+        SIMPLE_TASK dispatch has demonstrably exhausted its turn cap
+        (``_stamp_simple_saturated``), the "simple" label is retired and every
+        subsequent dispatch takes the full architect path.
+        """
+        from orchestrator.agents.triage import is_declared_simple_task
+        metadata = self.task.get('metadata') or {}
+        return (
+            not self.initial_plan
+            and self.config.simple_task_enabled
+            and not metadata.get('auto_eval_redo')
+            and not metadata.get('force_full_path')
+            and is_declared_simple_task(self.task)
+            and not RoutingState.from_metadata(metadata).simple_saturated
+        )
+
     async def _run_simple_task(self) -> WorkflowOutcome:
         """Lever C — single-agent simple-task path.
 
@@ -4211,6 +4234,15 @@ class TaskWorkflow:
 
         if not result.success:
             cls = classify_agent_failure(result)
+            if cls.kind == AgentFailureKind.MAX_TURNS:
+                # Task ν: the SIMPLE_TASK agent exhausted its turn cap without
+                # completing — the "simple" label was demonstrated wrong, so
+                # stamp metadata.routing.simple_saturated=True and let every
+                # SUBSEQUENT dispatch take the full architect path. Detection
+                # is on the error_max_turns subtype only (classify_agent_failure
+                # orders MAX_TURNS below TIMED_OUT, so a wall-clock SIGKILL is
+                # NOT treated as saturation).
+                await self._stamp_simple_saturated()
             logger.info(
                 'Task %s: SIMPLE_TASK did not succeed (%s) — '
                 'falling through to architect path',
@@ -4328,6 +4360,46 @@ class TaskWorkflow:
                 'Task %s: failed to stamp optimistic_path=%s: %s',
                 self.task_id, kind, exc,
             )
+
+    async def _stamp_simple_saturated(self) -> None:
+        """Stamp ``metadata.routing.simple_saturated=True`` (task ν).
+
+        Called when a SIMPLE_TASK invocation ends at its turn cap
+        (``AgentFailureKind.MAX_TURNS``) without completing: the author's
+        ``complexity='simple'`` declaration was demonstrated wrong, so the
+        runtime retires the label — every SUBSEQUENT dispatch of this task
+        fails the ``_should_run_simple_task`` gate and takes the full
+        architect path ("the label stops being re-trusted once demonstrated
+        wrong").
+
+        A read-modify-write that flips ONLY ``simple_saturated`` and merges
+        just the ``routing`` key, mirroring ``_record_routing_decision``:
+        ``_invoke`` already wrote ``routing.latest``/``history``/
+        ``routing_tier`` for this dispatch (in-memory and via merge), and a
+        merge-mode write preserves that state rather than clobbering it.
+        Idempotent (returns early if already stamped) and best-effort — a
+        failed scheduler write logs a warning and never raises, honoring the
+        "routing telemetry must never block or crash a caller" philosophy.
+        The in-memory ``self.task['metadata']['routing']`` update always runs
+        regardless of the scheduler write's outcome.
+        """
+        state = RoutingState.from_metadata(self.task.get('metadata'))
+        if state.simple_saturated:
+            return
+        new_state = state.model_copy(update={'simple_saturated': True})
+        if self.scheduler:
+            try:
+                await self.scheduler.update_task(
+                    self.task_id,
+                    {'routing': new_state.model_dump()},
+                    metadata_mode='merge',  # type: ignore[reportCallIssue]
+                )
+            except Exception:
+                logger.warning(
+                    'Task %s: failed to stamp routing.simple_saturated',
+                    self.task_id, exc_info=True,
+                )
+        self.task.setdefault('metadata', {})['routing'] = new_state.model_dump()
 
     async def _validate_prerequisites_or_block(
         self, context: str

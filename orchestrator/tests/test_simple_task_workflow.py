@@ -34,6 +34,7 @@ def _make_result(
     cost_usd: float = 0.10,
     turns: int = 5,
     duration_ms: int = 1000,
+    subtype: str | None = None,
 ) -> AgentResult:
     return AgentResult(
         success=success,
@@ -43,7 +44,7 @@ def _make_result(
         turns=turns,
         session_id='sid',
         structured_output=None,
-        subtype='success' if success else 'error',
+        subtype=subtype if subtype is not None else ('success' if success else 'error'),
         stderr='',
         account_name='test',
         timed_out=False,
@@ -241,6 +242,119 @@ async def test_simple_task_invoke_failure_falls_through(tmp_path: Path):
     assert outcome == WorkflowOutcome.REQUEUED
 
 
+def _saturation_stamp_calls(update_task: AsyncMock) -> list:
+    """Every scheduler.update_task call that is a merge-mode routing write
+    flipping ``simple_saturated`` True — i.e. the ``_stamp_simple_saturated``
+    write, positional payload ``{'routing': {..., 'simple_saturated': True}}``
+    with ``metadata_mode='merge'``."""
+    return [
+        c for c in update_task.call_args_list
+        if len(c.args) >= 2
+        and isinstance(c.args[1], dict)
+        and isinstance(c.args[1].get('routing'), dict)
+        and c.args[1]['routing'].get('simple_saturated') is True
+        and c.kwargs.get('metadata_mode') == 'merge'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_task_max_turns_stamps_saturated(tmp_path: Path):
+    """A SIMPLE_TASK invocation that ends at max_turns (subtype
+    ``error_max_turns`` → classify MAX_TURNS) falls through to the architect
+    path AND stamps ``metadata.routing.simple_saturated=True`` via a merge-mode
+    routing write, so subsequent dispatches skip the simple path (task ν)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        invoke_outcome=_make_result(
+            success=False, subtype='error_max_turns', output='',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    stamp_calls = _saturation_stamp_calls(f.update_task)
+    assert stamp_calls, (
+        'expected a merge-mode routing stamp with simple_saturated=True'
+    )
+    # _invoke is stubbed so no _record_routing_decision write intervenes —
+    # the stamp is the sole routing write.
+    assert stamp_calls[0].args[0] == f.wf.task_id
+    # The persistence-independent in-memory flip is what makes the very next
+    # in-dispatch _should_run_simple_task read return False — assert it landed
+    # regardless of the (here-succeeding) scheduler write.
+    assert f.wf.task['metadata']['routing']['simple_saturated'] is True
+
+
+@pytest.mark.asyncio
+async def test_simple_task_max_turns_in_memory_stamp_survives_write_failure(
+    tmp_path: Path,
+):
+    """The saturation stamp is best-effort: when the merge-mode scheduler write
+    raises, ``_run_simple_task`` still returns REQUEUED (the exception is
+    swallowed inside ``_stamp_simple_saturated``, never propagated to crash the
+    fall-through to the architect) AND the persistence-independent in-memory
+    ``self.task['metadata']['routing']['simple_saturated']`` flip still lands —
+    so the very next in-dispatch gate read observes the retired label (task ν)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        invoke_outcome=_make_result(
+            success=False, subtype='error_max_turns', output='',
+        ),
+    )
+    # On the max_turns failure path the ONLY update_task call is the stamp
+    # write, so a blanket side_effect targets exactly that write.
+    f.update_task.side_effect = RuntimeError('scheduler write failed')
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    assert f.wf.task['metadata']['routing']['simple_saturated'] is True
+
+
+@pytest.mark.asyncio
+async def test_simple_task_max_turns_already_saturated_no_double_write(
+    tmp_path: Path,
+):
+    """``_stamp_simple_saturated`` is idempotent: when the task is ALREADY
+    saturated, a fresh max_turns failure early-returns before touching the
+    scheduler — no double merge-write occurs — and the pre-existing in-memory
+    flag is preserved (task ν)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={'routing': {'simple_saturated': True}},
+        invoke_outcome=_make_result(
+            success=False, subtype='error_max_turns', output='',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    # Idempotent early-return: no scheduler write at all on this failure path.
+    f.update_task.assert_not_awaited()
+    assert not _saturation_stamp_calls(f.update_task)
+    assert f.wf.task['metadata']['routing']['simple_saturated'] is True
+
+
+@pytest.mark.asyncio
+async def test_simple_task_generic_failure_does_not_stamp(tmp_path: Path):
+    """A non-max_turns SIMPLE_TASK failure (subtype ``error_empty_output`` →
+    classify EMPTY_OUTPUT) falls through WITHOUT stamping saturation — only a
+    demonstrated turn-cap exhaustion retires the simple label (task ν)."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        invoke_outcome=_make_result(
+            success=False, subtype='error_empty_output', output='',
+        ),
+    )
+
+    outcome = await f.wf._run_simple_task()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    assert not _saturation_stamp_calls(f.update_task)
+
+
 @pytest.mark.asyncio
 async def test_simple_task_invoke_exception_falls_through(tmp_path: Path):
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
@@ -267,3 +381,31 @@ async def test_blast_radius_expansion_invoked_when_files_grow(tmp_path: Path):
     outcome = await f.wf._run_simple_task()
     assert outcome == WorkflowOutcome.PLANNED
     f.handle_blast_radius_expansion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_should_run_simple_task_true_for_clean_simple_task(tmp_path: Path):
+    """The extracted SIMPLE_TASK gate returns True for a clean author-declared
+    simple task: no initial_plan, simple_task_enabled, no auto_eval_redo /
+    force_full_path / hard-blocker, and NOT saturated."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={'complexity': 'simple'},
+    )
+    f.wf.initial_plan = None
+
+    assert f.wf._should_run_simple_task() is True
+
+
+@pytest.mark.asyncio
+async def test_should_run_simple_task_false_when_saturated(tmp_path: Path):
+    """Once ``metadata.routing.simple_saturated`` is stamped (task ν), the gate
+    returns False even for an otherwise-clean simple task — the demonstrated-
+    wrong label is not re-trusted, so the full architect path runs."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        task_metadata={'complexity': 'simple', 'routing': {'simple_saturated': True}},
+    )
+    f.wf.initial_plan = None
+
+    assert f.wf._should_run_simple_task() is False
