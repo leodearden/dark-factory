@@ -2029,17 +2029,33 @@ async def filter_stale_bulk_get_statuses_flags(
     if not check_positions:
         return list(flags)
 
+    # The UNSCOPED bulk census is identical for every flag within one filter
+    # invocation, so fetch it ONCE and share it across all per-task scoped
+    # re-checks — otherwise each matching flag would re-read the entire project
+    # census (N full-census reads for N flags).  Fail-safe: any error fetching
+    # the shared census KEEPS every flag (mirrors the per-flag KEEP-on-error).
+    try:
+        bulk = await taskmaster.get_statuses(project_root)
+    except Exception as exc:
+        logger.debug(
+            'reconciliation.stale_bulk_get_statuses_filter_bulk_read_error error=%s',
+            exc,
+        )
+        return list(flags)  # KEEP all flags on bulk-census read error (fail-safe)
+    bulk_map: dict[Any, Any] = bulk if isinstance(bulk, dict) else {}
+
     async def _safe_ab_check(task_id: Any) -> tuple[bool, str | None]:
         """Re-run the flag's own bulk-vs-scoped A/B check LIVE.
 
-        Returns ``(should_drop, agreed_status)``.  DROP only when the fresh
-        unscoped and scoped reads both report a non-None status for the cited
-        task AND those statuses are equal.  Any exception, a missing/None cited
-        status on either read, or a live divergence => KEEP (fail-closed).
+        Returns ``(should_drop, agreed_status)``.  Compares the cited task's
+        status in the shared unscoped ``bulk_map`` against a fresh per-task
+        scoped read.  DROP only when both report a non-None status for the cited
+        task AND those statuses are equal.  Any exception on the scoped read, a
+        missing/None cited status on either read, or a live divergence => KEEP
+        (fail-closed).
         """
         tid = str(task_id)
         try:
-            bulk = await taskmaster.get_statuses(project_root)
             scoped = await taskmaster.get_statuses(project_root, ids=[tid])
         except Exception as exc:
             logger.debug(
@@ -2047,7 +2063,7 @@ async def filter_stale_bulk_get_statuses_flags(
                 tid, exc,
             )
             return False, None  # KEEP flag on error (fail-safe)
-        bulk_status = bulk.get(tid) if isinstance(bulk, dict) else None
+        bulk_status = bulk_map.get(tid)
         scoped_status = scoped.get(tid) if isinstance(scoped, dict) else None
         if bulk_status is not None and bulk_status == scoped_status:
             return True, bulk_status  # live reads AGREE → benign artifact → DROP
