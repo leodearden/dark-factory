@@ -337,6 +337,78 @@ class TestOrphanL0Reaper:
         assert l1s[0].task_id == 'task-77'
 
     @pytest.mark.asyncio
+    async def test_live_lockfree_dispatch_divergence_not_promoted(
+        self, harness: Harness,
+    ):
+        """Task 2931: defer a divergence-class L0 while its task is live
+        inside a lock-free reviewer_comprehensive/resettled_adjudicator
+        stage.
+
+        Those stages ``self._invoke(...)`` an agent role that holds NO
+        module locks and is absent from ``_dispatched``, so
+        ``is_actively_held`` correctly returns False — yet the task is
+        genuinely live mid-dispatch, its ``metadata.files`` legitimately
+        lagging ``plan.files`` during in-flight scope reconciliation. The FP
+        recurred post-2878 (esc-2865-19, esc-2869-10). The liveness signal
+        these stages DO leave behind is ``metadata.routing.latest.decided_at``
+        (stamped fresh per LLM invocation). Here it is 5s old — well within
+        the 120s test grace — so the reaper must defer (not promote) the
+        divergence L0.
+
+        RED on main: the reaper has no routing-freshness gate, so the aged,
+        not-held orphan is promoted (count == 1, an L1 filed) instead of 0.
+        """
+        assert harness._escalation_queue is not None
+        harness.config.orphan_l0_dispatch_freshness_secs = 120.0
+        # Reviewer/adjudicator stage holds no locks and isn't dispatched.
+        harness.scheduler.is_actively_held = MagicMock(return_value=False)
+
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-42'),
+            task_id='task-42',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task task-42'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Deliberately NOT in _escalation_events (stale-snapshot gate would
+        # not skip it) and is_actively_held is False (no locks) — only the
+        # routing-freshness signal proves the task is live.
+
+        fresh_decided_at = (
+            datetime.now(UTC) - timedelta(seconds=5.0)
+        ).isoformat()
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'in-progress',
+                'metadata': {
+                    'routing': {'latest': {'decided_at': fresh_decided_at}},
+                },
+            },
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+
+    @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
