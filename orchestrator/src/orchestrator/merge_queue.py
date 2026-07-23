@@ -14587,10 +14587,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # dispatch).  Fail-open on a get_main_sha error (empty read → skip the
         # check; the item dispatches as before rather than wedging dispatch).
         _dead_base_remerged = False
-        try:
-            _dispatch_main = await self._git_ops.get_main_sha()
-        except Exception:
-            _dispatch_main = ''
+        # EFFICIENCY (task 2885 amend): compute _has_inflight_verify up front so
+        # the main-SHA fetch below can be ELIDED on the speculative hot path.
+        # Two consumers read _dispatch_main:
+        #   • this INV-3 dead-base check — needs it iff the dead-base ledger is
+        #     non-empty (nothing can be a dead link when the ledger is empty);
+        #   • the Mechanism-2 staleness check further down — needs it only for a
+        #     non-speculative, non-group item when no verify is in flight.
+        # In the common steady state (empty ledger + speculative item) NEITHER
+        # consumer needs it, so skip the get_main_sha() subprocess entirely —
+        # restoring the pre-INV-3 behaviour where speculative dispatch never
+        # fetched main.  _has_inflight_verify is a pure snapshot of self._inflight
+        # and stays valid at its use below: the only intervening mutation is the
+        # dead-base _remerge, which sets _dead_base_remerged=True and thereby
+        # short-circuits the Mechanism-2 gate regardless of this value.
+        _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
+        _needs_main_sha = bool(self._dead_base_commits) or (
+            not _has_inflight_verify
+            and not item.speculative
+            and not isinstance(req, GroupMergeRequest)
+        )
+        _dispatch_main = ''
+        if _needs_main_sha:
+            try:
+                _dispatch_main = await self._git_ops.get_main_sha()
+            except Exception:
+                _dispatch_main = ''
         _dispatch_dead = (
             self._chain_dead_link(item, _dispatch_main) if _dispatch_main else None
         )
@@ -14615,6 +14637,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 're-merging against actual main instead of burning a verify',
                 req.task_id, _dispatch_dead,
             )
+            # INV-3 dangling-edge fix (task 2885, enforcement (c) parity):
+            # this doomed build's OWN merge commit is orphaned by the re-merge
+            # below — record it dead so a straggler stacked on it is likewise
+            # caught by this same dispatch-time re-check.  Parity with the three
+            # other invalidation sites (head-failure cascade, RUNNER_UNAVAILABLE,
+            # and the Mechanism-2 staleness discard just below), all of which
+            # record the old commit dead for the identical reason.  item is a
+            # RealMergeItem here (_chain_dead_link returned non-None), guarded
+            # for type-safety.
+            if isinstance(item, RealMergeItem):
+                self._record_dead_base(item.merge_result.merge_commit or '')
             item = await self._remerge(req, item.started_monotonic)
             self._note_transition(
                 req.request_id, ItemLifecycleState.MERGING,
@@ -14675,7 +14708,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # carve-out that makes case (b) provable: even if B's base_sha happened
         # to differ from current_main, Mechanism 2 would not fire for speculative
         # items — preventing any main_advanced remerge on the clean-landed path.
-        _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
+        # _has_inflight_verify is computed once up front (see the INV-3 dead-base
+        # re-check above, where it also gates the main-SHA fetch) and reused here
+        # for the Mechanism-2 gate — one snapshot of self._inflight per dispatch.
         if not _has_inflight_verify and not _dead_base_remerged:
             remerge_reason: str | None = None
             if item.speculative and (self._n_failed or self._remerge_occurred):
