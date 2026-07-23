@@ -31,6 +31,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.merge_queue import (
+    DecidedItem,
     InflightEntry,
     InflightVerifyResult,
     MergeOutcome,
@@ -43,9 +44,11 @@ from orchestrator.verify_runner import HostLease
 # test_merge_queue_concurrent_verify).
 from test_merge_queue_two_layer_integration import (
     _make_fake_item,
+    _make_inflight_entry,
     _make_merged_item,
     _make_worker,
 )
+from test_merge_queue_verify_base_invariant import _fake_local_allocator
 from test_merge_speculation import _LateArrivalFakeEventStore
 
 # ── Fixtures (mirrored from test_merge_queue_verify_base_invariant.py) ────────
@@ -393,3 +396,93 @@ class TestAdoptionPassVoid:
         assert worker._event_store.speculative_events(EventType.verdict_voided) == []
         # Proof the normal PASS/CAS path WAS reached (advance attempted), not voided.
         worker._git_ops.advance_main.assert_awaited()
+
+
+# ── Dispatch-time / host-acquisition dead-base re-check (enforcement (a)) ──────
+
+
+@pytest.mark.asyncio
+class TestDispatchDeadBaseRecheck:
+    """A built-awaiting-host straggler whose base went DEAD is re-checked PER-ITEM
+    at host-acquisition — regardless of the GLOBAL ``_has_inflight_verify`` flag
+    (the exact 5260 gap: the old gate skipped the staleness re-merge whenever ANY
+    other verify was in flight).  A doomed item is discarded + re-merged against
+    real main instead of acquiring a host and burning a 40-min verify on a dead
+    base.  An item on a LIVE base dispatches normally under the same state."""
+
+    async def test_dead_base_rechecked_at_dispatch_despite_inflight_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        worker = _make_worker(git_ops)
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._dead_base_commits.add(_DEAD)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()  # one free local slot
+        worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
+        )
+        # _remerge returns a DecidedItem so the post-remerge passthrough returns
+        # WITHOUT ever launching a verify (proves no verify burned on the dead base).
+        _, remerged = _make_fake_item(
+            'remerged-dispatch', base_sha=_MAIN, merge_commit=None,
+            config=config, git_repo=git_repo,
+        )
+        worker._remerge = AsyncMock(return_value=remerged)  # type: ignore[method-assign]
+
+        # A head entry WITH a verify_task → _has_inflight_verify is True (the exact
+        # 5260 condition the old global-flag gate mis-handles).
+        _, head = _make_fake_item(
+            'head', base_sha=_MAIN, merge_commit='headc', config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(head, verifying=True))
+
+        # The built-awaiting-host straggler: base_sha points at a DEAD commit.
+        _, item = _make_fake_item(
+            'straggler', base_sha=_DEAD, merge_commit='stragc', config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+
+        await worker._dispatch_item(item)
+
+        worker._remerge.assert_awaited_once()          # re-merged despite _has_inflight_verify True
+        worker._run_inflight_verify.assert_not_called()  # NO verify burned on the dead base
+        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        assert len(voided) == 1
+        assert voided[0]['data']['dead_link'] == _DEAD
+        assert voided[0]['data']['reason'] == 'chain_dead'
+        assert voided[0]['data']['point'] == 'dispatch'
+
+    async def test_live_base_dispatches_normally_under_inflight_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        # Control: base_sha == current main → chain intact; the item must dispatch
+        # normally (verify launched, no remerge, no void) even though an UNRELATED
+        # dead commit sits in the ledger and _has_inflight_verify is True.
+        worker = _make_worker(git_ops)
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._dead_base_commits.add(_DEAD)  # unrelated dead commit
+        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
+        worker._remerge = AsyncMock()  # type: ignore[method-assign]
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=Path('/fake/merge-wt')),
+        )
+
+        _, head = _make_fake_item(
+            'head2', base_sha=_MAIN, merge_commit='headc2', config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(head, verifying=True))
+
+        _, item = _make_fake_item(
+            'live-straggler', base_sha=_MAIN, merge_commit='livec', config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+
+        entry = await worker._dispatch_item(item)
+
+        worker._remerge.assert_not_awaited()             # intact chain → no remerge
+        worker._run_inflight_verify.assert_called_once()  # verify launched normally
+        assert worker._event_store.speculative_events(EventType.verdict_voided) == []
+        assert entry is not None
