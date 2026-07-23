@@ -8158,16 +8158,23 @@ class GitOps:
         returned outcome and, ONLY on ``'failed'``, applies a crash-safe
         filesystem fallback for the task-2922 shape-1 leak.
 
-        Shape-1: an interrupted teardown (SIGTERM/restart mid-merge) leaves
-        a full ``_merge-<uuid>`` checkout on disk while its
-        ``.git/worktrees/<name>`` admin dir is already gone, so
-        ``git worktree remove --force`` errors ('not a working tree') and
-        the primitive returns ``'failed'`` and LEAVES the tree (its pinned
-        contract — see task 2924's
-        ``test_non_worktree_directory_returns_failed``). ``'failed'`` also
-        means the primitive's lease acquire already confirmed NO live holder
-        (a live holder yields ``'skipped_lease_held'``), so the tree is
-        verified-dead and safe to remove from the filesystem here.
+        Shape-1 is the canonical trigger: an interrupted teardown
+        (SIGTERM/restart mid-merge) leaves a full ``_merge-<uuid>`` checkout
+        on disk while its ``.git/worktrees/<name>`` admin dir is already
+        gone, so ``git worktree remove --force`` errors ('not a working
+        tree') and the primitive returns ``'failed'`` and LEAVES the tree
+        (its pinned contract — see task 2924's
+        ``test_non_worktree_directory_returns_failed``). But ``'failed'`` is
+        NOT proof of shape-1 specifically: it is simply *any* non-zero git
+        worktree removal — a ``git worktree lock``-ed tree or a transient
+        filesystem/I/O error yield it too. The fallback deliberately does
+        NOT try to distinguish the cause; it force-removes any unleased
+        ``_merge-`` tree git could not remove, whatever the reason. That is
+        safe here because merge worktrees are throwaway/ephemeral by
+        construction AND ``'failed'`` already means the primitive's lease
+        acquire confirmed NO live holder (a live holder yields
+        ``'skipped_lease_held'``), so the tree is unleased and safe to
+        remove from the filesystem.
 
         On ``'failed'`` the fallback: (1) band-guards via
         :meth:`_refuse_foreign_band` (defense-in-depth — the outcome check
@@ -8195,12 +8202,15 @@ class GitOps:
         if outcome != 'failed':
             return
 
-        # Shape-1 crash-safe fallback (task 2922): the guarded git removal
-        # failed — commonly the .git/worktrees/<name> admin dir was already
-        # removed by an interrupted teardown — AND the primitive's lease
-        # acquire already confirmed no live holder, so remove the on-disk tree
-        # git can no longer remove. The band guard is defense-in-depth over the
-        # outcome check; it can never fire for a genuine _merge- path.
+        # Crash-safe fallback (task 2922): the guarded git removal returned
+        # 'failed' — i.e. ANY non-zero git worktree removal. Most commonly the
+        # shape-1 case (the .git/worktrees/<name> admin dir was already removed
+        # by an interrupted teardown), but a locked tree or a transient FS/I/O
+        # error too. We intentionally do NOT distinguish the cause: the
+        # primitive's lease acquire already confirmed no live holder, so we
+        # force-remove this unleased throwaway _merge- tree git could no longer
+        # remove, whatever the reason. The band guard is defense-in-depth over
+        # the outcome check; it can never fire for a genuine _merge- path.
         if self._refuse_foreign_band(
             merge_wt, frozenset({'_merge-'}), 'cleanup_merge_worktree',
         ):
