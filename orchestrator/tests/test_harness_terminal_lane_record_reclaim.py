@@ -369,6 +369,83 @@ class TestStaleLaneAssignmentCensus:
         )
         assert await harness._stale_lane_assignment_census() == []
 
+    async def test_naive_updated_at_past_threshold_reported(
+        self, tmp_path: Path
+    ) -> None:
+        """A legacy NAIVE (no-offset) updated_at past threshold is still reported.
+
+        Guards the ``updated_at.tzinfo is None -> replace(tzinfo=UTC)`` branch:
+        without it the tz-aware ``now`` minus a tz-naive ``updated_at`` raises
+        TypeError which — inside _maybe_write_digest's try/except — would
+        silently swallow the whole census.
+        """
+        harness, git_ops = _make_pool_harness(tmp_path, lane_stale_report_days=7.0)
+        naive_stale = (
+            (datetime.now(UTC) - timedelta(days=10)).replace(tzinfo=None).isoformat()
+        )
+        assert '+00:00' not in naive_stale  # genuinely offset-naive
+        _write_record(
+            git_ops, '_lane-naive', DurableLaneState.ASSIGNED, '8000',
+            updated_at=naive_stale,
+        )
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'8000': 'blocked'}, None)
+        )
+
+        census = await harness._stale_lane_assignment_census()
+
+        assert len(census) == 1
+        assert '_lane-naive' in census[0]
+        assert '8000' in census[0]
+        assert 'stale' in census[0].lower()
+
+    async def test_stale_in_use_state_record_reported(self, tmp_path: Path) -> None:
+        """Census enumerates IN_USE records too, not only ASSIGNED.
+
+        The reclaim pass exercises IN_USE (the cancelled lane); the census is
+        otherwise only driven with ASSIGNED records — assert the shared
+        ASSIGNED/IN_USE filter reports a stale IN_USE non-terminal lane.
+        """
+        harness, git_ops = _make_pool_harness(tmp_path, lane_stale_report_days=7.0)
+        _write_record(
+            git_ops, '_lane-inuse', DurableLaneState.IN_USE, '8100',
+            updated_at=(datetime.now(UTC) - timedelta(days=10)).isoformat(),
+        )
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'8100': 'in-progress'}, None)
+        )
+
+        census = await harness._stale_lane_assignment_census()
+
+        assert len(census) == 1
+        assert '_lane-inuse' in census[0]
+        assert '8100' in census[0]
+        assert 'in-progress' in census[0]
+
+    async def test_threshold_boundary_over_reported_under_excluded(
+        self, tmp_path: Path
+    ) -> None:
+        """``age > threshold`` is strict: just-over is reported, just-under excluded."""
+        harness, git_ops = _make_pool_harness(tmp_path, lane_stale_report_days=7.0)
+        now = datetime.now(UTC)
+        _write_record(
+            git_ops, '_lane-over', DurableLaneState.ASSIGNED, '8200',
+            updated_at=(now - timedelta(days=7, hours=1)).isoformat(),
+        )
+        _write_record(
+            git_ops, '_lane-under', DurableLaneState.ASSIGNED, '8201',
+            updated_at=(now - timedelta(days=7) + timedelta(hours=1)).isoformat(),
+        )
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'8200': 'blocked', '8201': 'blocked'}, None)
+        )
+
+        census = await harness._stale_lane_assignment_census()
+
+        assert len(census) == 1
+        assert any('_lane-over' in ln and '8200' in ln for ln in census)
+        assert not any('8201' in ln for ln in census)
+
 
 # ---------------------------------------------------------------------------
 # step-13: _maybe_write_digest populates DigestInputs.stale_lane_census
@@ -398,7 +475,10 @@ class TestMaybeWriteDigestStaleCensus:
         # _maybe_write_digest doesn't error — mirrors test_harness_digest_rollup.
         RunStore(event_store.db_path)
 
-        census_lines = ['- _lane-3 -> task 5260 (blocked), stale 10.2d']
+        # Un-bulleted lines — matches the real _stale_lane_assignment_census
+        # output contract; render_digest_markdown adds the '- ' prefix itself
+        # (a bulleted mock would model a double-bulleted digest line).
+        census_lines = ['_lane-3 -> task 5260 (blocked), stale 10.2d']
         harness._stale_lane_assignment_census = AsyncMock(return_value=census_lines)
 
         harness._escalation_event_count = 5
