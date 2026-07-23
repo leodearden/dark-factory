@@ -5781,6 +5781,20 @@ class Harness:
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
         await self._run_interactive_worktree_reaper_pass()
+        # Leaf γ (task 2891): the durable-record terminal-lane reclaim rides
+        # this same fail-soft cadence tick (no new timer/loop). Belt-and-
+        # suspenders try/except — mirroring the interactive-worktree reaper
+        # delegate's bounded-log rationale (logger.error, NOT logger.exception)
+        # — so a reclaim fault can never break the shared warm-lane GC cadence
+        # loop or the never-raise contract of this pass.
+        try:
+            await self._reclaim_terminal_lane_records()
+        except Exception as exc:
+            logger.error(
+                'Terminal-lane-record reclaim pass failed: %s: %s',
+                type(exc).__name__,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Interactive-worktree (_iact-*) crash-safety reaper — task δ/2012
