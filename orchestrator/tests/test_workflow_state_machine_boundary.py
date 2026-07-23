@@ -1394,7 +1394,7 @@ class TestBlockDispositionOneClassifierAndCompleteness:
 async def _invoke_probe(
     role: AgentRole, config: OrchestratorConfig, git_ops: GitOps,
     task_assignment: TaskAssignment,
-) -> tuple[Mapping[str, Any], TaskWorkflow]:
+) -> tuple[Mapping[str, Any], TaskWorkflow, Path]:
     """Build a TaskWorkflow, patch invoke_with_cap_retry, invoke ``_invoke``.
 
     Duplicated (not imported) from test_agent_capability_wiring.py's helper
@@ -1404,9 +1404,10 @@ async def _invoke_probe(
     module's rows 5-6 duplicated git_repo/config/git_ops/task_assignment
     fixtures — same rationale, see their docstring above).
 
-    Returns (call_kwargs, workflow) — the kwargs invoke_with_cap_retry was
-    awaited with, and the workflow instance (so callers can assert against
-    workflow.modules).
+    Returns (call_kwargs, workflow, cwd) — the kwargs invoke_with_cap_retry
+    was awaited with, the workflow instance (so callers can assert against
+    workflow.modules), and the worktree path (a real linked worktree, so the
+    row-12 write-set assertion can check the worktree root is carved in).
     """
     wt_info = await git_ops.create_worktree(task_assignment.task_id)
     cwd = wt_info.path
@@ -1432,7 +1433,7 @@ async def _invoke_probe(
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None
-    return mock_cap_retry.await_args.kwargs, workflow
+    return mock_cap_retry.await_args.kwargs, workflow, cwd
 
 
 class TestCapabilityWiringImportAssert:
@@ -1506,12 +1507,25 @@ class TestCapabilityWiringImportAssert:
         role = AgentRole(
             name='probe_sbx', system_prompt='x', allowed_tools=[], sandboxed=True,
         )
-        call_kwargs, workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
-        assert call_kwargs.get('sandbox_modules') == workflow.modules, (
-            f"Expected sandbox_modules == {workflow.modules!r} (role.sandboxed=True) "
-            f"but got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
-            "sandboxing off role.sandboxed, not a role.name string check."
+        # Whole-worktree wiring (PRD os-sandbox D1): sandbox_modules=[] is the
+        # empty-list sandbox-on gate; the write set (worktree root + carve-outs)
+        # rides on sandbox_extras. Independent re-derivation of the α3 seam —
+        # assert the worktree root is carved in without recomputing the full set.
+        assert call_kwargs.get('sandbox_modules') == [], (
+            'Expected sandbox_modules == [] (role.sandboxed=True; whole-worktree '
+            f"gate) but got {call_kwargs.get('sandbox_modules')!r}. _invoke must "
+            'gate sandboxing off role.sandboxed, not a role.name string check.'
+        )
+        sandbox_extras = call_kwargs.get('sandbox_extras')
+        assert sandbox_extras is not None, (
+            'Expected sandbox_extras to carry the contract write set for a '
+            f'sandboxed role, but got {sandbox_extras!r}.'
+        )
+        assert str(cwd.resolve()) in sandbox_extras, (
+            f'Expected the worktree root {str(cwd.resolve())!r} carved into '
+            f'sandbox_extras, but got {sandbox_extras!r}.'
         )
 
     @pytest.mark.asyncio
@@ -1522,7 +1536,7 @@ class TestCapabilityWiringImportAssert:
             name='probe_plan', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'plan_tools'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         mcp_config = call_kwargs.get('mcp_config')
         servers = (mcp_config or {}).get('mcpServers', {})
@@ -1541,7 +1555,7 @@ class TestCapabilityWiringImportAssert:
             name='probe_orch', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'orchestrator'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs.get('mcp_config') is not None, (
             "Expected mcp_config to be built (role.mcp_families={'orchestrator'}) "
@@ -1557,7 +1571,7 @@ class TestCapabilityWiringImportAssert:
         """Negative control: a role declaring neither family and unsandboxed
         gets no sandbox modules and no plan-tools server wired."""
         role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs.get('sandbox_modules') is None, (
             f"Expected sandbox_modules is None (role.sandboxed=False) but got "

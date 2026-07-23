@@ -1503,6 +1503,7 @@ the simple path — stop and let the architect take over.
     # plan (_run_simple_task's success contract). Without 'plan_tools' here
     # the Lever-C fast-path always fell through to the architect.
     mcp_families=frozenset({'orchestrator', 'plan_tools'}),
+    sandboxed=True,
 )
 
 

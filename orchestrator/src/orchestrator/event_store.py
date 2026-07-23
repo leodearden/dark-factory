@@ -160,6 +160,21 @@ class EventType(StrEnum):
     merge_blocked = 'merge_blocked'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
+    # Emitted by verify.run_scoped_verification when the merge gate (the
+    # adoptable post-merge verdict path: role='merge' AND is_merge_verify=True)
+    # would otherwise return a "nothing to run" TRIVIAL PASS — no source files,
+    # empty existing_files (e.g. an ENOENT-clobbered worktree), or an empty
+    # command set.  INV-1 (plans/merge-verdict-integrity-prd.md §1, §3.2)
+    # forbids a no-evidence PASS from a merge-role verify: the would-be trivial
+    # pass is ESCALATED to the project's full merge gate, or — if no full-gate
+    # command exists — FAILs loud (VerifyResult category 'merge_no_evidence').
+    # task_id-keyed; data carries {reason, resolution, measured_at}.  reason ∈
+    # {no_source_files, empty_existing_files, empty_command_set}; resolution ∈
+    # {full_gate, loud_fail}; measured_at is an ISO-8601 str.  Only the
+    # dispatch-side LocalRunner threads an event_store, so the remote
+    # in-worktree path is None-safe (correctness fix still applies; only the
+    # event is dispatch-local, mirroring merge_flake_suppressed).
+    trivial_pass_escalated = 'trivial_pass_escalated'
 
     # Task lifecycle
     task_started = 'task_started'

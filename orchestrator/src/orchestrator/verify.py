@@ -1829,6 +1829,55 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
+#: INV-1 (task 2883) loud-FAIL category — greppable and, crucially, carrying NO
+#: parseable pytest node-ids, so the merge-flake suppression gate (which keys on
+#: node-ids) can never suppress a no-evidence merge FAIL.
+_MERGE_NO_EVIDENCE_CATEGORY = 'merge_no_evidence'
+
+
+def _trivial_pass_reason(existing_files: list[str]) -> str:
+    """INV-1 (task 2883) escalation reason for a no-source merge-gate resolution.
+
+    Single source of truth so Site 1 (module_configs branch) and Site 2
+    (no-module_configs branch) label the escalation IDENTICALLY:
+    ``'empty_existing_files'`` when the changed set resolved to nothing on disk
+    (e.g. an ENOENT-clobbered worktree, incident 83336a32) — distinguishing
+    evidence-absence from a genuine ``'no_source_files'`` docs-only diff.
+    (The global-tail backstop uses its own fixed ``'empty_command_set'`` reason.)
+    """
+    return 'empty_existing_files' if not existing_files else 'no_source_files'
+
+
+def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
+    """Build the INV-1 loud-FAIL VerifyResult for a merge gate that resolved to
+    'nothing to run' with no full-gate command to escalate to (task 2883).
+
+    Mirrors :func:`_trivial_pass`'s construction with the passed/trivial flags
+    INVERTED: ``passed=False`` so the merge worker treats it as blocked,
+    ``trivial=False`` so the task-2823 trivial-pass main-red gate never mistakes
+    it for a config-only short-circuit, and a distinct
+    ``category='merge_no_evidence'`` that carries no pytest node-ids so the
+    merge-flake suppression gate cannot suppress it.  *reason* ∈
+    {no_source_files, empty_existing_files, empty_command_set}.
+    """
+    summary = (
+        f'Merge gate produced no evidence ({reason}): the adoptable merge '
+        f'verdict resolved to "nothing to run" with no full-gate command — '
+        f'failing loud per INV-1 rather than trivially passing.'
+    )
+    return VerifyResult(
+        passed=False,
+        summary=summary,
+        test_output='',
+        lint_output='',
+        type_output=summary,
+        timed_out=False,
+        cause_hint=f'{_MERGE_NO_EVIDENCE_CATEGORY}:{reason}',
+        category=_MERGE_NO_EVIDENCE_CATEGORY,
+        trivial=False,
+    )
+
+
 async def _verify_pipeline_guard_requires_full_gate(
     worktree: Path,
     changed_files: list[str],
@@ -2855,8 +2904,9 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
 # Denylist, NOT allowlist: reify's cargo verify depends on a broad, evolving set
 # of toolchain/sccache/jobserver vars (RUSTC_WRAPPER, CARGO_*, the jobserver
 # FIFO, ...); an allowlist would silently break Rust verify the first time a new
-# var is needed.  We remove ONLY the python-env-selection vars that cause the
-# leak and pass everything else through untouched.
+# var is needed.  We remove ONLY the python-env-selection vars below plus the
+# orchestrator's own ORCH_* control-plane namespace (see _ORCH_ENV_PREFIX) —
+# the vars that cause a leak — and pass everything else through untouched.
 _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
     'VIRTUAL_ENV',
     'UV_PROJECT_ENVIRONMENT',
@@ -2876,6 +2926,20 @@ _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
     'CONDA_DEFAULT_ENV',
     'PYTHONHOME',
 })
+
+# The orchestrator's own control-plane env namespace.  ``OrchestratorConfig`` is
+# a pydantic-settings ``BaseSettings`` whose ``env_settings`` source reads the
+# ENTIRE ``ORCH_`` prefix as config overrides, so ANY ambient ``ORCH_*`` var
+# must NOT leak into a TARGET verify subprocess.  In particular ``load_config``
+# stamps ``os.environ['ORCH_CONFIG_PATH']`` in-process; if that leaks, a
+# snapshot-era env-sensitive test (e.g. an ``OrchestratorConfig()`` defaults
+# assertion frozen before main's autouse ``_isolate_orch_config`` hardening)
+# loads the PRODUCTION ``dark-factory-orchestrator.yaml`` and fails — falsifying
+# the eval metric collector's ``tests_pass`` on every cell (task 2957 / the RCA
+# doc ``plans/eval-metric-collector-orch-config-leak-rca-2026-07-22.md``).  We
+# scrub the WHOLE prefix (not just ORCH_CONFIG_PATH) so a future ORCH_* var
+# can't reintroduce the same leak class.
+_ORCH_ENV_PREFIX: str = 'ORCH_'
 
 
 def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
@@ -2903,15 +2967,23 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``_VENV_ISOLATION_KEYS``) and minus the venv ``bin`` dir on PATH, so
-    the target's toolchain resolves the target's OWN .venv.  Then injects
+    vars (``_VENV_ISOLATION_KEYS``), minus the orchestrator's ``ORCH_*``
+    control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
+    ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
+    config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
+    toolchain resolves the target's OWN .venv.  Then injects
     ``PYTHONUNBUFFERED=1`` (the partial-log invariant — see ``_run_cmd``) and
     finally overlays *extra* (the caller's ``_resolve_verify_env`` result:
     ``DF_VERIFY_ROLE`` plus reify's ``RUSTC_WRAPPER`` / ``CARGO_*`` / jobserver
-    vars) LAST, so target-supplied vars always win.
+    vars) LAST, so target-supplied vars always win — an ``ORCH_*`` var a caller
+    intentionally injects therefore survives the scrub.
     """
     venv = os.environ.get('VIRTUAL_ENV')
-    env = {k: v for k, v in os.environ.items() if k not in _VENV_ISOLATION_KEYS}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _VENV_ISOLATION_KEYS and not k.startswith(_ORCH_ENV_PREFIX)
+    }
     stripped_path = _strip_venv_bin_from_path(env.get('PATH'), venv)
     if stripped_path is not None:
         env['PATH'] = stripped_path
@@ -4789,6 +4861,7 @@ async def run_scoped_verification(
     archive_root: Path | None = None,
     force_workspace: bool = False,
     role: Literal['merge', 'task'] = 'task',
+    event_store: 'EventStore | None' = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
@@ -5009,37 +5082,74 @@ async def run_scoped_verification(
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
                     if not _has_source_files(existing_files):
-                        # Cheap deterministic backstop (task 2838) OR'd first so
-                        # it short-circuits the verify-pipeline-guard.sh
-                        # subprocess on the merge hot path; empty globs (default)
-                        # → False → expression byte-identical to guard-only.
-                        # The backstop matches the FULL changed set (task_files)
-                        # — including DELETED manifest-relevant paths, which are
-                        # absent from existing_files — because removing a file a
-                        # manifest enumerates shifts the manifest just as adding
-                        # one does (reviewer amendment, task 2838). The reify
-                        # consult keeps its existing on-disk existing_files
-                        # contract.
-                        should_override = role == 'merge' and (
-                            _merge_config_only_diff_forces_full_gate(config, task_files)
-                            or await _verify_pipeline_guard_requires_full_gate(
-                                worktree, existing_files,
-                            )
-                        )
-                        if should_override:
-                            logger.info(
-                                'config-only fast-path overridden by manifest-drift'
-                                ' backstop or verify-pipeline-guard'
-                                ' — running full gate (module_configs merge path)',
-                            )
-                            # Fall through to per-subproject fan-out below.
+                        if role == 'merge' and is_merge_verify:
+                            # INV-1 (task 2883): the ADOPTABLE merge verdict must
+                            # never trivially pass a no-evidence resolution. Any
+                            # 'nothing to run' outcome (no source files, or an
+                            # empty existing_files set from an ENOENT-clobbered
+                            # worktree) escalates to the full per-subproject gate
+                            # when at least one module carries a real command;
+                            # otherwise it FAILs loud rather than vouching for a
+                            # tree no gate ever ran on.
+                            reason = _trivial_pass_reason(existing_files)
+                            if any(
+                                mc.test_command or mc.lint_command
+                                or mc.type_check_command
+                                for mc in module_configs
+                            ):
+                                _emit_trivial_pass_escalated(
+                                    event_store, task_id,
+                                    reason=reason, resolution='full_gate',
+                                )
+                                logger.info(
+                                    'INV-1: merge gate escalating would-be trivial'
+                                    ' pass (%s) to the per-subproject full gate',
+                                    reason,
+                                )
+                                # Fall through to per-subproject fan-out below.
+                            else:
+                                _emit_trivial_pass_escalated(
+                                    event_store, task_id,
+                                    reason=reason, resolution='loud_fail',
+                                )
+                                logger.warning(
+                                    'INV-1: merge gate has no full-gate command'
+                                    ' (%s) — failing loud (merge_no_evidence)',
+                                    reason,
+                                )
+                                return _merge_no_evidence_fail(reason)
                         else:
-                            logger.info(
-                                'Verification mode: trivial pass (no source files in diff)',
+                            # Cheap deterministic backstop (task 2838) OR'd first so
+                            # it short-circuits the verify-pipeline-guard.sh
+                            # subprocess on the merge hot path; empty globs (default)
+                            # → False → expression byte-identical to guard-only.
+                            # The backstop matches the FULL changed set (task_files)
+                            # — including DELETED manifest-relevant paths, which are
+                            # absent from existing_files — because removing a file a
+                            # manifest enumerates shifts the manifest just as adding
+                            # one does (reviewer amendment, task 2838). The reify
+                            # consult keeps its existing on-disk existing_files
+                            # contract.
+                            should_override = role == 'merge' and (
+                                _merge_config_only_diff_forces_full_gate(config, task_files)
+                                or await _verify_pipeline_guard_requires_full_gate(
+                                    worktree, existing_files,
+                                )
                             )
-                            return _trivial_pass(
-                                'No source files changed — verify trivially passes',
-                            )
+                            if should_override:
+                                logger.info(
+                                    'config-only fast-path overridden by manifest-drift'
+                                    ' backstop or verify-pipeline-guard'
+                                    ' — running full gate (module_configs merge path)',
+                                )
+                                # Fall through to per-subproject fan-out below.
+                            else:
+                                logger.info(
+                                    'Verification mode: trivial pass (no source files in diff)',
+                                )
+                                return _trivial_pass(
+                                    'No source files changed — verify trivially passes',
+                                )
                     logger.info(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
@@ -5150,36 +5260,73 @@ async def run_scoped_verification(
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
             if not _has_source_files(existing_files):
-                # Cheap deterministic backstop (task 2838) OR'd first so it
-                # short-circuits the verify-pipeline-guard.sh subprocess on the
-                # merge hot path; empty globs (default) → False → expression
-                # byte-identical to the guard-only behaviour.
-                # The backstop matches the FULL changed set (task_files) —
-                # including DELETED manifest-relevant paths, which are absent
-                # from existing_files — because removing a file a manifest
-                # enumerates shifts the manifest just as adding one does
-                # (reviewer amendment, task 2838). The reify consult keeps its
-                # existing on-disk existing_files contract.
-                should_override = role == 'merge' and (
-                    _merge_config_only_diff_forces_full_gate(config, task_files)
-                    or await _verify_pipeline_guard_requires_full_gate(
-                        worktree, existing_files,
-                    )
-                )
-                if should_override:
-                    logger.info(
-                        'config-only fast-path overridden by manifest-drift'
-                        ' backstop or verify-pipeline-guard'
-                        ' — running full gate (no-module_configs merge path)',
-                    )
-                    # Fall through to the existing global run_verification path.
+                if role == 'merge' and is_merge_verify:
+                    # INV-1 (task 2883): the ADOPTABLE merge verdict must never
+                    # trivially pass a no-evidence resolution. Escalate to the
+                    # global full gate when a global command exists (fall through:
+                    # _build_fallback_config→None for a no-source diff, cargo-scope
+                    # is skipped, and control reaches the global run_verification
+                    # tail which runs config.test_command/lint/type). If NO global
+                    # command exists, FAIL loud INLINE so the global-tail backstop
+                    # never double-emits.
+                    reason = _trivial_pass_reason(existing_files)
+                    if (
+                        config.test_command
+                        or config.lint_command
+                        or config.type_check_command
+                    ):
+                        _emit_trivial_pass_escalated(
+                            event_store, task_id,
+                            reason=reason, resolution='full_gate',
+                        )
+                        logger.info(
+                            'INV-1: merge gate escalating would-be trivial pass'
+                            ' (%s) to the global full gate',
+                            reason,
+                        )
+                        # Fall through to the global run_verification tail below.
+                    else:
+                        _emit_trivial_pass_escalated(
+                            event_store, task_id,
+                            reason=reason, resolution='loud_fail',
+                        )
+                        logger.warning(
+                            'INV-1: merge gate has no global full-gate command'
+                            ' (%s) — failing loud (merge_no_evidence)',
+                            reason,
+                        )
+                        return _merge_no_evidence_fail(reason)
                 else:
-                    logger.info(
-                        'Verification mode: trivial pass (no source files, no module configs)',
+                    # Cheap deterministic backstop (task 2838) OR'd first so it
+                    # short-circuits the verify-pipeline-guard.sh subprocess on the
+                    # merge hot path; empty globs (default) → False → expression
+                    # byte-identical to the guard-only behaviour.
+                    # The backstop matches the FULL changed set (task_files) —
+                    # including DELETED manifest-relevant paths, which are absent
+                    # from existing_files — because removing a file a manifest
+                    # enumerates shifts the manifest just as adding one does
+                    # (reviewer amendment, task 2838). The reify consult keeps its
+                    # existing on-disk existing_files contract.
+                    should_override = role == 'merge' and (
+                        _merge_config_only_diff_forces_full_gate(config, task_files)
+                        or await _verify_pipeline_guard_requires_full_gate(
+                            worktree, existing_files,
+                        )
                     )
-                    return _trivial_pass(
-                        'No source files changed — verify trivially passes',
-                    )
+                    if should_override:
+                        logger.info(
+                            'config-only fast-path overridden by manifest-drift'
+                            ' backstop or verify-pipeline-guard'
+                            ' — running full gate (no-module_configs merge path)',
+                        )
+                        # Fall through to the existing global run_verification path.
+                    else:
+                        logger.info(
+                            'Verification mode: trivial pass (no source files, no module configs)',
+                        )
+                        return _trivial_pass(
+                            'No source files changed — verify trivially passes',
+                        )
             # NOTE (task γ amendment): unlike the module_configs branch below,
             # this call site deliberately does NOT thread a shared
             # content_cache into _build_fallback_config — doing so would add
@@ -5255,6 +5402,26 @@ async def run_scoped_verification(
                         attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                         role=role,
                     )
+
+        # INV-1 (task 2883) GLOBAL-tail backstop: the merge gate must never
+        # reach the final global run_verification with an empty command set —
+        # a config whose test/lint/type commands are all None/'' would make
+        # _summarize_checks return a vacuous 0==0==0 PASS, vouching for a tree
+        # no gate ever ran on. This path is reached only when Site 2 was NOT
+        # entered (task_files empty/None-derived-to-empty) — Site 2 already
+        # returns inline for the no-source case — so there is no double emission.
+        if role == 'merge' and is_merge_verify and not (
+            config.test_command or config.lint_command or config.type_check_command
+        ):
+            _emit_trivial_pass_escalated(
+                event_store, task_id,
+                reason='empty_command_set', resolution='loud_fail',
+            )
+            logger.warning(
+                'INV-1: merge gate reached the global tail with no command to run'
+                ' — failing loud (merge_no_evidence) rather than a vacuous pass',
+            )
+            return _merge_no_evidence_fail('empty_command_set')
 
         logger.info('Verification mode: global (no scope info)')
         return await run_verification(
@@ -6126,6 +6293,42 @@ def _emit_merge_flake_suppressed(
         data={
             'node_ids': node_ids,
             'merge_sha': merge_sha,
+            'measured_at': datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def _emit_trivial_pass_escalated(
+    event_store: 'EventStore | None',
+    task_id: str | None,
+    *,
+    reason: str,
+    resolution: str,
+) -> None:
+    """Emit the INV-1 structured escalation fact (task 2883). None-safe.
+
+    Emitted by :func:`run_scoped_verification` when the merge gate (role='merge'
+    AND is_merge_verify) escalates a would-be trivial pass to the full gate
+    (``resolution='full_gate'``) or FAILs loud (``resolution='loud_fail'``).
+    ``reason`` ∈ {no_source_files, empty_existing_files, empty_command_set}.
+
+    ``EventType`` is imported lazily to avoid any import-order coupling on this
+    central module (mirrors :func:`_emit_merge_flake_suppressed`).  The remote
+    in-worktree LocalRunner leaves *event_store* None (it cannot reach the
+    dispatching store), so only the dispatch-side event is local — the
+    correctness fix still applies remotely.
+    """
+    if event_store is None:
+        return
+    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
+
+    event_store.emit(
+        EventType.trivial_pass_escalated,
+        task_id=task_id,
+        role='merge',
+        data={
+            'reason': reason,
+            'resolution': resolution,
             'measured_at': datetime.now(UTC).isoformat(),
         },
     )

@@ -11561,3 +11561,104 @@ class TestRunInputText:
         rc, out, _ = await _run(['git', '--version'])
         assert rc == 0
         assert out.startswith('git version')
+
+
+@pytest.mark.asyncio
+class TestDisableSharedRepoAutoMaintenance:
+    """PRD plans/os-sandbox-worktree-containment-prd.md task α5 (D2 corollary).
+
+    Orchestrator-managed shared repos must have ``gc.auto=0`` +
+    ``maintenance.auto=false`` set idempotently so background
+    auto-gc/maintenance never fires under the narrow shared-.git write-set
+    (α2: .git root + packed-refs are RO), where it would fail
+    benignly-but-noisily.
+    """
+
+    async def test_disable_shared_repo_auto_maintenance_sets_and_is_idempotent(
+        self, git_ops: GitOps,
+    ):
+        """Both keys are set repo-locally, and a second call is a no-op-in-effect
+        (git config overwrites in place → naturally idempotent)."""
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc_gc, gc_val, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt, mt_val, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc == 0
+        assert gc_val.strip() == '0'
+        assert rc_mt == 0
+        assert mt_val.strip() == 'false'
+
+        # Idempotency: a second call overwrites in place, leaving identical values.
+        await git_ops.disable_shared_repo_auto_maintenance()
+        rc_gc2, gc_val2, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt2, mt_val2, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc2 == 0
+        assert gc_val2.strip() == '0'
+        assert rc_mt2 == 0
+        assert mt_val2.strip() == 'false'
+
+    async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A non-zero git rc degrades loudly, not fatally: the method returns
+        normally (never raises) and emits a WARNING naming each failed key + rc.
+
+        This is the core of the best-effort/loud contract (loud-over-silent
+        degradation) the docstring and PRD α5 emphasise: failing to set the key
+        merely leaves auto-gc enabled (itself only benign-but-noisy) and must
+        not block orchestrator startup or a task dispatch. A regression that
+        turned the WARNING into a raise, or dropped the rc!=0 check, is caught
+        here.
+        """
+        async def fake_run(cmd, cwd=None):
+            # Both `git config <key> <val>` writes fail with a non-zero rc.
+            return (1, '', 'fatal: could not write config')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            # Returns normally — a config-set failure must never raise.
+            result = await git_ops.disable_shared_repo_auto_maintenance()
+        assert result is None
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'disable_shared_repo_auto_maintenance' in r.getMessage()
+        ]
+        # Both keys hit the rc!=0 branch → one loud WARNING each (naming key,
+        # rc, and stderr). Asserting BOTH keys guards against a regression that
+        # drops the rc check for either write.
+        messages = ' '.join(r.getMessage() for r in warnings)
+        assert 'gc.auto' in messages
+        assert 'maintenance.auto' in messages
+        assert 'rc=1' in messages, (
+            f'expected the non-zero rc surfaced loudly; got: {messages!r}'
+        )
+
+    async def test_create_worktree_disables_auto_maintenance(
+        self, git_ops: GitOps,
+    ):
+        """The worktree-create path applies the config to the shared repo, so a
+        dispatch (and any config drift/re-clone) reasserts gc.auto=0 /
+        maintenance.auto=false — mirrors the create_worktree reify-debug-port
+        tests' 'call create_worktree, then assert a side effect' shape."""
+        await git_ops.create_worktree('gc-1')
+
+        rc_gc, gc_val, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt, mt_val, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc == 0
+        assert gc_val.strip() == '0'
+        assert rc_mt == 0
+        assert mt_val.strip() == 'false'

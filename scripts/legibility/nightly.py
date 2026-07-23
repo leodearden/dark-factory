@@ -348,7 +348,15 @@ def _default_poster(url: str, envelope: dict) -> None:
     """
     import httpx
 
-    response = httpx.post(url, json=envelope, timeout=10.0)
+    response = httpx.post(
+        url,
+        json=envelope,
+        # Required by the streamable-HTTP MCP transport -- single-sourced
+        # in census_trigger (already imported here) so a transport change is
+        # a one-line edit, not four lockstep edits with a silent-406 risk.
+        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
+        timeout=10.0,
+    )
     response.raise_for_status()
 
 
@@ -401,11 +409,27 @@ def _default_entrypoint_exists() -> bool:
 
 
 def _default_census_launcher() -> None:
-    """Best-effort subprocess launch of the census entrypoint (task η)."""
-    subprocess.run(
+    """Best-effort subprocess launch of the census entrypoint (task η).
+
+    Captures the census exit code and, on a NON-ZERO exit, emits ONE loud
+    warning (PRD decision 8: degradation never silent -- the silent-census
+    incident, task 2952). census.py's own main() files the escalation for the
+    failing stage; this loud log is the trickle-side trace so a failed census
+    is never invisible in the nightly's own journal. Keeps ``check=False`` and
+    never raises: census runs AFTER the trickle's own commit work, so a census
+    failure must never crash or fail the nightly run.
+    """
+    result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME)],
         check=False,
     )
+    if result.returncode != 0:
+        logger.warning(
+            "legibility trickle: census subprocess exited non-zero (returncode=%s) "
+            "-- census filed its own escalation for the failing stage; the nightly "
+            "trickle's own commit work is unaffected",
+            result.returncode,
+        )
 
 
 def evaluate_census_step(

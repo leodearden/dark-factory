@@ -39,10 +39,15 @@ def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
     session_id these tests assert on, writing the registry record at a
     different slug than the test reads. Clears the CLAUDE_SPAWN_* vars
     spawn-claude.sh sets (see that script for exactly which ones it
-    splices into a spawned session's real env) so this file is hermetic
-    regardless of launching context; tests needing a specific value still
-    set it explicitly via an env= mapping or monkeypatch.setenv, unaffected
-    by this fixture running first.
+    splices into a spawned session's real env), including
+    CLAUDE_SPAWN_ROLE/PROJECT/TASK_ID (Task 2940 — an orchestrator-spawned
+    launching context exports these too, and an omission here let the
+    leaked identity resolve to 'implementer:dark_factory#<id>' instead of
+    the clean 'session:dark-factory' default in subprocess-spawning
+    tests), so this file is hermetic regardless of launching context;
+    tests needing a specific value still set it explicitly via an env=
+    mapping or monkeypatch.setenv, unaffected by this fixture running
+    first.
     """
     monkeypatch.delenv('CLAUDE_SPAWN_SESSION_ID', raising=False)
     monkeypatch.delenv('CLAUDE_SPAWN_WM_TITLE', raising=False)
@@ -51,6 +56,9 @@ def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_SPAWN_LAUNCHER_PID', raising=False)
     monkeypatch.delenv('CLAUDE_SPAWN_TITLE', raising=False)
     monkeypatch.delenv('CLAUDE_SPAWN_PROMPT', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_ROLE', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_PROJECT', raising=False)
+    monkeypatch.delenv('CLAUDE_SPAWN_TASK_ID', raising=False)
 
 
 # ---------------------------------------------------------------------------

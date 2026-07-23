@@ -48,7 +48,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import config, inventory, sampling  # noqa: E402
+from legibility import census_trigger, config, inventory, sampling  # noqa: E402
 from orchestrator import session_registry  # noqa: E402
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
@@ -467,7 +467,15 @@ def _default_poster(url: str, envelope: dict) -> None:
     """
     import httpx
 
-    response = httpx.post(url, json=envelope, timeout=10.0)
+    response = httpx.post(
+        url,
+        json=envelope,
+        # Required by the streamable-HTTP MCP transport -- single-sourced
+        # in census_trigger (already imported here) so a transport change is
+        # a one-line edit, not four lockstep edits with a silent-406 risk.
+        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
+        timeout=10.0,
+    )
     response.raise_for_status()
 
 

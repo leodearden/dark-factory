@@ -16,8 +16,10 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1207,6 +1209,322 @@ def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Task 2934 step-1/2: _normalize_wm_window_id (decimal-vs-hex canonicalization)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_wm_window_id_decimal_and_padded_hex_collapse_to_same_canonical() -> None:
+    assert sr._normalize_wm_window_id('0x0000001a') == '0x1a'
+    assert sr._normalize_wm_window_id('26') == '0x1a'
+    # The crux: a decimal-captured id and a zero-padded-hex wmctrl id for the
+    # SAME window must compare equal after normalization.
+    assert sr._normalize_wm_window_id('26') == sr._normalize_wm_window_id('0x0000001a')
+
+
+def test_normalize_wm_window_id_already_canonical_round_trips() -> None:
+    assert sr._normalize_wm_window_id('0x1a') == '0x1a'
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [None, '', '   ', '0xZZ', 'nope', '-1'],
+    ids=['none', 'empty', 'whitespace', 'unparseable-hex', 'unparseable-decimal', 'negative'],
+)
+def test_normalize_wm_window_id_unparseable_or_negative_returns_none(raw: str | None) -> None:
+    assert sr._normalize_wm_window_id(raw) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 2934 step-3/4: _wmctrl_live_window_ids (single-probe live-window-id set)
+# ---------------------------------------------------------------------------
+
+
+def _fake_wmctrl_run(
+    stdout_lines: list[str], returncode: int = 0
+) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
+    """Build a fake ``run`` callable returning a canned ``wmctrl -l`` result."""
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, returncode=returncode, stdout='\n'.join(stdout_lines)
+        )
+
+    return _run
+
+
+def test_wmctrl_live_window_ids_rc0_multiline_returns_normalized_set() -> None:
+    run = _fake_wmctrl_run(
+        [
+            '0x0000001a  0 host  first window title',
+            '0x2b 1 host second-window-title',
+        ]
+    )
+    assert sr._wmctrl_live_window_ids(run) == {'0x1a', '0x2b'}
+
+
+def test_wmctrl_live_window_ids_collapses_mixed_casing_and_padding() -> None:
+    run = _fake_wmctrl_run(['0X0000002B  0 host  some window'])
+    assert sr._wmctrl_live_window_ids(run) == {'0x2b'}
+
+
+def test_wmctrl_live_window_ids_rc0_empty_stdout_returns_empty_set_not_none() -> None:
+    run = _fake_wmctrl_run([])
+    result = sr._wmctrl_live_window_ids(run)
+    assert result == set()
+    assert result is not None
+
+
+def test_wmctrl_live_window_ids_rc127_missing_binary_returns_none() -> None:
+    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=127)
+    assert sr._wmctrl_live_window_ids(run) is None
+
+
+def test_wmctrl_live_window_ids_rc124_transient_timeout_returns_none() -> None:
+    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=124)
+    assert sr._wmctrl_live_window_ids(run) is None
+
+
+def test_wmctrl_live_window_ids_other_nonzero_rc_returns_none() -> None:
+    run = _fake_wmctrl_run(['0x1a  0 host  irrelevant'], returncode=1)
+    assert sr._wmctrl_live_window_ids(run) is None
+
+
+def test_wmctrl_live_window_ids_run_raising_returns_none() -> None:
+    def _boom(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        raise OSError('wmctrl exploded')
+
+    assert sr._wmctrl_live_window_ids(_boom) is None
+
+
+def test_wmctrl_live_window_ids_titleless_short_line_still_contributes_id() -> None:
+    # No desktop/host/title columns -- id-only leniency: a reaper must fail
+    # toward keeping live sessions, so column-0-only lines still count.
+    run = _fake_wmctrl_run(['0x3c'])
+    assert sr._wmctrl_live_window_ids(run) == {'0x3c'}
+
+
+# ---------------------------------------------------------------------------
+# Task 2934 step-5/6: mark_windowless_wm_sessions_exited (happy path)
+# ---------------------------------------------------------------------------
+
+
+def test_mark_windowless_marks_wm_record_whose_window_id_is_absent(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='windowless-1',
+        status=sr.Status.AWAITING_INPUT,
+        display=sr.Display(kind='wm', wm_title='some title', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x0000ff99  0 host  some other window'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert {m.session_slug for m in marked} == {'windowless-1'}
+    record_path = sr.record_path_for_slug('windowless-1', root=tmp_path)
+    assert record_path.parent.is_dir()  # marked, NOT deleted
+    assert record_path.is_file()
+    reloaded = sr.read_record('windowless-1', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_mark_windowless_keeps_decimal_captured_id_matching_padded_hex_live_window(
+    tmp_path: Path,
+) -> None:
+    # DECIMAL-vs-hex KEEP: '26' (decimal) is the SAME window as the live,
+    # zero-padded-hex '0x0000001a' wmctrl reports -- must NOT be reaped.
+    r = _make_record(
+        session_slug='decimal-kept',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='26'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x0000001a  0 host  live window'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('decimal-kept', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='windowless-fields',
+        status=sr.Status.IDLE,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        launcher_pid=os.getpid(),
+        start_ts='2026-07-07T00:00:00+00:00',
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  other window'])
+
+    sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    reloaded = sr.read_record('windowless-fields', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    assert reloaded.role == 'unblock'
+    assert reloaded.project == 'df'
+    assert reloaded.task_id == '2085'
+    assert reloaded.launcher_pid == os.getpid()
+    assert reloaded.start_ts == '2026-07-07T00:00:00+00:00'
+
+
+# ---------------------------------------------------------------------------
+# Task 2934 step-7/8: mark_windowless_wm_sessions_exited fail-soft, scope,
+# and pid/age-independence
+# ---------------------------------------------------------------------------
+
+
+def test_mark_windowless_fail_soft_when_wmctrl_unavailable(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='no-wmctrl',
+        status=sr.Status.AWAITING_INPUT,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run([], returncode=127)  # missing binary -- no window evidence
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    # A headless run reaps NOTHING, even though this record's window would
+    # (if we could prove it) be gone -- "no evidence" != "window gone".
+    assert sr.read_record('no-wmctrl', root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+
+def test_mark_windowless_never_touches_tmux_display(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='tmux-session',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('tmux-session', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_never_touches_displayless_record(tmp_path: Path) -> None:
+    r = _make_record(session_slug='headless', status=sr.Status.RUNNING, display=None)
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('headless', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_leaves_already_terminal_wm_record_untouched(tmp_path: Path) -> None:
+    r = _make_record(
+        session_slug='already-exited-wm',
+        status=sr.Status.EXITED,
+        exit_code=0,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])  # window gone, but already terminal
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    reloaded = sr.read_record('already-exited-wm', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == 0  # NOT re-stamped with ORPHAN_EXIT_CODE
+
+
+@pytest.mark.parametrize(
+    'wm_window_id', [None, '0xZZ', 'nope'], ids=['none', 'unparseable-hex', 'unparseable-decimal']
+)
+def test_mark_windowless_skips_unparseable_or_missing_window_id(
+    wm_window_id: str | None, tmp_path: Path
+) -> None:
+    r = _make_record(
+        session_slug='no-id',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id=wm_window_id),
+    )
+    sr.write_record(r, root=tmp_path)
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    assert sr.read_record('no-id', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_reaps_regardless_of_live_pid_and_fresh_age(tmp_path: Path) -> None:
+    """THE CRUX: window-gone is definitive death evidence, independent of
+    launcher_pid liveness or record age -- proving this sweep reaps exactly
+    the zombies mark_orphaned_sessions_exited's pid/TTL guards currently keep.
+    """
+    r = _make_record(
+        session_slug='live-pid-fresh-but-windowless',
+        status=sr.Status.AWAITING_INPUT,
+        launcher_pid=os.getpid(),  # ALIVE
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug('live-pid-fresh-but-windowless', root=tmp_path)
+    _set_mtime(record_path, _NOW, timedelta(minutes=1))  # far under NON_TERMINAL_HEARTBEAT_TTL
+    run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert {m.session_slug for m in marked} == {'live-pid-fresh-but-windowless'}
+    reloaded = sr.read_record('live-pid-fresh-but-windowless', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
+    windowless_wm = _make_record(
+        session_slug='mix-windowless',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    present_window_wm = _make_record(
+        session_slug='mix-present',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='wm', wm_title='t2', wm_window_id='0x99'),
+    )
+    tmux_session = _make_record(
+        session_slug='mix-tmux',
+        status=sr.Status.RUNNING,
+        display=sr.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
+    )
+    headless = _make_record(session_slug='mix-headless', status=sr.Status.RUNNING, display=None)
+    terminal_wm = _make_record(
+        session_slug='mix-terminal',
+        status=sr.Status.EXITED,
+        exit_code=0,
+        display=sr.Display(kind='wm', wm_title='t3', wm_window_id='0x1a'),
+    )
+    for r in (windowless_wm, present_window_wm, tmux_session, headless, terminal_wm):
+        sr.write_record(r, root=tmp_path)
+
+    run = _fake_wmctrl_run(['0x99  0 host  still-open'])
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert {m.session_slug for m in marked} == {'mix-windowless'}
+    assert sr.read_record('mix-windowless', root=tmp_path).status == sr.Status.EXITED
+    assert sr.read_record('mix-present', root=tmp_path).status == sr.Status.RUNNING
+    assert sr.read_record('mix-tmux', root=tmp_path).status == sr.Status.RUNNING
+    assert sr.read_record('mix-headless', root=tmp_path).status == sr.Status.RUNNING
+    reloaded_terminal = sr.read_record('mix-terminal', root=tmp_path)
+    assert reloaded_terminal.status == sr.Status.EXITED
+    assert reloaded_terminal.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
 
@@ -1704,6 +2022,73 @@ def test_main_reap_marks_then_deletes(
     assert fresh_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
 
     assert not sr.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 2934 step-9/10: driving the WM-window sweep from `launching`/`reap`
+# ---------------------------------------------------------------------------
+
+
+def test_main_reap_marks_windowless_wm_session_before_deleting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    windowless = _make_record(
+        session_slug='reap-windowless',
+        status=sr.Status.AWAITING_INPUT,
+        launcher_pid=os.getpid(),  # ALIVE -- the pid/TTL sweep alone would never catch this
+        display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+    )
+    sr.write_record(windowless, root=tmp_path)
+
+    def _fake_wmctrl_list(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout='0x99  0 host  still-open window\n'
+        )
+
+    monkeypatch.setattr(sr, '_wmctrl_list', _fake_wmctrl_list)
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    # Marked, not deleted, in this SAME pass -- the window sweep ran in the
+    # mark phase before reap_stale_records (mark-then-delete order).
+    reloaded_dir = sr.record_path_for_slug('reap-windowless', root=tmp_path).parent
+    assert reloaded_dir.is_dir()
+    reloaded = sr.read_record('reap-windowless', root=tmp_path)
+    assert reloaded.status == sr.Status.EXITED
+    assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+
+
+def test_main_launching_fail_soft_when_window_sweep_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the new WM
+    window sweep: a fault must never raise out of _run_launching (it would
+    corrupt the printed record dir spawn-claude.sh captures into
+    SESSION_RECORD_DIR), exactly like a fault in the orphan mark sweep.
+    """
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    calls: list[None] = []
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
+        calls.append(None)
+        raise OSError('window sweep on fire')
+
+    monkeypatch.setattr(sr, 'mark_windowless_wm_sessions_exited', _boom)
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert calls  # the sweep really was invoked (and really did raise)
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
 
 # ---------------------------------------------------------------------------

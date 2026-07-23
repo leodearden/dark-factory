@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import json
 import logging
 import os
@@ -51,6 +52,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1191,6 +1193,10 @@ def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": arguments},
         },
+        # Required by the streamable-HTTP MCP transport -- single-sourced
+        # in census_trigger (already imported here) so a transport change is
+        # a one-line edit, not four lockstep edits with a silent-406 risk.
+        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
         timeout=30.0,
     )
     response.raise_for_status()
@@ -1268,6 +1274,30 @@ def _build_default_commit(project_root):
 
 def _parse_cli_date(value: str) -> date:
     return date.fromisoformat(value)
+
+
+def _build_stage_invokes(cfg):
+    """Build the three per-stage ``invoke(prompt, model)`` seams, each
+    carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
+    (see ``config.Timeouts`` for the rationale — why each stage needs its
+    own budget).
+
+    Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
+    census stage calls its invoke as ``invoke(prompt, model)`` with two
+    positional args and no kwargs, so a ``functools.partial`` that
+    pre-binds the keyword-only ``timeout`` is a drop-in ``invoke``.
+    ``mining_invoke`` also backs the headroom probe (``run_census`` routes
+    both through its single ``invoke`` param).
+
+    ``coder._invoke_cli`` is looked up here at call time (inside this
+    function, invoked from ``main``), never bound at import, so
+    monkeypatching ``coder._invoke_cli`` in tests takes effect.
+    """
+    return (
+        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs),
+        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs),
+        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1356,18 +1386,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    invoke = coder._invoke_cli
+    # Each census stage gets its OWN claude-CLI subprocess timeout; see
+    # config.Timeouts for the rationale.
+    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
+
+    # One escalate_fn closure shared by BOTH consumers: run_census's
+    # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
+    # below -- so defer and hard-failure escalations share one census
+    # escalation source and one never-mask-the-exit contract.
+    escalate_fn = _build_default_escalate_fn(cfg)
 
     try:
         outcome = run_census(
             batch_source=default_batch_source(
                 cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
             ),
-            invoke=invoke,
-            verify_fn=_build_default_verify_fn(str(project_root), invoke),
-            synthesize_fn=_build_default_synthesize_fn(invoke),
+            invoke=mining_invoke,
+            verify_fn=_build_default_verify_fn(str(project_root), verify_invoke),
+            synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
-            escalate_fn=_build_default_escalate_fn(cfg),
+            escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
             commit=_build_default_commit(project_root),
             codebook_dict=codebook_dict,
@@ -1380,8 +1418,19 @@ def main(argv: list[str] | None = None) -> int:
             date=date_str,
             force=args.force,
         )
-    except Exception as exc:  # noqa: BLE001 - fail loud: non-zero exit, never a silent crash
+    except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
         print(f"census: FAILED -- {exc}", file=sys.stderr)
+        # PRD decision 8 -- degradation never silent: file a best-effort
+        # escalation via the shared closure so a hard failure leaves an
+        # operator signal, not just a stderr line. The closure swallows all
+        # POST errors internally (logging a best-effort warning), so this
+        # never masks the exit and `return 1` always runs.
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=f"legibility census run failed ({cfg.project_id}): {exc}",
+            detail=traceback.format_exc(),
+        )
         return 1
 
     if outcome.status == "deferred":

@@ -40,3 +40,11 @@ models:
   census_miner: sonnet
   census_verify: sonnet
   census_synthesis: fable
+# Per-census-stage `claude` CLI subprocess budgets (seconds); see the Timeouts
+# model in scripts/legibility/config.py for the rationale (why each stage needs
+# its own budget). Pinned here (not just riding the schema defaults) so a future
+# change to those defaults cannot silently alter this project's census budgets.
+timeouts:
+  census_mining_secs: 120
+  census_verify_secs: 900
+  census_synthesis_secs: 1800

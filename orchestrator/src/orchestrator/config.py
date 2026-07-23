@@ -3123,6 +3123,17 @@ class OrchestratorConfig(BaseSettings):
             'reactive admit-time disk-pressure gate (warm_lane_disk_guard).'
         ),
     )
+    lane_stale_report_days: float = Field(
+        default=7.0,
+        description=(
+            'Age threshold in days beyond which a NON-terminal warm-lane '
+            'assignment (durable ASSIGNED/IN_USE record for a '
+            'pending/in-progress/blocked task) is reported in the digest '
+            "stale-lane census (leaf γ).  Such lanes are never auto-reclaimed "
+            '(WIP-preserving invariant) — the census only surfaces them for '
+            'operator attention.'
+        ),
+    )
 
     # No-landings circuit-breaker (θ=1893, Phase-2 backstop, PRD §5.5).
     # When rolling landing-rate == 0 AND warm-lane free-bytes is monotonically

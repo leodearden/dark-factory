@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import subprocess
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -424,6 +425,42 @@ def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
     assert ok is False
 
 
+class _FakeHttpxResponse:
+    def raise_for_status(self):
+        pass
+
+
+def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
+    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
+    lacking an Accept header covering both application/json and
+    text/event-stream (verified live against a local MCP /mcp endpoint).
+    `_default_poster`'s httpx import is lazy (httpx is not importable in
+    this test env), so a fake `httpx` module is injected via sys.modules."""
+    import sys
+
+    captured_kwargs = {}
+
+    fake_httpx = type(sys)('httpx')
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse()
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+
+    nightly._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
+
+    headers = captured_kwargs.get('headers') or {}
+    assert 'application/json' in headers.get('Accept', '')
+    assert 'text/event-stream' in headers.get('Accept', '')
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get('Content-Type') == 'application/json'
+    # The envelope must still ride along unchanged on the same POST.
+    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
+
+
 # ---------------------------------------------------------------------------
 # step-11/12: evaluate_census_step
 # ---------------------------------------------------------------------------
@@ -478,6 +515,44 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
 
     assert fire is True
     assert launcher_calls == [1]
+
+
+def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
+    """A non-zero census subprocess exit must be logged LOUD (naming the
+    returncode) rather than silently discarded -- the silent-census incident
+    this fixes (PRD decision 8: degradation never silent). The census files
+    its OWN escalation; the launcher's loud log is the trickle-side trace."""
+    def fake(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1)
+
+    monkeypatch.setattr(nightly.subprocess, "run", fake)
+
+    with caplog.at_level("WARNING", logger="legibility.nightly"):
+        result = nightly._default_census_launcher()
+
+    assert result is None, "the launcher never raises and returns None (never-crash-the-nightly)"
+    assert any(
+        "census" in r.getMessage() and "1" in r.getMessage()
+        for r in caplog.records if r.levelno >= logging.WARNING
+    ), "a non-zero census exit must be logged loud, naming the returncode"
+
+
+def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
+    """A zero-exit census (a deferred/no-fire outcome, or a clean run) must
+    stay quiet -- only a genuine non-zero exit gets the loud failure log."""
+    def fake0(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, "run", fake0)
+
+    with caplog.at_level("WARNING", logger="legibility.nightly"):
+        result = nightly._default_census_launcher()
+
+    assert result is None
+    assert not any(
+        "census" in r.getMessage()
+        for r in caplog.records if r.levelno >= logging.WARNING
+    ), "a zero-exit census must not emit a census-failure warning"
 
 
 # ---------------------------------------------------------------------------
