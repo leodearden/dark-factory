@@ -3333,3 +3333,109 @@ class TestMergeRequestTipRecency:
 
         # Clean up
         old_fut.cancel()
+
+
+# ---------------------------------------------------------------------------
+# TestMergeRequestDuplicateInVerify — task 2927 step-7/8: C3 in-verify reject
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDuplicateInVerify:
+    """step-7 RED: the MCP-level structured duplicate_in_verify reject (PRD §5 D3).
+
+    A newer descendant SHA submitted while the branch's earlier SHA is IN VERIFY
+    (worker snapshot reports verify_started_at for the in-flight request_id) must
+    return the structured {error, code, existing_mr, existing_sha,
+    verify_age_secs, hint} envelope and leave the live in-flight entry
+    undisturbed.
+
+    RED until step-8 adds the ``if dispatch.rejected:`` branch to
+    server.merge_request: without it the rejected MergeDispatchResult falls
+    through to the dispatched path and returns status='queued' (no 'code' key).
+    """
+
+    def _make_verify_git_ops(
+        self, *, new_tip: str, old_tip: str, main_branch: str = 'main',
+    ) -> types.SimpleNamespace:
+        """git_ops stub: resolve_branch_sha→new_tip, SUPERSET classify, no disk wt."""
+        async def _resolve_branch_sha(branch: str) -> str | None:
+            return new_tip if branch == 'task/B' else None
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            if ancestor == new_tip and descendant == main_branch:
+                return False  # skip already_merged fast-path
+            return bool(ancestor == old_tip and descendant == new_tip)  # SUPERSET
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        return types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+            project_root='/fake/project',
+        )
+
+    async def test_newer_sha_in_verify_returns_structured_reject(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            InFlightMergeRegistry,
+        )
+
+        OLD_TIP = 'aaaa0000deadbeef'
+        NEW_TIP = 'bbbb1111cafef00d'
+
+        registry = InFlightMergeRegistry()
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        ok = registry.acquire(
+            'B', 'task-old', old_fut, request_id='mr-old', snapshot_tip=OLD_TIP,
+        )
+        assert ok
+
+        # Worker snapshot reports mr-old IN VERIFY (verify_started_at set).
+        worker = _FakeMergeWorker()
+        worker.set_entries([{
+            'branch': 'B',
+            'request_id': 'mr-old',
+            'state': 'verifying',
+            'verify_started_at': 1000.0,
+            'verify_age_secs': 55.0,
+        }])
+
+        git_ops = self._make_verify_git_ops(new_tip=NEW_TIP, old_tip=OLD_TIP)
+        server, mq, _reg, _, _ = _build_merge_server(
+            tmp_path, registry=registry, git_ops=git_ops, worker=worker,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='task-new',
+                branch='B',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=0,
+            ),
+            timeout=5.0,
+        )
+
+        # Negative assertion: the reject must fire — a 'queued'/'attached'
+        # response (absence of the 'code' key) FAILS the test.
+        assert result.get('code') == 'duplicate_in_verify', (
+            f'expected a duplicate_in_verify reject; got {result}'
+        )
+        assert result.get('existing_mr') == 'mr-old'
+        assert result.get('existing_sha') == OLD_TIP
+        assert isinstance(result.get('verify_age_secs'), int)
+        assert result.get('hint') == 'merge_cancel then resubmit'
+        assert 'error' in result and result['error']
+
+        # Live verify entry UNDISTURBED — still in-flight, not cancelled, nothing enqueued.
+        entry = registry.entry('B')
+        assert entry is not None and entry.request_id == 'mr-old'
+        assert not old_fut.cancelled()
+        assert mq.empty()
+
+        old_fut.cancel()  # cleanup
