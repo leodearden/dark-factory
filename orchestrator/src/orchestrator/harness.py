@@ -3797,6 +3797,68 @@ class Harness:
             )
         return released
 
+    async def _stale_lane_assignment_census(self) -> list[str]:
+        """Census lines for NON-terminal warm-lane assignments idle past the threshold.
+
+        The reporting complement to :meth:`_reclaim_terminal_lane_records`
+        (leaf γ, task 2891): that pass reclaims TERMINAL-task lanes; this one
+        surfaces the non-terminal (pending/in-progress/blocked) durable
+        ASSIGNED/IN_USE records it deliberately LEAVES ALONE (WIP-preserving)
+        but which have been idle longer than ``config.lane_stale_report_days``
+        — the lanes an operator should look at (e.g. the incident-07-21 5260
+        lane held verified-green work while its task sat pending).
+
+        Rendered into the digest's ``## Stale lane assignments`` section via
+        ``DigestInputs.stale_lane_census``. Fail-safe throughout: returns ``[]``
+        on a missing pool or a degraded ``get_statuses`` read; a record with an
+        empty/unparseable ``updated_at`` is skipped (never counted). QUARANTINED
+        and terminal records are excluded.
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is None:
+            return []
+
+        records = self.git_ops._lane_lifecycle.all_records()
+        assigned = []
+        for lane_name, rec in records.items():
+            if (
+                rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
+                and rec.task_id is not None
+            ):
+                assigned.append((lane_name, rec, rec.task_id))
+        if not assigned:
+            return []
+
+        task_ids = list({task_id for _, _, task_id in assigned})
+        statuses, err = await self.scheduler.get_statuses(task_ids)
+        if resolver_failed(statuses, err):
+            return []
+
+        now = datetime.now(UTC)
+        threshold = timedelta(days=self.config.lane_stale_report_days)
+        census: list[str] = []
+        for lane_name, rec, task_id in assigned:
+            status = statuses.get(task_id)
+            if status is None or status in TERMINAL_STATUSES:
+                continue
+            if not rec.updated_at:
+                continue
+            try:
+                updated_at = datetime.fromisoformat(rec.updated_at)
+            except ValueError:
+                continue
+            # Records are written tz-aware (isoformat of a UTC datetime); guard
+            # a legacy naive value so the subtraction never raises TypeError.
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=UTC)
+            age = now - updated_at
+            if age > threshold:
+                census.append(
+                    f'{lane_name} -> task {task_id} ({status}), '
+                    f'stale {age.total_seconds() / 86400:.1f}d'
+                )
+        return census
+
     def _get_ground_truth(self) -> TaskGroundTruth:
         """Lazily build (and memoize) the ground-truth resolver (task 2243, W10-θ2).
 
