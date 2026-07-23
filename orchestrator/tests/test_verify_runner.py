@@ -6046,3 +6046,119 @@ class TestRemoteRunnerSyncIfStale:
         out = await runner.sync_if_stale(event_store=None, task_id=None)
         assert out.synced is True
         assert out.ok is True
+
+
+# ---------------------------------------------------------------------------
+# INV-2 (task 2884): run_merge_verify Step-0 mirror-semantics project-main push
+# ---------------------------------------------------------------------------
+
+
+def _make_mirror_runner(*, ff_rc: int, force_rc: int = 0, resolved_main: str = 'MAINSHA'):
+    """RemoteRunner (main_branch='main') + fake_run recorder for the mirror push.
+
+    fake_run routes by argv:
+      * ``git rev-parse main``              -> resolved_main (dedup probe)
+      * ``git push origin main:refs/heads/main``  (FF)    -> ff_rc
+      * ``git push origin +main:refs/heads/main`` (force) -> force_rc
+      * ``git push origin <sha>:refs/merge-verify/...``   -> 0 (load-bearing)
+      * ``git push origin --delete <ref>``                -> 0 (cleanup)
+      * ssh                                               -> canned PASS
+    Returns (runner, calls, expected_result).
+    """
+    calls: list[tuple[list[str], Any]] = []
+    expected = VerifyResult(passed=True, test_output='ok', lint_output='', type_output='', summary='ok')
+
+    async def fake_run(argv, *, cwd=None):
+        calls.append((list(argv), cwd))
+        if argv[:2] == ['git', 'rev-parse'] and len(argv) > 2 and argv[2] == 'main':
+            return (0, resolved_main, '')
+        if argv[:2] == ['git', 'push'] and len(argv) > 3:
+            refspec = argv[3]
+            if refspec == 'main:refs/heads/main':
+                return (ff_rc, '', '' if ff_rc == 0 else 'rejected: non-fast-forward')
+            if refspec == '+main:refs/heads/main':
+                return (force_rc, '', '' if force_rc == 0 else 'rejected: hook declined')
+            if 'refs/merge-verify/' in refspec:
+                return (0, '', '')
+            if refspec == '--delete':
+                return (0, '', '')
+            return (0, '', '')
+        return (0, result_to_json(expected), '')
+
+    runner = RemoteRunner(
+        name='laptop',
+        ssh_host='laptop.local',
+        git_remote='origin',
+        cwd='/repo',
+        main_branch='main',
+        run=fake_run,
+        id_factory=lambda: 'fixed-id',
+    )
+    return runner, calls, expected
+
+
+def _push_refspecs(calls) -> list[str]:
+    """Every `git push` refspec argument seen, in order."""
+    return [
+        argv[3] for (argv, _cwd) in calls
+        if argv[:2] == ['git', 'push'] and len(argv) > 3
+    ]
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerMainPushMirror:
+    """run_merge_verify Step-0: on a non-FF main push, force-mirror + emit runner_synced."""
+
+    async def test_ff_failure_retries_with_force_and_emits_project_main_mirror(self):
+        """(a) FF main push rc!=0 -> a `+main:refs/heads/main` force push follows and a
+        runner_synced(kind='project_main_mirror', forced=True) is emitted; the merge-sha
+        push + ssh still run and the VerifyResult is returned."""
+        runner, calls, expected = _make_mirror_runner(ff_rc=1, force_rc=0)
+        store = _RecordingEventStore()
+        result = await runner.run_merge_verify('abc123', _make_spec(), event_store=store)
+        assert result == expected
+
+        refspecs = _push_refspecs(calls)
+        # FF attempt precedes the force attempt
+        assert 'main:refs/heads/main' in refspecs
+        assert '+main:refs/heads/main' in refspecs
+        assert refspecs.index('main:refs/heads/main') < refspecs.index('+main:refs/heads/main')
+        # merge-sha push still issued (load-bearing transport intact)
+        assert any('refs/merge-verify/' in r for r in refspecs)
+
+        synced = store.events_of(EventType.runner_synced)
+        mirror = [e for e in synced if e.get('kind') == 'project_main_mirror']
+        assert len(mirror) == 1
+        assert mirror[0]['forced'] is True
+        assert mirror[0]['runner'] == 'laptop'
+
+    async def test_ff_success_no_force_no_mirror_event(self):
+        """(b) FF main push rc==0 -> no force push and no project_main_mirror event."""
+        runner, calls, expected = _make_mirror_runner(ff_rc=0)
+        store = _RecordingEventStore()
+        result = await runner.run_merge_verify('abc123', _make_spec(), event_store=store)
+        assert result == expected
+        refspecs = _push_refspecs(calls)
+        assert '+main:refs/heads/main' not in refspecs
+        mirror = [e for e in store.events_of(EventType.runner_synced) if e.get('kind') == 'project_main_mirror']
+        assert mirror == []
+
+    async def test_ff_and_force_both_fail_is_non_fatal_no_event(self):
+        """(c) FF rc!=0 AND force rc!=0 -> no raise, no event, best-effort swallow;
+        merge-sha push still issued and the result is returned."""
+        runner, calls, expected = _make_mirror_runner(ff_rc=1, force_rc=1)
+        store = _RecordingEventStore()
+        result = await runner.run_merge_verify('abc123', _make_spec(), event_store=store)  # must not raise
+        assert result == expected
+        refspecs = _push_refspecs(calls)
+        assert '+main:refs/heads/main' in refspecs  # force was attempted
+        assert any('refs/merge-verify/' in r for r in refspecs)  # merge-sha push still happened
+        mirror = [e for e in store.events_of(EventType.runner_synced) if e.get('kind') == 'project_main_mirror']
+        assert mirror == []  # force failed -> no success event
+
+    async def test_event_store_none_is_safe_on_force_path(self):
+        """event_store=None on the force path must not raise (None-safe emit)."""
+        runner, calls, expected = _make_mirror_runner(ff_rc=1, force_rc=0)
+        result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
+        assert result == expected
+        assert '+main:refs/heads/main' in _push_refspecs(calls)
