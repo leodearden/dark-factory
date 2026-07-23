@@ -103,6 +103,8 @@ class _Scaffold:
     name: str
     home: Path
     task_meta: Path
+    sibling_worktree: Path
+    other_task_meta: Path
 
 
 def _run_sandboxed(
@@ -162,8 +164,12 @@ def landlock_matrix_scaffold():
     ``.git`` gitdir file is exactly what ``compute_write_set`` parses in
     production); ``<base>/.task-meta/<name>/`` (the writable task-meta
     carve-out, via the same path shape ``TaskArtifacts.meta_root_for``
-    owns); and a hermetic fake ``HOME`` with ``~/.cache/uv/`` seeded so the
-    uv-cache carve-out is grantable at wrap time.
+    owns); a SIBLING linked worktree + its own (non-writable-by-contract)
+    ``.task-meta/`` dir, standing in for a second in-flight task on the
+    same host (rows 4/5's denial targets — pre-created so their parent
+    exists and the denial is a true landlock EACCES, not ENOENT); and a
+    hermetic fake ``HOME`` with ``~/.cache/uv/`` seeded so the uv-cache
+    carve-out is grantable at wrap time.
 
     Built under ``/var/tmp`` (never ``/tmp`` — see module docstring) via
     ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
@@ -184,8 +190,17 @@ def landlock_matrix_scaffold():
         worktree = base / name
         _git(['worktree', 'add', '-b', f'task/{name}', str(worktree), 'main'], main)
 
+        other_name = 'wt-b'
+        sibling_worktree = base / other_name
+        _git(
+            ['worktree', 'add', '-b', f'task/{other_name}', str(sibling_worktree), 'main'],
+            main,
+        )
+
         task_meta = base / '.task-meta' / name
         task_meta.mkdir(parents=True)
+        other_task_meta = base / '.task-meta' / other_name
+        other_task_meta.mkdir(parents=True)
 
         home = base / 'home'
         home.mkdir()
@@ -193,7 +208,8 @@ def landlock_matrix_scaffold():
 
         yield _Scaffold(
             base=base, main=main, worktree=worktree, name=name, home=home,
-            task_meta=task_meta,
+            task_meta=task_meta, sibling_worktree=sibling_worktree,
+            other_task_meta=other_task_meta,
         )
     finally:
         shutil.rmtree(base, ignore_errors=True)
