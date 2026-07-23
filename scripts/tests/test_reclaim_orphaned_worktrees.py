@@ -18,11 +18,15 @@ step-1: the pure ``parse_parking_dir_name(name)`` parser — trailing
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import reclaim_orphaned_worktrees as row
 from reclaim_orphaned_worktrees import parse_parking_dir_name
 
 LOG_PREFIX = "reclaim_orphaned_worktrees:"
+
+NOW = 1_000_000_000.0
+HOUR = 3600.0
 
 
 # ---------------------------------------------------------------------------
@@ -69,3 +73,67 @@ def test_parse_returns_none_on_calendar_invalid_stamp():
 def test_module_exposes_loud_prefix():
     """The module carries the stable greppable LOUD log prefix."""
     assert row._LOG_PREFIX == LOG_PREFIX
+
+
+# ---------------------------------------------------------------------------
+# step-3: pure select_reclaimable(records, now, min_age_hours)
+# ---------------------------------------------------------------------------
+
+def _rec(name: str, age_seconds: float) -> row.ParkedWorktree:
+    """A synthetic ParkedWorktree whose parked_at is *age_seconds* before NOW."""
+    return row.ParkedWorktree(
+        path=Path("/parkings") / name,
+        branch=f"task/{name}",
+        parked_at=datetime.fromtimestamp(NOW - age_seconds, tz=UTC),
+    )
+
+
+def test_select_reclaims_record_older_than_floor():
+    """A parking older than the floor -> reclaim with reason 'age'; a young
+    parking -> keep."""
+    old = _rec("old", 49 * HOUR)
+    young = _rec("young", 1 * HOUR)
+
+    decision = row.select_reclaimable([old, young], NOW, min_age_hours=48)
+
+    assert decision.reclaim_paths == {old.path}
+    assert decision.keep_paths == {young.path}
+    assert decision.reasons[old.path] == "age"
+
+
+def test_select_age_boundary_exact_is_kept_one_second_older_reclaimed():
+    """now - parked_at == min_age_hours*3600 exactly is KEPT (strict >, not >=);
+    one second older is reclaimed."""
+    boundary = _rec("boundary", 48 * HOUR)          # age == floor exactly
+    just_old = _rec("just_old", 48 * HOUR + 1)      # one second older
+
+    decision = row.select_reclaimable([boundary, just_old], NOW, min_age_hours=48)
+
+    assert decision.keep_paths == {boundary.path}
+    assert decision.reclaim_paths == {just_old.path}
+    assert decision.reasons[just_old.path] == "age"
+
+
+def test_select_non_positive_floor_reclaims_nothing():
+    """A non-positive floor reclaims NOTHING — even an ancient parking is kept
+    (fail-safe protecting fresh parkings; the OPPOSITE of gc_agent_transcripts'
+    'non-positive disables the axis')."""
+    ancient = _rec("ancient", 10_000 * HOUR)
+    young = _rec("young", 1 * HOUR)
+
+    for disabled in (0, -1):
+        decision = row.select_reclaimable([ancient, young], NOW, min_age_hours=disabled)
+        assert decision.keep_paths == {ancient.path, young.path}
+        assert decision.reclaim_paths == set()
+
+
+def test_select_reclaim_ordering_is_deterministic_oldest_first():
+    """The reclaim list is deterministically ordered oldest-first, independent
+    of input order."""
+    a = _rec("a", 100 * HOUR)   # oldest
+    b = _rec("b", 80 * HOUR)
+    c = _rec("c", 60 * HOUR)    # newest of the three (still > floor)
+
+    decision = row.select_reclaimable([c, a, b], NOW, min_age_hours=48)
+
+    assert [r.path for r, _reason in decision.reclaim] == [a.path, b.path, c.path]
