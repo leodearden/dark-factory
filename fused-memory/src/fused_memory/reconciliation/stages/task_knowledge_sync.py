@@ -50,6 +50,13 @@ from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_GROWTH,
+    STATE_ACTIVE,
+)
+from fused_memory.reconciliation.standing_decision_writer import (
+    expire_entity_standing_decision,
+)
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
 )
@@ -75,6 +82,11 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.services.live_workflow_detector import detect_live_workflow
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 from fused_memory.utils.async_utils import gather_collect
+
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - escalation package is optional
+    Escalation = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -674,6 +686,48 @@ _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
+# --- Entity-standing-decision growth-freshness sweep (task 2899 ζ) -----------
+# PRD plans/stage1-entity-standing-decision-prd.md §Staleness: a standing
+# decision's decision-time edge-count snapshot (``edge_count_at_decision``) is
+# corroborated against the LIVE graph at each Stage-2 tail. An ACTIVE row is
+# flipped to expired/growth when the entity has grown materially since the
+# decision:
+#     live > edge_count_at_decision * FACTOR
+#     OR live >= edge_count_at_decision + ABS_DELTA
+# (whichever trips first). The two-armed rule keeps a small entity from expiring
+# on a single-edge wobble (the ABS_DELTA floor) while still catching proportional
+# growth on a large entity (the FACTOR). These are the PRD contract defaults; each
+# is overridable PER RECORD via optional payload keys ``growth_factor`` /
+# ``growth_abs_delta`` (α's row-schema override path) — a local sweep constant
+# mirrors the file's existing convention (STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS).
+STANDING_DECISION_GROWTH_FACTOR: float = 1.25
+STANDING_DECISION_GROWTH_ABS_DELTA: int = 15
+
+# Per-cycle Stage-2 stats recorded by the growth sweep (explicit-zero, like the
+# marker-sweep stats): whether >=1 active row could not be verified this cycle
+# (fail-safe: the row is left ACTIVE) and how many rows were flipped to
+# expired/growth.
+ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY = (
+    'entity_standing_decision_growth_sweep_failed'
+)
+ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
+    'entity_standing_decision_growth_expired'
+)
+
+# Consecutive-failure streak (in full+completed cycles) at which the growth
+# sweep files a recon escalation (INV-4). Mirrors the task-count-snapshot
+# miss-streak threshold; recomputed from the journal each cycle (no stored
+# counter), so any successful sweep resets it.
+GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD: int = 3
+
+# Escalation category for the growth-sweep failure streak (INV-4). Free-form str
+# on ``Escalation.category``; kept distinct from the Stage-1/Stage-2 recon
+# categories (reconciliation_stale_human_operator / reconciliation_stale_flag /
+# recon_stale_task_count_snapshot) so it can be filtered independently.
+ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY = (
+    'reconciliation_growth_sweep_failure'
+)
+
 
 async def _resolve_terminal_task_ids(
     taskmaster,
@@ -1118,6 +1172,302 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
     )
+
+
+async def _sweep_entity_standing_decision_growth(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> dict:
+    """Corroborate each ACTIVE entity_standing_decision against the live graph (ζ).
+
+    The growth-freshness sweep (task 2899), a sibling of the Stage-2-tail marker
+    sweeps. For each ACTIVE ``entity_standing_decision`` row it fetches the
+    entity's LIVE edge count via graphiti and EXPIRES the row (reason='growth',
+    through the single-source :func:`expire_entity_standing_decision` flip helper)
+    when the entity has grown materially past its decision-time snapshot:
+
+        live > edge_count_at_decision * factor
+        OR live >= edge_count_at_decision + abs_delta
+
+    ``factor`` / ``abs_delta`` default to :data:`STANDING_DECISION_GROWTH_FACTOR`
+    / :data:`STANDING_DECISION_GROWTH_ABS_DELTA` and are overridable per row via
+    optional payload keys ``growth_factor`` / ``growth_abs_delta`` (a non-numeric
+    override is ignored in favour of the default).
+
+    **Fail-safe (never raises):**
+
+    * Unwired ledger (``memory_service.recon_ledger`` is ``None``) ⇒
+      ``{'checked': 0, 'expired': 0, 'failed': False}`` — the sweep did not run,
+      which is NOT a failure (mirrors the writer's ledger-None convention).
+    * A failure LISTING the active rows ⇒ ``failed=True`` (nothing checked).
+    * A per-row error (unparseable/incomplete payload, live-edge fetch failure,
+      or flip failure) ⇒ that row is LEFT ACTIVE (TTL-bounded; re-verified next
+      cycle) and ``failed=True``; the sweep continues to the next row. Leaving a
+      row active on unverified information is strictly safer than expiring it —
+      the marker sweeps' uncertain⇒keep direction.
+
+    ``failed=True`` is the signal the Stage-2 tail feeds to the consecutive-
+    failure streak escalation (:func:`_maybe_escalate_growth_sweep_failures`).
+
+    Returns ``{'checked': int, 'expired': int, 'failed': bool}``.
+    """
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        return {'checked': 0, 'expired': 0, 'failed': False}
+
+    log_extra = {'project_id': project_id, 'run_id': run_id}
+    try:
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+    except Exception:
+        logger.warning(
+            '_sweep_entity_standing_decision_growth: listing active standing '
+            'decisions failed for project_id=%s (sweep did not run)',
+            project_id, extra=log_extra, exc_info=True,
+        )
+        return {'checked': 0, 'expired': 0, 'failed': True}
+
+    checked = 0
+    expired = 0
+    failed = False
+    for row in rows:
+        checked += 1
+
+        # Reconstruct the decision-time snapshot + optional per-record overrides.
+        try:
+            payload = json.loads(row.payload_json)
+            decision_count = payload['edge_count_at_decision']
+        except Exception:
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: unreadable payload/snapshot '
+                'for entity_uuid=%s project_id=%s (left active)',
+                row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+            )
+            continue
+        if not isinstance(decision_count, (int, float)):
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: non-numeric '
+                'edge_count_at_decision=%r for entity_uuid=%s project_id=%s (left active)',
+                decision_count, row.entity_uuid, project_id, extra=log_extra,
+            )
+            continue
+        factor = payload.get('growth_factor')
+        if not isinstance(factor, (int, float)):
+            factor = STANDING_DECISION_GROWTH_FACTOR
+        abs_delta = payload.get('growth_abs_delta')
+        if not isinstance(abs_delta, (int, float)):
+            abs_delta = STANDING_DECISION_GROWTH_ABS_DELTA
+
+        # Sample the live edge count — a fetch failure leaves the row ACTIVE.
+        try:
+            edges = await memory_service.graphiti.get_valid_edges_for_node(
+                row.entity_uuid, group_id=project_id
+            )
+            live = len(edges)
+        except Exception:
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: live edge fetch failed for '
+                'entity_uuid=%s project_id=%s (left active, TTL-bounded)',
+                row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+            )
+            continue
+
+        if live > decision_count * factor or live >= decision_count + abs_delta:
+            try:
+                await expire_entity_standing_decision(
+                    ledger, row, reason=EXPIRY_REASON_GROWTH
+                )
+                expired += 1
+            except Exception:
+                failed = True
+                logger.warning(
+                    '_sweep_entity_standing_decision_growth: flip to expired/growth '
+                    'failed for entity_uuid=%s project_id=%s (left active)',
+                    row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+                )
+
+    return {'checked': checked, 'expired': expired, 'failed': failed}
+
+
+# ── Growth-sweep failure-streak escalation (task 2899 ζ, INV-4) ──────────────
+# Pure helpers mirroring task_count_snapshot_cadence's streak-on-miss shape,
+# INVERTED to streak-on-failure: the counted flag is True=sweep-failed (a
+# Graphiti error left >=1 active row unverified this cycle), not False=miss. The
+# streak is recomputed from journalled prior-run stats each cycle (no persisted
+# counter), so any successful sweep resets it and it survives a restart.
+
+
+def _extract_growth_sweep_failed(stage_report: object) -> bool | None:
+    """Read the growth-sweep failed flag off a Stage-2 report.
+
+    Accepts a real ``StageReport`` (attribute access), a raw dict shape (a
+    journal-reconstructed report or test double), or ``None``.
+
+    Returns ``True`` when
+    ``stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 1``,
+    ``False`` when ``== 0``, and ``None`` when the report is ``None``, its
+    ``stats`` is absent, or the key itself is absent — "unknown", never
+    miscounted as a confirmed failure or a confirmed success.
+    """
+    if stage_report is None:
+        return None
+    if isinstance(stage_report, dict):
+        stats = stage_report.get('stats') or {}
+    else:
+        stats = getattr(stage_report, 'stats', None) or {}
+    value = stats.get(ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY)
+    if value == 1:
+        return True
+    if value == 0:
+        return False
+    return None
+
+
+def _compute_growth_sweep_failure_streak(recent_flags: list[bool | None]) -> int:
+    """Count the leading run of consecutive failures in *recent_flags*.
+
+    *recent_flags* is most-recent-first. Counts consecutive ``True`` entries
+    from the start, stopping at the first ``False`` (a successful sweep resets
+    the streak) or ``None`` (unknown — stop, fail-safe: an inconclusive cycle
+    must never be counted as either a failure or a reset).
+    """
+    streak = 0
+    for flag in recent_flags:
+        if flag is True:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _evaluate_growth_sweep_escalation(
+    current_failed: bool | None,
+    prior_flags: list[bool | None],
+    *,
+    threshold: int = GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD,
+) -> dict:
+    """Decide whether the current cycle's sweep failure should escalate.
+
+    Fail-safe short-circuit (checked before the streak is computed): when
+    *current_failed* is not ``True`` (i.e. ``False`` — the sweep succeeded this
+    cycle — or ``None`` — it did not run / was inconclusive) the streak is ``0``
+    and there is no escalation. Only a CONFIRMED current failure can trigger.
+
+    Otherwise the streak is ``_compute_growth_sweep_failure_streak(prior_flags)
+    + 1`` (the "+1" is the current confirmed failure) and ``escalate`` is
+    ``streak >= threshold``.
+
+    Returns ``{'streak': int, 'escalate': bool}``.
+    """
+    if current_failed is not True:
+        return {'streak': 0, 'escalate': False}
+    streak = _compute_growth_sweep_failure_streak(prior_flags) + 1
+    return {'streak': streak, 'escalate': streak >= threshold}
+
+
+async def _maybe_escalate_growth_sweep_failures(
+    escalation_queue,
+    journal,
+    project_id: str,
+    run_id: str,
+    current_failed: bool | None,
+    *,
+    threshold: int = GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD,
+) -> bool:
+    """File a level-1 recon escalation on a sustained growth-sweep failure streak.
+
+    Mirrors ``stage1_stall_detector.maybe_escalate_stalled_tasks`` (a Stage may
+    file a recon escalation directly via ``self._escalation_queue``) and the
+    harness's ``_maybe_escalate_stale_task_count_snapshot`` journal-recompute:
+    the consecutive-failure streak is recomputed each cycle from
+    ``journal.get_recent_runs`` rather than a stored counter, so it resets on any
+    successful sweep and survives a restart with no new schema.
+
+    * Fail-safe short-circuit: only a CONFIRMED current failure
+      (*current_failed* is ``True``) is eligible — a successful or inconclusive
+      cycle returns ``False`` WITHOUT a journal read (cheap steady state).
+    * Prior runs are filtered to full-cycle COMPLETED runs only, EXCLUDING the
+      current *run_id* (a remediation/targeted or still-running run neither
+      counts toward nor resets the streak — matching the snapshot cadence).
+    * On reaching *threshold*, a single ``Escalation`` (level=1) is filed under
+      a STABLE per-project synthetic key ``recon-esd-growth-sweep:<project_id>``
+      and deduped via ``escalation_queue.has_open_l1`` so a persistent streak
+      folds into one open escalation rather than re-filing every cycle.
+
+    Fails open — never raises (the journal read is wrapped too), so a journal
+    hiccup never aborts the Stage-2 tail. Returns whether a NEW escalation was
+    filed. No-op (``False``) when the ``escalation`` package is unavailable or
+    *escalation_queue* is ``None``.
+    """
+    if Escalation is None or escalation_queue is None:
+        return False
+    if current_failed is not True:
+        return False
+    try:
+        recent = await journal.get_recent_runs(project_id, limit=max(20, threshold * 4))
+        prior_runs = [
+            r for r in recent
+            if getattr(r, 'id', None) != run_id
+            and str(getattr(r, 'run_type', '')) == 'full'
+            and str(getattr(r, 'status', '')) == 'completed'
+        ]
+        # Defensive re-sort most-recent-first: get_recent_runs already orders by
+        # started_at DESC, but _compute_growth_sweep_failure_streak depends on it.
+        prior_runs.sort(
+            key=lambda r: getattr(r, 'started_at', None) or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        prior_flags: list[bool | None] = []
+        for r in prior_runs:
+            stage_reports = getattr(r, 'stage_reports', None)
+            report = stage_reports.get('task_knowledge_sync') if isinstance(stage_reports, dict) else None
+            prior_flags.append(_extract_growth_sweep_failed(report))
+
+        result = _evaluate_growth_sweep_escalation(current_failed, prior_flags, threshold=threshold)
+        if not result['escalate']:
+            return False
+
+        key = f'recon-esd-growth-sweep:{project_id}'
+        if escalation_queue.has_open_l1(key):
+            logger.info(
+                'reconciliation.growth_sweep_failure_escalation_suppressed: '
+                'project_id=%s already has an open level-1 escalation',
+                project_id, extra={'project_id': project_id, 'run_id': run_id},
+            )
+            return False
+
+        streak = result['streak']
+        esc = Escalation(
+            id=escalation_queue.make_id(key),
+            task_id=key,
+            agent_role='reconciliation-stage2',
+            severity='blocking',
+            category=ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY,
+            summary=(
+                f'entity_standing_decision growth sweep failed for {streak} '
+                f'consecutive full cycles (project {project_id})'
+            ),
+            detail=(
+                'The reconciliation Stage-2 entity_standing_decision '
+                'growth-freshness sweep left >=1 ACTIVE row unverified (a Graphiti '
+                f'error) for {streak} consecutive completed full reconciliation '
+                f'cycles for project {project_id!r} (latest run_id={run_id}). '
+                'Active standing decisions may be growing stale without '
+                'corroboration; investigate Graphiti reachability for this project.'
+            ),
+            level=1,
+        )
+        escalation_queue.submit(esc)
+        return True
+    except Exception as e:
+        logger.warning(
+            'reconciliation.growth_sweep_failure_escalation_failed',
+            extra={'project_id': project_id, 'run_id': run_id, 'error': str(e)},
+        )
+        return False
 
 
 async def _verify_task_count_snapshot_written(
@@ -2280,7 +2630,51 @@ class TaskKnowledgeSync(BaseStage):
             self.memory, self.project_id, run_id,
         )
 
+        # Entity-standing-decision growth-freshness sweep (task 2899 ζ) — a
+        # sibling of the marker sweeps above, run at the Stage-2 TAIL (Stage 3 is
+        # read-only by design; PRD decision 9). Corroborates each ACTIVE standing
+        # decision's decision-time edge-count snapshot against the live graph and
+        # expires grown rows (reason='growth'); records explicit-zero stats and,
+        # on a full non-remediation cycle, evaluates the failure-streak escalation.
+        await self._run_entity_standing_decision_growth_sweep(report, run_id)
+
         return report
+
+    async def _run_entity_standing_decision_growth_sweep(
+        self,
+        report: StageReport,
+        run_id: str,
+    ) -> None:
+        """Run the ζ growth-freshness sweep and record its per-cycle stats (task 2899).
+
+        Delegates the row work to :func:`_sweep_entity_standing_decision_growth`
+        (best-effort, never raises), then records explicit-zero stats — the
+        ``failed`` flag (``1``/``0``) that the streak escalation reads next cycle
+        and the count of rows flipped to expired/growth — so downstream consumers
+        never need a ``.get(..., default)`` fallback.
+
+        The consecutive-failure streak escalation is evaluated ONLY on a full,
+        non-remediation cycle with a wired escalation queue: a remediation/targeted
+        pass must not inflate or reset the streak (mirroring the task-count-snapshot
+        cadence), and an unwired queue has nothing to file to. The filer itself is
+        journal-recompute + ``has_open_l1``-deduped and never raises.
+        """
+        result = await _sweep_entity_standing_decision_growth(
+            self.memory, self.project_id, run_id,
+        )
+        report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] = (
+            1 if result['failed'] else 0
+        )
+        report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] = result['expired']
+
+        if not self.remediation_mode and self._escalation_queue is not None:
+            await _maybe_escalate_growth_sweep_failures(
+                self._escalation_queue,
+                self.journal,
+                self.project_id,
+                run_id,
+                result['failed'],
+            )
 
     async def _apply_post_flight_guards(
         self,
