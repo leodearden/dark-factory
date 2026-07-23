@@ -36,7 +36,13 @@ from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import CpuPriorityConfig, GitConfig, JobserverConfig, OrchestratorConfig
+from orchestrator.config import (
+    CpuPriorityConfig,
+    GitConfig,
+    JobserverConfig,
+    OrchestratorConfig,
+    SandboxConfig,
+)
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -167,6 +173,12 @@ def config(git_repo: Path) -> OrchestratorConfig:
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        # These workflow e2e tests drive real _invoke against a bare-minimum
+        # fake worktree (no linked-worktree .git gitdir file), so the sandbox
+        # write-set path (compute_write_set, gated on sandbox.enabled) has
+        # nothing valid to parse. They exercise workflow logic, not
+        # sandboxing — keep sandbox off for hermeticity.
+        sandbox=SandboxConfig(enabled=False),
     )
 
 

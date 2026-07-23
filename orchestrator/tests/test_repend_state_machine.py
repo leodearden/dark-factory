@@ -53,7 +53,7 @@ from test_harness_reblock_signature_guard import (
 from test_stranded_blocked_sweep import _make_pending_l1, _make_resolved_l1
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
@@ -118,6 +118,12 @@ def config(git_repo: Path) -> OrchestratorConfig:
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        # These workflow-gate e2e tests drive real _invoke against a
+        # bare-minimum fake worktree (no linked-worktree .git gitdir file), so
+        # the sandbox write-set path (compute_write_set, gated on
+        # sandbox.enabled) has nothing valid to parse. They exercise gate
+        # logic, not sandboxing — keep sandbox off for hermeticity.
+        sandbox=SandboxConfig(enabled=False),
     )
 
 
