@@ -513,8 +513,11 @@ class TestDeterministicGateStranded:
 
     def test_false_for_non_dict_metadata(self) -> None:
         """(f) non-dict metadata → False (no raise)."""
-        assert _deterministic_gate_stranded('not-a-dict') is False
-        assert _deterministic_gate_stranded(123) is False
+        # Deliberately pass types the ``dict | None`` signature forbids to
+        # exercise the runtime ``isinstance`` guard documented as "non-dict
+        # metadata is treated as non-matching rather than raising".
+        assert _deterministic_gate_stranded('not-a-dict') is False  # type: ignore[arg-type]
+        assert _deterministic_gate_stranded(123) is False  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
