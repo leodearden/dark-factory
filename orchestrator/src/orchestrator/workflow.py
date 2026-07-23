@@ -8010,6 +8010,45 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             self._task_files
             and self._base_commit is not None
         ):
+            # Cross-repo deliverable short-circuit (task 3004): when every
+            # declared plan file belongs to another project, this task's branch
+            # is legitimately EMPTY (the deliverable lands on the other
+            # project's branch — the reify-task 5308 shape).  Routing it through
+            # the not-touched gate below would false-flag the empty branch and
+            # drag the architect through a dishonest narrowing pass, so recognise
+            # it first and route to the honest ``plan_files_cross_repo`` terminal
+            # outcome on the NORMAL ladder (no forced ``escalate_to_human``).
+            # Import directly from merge_gates (NOT the merge_queue shim) to keep
+            # hot merge_queue.py out of this task's lock scope.
+            from orchestrator.merge_gates import (
+                CROSS_REPO_DELIVERABLE_REASON_PREFIX,
+                is_cross_repo_task,
+            )
+            if is_cross_repo_task(
+                list(self._task_files),
+                self.config.project_root,
+                self.task.get('metadata'),
+            ):
+                _emit_merge_attempt(
+                    self.event_store, self.task_id,
+                    OutcomeKind.plan_files_cross_repo,
+                )
+                reason = (
+                    f'{CROSS_REPO_DELIVERABLE_REASON_PREFIX}: every declared '
+                    f'plan file belongs to another project, so this task\'s '
+                    f'branch is legitimately empty — the deliverable lands on '
+                    f'the other project\'s branch.  Verify the external landing '
+                    f'rather than re-running this (empty) branch.'
+                )
+                external_deps = (self.task.get('metadata') or {}).get('external_deps')
+                if external_deps:
+                    reason += f' external_deps={external_deps}.'
+                return await self._mark_blocked(
+                    reason,
+                    merge_phase=merge_phase,
+                    category='cross_repo_deliverable',
+                    suggested_action='verify_external_landing',
+                )
             rc, branch_head, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
