@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -572,6 +573,34 @@ def _build_delivered_check_escalation(
     )
     detail = '\n'.join(lines)
     return summary, detail
+
+
+def _delivered_checks_descriptor_digest(checks: list | None) -> str:
+    """Canonical-JSON sha256 hex digest of a dep's whole ``delivered_checks``
+    list (task 2975).
+
+    :meth:`Scheduler._compute_delivered_check_cache` folds this digest into
+    its persistent cache key alongside ``(dep_task_id, main_sha)`` so that
+    an operator correcting a check descriptor (pattern/paths/script/args)
+    at a FIXED main SHA is a cache MISS — forcing a re-evaluation on the
+    very next sweep — rather than continuing to serve a stale cached
+    verdict until an unrelated commit advances main and prunes it
+    (esc-2911-1/2 recurrence).
+
+    ``sort_keys=True`` canonicalizes dict-key order within each check so a
+    cosmetic key reordering does not needlessly bust the cache; list order
+    is deliberately preserved (order determines which check is reported
+    first on failure). ``checks or []`` normalizes both ``None`` and ``[]``
+    to the same digest — mirroring the falsy-checks short-circuit already
+    used at the collection site. Pure function: no scheduler state, no
+    side effects. Mirrors the repo's pure-hashlib sha256 hexdigest
+    convention (``agents/write_set.py``, ``shared/task_metadata.py``).
+    """
+    return hashlib.sha256(
+        json.dumps(checks or [], sort_keys=True, separators=(',', ':'), default=str).encode(
+            'utf-8'
+        )
+    ).hexdigest()
 
 
 class McpSessionLike(Protocol):
