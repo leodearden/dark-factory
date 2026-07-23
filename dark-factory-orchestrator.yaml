@@ -59,6 +59,26 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 verify_command_timeout_secs: 1800
 verify_cold_command_timeout_secs: 3600
 
+# Cold-verify shared-venv pre-provision (task 2997, esc-2913-3). On a COLD verify
+# worktree the shared workspace .venv is populated only as a SIDE EFFECT of the
+# TEST leg running `uv run pytest` in each member. The full-repo-scope root LINT
+# (`uv run ruff check …`) and TYPE (`… npx pyright`) commands, launched ~11ms
+# alongside TEST in one asyncio.gather, then race that sync and fail spuriously
+# (`Failed to spawn: ruff`; `Import "pytest" could not be resolved`).
+# run_verification runs this command ONCE per cold worktree, synchronously,
+# BEFORE the test/lint/type gather so the venv is populated first.
+#
+# `--all-packages` (NOT the naive `--project shared --extra dev`): ruff + the dev
+# deps live in each member's `[dependency-groups] dev`, NOT an optional-deps
+# `dev` extra (so `--extra dev` ERRORS: "Extra `dev` is not defined"). pyright
+# type-checks fused-memory/orchestrator/dashboard and resolves their test imports
+# against the shared root .venv, so it needs EVERY member's dev deps present, not
+# just shared's. `--all-packages` syncs all workspace members + their default dev
+# groups into the single root .venv. Verified against uv.lock (uv 0.11.6): it
+# resolves ruff 0.15.9 + pytest 9.0.3 + pytest-asyncio + aiosqlite + pyright —
+# the exact set the working shared venv already carries.
+verify_cold_preprovision_command: "uv sync --all-packages"
+
 # TEMPORARY manual override (watcher, 2026-07-13) to break the cross-project
 # verify-admission-slot contention with reify while task 2501 (per-project
 # slots-dir default) lands. Without this, verify_admission_slots_dir defaults to
