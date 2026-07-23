@@ -1,4 +1,4 @@
-"""Real-kernel Landlock enforcement-matrix suite.
+"""Real-kernel Landlock enforcement-matrix suite (test_sandbox_enforcement_matrix).
 
 Pins the 12 rows of ``plans/os-sandbox-worktree-containment-prd.md``'s
 §Enforcement matrix (task alpha4; D9; INV-1 machine-pin of the §Write-set
