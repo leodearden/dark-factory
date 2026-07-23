@@ -2483,6 +2483,140 @@ async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_me
     assert harness.judge.unhalt_grace_remaining('test-project') == 1
 
 
+async def _fake_completed_cycle(*_a, **_k):
+    """Stand-in for run_full_cycle so the auto-unhalt tests don't run a real
+    reconciliation cycle. Returns a completed ReconciliationRun."""
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+    )
+
+    return ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='auto_unhalt',
+        started_at=datetime.now(UTC),
+        events_processed=0,
+        status=RunStatus.completed,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_unhalt_resumes_after_cooldown_expiry(
+    journal, event_buffer, mock_memory_service
+):
+    """With auto_unhalt_after_cooldown enabled and the halt cooldown expired,
+    the halt-check auto-unhalts the project (awaiting judge.unhalt) and FALLS
+    THROUGH to run the cycle instead of skipping (task 2920 deliverable c)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    harness.config.auto_unhalt_after_cooldown = True
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) - timedelta(hours=1)  # expired
+    )
+    # Spy on unhalt while preserving real behaviour (clears halt, seeds grace).
+    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    harness.judge.unhalt = unhalt_spy
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ) as rfc_mock,
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+
+    unhalt_spy.assert_awaited()
+    assert unhalt_spy.await_args.args[0] == 'test-project'
+    assert not harness.judge.is_halted('test-project')  # halt cleared
+    assert rfc_mock.called, 'cycle must NOT be early-returned after auto-unhalt'
+
+
+@pytest.mark.asyncio
+async def test_no_auto_unhalt_when_disabled(
+    journal, event_buffer, mock_memory_service
+):
+    """Default (auto_unhalt_after_cooldown=False): an expired-cooldown halt is
+    still SKIPPED — legacy halt-until-manual-unhalt behaviour preserved."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    harness.config.auto_unhalt_after_cooldown = False
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) - timedelta(hours=1)  # expired, but feature disabled
+    )
+    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    harness.judge.unhalt = unhalt_spy
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ) as rfc_mock,
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+    unhalt_spy.assert_not_awaited()
+    rfc_mock.assert_not_called()
+    assert harness.judge.is_halted('test-project')  # still halted
+
+
+@pytest.mark.asyncio
+async def test_no_auto_unhalt_before_cooldown_expiry(
+    journal, event_buffer, mock_memory_service
+):
+    """Enabled but cooldown still in the FUTURE → still skipped, because
+    cooldown_expired is False."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    harness.config.auto_unhalt_after_cooldown = True
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) + timedelta(hours=1)  # not yet expired
+    )
+    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    harness.judge.unhalt = unhalt_spy
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ) as rfc_mock,
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+    unhalt_spy.assert_not_awaited()
+    rfc_mock.assert_not_called()
+    assert harness.judge.is_halted('test-project')
+
+
 @pytest.mark.asyncio
 async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_memory_service):
     """_make_stages() returns fresh stage instances with no leftover per-run state.
