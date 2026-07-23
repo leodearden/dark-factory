@@ -10790,6 +10790,218 @@ class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
         assert result == ''
 
 
+class TestRenderLiveWorkflowSectionCorroborationGate:
+    """_render_live_workflow_section threads per-task corroboration into
+    detect_live_workflow for IN-PROGRESS tasks (task 2963 step-8).
+
+    Scenario: an in-progress task whose ONLY live signals are a lingering
+    registered worktree and the project-wide orchestrator lock (no
+    recent_commit) — the fleet-redeploy false positive. The renderer must
+    require at least one FRESH per-task corroborating signal (a live
+    claimant/heartbeat, a scheduler holder/park entry, or a routing decision
+    stamped after the orchestrator's last restart). With none present the task
+    is downgraded to indeterminate (is_live=False) and dropped from the
+    section; any one fresh signal keeps it listed. The gate is
+    in-progress-only.
+
+    Direct-call harness (mirrors TestRenderLiveWorkflowSectionEmptyTasksNoOp)
+    plus real on-disk orchestrator.lock / scheduler_state.json fixtures so the
+    renderer's hoisted orchestrator_started_at + read_scheduler_state reads
+    exercise the true files.
+
+    RED until step-8 wires corroboration_for_task + orchestrator_started_at +
+    read_scheduler_state into the renderer (only case (a) fails today — the
+    renderer does not yet compute/pass ``corroborated``, so the task is listed;
+    cases (b)-(e) are GREEN-trivial now and pin the keep-listed behavior after
+    step-8).
+    """
+
+    _NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
+    # Orchestrator last (re)started 1h before _NOW.
+    _STARTED = datetime(2026, 7, 24, 11, 0, 0, tzinfo=UTC)
+    _TASK_ID = 2763
+    _BRANCH = 'task/2763'
+
+    # ----- on-disk fixtures -----
+
+    def _write_lock(self, tmp_path, started):
+        lock_dir = tmp_path / 'data' / 'orchestrator'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / 'orchestrator.lock').write_text(
+            f'PID 12345 started {started.isoformat()}\n', encoding='utf-8'
+        )
+
+    def _write_scheduler_state(self, tmp_path, *, parks=None, current_holders=None):
+        state_dir = tmp_path / 'data' / 'orchestrator'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state = {'parks': parks or {}, 'current_holders': current_holders or {}}
+        (state_dir / 'scheduler_state.json').write_text(
+            json.dumps(state), encoding='utf-8'
+        )
+
+    # ----- git signals: worktree_registered=True, recent_commit=False, non-bare -----
+
+    def _git_side_effect(self):
+        """Drive worktree_registered=True for task/2763, a NON-bare branch
+        (rev-list=3, so rule 4 cannot interfere), and an OLD tip timestamp
+        (48h — older than the 6h recency window) so recent_commit=False. The
+        only signals asserting liveness are the lingering worktree + the
+        (monkeypatched) project-wide orchestrator lock.
+        """
+        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+
+        old_ts = (self._NOW - timedelta(hours=48)).isoformat()
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=(
+                        'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                        f'worktree /project-2763\nHEAD def5678\n'
+                        f'branch refs/heads/{self._BRANCH}\n\n'
+                    ),
+                    stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr=''
+                )
+            # git log tip timestamp
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=old_ts, stderr=''
+            )
+
+        return side_effect
+
+    def _routing_metadata(self, decided_at):
+        """A well-formed metadata.routing whose latest decision is stamped at
+        *decided_at* (so RoutingState.from_metadata parses it cleanly)."""
+        return {
+            'routing': {
+                'latest': {
+                    'role': 'implementer',
+                    'model': 'claude-sonnet-4',
+                    'effort': 'medium',
+                    'budget_usd': 5.0,
+                    'max_turns': 40,
+                    'source_layer': 'role_default',
+                    'decided_at': decided_at.isoformat(),
+                }
+            }
+        }
+
+    def _render(self, tmp_path, task, monkeypatch):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        # Project-wide orchestrator lock reports live (a real PID check would
+        # fail against the fake PID in the lock file — orchestrator_started_at
+        # only parses the `started` token and needs no live PID).
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        with patch('subprocess.run', side_effect=self._git_side_effect()):
+            return _render_live_workflow_section(
+                [task], ProjectRoot(str(tmp_path)), now=self._NOW
+            )
+
+    # ----- cases -----
+
+    def test_uncorroborated_in_progress_task_is_dropped(self, tmp_path, monkeypatch):
+        """(a) No fresh claimant, absent from scheduler_state, routing decision
+        BEFORE the restart => indeterminate => task/2763 NOT listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)  # empty parks/current_holders
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            # no claimant_run_id => no live claimant
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH not in result, (
+            f"Expected {self._BRANCH} DROPPED (worktree+orchestrator-only, no "
+            f"corroboration => indeterminate); got:\n{result!r}"
+        )
+
+    def test_fresh_claimant_keeps_task_listed(self, tmp_path, monkeypatch):
+        """(b) A fresh claimant_run_id + recent heartbeat corroborates => listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-abc',
+            'heartbeat_at': (self._NOW - timedelta(minutes=2)).isoformat(),
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} LISTED (fresh claimant/heartbeat "
+            f"corroborates); got:\n{result!r}"
+        )
+
+    def test_scheduler_holder_keeps_task_listed(self, tmp_path, monkeypatch):
+        """(c) task_id present in scheduler_state current_holders => listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(
+            tmp_path, current_holders={'implement': str(self._TASK_ID)}
+        )
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} LISTED (scheduler holder corroborates); "
+            f"got:\n{result!r}"
+        )
+
+    def test_post_restart_routing_keeps_task_listed(self, tmp_path, monkeypatch):
+        """(d) routing.latest.decided_at AFTER the restart => listed."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)
+        task = {
+            'id': self._TASK_ID,
+            'status': 'in-progress',
+            'metadata': self._routing_metadata(self._STARTED + timedelta(minutes=30)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} LISTED (post-restart routing decision "
+            f"corroborates); got:\n{result!r}"
+        )
+
+    def test_gate_is_in_progress_only(self, tmp_path, monkeypatch):
+        """(e) A non-in-progress task (review) with the same worktree+
+        orchestrator-only signals and NO corroboration is still listed — the
+        corroboration gate is in-progress-only."""
+        self._write_lock(tmp_path, self._STARTED)
+        self._write_scheduler_state(tmp_path)
+        task = {
+            'id': self._TASK_ID,
+            'status': 'review',
+            'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH in result, (
+            f"Expected {self._BRANCH} (status=review) STILL listed — the "
+            f"corroboration gate is in-progress-only; got:\n{result!r}"
+        )
+
+
 class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
     """TaskKnowledgeSync._maybe_queue_briefing_refresh_tasks retains its
     taskmaster-None no-op (task 2150 step-3/4): the falsy-``project_root``
