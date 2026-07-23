@@ -80,3 +80,42 @@ class TestWarmLaneGcPass:
             await harness._run_warm_lane_gc_pass()
             mock_reclaim.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_pass_delegates_to_terminal_lane_record_reclaim(
+        self, tmp_path: Path
+    ) -> None:
+        """_run_warm_lane_gc_pass() awaits self._reclaim_terminal_lane_records() once.
+
+        Leaf γ (task 2891): the durable-record terminal-lane reclaim rides the
+        existing warm-lane GC cadence tick — no new timer/loop.
+        """
+        harness, _rs = _make_harness(tmp_path)
+        harness.git_ops._run_warm_lane_gc_reclaim = AsyncMock(return_value=0)
+        mock_reclaim = AsyncMock(return_value=0)
+        harness._reclaim_terminal_lane_records = mock_reclaim
+
+        await harness._run_warm_lane_gc_pass()
+
+        mock_reclaim.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_pass_swallows_terminal_lane_reclaim_raise(
+        self, tmp_path: Path
+    ) -> None:
+        """A raise from _reclaim_terminal_lane_records must NOT break the GC cadence.
+
+        Belt-and-suspenders fail-soft, mirroring the interactive-worktree reaper
+        delegate: a fault in the reclaim delegate cannot propagate out of
+        _run_warm_lane_gc_pass (never-raise contract).
+        """
+        harness, _rs = _make_harness(tmp_path)
+        harness.git_ops._run_warm_lane_gc_reclaim = AsyncMock(return_value=0)
+        harness._reclaim_terminal_lane_records = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+
+        # Must not raise
+        await harness._run_warm_lane_gc_pass()
+
+        harness._reclaim_terminal_lane_records.assert_awaited_once()
+
