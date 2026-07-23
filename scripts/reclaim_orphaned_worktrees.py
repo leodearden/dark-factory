@@ -335,3 +335,62 @@ def branch_ref_resolves(repo: Path, branch: str) -> bool:
         ['rev-parse', '--verify', '--quiet', f'refs/heads/{branch}'], cwd=repo
     )
     return rc == 0
+
+
+def park_commit(worktree: Path, reason: str) -> str | None:
+    """Snapshot a dirty parking's content onto its branch (``git add -A`` +
+    ``git commit --no-verify``).
+
+    Returns ``None`` and does nothing when the worktree is already clean (a
+    no-op). Otherwise stages everything (all tracked + untracked, non-ignored
+    content) and commits it with ``--no-verify`` so a rejecting pre-commit hook
+    can never strand the snapshot, returning the new HEAD sha. Any git failure
+    is logged LOUDLY and returns ``None`` — never raises. ``--no-verify`` and
+    ``add -A`` together make "dirty -> park-commit -> zero content lost" a
+    provable property: the content is now on the branch ref, reachable
+    independently of the worktree.
+    """
+    if not is_worktree_dirty(worktree):
+        return None
+
+    rc, _out, err = _run_git(['add', '-A'], cwd=worktree)
+    if rc != 0:
+        logger.warning(
+            '%s `git add -A` failed in %s (rc=%s): %s — NOT park-committing',
+            _LOG_PREFIX,
+            worktree,
+            rc,
+            err.strip(),
+        )
+        return None
+
+    rc, _out, err = _run_git(
+        ['commit', '--no-verify', '-m', f'chore: park-commit reclaim ({reason})'],
+        cwd=worktree,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s `git commit` failed in %s (rc=%s): %s — NOT park-committing',
+            _LOG_PREFIX,
+            worktree,
+            rc,
+            err.strip(),
+        )
+        return None
+
+    rc, out, err = _run_git(['rev-parse', 'HEAD'], cwd=worktree)
+    if rc != 0:
+        logger.warning(
+            '%s `git rev-parse HEAD` failed in %s after park-commit (rc=%s): %s',
+            _LOG_PREFIX,
+            worktree,
+            rc,
+            err.strip(),
+        )
+        return None
+
+    sha = out.strip()
+    logger.info(
+        '%s park-committed %s (reason=%s) -> %s', _LOG_PREFIX, worktree, reason, sha
+    )
+    return sha
