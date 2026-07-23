@@ -59,7 +59,7 @@ from orchestrator.landing_evidence import (
     file_unattributed_landing_escalation,
     validate_landing_evidence,
 )
-from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
+from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME, LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
@@ -3693,6 +3693,55 @@ class Harness:
                 'Terminal-lane reconciler: released %d lane(s)', released,
             )
 
+    async def _assigned_durable_records_with_statuses(
+        self,
+    ) -> tuple[list[tuple[str, LaneRecord, str]], dict[str, str]] | None:
+        """Shared prologue for the durable-record warm-lane passes (leaf γ, task 2891).
+
+        Both :meth:`_reclaim_terminal_lane_records` and
+        :meth:`_stale_lane_assignment_census` open identically: fetch the
+        warm-lane pool (None-guard), enumerate the durable
+        ``git_ops._lane_lifecycle.all_records()`` filtered to ASSIGNED/IN_USE
+        records with a non-None ``task_id``, batch ``scheduler.get_statuses``
+        for their distinct task ids, and ABORT the whole pass on a
+        degraded/empty (``resolver_failed``) read — never mass-acting on a
+        transient DB failure or an empty task tree.
+
+        Returns ``(assigned, statuses)`` where ``assigned`` is the list of
+        ``(lane_name, record, task_id)`` triples (``task_id`` narrowed non-None)
+        and ``statuses`` the batched status map; returns ``None`` as the single
+        abort sentinel when there is no pool, no assigned records, or the status
+        read failed. Factoring this here keeps the None-guard / ASSIGNED-IN_USE
+        filter / resolver_failed-abort semantics of the two passes identical by
+        construction (they cannot drift apart).
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is None:
+            return None
+
+        records = self.git_ops._lane_lifecycle.all_records()
+        assigned: list[tuple[str, LaneRecord, str]] = []
+        for lane_name, rec in records.items():
+            if (
+                rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
+                and rec.task_id is not None
+            ):
+                assigned.append((lane_name, rec, rec.task_id))
+        if not assigned:
+            return None
+
+        task_ids = list({task_id for _, _, task_id in assigned})
+        statuses, err = await self.scheduler.get_statuses(task_ids)
+        if resolver_failed(statuses, err):
+            logger.warning(
+                'Durable warm-lane pass: get_statuses returned %s — aborting '
+                '(fail-safe against a transient DB failure or empty task tree; '
+                'never mass-acts on a degraded read)',
+                'error' if err is not None else 'empty',
+            )
+            return None
+        return assigned, statuses
+
     async def _reclaim_terminal_lane_records(self) -> int:
         """Release warm lanes whose DURABLE record is assigned to a terminal task.
 
@@ -3722,34 +3771,13 @@ class Harness:
         The branch-ref-resolve gate (assert the task branch still resolves
         before release) is added in step-8.
         """
-        pool = self.git_ops.warm_lane_pool
-        if pool is None:
+        prologue = await self._assigned_durable_records_with_statuses()
+        if prologue is None:
             return 0
-
-        records = self.git_ops._lane_lifecycle.all_records()
-        assigned = []
-        for lane_name, rec in records.items():
-            if (
-                rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
-                and rec.task_id is not None
-            ):
-                assigned.append((lane_name, rec.task_id))
-        if not assigned:
-            return 0
-
-        task_ids = list({task_id for _, task_id in assigned})
-        statuses, err = await self.scheduler.get_statuses(task_ids)
-        if resolver_failed(statuses, err):
-            logger.warning(
-                'Terminal-lane-record reclaim: get_statuses returned %s — '
-                'aborting pass (fail-safe against transient DB failure or '
-                'empty task tree)',
-                'error' if err is not None else 'empty',
-            )
-            return 0
+        assigned, statuses = prologue
 
         released = 0
-        for lane_name, task_id in assigned:
+        for lane_name, _rec, task_id in assigned:
             status = statuses.get(task_id)
             if status not in TERMINAL_STATUSES:
                 continue
@@ -3814,25 +3842,10 @@ class Harness:
         empty/unparseable ``updated_at`` is skipped (never counted). QUARANTINED
         and terminal records are excluded.
         """
-        pool = self.git_ops.warm_lane_pool
-        if pool is None:
+        prologue = await self._assigned_durable_records_with_statuses()
+        if prologue is None:
             return []
-
-        records = self.git_ops._lane_lifecycle.all_records()
-        assigned = []
-        for lane_name, rec in records.items():
-            if (
-                rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
-                and rec.task_id is not None
-            ):
-                assigned.append((lane_name, rec, rec.task_id))
-        if not assigned:
-            return []
-
-        task_ids = list({task_id for _, _, task_id in assigned})
-        statuses, err = await self.scheduler.get_statuses(task_ids)
-        if resolver_failed(statuses, err):
-            return []
+        assigned, statuses = prologue
 
         now = datetime.now(UTC)
         threshold = timedelta(days=self.config.lane_stale_report_days)
