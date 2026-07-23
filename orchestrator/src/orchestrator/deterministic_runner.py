@@ -1853,6 +1853,36 @@ class DeterministicRunner:
                         'before_done_ran_at=%s, gate resolved — setting done',
                         task_id, before_done_ran_at_check,
                     )
+                else:
+                    # Pure-gate resume (before_done is None): an empty PENDING
+                    # queue is NOT proof a human resolved the gate.  Require the
+                    # SAME archive-inclusive positive proof the deploy path
+                    # demands below (section 2's own_escalation_resolved) before
+                    # driving to done — otherwise a LOST born-at-L2 gate
+                    # escalation (task 2954 strand) would let an operator's
+                    # re-pend of the stuck task silently BYPASS the human gate.
+                    # status=None scans the archive too, so a resolved/dismissed
+                    # record counts as proof a human was in the loop; agent_role
+                    # scopes it to the runner's OWN gate escalations.  When NO
+                    # record ever landed, re-establish the gate via
+                    # _file_milestone_gate_and_block and stay BLOCKED rather than
+                    # phantom-completing.
+                    own_escalation_resolved = bool(self.escalation_queue.get_by_task(
+                        task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
+                    ))
+                    if not own_escalation_resolved:
+                        logger.warning(
+                            'DeterministicRunner: task %s pure-gate resume — '
+                            'gate_escalated_at stamped but NO escalation record '
+                            'exists (pending or archived); the gate was never '
+                            'proven resolved (likely lost across a restart) — '
+                            're-filing the born-at-L2 gate instead of driving to '
+                            'done (task 2954)',
+                            task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
                     task_id,

@@ -94,6 +94,25 @@ def _mock_scheduler(task: dict):
     return scheduler
 
 
+def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
+    """Seed a RESOLVED+ARCHIVED deterministic gate escalation for *task_id*.
+
+    This is the true state after a human ``resume``: the L2 gate is archived
+    (resolved) BEFORE the task is re-pended (task 2954).  It makes the pure-gate
+    resume's archive-inclusive ``own_escalation_resolved`` proof pass, so the
+    legitimate drive-to-done stays green — as distinct from a truly-empty queue
+    (a LOST escalation), which the hardened resume treats as a strand.
+    """
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id,
+        agent_role='orchestrator-deterministic', severity='critical',
+        category='milestone_gate', summary='Ship feature gate', level=2,
+    )
+    queue.submit(esc)
+    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human')
+    return esc
+
+
 def _deploy_task(
     task_id: str = '200',
     target_unit: str | None = 'orchestrator-reify.service',
@@ -516,10 +535,13 @@ class TestIdempotentResumeAndQuiescence:
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
-        # gate already escalated; escalation already resolved (no pending)
+        # gate already escalated; escalation resolved+archived (task 2954: the
+        # true post-`resume` state — an empty archive would be a LOST-escalation
+        # strand, which the hardened resume re-files rather than driving to done).
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty queue — no pending escalation
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '100')
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -544,6 +566,7 @@ class TestIdempotentResumeAndQuiescence:
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '100')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -679,7 +702,8 @@ class TestIdempotentResumeAndQuiescence:
 
         task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty — gate escalation resolved
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '99')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
