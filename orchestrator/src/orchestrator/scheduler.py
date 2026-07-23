@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -572,6 +573,34 @@ def _build_delivered_check_escalation(
     )
     detail = '\n'.join(lines)
     return summary, detail
+
+
+def _delivered_checks_descriptor_digest(checks: list | None) -> str:
+    """Canonical-JSON sha256 hex digest of a dep's whole ``delivered_checks``
+    list (task 2975).
+
+    :meth:`Scheduler._compute_delivered_check_cache` folds this digest into
+    its persistent cache key alongside ``(dep_task_id, main_sha)`` so that
+    an operator correcting a check descriptor (pattern/paths/script/args)
+    at a FIXED main SHA is a cache MISS — forcing a re-evaluation on the
+    very next sweep — rather than continuing to serve a stale cached
+    verdict until an unrelated commit advances main and prunes it
+    (esc-2911-1/2 recurrence).
+
+    ``sort_keys=True`` canonicalizes dict-key order within each check so a
+    cosmetic key reordering does not needlessly bust the cache; list order
+    is deliberately preserved (order determines which check is reported
+    first on failure). ``checks or []`` normalizes both ``None`` and ``[]``
+    to the same digest — mirroring the falsy-checks short-circuit already
+    used at the collection site. Pure function: no scheduler state, no
+    side effects. Mirrors the repo's pure-hashlib sha256 hexdigest
+    convention (``agents/write_set.py``, ``shared/task_metadata.py``).
+    """
+    return hashlib.sha256(
+        json.dumps(checks or [], sort_keys=True, separators=(',', ':'), default=str).encode(
+            'utf-8'
+        )
+    ).hexdigest()
 
 
 class McpSessionLike(Protocol):
@@ -1557,22 +1586,35 @@ class Scheduler:
         # failure re-escalate after a resolve), or (b) on an all-DELIVERED
         # tick for that dependent (streak-reset-on-pass).
         self._streak_delivered_fail = StreakCounter(key_fn=lambda k: k[0])
-        # Persistent per-(dep_task_id, main_sha) delivered-check result cache
-        # (task 2580, delta). Keyed by the SHA the check was evaluated
-        # against so a new commit on main naturally self-heals: stale
-        # entries for the previous SHA are pruned by
+        # Persistent per-(dep_task_id, main_sha, descriptor_digest)
+        # delivered-check result cache (task 2580, delta; descriptor-digest
+        # dimension added task 2975). Keyed by the SHA the check was
+        # evaluated against so a new commit on main naturally self-heals:
+        # stale entries for the previous SHA are pruned by
         # _compute_delivered_check_cache once it observes main has moved,
         # forcing a fresh re-evaluation rather than trusting a result that
-        # predates the capability landing. Process-local — an orchestrator
-        # restart is an acceptable implicit reset (mirrors every other
-        # process-local cache above). Only ever holds DELIVERED=True
-        # entries (REFILE of task 2782/2783): True is monotone-safe at a
-        # fixed tree (a capability present at a SHA stays present), but
-        # FAILED is not monotone-safe against the OBSERVATION — a transient
-        # git-grep miss at the same SHA must not wedge the gate — so FAILED
-        # is deliberately never written here and is re-run every sweep (see
+        # predates the capability landing. ALSO keyed by
+        # _delivered_checks_descriptor_digest(checks) — a canonical-JSON
+        # sha256 of the dep's whole metadata.delivered_checks list — so an
+        # operator correcting a check descriptor (pattern/paths/script) at
+        # a FIXED main SHA lands on a different key than a prior sweep's
+        # cached entry: the edit is a cache MISS, forcing re-evaluation on
+        # the very next sweep instead of continuing to serve a verdict
+        # computed against the old descriptor until main happens to advance
+        # (esc-2911-1/2). Each sweep also prunes any sibling digest-variant
+        # entries left for the SAME (dep_task_id, main_sha) by an earlier
+        # descriptor, bounding growth to one variant per (dep, sha) instead
+        # of accumulating one entry per historical edit. Process-local — an
+        # orchestrator restart is an
+        # acceptable implicit reset (mirrors every other process-local
+        # cache above). Only ever holds DELIVERED=True entries (REFILE of
+        # task 2782/2783): True is monotone-safe at a fixed tree (a
+        # capability present at a SHA stays present), but FAILED is not
+        # monotone-safe against the OBSERVATION — a transient git-grep miss
+        # at the same SHA must not wedge the gate — so FAILED is
+        # deliberately never written here and is re-run every sweep (see
         # the FAILED branch below).
-        self._delivered_check_cache: dict[tuple[str, str], bool] = {}
+        self._delivered_check_cache: dict[tuple[str, str, str], bool] = {}
         # The main SHA the cache above was last pruned/keyed against. None
         # before the first sweep that finds at least one checked dep.
         self._delivered_check_sha: str | None = None
@@ -2932,8 +2974,11 @@ class Scheduler:
         terminal dep — the common case (no delivered-checks tasks) pays
         zero git cost. Only a DELIVERED (``True``) result is cached
         persistently, on ``self._delivered_check_cache``, keyed
-        ``(dep_task_id, main_sha)`` — caching is sound there because a
-        capability present at a fixed SHA stays present (monotone-safe).
+        ``(dep_task_id, main_sha, descriptor_digest)`` — the third element
+        being ``_delivered_checks_descriptor_digest(checks)``, a canonical-
+        JSON sha256 of the dep's whole ``metadata.delivered_checks`` list
+        (task 2975) — caching is sound there because a capability present
+        at a fixed SHA and descriptor stays present (monotone-safe).
         FAILED is deliberately NEVER cached (REFILE of task 2782/2783): a
         ``git grep`` observation can transiently miss the same SHA (e.g. a
         race with a concurrent write during the merge that produced it, or
@@ -2941,10 +2986,19 @@ class Scheduler:
         ref) even though the capability is actually present, so a FAILED
         result is re-run every sweep — symmetric with the uncached ERRORED
         fail-safe path below — letting it flip to DELIVERED at the SAME SHA
-        instead of wedging until main advances. When main DOES advance,
-        stale-SHA cache entries are additionally pruned (a second,
-        independent self-heal path — a capability landing on main is
-        picked up the very next tick with no operator action either way).
+        instead of wedging until main advances. Two independent self-heal
+        paths keep a stale cached DELIVERED from ever wedging the gate:
+        when main DOES advance, stale-SHA cache entries are pruned (a
+        capability landing on main is picked up the very next tick with no
+        operator action either way); and when an operator corrects a dep's
+        descriptor (pattern/paths/script) at a FIXED sha, the changed digest
+        makes the prior sweep's cache entry a MISS, forcing re-evaluation on
+        the very next tick instead of waiting for main to advance
+        (esc-2911-1/2). Each sweep also prunes any sibling digest-variant
+        entries left behind for the SAME ``(dep_task_id, main_sha)`` by an
+        earlier descriptor, bounding cache growth to one variant per
+        ``(dep, sha)`` rather than accumulating one entry per historical
+        edit.
         A per-tick budget
         (``config.delivered_checks.max_checks_per_tick``) bounds worst-case
         runner fan-out: a dep whose checks don't all complete within budget
@@ -3077,8 +3131,48 @@ class Scheduler:
         # _note_delivered_hold both already accept detail=None.
         fail_detail_by_dep: dict[str, dict | None] = {}
 
+        # Per-dep index of existing cache keys, built ONCE per sweep in a
+        # single O(cache_size) pass (task 2975 amendment,
+        # reviewer_comprehensive perf note): the stale-digest-variant prune
+        # below previously re-scanned the WHOLE self._delivered_check_cache
+        # for every dep in checked_deps — with the cache bounded to
+        # roughly one entry per (dep, sha) (see the class docstring above),
+        # that per-dep full scan was effectively O(deps^2) per sweep.
+        # Looking up this index instead makes the prune O(1) amortized per
+        # dep. checked_deps is keyed by dep_id (each dep_id appears exactly
+        # once in the loop below), so a dep's slice of the index is never
+        # consulted again after its own iteration and does not need to be
+        # kept in sync with deletions made for OTHER deps.
+        keys_by_dep: dict[str, list[tuple[str, str, str]]] = {}
+        for k in self._delivered_check_cache:
+            keys_by_dep.setdefault(k[0], []).append(k)
+
         for dep_id, dep_task in checked_deps.items():
-            cache_key = (dep_id, main_sha)
+            # Read the descriptor and fold its digest into the cache key
+            # BEFORE the cache-hit check (task 2975): an operator editing
+            # metadata.delivered_checks at a fixed main SHA must land on a
+            # DIFFERENT key than the one a prior sweep cached against, so
+            # the edit is a cache MISS (re-evaluate) rather than continuing
+            # to serve a verdict computed against the old descriptor.
+            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+            descriptor_digest = _delivered_checks_descriptor_digest(checks)
+            cache_key = (dep_id, main_sha, descriptor_digest)
+            # Prune any stale digest variant(s) left behind by an earlier
+            # descriptor for this SAME (dep, sha) (task 2975): bounds cache
+            # growth to one variant per (dep, sha) rather than accumulating
+            # one entry per historical descriptor edit. Scoped to this
+            # dep's own keys via the keys_by_dep index built above instead
+            # of scanning self._delivered_check_cache in full. The
+            # comprehension materializes the matches into a list first —
+            # deleting from self._delivered_check_cache while iterating a
+            # view of it directly would raise.
+            stale_variant_keys = [
+                k
+                for k in keys_by_dep.get(dep_id, ())
+                if k[1] == main_sha and k[2] != descriptor_digest
+            ]
+            for stale_key in stale_variant_keys:
+                del self._delivered_check_cache[stale_key]
             if cache_key in self._delivered_check_cache:
                 # Only the monotone-safe DELIVERED=True result is ever
                 # cached (see the FAILED branch below) — a cache hit is
@@ -3093,7 +3187,6 @@ class Scheduler:
                 self._delivered_check_error_streak.pop(dep_id, None)
                 continue
 
-            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
             # Only the first dep this sweep actually evaluates gets the

@@ -39,6 +39,7 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     TickContext,
     _build_delivered_check_escalation,
+    _delivered_checks_descriptor_digest,
 )
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1188,114 @@ class TestNoteDeliveredHold:
 
 
 # ---------------------------------------------------------------------------
+# TestDeliveredChecksDescriptorDigest (task 2975 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredChecksDescriptorDigest:
+    """``_delivered_checks_descriptor_digest`` — the pure canonical-JSON
+    sha256 helper that lets :meth:`Scheduler._compute_delivered_check_cache`
+    fold a descriptor digest into its cache key (task 2975), so correcting a
+    dep's ``metadata.delivered_checks`` at a FIXED main SHA is a cache MISS
+    (re-evaluate) instead of continuing to serve a stale cached verdict.
+    Pure function: no scheduler state, no side effects.
+    """
+
+    _ONE_CHECK = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    # --- (a) determinism: identical input -> identical, stable digest ------
+
+    def test_identical_lists_produce_same_digest_deterministically(self):
+        checks = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        other = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+        digest1 = _delivered_checks_descriptor_digest(checks)
+        digest2 = _delivered_checks_descriptor_digest(other)
+        digest3 = _delivered_checks_descriptor_digest(checks)
+
+        assert isinstance(digest1, str)
+        assert len(digest1) == 64, 'expected a sha256 hex digest (64 hex chars)'
+        assert all(c in '0123456789abcdef' for c in digest1)
+        assert digest1 == digest2 == digest3, 'same descriptor content must hash identically'
+
+    # --- (b) any descriptor field change -> a DIFFERENT digest -------------
+
+    def test_changed_grep_pattern_produces_different_digest(self):
+        original = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        changed = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'}]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_paths_produces_different_digest(self):
+        original = [{
+            'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo',
+            'paths': ['src/'], 'expect': 'present',
+        }]
+        changed = [{
+            'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo',
+            'paths': ['src/', 'lib/'], 'expect': 'present',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_script_args_produces_different_digest(self):
+        original = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'bar'], 'expect': 'exit_zero',
+        }]
+        changed = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'baz'], 'expect': 'exit_zero',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_script_name_produces_different_digest(self):
+        original = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': [], 'expect': 'exit_zero',
+        }]
+        changed = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_other.sh',
+            'args': [], 'expect': 'exit_zero',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    # --- (c) key reordering within a check dict -> the SAME digest ---------
+
+    def test_key_reorder_within_check_dict_produces_same_digest(self):
+        forward = [{'name': 'cap-one', 'pattern': 'foo', 'expect': 'present'}]
+        reordered = [{'expect': 'present', 'pattern': 'foo', 'name': 'cap-one'}]
+
+        assert _delivered_checks_descriptor_digest(forward) == (
+            _delivered_checks_descriptor_digest(reordered)
+        )
+
+    # --- (d) empty list and None both hash the same, distinct from 1 check -
+
+    def test_empty_list_and_none_produce_same_stable_digest_distinct_from_one_check(self):
+        empty_digest1 = _delivered_checks_descriptor_digest([])
+        empty_digest2 = _delivered_checks_descriptor_digest([])
+        none_digest1 = _delivered_checks_descriptor_digest(None)
+        none_digest2 = _delivered_checks_descriptor_digest(None)
+        one_check_digest = _delivered_checks_descriptor_digest(self._ONE_CHECK)
+
+        assert empty_digest1 == empty_digest2, 'empty-list digest must be stable'
+        assert none_digest1 == none_digest2, 'None digest must be stable'
+        assert empty_digest1 == none_digest1, '[] and None must normalize to the same digest'
+        assert empty_digest1 != one_check_digest
+
+
+# ---------------------------------------------------------------------------
 # TestComputeDeliveredCheckCache (task 2580 — step-13 RED / step-14 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -1265,6 +1374,12 @@ class TestComputeDeliveredCheckCache:
             for evt, data in _event_store.events  # type: ignore[attr-defined]
             if evt == str(EventType.delivered_check_gate_held)
         ]
+
+    def _dcc_key(self, dep_id: str, sha: str, checks: list | None) -> tuple[str, str, str]:
+        """Build the 3-tuple ``_delivered_check_cache`` key (task 2975),
+        using the same digest helper the scheduler uses, for assertions
+        that need to name a specific cache entry below."""
+        return (dep_id, sha, _delivered_checks_descriptor_digest(checks))
 
     # --- (a) no checked deps -> {} and the SHA resolver is NEVER called ----
 
@@ -1348,7 +1463,9 @@ class TestComputeDeliveredCheckCache:
         result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert result == {}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'ERRORED must not leave ANY digest-variant cache entry for this dep/sha'
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert self._held_events(scheduler) == []
 
@@ -1390,8 +1507,9 @@ class TestComputeDeliveredCheckCache:
             'the first (and only) dep this sweep must fully resolve despite exceeding budget'
         )
         assert calls == ['cap-a', 'cap-b'], 'both checks must run — forward progress is guaranteed'
-        assert ('20', 'sha1') in scheduler._delivered_check_cache
-        assert scheduler._delivered_check_cache[('20', 'sha1')] is True
+        key = self._dcc_key('20', 'sha1', self._TWO_CHECKS)
+        assert key in scheduler._delivered_check_cache
+        assert scheduler._delivered_check_cache[key] is True
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'exceeding the per-tick budget for the guaranteed-progress dep must log a WARNING'
         )
@@ -1429,7 +1547,9 @@ class TestComputeDeliveredCheckCache:
 
         assert result == {'20': True}
         assert calls == ['cap-a'], 'the second dep must NOT be evaluated once the budget is spent'
-        assert ('21', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '21' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'the deferred dep must not leave ANY digest-variant cache entry'
 
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
@@ -1484,8 +1604,10 @@ class TestComputeDeliveredCheckCache:
         assert second == {'20': True}
         assert calls2 == ['cap-one'], 'stale-sha cache entry must be pruned, forcing re-invoke'
         assert scheduler._streak_delivered_hold.value('10') == 0
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
-        assert ('20', 'sha2') in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'every sha1-keyed digest variant must be pruned once main advances'
+        assert self._dcc_key('20', 'sha2', self._ONE_CHECK) in scheduler._delivered_check_cache
 
     # --- (h) cached-False dep still holds + emits detail on every sweep ----
 
@@ -1611,9 +1733,9 @@ class TestComputeDeliveredCheckCache:
 
         first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
         assert first == {'20': False}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache, (
-            'a FAILED result must NOT be cached sticky'
-        )
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'a FAILED result must NOT be cached sticky (any digest variant)'
 
         second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
@@ -1623,7 +1745,8 @@ class TestComputeDeliveredCheckCache:
         assert calls == ['cap-one', 'cap-one'], (
             'the check must re-run on sweep 2 — it must NOT be served from a sticky-False cache'
         )
-        assert scheduler._delivered_check_cache[('20', 'sha1')] is True, (
+        key = self._dcc_key('20', 'sha1', self._ONE_CHECK)
+        assert scheduler._delivered_check_cache[key] is True, (
             'the monotone-safe DELIVERED result IS now cached'
         )
         assert scheduler._streak_delivered_hold.value('10') == 0, (
@@ -1705,7 +1828,9 @@ class TestComputeDeliveredCheckCache:
         result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert result == {}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'a timed-out (ERRORED) check must not leave ANY digest-variant cache entry'
         assert self._held_events(scheduler) == []
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0
@@ -1776,6 +1901,232 @@ class TestComputeDeliveredCheckCache:
 
         assert result == {}
         assert sha_calls['n'] == 0
+
+    # --- (l) descriptor change at a FIXED sha invalidates a cached
+    #     DELIVERED result and forces re-evaluation (task 2975 — the
+    #     esc-2911-1/2 recurrence: a corrected descriptor must self-heal
+    #     WITHOUT waiting for main to advance) --------------------------
+
+    @pytest.mark.asyncio
+    async def test_descriptor_change_same_sha_invalidates_cached_delivered_and_reevaluates(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """esc-2911-1/2: an operator correcting a dep's
+        ``metadata.delivered_checks`` descriptor (pattern/paths/script) at a
+        FIXED main SHA must be picked up on the very next sweep — NOT
+        wedged behind a stale cached DELIVERED verdict until an unrelated
+        commit advances main and prunes it. Before this fix, the cache was
+        keyed ``(dep_id, main_sha)`` only, so a descriptor change at a fixed
+        SHA was entirely invisible to it.
+
+        Sweeps 3-4 additionally fold in the *unchanged*-descriptor
+        efficiency guarantee (mirrors (f)
+        ``test_cache_hit_does_not_reinvoke_runner``): a cache hit is only
+        possible once a descriptor has actually resolved DELIVERED, since
+        FAILED is (by design — REFILE of task 2782/2783, see (i2)
+        ``test_failed_then_delivered_same_sha_flips_and_unwedges``) never
+        cached. So sweep 3 mirrors that same transient-FAILED-then-
+        DELIVERED flip for the CHANGED descriptor (still unchanged from
+        sweep 2) before sweep 4 observes a genuine cache hit — the runner
+        is not re-invoked a further time once the changed descriptor
+        itself has stabilized DELIVERED and been cached.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        ])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        assert calls == ['cap-one']
+
+        # Operator edits the descriptor at the SAME sha (pattern 'foo' ->
+        # 'bar', same check name) — a fresh runner now resolves it FAILED.
+        dep['metadata'] = {'delivered_checks': [
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'},
+        ]}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': False}, (
+            'the changed descriptor must be RE-EVALUATED, not served from the '
+            'stale cached True left over from the OLD descriptor'
+        )
+        assert calls2 == ['cap-one'], (
+            'the changed descriptor must MISS the cache and invoke the runner exactly once'
+        )
+
+        # SAME (still-changed) descriptor observed again: like (i2), a
+        # FAILED result is never cached, so it can flip to DELIVERED on a
+        # later sweep at the identical descriptor/SHA instead of staying
+        # wedged.
+        fake_runner3, calls3 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner3)
+
+        third = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert third == {'20': True}
+        assert calls3 == ['cap-one'], 'FAILED is never cached, so this must be a fresh invocation'
+
+        # A FOURTH sweep at the SAME (now-DELIVERED, still-unchanged)
+        # descriptor is a genuine cache hit — the unchanged-descriptor
+        # efficiency guarantee also holds for a descriptor that changed
+        # mid-flight, not just one that was stable from the first sweep.
+        fourth = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert fourth == {'20': True}
+        assert calls3 == ['cap-one'], (
+            'the runner must NOT be re-invoked once the changed descriptor is cached'
+        )
+
+    # --- (m) FAILED descriptor corrected at the SAME sha -> DELIVERED next
+    #     sweep (task's literal acceptance criterion). Already-green
+    #     regression lock, NOT the RED driver — FAILED was never cached to
+    #     begin with (REFILE of task 2782/2783), so this already worked
+    #     before this task's fix; see (l) above for the genuinely-RED
+    #     scenario (a cached DELIVERED must be INVALIDATED when the
+    #     descriptor changes). ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_descriptor_corrected_same_sha_reevaluates_to_delivered(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """The task's literal acceptance criterion: a broken delivered-check
+        pattern that FAILS, corrected in ``metadata.delivered_checks`` at
+        the SAME main sha, must resolve DELIVERED on the very next sweep.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'fooo', 'expect': 'present'},
+        ])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': False}
+        assert calls == ['cap-one']
+
+        # Operator corrects the broken pattern at the SAME sha.
+        dep['metadata'] = {'delivered_checks': [
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        ]}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+
+    # --- (n) descriptor-variant pruning bounds cache growth to ONE entry
+    #     per (dep, sha) — without this, repeated descriptor edits at a
+    #     fixed SHA would accumulate one stale variant per edit until main
+    #     advances ------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_descriptor_change_prunes_stale_digest_variant_same_sha(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A descriptor change at a fixed main SHA must not just MISS the
+        cache (see (l) above) — the STALE ``(dep, sha, old-digest)`` entry
+        left behind by the prior descriptor must be actively PRUNED, so
+        cache growth stays bounded to one variant per ``(dep, sha)`` rather
+        than accumulating one entry per historical descriptor edit.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        checks_d1 = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        dep = self._dep(checks=checks_d1)
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        key_d1 = self._dcc_key('20', 'sha1', checks_d1)
+        assert key_d1 in scheduler._delivered_check_cache
+
+        # Operator edits the descriptor at the SAME sha; the new descriptor
+        # also resolves DELIVERED (so its own variant gets cached, letting
+        # us assert exactly one variant survives).
+        checks_d2 = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'baz', 'expect': 'present'}]
+        dep['metadata'] = {'delivered_checks': checks_d2}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+        key_d2 = self._dcc_key('20', 'sha1', checks_d2)
+        assert key_d1 not in scheduler._delivered_check_cache, (
+            'the stale (dep, sha, old-digest) variant must be pruned once the '
+            'descriptor changes, not left to linger alongside the new variant'
+        )
+        same_dep_sha_keys = [
+            k for k in scheduler._delivered_check_cache if k[0] == '20' and k[1] == 'sha1'
+        ]
+        assert same_dep_sha_keys == [key_d2], (
+            f'cache growth must stay bounded to ONE variant per (dep, sha); '
+            f'got {same_dep_sha_keys!r}'
+        )
+
+    # --- (o) regression: SHA advance still prunes EVERY digest variant, not
+    #     just the one matching the current descriptor — the digest-variant
+    #     prune above is ADDITIVE to, not a replacement for, the existing
+    #     SHA-based prune ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sha_advance_prunes_across_digest_variants(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Regression lock for the retained SHA-prune (~3098): once a
+        ``(dep, sha, digest)`` entry is cached, advancing main to a new SHA
+        must still prune EVERY sha1-keyed variant (regardless of its
+        digest), not just whichever digest happens to match the current
+        descriptor. Guards against a future digest-variant-scoped prune
+        accidentally narrowing the existing whole-SHA prune.
+        """
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        assert self._dcc_key('20', 'sha1', self._ONE_CHECK) in scheduler._delivered_check_cache
+
+        sha_box['value'] = 'sha2'
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+        assert not any(
+            k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'every sha1-keyed variant must be pruned once main advances, regardless of digest'
+        assert self._dcc_key('20', 'sha2', self._ONE_CHECK) in scheduler._delivered_check_cache
 
 
 # ---------------------------------------------------------------------------
