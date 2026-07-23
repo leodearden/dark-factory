@@ -1886,6 +1886,132 @@ class TestComputeDeliveredCheckCache:
         assert result == {}
         assert sha_calls['n'] == 0
 
+    # --- (l) descriptor change at a FIXED sha invalidates a cached
+    #     DELIVERED result and forces re-evaluation (task 2975 — the
+    #     esc-2911-1/2 recurrence: a corrected descriptor must self-heal
+    #     WITHOUT waiting for main to advance) --------------------------
+
+    @pytest.mark.asyncio
+    async def test_descriptor_change_same_sha_invalidates_cached_delivered_and_reevaluates(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """esc-2911-1/2: an operator correcting a dep's
+        ``metadata.delivered_checks`` descriptor (pattern/paths/script) at a
+        FIXED main SHA must be picked up on the very next sweep — NOT
+        wedged behind a stale cached DELIVERED verdict until an unrelated
+        commit advances main and prunes it. Before this fix, the cache was
+        keyed ``(dep_id, main_sha)`` only, so a descriptor change at a fixed
+        SHA was entirely invisible to it.
+
+        Sweeps 3-4 additionally fold in the *unchanged*-descriptor
+        efficiency guarantee (mirrors (f)
+        ``test_cache_hit_does_not_reinvoke_runner``): a cache hit is only
+        possible once a descriptor has actually resolved DELIVERED, since
+        FAILED is (by design — REFILE of task 2782/2783, see (i2)
+        ``test_failed_then_delivered_same_sha_flips_and_unwedges``) never
+        cached. So sweep 3 mirrors that same transient-FAILED-then-
+        DELIVERED flip for the CHANGED descriptor (still unchanged from
+        sweep 2) before sweep 4 observes a genuine cache hit — the runner
+        is not re-invoked a further time once the changed descriptor
+        itself has stabilized DELIVERED and been cached.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        ])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        assert calls == ['cap-one']
+
+        # Operator edits the descriptor at the SAME sha (pattern 'foo' ->
+        # 'bar', same check name) — a fresh runner now resolves it FAILED.
+        dep['metadata'] = {'delivered_checks': [
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'},
+        ]}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': False}, (
+            'the changed descriptor must be RE-EVALUATED, not served from the '
+            'stale cached True left over from the OLD descriptor'
+        )
+        assert calls2 == ['cap-one'], (
+            'the changed descriptor must MISS the cache and invoke the runner exactly once'
+        )
+
+        # SAME (still-changed) descriptor observed again: like (i2), a
+        # FAILED result is never cached, so it can flip to DELIVERED on a
+        # later sweep at the identical descriptor/SHA instead of staying
+        # wedged.
+        fake_runner3, calls3 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner3)
+
+        third = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert third == {'20': True}
+        assert calls3 == ['cap-one'], 'FAILED is never cached, so this must be a fresh invocation'
+
+        # A FOURTH sweep at the SAME (now-DELIVERED, still-unchanged)
+        # descriptor is a genuine cache hit — the unchanged-descriptor
+        # efficiency guarantee also holds for a descriptor that changed
+        # mid-flight, not just one that was stable from the first sweep.
+        fourth = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert fourth == {'20': True}
+        assert calls3 == ['cap-one'], (
+            'the runner must NOT be re-invoked once the changed descriptor is cached'
+        )
+
+    # --- (m) FAILED descriptor corrected at the SAME sha -> DELIVERED next
+    #     sweep (task's literal acceptance criterion). Already-green
+    #     regression lock, NOT the RED driver — FAILED was never cached to
+    #     begin with (REFILE of task 2782/2783), so this already worked
+    #     before this task's fix; see (l) above for the genuinely-RED
+    #     scenario (a cached DELIVERED must be INVALIDATED when the
+    #     descriptor changes). ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_descriptor_corrected_same_sha_reevaluates_to_delivered(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """The task's literal acceptance criterion: a broken delivered-check
+        pattern that FAILS, corrected in ``metadata.delivered_checks`` at
+        the SAME main sha, must resolve DELIVERED on the very next sweep.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.FAILED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep(checks=[
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'fooo', 'expect': 'present'},
+        ])
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': False}
+        assert calls == ['cap-one']
+
+        # Operator corrects the broken pattern at the SAME sha.
+        dep['metadata'] = {'delivered_checks': [
+            {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'},
+        ]}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+
 
 # ---------------------------------------------------------------------------
 # TestDeliveredCheckGraceEscalation (task 2583 — step-9 RED / step-10 GREEN)
