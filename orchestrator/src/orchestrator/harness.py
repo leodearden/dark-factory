@@ -3693,6 +3693,94 @@ class Harness:
                 'Terminal-lane reconciler: released %d lane(s)', released,
             )
 
+    async def _reclaim_terminal_lane_records(self) -> int:
+        """Release warm lanes whose DURABLE record is assigned to a terminal task.
+
+        The durable-record complement to :meth:`_reconcile_terminal_lanes`
+        (leaf γ, task 2891). Where the in-memory reconciler enumerates only
+        ``pool.assignments_snapshot()``, this pass enumerates the durable
+        ``.lane-state/*.json`` records via
+        ``git_ops._lane_lifecycle.all_records()`` — the records that accumulate
+        across restarts/churn and whose in-memory mapping is often lost, so the
+        in-memory reconciler never sees them (the incident-07-21 pool-exhaustion
+        census counted 41 such assigned durable records against zero free).
+
+        For each durable ASSIGNED/IN_USE record whose task is TERMINAL
+        (done/cancelled) and NOT ``scheduler.is_dispatched`` (the live-acquire
+        guard), release the lane via the path-based ``git_ops.release_warm_lane``
+        — the map-based ``release_lane_for_terminal_task`` no-ops for
+        durable-only records whose in-memory assignment was lost, which is
+        exactly what this pass targets. NON-terminal (pending/in-progress/
+        blocked) lanes are NEVER released (the WIP-preserving invariant: a live
+        task's lane may hold verified-green work — the incident 5260 lane did).
+
+        Fail-safe MIRRORS :meth:`_reconcile_terminal_lanes`: a degraded/empty
+        ``get_statuses`` read ABORTS the whole pass (never mass-free). Rides
+        ``_run_warm_lane_gc_pass`` (no new timer/loop). Returns the number of
+        lanes released.
+
+        The branch-ref-resolve gate (assert the task branch still resolves
+        before release) is added in step-8.
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is None:
+            return 0
+
+        records = self.git_ops._lane_lifecycle.all_records()
+        assigned = []
+        for lane_name, rec in records.items():
+            if (
+                rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
+                and rec.task_id is not None
+            ):
+                assigned.append((lane_name, rec.task_id))
+        if not assigned:
+            return 0
+
+        task_ids = list({task_id for _, task_id in assigned})
+        statuses, err = await self.scheduler.get_statuses(task_ids)
+        if resolver_failed(statuses, err):
+            logger.warning(
+                'Terminal-lane-record reclaim: get_statuses returned %s — '
+                'aborting pass (fail-safe against transient DB failure or '
+                'empty task tree)',
+                'error' if err is not None else 'empty',
+            )
+            return 0
+
+        released = 0
+        for lane_name, task_id in assigned:
+            status = statuses.get(task_id)
+            if status not in TERMINAL_STATUSES:
+                continue
+            if self.scheduler.is_dispatched(task_id):
+                # Live-acquire guard: a workflow may have just acquired this
+                # task's lane; skip to avoid racing the fresh dispatch.
+                continue
+            lane_dir = self.git_ops.worktree_base / lane_name
+            await self.git_ops.release_warm_lane(lane_dir, task_id)
+            released += 1
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.worktree_reaped,
+                    task_id=task_id,
+                    data={
+                        'reason': 'terminal-lane-record-reclaim',
+                        'status': status,
+                        # warm lane is FREE'd but NOT removed from disk — mirror
+                        # _reconcile_terminal_lanes so downstream telemetry does
+                        # not over-count worktree removals.
+                        'warm_lane_retained': True,
+                    },
+                )
+
+        if released:
+            logger.info(
+                'Terminal-lane-record reclaim: released %d durable-record lane(s)',
+                released,
+            )
+        return released
+
     def _get_ground_truth(self) -> TaskGroundTruth:
         """Lazily build (and memoize) the ground-truth resolver (task 2243, W10-θ2).
 
