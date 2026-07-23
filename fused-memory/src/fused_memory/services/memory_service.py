@@ -41,6 +41,13 @@ from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
 )
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_MERGE,
+    STATE_ACTIVE,
+)
+from fused_memory.reconciliation.standing_decision_writer import (
+    expire_entity_standing_decision,
+)
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -4266,7 +4273,73 @@ class MemoryService:
                         journal_exc,
                     )
 
+        # ζ (task 2899) — best-effort standing-decision invalidation. Reached
+        # only on a SUCCESSFUL merge (a backend failure re-raises through the
+        # finally above, never landing here). The post-merge entity is a new
+        # subject, so any ACTIVE decision on either merged uuid no longer
+        # applies and is flipped to expired/merge. merge_entities is the
+        # authoritative operation; this secondary consequence must NEVER break
+        # it — a hook failure is logged and swallowed (the row simply stays
+        # ACTIVE, caught later by TTL or the growth sweep).
+        try:
+            await self._expire_standing_decisions_for_merge(
+                project_id, deprecated_uuid, surviving_uuid
+            )
+        except Exception as hook_exc:
+            logger.warning(
+                'merge_entities: standing-decision invalidation hook failed for '
+                'deprecated=%s surviving=%s project_id=%s (merge already '
+                'committed; row left ACTIVE for TTL/growth sweep): %s',
+                deprecated_uuid,
+                surviving_uuid,
+                project_id,
+                hook_exc,
+            )
+
         return result
+
+    async def _expire_standing_decisions_for_merge(
+        self,
+        project_id: str,
+        deprecated_uuid: str,
+        surviving_uuid: str,
+    ) -> int:
+        """Expire ACTIVE ``entity_standing_decision`` rows on EITHER merged uuid.
+
+        ζ's ``merge_entities`` invalidation hook (task 2899). A merge fuses two
+        entity nodes into one new subject, so a prior "this class of complaint
+        about entity X was dismissed" decision on either the deprecated or the
+        surviving uuid no longer applies — re-deriving the complaint once
+        against the merged entity is correct (PRD §Staleness; also the first fix
+        for the dangling-uuid hazard, research fact 9).
+
+        Enumerates ACTIVE standing rows via ``list_entity_standing_decisions``
+        (state=active) and filters to those whose ``entity_uuid`` is one of the
+        two merged uuids, flipping each through the single-source
+        :func:`~fused_memory.reconciliation.standing_decision_writer.expire_entity_standing_decision`
+        primitive with ``reason='merge'``. List+filter is used (NOT
+        ``get_active_entity_standing_decision``, which raises on >1 active
+        grounds for one entity) so this stays robust to the future
+        multiple-active-grounds-per-entity case.
+
+        Returns the number of rows expired. An unwired ledger
+        (``self.recon_ledger is None``) is a no-op returning ``0`` (did-not-run,
+        never a spurious miss) — matching the ledger-None-returns-0 convention
+        of the ζ growth sweep and the writer's guard.
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return 0
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+        merged_uuids = {deprecated_uuid, surviving_uuid}
+        expired = 0
+        for row in rows:
+            if row.entity_uuid in merged_uuids:
+                await expire_entity_standing_decision(
+                    ledger, row, reason=EXPIRY_REASON_MERGE
+                )
+                expired += 1
+        return expired
 
     async def delete_entity(
         self,
