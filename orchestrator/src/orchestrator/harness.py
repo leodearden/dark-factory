@@ -3757,6 +3757,22 @@ class Harness:
                 # Live-acquire guard: a workflow may have just acquired this
                 # task's lane; skip to avoid racing the fresh dispatch.
                 continue
+            # Assert-before-release (PRD): confirm the task branch ref still
+            # resolves before freeing the lane. Branch survival ON release is
+            # already guaranteed by inv.10 (release_warm_lane retains a branch
+            # carrying commits beyond main); a terminal task whose branch has
+            # ALREADY vanished is a rare anomaly we conservatively leave for the
+            # in-memory reconciler / next acquire rather than silently releasing
+            # — honoring the loud-over-silent, WIP-preserving posture.
+            branch = f'{self.git_ops.config.branch_prefix}{task_id}'
+            if await self.git_ops.resolve_branch_sha(branch) is None:
+                logger.warning(
+                    'Terminal-lane-record reclaim: branch %s for terminal task '
+                    '%s (lane %s) does not resolve — skipping release, leaving '
+                    'for the in-memory reconciler / next acquire',
+                    branch, task_id, lane_name,
+                )
+                continue
             lane_dir = self.git_ops.worktree_base / lane_name
             await self.git_ops.release_warm_lane(lane_dir, task_id)
             released += 1
