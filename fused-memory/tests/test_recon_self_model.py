@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
+from fused_memory.reconciliation import standing_decision_constants as sdc
 
 # --------------------------------------------------------------------------- #
 # Static vocabulary constants (step-1/2)
@@ -425,3 +426,53 @@ class TestPremiseLint:
             # setattr, not a direct attribute assignment, so this stays pyright-clean
             # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
             setattr(v, 'premise', 'mutated')  # noqa: B010
+
+
+# --------------------------------------------------------------------------- #
+# render_entity_standing_decision_schema_section (task 2898 ε, step-1/2)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderEntityStandingDecisionSchemaSection:
+    """render_entity_standing_decision_schema_section() renders the SHARED
+    entity_standing_decision schema section (record kind + grounds enum), the
+    ad-hoc-kind demotion prose, and the pre-emission advisory-check prose —
+    rendered byte-identically into BOTH the Stage-1 and Stage-2 prompts."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_entity_standing_decision_schema_section(), str)
+        assert m.render_entity_standing_decision_schema_section()
+
+    def test_record_kind_is_single_sourced_from_constants(self):
+        """The rendered text contains the α record-kind constant VALUE (not a
+        re-hardcoded literal), proving it is single-sourced from
+        standing_decision_constants (INV-5)."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert sdc.RECORD_KIND_ENTITY_STANDING_DECISION in text
+        assert sdc.RECORD_KIND_ENTITY_STANDING_DECISION == 'entity_standing_decision'
+
+    def test_grounds_enum_value_is_single_sourced(self):
+        """The rendered text contains the α grounds enum constant VALUE."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION in text
+        assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION == 'structural_size_conflation'
+
+    def test_demotion_prose_names_ad_hoc_kinds_as_evidence_only(self):
+        """Item 4: the entity_standing_decision ledger kind is the SOLE
+        machine-consulted standing-decision form; the ad-hoc mem0 kinds are
+        demoted to evidence-only."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert 'recurring_flag_standing_decision' in text
+        assert 'stage1_finding_correction' in text
+        assert 'evidence-only' in text or 'sole' in text
+
+    def test_advisory_check_prose(self):
+        """Item 2: a pre-emission advisory get_memories_by_metadata check against
+        the mem0 mirror; advisory ONLY — the authoritative gate is Stage 1's
+        filter, and reads never consult mem0 for authority."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert 'get_memories_by_metadata' in text
+        assert 'advisory' in text
+        assert 'authoritative' in text
+        assert 'Stage 1' in text
+        assert 'never consult mem0' in text
