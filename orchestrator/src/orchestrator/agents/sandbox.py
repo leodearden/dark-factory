@@ -104,6 +104,19 @@ def build_bwrap_command(
         for extra in writable_extras:
             if os.path.isdir(extra):
                 cmd.extend(['--bind', extra, extra])
+            else:
+                # bwrap cannot --bind a nonexistent path, and compute_write_set
+                # is intentionally pure (no makedirs) — existence/creation is
+                # the backend's job, but this backend does not create extras
+                # (unlike the writable_modules/.task loops above, which do).
+                # Silently dropping the bind would let a requested writable
+                # path (e.g. ~/.claude/fleet on first run) go missing with no
+                # signal, contrary to the loud-over-silent-degradation norm —
+                # so surface it instead of degrading silently.
+                logger.warning(
+                    'build_bwrap_command: writable extra %r is not a directory '
+                    '— skipping bind (path missing or not created yet)', extra,
+                )
 
     cmd.append('--')
     cmd.extend(inner_cmd)
