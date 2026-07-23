@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -5731,3 +5732,85 @@ class TestRemoteRunnerSshRunSeam:
             cwd='/repo',
         )
         assert runner._ssh_run is not runner._run
+
+
+# ---------------------------------------------------------------------------
+# INV-2 (task 2884, plans/merge-verdict-integrity-prd.md §1, §3.1):
+#   SyncOutcome frozen dataclass + resolve_local_df_checkout() helper
+# ---------------------------------------------------------------------------
+
+
+class TestSyncOutcome:
+    """SyncOutcome is a frozen dataclass describing a contract-currency sync attempt."""
+
+    def test_is_frozen_dataclass(self):
+        from orchestrator.verify_runner import SyncOutcome
+
+        assert dataclasses.is_dataclass(SyncOutcome)
+        out = SyncOutcome()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            out.ok = False  # type: ignore[misc]
+
+    def test_all_fields_and_types(self):
+        from orchestrator.verify_runner import SyncOutcome
+
+        out = SyncOutcome(
+            configured=True,
+            stale=True,
+            synced=True,
+            ok=True,
+            local_head='aaaaaaa',
+            remote_head='bbbbbbb',
+            detail='pulled + uv sync',
+        )
+        assert out.configured is True
+        assert out.stale is True
+        assert out.synced is True
+        assert out.ok is True
+        assert out.local_head == 'aaaaaaa'
+        assert out.remote_head == 'bbbbbbb'
+        assert out.detail == 'pulled + uv sync'
+
+    def test_not_configured_defaults_are_pass_through(self):
+        """A default (not-configured) outcome must NOT bench: configured=False,
+        ok=True (no fail-closed), stale=False, synced=False, heads/detail None.
+        This is the byte-identical-to-today opt-out shape."""
+        from orchestrator.verify_runner import SyncOutcome
+
+        out = SyncOutcome()
+        assert out.configured is False
+        assert out.ok is True
+        assert out.stale is False
+        assert out.synced is False
+        assert out.local_head is None
+        assert out.remote_head is None
+        assert out.detail is None
+
+
+class TestResolveLocalDfCheckout:
+    """resolve_local_df_checkout walks up to the DF repo root (.git dir/file), None on miss."""
+
+    def test_returns_repo_root_containing_dot_git_from_source_tree(self):
+        from orchestrator.verify_runner import resolve_local_df_checkout
+
+        root = resolve_local_df_checkout()
+        assert root is not None
+        assert isinstance(root, Path)
+        # The stop condition is a `.git` entry (dir in the main checkout, file in
+        # a linked worktree) — either way it must exist on the returned root.
+        assert (root / '.git').exists()
+
+    def test_returns_none_when_start_has_no_git_ancestor(self, tmp_path):
+        """Fail-safe: a checkout-less start path yields None → auto-sync stays inert."""
+        from orchestrator.verify_runner import resolve_local_df_checkout
+
+        assert resolve_local_df_checkout(start=tmp_path) is None
+
+    def test_finds_git_root_from_nested_start(self, tmp_path):
+        """A `.git` marker at an ancestor of the start path is discovered on the walk up."""
+        from orchestrator.verify_runner import resolve_local_df_checkout
+
+        (tmp_path / '.git').mkdir()
+        nested = tmp_path / 'a' / 'b' / 'c'
+        nested.mkdir(parents=True)
+        assert resolve_local_df_checkout(start=nested) == tmp_path
