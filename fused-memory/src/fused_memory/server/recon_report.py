@@ -1351,6 +1351,7 @@ class ReconReportState:
                 'cited_tasks': list(f.cited_tasks),
                 'cited_memories': list(f.cited_memories),
                 'cited_runs': list(f.cited_runs),  # task-2595
+                'standing_decision_id': f.standing_decision_id,  # task 2897 δ
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1425,6 +1426,7 @@ class ReconReportState:
                     'cited_tasks': list(f.cited_tasks),
                     'cited_memories': list(f.cited_memories),
                     'cited_runs': list(f.cited_runs),  # task-2595
+                    'standing_decision_id': f.standing_decision_id,  # task 2897 δ
                 })
         return results
 
