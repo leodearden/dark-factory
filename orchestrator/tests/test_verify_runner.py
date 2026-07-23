@@ -5800,10 +5800,15 @@ class TestResolveLocalDfCheckout:
         # a linked worktree) — either way it must exist on the returned root.
         assert (root / '.git').exists()
 
-    def test_returns_none_when_start_has_no_git_ancestor(self, tmp_path):
-        """Fail-safe: a checkout-less start path yields None → auto-sync stays inert."""
+    def test_returns_none_when_start_has_no_git_ancestor(self, tmp_path, monkeypatch):
+        """Fail-safe: no `.git` discoverable on the walk yields None → auto-sync
+        stays inert.  We neutralise the ambient filesystem (a stray `/tmp/.git`
+        exists on some hosts, which would otherwise be found on the walk up from
+        a tmp_path) by forcing every `.git` existence probe to miss."""
+        from orchestrator import verify_runner
         from orchestrator.verify_runner import resolve_local_df_checkout
 
+        monkeypatch.setattr(verify_runner.Path, 'exists', lambda self: False)
         assert resolve_local_df_checkout(start=tmp_path) is None
 
     def test_finds_git_root_from_nested_start(self, tmp_path):

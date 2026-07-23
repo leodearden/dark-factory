@@ -72,6 +72,9 @@ __all__ = [
     "RemoteRunner",
     "RunnerUnavailable",
     "VerifyRunnerPool",
+    # INV-2 (task 2884) — contract-currency auto-sync at dispatch
+    "SyncOutcome",
+    "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
     "run_merge_verify_on_worktree",
@@ -921,6 +924,66 @@ async def _default_ssh_heartbeat_run(
         stdout_b.decode().strip(),
         stderr_b.decode().strip(),
     )
+
+
+@dataclass(frozen=True)
+class SyncOutcome:
+    """Result of a RemoteRunner contract-currency sync attempt (INV-2).
+
+    Returned by ``RemoteRunner.sync_if_stale``.  The pool reads ``configured``
+    and ``ok`` to decide fail-closed benching:
+
+      * ``configured=False``  — the runner opted out of INV-2 auto-sync (no
+        ``df_checkout_path`` / no resolvable local DF root).  Always paired with
+        ``ok=True`` so the pool NEVER benches an un-migrated runner; this is the
+        byte-identical-to-today pass-through shape (the default constructed
+        value).
+      * ``configured=True, ok=True``   — the remote DF checkout is current, or
+        was successfully brought current (``synced=True``); adopt its verdict.
+      * ``configured=True, ok=False``  — staleness was detected but the sync
+        FAILED (or was skipped mid-dispatch); the pool benches the runner
+        fail-closed (PRD §3.1).
+
+    ``stale`` records whether a HEAD mismatch was detected; ``synced`` whether a
+    pull+uv-sync actually completed ok.  ``local_head``/``remote_head`` carry the
+    compared shas (for the ``runner_stale`` payload / operator triage);
+    ``detail`` is a short human string.  Frozen so an outcome cannot be mutated
+    after the fact.
+    """
+
+    configured: bool = False
+    stale: bool = False
+    synced: bool = False
+    ok: bool = True
+    local_head: str | None = None
+    remote_head: str | None = None
+    detail: str | None = None
+
+
+def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
+    """Walk up from *start* to the Dark-Factory repo root (the ``.git`` marker).
+
+    *start* defaults to this module's own file (``Path(__file__)``), so the
+    running orchestrator resolves its OWN source checkout — the trust anchor
+    whose HEAD a remote runner's DF checkout is compared against (INV-2).
+
+    Returns the first ancestor directory containing a ``.git`` entry — a
+    directory in the main checkout, a FILE in a linked git worktree — or
+    ``None`` when no such ancestor exists.  ``None`` is the fail-safe: callers
+    treat an unresolvable local checkout as "auto-sync disabled" (opt-in),
+    never as an error.
+    """
+    if start is None:
+        here = Path(__file__).resolve()
+    else:
+        here = start
+    # A file start begins the walk at its parent; a directory start is itself a
+    # candidate.  Either way we ascend to the filesystem root.
+    candidates = [here, *here.parents] if here.is_dir() else list(here.parents)
+    for d in candidates:
+        if (d / '.git').exists():
+            return d
+    return None
 
 
 class RemoteRunner:
