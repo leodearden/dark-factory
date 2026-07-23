@@ -7,6 +7,7 @@ and fail-safes; the git-level work detection / quarantine mechanics live in
 ``test_git_ops.py``.
 """
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -379,3 +380,79 @@ class TestOrphanReaperNoPoolConfiguredNoOp:
         harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '500')  # type: ignore[attr-defined]
         harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
         harness._file_pool_storage_absent_escalation.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestOrphanReaperC2Namespace:
+    """C2 namespace invariant in _reap_orphan_worktrees (task 2925, beta).
+
+    PRD: docs/prds/merge-worktree-lifecycle-integrity.md §4 Contract C2.
+
+    The reaper's old NEGATIVE skip list only excluded `_merge-*` and
+    `*-skip-attempt`, so every OTHER `_`/`.`-prefixed infra band
+    (`_mainprobe-*`, `_offline-deep`, `_iact-*`, `.reseed-trash`, ...) fell
+    through to the orphan quarantine/reap branch — a latent bug (a clean
+    `_offline-deep` would be reaped) that C2 closes with the positive-match
+    classifier.  `_merge-*` is REPORTED to the merge reaper; every other
+    infra band is left to its owner; only task-id-shaped orphans are reaped.
+    """
+
+    async def test_infra_bands_survive_only_task_shaped_orphan_reaped(
+        self, harness: Harness, caplog,
+    ):
+        base = harness.git_ops.worktree_base
+
+        # Infra dirs NOT in live_ids ({'100','101'}) — all must survive.
+        # `_merge-<uuid>` was already skipped by the old per-name list; the
+        # other four are the latent-bug bands that were WRONGLY reaped.
+        merge_uuid = _mk(base, '_merge-ba97f10a')
+        infra_dirs = {
+            name: _mk(base, name)
+            for name in ('_mainprobe-x', '_offline-deep', '_iact-slug', '.reseed-trash')
+        }
+        # `*-skip-attempt` is a SUFFIX namespace (not `_`/`.`-prefixed) whose
+        # existing skip must be preserved — regression guard for step-6.
+        skip_attempt = _mk(base, '888-skip-attempt')
+
+        # Positive control: a task-id-shaped ORPHAN (not live, clean) is still
+        # reaped.  An inert sweep that skips everything fails HERE.
+        wt_orphan = _mk(base, '888')
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._reap_orphan_worktrees()
+
+        # Positive control + negative check in one: 888 is the ONLY reap.
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt_orphan, '888')  # type: ignore[attr-defined]
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+        # No infra/merge/skip-attempt path was reaped or quarantined.
+        protected = {merge_uuid, skip_attempt, *infra_dirs.values()}
+        cleaned = {
+            c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+        }
+        assert cleaned.isdisjoint(protected), (
+            f'C2 violated — reaper cleaned protected entries: {cleaned & protected}'
+        )
+        for d in protected:
+            assert d.exists(), f'{d.name} must survive the orphan-reaper sweep'
+
+        # Exactly one reaped event (for 888); no quarantine events at all.
+        emitted = _emitted_types(harness)
+        assert emitted.count(EventType.worktree_reaped) == 1
+        assert EventType.worktree_quarantined not in emitted
+
+        # Skip disposition OBSERVED (not silence): every protected entry is
+        # named in an explicit INFO record. We assert the STABLE structured
+        # signal — an INFO record mentions the entry name — NOT the exact
+        # human-facing prose of the disposition lines, which may be reworded
+        # without any change to the disposition. (The classifier's
+        # task/merge/infra verdict is unit-pinned in
+        # test_worktree_namespace_c2.py.)
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.INFO
+        ]
+        for name in ('_merge-ba97f10a', '_mainprobe-x', '_offline-deep',
+                     '_iact-slug', '.reseed-trash'):
+            assert any(name in m for m in info_messages), (
+                f'missing explicit skip/report line naming {name}'
+            )
