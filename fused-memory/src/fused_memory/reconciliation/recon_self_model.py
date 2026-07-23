@@ -382,6 +382,40 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
+def render_investigation_outcome_section() -> str:
+    """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
+    PRD plans/stage1-entity-standing-decision-prd.md §ε).
+
+    Wired into the Stage-2 prompt only — Stage 1 has no writer path and does not
+    conclude investigations, so instructing it to write these records would be
+    misleading (never tell a stage to use a capability it lacks). Covers the
+    ``investigation_outcome`` mem0-kind schema (kind single-sourced from
+    ``standing_decision_constants`` / task 2894 α) and the Stage-2 write
+    instruction: on every not-actionable investigation conclusion going forward,
+    write one record. The pool of these records feeds β's authorization arm-2
+    evidence (the writer counts them before it may emit an
+    entity_standing_decision); day-one emptiness is expected and accepted by
+    design (PRD decision 8).
+    """
+    return (
+        '## Investigation Outcome Records\n'
+        'When you (Stage 2) conclude an investigation of a flagged entity and '
+        'determine it is not actionable, write an '
+        f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
+        'evidence. Schema (observations_and_summaries category):\n'
+        f'  - `metadata.kind = "{MEM0_KIND_INVESTIGATION_OUTCOME}"`\n'
+        "  - `metadata.entity_uuid = <the investigated entity's uuid>`\n"
+        '  - `metadata.actionable = false`\n'
+        '  - `metadata.run_id = <current run_id>`\n\n'
+        'Write one such record on every not-actionable investigation conclusion going '
+        "forward. These records feed the standing-decision writer's authorization arm-2 "
+        'evidence pool — the writer counts matching '
+        f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` records before it is permitted to emit an '
+        f'`{RECORD_KIND_ENTITY_STANDING_DECISION}`. Day-one emptiness of this pool is '
+        'expected and accepted by design; it fills forward as investigations conclude.'
+    )
+
+
 def render_cycle_summary_section() -> str:
     """Render the per-cycle summary metadata convention, faithful to
     reconciliation/prompts/stage2.py:236-302, interpolating the
