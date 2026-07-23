@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -305,3 +306,80 @@ def test_readers_do_not_mutate_the_store(tmp_path):
     # No rollback-journal / WAL side files created by a mode=ro reader.
     assert not (tmp_path / "runs.db-wal").exists()
     assert not (tmp_path / "runs.db-journal").exists()
+
+
+# ---------------------------------------------------------------------------
+# Probe-report-on-main check (condition b) — tracked-on-main, not bare
+# filesystem existence.
+# ---------------------------------------------------------------------------
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def _init_repo_on_main(repo):
+    """Init a git repo whose default branch is deterministically `main`."""
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q")
+    _git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "README.md").write_text("init\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "init")
+
+
+def _write_report(repo):
+    p = repo / PROBE_REPORT_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# containment probe report\n")
+    return p
+
+
+def test_report_absent_on_main_is_false(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo_on_main(repo)
+    assert sandbox_soak._report_present_on_main(
+        repo, ref="main", path=PROBE_REPORT_PATH
+    ) is False
+
+
+def test_untracked_uncommitted_report_is_false(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo_on_main(repo)
+    _write_report(repo)  # on disk but never `git add`/commit
+    assert sandbox_soak._report_present_on_main(
+        repo, ref="main", path=PROBE_REPORT_PATH
+    ) is False
+
+
+def test_committed_report_on_main_is_true(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo_on_main(repo)
+    _write_report(repo)
+    _git(repo, "add", PROBE_REPORT_PATH)
+    _git(repo, "commit", "-q", "-m", "add probe report")
+    assert sandbox_soak._report_present_on_main(
+        repo, ref="main", path=PROBE_REPORT_PATH
+    ) is True
+
+
+def test_not_a_git_repo_raises_soak_input_error(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(sandbox_soak.SoakInputError):
+        sandbox_soak._report_present_on_main(
+            plain, ref="main", path=PROBE_REPORT_PATH
+        )
+
+
+def test_unknown_ref_raises_soak_input_error(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo_on_main(repo)
+    with pytest.raises(sandbox_soak.SoakInputError):
+        sandbox_soak._report_present_on_main(
+            repo, ref="no-such-branch", path=PROBE_REPORT_PATH
+        )
