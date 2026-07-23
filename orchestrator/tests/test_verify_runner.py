@@ -6162,3 +6162,146 @@ class TestRemoteRunnerMainPushMirror:
         result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
         assert result == expected
         assert '+main:refs/heads/main' in _push_refspecs(calls)
+
+
+# ---------------------------------------------------------------------------
+# INV-2 (task 2884): VerifyRunnerPool.dispatch pre-dispatch contract-currency
+# ---------------------------------------------------------------------------
+
+
+def _pool_fake_remote(name='laptop', *, sync_outcome, result=None):
+    """A REAL RemoteRunner (so isinstance(selected, RemoteRunner) holds) with
+    sync_if_stale + run_merge_verify replaced by instance stubs.
+
+    Records the event_store/task_id each stub was called with.
+    """
+    async def _noop_run(argv, *, cwd=None):
+        return (0, '', '')
+
+    r = RemoteRunner(
+        name=name, ssh_host='h', git_remote='origin', cwd='/repo', run=_noop_run,
+    )
+    r._sync_seen = None  # type: ignore[attr-defined]
+    r._rmv_calls = []  # type: ignore[attr-defined]
+    _res = result if result is not None else VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='remote-ok',
+    )
+
+    async def _sync(*, event_store=None, task_id=None):
+        r._sync_seen = {'event_store': event_store, 'task_id': task_id}  # type: ignore[attr-defined]
+        return sync_outcome
+
+    async def _rmv(merge_sha, spec, *, task_id=None, archive_root=None, event_store=None):
+        r._rmv_calls.append({'event_store': event_store, 'task_id': task_id})  # type: ignore[attr-defined]
+        return _res
+
+    r.sync_if_stale = _sync  # type: ignore[assignment]
+    r.run_merge_verify = _rmv  # type: ignore[assignment]
+    return r
+
+
+class _PoolFakeLocal:
+    """Minimal is_local runner for the pool's local trust-anchor / fallback."""
+
+    is_local = True
+
+    def __init__(self, name='local'):
+        self.name = name
+        self.calls: list[tuple[str, Any]] = []
+
+    async def health(self) -> bool:
+        return True
+
+    async def run_merge_verify(self, merge_sha, spec):
+        self.calls.append((merge_sha, spec))
+        return VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='local-ok',
+        )
+
+
+@pytest.mark.asyncio
+class TestVerifyRunnerPoolContractCurrency:
+    """Pre-dispatch sync_if_stale gate: adopt-on-ok, fail-closed bench on not-ok."""
+
+    async def test_two_runner_sync_ok_dispatches_remote(self):
+        """(a) [remote, local], sync ok -> REMOTE runs, not quarantined, sync got the store."""
+        from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
+
+        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
+        local = _PoolFakeLocal()
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t9')
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.summary == 'remote-ok'
+        mv = store.events_of(EventType.merge_verify)
+        assert mv and mv[0]['runner'] == 'laptop'
+        assert pool.is_quarantined('laptop') is False
+        assert local.calls == []
+        # sync_if_stale received the pool's event_store + task_id
+        assert remote._sync_seen == {'event_store': store, 'task_id': 't9'}
+
+    async def test_two_runner_sync_fail_benches_remote_and_falls_back_local(self):
+        """(b) sync configured=True/ok=False -> quarantine remote AND dispatch local;
+        remote.run_merge_verify NEVER called."""
+        from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
+
+        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
+        local = _PoolFakeLocal()
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t1')
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.summary == 'local-ok'
+        assert pool.is_quarantined('laptop') is True
+        assert remote._rmv_calls == []  # remote verdict never taken
+        assert len(local.calls) == 1
+        mv = store.events_of(EventType.merge_verify)
+        assert mv and mv[0]['runner'] == 'local'
+
+    async def test_single_remote_pool_sync_fail_raises_runner_unavailable(self):
+        """(c) [remote] only, sync fail -> RunnerUnavailable (production fail-closed bench)."""
+        from orchestrator.verify_runner import (
+            RunnerUnavailable,
+            SyncOutcome,
+            VerifyRunnerPool,
+        )
+
+        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote], event_store=store, task_id='t1')
+
+        with pytest.raises(RunnerUnavailable):
+            await pool.dispatch('abc123', _make_spec())
+        assert pool.is_quarantined('laptop') is True
+        assert remote._rmv_calls == []
+
+    async def test_sync_not_configured_dispatches_remote_no_quarantine(self):
+        """(d) sync configured=False -> byte-identical: remote dispatched, not benched."""
+        from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
+
+        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=False, ok=True))
+        local = _PoolFakeLocal()
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t1')
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.summary == 'remote-ok'
+        assert pool.is_quarantined('laptop') is False
+        assert local.calls == []
+
+    async def test_event_store_threaded_into_remote_run_merge_verify(self):
+        """(e) happy path threads event_store=pool._event_store into run_merge_verify."""
+        from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
+
+        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote], event_store=store, task_id='t1')
+
+        await pool.dispatch('abc123', _make_spec())
+
+        assert len(remote._rmv_calls) == 1
+        assert remote._rmv_calls[0]['event_store'] is store
