@@ -1040,6 +1040,153 @@ class TestRunDeterministicReconSweep:
         assert esc.suggested_action == 'manual_intervention'
         h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
 
+    # -----------------------------------------------------------------------
+    # task 2954: pure-gate / always_escalates GATE-strand recovery wired into
+    # Source A — FULL sweep passes over a REAL EscalationQueue on tmp_path so
+    # the re-filed (or NOT re-filed) record is queryable end-to-end.
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _gate_metadata() -> dict:
+        return {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'before_done': None,
+            'gate_escalated_at': '2026-07-01T00:05:00+00:00',
+            'gate_options': ['approve', 'reject'],
+        }
+
+    @pytest.mark.asyncio
+    async def test_gate_strand_refired_when_no_escalation_anywhere(self, tmp_path: Path) -> None:
+        """(a) blocked pure-gate task, gate_escalated_at set, NO record anywhere
+        (empty queue + empty archive) → sweep re-fires exactly ONE L2
+        milestone_gate escalation, queryable and scoped to the runner's role."""
+        h = _make_recon_harness()
+        h.event_store = None
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        tid = 'tid-gate'
+        task = {
+            'id': tid, 'status': 'blocked',
+            'title': 'Human gate 5330', 'description': 'Approve reify 5330.',
+            'metadata': self._gate_metadata(),
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await h._run_deterministic_recon_sweep()
+
+        pending = queue.get_by_task(tid, status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate'
+        assert pending[0].level == 2
+        assert pending[0].agent_role == 'orchestrator-deterministic'
+
+    @pytest.mark.asyncio
+    async def test_gate_strand_not_refired_when_pending_exists(self, tmp_path: Path) -> None:
+        """(b) same task but a PENDING deterministic escalation already exists →
+        sweep does NOT re-fire (quiescent, still exactly one)."""
+        h = _make_recon_harness()
+        h.event_store = None
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        tid = 'tid-gate'
+        existing = Escalation(
+            id=queue.make_id(tid), task_id=tid,
+            agent_role='orchestrator-deterministic', severity='critical',
+            category='milestone_gate', summary='Human gate 5330', level=2,
+        )
+        queue.submit(existing)
+        task = {
+            'id': tid, 'status': 'blocked',
+            'title': 'Human gate 5330', 'description': 'Approve reify 5330.',
+            'metadata': self._gate_metadata(),
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await h._run_deterministic_recon_sweep()
+
+        pending = queue.get_by_task(tid, status='pending')
+        assert len(pending) == 1  # still exactly one — no duplicate re-fired
+        assert pending[0].id == existing.id
+
+    @pytest.mark.asyncio
+    async def test_gate_strand_not_refired_when_resolved_archived(self, tmp_path: Path) -> None:
+        """(c) same task but the only escalation is RESOLVED+ARCHIVED → the
+        archive-inclusive discriminator recognizes a genuinely-resolved gate,
+        NOT a strand, so the sweep does NOT re-fire."""
+        h = _make_recon_harness()
+        h.event_store = None
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        tid = 'tid-gate'
+        existing = Escalation(
+            id=queue.make_id(tid), task_id=tid,
+            agent_role='orchestrator-deterministic', severity='critical',
+            category='milestone_gate', summary='Human gate 5330', level=2,
+        )
+        queue.submit(existing)
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        # Sanity: nothing pending, but the archive holds the resolved record.
+        assert queue.get_by_task(tid, status='pending') == []
+        assert len(queue.get_by_task(tid, agent_role='orchestrator-deterministic')) == 1
+
+        task = {
+            'id': tid, 'status': 'blocked',
+            'title': 'Human gate 5330', 'description': 'Approve reify 5330.',
+            'metadata': self._gate_metadata(),
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await h._run_deterministic_recon_sweep()
+
+        # No NEW pending re-fired; the archived resolved record is untouched.
+        assert queue.get_by_task(tid, status='pending') == []
+        assert len(queue.get_by_task(tid, agent_role='orchestrator-deterministic')) == 1
+
+    @pytest.mark.asyncio
+    async def test_gate_and_deploy_strands_disjoint_in_same_pass(self, tmp_path: Path) -> None:
+        """(d) mutual-exclusion: a deploy RAN-strand and a gate strand in the
+        SAME pass are each handled by their OWN recovery — the gate task is not
+        double-handled by the deploy path, and vice-versa."""
+        h = _make_recon_harness()
+        h.event_store = None
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 4321, 'ActiveState': 'active'}
+        )
+        gate_tid = 'tid-gate'
+        deploy_tid = 'tid-deploy'
+        gate_task = {
+            'id': gate_tid, 'status': 'blocked',
+            'title': 'Human gate 5330', 'description': 'Approve reify 5330.',
+            'metadata': self._gate_metadata(),
+        }
+        deploy_task = {
+            'id': deploy_tid, 'status': 'blocked',
+            'description': 'Deploy fused-memory restart',
+            'metadata': _strand_metadata(phase=DeployPhase.RAN),
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[gate_task, deploy_task])
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+        await h._run_deterministic_recon_sweep()
+
+        # Gate task → exactly one L2 milestone_gate from the runner's sentinel role.
+        gate_escs = queue.get_by_task(gate_tid, status='pending')
+        assert len(gate_escs) == 1
+        assert gate_escs[0].category == 'milestone_gate'
+        assert gate_escs[0].agent_role == 'orchestrator-deterministic'
+        # Deploy task → exactly one L1 deploy-strand recovery from the SWEEP
+        # role; NOT a milestone_gate, and NOT double-handled by the gate path.
+        deploy_escs = queue.get_by_task(deploy_tid, status='pending')
+        assert len(deploy_escs) == 1
+        assert deploy_escs[0].category != 'milestone_gate'
+        assert deploy_escs[0].agent_role == 'harness-deterministic-recon-sweep'
+
 
 # ---------------------------------------------------------------------------
 # Amendment: the generic stranded-blocked reaper (_reconcile_one_stranded)
