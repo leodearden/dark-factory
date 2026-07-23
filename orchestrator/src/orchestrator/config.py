@@ -1830,7 +1830,7 @@ class GitConfig(BaseModel):
         ),
     )
     warm_lane_reclaim_on_exhaustion: bool = Field(
-        default=False,
+        default=True,
         description=(
             'When True, GitOps.acquire_warm_lane() engages the reclaim-on-exhaustion '
             'SAFETY VALVE (task 1933): instead of returning EXHAUSTED immediately when '
@@ -1841,13 +1841,25 @@ class GitConfig(BaseModel):
             'fresh-reset path — zero new git plumbing.  A WARNING log records every steal '
             '(ops signal: safety valve fired = real pool pressure).  NEVER steals a '
             'dispatched (live) lane — the is_dispatched predicate is re-checked '
-            'synchronously under the pool lock (TOCTOU guard, task 1933).  '
+            'synchronously under the pool lock (TOCTOU guard, task 1933, '
+            'git_ops.py _try_reclaim_lane_for / warm_lane_pool.py reclaim_victim).  '
             'Falls back to EXHAUSTED/cold only when no eligible victim exists.  '
             'Requires warm_lane_pool=True.  '
-            'Default False → byte-identical, trivially revertible, matches '
-            'warm_lane_pool/warm_lane_disk_guard convention; enable when ready '
-            '(the INTERIM MARGIN reify spare_warm_lanes deployed 2026-06-29 '
-            'covers headroom until then).'
+            'Default True (flipped fleet-wide: PRD warm-lane-exhaustion-hardening W4) — '
+            'there is no surviving reason to keep this False (Leo investigation '
+            '2026-07-23).  The prior deferral rationale referenced the reify '
+            '"INTERIM MARGIN" spare_warm_lanes key, which never parsed (a top-level '
+            'key with no reader; 2026-07-22 incident).  The 2854 reseed-verify guard '
+            '(merge 0c8137d560) protects the steal path\'s shared reseed tail.  '
+            'Callbacks are installed in Harness.__init__, so the fleet adopts the new '
+            'default on each unit\'s next restart (<=8h redeploy cadence), not '
+            'instantaneously.  defaults.yaml deliberately does NOT list this knob — '
+            'the Field default here is the single source of truth (do not add it '
+            'there; a second source would drift).  Residual accepted risk (decision '
+            '6): untracked victim-worktree files are NOT preserved across a steal '
+            '(only tracked WIP is committed to the victim branch, per 1912 '
+            'retention), and sustained over-demand causes steal-churn, which is '
+            'WARNING-logged per steal (ops signal, not silently absorbed).'
         ),
     )
     max_interactive_worktrees: int = Field(
