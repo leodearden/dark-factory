@@ -4742,6 +4742,16 @@ class GitOps:
             # before falling back to EXHAUSTED (task 1933 safety valve).
             reclaimed = await self._try_reclaim_lane_for(branch_name)
             if reclaimed is None:
+                # Task 2984 (PRD α): carry the typed census on the exhaustion
+                # path so an operator sees WHY the pool is full (free / held by
+                # a dispatched task / pinned by a non-dispatched task / unknown
+                # / quarantined).  Assembled fresh here (cheap on the rare
+                # exhaustion path, race-free) rather than threaded through the
+                # shared WarmLaneUnavailable sentinel.
+                logger.warning(
+                    'acquire_warm_lane: warm-lane pool EXHAUSTED for branch %r — %s',
+                    branch_name, self._assemble_warm_lane_census().render(),
+                )
                 return WarmLaneUnavailable.EXHAUSTED  # Pool exhausted → backpressure
             # Stolen lane: registered worktree, reused=False.  Falls through past
             # `if reused:` (False) and `elif not _is_registered_worktree(lane)`
