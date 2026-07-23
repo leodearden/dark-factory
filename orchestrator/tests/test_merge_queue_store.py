@@ -37,7 +37,7 @@ from orchestrator.merge_queue_store import (
     reconstruct_merge_request,
     recover_pending_merges,
 )
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_types import InFlightMergeRegistry, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -426,6 +426,256 @@ class TestRecoverPendingMerges:
         assert report['dropped'] == 2
         assert len(report['requests']) == 1
         assert report['requests'][0].request_id == req_a.request_id
+
+
+# ---------------------------------------------------------------------------
+# task 2926 (C3 γ) step-3 — recover_pending_merges registry-gated dedup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverPendingMergesRegistryDedup:
+    """task 2926 (C3 γ) step-3 RED: recover_pending_merges collapses per-branch
+    duplicates through the InFlightMergeRegistry BEFORE enqueue.
+
+    RED until step-4 adds the ``registry`` kwarg + the Phase-2 collapse. Reuses
+    the ``_make_req`` + fake-git_ops resolve_branch_sha/is_ancestor scaffolding
+    from :class:`TestRecoverPendingMerges`; constructs a REAL
+    ``InFlightMergeRegistry`` so the winner+peer future-mirror (attach) is
+    OBSERVED, not inferred.
+    """
+
+    def _make_git_ops(
+        self,
+        *,
+        full_branch: str,
+        branch_sha: str = 'sha-live',
+        ancestor_pairs: set[tuple[str, str]] | None = None,
+    ) -> MagicMock:
+        """Fake git_ops for the dedup tests.
+
+        * ``resolve_branch_sha(full_branch)`` → *branch_sha* (survives Phase 1),
+          None for any other ref.
+        * ``is_ancestor(a, b)`` → True iff ``(a, b)`` in *ancestor_pairs*.  The
+          survival check ``is_ancestor(full_branch, 'main')`` is therefore False
+          (branch not yet landed) unless that pair is explicitly supplied, and
+          the Phase-2 tip classification is driven by the snapshot-tip pairs.
+        """
+        pairs = ancestor_pairs if ancestor_pairs is not None else set()
+
+        async def fake_resolve(branch: str) -> str | None:
+            return branch_sha if branch == full_branch else None
+
+        async def fake_is_ancestor(ancestor: str, descendant: str) -> bool:
+            return (ancestor, descendant) in pairs
+
+        git_ops = MagicMock()
+        git_ops.resolve_branch_sha = fake_resolve
+        git_ops.is_ancestor = fake_is_ancestor
+        return git_ops
+
+    async def test_same_sha_coalesces_to_one_with_peer_mirror(
+        self, tmp_path: Path
+    ) -> None:
+        """Two same-SHA records for one branch → exactly ONE enqueued winner;
+        the loser attaches as a peer whose future mirrors the winner's outcome."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req1 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        req2 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        store.record(req1)
+        store.record(req2)
+
+        registry = InFlightMergeRegistry()
+        git_ops = self._make_git_ops(full_branch='task/5326')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/', registry=registry,
+        )
+
+        # Exactly ONE enqueued winner; the duplicate coalesced.
+        assert queue.qsize() == 1
+        assert report['recovered'] == 1
+        assert report['coalesced'] == 1
+
+        # Registry entry holds the primary + one attached peer waiter.
+        entry = registry.entry('5326')
+        assert entry is not None
+        assert len(entry.waiters) == 2, (
+            f'Expected primary+peer waiters; got {len(entry.waiters)}'
+        )
+
+        # First-seen wins the SAME tie → req1 is the enqueued winner.
+        assert len(report['requests']) == 1
+        winner_req = report['requests'][0]
+        assert winner_req.request_id == req1.request_id
+
+        # Grab the PEER future BEFORE resolving the winner.
+        peer_futures = [
+            w.future for w in entry.waiters if w.future is not winner_req.result
+        ]
+        assert len(peer_futures) == 1
+        peer = peer_futures[0]
+        assert not peer.done()
+
+        # Resolving the winner mirrors the terminal outcome onto the peer:
+        # both requesters resolve — the coalesce attach is OBSERVED.
+        sentinel = object()
+        winner_req.result.set_result(sentinel)
+        await asyncio.sleep(0)
+        assert peer.done()
+        assert peer.result() is sentinel
+
+        # The loser's journal entry is removed; the winner stays journaled.
+        remaining_ids = {r.request_id for r in store.load()}
+        assert req2.request_id not in remaining_ids, 'loser must be store.remove()d'
+        assert req1.request_id in remaining_ids, 'winner stays journaled'
+
+    async def test_descendant_wins_ancestor_first(self, tmp_path: Path) -> None:
+        """Journal order [ancestor, descendant] → the DESCENDANT is enqueued (REPLACE)."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req_anc = _make_req('5326', '5326', wt, config, snapshot_tip='anc')
+        req_desc = _make_req('5326', '5326', wt, config, snapshot_tip='desc')
+        store.record(req_anc)   # ancestor first in the journal
+        store.record(req_desc)
+
+        registry = InFlightMergeRegistry()
+        git_ops = self._make_git_ops(
+            full_branch='task/5326', ancestor_pairs={('anc', 'desc')},
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/', registry=registry,
+        )
+
+        assert queue.qsize() == 1
+        assert report['coalesced'] == 1
+        enqueued = queue.get_nowait()
+        assert enqueued.request_id == req_desc.request_id, (
+            'the DESCENDANT record must be the single enqueued winner'
+        )
+
+    async def test_descendant_wins_descendant_first(self, tmp_path: Path) -> None:
+        """Journal order [descendant, ancestor] → still the DESCENDANT is enqueued
+        (order-independence: the pre-grouping picks the descendant-most tip)."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req_desc = _make_req('5326', '5326', wt, config, snapshot_tip='desc')
+        req_anc = _make_req('5326', '5326', wt, config, snapshot_tip='anc')
+        store.record(req_desc)   # descendant first in the journal
+        store.record(req_anc)
+
+        registry = InFlightMergeRegistry()
+        git_ops = self._make_git_ops(
+            full_branch='task/5326', ancestor_pairs={('anc', 'desc')},
+        )
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/', registry=registry,
+        )
+
+        assert queue.qsize() == 1
+        assert report['coalesced'] == 1
+        enqueued = queue.get_nowait()
+        assert enqueued.request_id == req_desc.request_id, (
+            'order-independent: the descendant wins regardless of journal order'
+        )
+
+    async def test_divergence_replaces_and_warns(
+        self, tmp_path: Path, caplog, monkeypatch
+    ) -> None:
+        """Divergent pair (is_ancestor False both ways) + patch NOT contained →
+        resolve_divergent SUPERSET → REPLACE to the later record + a D2 WARNING
+        naming the branch."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req_x = _make_req('5326', '5326', wt, config, snapshot_tip='X')
+        req_y = _make_req('5326', '5326', wt, config, snapshot_tip='Y')
+        store.record(req_x)
+        store.record(req_y)
+
+        async def _pcc(head: str, upstream: str, git_ops: object) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.patch_content_contained', _pcc,
+        )
+
+        registry = InFlightMergeRegistry()
+        git_ops = self._make_git_ops(full_branch='task/5326')  # DIVERGENT
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        with caplog.at_level(logging.WARNING):
+            report = await recover_pending_merges(
+                store, queue, git_ops, config, event_store=None,
+                main_branch='main', branch_prefix='task/', registry=registry,
+            )
+
+        assert queue.qsize() == 1
+        assert report['coalesced'] == 1
+        enqueued = queue.get_nowait()
+        assert enqueued.request_id == req_y.request_id, (
+            'the later divergent (SUPERSET) record wins (D2)'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'diverg' in r.message.lower()
+        ]
+        assert warns, (
+            f'Expected a divergence WARNING; got {[r.message for r in caplog.records]}'
+        )
+        assert any('5326' in r.message for r in warns), (
+            f'WARNING must name the branch; got {[r.message for r in warns]}'
+        )
+
+    async def test_registry_none_preserves_double_enqueue(
+        self, tmp_path: Path
+    ) -> None:
+        """registry omitted (default None) → current behavior preserved: two
+        duplicate records both enqueue (qsize()==2), report['coalesced']==0."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req1 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        req2 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        store.record(req1)
+        store.record(req2)
+
+        git_ops = self._make_git_ops(full_branch='task/5326')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/',
+        )
+
+        assert queue.qsize() == 2, (
+            'registry=None must preserve direct-enqueue-per-survivor'
+        )
+        assert report['recovered'] == 2
+        assert report['coalesced'] == 0
 
 
 # ---------------------------------------------------------------------------
