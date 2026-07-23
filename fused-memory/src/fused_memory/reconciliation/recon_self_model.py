@@ -15,8 +15,12 @@ its rendered sections at a later task (ξ). Those prompts currently import
 nothing from harness.py/flag_dedup.py/recon_ledger.py, so — to stay safely
 importable from the prompt-import path without pulling in aiosqlite
 (recon_ledger's dependency) or other reconciliation internals — this module
-imports ONLY reconciliation.recon_pool_map (itself a leaf — see that
-module's docstring) plus stdlib. Consistency with recon_ledger.MARKER_KINDS,
+imports ONLY reconciliation.recon_pool_map and
+reconciliation.standing_decision_constants (both pure leaves — see those
+modules' docstrings; standing_decision_constants imports only
+`from __future__ import annotations`, so it pulls no reconciliation
+internals onto the prompt-import path) plus stdlib. Consistency with
+recon_ledger.MARKER_KINDS,
 harness._derive_affected_ids, and flag_dedup's content-fingerprint fallback
 is cross-checked by tests (fused-memory/tests/test_recon_self_model.py),
 which may import those modules freely.
@@ -48,6 +52,11 @@ from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
     STAGE2_CYCLE_SUMMARY_RECON_POOL,
+)
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    MEM0_KIND_INVESTIGATION_OUTCOME,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
 )
 
 # --------------------------------------------------------------------------- #
@@ -325,6 +334,51 @@ def render_suppression_schema_section() -> str:
         'record exist for the same task_id, the blanket record wins (union '
         'semantics) — a blanket suppression cannot be narrowed by a more '
         'specific scoped record.'
+    )
+
+
+def render_entity_standing_decision_schema_section() -> str:
+    """Render the SHARED entity-standing-decision schema section (task 2898 ε,
+    PRD plans/stage1-entity-standing-decision-prd.md §ε).
+
+    Rendered byte-identically into BOTH the Stage-1 and Stage-2 system prompts
+    (the record schema, the demotion fact, and the advisory-read fact are all
+    system-wide invariants each stage must understand). It covers three
+    both-stages facts:
+
+    * the ``entity_standing_decision`` ledger record schema — record kind +
+      grounds enum, single-sourced from ``standing_decision_constants`` (task
+      2894 α) so the rendered text carries the constant VALUES, not re-hardcoded
+      literals (INV-5);
+    * the demotion (PRD decision 6): the ledger kind is the SOLE
+      machine-consulted standing-decision form, and the ad-hoc mem0 kinds
+      ``recurring_flag_standing_decision`` / ``stage1_finding_correction`` are
+      evidence-only;
+    * the pre-emission advisory ``get_memories_by_metadata`` check against the
+      mem0 mirror — advisory ONLY, because the authoritative gate is Stage 1's
+      deterministic filter (γ) and reads never consult mem0 for authority.
+    """
+    return (
+        '## Entity Standing Decisions\n'
+        f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
+        'machine-consulted standing-decision form — the durable record that a prior '
+        'investigation adjudicated a recurring class of complaint about an entity and '
+        'dismissed it as a known false positive. Canonical recon_ledger record schema:\n'
+        f'  - `record_kind = "{RECORD_KIND_ENTITY_STANDING_DECISION}"`\n'
+        '  - `grounds` ∈ the closed grounds enum — currently the single value '
+        f'`"{GROUNDS_STRUCTURAL_SIZE_CONFLATION}"`; a complaint citing a specific edge '
+        'uuid is by definition outside it (the per-edge escape hatch).\n'
+        '  - `entity_uuid`, `decided_at`, and a never-None `expires_at`.\n\n'
+        'Demotion (PRD decision 6): the ad-hoc mem0 kinds '
+        '`recurring_flag_standing_decision` and `stage1_finding_correction` are demoted '
+        'to evidence-only. No machine gate consults them; only the '
+        f'`{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record governs suppression.\n\n'
+        'Pre-emission advisory check: before emitting a standing decision you MAY run an '
+        'advisory `get_memories_by_metadata` lookup against the mem0 mirror to see '
+        'whether a matching decision already exists. This is ADVISORY ONLY — the '
+        "authoritative gate is Stage 1's deterministic filter (γ), the sole enforcement "
+        'point. Reads never consult mem0 for authority: a mem0 hit or miss changes '
+        'nothing about whether a finding is suppressed; only the ledger record does.'
     )
 
 
