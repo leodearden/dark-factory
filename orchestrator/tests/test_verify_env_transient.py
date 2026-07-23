@@ -649,9 +649,13 @@ _XDIST_WORKER_CRASH_OUTPUT = (
 # esc-2971-13 (steward-verified): the installed pytest-xdist actually quotes
 # the worker id too — ``worker 'gw24' crashed while running '<nodeid>'`` —
 # not just the trailing nodeid as _XDIST_WORKER_CRASH_OUTPUT above models.
-# Without quote-tolerance on the worker-id alternative,
-# _XDIST_WORKER_CRASH_RE.search() misses this real-world form entirely and
-# _is_bare_xdist_worker_crash never reclassifies it.
+# This models the FULL real-world combined output, where the node-down line
+# and the quoted worker-crash line appear together. On its own it does NOT
+# prove quote-tolerance: the ``[gwNN] node down`` line here already matches
+# two other, unchanged alternatives of _XDIST_WORKER_CRASH_RE regardless of
+# how the worker-crash alternative is spelled. The isolating check —
+# asserting the regex against a node-down-free quoted-crash line — lives in
+# test_bare_worker_crash_with_quoted_worker_id_is_true below.
 _XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT = (
     'orchestrator/tests/test_config.py ....\n'
     '[gw24] node down: Not properly terminated\n'
@@ -749,7 +753,21 @@ class TestBareXdistWorkerCrashDetector:
         trailing nodeid; _XDIST_WORKER_CRASH_RE must tolerate the optional
         quotes or this class of bare worker-crash silently falls through to
         the debugger/human instead of the bounded infra retry.
+
+        First isolates the changed alternative directly against a line with
+        NO ``node down`` substring: _XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT
+        alone would stay green even if quote-tolerance were reverted, since
+        its node-down line independently matches two other, unchanged
+        alternatives of the pattern.
         """
+        assert (
+            verify._XDIST_WORKER_CRASH_RE.search(
+                "worker 'gw24' crashed while running "
+                "'orchestrator/tests/test_config.py::TestFoo::test_bar'"
+            )
+            is not None
+        )
+
         result = verify._is_bare_xdist_worker_crash(
             _XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT
         )
