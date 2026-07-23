@@ -15,8 +15,13 @@ import pytest
 # RED in step-1: module does not exist yet; import will fail until step-2.
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
+    DEFAULT_HEARTBEAT_TTL,
     WorkflowLiveness,
+    _routing_decided_after_restart,
+    _task_in_scheduler_holders_or_parks,
+    corroboration_for_task,
     detect_live_workflow,
+    has_live_workflow_corroboration,
     is_workflow_live_for_task,
 )
 
@@ -1040,3 +1045,207 @@ class TestBareStrandedOrchestratorSuppression:
 
         assert result.orchestrator_live is True
         assert result.is_live is True
+
+
+# ---------------------------------------------------------------------------
+# Corroboration helpers (task 2963)
+# ---------------------------------------------------------------------------
+
+_CORROB_NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)
+_CORROB_TASK_ID = '2763'
+
+
+def _routing_metadata(decided_at: str | None) -> dict:
+    """Build a task ``metadata`` dict with a valid ``routing.latest`` mirror.
+
+    Supplies all RoutingDecisionMirror-required fields so ``.latest`` is
+    non-None; ``decided_at`` is the only field the corroboration path reads.
+    """
+    return {
+        'routing': {
+            'latest': {
+                'role': 'implementer',
+                'model': 'claude',
+                'effort': 'high',
+                'budget_usd': 1.0,
+                'max_turns': 10,
+                'source_layer': 'default',
+                'decided_at': decided_at,
+            }
+        }
+    }
+
+
+class TestTaskInSchedulerHoldersOrParks:
+    """_task_in_scheduler_holders_or_parks: task_id in parks-keys OR holders-values."""
+
+    def test_true_when_task_id_is_parks_key(self):
+        state = {'parks': {_CORROB_TASK_ID: {'reason': 'x'}}, 'current_holders': {}}
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+
+    def test_true_when_task_id_is_current_holders_value(self):
+        # current_holders is {module: task_id}; the task_id is a VALUE, not a key.
+        state = {'parks': {}, 'current_holders': {'reconciliation': _CORROB_TASK_ID}}
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+
+    def test_false_when_in_neither(self):
+        state = {'parks': {'9999': {}}, 'current_holders': {'mod': '9999'}}
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is False
+
+    def test_no_raise_when_state_none(self):
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, None) is False
+
+    def test_no_raise_when_keys_missing(self):
+        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, {}) is False
+
+    def test_int_task_id_coerced_to_str(self):
+        # scheduler_state keys/values are strings (JSON); an int task_id still matches.
+        state = {'parks': {'2763': {}}, 'current_holders': {}}
+        assert _task_in_scheduler_holders_or_parks(2763, state) is True
+
+
+class TestRoutingDecidedAfterRestart:
+    """_routing_decided_after_restart: decided_at strictly newer than started."""
+
+    _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
+
+    def test_true_when_decided_after_started(self):
+        assert _routing_decided_after_restart('2026-07-23T11:00:00Z', self._STARTED) is True
+
+    def test_false_when_decided_before_started(self):
+        assert _routing_decided_after_restart('2026-07-23T09:00:00Z', self._STARTED) is False
+
+    def test_false_when_decided_equals_started(self):
+        assert _routing_decided_after_restart('2026-07-23T10:00:00Z', self._STARTED) is False
+
+    def test_false_when_decided_none(self):
+        assert _routing_decided_after_restart(None, self._STARTED) is False
+
+    def test_false_when_decided_unparseable(self):
+        assert _routing_decided_after_restart('not-a-time', self._STARTED) is False
+
+    def test_false_when_started_none(self):
+        # Cannot prove post-restart without a restart boundary.
+        assert _routing_decided_after_restart('2026-07-23T11:00:00Z', None) is False
+
+
+class TestHasLiveWorkflowCorroboration:
+    """has_live_workflow_corroboration: OR of the three per-task signals."""
+
+    _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
+
+    def test_true_when_claimant_live_short_circuits(self):
+        # Even with empty scheduler state and no routing, a live claimant suffices.
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=True,
+            scheduler_state=None,
+            routing_latest_decided_at=None,
+            orchestrator_started_at=None,
+        ) is True
+
+    def test_true_via_scheduler_only(self):
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=False,
+            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            routing_latest_decided_at=None,
+            orchestrator_started_at=None,
+        ) is True
+
+    def test_true_via_routing_only(self):
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=False,
+            scheduler_state=None,
+            routing_latest_decided_at='2026-07-23T11:00:00Z',
+            orchestrator_started_at=self._STARTED,
+        ) is True
+
+    def test_false_when_all_absent(self):
+        assert has_live_workflow_corroboration(
+            _CORROB_TASK_ID,
+            claimant_live=False,
+            scheduler_state={'parks': {}, 'current_holders': {}},
+            routing_latest_decided_at='2026-07-23T09:00:00Z',  # before started
+            orchestrator_started_at=self._STARTED,
+        ) is False
+
+
+class TestCorroborationForTask:
+    """corroboration_for_task: assembles the three signals from a task dict."""
+
+    _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
+
+    def test_default_heartbeat_ttl_is_ten_minutes(self):
+        assert DEFAULT_HEARTBEAT_TTL == timedelta(minutes=10)
+
+    def test_fresh_heartbeat_true(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            'heartbeat_at': (_CORROB_NOW - timedelta(minutes=1)).isoformat(),
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is True
+
+    def test_stale_heartbeat_no_other_signal_false(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': 'run-1/sess-1/pid=42',
+            # 30 min old > 10 min ttl → stale → not a live claimant.
+            'heartbeat_at': (_CORROB_NOW - timedelta(minutes=30)).isoformat(),
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state={'parks': {}, 'current_holders': {}},
+            orchestrator_started_at=self._STARTED,
+        ) is False
+
+    def test_routing_after_started_true(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            # No fresh claimant.
+            'claimant_run_id': None,
+            'metadata': _routing_metadata('2026-07-23T11:00:00Z'),  # after started
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=self._STARTED,
+        ) is True
+
+    def test_routing_before_started_false(self):
+        task = {
+            'id': _CORROB_TASK_ID,
+            'status': 'in-progress',
+            'claimant_run_id': None,
+            'metadata': _routing_metadata('2026-07-23T09:00:00Z'),  # before started
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=self._STARTED,
+        ) is False
+
+    def test_missing_metadata_no_raise_relies_on_other_signals(self):
+        # No metadata, no claimant, but present in scheduler parks → True (no raise).
+        task = {'id': _CORROB_TASK_ID, 'status': 'in-progress', 'claimant_run_id': None}
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            orchestrator_started_at=self._STARTED,
+        ) is True
+
+    def test_empty_metadata_no_raise_all_absent_false(self):
+        task = {
+            'id': _CORROB_TASK_ID, 'status': 'in-progress',
+            'claimant_run_id': None, 'metadata': {},
+        }
+        assert corroboration_for_task(
+            task, _CORROB_TASK_ID, now=_CORROB_NOW,
+            scheduler_state=None, orchestrator_started_at=None,
+        ) is False
