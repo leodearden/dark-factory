@@ -77,7 +77,10 @@ def build_landlock_command(
     Strategy:
     - Invoke the ``landlock_exec`` helper (``python -m landlock_exec`` style)
     - Pass per-module and ``.task`` writable paths via ``--writable``
-    - ``/`` is read-only, ``~/.claude`` is writable (handled inside the helper)
+    - ``/`` is read-only; ``~/.claude`` is read-only too except for whatever
+      subpaths are supplied here via ``writable_extras`` (e.g.
+      ``~/.claude/fleet/``, as computed by
+      ``orchestrator.agents.write_set.compute_write_set``)
 
     Returns argv suitable for ``asyncio.create_subprocess_exec``.
     """

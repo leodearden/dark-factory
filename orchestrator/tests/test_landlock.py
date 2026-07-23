@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -224,3 +226,82 @@ class TestSandboxConfigBackendField:
         from orchestrator.config import SandboxConfig
         with pytest.raises(ValidationError):
             SandboxConfig(backend='seccomp-magic')  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Test 6: ~/.claude narrowing — deny settings.json, allow fleet/, allow
+# redirected in-worktree transcript writes (PRD enforcement matrix rows 9/10)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not is_landlock_available(),
+    reason='landlock not supported on this kernel',
+)
+class TestLandlockClaudeHomeNarrowing:
+    def test_denies_settings_but_allows_fleet_and_transcript(self):
+        # /var/tmp — outside the wrapper's blanket /tmp grant, so writes here
+        # are governed only by the rules under test. HOME is overridden to a
+        # fake home (below) so this never touches the real ~/.claude.
+        base = Path(tempfile.mkdtemp(prefix='landlock-claude-home-', dir='/var/tmp'))
+        try:
+            fake_home = base / 'home'
+            fake_home.mkdir()
+            fleet_dir = fake_home / '.claude' / 'fleet'
+            fleet_dir.mkdir(parents=True)
+            settings_path = fake_home / '.claude' / 'settings.json'
+            settings_path.write_text(json.dumps({'orig': True}))
+
+            worktree = base / 'wt'
+            worktree.mkdir()
+
+            self._run_enforcement(fake_home, fleet_dir, settings_path, worktree)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _run_enforcement(
+        self, fake_home: Path, fleet_dir: Path, settings_path: Path, worktree: Path,
+    ) -> None:
+        # Mirrors the production compute_write_set() -> sandbox_extras ->
+        # build_landlock_command(writable_extras=...) chain: fleet/ is the
+        # only ~/.claude subpath granted, passed the same way the real
+        # workflow wiring passes it.
+        transcript_dir = worktree / '.task' / 'claude-config-x' / 'projects'
+        poisoned = json.dumps({'pwned': True})
+
+        inner = [
+            '/bin/sh', '-c',
+            (
+                f'(touch {fleet_dir}/rec 2>/dev/null && echo fleet_ok || echo fleet_denied) && '
+                f"(printf '%s' '{poisoned}' > {settings_path} 2>/dev/null && "
+                'echo settings_wrote || echo settings_denied) && '
+                f'(mkdir -p {transcript_dir} 2>/dev/null && '
+                f'printf transcript > {transcript_dir}/transcript.jsonl 2>/dev/null && '
+                'echo transcript_ok || echo transcript_denied) && '
+                'echo end'
+            ),
+        ]
+        cmd = build_landlock_command(
+            inner, worktree, [], writable_extras=[str(fleet_dir)],
+        )
+        result = subprocess.run(
+            cmd,
+            env={**os.environ, 'HOME': str(fake_home)},
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        assert result.returncode == 0, f'stderr={result.stderr}'
+        assert 'end' in result.stdout
+
+        # Row 10 (over-narrow guard): the fleet/ extra stays writable.
+        assert 'fleet_ok' in result.stdout, result.stdout
+
+        # Row 9 (the property under test): settings.json is NOT writable via
+        # the narrowed ~/.claude grant, and its content is left untouched.
+        assert 'settings_denied' in result.stdout, result.stdout
+        assert 'settings_wrote' not in result.stdout
+        assert json.loads(settings_path.read_text()) == {'orig': True}
+
+        # Acceptance: redirected in-worktree transcript writes still work.
+        assert 'transcript_ok' in result.stdout, result.stdout

@@ -14,9 +14,15 @@ Usage::
         -- <inner cmd> [args...]
 
 The ``/`` filesystem is made read-only (exec + read_file + read_dir). Each
-``--writable`` path is granted full v1 access. ``~/.claude`` is always
-writable (OAuth/session state). ``/dev`` gets WRITE_FILE + RO (for /dev/null
-etc.). Nothing else can be written.
+``--writable`` path is granted full v1 access. ``~/.claude`` is NOT granted
+wholesale: only the subpaths passed in via ``--writable`` are writable (e.g.
+``~/.claude/fleet/``, supplied as an extra computed by
+``orchestrator.agents.write_set.compute_write_set``). The CLI's own
+OAuth/session state is redirected to a per-task ``CLAUDE_CONFIG_DIR`` inside
+the worktree (already writable via the module/``.task`` paths), so
+``~/.claude/settings.json``, ``CLAUDE.md``, hooks, and plugins stay
+read-only (PRD deny-write-to-settings.json property). ``/dev`` gets
+WRITE_FILE + RO (for /dev/null etc.). Nothing else can be written.
 """
 
 from __future__ import annotations
@@ -149,9 +155,6 @@ def main(argv: list[str] | None = None) -> int:
     # Agent scratch (temp files, MCP configs, sysprompt files).
     # /tmp only — avoid /var/tmp so worktrees placed there stay restricted.
     _add_path(libc, ruleset_fd, '/tmp', FS_V1_ALL)
-
-    # Claude CLI OAuth + session state
-    _add_path(libc, ruleset_fd, os.path.expanduser('~/.claude'), FS_V1_ALL)
 
     # Per-invocation writable paths (locked modules, .task, extras)
     for path in ns.writable:
