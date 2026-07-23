@@ -296,3 +296,48 @@ def test_list_absent_parking_root_returns_empty(tmp_path):
     """An ABSENT parking root yields [] (no parkings to scan)."""
     repo = _init_repo(tmp_path)
     assert row.list_parked_worktrees(repo, _parking_root(repo)) == []
+
+
+# ---------------------------------------------------------------------------
+# step-7: is_worktree_dirty(path) / branch_ref_resolves(repo, branch)
+# ---------------------------------------------------------------------------
+
+def test_is_worktree_dirty_false_on_clean_checkout(tmp_path):
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    assert row.is_worktree_dirty(parking) is False
+
+
+def test_is_worktree_dirty_true_on_untracked_file(tmp_path):
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    (parking / "scratch.txt").write_text("new\n")
+    assert row.is_worktree_dirty(parking) is True
+
+
+def test_is_worktree_dirty_true_on_modified_tracked_file(tmp_path):
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    (parking / "README.md").write_text("changed\n")
+    assert row.is_worktree_dirty(parking) is True
+
+
+def test_is_worktree_dirty_fail_safe_true_when_status_errors(tmp_path, caplog):
+    """A ``git status`` that errors (path is not a worktree) is treated
+    fail-safe as DIRTY (True) and never raises — mirrors
+    GitOps._worktree_dirty's fail-safe True."""
+    caplog.set_level(logging.WARNING, logger="reclaim_orphaned_worktrees")
+    not_a_worktree = tmp_path / "not-a-worktree"
+    not_a_worktree.mkdir()
+    assert row.is_worktree_dirty(not_a_worktree) is True
+
+
+def test_branch_ref_resolves_true_for_existing_branch(tmp_path):
+    repo = _init_repo(tmp_path)
+    _add_parking(repo, f"2920-{TS_OLD}")
+    assert row.branch_ref_resolves(repo, f"task/2920-{TS_OLD}") is True
+
+
+def test_branch_ref_resolves_false_for_missing_branch(tmp_path):
+    repo = _init_repo(tmp_path)
+    assert row.branch_ref_resolves(repo, "task/does-not-exist") is False
