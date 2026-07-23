@@ -3752,6 +3752,25 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
                 cm.__exit__(None, None, None)
 
 
+# Cold-verify shared-venv pre-provision coalescing guard (task 2997).
+# run_verification is invoked N times concurrently in fan-outs (run_scoped_
+# verification's per-module gather; the post-merge type-only pyright gather in
+# merge_queue.py).  Without coalescing, each call would spawn its own `uv sync`
+# on the same cold `.venv` — itself the concurrent-uv-on-cold-venv operation
+# this task exists to eliminate.  A per-worktree lock + a completed-path set
+# (both keyed by the RESOLVED worktree path) make overlapping callers await a
+# single in-flight provision and later callers skip.  Follows the module-level
+# cache precedent (_PROBE_CACHE).
+#
+# No separate guard lock protects the dict: the get-or-create below runs with no
+# `await` between the read and the write, so under asyncio's cooperative
+# scheduling it is atomic (two coroutines cannot interleave within it).  A
+# module-level `asyncio.Lock()` created at import would instead bind to the first
+# event loop that touched it and raise cross-loop under pytest's per-test loops.
+_PREPROVISION_LOCKS: dict[str, asyncio.Lock] = {}
+_PREPROVISION_DONE: set[str] = set()
+
+
 async def _preprovision_shared_venv(
     worktree: Path,
     config: OrchestratorConfig,
@@ -3778,21 +3797,45 @@ async def _preprovision_shared_venv(
     cmd = config.verify_cold_preprovision_command
     if not cmd:
         return
-    logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
-    rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
-    if rc != 0:
-        # Fail-open + loud (honours the loud-over-silent-degradation norm;
-        # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL sync
-        # is what closes the race; a FAILED sync is a real infra problem the
-        # gather's own tool spawn + existing failure classification will surface,
-        # so the pre-provision must NEVER become a NEW failure source — warn and
-        # return normally, always proceeding to the gather, never raising.
-        tail = out[-500:] if out else ''
-        logger.warning(
-            'Cold-verify shared-venv pre-provision failed (rc=%d), proceeding to '
-            'the verify gather anyway: %r\noutput tail: %s',
-            rc, cmd, tail,
-        )
+    key = str(worktree.resolve())
+    # Fast path: already provisioned for this worktree — skip without taking the
+    # lock (the common case once a worktree's first cold verify has run).
+    if key in _PREPROVISION_DONE:
+        return
+    # Get-or-create the per-worktree lock.  Synchronous (no await between the get
+    # and the set) → atomic under asyncio, so no separate guard lock is needed.
+    lock = _PREPROVISION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PREPROVISION_LOCKS[key] = lock
+    async with lock:
+        # Double-checked: a concurrent caller may have completed the provision
+        # while we awaited the lock — coalesce onto its single sync and skip.
+        if key in _PREPROVISION_DONE:
+            return
+        logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
+        rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        if rc != 0:
+            # Fail-open + loud (honours the loud-over-silent-degradation norm;
+            # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL
+            # sync is what closes the race; a FAILED sync is a real infra problem
+            # the gather's own tool spawn + existing failure classification will
+            # surface, so the pre-provision must NEVER become a NEW failure
+            # source — warn and return normally, always proceeding to the gather,
+            # never raising.
+            tail = out[-500:] if out else ''
+            logger.warning(
+                'Cold-verify shared-venv pre-provision failed (rc=%d), proceeding '
+                'to the verify gather anyway: %r\noutput tail: %s',
+                rc, cmd, tail,
+            )
+        # Mark done on completion (success OR fail-open failure) so overlapping
+        # callers coalesce onto this single in-flight sync and later callers skip.
+        # A failed sync is deliberately not retried per-caller (fail-open; the
+        # gather surfaces any real breakage) — retrying N times on a cold
+        # throwaway worktree would not help and reintroduces the concurrent-uv
+        # race this guard exists to prevent.
+        _PREPROVISION_DONE.add(key)
 
 
 async def run_verification(
