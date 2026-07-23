@@ -4,7 +4,7 @@ import asyncio
 import dataclasses
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -6169,7 +6169,7 @@ class TestRemoteRunnerMainPushMirror:
 # ---------------------------------------------------------------------------
 
 
-def _pool_fake_remote(name='laptop', *, sync_outcome, result=None):
+def _pool_fake_remote(name='laptop', *, sync_outcome, result=None) -> Any:
     """A REAL RemoteRunner (so isinstance(selected, RemoteRunner) holds) with
     sync_if_stale + run_merge_verify replaced by instance stubs.
 
@@ -6203,7 +6203,7 @@ def _pool_fake_remote(name='laptop', *, sync_outcome, result=None):
 class _PoolFakeLocal:
     """Minimal is_local runner for the pool's local trust-anchor / fallback."""
 
-    is_local = True
+    is_local: ClassVar[bool] = True
 
     def __init__(self, name='local'):
         self.name = name

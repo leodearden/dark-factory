@@ -30,7 +30,7 @@ Assertions are on event ORDER and PAYLOADS, not merely presence.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -40,7 +40,6 @@ from orchestrator.verify_runner import (
     MergeVerifySpec,
     RemoteRunner,
     RunnerUnavailable,
-    SyncOutcome,
     UnscopedTypecheckSpec,
     VerifyRunnerPool,
     result_to_json,
@@ -89,7 +88,7 @@ class _RecordingEventStore:
 class _CapstoneLocal:
     """Minimal is_local trust-anchor / fallback runner (mirrors _PoolFakeLocal)."""
 
-    is_local = True
+    is_local: ClassVar[bool] = True
 
     def __init__(self, name: str = 'local') -> None:
         self.name = name

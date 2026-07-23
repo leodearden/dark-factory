@@ -973,10 +973,7 @@ def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
     treat an unresolvable local checkout as "auto-sync disabled" (opt-in),
     never as an error.
     """
-    if start is None:
-        here = Path(__file__).resolve()
-    else:
-        here = start
+    here = Path(__file__).resolve() if start is None else start
     # A file start begins the walk at its parent; a directory start is itself a
     # candidate.  Either way we ascend to the filesystem root.
     candidates = [here, *here.parents] if here.is_dir() else list(here.parents)
