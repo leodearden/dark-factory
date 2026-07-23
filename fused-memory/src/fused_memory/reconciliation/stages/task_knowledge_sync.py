@@ -2762,6 +2762,11 @@ class TaskKnowledgeSync(BaseStage):
                     'flag_type': finding.get('flag_type'),
                     'finding_id': finding.get('finding_id'),
                     'content': finding.get('description'),
+                    # Hook B (task 2897 δ): carry the standing-decision
+                    # annotation through this re-projection so it renders into
+                    # the Stage 2 payload (_format_flagged json.dumps verbatim);
+                    # None when the finding was not adjudicated.
+                    'standing_decision_id': finding.get('standing_decision_id'),
                 }
             )
             if sig is not None:
