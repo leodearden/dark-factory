@@ -11472,6 +11472,12 @@ class Harness:
             else:
                 digest_dir = Path(self.config.project_root) / 'data' / 'digests'
 
+            # (11b) Stale-lane census (leaf γ, task 2891) — best-effort; the
+            # method is already fail-safe (returns [] on a missing pool or a
+            # degraded status read) and runs inside this try/except so a census
+            # hiccup can never break the digest write.
+            stale_lane_census = await self._stale_lane_assignment_census()
+
             inputs = digest_mod.DigestInputs(
                 window_start_iso=window_start,
                 window_end_iso=window_end,
@@ -11487,6 +11493,7 @@ class Harness:
                 watcher_clusters=[],
                 dry_run_proposals=[],
                 model_role_rollup=model_role_rollup,
+                stale_lane_census=stale_lane_census,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)
