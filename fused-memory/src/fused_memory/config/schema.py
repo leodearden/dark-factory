@@ -421,7 +421,9 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     closes task 2845 (gate 2841) AND the sibling venv-shadowing cluster (gate
     2844); the pytest-xdist cluster closes task 2974 -- it is the topic that
     originally motivated the guard (9 duplicates consolidated into canonical
-    memory 8bb3eb15) but was never itself seeded.
+    memory 8bb3eb15) but was never itself seeded. A fourth cluster (task 3013)
+    seeds the architect report_task_already_done / main-reachable-commit
+    family prospectively, ahead of still-open gate 3011.
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
@@ -504,6 +506,33 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
                 'pyproject.toml). Do NOT add another entry -- update/consolidate '
                 'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='architect-report-task-already-done-main-reachability',
+            # Reviewer (robustness, task 3013): all four phrases are distinctive
+            # literal identifiers/commands -- the report_task_already_done tool
+            # name, the _handle_already_done_report handler name, the literal
+            # git subcommand 'merge-base --is-ancestor', and the hyphenated
+            # 'main-reachable' -- none of which is a short generic token that
+            # could substring-match unrelated text, so no further narrowing
+            # (unlike venv-shadowing above) is needed. Registered prospectively:
+            # gate task 3011's 12-entry cluster is still open awaiting a
+            # consolidation ruling, but this guard is forward-looking (it only
+            # blocks NEW near-dup writes), so seeding it now stops that cluster
+            # from growing further while 3011 is parked.
+            phrases=[
+                'report_task_already_done',
+                'main-reachable',
+                'merge-base --is-ancestor',
+                '_handle_already_done_report',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-contradictory topic (architect report_task_already_done '
+                'requires a main-reachable commit) gated to human task 3011. Do '
+                'NOT add another entry -- update/consolidate the existing entries, '
+                'or add context to gate task 3011.'
             ),
         ),
     ]
