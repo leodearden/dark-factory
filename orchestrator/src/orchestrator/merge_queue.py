@@ -14542,6 +14542,72 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         item_permit = item.permit
         iteration_did_remerge = False
 
+        # ── INV-3 dead-base re-check (enforcement point (a), dispatch) ────────
+        # (PRD plans/merge-verdict-integrity-prd.md leaf γ, §1 INV-3 / §3.3.)
+        # Per-item, at host-acquisition time and REGARDLESS of the global
+        # _has_inflight_verify flag — the exact 5260 gap: a built-awaiting-host
+        # straggler dispatched while OTHER verifies were in flight skipped the
+        # Mechanism-2 staleness re-merge (gated on `not _has_inflight_verify`) and
+        # burned a 43-min verify on a base that had already been re-merged away.
+        # If THIS item's base is a KNOWN-DEAD commit, discard the doomed build and
+        # re-merge it against real main instead of acquiring a host — this is the
+        # correctness backstop, the head-failure cascade's _record_dead_base being
+        # the fast prompt-invalidation optimization (PRD §3.3).  Depth-agnostic: a
+        # live deep base returns None from _chain_dead_link (untouched → normal
+        # dispatch).  Fail-open on a get_main_sha error (empty read → skip the
+        # check; the item dispatches as before rather than wedging dispatch).
+        _dead_base_remerged = False
+        try:
+            _dispatch_main = await self._git_ops.get_main_sha()
+        except Exception:
+            _dispatch_main = ''
+        _dispatch_dead = (
+            self._chain_dead_link(item, _dispatch_main) if _dispatch_main else None
+        )
+        if _dispatch_dead is not None:
+            iteration_did_remerge = True
+            _dead_base_remerged = True  # coordinate: skip the Mechanism-2 block below
+            # MQ-reliability kappa: DISPATCHING -> MERGING for the remerge window
+            # (mirrors the Mechanism-2 dispatch-time remerge transitions).
+            self._note_transition(
+                req.request_id, ItemLifecycleState.DISPATCHING,
+                ItemLifecycleState.MERGING, live_obj=req,
+            )
+            # merge_wt is a required non-None Path on a RealMergeItem (task ο);
+            # _chain_dead_link returned non-None → item is a RealMergeItem here.
+            await self._cleanup_owned_merge_worktree(item.merge_wt)
+            self._emit_speculative(
+                EventType.verdict_voided, req.task_id,
+                dead_link=_dispatch_dead, reason='chain_dead', point='dispatch',
+            )
+            logger.info(
+                'Task %s: dead-base straggler at dispatch (dead link %s) — '
+                're-merging against actual main instead of burning a verify',
+                req.task_id, _dispatch_dead,
+            )
+            item = await self._remerge(req, item.started_monotonic)
+            self._note_transition(
+                req.request_id, ItemLifecycleState.MERGING,
+                ItemLifecycleState.DISPATCHING, live_obj=item,
+            )
+            # A re-merged item may itself be immediately decided (conflict / train
+            # slot) — return it as a passthrough so no verify is EVER launched
+            # against it (mirrors the Mechanism-2 post-remerge passthrough tail).
+            if isinstance(item, DecidedItem):
+                self._remerge_occurred = iteration_did_remerge
+                return InflightEntry(
+                    item=item,
+                    lease=None,
+                    verify_task=None,
+                    merge_wt=None,
+                    was_speculative=item_was_speculative,
+                    passthrough_outcome=item.immediate_outcome,
+                    started_at=time.time(),
+                    permit=item_permit,
+                )
+            # item: RealMergeItem re-based on live main — falls through to the
+            # normal host-acquire + verify dispatch below (no longer dead-based).
+
         # ── Chain re-merge (Mechanism 2 + chain-invalidation) ──────────────
         # Only when no REAL verify task is running (predecessor already finalized).
         # Passthrough entries (verify_task=None, lease=None) are already decided;
@@ -14580,7 +14646,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # to differ from current_main, Mechanism 2 would not fire for speculative
         # items — preventing any main_advanced remerge on the clean-landed path.
         _has_inflight_verify = any(e.verify_task is not None for e in self._inflight)
-        if not _has_inflight_verify:
+        if not _has_inflight_verify and not _dead_base_remerged:
             remerge_reason: str | None = None
             if item.speculative and (self._n_failed or self._remerge_occurred):
                 remerge_reason = (
@@ -14604,8 +14670,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 and not isinstance(req, GroupMergeRequest)
             ):
                 # Mechanism 2: check staleness at pickup for non-speculative items.
-                current_main = await self._git_ops.get_main_sha()
-                if item.base_sha != current_main:
+                # Reuse the INV-3 dead-base re-check's already-fetched main SHA
+                # (_dispatch_main, step-8) — one get_main_sha per dispatch, not
+                # two.  A fail-open empty read (a git error at that fetch) SKIPS
+                # this staleness check and dispatches as-is, rather than spuriously
+                # remerging against '' (base_sha != '' is always True).
+                if _dispatch_main and item.base_sha != _dispatch_main:
                     remerge_reason = 'main_advanced'
 
             if remerge_reason is not None:
