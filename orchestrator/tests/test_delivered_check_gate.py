@@ -2028,6 +2028,106 @@ class TestComputeDeliveredCheckCache:
         assert second == {'20': True}
         assert calls2 == ['cap-one']
 
+    # --- (n) descriptor-variant pruning bounds cache growth to ONE entry
+    #     per (dep, sha) — without this, repeated descriptor edits at a
+    #     fixed SHA would accumulate one stale variant per edit until main
+    #     advances ------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_descriptor_change_prunes_stale_digest_variant_same_sha(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """A descriptor change at a fixed main SHA must not just MISS the
+        cache (see (l) above) — the STALE ``(dep, sha, old-digest)`` entry
+        left behind by the prior descriptor must be actively PRUNED, so
+        cache growth stays bounded to one variant per ``(dep, sha)`` rather
+        than accumulating one entry per historical descriptor edit.
+        """
+        scheduler._resolve_main_sha, _sha_calls = self._fake_sha('sha1')
+        fake_runner, calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        checks_d1 = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        dep = self._dep(checks=checks_d1)
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        key_d1 = self._dcc_key('20', 'sha1', checks_d1)
+        assert key_d1 in scheduler._delivered_check_cache
+
+        # Operator edits the descriptor at the SAME sha; the new descriptor
+        # also resolves DELIVERED (so its own variant gets cached, letting
+        # us assert exactly one variant survives).
+        checks_d2 = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'baz', 'expect': 'present'}]
+        dep['metadata'] = {'delivered_checks': checks_d2}
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+        key_d2 = self._dcc_key('20', 'sha1', checks_d2)
+        assert key_d1 not in scheduler._delivered_check_cache, (
+            'the stale (dep, sha, old-digest) variant must be pruned once the '
+            'descriptor changes, not left to linger alongside the new variant'
+        )
+        same_dep_sha_keys = [
+            k for k in scheduler._delivered_check_cache if k[0] == '20' and k[1] == 'sha1'
+        ]
+        assert same_dep_sha_keys == [key_d2], (
+            f'cache growth must stay bounded to ONE variant per (dep, sha); '
+            f'got {same_dep_sha_keys!r}'
+        )
+
+    # --- (o) regression: SHA advance still prunes EVERY digest variant, not
+    #     just the one matching the current descriptor — the digest-variant
+    #     prune above is ADDITIVE to, not a replacement for, the existing
+    #     SHA-based prune ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sha_advance_prunes_across_digest_variants(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """Regression lock for the retained SHA-prune (~3098): once a
+        ``(dep, sha, digest)`` entry is cached, advancing main to a new SHA
+        must still prune EVERY sha1-keyed variant (regardless of its
+        digest), not just whichever digest happens to match the current
+        descriptor. Guards against a future digest-variant-scoped prune
+        accidentally narrowing the existing whole-SHA prune.
+        """
+        sha_box = {'value': 'sha1'}
+
+        async def _resolve():
+            return sha_box['value']
+
+        scheduler._resolve_main_sha = _resolve
+        fake_runner, _calls = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner)
+        task = self._dependent()
+        dep = self._dep()
+        status_map = {'20': 'done'}
+        tasks_by_id = {'20': dep, '10': task}
+
+        first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+        assert first == {'20': True}
+        assert self._dcc_key('20', 'sha1', self._ONE_CHECK) in scheduler._delivered_check_cache
+
+        sha_box['value'] = 'sha2'
+        fake_runner2, calls2 = self._fake_runner({'cap-one': DeliveredCheckResult.DELIVERED})
+        monkeypatch.setattr('orchestrator.scheduler.run_delivered_check', fake_runner2)
+
+        second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
+
+        assert second == {'20': True}
+        assert calls2 == ['cap-one']
+        assert not any(
+            k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'every sha1-keyed variant must be pruned once main advances, regardless of digest'
+        assert self._dcc_key('20', 'sha2', self._ONE_CHECK) in scheduler._delivered_check_cache
+
 
 # ---------------------------------------------------------------------------
 # TestDeliveredCheckGraceEscalation (task 2583 — step-9 RED / step-10 GREEN)
