@@ -3495,6 +3495,92 @@ class TestAcquireForWritesThroughDurable:
 
 
 # ===========================================================================
+# Task 2986 (W2b) step-3 RED: single-writer — release writes the durable
+# RELEASED record through the moment it flips the in-memory state to FREE
+# (PRD warm-lane-exhaustion-hardening boundary row 2). Today release only
+# mutates the in-memory _lanes/_assignments — these fail until step-4.
+# ===========================================================================
+
+
+class TestReleaseWritesThroughDurable:
+    def test_release_writes_released_record(self, tmp_path: Path):
+        """boundary row 2: release brings the durable record ASSIGNED->RELEASED
+        with task_id cleared, at the moment it flips in-memory state to FREE."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Bring the lane to durable ASSIGNED:42 + in-memory ASSIGNED+mapped.
+        asyncio.run(pool.acquire_for('42'))
+        assert lifecycle.read(lane).state == DurableLaneState.ASSIGNED
+
+        asyncio.run(pool.release(lane))
+
+        # (a) in-memory: FREE + assignment dropped
+        assert pool.state(lane) == LaneState.FREE
+        assert pool.assignment_for('42') is None
+        # (b) durable record mirrored through to RELEASED, task_id cleared
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.RELEASED
+        assert record.task_id is None
+
+    def test_release_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): release writes NO durable record."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+
+        asyncio.run(pool.acquire_for('42'))
+        asyncio.run(pool.release(base / '_lane-0'))
+
+        assert pool.state(base / '_lane-0') == LaneState.FREE
+        assert not (base / '.lane-state').exists()
+
+    def test_release_already_released_record_is_noop(self, tmp_path: Path):
+        """Releasing a lane whose record is already RELEASED (or absent) is a
+        no-op — never raises, never writes an illegal RELEASED->RELEASED edge."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        # Seed the record to RELEASED directly.
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/7')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='7')
+        lifecycle.transition(lane, DurableLaneState.RELEASED)
+        released_at = lifecycle.read(lane).updated_at
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Lane is FREE in-memory + RELEASED on disk → release must be a no-op.
+        asyncio.run(pool.release(lane))  # must not raise
+
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.RELEASED
+        assert record.updated_at == released_at  # untouched, no RELEASED->RELEASED
+
+    def test_release_absent_record_is_noop(self, tmp_path: Path):
+        """Releasing a known lane with NO durable record is a no-op (no write)."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        asyncio.run(pool.release(lane))  # must not raise
+
+        assert lifecycle.read(lane) is None
+
+
+# ===========================================================================
 # Step-6: RED — GitOps.refresh_warm_base unit + inv.9 promote-provenance
 # ===========================================================================
 
