@@ -12316,6 +12316,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _downstream = list(self._inflight)
                     self._inflight_clear()
 
+                    # INV-3 dangling-successor-edge fix (task 2885 step-10,
+                    # enforcement point (c) — PRD §3.3 prompt-invalidation): the
+                    # FAILED head's merge commit is now orphaned (it will never be
+                    # on main).  Record it dead so a straggler that was BUILT-
+                    # AWAITING-HOST — parked on _redispatch, NOT in self._inflight,
+                    # so INVISIBLE to this _inflight-only cascade (the exact 5260
+                    # gap) — is caught by the dispatch-time dead-base re-check
+                    # (enforcement (a)) instead of verifying against it.  Each
+                    # downstream entry's OLD commit is recorded below, just before
+                    # its own _remerge replaces the item.
+                    if isinstance(head.item, RealMergeItem):
+                        self._record_dead_base(head.item.merge_result.merge_commit or '')
+
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
                     # also detect halt via their abort-polls and self-requeue;
@@ -12474,6 +12487,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # from_state cross-check and fires a spurious
                             # dedup'd L1 escalation on every cascade-remerge
                             # redispatch.
+                            # INV-3 dangling-edge fix (task 2885 step-10,
+                            # enforcement (c)): capture this downstream's OLD
+                            # merge commit BEFORE _remerge replaces the item — it
+                            # is about to be re-merged away, so a straggler stacked
+                            # on it now has a dangling successor edge.  Recording it
+                            # dead makes that straggler catchable at dispatch.
+                            if isinstance(_entry.item, RealMergeItem):
+                                self._record_dead_base(
+                                    _entry.item.merge_result.merge_commit or ''
+                                )
                             _rid = _entry.item.request.request_id
                             _from_state = self._lifecycle.current(_rid)
                             if _from_state is not None:
@@ -13973,6 +13996,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # than returning to FINALIZING/DISPATCHING, mirroring the
                 # downstream head-failure cascade's own remerge-then-redispatch
                 # shape.
+                # INV-3 dangling-edge fix (task 2885 step-10, enforcement (c)):
+                # the RU'd item's merge commit is orphaned by this re-merge —
+                # record it dead so a straggler stacked on it is caught at
+                # dispatch (parity with the head-failure cascade + Mechanism-2
+                # discard remerge sites).
+                if isinstance(entry.item, RealMergeItem):
+                    self._record_dead_base(entry.item.merge_result.merge_commit or '')
                 self._note_transition(
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
@@ -14707,6 +14737,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'Task %s: discarding stale merge (%s), re-merging against actual main',
                     req.task_id, remerge_reason,
                 )
+                # INV-3 dangling-edge fix (task 2885 step-10, enforcement (c)):
+                # this stale merge is about to be re-merged away — record its
+                # now-orphaned commit dead so a straggler stacked on it is caught
+                # by the dispatch-time dead-base re-check.  item is always a
+                # RealMergeItem here (a DecidedItem returned via the passthrough
+                # above), guarded for type-safety.
+                if isinstance(item, RealMergeItem):
+                    self._record_dead_base(item.merge_result.merge_commit or '')
                 item = await self._remerge(req, item.started_monotonic)
                 # MQ-reliability kappa (task 2169): "then back" — regardless of
                 # whether the re-merged item now falls through to a passthrough
