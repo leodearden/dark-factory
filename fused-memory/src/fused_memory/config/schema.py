@@ -415,13 +415,18 @@ class ProceduralTopicCluster(BaseModel):
 def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     """Seed the known-contradictory/recurring procedural_knowledge topic clusters.
 
-    All three are recurring procedural_knowledge topics that grew several
-    contradictory or paraphrased entries each because every restatement scored
-    BELOW the cosine near-dup threshold. Seeding the two eval-worktree clusters
-    closes task 2845 (gate 2841) AND the sibling venv-shadowing cluster (gate
-    2844); the pytest-xdist cluster closes task 2974 -- it is the topic that
-    originally motivated the guard (9 duplicates consolidated into canonical
-    memory 8bb3eb15) but was never itself seeded.
+    The first three are recurring procedural_knowledge topics that grew
+    several contradictory or paraphrased entries each because every
+    restatement scored BELOW the cosine near-dup threshold. Seeding the two
+    eval-worktree clusters closes task 2845 (gate 2841) AND the sibling
+    venv-shadowing cluster (gate 2844); the pytest-xdist cluster closes task
+    2974 -- it is the topic that originally motivated the guard (9
+    duplicates consolidated into canonical memory 8bb3eb15) but was never
+    itself seeded. Two more clusters (task 3013) seed architect-related
+    families: report_task_already_done / main-reachable-commit, registered
+    prospectively ahead of still-open gate 3011; and plan-revalidation after
+    requeue/lock, gated to already-adjudicated task 2973 (canonical Mem0
+    entries 6a96a020 / 974b0adb).
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
@@ -504,6 +509,64 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
                 'pyproject.toml). Do NOT add another entry -- update/consolidate '
                 'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='architect-report-task-already-done-main-reachability',
+            # Reviewer (robustness, task 3013): all four phrases are distinctive
+            # literal identifiers/commands -- the report_task_already_done tool
+            # name, the _handle_already_done_report handler name, the literal
+            # git subcommand 'merge-base --is-ancestor', and the hyphenated
+            # 'main-reachable' -- none of which is a short generic token that
+            # could substring-match unrelated text, so no further narrowing
+            # (unlike venv-shadowing above) is needed. Registered prospectively:
+            # gate task 3011's 12-entry cluster is still open awaiting a
+            # consolidation ruling, but this guard is forward-looking (it only
+            # blocks NEW near-dup writes), so seeding it now stops that cluster
+            # from growing further while 3011 is parked.
+            phrases=[
+                'report_task_already_done',
+                'main-reachable',
+                'merge-base --is-ancestor',
+                '_handle_already_done_report',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-contradictory topic (architect report_task_already_done '
+                'requires a main-reachable commit) gated to human task 3011. Do '
+                'NOT add another entry -- update/consolidate the existing entries, '
+                'or add context to gate task 3011.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='architect-plan-revalidation-requeue-lock',
+            # Reviewer (robustness, task 3013): phrases are distinctive
+            # multi-word/literal substrings drawn verbatim from canonical Mem0
+            # entries 6a96a020 (subcase plan_json_gitignore_wipe) and 974b0adb
+            # (subcase lost_plan_reconstruction). Standalone generic tokens
+            # ('lock', 'requeue', 'plan', 'commit', 'main', 'revalidate') are
+            # deliberately excluded -- each could substring-match unrelated
+            # notes on its own (the venv-shadowing over-match lesson above).
+            # Bare 'create_plan'/'plan.json' are also excluded even though
+            # they'd be on-topic: those already anchor the
+            # eval-worktree-plan-tools-missing cluster, and reusing them here
+            # would blur the two clusters and risk mis-routing a write to the
+            # wrong gate task.
+            phrases=[
+                '.task/plan.json',
+                'plan-revalidation',
+                'requeue rebase',
+                'lost-plan reconstruction',
+                'committed TDD steps',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-recurring topic (architect plan-revalidation after a '
+                'requeue rebase or lock loss) gated to human task 2973 -- see '
+                'canonical memory 6a96a020-6193-4a7e-82a6-4f27bcf5378e and '
+                '974b0adb-ed54-44bd-aa12-aeaeae8b3ea6. Do NOT add another entry '
+                '-- update/consolidate the existing entries, or add context to '
+                'gate task 2973.'
             ),
         ),
     ]
