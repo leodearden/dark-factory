@@ -421,6 +421,16 @@ def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
     is treated as non-matching rather than raising — the caller then falls
     through to the unchanged crash-window re-escalation path, so a genuine
     crash-window is never silently dismissed.
+
+    This detects the scheduled-self-deploy SHAPE only; it deliberately does
+    NOT read ``always_escalates`` (the before_done_scheduled_at stamp is
+    written on BOTH the always_escalates=False done path AND the act-then-ask
+    always_escalates=True gate path).  A True result therefore means "drive
+    to DONE" ONLY for always_escalates=False — the caller MUST apply the
+    always_escalates policy split (re-file the milestone gate + block when
+    always_escalates=True), exactly as the (b-self) branch does; short-
+    circuiting to DONE on a bare True would bypass a still-open act-then-ask
+    gate (reviewer_comprehensive amendment, task 2983).
     """
     if not isinstance(task, dict):
         return False
@@ -2154,6 +2164,28 @@ class DeterministicRunner:
                 # crash-window still re-escalates exactly as today.
                 current_task = await self.scheduler.get_task(task_id)
                 if _is_scheduled_self_deploy_complete(current_task):
+                    # Amendment (reviewer_comprehensive): the scheduled stamp is
+                    # written on BOTH the always_escalates=False path (task set
+                    # 'done' via 'deterministic-deploy-scheduled') AND the
+                    # act-then-ask always_escalates=True path (b-self above,
+                    # which RE-FILES the milestone gate and BLOCKS).  Mirror
+                    # b-self's policy split here so the DONE short-circuit
+                    # applies ONLY to the always_escalates=False shape: for an
+                    # always_escalates=True self-deploy whose fresh get_task now
+                    # carries before_done_scheduled_at, re-file the gate and
+                    # block instead of silently bypassing the still-open
+                    # act-then-ask gate with a phantom-done.
+                    if always_escalates:
+                        logger.info(
+                            'DeterministicRunner: task %s stale-snapshot '
+                            'double-dispatch of a scheduled self-deploy with '
+                            'always_escalates=True — re-filing milestone gate '
+                            '(gate not bypassed, task 2983)',
+                            task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
                     logger.info(
                         'DeterministicRunner: task %s double-dispatch of a '
                         'completed scheduled self-deploy detected via fresh '

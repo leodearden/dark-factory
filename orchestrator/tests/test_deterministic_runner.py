@@ -4294,6 +4294,74 @@ class TestCrashWindowScheduledDoubleDispatch:
         ]
         assert blocked_calls, 'genuine crash-window must leave the task blocked'
 
+    async def test_stale_redispatch_always_escalates_true_refiles_gate_not_done(
+        self, tmp_path: Path,
+    ):
+        """Amendment (reviewer_comprehensive): a STALE re-dispatch of an
+        always_escalates=True scheduled self-deploy must NOT be short-circuited
+        to DONE by the fresh-read backstop.
+
+        The before_done_scheduled_at stamp is written on BOTH the
+        always_escalates=False path (which sets the task 'done') AND the
+        act-then-ask always_escalates=True path (b-self, which re-files the
+        milestone gate and BLOCKS — the gate must not be bypassed).  When the
+        in-hand snapshot lacks the stamp (so b-self is skipped) but the fresh
+        get_task now carries before_done_scheduled_at, the DONE short-circuit
+        must apply ONLY to always_escalates=False; the act-then-ask gate must be
+        re-filed (mirroring b-self), never silently bypassed with a done write.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # Stale snapshot: before_done_ran_at only, always_escalates=True.
+        snapshot = self._stale_snapshot('2913')
+        snapshot['metadata']['always_escalates'] = True
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)  # empty — gate not yet re-observed
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read carries the scheduled stamp the snapshot lacked, still
+        # always_escalates=True (act-then-ask; the gate is NOT resolved).
+        current_task = _deploy_task(
+            task_id='2913',
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-07-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-2913.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        current_task['metadata']['always_escalates'] = True
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            'a stale re-dispatch of an always_escalates=True scheduled self-deploy '
+            'must re-file the gate and BLOCK, not return DONE'
+        )
+        pending = queue.get_by_task('2913', status='pending')
+        assert len(pending) == 1, (
+            f'the act-then-ask milestone gate must be re-filed exactly once, '
+            f'got {len(pending)}'
+        )
+        assert pending[0].category == 'milestone_gate', (
+            f'the gate re-file must be a milestone_gate, not {pending[0].category!r}'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done'
+        ]
+        assert not done_calls, (
+            'the still-open act-then-ask gate must never be bypassed with a done write'
+        )
+
 
 @pytest.mark.asyncio
 class TestCrashWindowReverify:
