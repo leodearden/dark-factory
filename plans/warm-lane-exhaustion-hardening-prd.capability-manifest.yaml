@@ -1,0 +1,165 @@
+# Machine-readable twin of warm-lane-exhaustion-hardening-prd.capability-manifest.md
+# DF labels only — θ (reify audit relabel) is cross-project and excluded from
+# the sidecar/dispatch gate (external deps gate on status, not delivered_checks).
+# task_id values stamped by commit_planning (task 2578 stamper).
+prd: plans/warm-lane-exhaustion-hardening-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Typed warm-lane pool census, carried on the exhaustion path"
+    capabilities:
+      - name: "census-fields-contract"
+        binding: "capability→producer (built by α) — census dataclass with contract-fixed field n_pinned_non_dispatched, carried in WarmLanePoolExhausted message + WARNING log"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "n_pinned_non_dispatched"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "dispatched-predicate-seam"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/git_ops.py:1447 warm_lane_dispatched_predicate"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "warm_lane_dispatched_predicate"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "β"
+    task_id: null
+    title: "Escalation-server MCP tool: warm-lane status"
+    capabilities:
+      - name: "warm-lane-status-tool-registered"
+        binding: "capability→producer (built by β; registration pattern wired at escalation/src/escalation/server.py:1604) — contract-fixed tool name"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get_warm_lane_status"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+  - label: "γ"
+    task_id: null
+    title: "Single-writer assignment store with loud drift"
+    capabilities:
+      - name: "drift-escalation-root-cause"
+        binding: "capability→producer (built by γ) — contract-fixed root-cause literal lane_record_drift, deduped via escalation/src/escalation/queue.py:821 find_pending_l2_by_root_cause"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lane_record_drift"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "durable-writer-seam"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/warm_lane_pool.py:326 _note_assigned_durable"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_note_assigned_durable"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "sole-writer-invariant-I2"
+        binding: "grep-checkable contract (PRD §Contract I2) — zero assignment-field writers outside warm_lane_pool.py after γ"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "negative sole-writer sweep is judged by γ's boundary tests, not a single grep"
+  - label: "δ"
+    task_id: null
+    title: "Digest-time map↔record divergence cross-check"
+    capabilities:
+      - name: "divergence-digest-anchor"
+        binding: "capability→producer (built by δ) — contract-fixed literal lane_record_divergence; extends digest.py:621 stale_lane_census pattern (2891)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lane_record_divergence"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "record-reader-seam"
+        binding: "capability→producer (wired) — harness.py _assigned_durable_records_with_statuses (task 2891, merge 642bfc9b6c)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_assigned_durable_records_with_statuses"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "ε"
+    task_id: null
+    title: "EXHAUSTED requeue-cap flip + structural-exhaustion L2"
+    capabilities:
+      - name: "structural-exhaustion-escalation"
+        binding: "capability→producer (built by ε) — contract-fixed root-cause literal warm_lane_pool_structurally_exhausted; dedup via queue.py:821"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "warm_lane_pool_structurally_exhausted"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "disposition-row-declared-once"
+        binding: "capability→producer (wired) — workflow_types.py:306-313 WarmLanePoolExhausted BlockDisposition, consumed workflow.py:2763-2779"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reason_prefix='warm_lane_pool_exhausted'"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "no-per-task-cap-burn"
+        binding: "rejection-mechanism — counting driven solely by the declared-once disposition row; asserted against scheduler._requeue_counts by ε's test"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "counts flip is a boolean on a multi-line row; asserted by ε's prescribed test, not a line-spanning grep"
+  - label: "ζ"
+    task_id: null
+    title: "Unknown-config-key census: startup L2 + reload surfacing + --check-config"
+    capabilities:
+      - name: "unknown-key-escalation-root-cause"
+        binding: "capability→producer (built by ζ) — contract-fixed root-cause literal config_unknown_keys; dedup by key-set signature via queue.py:821"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "config_unknown_keys"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "raw-yaml-source"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/config.py:3970 YamlSettingsSource"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "YamlSettingsSource"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "cli-entry"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/cli.py:200 click group main"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "subcommand shape decided at ζ impl; click group existence already bound above via file evidence"
+  - label: "η"
+    task_id: null
+    title: "Valve default flip: warm_lane_reclaim_on_exhaustion True"
+    capabilities:
+      - name: "default-true-pinned-by-test"
+        binding: "capability→producer (built by η) — prescribed test name asserts stock OrchestratorConfig resolves the valve True"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_warm_lane_reclaim_on_exhaustion_default_true"
+          paths: ["orchestrator/tests/"]
+          expect: present
+      - name: "no-defaults-yaml-shadow"
+        binding: "verified absent — defaults.yaml does not list the knob; Field default is the single source"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "warm_lane_reclaim_on_exhaustion"
+          paths: ["orchestrator/src/orchestrator/defaults.yaml"]
+          expect: absent
+      - name: "steal-path-wired"
+        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/git_ops.py:4081 _try_reclaim_lane_for, called :4581; reseed-verify guard (2854, merge 0c8137d560)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_try_reclaim_lane_for"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
