@@ -125,6 +125,30 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 RecoverResult = Literal['rewound', 'cas_failed', 'error']
 
 
+# Return type for remove_merge_worktree_guarded — the C1 lease-enforced
+# removal primitive (PRD merge-worktree-lifecycle-integrity.md, task alpha).
+# 'removed'            — uncontended: the flock was free, the path existed,
+#                         and `git worktree remove --force` succeeded.
+# 'skipped_lease_held' — a LIVE merge-verify holds the tree's flock; removal
+#                         is skipped (never deferred/retried — true leaks are
+#                         collected later by the merge reaper's age-grace
+#                         sweep). A dead/stale holder never produces this
+#                         outcome: the kernel auto-releases a crashed
+#                         holder's flock, so the non-blocking acquire simply
+#                         succeeds and removal proceeds (fail-open).
+# 'skipped_persistent' — path resolves to persistent_merge_worktree_path or
+#                         persistent_offline_deep_worktree_path; persistent
+#                         lanes are never removed regardless of lease.
+# 'not_present'        — the flock was acquired but the path no longer
+#                         exists.
+# 'failed'              — the flock was acquired and the path existed, but
+#                         `git worktree remove --force` itself returned
+#                         non-zero.
+RemovalOutcome = Literal[
+    'removed', 'skipped_lease_held', 'skipped_persistent', 'not_present', 'failed',
+]
+
+
 # Single source of truth for the WIP safety-commit subject prefix produced by
 # _inter_iteration_rebase (workflow.py), and the requeue-rebase /
 # warm-lane-reclaim paths below (commit() call sites in this module). Any
@@ -8021,32 +8045,120 @@ class GitOps:
         logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
         return merge_wt, pre_merge_sha.strip()
 
+    async def remove_merge_worktree_guarded(
+        self, path: Path, *, reason: str,
+    ) -> RemovalOutcome:
+        """Remove a merge worktree, gated by its merge-verify flock (C1).
+
+        PRD: docs/prds/merge-worktree-lifecycle-integrity.md, task alpha.
+
+        Acquire-then-remove, never check-then-remove: non-blocking try-
+        acquires *path*'s per-lane merge-verify flock
+        (:func:`~orchestrator.verify_cancel.lane_lock_path`, the SAME inode
+        a verify holds via :meth:`merge_verify_lease`) and HOLDS it across
+        the ``git worktree remove`` — so no verify can start in the window
+        between a liveness check and the delete (the incident's 23s
+        TOCTOU). A live holder makes the non-blocking acquire fail
+        immediately, in which case removal is skipped
+        (``'skipped_lease_held'``, logged as a single WARNING naming the
+        holder pgid) rather than deferred or retried; a dead or stale
+        holder's flock is auto-released by the kernel, so the acquire
+        simply succeeds and removal proceeds (fail-open, intrinsic to
+        flock — this method never consults holder liveness directly). The
+        holder-pgid rendezvous file is read ONLY to name the holder in
+        that WARNING — a best-effort, fail-open diagnostic hint, never a
+        removal gate.
+
+        **Persistent-worktree exemption**: if *path* resolves to
+        :attr:`persistent_merge_worktree_path` OR
+        :attr:`persistent_offline_deep_worktree_path`, this method returns
+        ``'skipped_persistent'`` WITHOUT touching any flock — both
+        persistent worktrees survive across attempts and across verify
+        failures regardless of lease state, so there is nothing to
+        serialize against.
+
+        On the tree-gone outcomes (``'removed'`` / ``'not_present'``) the
+        sibling ``<path>.lock`` flock file is unlinked while the flock is
+        still held (mirroring :meth:`ephemeral_worktree`), so an ephemeral
+        merge-worktree removal leaves no orphan ``_merge-<uuid>.lock`` behind.
+        The lock is NEVER unlinked on ``'skipped_lease_held'`` (this call did
+        not acquire it — a live holder's lock is left untouched) or on
+        ``'failed'`` (the tree, and thus its lane, survives). This differs
+        from :meth:`merge_verify_lease`, whose persistent-lane lock is
+        deliberately retained across attempts.
+
+        *reason* is a short caller-supplied label (e.g. the calling
+        function's name) recorded in logs for diagnostics.
+        """
+        if path.resolve() == self.persistent_merge_worktree_path.resolve():
+            logger.debug('remove_merge_worktree_guarded: persistent merge worktree retained: %s', path)
+            return 'skipped_persistent'
+        if path.resolve() == self.persistent_offline_deep_worktree_path.resolve():
+            logger.debug('remove_merge_worktree_guarded: persistent offline-deep worktree retained: %s', path)
+            return 'skipped_persistent'
+
+        lock_path = lane_lock_path(path)
+        fd = acquire_merge_verify_flock(lock_path, 0.0)
+        if fd is None:
+            holder = read_lock_holder_pgid(self.worktree_base)
+            logger.warning(
+                'remove_merge_worktree_guarded: merge-verify lease held by live '
+                'holder (pgid=%s); skipping removal of %s (reason=%s) -- leaving '
+                'for the merge reaper',
+                holder, path, reason,
+            )
+            return 'skipped_lease_held'
+        # Only unlink the sibling ``.lock`` file when THIS call both acquired
+        # the flock and drove the tree gone (removed/not_present) — never on
+        # 'failed' (the tree, and thus its lane, survives) and never on
+        # 'skipped_lease_held' (we did not acquire the lock, so we must never
+        # yank a live holder's lock file). See the unlink_lock finally below.
+        unlink_lock = False
+        try:
+            if not path.exists():
+                unlink_lock = True
+                return 'not_present'
+            rc, _, err = await _run(
+                ['git', 'worktree', 'remove', str(path), '--force'],
+                cwd=self.project_root,
+            )
+            if rc == 0:
+                logger.info(
+                    'remove_merge_worktree_guarded: removed %s (reason=%s)', path, reason,
+                )
+                unlink_lock = True
+                return 'removed'
+            logger.warning(
+                'remove_merge_worktree_guarded: failed to remove %s (reason=%s): %s',
+                path, reason, err,
+            )
+            return 'failed'
+        finally:
+            # Unlink the lock file BEFORE releasing/closing the flock, mirroring
+            # ephemeral_worktree (git_ops.py ~1797): a contender that opens the
+            # path after our unlink necessarily creates a fresh inode, so it can
+            # never observe the lock we are about to drop. Unlinking on the
+            # tree-gone outcomes keeps the merge-worktree lane from leaving an
+            # orphan ``_merge-<uuid>.lock`` behind — the ephemeral lane no longer
+            # exists to serialize against, unlike merge_verify_lease's persistent
+            # lane whose lock is deliberately retained across attempts.
+            if unlink_lock:
+                with contextlib.suppress(Exception):
+                    os.unlink(lock_path)
+            release_merge_verify_flock(fd)
+
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         """Remove a temporary merge worktree.
 
-        **Persistent-worktree exemption**: if *merge_wt* resolves to
-        :attr:`persistent_merge_worktree_path` OR
-        :attr:`persistent_offline_deep_worktree_path`, this method is a
-        **no-op** — both persistent worktrees survive across attempts and
-        across verify failures, so their (independently retained) ``target/``
-        warmth is preserved.  The ephemeral removal path is unchanged for all
-        other ``_merge-*`` worktrees.
+        Routes through the C1 guarded primitive,
+        :meth:`remove_merge_worktree_guarded` — lease-held trees are now
+        *skipped* (leaving them for the merge reaper) rather than
+        force-removed out from under a live verify. Persistent-worktree
+        exemption and uncontended removal are unchanged; the returned
+        outcome is discarded since this method's callers do not consume
+        one.
         """
-        if merge_wt.resolve() == self.persistent_merge_worktree_path.resolve():
-            logger.debug('persistent merge worktree retained: %s', merge_wt)
-            return
-        if merge_wt.resolve() == self.persistent_offline_deep_worktree_path.resolve():
-            logger.debug('persistent offline-deep worktree retained: %s', merge_wt)
-            return
-
-        rc, _, err = await _run(
-            ['git', 'worktree', 'remove', str(merge_wt), '--force'],
-            cwd=self.project_root,
-        )
-        if rc != 0:
-            logger.warning(f'Failed to remove merge worktree {merge_wt}: {err}')
-        else:
-            logger.info(f'Cleaned up merge worktree {merge_wt}')
+        await self.remove_merge_worktree_guarded(merge_wt, reason='cleanup_merge_worktree')
 
     async def create_throwaway_verify_worktree(self, merge_commit: str) -> Path:
         """Create an ephemeral ``_merge-<uuid>`` worktree at *merge_commit*.
