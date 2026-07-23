@@ -1,5 +1,6 @@
 """Tests for orchestrator/verify_runner.py — MergeVerifySpec + VerifyResult JSON codec."""
 
+import asyncio
 import dataclasses
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     LocalRunner,
@@ -5819,3 +5821,228 @@ class TestResolveLocalDfCheckout:
         nested = tmp_path / 'a' / 'b' / 'c'
         nested.mkdir(parents=True)
         assert resolve_local_df_checkout(start=nested) == tmp_path
+
+
+# ---------------------------------------------------------------------------
+# INV-2 (task 2884): RemoteRunner.sync_if_stale — contract-currency auto-sync
+# ---------------------------------------------------------------------------
+
+
+class _RecordingEventStore:
+    """Minimal EventStore stand-in capturing emit() calls in-memory.
+
+    Mirrors test_merge_verdict_integrity_inv1._RecordingEventStore.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, str | None, dict[str, Any]]] = []
+
+    def emit(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        phase: str | None = None,
+        role: str | None = None,
+        data: dict[str, Any] | None = None,
+        cost_usd: float | None = None,
+        duration_ms: float | None = None,
+        **kw: Any,
+    ) -> None:
+        self.events.append((event_type, task_id, dict(data or {})))
+
+    def events_of(self, event_type: Any) -> list[dict[str, Any]]:
+        return [data for (et, _tid, data) in self.events if et == event_type]
+
+
+def _make_sync_runner(
+    *,
+    df_remote: str | None = '/remote/df',
+    df_local: str | None = '/local/df',
+    local_head: str = 'LOCALHEAD',
+    remote_head: str = 'REMOTEHEAD',
+    pull_rc: int = 0,
+    uv_rc: int = 0,
+    post_sync_head: str | None = None,
+    raise_on: str | None = None,
+):
+    """Build a RemoteRunner wired for sync_if_stale with a recording fake_run.
+
+    fake_run routes canned (rc, stdout, stderr) by argv shape:
+      * ``git rev-parse HEAD`` (cwd=df_local)        -> local_head
+      * ssh ``git -C <df> rev-parse HEAD``           -> remote_head, then
+                                                        post_sync_head once a
+                                                        pull has fired
+      * ssh ``git -C <df> pull --ff-only``           -> pull_rc
+      * ssh ``cd <df> && uv sync``                   -> uv_rc
+    ``raise_on`` (a substring of the ssh remote command) makes that ssh call
+    raise OSError, exercising the never-raises transport-error path.
+    Returns (runner, calls, store).
+    """
+    calls: list[tuple[list[str], Any]] = []
+    state = {'pulled': False}
+    settled_head = post_sync_head if post_sync_head is not None else local_head
+
+    async def fake_run(argv, *, cwd=None):
+        calls.append((list(argv), cwd))
+        if argv[:3] == ['git', 'rev-parse', 'HEAD']:
+            return (0, local_head, '')
+        if argv and argv[0] == 'ssh':
+            remote_cmd = argv[-1]
+            if raise_on is not None and raise_on in remote_cmd:
+                raise OSError('ssh transport boom')
+            if 'rev-parse HEAD' in remote_cmd:
+                return (0, settled_head if state['pulled'] else remote_head, '')
+            if 'pull --ff-only' in remote_cmd:
+                state['pulled'] = True
+                return (pull_rc, '', '' if pull_rc == 0 else 'pull rejected')
+            if 'uv sync' in remote_cmd:
+                return (uv_rc, '', '' if uv_rc == 0 else 'uv sync failed')
+        return (0, '', '')
+
+    runner = RemoteRunner(
+        name='laptop',
+        ssh_host='laptop.local',
+        git_remote='origin',
+        cwd='/repo',
+        df_remote_checkout=df_remote,
+        df_local_checkout=df_local,
+        run=fake_run,
+        id_factory=lambda: 'fixed-id',
+    )
+    return runner, calls, _RecordingEventStore()
+
+
+def _ssh_cmds(calls) -> list[str]:
+    """The trailing remote-command string of every ssh call, in order."""
+    return [argv[-1] for (argv, _cwd) in calls if argv and argv[0] == 'ssh']
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSyncIfStale:
+    """RemoteRunner.sync_if_stale: HEAD-compare per dispatch, fail-closed."""
+
+    async def test_sync_lock_attribute_is_asyncio_lock(self):
+        runner, _calls, _store = _make_sync_runner()
+        assert isinstance(runner._sync_lock, asyncio.Lock)
+
+    async def test_not_configured_when_df_remote_none_is_pass_through(self):
+        """(a) df_remote_checkout=None -> configured=False, ok=True, ZERO calls, no events."""
+        runner, calls, store = _make_sync_runner(df_remote=None)
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.configured is False
+        assert out.ok is True
+        assert out.stale is False
+        assert calls == []
+        assert store.events == []
+
+    async def test_not_configured_when_df_local_none_is_pass_through(self):
+        """(a') df_local_checkout=None -> configured=False, ok=True, ZERO calls."""
+        runner, calls, store = _make_sync_runner(df_local=None)
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.configured is False
+        assert out.ok is True
+        assert calls == []
+        assert store.events == []
+
+    async def test_current_heads_equal_no_pull_no_events(self):
+        """(b) local HEAD == remote HEAD -> ok=True, stale=False, NO pull/uv-sync, no events."""
+        runner, calls, store = _make_sync_runner(local_head='SAME', remote_head='SAME')
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.configured is True
+        assert out.ok is True
+        assert out.stale is False
+        assert out.synced is False
+        # only the two rev-parse probes fired, no pull / uv-sync
+        ssh = _ssh_cmds(calls)
+        assert not any('pull --ff-only' in c for c in ssh)
+        assert not any('uv sync' in c for c in ssh)
+        assert store.events == []
+
+    async def test_stale_then_synced_emits_stale_then_synced_in_order(self):
+        """(c) remote differs -> runner_stale, then pull --ff-only then uv sync (in order),
+        then runner_synced(kind='df_checkout'); ok=True, synced=True, stale=True."""
+        runner, calls, store = _make_sync_runner(
+            local_head='NEWHEAD', remote_head='OLDHEAD', post_sync_head='NEWHEAD',
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t7')
+        assert out.configured is True
+        assert out.stale is True
+        assert out.synced is True
+        assert out.ok is True
+
+        # runner_stale carries the compared heads
+        stales = store.events_of(EventType.runner_stale)
+        assert len(stales) == 1
+        assert stales[0]['local_head'] == 'NEWHEAD'
+        assert stales[0]['remote_head'] == 'OLDHEAD'
+        assert stales[0]['runner'] == 'laptop'
+
+        # pull --ff-only issued BEFORE uv sync over ssh
+        ssh = _ssh_cmds(calls)
+        pull_idx = next(i for i, c in enumerate(ssh) if 'pull --ff-only' in c)
+        uv_idx = next(i for i, c in enumerate(ssh) if 'uv sync' in c)
+        assert pull_idx < uv_idx
+
+        # runner_synced emitted AFTER runner_stale, kind df_checkout
+        synced = store.events_of(EventType.runner_synced)
+        assert len(synced) == 1
+        assert synced[0]['kind'] == 'df_checkout'
+        assert synced[0]['to_head'] == 'NEWHEAD'
+        assert synced[0]['runner'] == 'laptop'
+        # ordering across the two event types
+        types_in_order = [et for (et, _t, _d) in store.events]
+        assert types_in_order.index(EventType.runner_stale) < types_in_order.index(EventType.runner_synced)
+
+    async def test_stale_pull_fails_is_fail_closed_no_synced(self):
+        """(d) pull rc!=0 -> ok=False, synced=False, runner_stale emitted, NO runner_synced."""
+        runner, calls, store = _make_sync_runner(
+            local_head='NEW', remote_head='OLD', pull_rc=1,
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.ok is False
+        assert out.synced is False
+        assert out.stale is True
+        assert len(store.events_of(EventType.runner_stale)) == 1
+        assert store.events_of(EventType.runner_synced) == []
+
+    async def test_stale_uv_sync_fails_is_fail_closed(self):
+        """(e) pull ok but uv sync rc!=0 -> ok=False."""
+        runner, calls, store = _make_sync_runner(
+            local_head='NEW', remote_head='OLD', pull_rc=0, uv_rc=1,
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.ok is False
+        assert out.synced is False
+        assert store.events_of(EventType.runner_synced) == []
+
+    async def test_inflight_guard_skips_pull_and_uv_sync(self):
+        """(f) dispatch_in_flight True -> never pull/uv-sync under a live verify;
+        runner_stale still emitted (read-only probe), NO runner_synced, not benched."""
+        runner, calls, store = _make_sync_runner(local_head='NEW', remote_head='OLD')
+        runner._inflight_request_id = 'live-verify'  # dispatch_in_flight -> True
+        assert runner.dispatch_in_flight is True
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        ssh = _ssh_cmds(calls)
+        assert not any('pull --ff-only' in c for c in ssh)
+        assert not any('uv sync' in c for c in ssh)
+        # staleness was detected (read-only), so runner_stale fired, but no sync
+        assert len(store.events_of(EventType.runner_stale)) == 1
+        assert store.events_of(EventType.runner_synced) == []
+        assert out.synced is False
+
+    async def test_never_raises_on_ssh_oserror_is_fail_closed(self):
+        """(g) an ssh OSError never propagates -> ok=False (fail-closed)."""
+        runner, calls, store = _make_sync_runner(
+            local_head='NEW', remote_head='OLD', raise_on='rev-parse HEAD',
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')  # must not raise
+        assert out.configured is True
+        assert out.ok is False
+
+    async def test_none_event_store_is_safe(self):
+        """event_store=None must not raise (mirrors LocalRunner emit-only-when-not-None)."""
+        runner, calls, store = _make_sync_runner(local_head='NEW', remote_head='OLD')
+        out = await runner.sync_if_stale(event_store=None, task_id=None)
+        assert out.synced is True
+        assert out.ok is True
