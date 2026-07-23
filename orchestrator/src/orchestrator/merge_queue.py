@@ -13686,6 +13686,57 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
         return InflightVerifyResult(outcome=out, merge_wt=merge_wt, spec_warm=_spec_warm)
 
+    async def _void_and_remerge(
+        self,
+        entry: InflightEntry,
+        item: SpeculativeItem,
+        dead_link: str,
+        vr: InflightVerifyResult | None,
+    ) -> bool:
+        """VOID a dead-based verdict at adoption time and re-merge it (INV-3).
+
+        Shared by the FAIL and PASS adoption paths in :meth:`_finalize_inflight`
+        (PRD plans/merge-verdict-integrity-prd.md leaf γ, §1 INV-3).  A verdict —
+        pass or fail — whose base is a DEAD commit (named by *dead_link*, the
+        non-None result of :meth:`_chain_dead_link`) describes a tree that will
+        never be on main, so it is neither adopted as a task block NOR advanced
+        onto main.  Clean the verified worktree, emit ``verdict_voided`` naming
+        *dead_link*, re-merge the item against real main, and re-park it on
+        ``_redispatch`` for a fresh verify.  The request is left UNRESOLVED — a
+        dead-base FAIL never blocks the task, and (because the re-merge resets
+        base_sha to live real-main, not in the dead set) a subsequent GENUINE
+        failure on real main IS adopted normally, so voiding is one-shot and
+        cannot livelock.
+
+        Mirrors the RUNNER_UNAVAILABLE remerge→REDISPATCH_PARKED template (the
+        registry FINALIZING→MERGING→REDISPATCH_PARKED hops keep the lifecycle
+        registry reconciled).  Always returns ``False`` (main not advanced); the
+        caller sets ``_n_failed_val = False`` (a voided item is NOT a failure and
+        must not trigger the downstream head-failure cascade).
+        """
+        req = item.request
+        # Clean the verified worktree — vr.merge_wt for a real verify; the
+        # verify_task=None compat shim carries the worktree on the entry.
+        _wt = vr.merge_wt if vr is not None else entry.merge_wt
+        _spec_warm = vr.spec_warm if vr is not None else False
+        if _wt is not None:
+            await self._release_or_cleanup(_wt, spec_warm=_spec_warm)
+        self._emit_speculative(
+            EventType.verdict_voided, req.task_id,
+            dead_link=dead_link, reason='chain_dead', point='adoption',
+        )
+        self._note_transition(
+            req.request_id, ItemLifecycleState.FINALIZING,
+            ItemLifecycleState.MERGING, live_obj=entry,
+        )
+        _remerged = await self._remerge(item.request, item.started_monotonic)
+        self._note_transition(
+            req.request_id, ItemLifecycleState.MERGING,
+            ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged,
+        )
+        self._redispatch.appendleft(_remerged)
+        return False
+
     async def _finalize_inflight(self, entry: InflightEntry) -> bool:
         """Run the CAS advance_main + post-advance work for one in-flight item.
 
@@ -13944,60 +13995,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if vr is not None:
                 self._record_verify_outcome(vr.outcome is None)
 
+            # ── INV-3 chain-intact enforcement — adoption (PASS or FAIL) ─────
+            # (PRD plans/merge-verdict-integrity-prd.md leaf γ, §1 INV-3.)
+            # Hoisted to a single point BEFORE both the FAIL adoption branch and
+            # the PASS CAS-advance loop so it governs EVERY adoptable verdict.  A
+            # verdict — pass OR fail — verified against a DEAD base (a predecessor
+            # merge commit that was failed / ejected / superseded / re-merged
+            # since verify dispatch; the reify-5260 built-awaiting-host straggler:
+            # a 43-min FAIL from an orphaned base blocked its task for ~30h) —
+            # describes a tree that will NEVER be on main.  It is PHANTOM: a dead-
+            # based FAIL must NEVER block the task and a dead-based PASS must NEVER
+            # be advanced onto main.  VOID it via _void_and_remerge (emit
+            # verdict_voided, re-merge against real main, re-park on _redispatch,
+            # leave req UNRESOLVED).  _n_failed_val is False — a merely-voided item
+            # is NOT a failure, so it must not spuriously trigger the downstream
+            # head-failure cascade off a request that never actually failed.
+            #
+            # DEPTH-AGNOSTIC: _chain_dead_link returns None for a live deep base
+            # (a still-in-flight predecessor's merge_commit is not in the dead
+            # set), so a deep multi-merge PASS with an intact chain falls straight
+            # through to the normal CAS path — the deep-frontier probe campaign
+            # stays unimpeded (PRD §6).
+            #
+            # Fail-open: a get_main_sha() error (or an empty read) SKIPS the check
+            # and proceeds to normal FAIL/PASS adoption — INV-3 must never wedge
+            # finalize on the #1-reliability hot path (PRD design decision 4:
+            # degrade never).  A void missed here is caught again at the item's
+            # next dispatch-time re-check (enforcement point (a)).
+            try:
+                _void_main = await self._git_ops.get_main_sha()
+            except Exception:
+                _void_main = ''
+            _dead_link = (
+                self._chain_dead_link(item, _void_main) if _void_main else None
+            )
+            if _dead_link is not None:
+                _n_failed_val = False  # voided ≠ failed → no false cascade
+                return await self._void_and_remerge(entry, item, _dead_link, vr)
+
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             if vr is not None and vr.outcome is not None:
-                # ── INV-3 chain-intact enforcement — FAIL adoption ───────────
-                # (PRD plans/merge-verdict-integrity-prd.md leaf γ, §1 INV-3.)
-                # Before adopting this FAIL as a task block, re-check that the
-                # item's chain is still intact.  A FAIL verified against a DEAD
-                # base — a predecessor merge commit that was failed / ejected /
-                # superseded / re-merged since verify dispatch (the reify-5260
-                # built-awaiting-host straggler: a 43-min FAIL from an orphaned
-                # base blocked its task for ~30h) — describes a tree that will
-                # NEVER be on main, so the verdict is PHANTOM and must NEVER
-                # block the task.  VOID it: emit verdict_voided naming the dead
-                # link, re-merge the item against real main, re-park it on
-                # _redispatch for a fresh verify, and leave req UNRESOLVED.
-                # _n_failed_val is False — a merely-voided item is NOT a failure,
-                # so it must not spuriously trigger the downstream head-failure
-                # cascade off a request that never actually failed.  Mirrors the
-                # RUNNER_UNAVAILABLE remerge→REDISPATCH_PARKED template above.
-                # (PASS adoption gets the same guard in a later step; this step
-                # wires the load-bearing FAIL branch only.)
-                #
-                # Fail-open: a get_main_sha() error (or an empty read) SKIPS the
-                # check and proceeds to normal FAIL adoption — INV-3 must never
-                # wedge finalize on the #1-reliability hot path (PRD design
-                # decision 4: degrade never).  A void missed here is caught again
-                # at the item's next dispatch-time re-check.
-                try:
-                    _void_main = await self._git_ops.get_main_sha()
-                except Exception:
-                    _void_main = ''
-                _dead_link = (
-                    self._chain_dead_link(item, _void_main) if _void_main else None
-                )
-                if _dead_link is not None:
-                    await self._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
-                    self._emit_speculative(
-                        EventType.verdict_voided, req.task_id,
-                        dead_link=_dead_link, reason='chain_dead', point='adoption',
-                    )
-                    self._note_transition(
-                        req.request_id, ItemLifecycleState.FINALIZING,
-                        ItemLifecycleState.MERGING, live_obj=entry,
-                    )
-                    _remerged_void = await self._remerge(
-                        item.request, item.started_monotonic,
-                    )
-                    self._note_transition(
-                        req.request_id, ItemLifecycleState.MERGING,
-                        ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged_void,
-                    )
-                    self._redispatch.appendleft(_remerged_void)
-                    _n_failed_val = False  # voided ≠ failed → no false cascade
-                    return False
-
                 fail_merge_wt = vr.merge_wt
                 await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
                 # I4 runs.db surface (task 2383 β, step 18): thread the skew
