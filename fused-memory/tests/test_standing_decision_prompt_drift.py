@@ -24,6 +24,7 @@ from fused_memory.reconciliation.prompts.stage2 import (
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_entity_standing_decision_schema_section,
+    render_investigation_outcome_section,
 )
 
 
@@ -43,3 +44,32 @@ class TestEntityStandingDecisionSchemaSectionPinned:
             render_entity_standing_decision_schema_section()
             in build_stage2_system_prompt('dark_factory')
         )
+
+
+class TestInvestigationOutcomeSectionStageSpecific:
+    """The investigation_outcome section is STAGE-2-ONLY: byte-identically
+    present in the Stage-2 prompt (and its dark_factory assembly) and ABSENT
+    from the Stage-1 prompt (Stage 1 has no writer path / concludes no
+    investigations)."""
+
+    def test_present_in_stage2(self):
+        assert render_investigation_outcome_section() in STAGE2_SYSTEM_PROMPT
+
+    def test_present_in_build_stage2_dark_factory(self):
+        assert (
+            render_investigation_outcome_section()
+            in build_stage2_system_prompt('dark_factory')
+        )
+
+    def test_absent_from_stage1(self):
+        assert render_investigation_outcome_section() not in STAGE1_SYSTEM_PROMPT
+
+
+class TestDeltaAnnotatedFindingRuleColocated:
+    """δ's annotated-finding no-reinvestigation rule (already on main, task
+    2899 δ) is present in the Stage-2 prompt — a co-located drift guard. δ owns
+    the prose; ε only asserts the assembled Stage-2 prompt carries both δ's rule
+    and ε's investigation_outcome instruction."""
+
+    def test_standing_decision_id_present_in_stage2(self):
+        assert 'standing_decision_id' in STAGE2_SYSTEM_PROMPT
