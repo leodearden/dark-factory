@@ -344,6 +344,30 @@ def test_branch_ref_resolves_false_for_missing_branch(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _run_git: the shared subprocess chokepoint is fail-safe under a git timeout
+# ---------------------------------------------------------------------------
+
+def test_run_git_timeout_returns_fail_safe_nonzero_without_raising(tmp_path, monkeypatch):
+    """A hung git invocation that trips the subprocess ``timeout`` must be mapped
+    to a fail-safe ``(1, '', <msg>)`` — NOT propagated. ``subprocess.TimeoutExpired``
+    is a ``SubprocessError``, not an ``OSError``, so a bare ``except OSError`` would
+    let it escape and blow up the UNGUARDED chokepoints (``git worktree list`` in
+    list_parked_worktrees, ``git worktree prune`` in main), breaking the
+    never-raise / always-exit-0 contract the nightly timer relies on when the
+    concurrently-running orchestrator holds an index.lock on the same repo."""
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["git", "status"], timeout=120)
+
+    monkeypatch.setattr(row.subprocess, "run", fake_run)
+
+    rc, out, err = row._run_git(["status", "--porcelain"], cwd=tmp_path)  # must not raise
+
+    assert rc == 1
+    assert out == ""
+    assert err  # carries the TimeoutExpired message for the LOUD log
+
+
+# ---------------------------------------------------------------------------
 # step-9: park_commit(worktree, reason) — zero content lost
 # ---------------------------------------------------------------------------
 

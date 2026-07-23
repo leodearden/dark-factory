@@ -224,10 +224,18 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     """Run ``git <args>`` in *cwd*, returning ``(returncode, stdout, stderr)``.
 
     The single subprocess chokepoint used by EVERY git call in this module.
-    Forces ``LC_ALL=C`` so porcelain output is locale-stable. Best-effort +
-    never-raise: an ``OSError`` (git binary missing, *cwd* vanished, etc.) is
-    mapped to a non-zero ``(1, '', <message>)`` rather than propagated, so
-    callers can treat a failed git call fail-safe without a ``try/except``.
+    Forces ``LC_ALL=C`` so porcelain output is locale-stable. A 120s ``timeout``
+    bounds a hung git invocation (e.g. one blocking on an ``index.lock`` held by
+    the concurrently-running orchestrator on the same repo). Best-effort +
+    never-raise: an ``OSError`` (git binary missing, *cwd* vanished, etc.) OR a
+    ``subprocess.TimeoutExpired`` (a hung call tripping the 120s bound —
+    ``TimeoutExpired`` is a ``SubprocessError``, NOT an ``OSError``, so it must
+    be caught explicitly) is mapped to a non-zero ``(1, '', <message>)`` rather
+    than propagated. That keeps EVERY git chokepoint fail-safe — including the
+    unguarded ``git worktree list`` in :func:`list_parked_worktrees` and the
+    ``git worktree prune`` in :func:`main` — so the never-raise / always-exit-0
+    posture holds even under routine git contention, without each caller needing
+    its own ``try/except``.
     """
     env = dict(os.environ, LC_ALL='C')
     try:
@@ -239,7 +247,7 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
             env=env,
             timeout=120,
         )
-    except OSError as err:
+    except (OSError, subprocess.TimeoutExpired) as err:
         return 1, '', str(err)
     return proc.returncode, proc.stdout, proc.stderr
 
