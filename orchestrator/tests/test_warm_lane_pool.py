@@ -8,6 +8,8 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 """
 
 import asyncio
+import dataclasses
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -19,7 +21,7 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.warm_lane_pool import LaneState, WarmLanePool
+from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolCensus
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -297,6 +299,190 @@ class TestAssignmentsSnapshot:
         assert snap is not pool._assignments, (
             'assignments_snapshot() must return a copy, not the live dict'
         )
+
+
+# ===========================================================================
+# Task 2984 step-01/02: WarmLanePoolCensus dataclass (pure, git-free)
+# ===========================================================================
+
+
+class TestWarmLanePoolCensus:
+    """The typed census carried on the warm-lane exhaustion path.
+
+    A frozen dataclass with six int fields whose render() emits a single-line
+    key=value string reused verbatim by both the WarmLanePoolExhausted message
+    and the EXHAUSTED-return WARNING log (single format source).
+    """
+
+    def _census(self, **overrides: int) -> WarmLanePoolCensus:
+        fields = dict(
+            size=0,
+            n_free=0,
+            n_assigned_dispatched=0,
+            n_pinned_non_dispatched=0,
+            n_unknown_dispatch=0,
+            n_quarantined=0,
+        )
+        fields.update(overrides)
+        return WarmLanePoolCensus(**fields)
+
+    def test_constructs_with_six_int_fields(self):
+        """Constructs positionally/by-keyword with the six contract-fixed int fields."""
+        census = WarmLanePoolCensus(
+            size=6,
+            n_free=1,
+            n_assigned_dispatched=2,
+            n_pinned_non_dispatched=1,
+            n_unknown_dispatch=2,
+            n_quarantined=3,
+        )
+        assert census.size == 6
+        assert census.n_free == 1
+        assert census.n_assigned_dispatched == 2
+        # n_pinned_non_dispatched is the contract-fixed literal (delivered_check anchor)
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 2
+        assert census.n_quarantined == 3
+
+    def test_render_is_single_line(self):
+        """render() returns a single-line string (no embedded newline)."""
+        rendered = self._census(size=4, n_free=4).render()
+        assert isinstance(rendered, str)
+        assert '\n' not in rendered
+
+    def test_render_contains_every_field_as_key_value_token(self):
+        """render() surfaces every field as a `name=<value>` token."""
+        census = WarmLanePoolCensus(
+            size=6,
+            n_free=1,
+            n_assigned_dispatched=2,
+            n_pinned_non_dispatched=1,
+            n_unknown_dispatch=2,
+            n_quarantined=3,
+        )
+        rendered = census.render()
+        assert 'size=6' in rendered
+        assert 'n_free=1' in rendered
+        assert 'n_assigned_dispatched=2' in rendered
+        # Explicit: the delivered_check / user-observable signal key must be present.
+        assert 'n_pinned_non_dispatched=' in rendered
+        assert 'n_pinned_non_dispatched=1' in rendered
+        assert 'n_unknown_dispatch=2' in rendered
+        assert 'n_quarantined=3' in rendered
+
+    def test_is_frozen(self):
+        """The dataclass is frozen (immutable value object)."""
+        census = self._census(size=1, n_free=1)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            census.size = 99  # type: ignore[misc]
+
+
+class TestWarmLanePoolCensusClassification:
+    """WarmLanePool.census(is_dispatched, n_quarantined) — pure classification.
+
+    Runs against a bare WarmLanePool (no git).  Per-lane rule:
+      FREE                                   -> n_free
+      ASSIGNED, is_dispatched is None        -> n_unknown_dispatch
+      ASSIGNED, no branch mapping             -> n_unknown_dispatch
+      ASSIGNED, is_dispatched(branch) True   -> n_assigned_dispatched
+      ASSIGNED, is_dispatched(branch) False  -> n_pinned_non_dispatched
+    """
+
+    @staticmethod
+    def _invariant_holds(c: WarmLanePoolCensus) -> bool:
+        return c.size == (
+            c.n_free
+            + c.n_assigned_dispatched
+            + c.n_pinned_non_dispatched
+            + c.n_unknown_dispatch
+        )
+
+    def test_all_free_pool_counts_as_n_free(self, tmp_path: Path):
+        """(a) A pristine pool: n_free == size, every other pool bucket 0."""
+        pool = _make_pool(tmp_path, size=3)
+        census = pool.census(is_dispatched=lambda b: True)
+        assert census.size == 3
+        assert census.n_free == 3
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert census.n_unknown_dispatch == 0
+        assert census.n_quarantined == 0
+        assert self._invariant_holds(census)
+
+    def test_predicate_wired_splits_dispatched_and_pinned(self, tmp_path: Path):
+        """(b) With a wired predicate, dispatched -> n_assigned_dispatched,
+        non-dispatched -> n_pinned_non_dispatched."""
+        pool = _make_pool(tmp_path, size=4)
+        asyncio.run(pool.acquire_for('dispatched-1'))
+        asyncio.run(pool.acquire_for('dispatched-2'))
+        asyncio.run(pool.acquire_for('pinned-1'))
+        # one lane stays FREE
+        dispatched = {'dispatched-1', 'dispatched-2'}
+        census = pool.census(is_dispatched=lambda b: b in dispatched)
+        assert census.size == 4
+        assert census.n_free == 1
+        assert census.n_assigned_dispatched == 2
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 0
+        assert self._invariant_holds(census)
+
+    def test_predicate_none_degrades_all_assigned_to_unknown(self, tmp_path: Path):
+        """(c) predicate None (unwired): every ASSIGNED lane -> n_unknown_dispatch,
+        n_assigned_dispatched == n_pinned_non_dispatched == 0."""
+        pool = _make_pool(tmp_path, size=3)
+        asyncio.run(pool.acquire_for('a'))
+        asyncio.run(pool.acquire_for('b'))
+        census = pool.census(is_dispatched=None)
+        assert census.size == 3
+        assert census.n_free == 1
+        assert census.n_unknown_dispatch == 2
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert self._invariant_holds(census)
+
+    def test_assigned_lane_without_branch_mapping_is_unknown(self, tmp_path: Path):
+        """(d) An ASSIGNED lane with no _assignments entry (try_acquire) has no
+        branch to test -> n_unknown_dispatch, even with a wired predicate."""
+        pool = _make_pool(tmp_path, size=2)
+        lane = asyncio.run(pool.try_acquire())
+        assert lane is not None
+        census = pool.census(is_dispatched=lambda b: True)
+        assert census.size == 2
+        assert census.n_free == 1
+        assert census.n_unknown_dispatch == 1
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert self._invariant_holds(census)
+
+    def test_n_quarantined_passed_through_unchanged(self, tmp_path: Path):
+        """(e) n_quarantined is a pass-through, standing OUTSIDE the size sum."""
+        pool = _make_pool(tmp_path, size=1)
+        census = pool.census(is_dispatched=lambda b: True, n_quarantined=7)
+        assert census.n_quarantined == 7
+        assert self._invariant_holds(census)
+
+    def test_n_quarantined_defaults_to_zero(self, tmp_path: Path):
+        """(e') n_quarantined defaults to 0 when the caller omits it."""
+        pool = _make_pool(tmp_path, size=1)
+        census = pool.census(is_dispatched=lambda b: True)
+        assert census.n_quarantined == 0
+
+    def test_invariant_holds_with_all_four_buckets_populated(self, tmp_path: Path):
+        """(f) The size decomposition holds with free/dispatched/pinned/unknown
+        all populated in one pool."""
+        pool = _make_pool(tmp_path, size=5)
+        asyncio.run(pool.acquire_for('disp'))   # dispatched
+        asyncio.run(pool.acquire_for('pin'))    # pinned (non-dispatched)
+        asyncio.run(pool.try_acquire())         # unknown (no branch mapping)
+        # two lanes remain FREE
+        census = pool.census(is_dispatched=lambda b: b == 'disp', n_quarantined=3)
+        assert census.size == 5
+        assert census.n_free == 2
+        assert census.n_assigned_dispatched == 1
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 1
+        assert census.n_quarantined == 3
+        assert self._invariant_holds(census)
 
 
 # ===========================================================================
@@ -3487,6 +3673,77 @@ class TestCreateWorktreeWarmLaneRouting:
             f'Cold dir {cold_dir} must NOT be created on pool exhaustion'
         )
 
+    async def test_create_worktree_exhausted_logs_census_warning(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """Task 2984 step-07/08: the EXHAUSTED return emits exactly one WARNING
+        carrying the pool census (size=1, n_free=0, n_pinned_non_dispatched=...).
+
+        Mirrors test_create_worktree_exhausted_raises_pool_exhausted's forced
+        exhaustion recipe, adding a caplog assertion on the new WARNING.
+        """
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the single-lane pool with a first successful create.
+        info_a = await git_ops.create_worktree('task-first')
+        assert isinstance(info_a, WorktreeInfo), (
+            f'Prerequisite: first create must succeed, got {info_a!r}'
+        )
+
+        # Capture WARNING logs emitted DURING the exhausted second call only.
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            pytest.raises(WarmLanePoolExhausted),
+        ):
+            await git_ops.create_worktree('task-second')
+
+        # Exactly one WARNING record carries the census (keyed on the
+        # contract-fixed n_pinned_non_dispatched token).
+        census_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'n_pinned_non_dispatched=' in r.getMessage()
+        ]
+        assert len(census_warnings) == 1, (
+            f'expected exactly one census WARNING at the EXHAUSTED return, got '
+            f'{[r.getMessage() for r in census_warnings]}'
+        )
+        msg = census_warnings[0].getMessage()
+        assert 'EXHAUSTED' in msg, msg
+        assert 'size=1' in msg, msg
+        assert 'n_free=0' in msg, msg
+        assert 'n_pinned_non_dispatched=' in msg, msg
+
+    async def test_create_worktree_exhausted_message_carries_census(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Task 2984 step-09/10: the WarmLanePoolExhausted message APPENDS the
+        census while preserving the existing prefix (so bare pytest.raises
+        sites with no match= stay green)."""
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        info_a = await git_ops.create_worktree('task-first')
+        assert isinstance(info_a, WorktreeInfo), (
+            f'Prerequisite: first create must succeed, got {info_a!r}'
+        )
+
+        with pytest.raises(WarmLanePoolExhausted) as excinfo:
+            await git_ops.create_worktree('task-second')
+
+        message = str(excinfo.value)
+        # Existing prefix preserved.
+        assert 'warm-lane pool exhausted for branch' in message, message
+        # Census appended, keyed on the contract-fixed token.
+        assert 'n_pinned_non_dispatched=' in message, message
+        assert 'size=1' in message, message
+        assert 'n_free=0' in message, message
+
     async def test_create_worktree_fault_raises_runtime_error(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
@@ -3534,6 +3791,138 @@ class TestCreateWorktreeWarmLaneRouting:
         cold_dir = git_ops.worktree_base / 'task-success'
         assert not cold_dir.exists(), (
             f'Cold dir {cold_dir} must NOT be created when pool lane was used'
+        )
+
+
+# ===========================================================================
+# Task 2984 step-05/06: GitOps._assemble_warm_lane_census() — single assembler
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAssembleWarmLaneCensus:
+    """GitOps._assemble_warm_lane_census() — the one INV-5 assembler.
+
+    Reads self.warm_lane_pool + self.warm_lane_dispatched_predicate, counts
+    QUARANTINED durable records via self._lane_lifecycle.all_records(), and
+    returns pool.census(...).  Both α consumers (the EXHAUSTED-return WARNING
+    and the WarmLanePoolExhausted message) call it.
+    """
+
+    async def test_predicate_wired_splits_dispatched_and_pinned(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(a) A wired predicate splits assigned lanes into dispatched vs pinned."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.acquire_for('task-disp')
+        await git_ops.warm_lane_pool.acquire_for('task-pin')
+        git_ops.warm_lane_dispatched_predicate = lambda b: b == 'task-disp'
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.size == 3
+        assert census.n_free == 1
+        assert census.n_assigned_dispatched == 1
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 0
+        assert census.n_quarantined == 0
+
+    async def test_predicate_none_degrades_assigned_to_unknown(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(b) With the predicate left None (default, unwired), every assigned
+        lane degrades to n_unknown_dispatch."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        # Default construction leaves the predicate unwired.
+        assert git_ops.warm_lane_dispatched_predicate is None
+        await git_ops.warm_lane_pool.acquire_for('task-a')
+        await git_ops.warm_lane_pool.acquire_for('task-b')
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.size == 3
+        assert census.n_free == 1
+        assert census.n_unknown_dispatch == 2
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert census.n_quarantined == 0
+
+    async def test_n_quarantined_counts_only_quarantined_records(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(c) n_quarantined counts exactly the QUARANTINED durable records;
+        non-quarantined records are excluded."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        lanes = git_ops.warm_lane_pool.lane_paths()
+        # One QUARANTINED durable record ((None, QUARANTINED) is a legal edge)...
+        git_ops._lane_lifecycle.transition(lanes[0], DurableLaneState.QUARANTINED)
+        # ...and one NON-quarantined record that must be excluded from the count.
+        git_ops._lane_lifecycle.transition(lanes[1], DurableLaneState.SEED)
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.n_quarantined == 1
+
+    async def test_no_quarantined_records_counts_zero(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(c') With no durable records at all, n_quarantined is 0."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        census = git_ops._assemble_warm_lane_census()
+        assert census.n_quarantined == 0
+
+    async def test_pool_disabled_returns_all_zero_census(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(d) Defensive branch: with the pool disabled (warm_lane_pool is None),
+        the assembler returns an all-zero census rather than raising.  The α call
+        sites only reach here with the pool enabled, but the assembler stays
+        total so β/ε can reuse it unconditionally."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=0)
+        assert git_ops.warm_lane_pool is None
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.size == 0
+        assert census.n_free == 0
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert census.n_unknown_dispatch == 0
+        assert census.n_quarantined == 0
+
+    async def test_durable_scan_oserror_reports_zero_and_warns(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """(e) Defensive branch: an OSError from the durable-record scan is
+        caught — the census reports n_quarantined=0, logs a WARNING, and is
+        still returned.  A disk hiccup must never crash the census and mask the
+        EXHAUSTED signal it decorates (loud-over-silent, but never mis-loud)."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.acquire_for('task-a')
+
+        with (
+            patch.object(
+                git_ops._lane_lifecycle,
+                'all_records',
+                side_effect=OSError('durable store unreadable'),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+        ):
+            census = git_ops._assemble_warm_lane_census()
+
+        # The census is still returned (never raises) with n_quarantined degraded
+        # to 0, while the rest of the pool classification is intact.
+        assert census is not None
+        assert census.n_quarantined == 0
+        assert census.size == 3
+        # Exactly one WARNING names the degraded durable-record scan.
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'could not scan durable lane' in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly one census OSError WARNING, got {warnings}'
         )
 
 

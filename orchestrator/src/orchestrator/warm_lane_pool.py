@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,6 +28,60 @@ logger = logging.getLogger(__name__)
 class LaneState(Enum):
     FREE = 'free'
     ASSIGNED = 'assigned'
+
+
+@dataclass(frozen=True)
+class WarmLanePoolCensus:
+    """Typed snapshot of warm-lane pool occupancy at one instant.
+
+    Carried on the warm-lane exhaustion path (PRD α / W2a): appended to the
+    ``WarmLanePoolExhausted`` message and emitted in the WARNING log at the
+    EXHAUSTED return, so an operator sees WHY the pool is full — how many lanes
+    are free, held by a dispatched task, pinned by a non-dispatched (stuck)
+    task, of unknown dispatch status, or durably quarantined.
+
+    Lives in this git-free module (not ``git_ops``) so the escalation server
+    (PRD β) can import it without pulling in git plumbing.  The pure counting
+    lives on :meth:`WarmLanePool.census`; ``n_quarantined`` is supplied by the
+    caller (GitOps, which reads durable records) rather than computed here, so
+    this module stays "pure in-memory, no git I/O".
+
+    Size decomposition invariant (holds by construction in
+    :meth:`WarmLanePool.census`)::
+
+        size == n_free + n_assigned_dispatched
+                + n_pinned_non_dispatched + n_unknown_dispatch
+
+    ``n_quarantined`` stands OUTSIDE that sum: durable QUARANTINED records are
+    not pool members (PRD Open Q5 resolved: include the count regardless).
+
+    ``n_pinned_non_dispatched`` is the contract-fixed field name — the
+    delivered_check / user-observable signal keys on it.
+    """
+
+    size: int
+    n_free: int
+    n_assigned_dispatched: int
+    n_pinned_non_dispatched: int
+    n_unknown_dispatch: int
+    n_quarantined: int
+
+    def render(self) -> str:
+        """Return the stable single-line ``key=value`` string.
+
+        The ONE format source reused verbatim by both the
+        ``WarmLanePoolExhausted`` exception message and the EXHAUSTED-return
+        WARNING log (and, later, the PRD β/ε consumers), so the operator-facing
+        signal is identical and greppable everywhere.
+        """
+        return (
+            f'size={self.size} '
+            f'n_free={self.n_free} '
+            f'n_assigned_dispatched={self.n_assigned_dispatched} '
+            f'n_pinned_non_dispatched={self.n_pinned_non_dispatched} '
+            f'n_unknown_dispatch={self.n_unknown_dispatch} '
+            f'n_quarantined={self.n_quarantined}'
+        )
 
 
 class WarmLanePool:
@@ -264,6 +319,75 @@ class WarmLanePool:
         entries are harmless.
         """
         return dict(self._assignments)
+
+    def census(
+        self,
+        is_dispatched: Callable[[str], bool] | None,
+        n_quarantined: int = 0,
+    ) -> WarmLanePoolCensus:
+        """Classify every lane into a typed :class:`WarmLanePoolCensus`.
+
+        Pure in-memory read over ``_lanes``/``_assignments`` — no ``await``, no
+        lock, no git I/O (keeps this module git-free).  The single-threaded
+        asyncio loop guarantees no concurrent ``acquire_for``/``release``
+        coroutine interleaves during the loop (no ``await`` point), the same
+        no-lock safety rationale as :meth:`assignments_snapshot`.
+
+        Args:
+            is_dispatched: ``branch -> bool`` predicate distinguishing a lane
+                held by a live dispatched task (``n_assigned_dispatched``) from
+                one pinned by a non-dispatched/stuck task
+                (``n_pinned_non_dispatched``).  ``None`` at unwired construction
+                sites (cli/recover/evals, or the reclaim valve off): every
+                ASSIGNED lane then honestly reports ``n_unknown_dispatch``
+                rather than guessing.
+            n_quarantined: Pass-through count of durable QUARANTINED records,
+                supplied by the git-aware caller (GitOps); this pure method
+                never reads durable state itself.
+
+        Classification per lane:
+            FREE                                    -> n_free
+            ASSIGNED + is_dispatched is None        -> n_unknown_dispatch
+            ASSIGNED + no branch mapping             -> n_unknown_dispatch
+            ASSIGNED + is_dispatched(branch) True   -> n_assigned_dispatched
+            ASSIGNED + is_dispatched(branch) False  -> n_pinned_non_dispatched
+
+        Invariant by construction:
+            ``size == n_free + n_assigned_dispatched
+                      + n_pinned_non_dispatched + n_unknown_dispatch``
+        (``n_quarantined`` stands apart — QUARANTINED records are not pool
+        members.)
+        """
+        # Invert branch -> lane into lane -> branch.  Each lane maps to at most
+        # one branch (acquire_for/reclaim_victim maintain a 1:1 assignment), so
+        # no information is lost.
+        lane_to_branch: dict[Path, str] = {
+            lane: branch for branch, lane in self._assignments.items()
+        }
+        n_free = 0
+        n_assigned_dispatched = 0
+        n_pinned_non_dispatched = 0
+        n_unknown_dispatch = 0
+        for lane, lane_state in self._lanes.items():
+            if lane_state == LaneState.FREE:
+                n_free += 1
+                continue
+            # ASSIGNED lane.
+            branch = lane_to_branch.get(lane)
+            if is_dispatched is None or branch is None:
+                n_unknown_dispatch += 1
+            elif is_dispatched(branch):
+                n_assigned_dispatched += 1
+            else:
+                n_pinned_non_dispatched += 1
+        return WarmLanePoolCensus(
+            size=len(self._lanes),
+            n_free=n_free,
+            n_assigned_dispatched=n_assigned_dispatched,
+            n_pinned_non_dispatched=n_pinned_non_dispatched,
+            n_unknown_dispatch=n_unknown_dispatch,
+            n_quarantined=n_quarantined,
+        )
 
     def note_assignment(self, task_id: str, lane: Path) -> None:
         """Record *task_id* → *lane* in the assignment map.
