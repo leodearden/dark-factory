@@ -8148,17 +8148,85 @@ class GitOps:
             release_merge_verify_flock(fd)
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
-        """Remove a temporary merge worktree.
+        """Remove a temporary merge worktree, crash-safely (task 2922).
 
         Routes through the C1 guarded primitive,
-        :meth:`remove_merge_worktree_guarded` — lease-held trees are now
+        :meth:`remove_merge_worktree_guarded` — lease-held trees are
         *skipped* (leaving them for the merge reaper) rather than
-        force-removed out from under a live verify. Persistent-worktree
-        exemption and uncontended removal are unchanged; the returned
-        outcome is discarded since this method's callers do not consume
-        one.
+        force-removed out from under a live verify, and the persistent
+        worktrees are exempted. This method inspects the primitive's
+        returned outcome and, ONLY on ``'failed'``, applies a crash-safe
+        filesystem fallback for the task-2922 shape-1 leak.
+
+        Shape-1 is the canonical trigger: an interrupted teardown
+        (SIGTERM/restart mid-merge) leaves a full ``_merge-<uuid>`` checkout
+        on disk while its ``.git/worktrees/<name>`` admin dir is already
+        gone, so ``git worktree remove --force`` errors ('not a working
+        tree') and the primitive returns ``'failed'`` and LEAVES the tree
+        (its pinned contract — see task 2924's
+        ``test_non_worktree_directory_returns_failed``). But ``'failed'`` is
+        NOT proof of shape-1 specifically: it is simply *any* non-zero git
+        worktree removal — a ``git worktree lock``-ed tree or a transient
+        filesystem/I/O error yield it too. The fallback deliberately does
+        NOT try to distinguish the cause; it force-removes any unleased
+        ``_merge-`` tree git could not remove, whatever the reason. That is
+        safe here because merge worktrees are throwaway/ephemeral by
+        construction AND ``'failed'`` already means the primitive's lease
+        acquire confirmed NO live holder (a live holder yields
+        ``'skipped_lease_held'``), so the tree is unleased and safe to
+        remove from the filesystem.
+
+        On ``'failed'`` the fallback: (1) band-guards via
+        :meth:`_refuse_foreign_band` (defense-in-depth — the outcome check
+        is the primary safety gate, but this can never let a
+        non-``_merge-`` path be rmtree'd); (2)
+        ``shutil.rmtree(..., ignore_errors=True)`` the on-disk tree git can
+        no longer remove; (3) unlinks the sibling :func:`lane_lock_path`
+        ``.lock`` (the primitive RETAINS it on ``'failed'``, so we clear the
+        now-orphaned lane lock, honouring the no-leak convention); (4)
+        :meth:`_prune_registrations` clears any dangling admin entry. The
+        order — remove-tree-then-prune — leaves at most the benign inverse
+        shape (admin entry without a tree) that git prune / name-reuse
+        already handle, so an interrupted teardown is always completable by
+        a later sweep.
+
+        Every other outcome (``'removed'`` / ``'not_present'`` / the two
+        ``'skipped_*'``) returns immediately, so a live-leased tree and the
+        warm persistent lanes are NEVER force-removed. Never raises;
+        idempotent — a re-call sees the tree already gone → primitive
+        ``'not_present'`` → early return.
         """
-        await self.remove_merge_worktree_guarded(merge_wt, reason='cleanup_merge_worktree')
+        outcome = await self.remove_merge_worktree_guarded(
+            merge_wt, reason='cleanup_merge_worktree',
+        )
+        if outcome != 'failed':
+            return
+
+        # Crash-safe fallback (task 2922): the guarded git removal returned
+        # 'failed' — i.e. ANY non-zero git worktree removal. Most commonly the
+        # shape-1 case (the .git/worktrees/<name> admin dir was already removed
+        # by an interrupted teardown), but a locked tree or a transient FS/I/O
+        # error too. We intentionally do NOT distinguish the cause: the
+        # primitive's lease acquire already confirmed no live holder, so we
+        # force-remove this unleased throwaway _merge- tree git could no longer
+        # remove, whatever the reason. The band guard is defense-in-depth over
+        # the outcome check; it can never fire for a genuine _merge- path.
+        if self._refuse_foreign_band(
+            merge_wt, frozenset({'_merge-'}), 'cleanup_merge_worktree',
+        ):
+            return
+        logger.warning(
+            'cleanup_merge_worktree: git worktree remove failed for %s — '
+            'commonly the admin dir was already removed by an interrupted '
+            'teardown; applying crash-safe rmtree fallback (task 2922 shape-1)',
+            merge_wt,
+        )
+        shutil.rmtree(merge_wt, ignore_errors=True)
+        # The primitive retains the sibling .lock on 'failed'; unlink it now
+        # that the lane is gone (mirrors the primitive's 'removed'-path unlink).
+        with contextlib.suppress(Exception):
+            os.unlink(lane_lock_path(merge_wt))
+        await self._prune_registrations(context='cleanup_merge_worktree')
 
     async def create_throwaway_verify_worktree(self, merge_commit: str) -> Path:
         """Create an ephemeral ``_merge-<uuid>`` worktree at *merge_commit*.
