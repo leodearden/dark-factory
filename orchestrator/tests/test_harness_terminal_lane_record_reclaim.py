@@ -24,16 +24,22 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _workflow_helpers import _build_harness
+from test_harness_park_stop import (
+    _cost_store_factory,  # noqa: F401 -- reused cross-module pytest fixture
+    _make_harness_with_mocks,
+)
 
+from orchestrator import digest as digest_mod
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.run_store import RunStore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -362,3 +368,53 @@ class TestStaleLaneAssignmentCensus:
             return_value=({'7000': 'blocked', '7001': 'blocked'}, None)
         )
         assert await harness._stale_lane_assignment_census() == []
+
+
+# ---------------------------------------------------------------------------
+# step-13: _maybe_write_digest populates DigestInputs.stale_lane_census
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestMaybeWriteDigestStaleCensus:
+    """_maybe_write_digest feeds _stale_lane_assignment_census into DigestInputs.
+
+    Mirrors test_harness_digest_rollup.py's model_role_rollup-wiring test: the
+    digest write must carry the census the harness computes, not the default [].
+    """
+
+    async def test_digest_inputs_carry_stale_lane_census(
+        self, tmp_path: Path, _cost_store_factory
+    ) -> None:
+        harness, _run_store, event_store = _make_harness_with_mocks(tmp_path)
+        harness.config = OrchestratorConfig(
+            project_root=tmp_path,
+            digest_every_n_escalations=3,
+            digest_ewa_threshold=999.0,  # high threshold — no trip
+        )
+        harness.cost_store = await _cost_store_factory(event_store.db_path.name)
+        # RunStore's task_results schema isn't created by EventStore; apply it
+        # (construct-and-discard) so the model_role_rollup query inside
+        # _maybe_write_digest doesn't error — mirrors test_harness_digest_rollup.
+        RunStore(event_store.db_path)
+
+        census_lines = ['- _lane-3 -> task 5260 (blocked), stale 10.2d']
+        harness._stale_lane_assignment_census = AsyncMock(return_value=census_lines)
+
+        harness._escalation_event_count = 5
+        harness._last_digest_event_count = 0
+
+        captured: dict = {}
+
+        def _capture(digest_dir, inputs):
+            captured['inputs'] = inputs
+            return digest_mod.DigestResult(
+                path=None, tripped=inputs.tripped, ewa_value=inputs.ewa_value
+            )
+
+        with patch.object(digest_mod, 'write_digest_entry', side_effect=_capture):
+            await harness._maybe_write_digest()
+
+        harness._stale_lane_assignment_census.assert_awaited_once()
+        assert 'inputs' in captured, 'write_digest_entry must have been called'
+        assert captured['inputs'].stale_lane_census == census_lines
