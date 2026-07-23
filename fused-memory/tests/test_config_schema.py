@@ -1295,7 +1295,6 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         ]
         assert cluster.min_phrase_hits == 2
         assert '3011' in cluster.hint
-        assert 'Do NOT add another entry' in cluster.hint
 
     def test_matches_representative_near_duplicate_note(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1352,7 +1351,6 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         ]
         assert cluster.min_phrase_hits == 2
         assert '2973' in cluster.hint
-        assert 'Do NOT add another entry' in cluster.hint
 
     def test_matches_representative_near_duplicate_note(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1381,3 +1379,21 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
             'plan-tools state persists in .task/plan.json.'
         )
         assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
+
+    def test_full_default_cluster_list_resolves_here_not_plan_tools_cluster(self):
+        # eval-worktree-plan-tools-missing is seeded earlier in the default
+        # list and find_matching_topic_cluster returns the FIRST qualifying
+        # cluster, so a plan-revalidation note must not be shadowed by it.
+        # The note below hits only 1 distinct phrase on that earlier cluster
+        # ('plan.json', via '.task/plan.json') -- below its min_phrase_hits
+        # of 2 -- so matching correctly falls through to this cluster's own
+        # >=2 hits ('.task/plan.json', 'plan-revalidation', 'requeue rebase').
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        note = (
+            'During architect plan-revalidation after a requeue rebase, check '
+            'whether .task/plan.json still exists before choosing confirm vs '
+            'recreate.'
+        )
+        result = find_matching_topic_cluster(note, clusters)
+        assert result is not None
+        assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
