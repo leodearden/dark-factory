@@ -785,6 +785,34 @@ class TestRenderDigestMarkdown:
         assert '## Dry-run proposals' in md
         assert 'none queued' in md
 
+    def test_stale_lane_census_defaults_empty(self) -> None:
+        """DigestInputs constructs WITHOUT stale_lane_census (defaults to []).
+
+        Leaf γ: the new field is defaulted so every existing constructor/call
+        site (including _make_digest_inputs above) stays valid.
+        """
+        inputs = _make_digest_inputs()
+        assert inputs.stale_lane_census == []
+
+    def test_stale_lane_census_section_renders_lines(self) -> None:
+        """Stale lane assignments section lists each census line (leaf γ)."""
+        inputs = _make_digest_inputs()
+        inputs.stale_lane_census = [
+            '_lane-3 -> task 5260 (blocked), stale 10.2d',
+            '_lane-9 -> task 4211 (in-progress), stale 8.0d',
+        ]
+        md = digest.render_digest_markdown(inputs)
+        assert '## Stale lane assignments' in md
+        assert '_lane-3 -> task 5260 (blocked), stale 10.2d' in md
+        assert '_lane-9 -> task 4211 (in-progress), stale 8.0d' in md
+
+    def test_stale_lane_census_section_empty(self) -> None:
+        """When no stale lanes, the section renders _none_."""
+        inputs = _make_digest_inputs()
+        inputs.stale_lane_census = []
+        md = digest.render_digest_markdown(inputs)
+        assert '## Stale lane assignments\n_none_\n' in md
+
 
 # ---------------------------------------------------------------------------
 # TestWriteDigestEntry (step-13)
