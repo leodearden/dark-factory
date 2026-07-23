@@ -5861,6 +5861,7 @@ def _make_sync_runner(
     df_local: str | None = '/local/df',
     local_head: str = 'LOCALHEAD',
     remote_head: str = 'REMOTEHEAD',
+    upstream_head: str | None = None,
     pull_rc: int = 0,
     uv_rc: int = 0,
     post_sync_head: str | None = None,
@@ -5870,11 +5871,17 @@ def _make_sync_runner(
 
     fake_run routes canned (rc, stdout, stderr) by argv shape:
       * ``git rev-parse HEAD`` (cwd=df_local)        -> local_head
+      * ``git rev-parse @{upstream}`` (cwd=df_local) -> upstream_head, or rc=128
+                                                        (no upstream) when None
       * ssh ``git -C <df> rev-parse HEAD``           -> remote_head, then
                                                         post_sync_head once a
                                                         pull has fired
       * ssh ``git -C <df> pull --ff-only``           -> pull_rc
       * ssh ``cd <df> && uv sync``                   -> uv_rc
+    ``upstream_head`` models the dispatcher's last-fetched origin ref used by the
+    false-stale suppression (remote-at-origin while local leads origin); None
+    (the default) makes ``@{upstream}`` unresolvable so the raw HEAD-mismatch
+    stale path is taken (byte-identical to the pre-amendment behaviour).
     ``raise_on`` (a substring of the ssh remote command) makes that ssh call
     raise OSError, exercising the never-raises transport-error path.
     Returns (runner, calls, store).
@@ -5887,6 +5894,10 @@ def _make_sync_runner(
         calls.append((list(argv), cwd))
         if argv[:3] == ['git', 'rev-parse', 'HEAD']:
             return (0, local_head, '')
+        if argv[:3] == ['git', 'rev-parse', '@{upstream}']:
+            if upstream_head is None:
+                return (128, '', 'fatal: no upstream configured for the current branch')
+            return (0, upstream_head, '')
         if argv and argv[0] == 'ssh':
             remote_cmd = argv[-1]
             if raise_on is not None and raise_on in remote_cmd:
@@ -5958,6 +5969,41 @@ class TestRemoteRunnerSyncIfStale:
         assert not any('pull --ff-only' in c for c in ssh)
         assert not any('uv sync' in c for c in ssh)
         assert store.events == []
+
+    async def test_dispatcher_leads_origin_is_current_no_stale_no_churn(self):
+        """Remote at ORIGIN while the dispatcher's local HEAD merely leads origin
+        (unpushed commits) is NOT stale: no runner_stale, no pull/uv-sync, no
+        events — the remote already matches the shared upstream, so a pull would
+        be a no-op (design_decisions[3]; suppresses the per-dispatch churn)."""
+        runner, calls, store = _make_sync_runner(
+            local_head='LOCAL_AHEAD', remote_head='ORIGIN', upstream_head='ORIGIN',
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.configured is True
+        assert out.ok is True
+        assert out.stale is False
+        assert out.synced is False
+        ssh = _ssh_cmds(calls)
+        assert not any('pull --ff-only' in c for c in ssh)
+        assert not any('uv sync' in c for c in ssh)
+        # No false-positive staleness telemetry.
+        assert store.events_of(EventType.runner_stale) == []
+        assert store.events_of(EventType.runner_synced) == []
+
+    async def test_behind_origin_still_stale_when_upstream_resolves(self):
+        """A genuinely-frozen remote (behind origin) is STILL detected as stale
+        even when the upstream ref resolves: remote HEAD != upstream -> the
+        suppression does NOT fire, runner_stale is emitted and the sync runs."""
+        runner, calls, store = _make_sync_runner(
+            local_head='LOCAL_AHEAD', remote_head='FROZEN_OLD',
+            upstream_head='ORIGIN', post_sync_head='ORIGIN',
+        )
+        out = await runner.sync_if_stale(event_store=store, task_id='t1')
+        assert out.stale is True
+        assert out.synced is True
+        assert out.ok is True
+        assert len(store.events_of(EventType.runner_stale)) == 1
+        assert len(store.events_of(EventType.runner_synced)) == 1
 
     async def test_stale_then_synced_emits_stale_then_synced_in_order(self):
         """(c) remote differs -> runner_stale, then pull --ff-only then uv sync (in order),
@@ -6305,3 +6351,69 @@ class TestVerifyRunnerPoolContractCurrency:
 
         assert len(remote._rmv_calls) == 1
         assert remote._rmv_calls[0]['event_store'] is store
+
+    async def test_multi_remote_first_fail_tries_second_remote_before_local(self):
+        """[remote_a(fail), remote_b(ok), local]: the fail-closed bench re-selects
+        the NEXT healthy REMOTE, not the local anchor — remote_b serves, local is
+        never burdened (multi-remote pools no longer fall straight to local)."""
+        from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
+
+        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=True))
+        local = _PoolFakeLocal()
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote_a, remote_b, local], event_store=store, task_id='t1')
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.summary == 'remote-ok'
+        assert pool.is_quarantined('a') is True
+        assert pool.is_quarantined('b') is False
+        assert remote_a._rmv_calls == []       # benched remote verdict never taken
+        assert len(remote_b._rmv_calls) == 1   # second remote served
+        assert local.calls == []               # local anchor untouched
+        mv = store.events_of(EventType.merge_verify)
+        assert mv and mv[0]['runner'] == 'b'
+
+    async def test_multi_remote_all_fail_falls_back_to_local(self):
+        """[remote_a(fail), remote_b(fail), local]: both remotes benched, then the
+        local trust anchor serves."""
+        from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
+
+        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
+        local = _PoolFakeLocal()
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote_a, remote_b, local], event_store=store, task_id='t1')
+
+        result = await pool.dispatch('abc123', _make_spec())
+
+        assert result.summary == 'local-ok'
+        assert pool.is_quarantined('a') is True
+        assert pool.is_quarantined('b') is True
+        assert remote_a._rmv_calls == []
+        assert remote_b._rmv_calls == []
+        assert len(local.calls) == 1
+        mv = store.events_of(EventType.merge_verify)
+        assert mv and mv[0]['runner'] == 'local'
+
+    async def test_multi_remote_all_fail_no_local_raises_runner_unavailable(self):
+        """[remote_a(fail), remote_b(fail)] with no local: every remote benched and
+        no trust anchor remains -> RunnerUnavailable (production fail-closed)."""
+        from orchestrator.verify_runner import (
+            RunnerUnavailable,
+            SyncOutcome,
+            VerifyRunnerPool,
+        )
+
+        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote_a, remote_b], event_store=store, task_id='t1')
+
+        with pytest.raises(RunnerUnavailable):
+            await pool.dispatch('abc123', _make_spec())
+        assert pool.is_quarantined('a') is True
+        assert pool.is_quarantined('b') is True
+        assert remote_a._rmv_calls == []
+        assert remote_b._rmv_calls == []

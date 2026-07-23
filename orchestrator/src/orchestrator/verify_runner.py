@@ -1102,14 +1102,22 @@ class RemoteRunner:
         Cadence = HEAD-compare PER DISPATCH (PRD §9, architect's call): resolve
         the local DF HEAD (network-free ``git rev-parse``) and the remote DF
         checkout HEAD (over ssh).  Equal ⇒ the remote already runs the
-        dispatcher's gate code — no pull.  Different ⇒ emit ``runner_stale`` and,
-        serialised on the per-runner lock and only when NO verify is in flight
-        (never ``git pull`` under a live verify), run ``git pull --ff-only`` +
-        ``uv sync`` on the remote DF checkout, emitting ``runner_synced``
-        (kind='df_checkout') on success.  Success is keyed on the two return
-        codes, NOT a post-sync HEAD-equality check — the dispatcher's local DF
-        HEAD may legitimately lead origin (unpushed commits), and the remote
-        pulls from origin (design_decisions[3]).
+        dispatcher's gate code — no pull.  Different-but-at-origin ⇒ ALSO current:
+        the remote pulls ``--ff-only`` from ORIGIN, so when it already matches the
+        dispatcher's last-fetched upstream ref it is NOT stale — the dispatcher's
+        local DF HEAD may merely lead origin by unpushed commits (design_decisions
+        [3]), and a pull would be a no-op.  Suppressing this case avoids re-firing
+        a false ``runner_stale`` + a futile pull/uv-sync on EVERY dispatch of a
+        healthy dispatcher-leads-origin runner, which would dilute the
+        genuinely-frozen-checkout alert this event exists to raise (incident
+        bb834dd42a).  Different AND the remote does not match origin ⇒ emit
+        ``runner_stale`` and, serialised on the per-runner lock and only when NO
+        verify is in flight (never ``git pull`` under a live verify), run ``git
+        pull --ff-only`` + ``uv sync`` on the remote DF checkout, emitting
+        ``runner_synced`` (kind='df_checkout') on success.  Success is keyed on
+        the two return codes, NOT a post-sync HEAD-equality check — the
+        dispatcher's local DF HEAD may legitimately lead origin (unpushed
+        commits), and the remote pulls from origin (design_decisions[3]).
 
         Fail-closed and never-raises: staleness with a failed pull/uv-sync, or
         any subprocess/transport error, returns ``ok=False`` so the pool benches
@@ -1155,6 +1163,35 @@ class RemoteRunner:
                     configured=True, ok=True, stale=False,
                     local_head=local_head, remote_head=remote_head,
                     detail='current',
+                )
+
+            # 2b) Heads differ — but the remote pulls ``--ff-only`` from ORIGIN,
+            #     so the currency contract is the dispatcher's SHARED origin ref,
+            #     not its possibly-ahead local HEAD (unpushed commits,
+            #     design_decisions[3]).  When the remote already matches the
+            #     dispatcher's last-fetched upstream, a pull would be a no-op and
+            #     the runner is NOT stale: suppress the false-positive
+            #     ``runner_stale`` + the futile pull/uv-sync churn that would
+            #     otherwise fire on every dispatch of a healthy
+            #     dispatcher-leads-origin runner (diluting the genuinely-frozen
+            #     alert — incident bb834dd42a).  Best-effort + network-free: an
+            #     unresolvable upstream (rc!=0 / empty, e.g. detached HEAD or no
+            #     tracking branch) falls through to the raw HEAD-mismatch stale
+            #     path below — byte-identical to the pre-amendment behaviour.
+            reference_head: str | None = None
+            try:
+                ref_rc, ref_out, _ = await self._run(
+                    ['git', 'rev-parse', '@{upstream}'], cwd=df_local_str,
+                )
+                if ref_rc == 0:
+                    reference_head = ref_out.strip() or None
+            except Exception:
+                reference_head = None
+            if reference_head is not None and remote_head == reference_head:
+                return SyncOutcome(
+                    configured=True, ok=True, stale=False,
+                    local_head=local_head, remote_head=remote_head,
+                    detail='current (remote at origin; dispatcher leads origin)',
                 )
 
             # 3) Stale — announce BEFORE any mutation so the bench/sync is
@@ -1909,25 +1946,46 @@ class VerifyRunnerPool:
         # verdict is adoptable only if it executed CURRENT gate logic, so bring its
         # DF *code* checkout current before dispatch (HEAD-compare + git pull/uv
         # sync inside sync_if_stale).  On a fail-closed sync (configured & not ok)
-        # bench the runner: quarantine it and re-select the local trust anchor when
-        # one is distinct (2-runner pools), else raise RunnerUnavailable so the
-        # single-runner production pool's caller benches + re-dispatches on a free
-        # host (merge_queue._run_inflight_verify → _finalize_inflight
-        # quarantine_and_release).  A not-configured runner (default None df paths)
-        # returns configured=False/ok=True → byte-identical to the pre-INV-2 path.
-        if isinstance(selected, RemoteRunner):
+        # bench that remote (quarantine) and RE-SELECT: prefer-remote surfaces the
+        # NEXT healthy remote in a multi-remote pool, then the local trust anchor
+        # (2-runner pools).  Only when no distinct healthy runner remains do we
+        # raise RunnerUnavailable, so the single-runner production pool's caller
+        # benches + re-dispatches on a free host (merge_queue._run_inflight_verify
+        # → _finalize_inflight quarantine_and_release).  A not-configured runner
+        # (default None df paths) returns configured=False/ok=True → byte-identical
+        # to the pre-INV-2 path.  The loop is bounded by the runner count (each
+        # failed sync quarantines one distinct runner, so it always converges);
+        # the for-else is a fail-closed backstop for the unreachable exhaustion.
+        for _ in range(len(self._runners)):
+            if not isinstance(selected, RemoteRunner):
+                break
             outcome = await selected.sync_if_stale(
                 event_store=self._event_store, task_id=self._task_id,
             )
-            if outcome.configured and not outcome.ok:
-                self.quarantine(selected.name)
-                if self._local is not None and self._local is not selected:
-                    selected = self._local
-                else:
-                    raise RunnerUnavailable(
-                        f'runner {selected.name!r} benched: INV-2 contract-currency '
-                        f'sync failed ({outcome.detail})'
-                    )
+            if not (outcome.configured and not outcome.ok):
+                break  # sync ok, or not configured → dispatch `selected`
+            # Fail-closed: bench this remote and try the next eligible runner.
+            self.quarantine(selected.name)
+            nxt = self._select_runner()
+            if nxt is selected or (
+                isinstance(nxt, RemoteRunner) and self.is_quarantined(nxt.name)
+            ):
+                # No distinct healthy runner remains (all remotes benched, no
+                # local anchor) → single-runner production fail-closed bench.
+                raise RunnerUnavailable(
+                    f'runner {selected.name!r} benched: INV-2 contract-currency '
+                    f'sync failed ({outcome.detail})'
+                )
+            selected = nxt
+        else:
+            # Defensive (unreachable): the bounded loop settled on a still-benched
+            # remote instead of breaking/raising.  Fail-closed rather than dispatch
+            # a quarantined runner.
+            if isinstance(selected, RemoteRunner) and self.is_quarantined(selected.name):
+                raise RunnerUnavailable(
+                    f'runner {selected.name!r} benched: INV-2 contract-currency '
+                    f'sync gate exhausted'
+                )
 
         t0 = time.monotonic()
         try:
