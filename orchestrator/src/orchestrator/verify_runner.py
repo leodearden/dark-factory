@@ -1244,12 +1244,17 @@ class RemoteRunner:
         *,
         task_id: str | None = None,
         archive_root: Path | None = None,
+        event_store: Any = None,
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
         (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
         (b) ssh <ssh_host> <shlex-quoted remote argv>
         (c) parse stdout via result_from_json
+
+        *event_store* (INV-2, task 2884; None-safe, mirrors LocalRunner) receives
+        a ``runner_synced`` (kind='project_main_mirror') event when the best-effort
+        Step-0 main push had to force-mirror a diverged remote main ref.
 
         When the result has passed=False and both *task_id* and *archive_root*
         are provided, the remote ssh stderr is archived best-effort to
@@ -1304,12 +1309,48 @@ class RemoteRunner:
                             if resolved_main_sha is not None:
                                 self._last_pushed_main_sha = resolved_main_sha
                         else:
-                            import logging as _logging
-                            _logging.getLogger(__name__).warning(
-                                'RemoteRunner %r: best-effort main push of %r to %r failed '
-                                '(rc=%d): %s — continuing with merge-sha push',
-                                self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+                            # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
+                            # main push was rejected (typically non-fast-forward —
+                            # the remote PROJECT main diverged, e.g. the laptop
+                            # reify main since 07-20).  Retry ONCE with a force
+                            # refspec to restore mirror semantics.  The FF fast
+                            # path above is preserved — a force is attempted ONLY
+                            # on FF failure, so a healthy remote never sees one and
+                            # the divergence signal is not silently dropped.
+                            force_rc, _, force_stderr = await self._run(
+                                ['git', 'push', self._git_remote,
+                                 f'+{self._main_branch}:refs/heads/{self._main_branch}'],
+                                cwd=self._cwd,
                             )
+                            if force_rc == 0:
+                                prior_main_sha = self._last_pushed_main_sha
+                                if resolved_main_sha is not None:
+                                    self._last_pushed_main_sha = resolved_main_sha
+                                if event_store is not None:
+                                    from orchestrator.event_store import EventType
+                                    event_store.emit(
+                                        EventType.runner_synced,
+                                        task_id=task_id,
+                                        data={
+                                            'runner': self.name,
+                                            'kind': 'project_main_mirror',
+                                            'from_head': prior_main_sha,
+                                            'to_head': resolved_main_sha,
+                                            'forced': True,
+                                        },
+                                    )
+                            else:
+                                # Force ALSO failed — keep today's best-effort
+                                # WARNING+swallow (the merge-sha push stays the
+                                # load-bearing transport; a non-fatal main push
+                                # must never abort the verify).
+                                import logging as _logging
+                                _logging.getLogger(__name__).warning(
+                                    'RemoteRunner %r: best-effort main push of %r to %r failed '
+                                    '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
+                                    self.name, self._main_branch, self._git_remote,
+                                    main_rc, main_stderr, force_rc, force_stderr,
+                                )
                     except OSError as exc:
                         import logging as _logging
                         _logging.getLogger(__name__).warning(
