@@ -16,16 +16,20 @@ import pytest_asyncio
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_GROWTH,
+    EXPIRY_REASON_MERGE,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     MEM0_KIND_INVESTIGATION_OUTCOME,
     RECORD_KIND_ENTITY_STANDING_DECISION,
     STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
+    STATE_EXPIRED,
 )
 from fused_memory.reconciliation.standing_decision_writer import (
     EvidenceGateRejected,
     LedgerUnavailable,
     evaluate_evidence_gate,
+    expire_entity_standing_decision,
     write_entity_standing_decision,
 )
 
@@ -526,3 +530,106 @@ class TestWriteEntityStandingDecision:
         # Fail-fast: no edge-count sampling and no best-effort mem0 mirror ran.
         service.graphiti.get_valid_edges_for_node.assert_not_called()
         service.add_memory.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# expire_entity_standing_decision — the single-source flip primitive (ζ)
+# shared by the growth sweep and the merge hook (INV-5).
+# ---------------------------------------------------------------------------
+
+_EXPIRE_ENTITY_UUID = 'cccccccc-3333-3333-3333-333333333333'
+_EXPIRE_DECIDED_AT = '2026-07-01T00:00:00+00:00'
+_EXPIRE_EXPIRES_AT = '2026-09-29T00:00:00+00:00'
+
+
+@pytest_asyncio.fixture
+async def standing_decision_ledger(tmp_path):
+    """A real initialized ReconLedgerStore on tmp_path (no memory_service).
+
+    The expire helper operates directly on the ledger, so its tests need only
+    the store — not the full AsyncMock memory_service the writer tests use.
+    """
+    ledger = ReconLedgerStore(tmp_path / 'reconciliation.db')
+    await ledger.initialize()
+    try:
+        yield ledger
+    finally:
+        await ledger.close()
+
+
+async def _seed_active_decision(ledger, *, entity_uuid=_EXPIRE_ENTITY_UUID, edge_count=7,
+                                evidence=None):
+    """Seed one ACTIVE entity_standing_decision row and return the fetched record."""
+    await ledger.upsert_entity_standing_decision(
+        project_id=_PROJECT_ID,
+        entity_uuid=entity_uuid,
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at=_EXPIRE_DECIDED_AT,
+        expires_at=_EXPIRE_EXPIRES_AT,
+        edge_count_at_decision=edge_count,
+        evidence=evidence if evidence is not None else [{'type': 'mem0', 'id': 'ev-1'}],
+        state=STATE_ACTIVE,
+    )
+    rows = await ledger.list_entity_standing_decisions(_PROJECT_ID, state=STATE_ACTIVE)
+    assert len(rows) == 1
+    return rows[0]
+
+
+class TestExpireEntityStandingDecision:
+    """The ζ single-source flip helper: state→expired + expiry_reason stamp,
+    every other field preserved unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_flip_to_expired_growth_preserves_all_other_fields(
+        self, standing_decision_ledger
+    ):
+        """expire_entity_standing_decision(..., reason=growth) flips the row to
+        state=expired with payload expiry_reason=growth, and leaves grounds,
+        decided_at (row.created_at), edge_count_at_decision, evidence, and
+        expires_at byte-for-byte unchanged."""
+        ledger = standing_decision_ledger
+        evidence = [{'type': 'mem0', 'id': 'ev-1', 'locally_resolved': True}]
+        row = await _seed_active_decision(ledger, edge_count=11, evidence=evidence)
+
+        await expire_entity_standing_decision(ledger, row, reason=EXPIRY_REASON_GROWTH)
+
+        # No ACTIVE rows remain; exactly one EXPIRED row (same PK, last-write-wins).
+        assert await ledger.list_entity_standing_decisions(_PROJECT_ID, state=STATE_ACTIVE) == []
+        expired = await ledger.list_entity_standing_decisions(
+            _PROJECT_ID, state=STATE_EXPIRED
+        )
+        assert len(expired) == 1
+        flipped = expired[0]
+        assert flipped.state == STATE_EXPIRED
+        assert flipped.entity_uuid == _EXPIRE_ENTITY_UUID
+        assert flipped.created_at == _EXPIRE_DECIDED_AT  # decided_at preserved
+        assert flipped.expires_at == _EXPIRE_EXPIRES_AT  # expires_at preserved
+
+        payload = json.loads(flipped.payload_json)
+        assert payload['expiry_reason'] == EXPIRY_REASON_GROWTH
+        assert payload['grounds'] == GROUNDS_STRUCTURAL_SIZE_CONFLATION
+        assert payload['decided_at'] == _EXPIRE_DECIDED_AT
+        assert payload['edge_count_at_decision'] == 11
+        assert payload['evidence'] == evidence
+
+    @pytest.mark.asyncio
+    async def test_second_flip_stamps_merge_reason(self, standing_decision_ledger):
+        """A subsequent expire call with reason=merge overwrites the stamped
+        expiry_reason to 'merge' (the helper is reason-parametric)."""
+        ledger = standing_decision_ledger
+        row = await _seed_active_decision(ledger)
+        await expire_entity_standing_decision(ledger, row, reason=EXPIRY_REASON_GROWTH)
+
+        # Re-fetch the now-expired row and flip it with the merge reason.
+        expired = await ledger.list_entity_standing_decisions(
+            _PROJECT_ID, state=STATE_EXPIRED
+        )
+        await expire_entity_standing_decision(
+            ledger, expired[0], reason=EXPIRY_REASON_MERGE
+        )
+
+        rows = await ledger.list_entity_standing_decisions(
+            _PROJECT_ID, state=STATE_EXPIRED
+        )
+        assert len(rows) == 1
+        assert json.loads(rows[0].payload_json)['expiry_reason'] == EXPIRY_REASON_MERGE
