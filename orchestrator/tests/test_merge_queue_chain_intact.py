@@ -29,7 +29,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.merge_queue import (
     InflightEntry,
     InflightVerifyResult,
@@ -95,6 +95,9 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
 # unambiguous.
 _DEAD = 'd' * 40
 _MAIN = 'a' * 40
+# A LIVE deep predecessor merge_commit — != main and NOT in the dead set.  A
+# verdict on this base is verify-depth-agnostic INTACT (never voided).
+_LIVE_DEEP = 'e' * 40
 
 
 def _make_mock_allocator() -> MagicMock:
@@ -296,3 +299,97 @@ class TestAdoptionFailVoid:
         assert req.result.result().status == 'blocked'
         assert worker._n_failed is True
         assert worker._event_store.speculative_events(EventType.verdict_voided) == []
+
+
+# ── Adoption-time PASS-void + depth-agnostic non-regression ───────────────────
+
+
+@pytest.mark.asyncio
+class TestAdoptionPassVoid:
+    """A PASS verdict verified against a DEAD base is VOID too: the dead-based
+    tree is NEVER advanced onto main — the item is re-merged + re-parked and
+    ``verdict_voided`` is emitted.  A PASS on a LIVE DEEP base (a predecessor
+    merge_commit that is NOT dead) is INTACT and adopted through the normal CAS
+    path (verify-depth-agnostic: chain-intact, NOT base==main)."""
+
+    async def test_pass_from_dead_base_is_voided_and_never_advances_main(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        # A real merged item, then point its base at a known-DEAD commit.
+        _, item = await _make_merged_item(git_ops, config, 'task/void-pass', 'vp.py', 'p=1\n')
+        item = dataclasses.replace(item, base_sha=_DEAD)
+        req = item.request
+
+        worker = _make_worker(git_ops)
+        # Today's RED run has no PASS-branch void yet, so it falls through to the
+        # CAS loop; MAX_CAS_RETRIES=0 makes that exit immediately (no real advance
+        # — advance_main is mocked to cas_failed) so the RED assertions below fail
+        # cleanly rather than looping.
+        worker.MAX_CAS_RETRIES = 0
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker._host_allocator = _make_mock_allocator()
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._dead_base_commits.add(_DEAD)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
+        # advance_main spy — a dead-based tree must NEVER be advanced onto main.
+        worker._git_ops.advance_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=AdvanceOutcome(result='cas_failed'),
+        )
+
+        _, remerged = _make_fake_item(
+            'remerged-pass', base_sha=_MAIN, merge_commit='rmc11111',
+            config=config, git_repo=git_repo,
+        )
+        worker._remerge = AsyncMock(return_value=remerged)  # type: ignore[method-assign]
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = _make_pass_entry(item, lease, item.merge_wt)
+
+        result = await worker._finalize_inflight(entry)
+
+        assert result is False
+        worker._git_ops.advance_main.assert_not_awaited()  # dead tree never advanced
+        worker._remerge.assert_awaited_once()              # re-merged against real main
+        assert remerged in worker._redispatch              # re-parked for re-verify
+        assert not req.result.done()                       # PASS void leaves req unresolved
+        assert worker._n_failed is False                   # voided ≠ failed
+        voided = worker._event_store.speculative_events(EventType.verdict_voided)
+        assert len(voided) == 1
+        assert voided[0]['data']['dead_link'] == _DEAD
+        assert voided[0]['data']['reason'] == 'chain_dead'
+        assert voided[0]['data']['point'] == 'adoption'
+
+    async def test_pass_on_live_deep_base_is_adopted_not_voided(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        # base_sha = a LIVE deep predecessor merge_commit — != main and NOT in
+        # the dead set.  Depth-agnostic: a deep intact chain is adopted (reaches
+        # the normal CAS advance path), NOT voided.  This must hold both before
+        # and after the PASS-branch void is wired (a non-regression guard).
+        _, item = await _make_merged_item(git_ops, config, 'task/deep-pass', 'dp.py', 'd=3\n')
+        item = dataclasses.replace(item, base_sha=_LIVE_DEEP)
+        req = item.request
+
+        worker = _make_worker(git_ops)
+        worker.MAX_CAS_RETRIES = 0  # exit the CAS fast; we only assert the void branch is SKIPPED
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker._host_allocator = _make_mock_allocator()
+        worker._event_store = _LateArrivalFakeEventStore()
+        worker._dead_base_commits.add(_DEAD)  # unrelated dead commit; _LIVE_DEEP is NOT in it
+        worker._git_ops.get_main_sha = AsyncMock(return_value=_MAIN)  # type: ignore[method-assign]
+        worker._git_ops.advance_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=AdvanceOutcome(result='cas_failed'),
+        )
+        worker._remerge = AsyncMock()  # type: ignore[method-assign]
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        entry = _make_pass_entry(item, lease, item.merge_wt)
+
+        await worker._finalize_inflight(entry)
+
+        # NOT voided: the deep intact chain proceeds to the normal CAS path.
+        worker._remerge.assert_not_awaited()
+        assert not worker._redispatch
+        assert worker._event_store.speculative_events(EventType.verdict_voided) == []
+        # Proof the normal PASS/CAS path WAS reached (advance attempted), not voided.
+        worker._git_ops.advance_main.assert_awaited()
