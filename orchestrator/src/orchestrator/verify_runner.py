@@ -72,6 +72,9 @@ __all__ = [
     "RemoteRunner",
     "RunnerUnavailable",
     "VerifyRunnerPool",
+    # INV-2 (task 2884) — contract-currency auto-sync at dispatch
+    "SyncOutcome",
+    "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
     "run_merge_verify_on_worktree",
@@ -923,6 +926,63 @@ async def _default_ssh_heartbeat_run(
     )
 
 
+@dataclass(frozen=True)
+class SyncOutcome:
+    """Result of a RemoteRunner contract-currency sync attempt (INV-2).
+
+    Returned by ``RemoteRunner.sync_if_stale``.  The pool reads ``configured``
+    and ``ok`` to decide fail-closed benching:
+
+      * ``configured=False``  — the runner opted out of INV-2 auto-sync (no
+        ``df_checkout_path`` / no resolvable local DF root).  Always paired with
+        ``ok=True`` so the pool NEVER benches an un-migrated runner; this is the
+        byte-identical-to-today pass-through shape (the default constructed
+        value).
+      * ``configured=True, ok=True``   — the remote DF checkout is current, or
+        was successfully brought current (``synced=True``); adopt its verdict.
+      * ``configured=True, ok=False``  — staleness was detected but the sync
+        FAILED (or was skipped mid-dispatch); the pool benches the runner
+        fail-closed (PRD §3.1).
+
+    ``stale`` records whether a HEAD mismatch was detected; ``synced`` whether a
+    pull+uv-sync actually completed ok.  ``local_head``/``remote_head`` carry the
+    compared shas (for the ``runner_stale`` payload / operator triage);
+    ``detail`` is a short human string.  Frozen so an outcome cannot be mutated
+    after the fact.
+    """
+
+    configured: bool = False
+    stale: bool = False
+    synced: bool = False
+    ok: bool = True
+    local_head: str | None = None
+    remote_head: str | None = None
+    detail: str | None = None
+
+
+def resolve_local_df_checkout(start: Path | None = None) -> Path | None:
+    """Walk up from *start* to the Dark-Factory repo root (the ``.git`` marker).
+
+    *start* defaults to this module's own file (``Path(__file__)``), so the
+    running orchestrator resolves its OWN source checkout — the trust anchor
+    whose HEAD a remote runner's DF checkout is compared against (INV-2).
+
+    Returns the first ancestor directory containing a ``.git`` entry — a
+    directory in the main checkout, a FILE in a linked git worktree — or
+    ``None`` when no such ancestor exists.  ``None`` is the fail-safe: callers
+    treat an unresolvable local checkout as "auto-sync disabled" (opt-in),
+    never as an error.
+    """
+    here = Path(__file__).resolve() if start is None else start
+    # A file start begins the walk at its parent; a directory start is itself a
+    # candidate.  Either way we ascend to the filesystem root.
+    candidates = [here, *here.parents] if here.is_dir() else list(here.parents)
+    for d in candidates:
+        if (d / '.git').exists():
+            return d
+    return None
+
+
 class RemoteRunner:
     """Runs a merge-verify bundle on a remote host via git push + ssh.
 
@@ -950,6 +1010,8 @@ class RemoteRunner:
         *,
         config_path: str | None = None,
         main_branch: str | None = None,
+        df_remote_checkout: str | None = None,
+        df_local_checkout: str | Path | None = None,
         run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         ssh_run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         heartbeat_interval: float | None = None,
@@ -961,6 +1023,17 @@ class RemoteRunner:
         self._cwd = cwd
         self._config_path = config_path
         self._main_branch = main_branch
+        # INV-2 (task 2884): the remote DF *code* checkout (where `orchestrator
+        # verify-merge` resolves) and the dispatcher's own local DF root — the
+        # HEAD-compare pair for contract-currency auto-sync.  Both None keeps
+        # sync_if_stale a byte-identical no-op (opt-in).  Distinct from
+        # _git_remote/_cwd, which are the PROJECT checkout.
+        self._df_remote_checkout = df_remote_checkout
+        self._df_local_checkout = df_local_checkout
+        # Per-runner lock serialising the mutating sync (pull + uv sync) so two
+        # concurrent dispatches never `git pull` the same checkout at once
+        # (PRD §3.1).  Read-only HEAD probes run outside it.
+        self._sync_lock = asyncio.Lock()
         self._run = run if run is not None else _default_subprocess_run
         # γ: connection-death heartbeat-watchdog (PRD §8.1). The ssh dispatch is
         # load-bearing (it's the call that blocks for the whole remote build), so
@@ -1017,6 +1090,187 @@ class RemoteRunner:
         except Exception:
             return False
 
+    async def sync_if_stale(
+        self,
+        *,
+        event_store: Any = None,
+        task_id: str | None = None,
+    ) -> SyncOutcome:
+        """INV-2 contract-currency gate — bring the remote DF *code* checkout
+        current with the dispatcher before its verdict is adopted.
+
+        Cadence = HEAD-compare PER DISPATCH (PRD §9, architect's call): resolve
+        the local DF HEAD (network-free ``git rev-parse``) and the remote DF
+        checkout HEAD (over ssh).  Equal ⇒ the remote already runs the
+        dispatcher's gate code — no pull.  Different-but-at-origin ⇒ ALSO current:
+        the remote pulls ``--ff-only`` from ORIGIN, so when it already matches the
+        dispatcher's last-fetched upstream ref it is NOT stale — the dispatcher's
+        local DF HEAD may merely lead origin by unpushed commits (design_decisions
+        [3]), and a pull would be a no-op.  Suppressing this case avoids re-firing
+        a false ``runner_stale`` + a futile pull/uv-sync on EVERY dispatch of a
+        healthy dispatcher-leads-origin runner, which would dilute the
+        genuinely-frozen-checkout alert this event exists to raise (incident
+        bb834dd42a).  Different AND the remote does not match origin ⇒ emit
+        ``runner_stale`` and, serialised on the per-runner lock and only when NO
+        verify is in flight (never ``git pull`` under a live verify), run ``git
+        pull --ff-only`` + ``uv sync`` on the remote DF checkout, emitting
+        ``runner_synced`` (kind='df_checkout') on success.  Success is keyed on
+        the two return codes, NOT a post-sync HEAD-equality check — the
+        dispatcher's local DF HEAD may legitimately lead origin (unpushed
+        commits), and the remote pulls from origin (design_decisions[3]).
+
+        Fail-closed and never-raises: staleness with a failed pull/uv-sync, or
+        any subprocess/transport error, returns ``ok=False`` so the pool benches
+        the runner (PRD §3.1).  Not configured (no ``df_remote_checkout`` / no
+        resolvable ``df_local_checkout``) returns ``configured=False, ok=True``
+        and issues ZERO ssh/git calls — byte-identical to the pre-INV-2 path.
+        ``event_store`` is None-safe (emit only when set), mirroring LocalRunner.
+        """
+        df_remote = self._df_remote_checkout
+        df_local = self._df_local_checkout
+        # Opt-in gate: either path unset ⇒ inert pass-through, no bench, no I/O.
+        if not df_remote or df_local is None:
+            return SyncOutcome(configured=False, ok=True)
+
+        df_local_str = str(df_local)
+
+        def _emit(event_type: Any, data: dict[str, Any]) -> None:
+            if event_store is not None:
+                event_store.emit(event_type, task_id=task_id, data=data)
+
+        try:
+            from orchestrator.event_store import EventType
+
+            # 1) Resolve local DF HEAD (network-free) + remote DF HEAD (ssh).
+            local_rc, local_out, _ = await self._run(
+                ['git', 'rev-parse', 'HEAD'], cwd=df_local_str,
+            )
+            remote_rc, remote_out, _ = await self._run(
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                 f'git -C {shlex.quote(df_remote)} rev-parse HEAD'],
+            )
+            if local_rc != 0 or remote_rc != 0:
+                return SyncOutcome(
+                    configured=True, ok=False,
+                    detail=f'HEAD resolve failed (local rc={local_rc}, remote rc={remote_rc})',
+                )
+            local_head = local_out.strip()
+            remote_head = remote_out.strip()
+
+            # 2) Current — remote already runs the dispatcher's gate code.
+            if local_head == remote_head:
+                return SyncOutcome(
+                    configured=True, ok=True, stale=False,
+                    local_head=local_head, remote_head=remote_head,
+                    detail='current',
+                )
+
+            # 2b) Heads differ — but the remote pulls ``--ff-only`` from ORIGIN,
+            #     so the currency contract is the dispatcher's SHARED origin ref,
+            #     not its possibly-ahead local HEAD (unpushed commits,
+            #     design_decisions[3]).  When the remote already matches the
+            #     dispatcher's last-fetched upstream, a pull would be a no-op and
+            #     the runner is NOT stale: suppress the false-positive
+            #     ``runner_stale`` + the futile pull/uv-sync churn that would
+            #     otherwise fire on every dispatch of a healthy
+            #     dispatcher-leads-origin runner (diluting the genuinely-frozen
+            #     alert — incident bb834dd42a).  Best-effort + network-free: an
+            #     unresolvable upstream (rc!=0 / empty, e.g. detached HEAD or no
+            #     tracking branch) falls through to the raw HEAD-mismatch stale
+            #     path below — byte-identical to the pre-amendment behaviour.
+            reference_head: str | None = None
+            try:
+                ref_rc, ref_out, _ = await self._run(
+                    ['git', 'rev-parse', '@{upstream}'], cwd=df_local_str,
+                )
+                if ref_rc == 0:
+                    reference_head = ref_out.strip() or None
+            except Exception:
+                reference_head = None
+            if reference_head is not None and remote_head == reference_head:
+                return SyncOutcome(
+                    configured=True, ok=True, stale=False,
+                    local_head=local_head, remote_head=remote_head,
+                    detail='current (remote at origin; dispatcher leads origin)',
+                )
+
+            # 3) Stale — announce BEFORE any mutation so the bench/sync is
+            #    auditable even if the sync is skipped (inflight) or fails.
+            _emit(EventType.runner_stale, {
+                'runner': self.name,
+                'local_head': local_head,
+                'remote_head': remote_head,
+            })
+
+            async with self._sync_lock:
+                # Never git-pull under a live verify — it would disturb the
+                # checkout the running verify is executing against.  Skip (do
+                # NOT bench): the next dispatch re-checks with no verify in
+                # flight; in the production pre-dispatch flow no verify is ever
+                # in flight here, so INV-2's fail-closed guarantee is unaffected.
+                if self.dispatch_in_flight:
+                    return SyncOutcome(
+                        configured=True, ok=True, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail='skipped: verify in flight',
+                    )
+
+                pull_rc, _, pull_err = await self._run(
+                    ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                     f'git -C {shlex.quote(df_remote)} pull --ff-only'],
+                )
+                if pull_rc != 0:
+                    return SyncOutcome(
+                        configured=True, ok=False, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail=f'git pull --ff-only failed (rc={pull_rc}): {pull_err}',
+                    )
+
+                uv_rc, _, uv_err = await self._run(
+                    ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                     f'cd {shlex.quote(df_remote)} && uv sync'],
+                )
+                if uv_rc != 0:
+                    return SyncOutcome(
+                        configured=True, ok=False, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail=f'uv sync failed (rc={uv_rc}): {uv_err}',
+                    )
+
+                # Best-effort post-sync HEAD for the runner_synced.to_head
+                # payload — informational only, never gates ok.
+                to_head: str | None = None
+                try:
+                    ph_rc, ph_out, _ = await self._run(
+                        ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                         f'git -C {shlex.quote(df_remote)} rev-parse HEAD'],
+                    )
+                    if ph_rc == 0:
+                        to_head = ph_out.strip() or None
+                except Exception:
+                    to_head = None
+
+                _emit(EventType.runner_synced, {
+                    'runner': self.name,
+                    'kind': 'df_checkout',
+                    'from_head': remote_head,
+                    'to_head': to_head,
+                    'forced': False,
+                })
+                return SyncOutcome(
+                    configured=True, ok=True, stale=True, synced=True,
+                    local_head=local_head, remote_head=to_head or remote_head,
+                    detail='synced (df_checkout)',
+                )
+        except Exception as exc:
+            # Any subprocess/transport error anywhere above ⇒ fail-closed.
+            # Exception (not BaseException) so asyncio.CancelledError still
+            # propagates.  Never raises to the caller.
+            return SyncOutcome(
+                configured=True, ok=False,
+                detail=f'sync transport error: {exc!r}',
+            )
+
     async def run_merge_verify(
         self,
         merge_sha: str,
@@ -1024,12 +1278,17 @@ class RemoteRunner:
         *,
         task_id: str | None = None,
         archive_root: Path | None = None,
+        event_store: Any = None,
     ) -> VerifyResult:
         """Run the combined merge-verify bundle on the remote host.
 
         (a) git push <git_remote> <merge_sha>:refs/merge-verify/<request_id>
         (b) ssh <ssh_host> <shlex-quoted remote argv>
         (c) parse stdout via result_from_json
+
+        *event_store* (INV-2, task 2884; None-safe, mirrors LocalRunner) receives
+        a ``runner_synced`` (kind='project_main_mirror') event when the best-effort
+        Step-0 main push had to force-mirror a diverged remote main ref.
 
         When the result has passed=False and both *task_id* and *archive_root*
         are provided, the remote ssh stderr is archived best-effort to
@@ -1084,12 +1343,48 @@ class RemoteRunner:
                             if resolved_main_sha is not None:
                                 self._last_pushed_main_sha = resolved_main_sha
                         else:
-                            import logging as _logging
-                            _logging.getLogger(__name__).warning(
-                                'RemoteRunner %r: best-effort main push of %r to %r failed '
-                                '(rc=%d): %s — continuing with merge-sha push',
-                                self.name, self._main_branch, self._git_remote, main_rc, main_stderr,
+                            # INV-2 mirror-semantics (task 2884, PRD §3.1): the FF
+                            # main push was rejected (typically non-fast-forward —
+                            # the remote PROJECT main diverged, e.g. the laptop
+                            # reify main since 07-20).  Retry ONCE with a force
+                            # refspec to restore mirror semantics.  The FF fast
+                            # path above is preserved — a force is attempted ONLY
+                            # on FF failure, so a healthy remote never sees one and
+                            # the divergence signal is not silently dropped.
+                            force_rc, _, force_stderr = await self._run(
+                                ['git', 'push', self._git_remote,
+                                 f'+{self._main_branch}:refs/heads/{self._main_branch}'],
+                                cwd=self._cwd,
                             )
+                            if force_rc == 0:
+                                prior_main_sha = self._last_pushed_main_sha
+                                if resolved_main_sha is not None:
+                                    self._last_pushed_main_sha = resolved_main_sha
+                                if event_store is not None:
+                                    from orchestrator.event_store import EventType
+                                    event_store.emit(
+                                        EventType.runner_synced,
+                                        task_id=task_id,
+                                        data={
+                                            'runner': self.name,
+                                            'kind': 'project_main_mirror',
+                                            'from_head': prior_main_sha,
+                                            'to_head': resolved_main_sha,
+                                            'forced': True,
+                                        },
+                                    )
+                            else:
+                                # Force ALSO failed — keep today's best-effort
+                                # WARNING+swallow (the merge-sha push stays the
+                                # load-bearing transport; a non-fatal main push
+                                # must never abort the verify).
+                                import logging as _logging
+                                _logging.getLogger(__name__).warning(
+                                    'RemoteRunner %r: best-effort main push of %r to %r failed '
+                                    '(FF rc=%d: %s; force rc=%d: %s) — continuing with merge-sha push',
+                                    self.name, self._main_branch, self._git_remote,
+                                    main_rc, main_stderr, force_rc, force_stderr,
+                                )
                     except OSError as exc:
                         import logging as _logging
                         _logging.getLogger(__name__).warning(
@@ -1646,17 +1941,66 @@ class VerifyRunnerPool:
         _log = logging.getLogger(__name__)
 
         selected = self._select_runner()
+
+        # INV-2 (task 2884): pre-dispatch contract-currency gate.  A RemoteRunner's
+        # verdict is adoptable only if it executed CURRENT gate logic, so bring its
+        # DF *code* checkout current before dispatch (HEAD-compare + git pull/uv
+        # sync inside sync_if_stale).  On a fail-closed sync (configured & not ok)
+        # bench that remote (quarantine) and RE-SELECT: prefer-remote surfaces the
+        # NEXT healthy remote in a multi-remote pool, then the local trust anchor
+        # (2-runner pools).  Only when no distinct healthy runner remains do we
+        # raise RunnerUnavailable, so the single-runner production pool's caller
+        # benches + re-dispatches on a free host (merge_queue._run_inflight_verify
+        # → _finalize_inflight quarantine_and_release).  A not-configured runner
+        # (default None df paths) returns configured=False/ok=True → byte-identical
+        # to the pre-INV-2 path.  The loop is bounded by the runner count (each
+        # failed sync quarantines one distinct runner, so it always converges);
+        # the for-else is a fail-closed backstop for the unreachable exhaustion.
+        for _ in range(len(self._runners)):
+            if not isinstance(selected, RemoteRunner):
+                break
+            outcome = await selected.sync_if_stale(
+                event_store=self._event_store, task_id=self._task_id,
+            )
+            if not (outcome.configured and not outcome.ok):
+                break  # sync ok, or not configured → dispatch `selected`
+            # Fail-closed: bench this remote and try the next eligible runner.
+            self.quarantine(selected.name)
+            nxt = self._select_runner()
+            if nxt is selected or (
+                isinstance(nxt, RemoteRunner) and self.is_quarantined(nxt.name)
+            ):
+                # No distinct healthy runner remains (all remotes benched, no
+                # local anchor) → single-runner production fail-closed bench.
+                raise RunnerUnavailable(
+                    f'runner {selected.name!r} benched: INV-2 contract-currency '
+                    f'sync failed ({outcome.detail})'
+                )
+            selected = nxt
+        else:
+            # Defensive (unreachable): the bounded loop settled on a still-benched
+            # remote instead of breaking/raising.  Fail-closed rather than dispatch
+            # a quarantined runner.
+            if isinstance(selected, RemoteRunner) and self.is_quarantined(selected.name):
+                raise RunnerUnavailable(
+                    f'runner {selected.name!r} benched: INV-2 contract-currency '
+                    f'sync gate exhausted'
+                )
+
         t0 = time.monotonic()
         try:
             # task-1920: thread archive_root + task_id into RemoteRunner only.
             # Existing 2-arg test doubles and LocalRunner (which archives via its own
             # constructor) are left untouched — the isinstance branch confines the
             # change to the one runner that needs it.
+            # INV-2: event_store is threaded too so run_merge_verify can emit the
+            # project-main mirror-push runner_synced event.
             if isinstance(selected, RemoteRunner):
                 result = await selected.run_merge_verify(
                     merge_sha, spec,
                     task_id=self._task_id,
                     archive_root=self._archive_root,
+                    event_store=self._event_store,
                 )
             else:
                 result = await selected.run_merge_verify(merge_sha, spec)

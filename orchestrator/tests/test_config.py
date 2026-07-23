@@ -1500,6 +1500,44 @@ class TestVerifyRunnerConfig:
         assert cfg.config_path == '/etc/orch.yaml'
         assert cfg.enabled is False
 
+    def test_verify_runner_config_df_checkout_path_defaults_none(self):
+        """df_checkout_path defaults None — INV-2 auto-sync opt-in/off (task 2884)."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        assert cfg.df_checkout_path is None
+
+    def test_verify_runner_config_df_checkout_path_accepts_string(self):
+        """df_checkout_path accepts a remote-host path string (task 2884)."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='laptop', ssh_host='laptop.local', git_remote='origin',
+            df_checkout_path='/home/leo/src/dark-factory',
+        )
+        assert cfg.df_checkout_path == '/home/leo/src/dark-factory'
+
+    def test_verify_runner_config_df_checkout_path_roundtrip(self):
+        """df_checkout_path survives a model_dump → re-construct round-trip (task 2884)."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='laptop', ssh_host='laptop.local', git_remote='origin',
+            df_checkout_path='/remote/df',
+        )
+        dumped = cfg.model_dump()
+        assert dumped['df_checkout_path'] == '/remote/df'
+        rebuilt = VerifyRunnerConfig(**dumped)
+        assert rebuilt.df_checkout_path == '/remote/df'
+
+    def test_verify_runner_config_backcompat_block_without_df_checkout_path(self):
+        """An existing verify_runners block omitting df_checkout_path still validates
+        and defaults the field to None (back-compat — task 2884)."""
+        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
+            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+        ])
+        assert config.verify_runners[0].df_checkout_path is None
+
     def test_orchestrator_config_verify_runners_defaults_empty(self):
         """OrchestratorConfig.verify_runners defaults to [] not None."""
         config = OrchestratorConfig()

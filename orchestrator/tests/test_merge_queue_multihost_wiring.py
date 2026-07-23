@@ -40,13 +40,17 @@ def _make_config(*, verify_runners=None, main_branch='main', drift_every_n=20):
     return OrchestratorConfig(**kwargs)
 
 
-def _make_runner_cfg(name, *, ssh_host='h.local', git_remote='r', config_path=None, enabled=True):
+def _make_runner_cfg(
+    name, *, ssh_host='h.local', git_remote='r', config_path=None, enabled=True,
+    df_checkout_path=None,
+):
     return VerifyRunnerConfig(
         name=name,
         ssh_host=ssh_host,
         git_remote=git_remote,
         config_path=config_path,
         enabled=enabled,
+        df_checkout_path=df_checkout_path,
     )
 
 
@@ -159,6 +163,70 @@ class TestBuildRemoteRunners:
         ])
         result = self._call(config, quarantine=set())
         assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# task 2884 step-9 RED / step-10 GREEN: _build_remote_runners threads the
+# INV-2 contract-currency paths (df_remote_checkout per-runner config +
+# df_local_checkout resolved once from the dispatcher's own DF root).
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRemoteRunnersDfCheckout:
+    """Each RemoteRunner built by _build_remote_runners receives the INV-2 paths.
+
+    - df_remote_checkout == its VerifyRunnerConfig.df_checkout_path (per-runner,
+      opt-in; None keeps auto-sync OFF / byte-identical).
+    - df_local_checkout == resolve_local_df_checkout() — the running
+      dispatcher's own DF code root, resolved ONCE and shared across every
+      runner in the build.
+
+    RED until step-10 threads both kwargs through the RemoteRunner(...)
+    construction (today they default to None on every runner).
+    """
+
+    def _call(self, config, cwd='/repo', *, quarantine=None):
+        from orchestrator.merge_queue import _build_remote_runners
+        return _build_remote_runners(config, cwd, quarantine=quarantine)
+
+    def test_df_remote_checkout_threaded_from_config(self):
+        """Each runner's _df_remote_checkout == its cfg.df_checkout_path."""
+        config = _make_config(verify_runners=[
+            _make_runner_cfg('r1', df_checkout_path='/remote/df1'),
+            _make_runner_cfg('r2', df_checkout_path='/remote/df2'),
+        ])
+        result = self._call(config)
+        assert [r._df_remote_checkout for r in result] == ['/remote/df1', '/remote/df2']
+
+    def test_df_remote_checkout_defaults_none_opt_in(self):
+        """A runner with no df_checkout_path gets _df_remote_checkout=None (auto-sync OFF)."""
+        config = _make_config(verify_runners=[_make_runner_cfg('r1')])
+        result = self._call(config)
+        assert result[0]._df_remote_checkout is None
+
+    def test_df_local_checkout_resolved_once_and_threaded_to_every_runner(self):
+        """df_local_checkout == resolve_local_df_checkout(), resolved once, shared."""
+        from pathlib import Path
+
+        sentinel = Path('/dispatcher/dark-factory')
+        config = _make_config(verify_runners=[
+            _make_runner_cfg('r1', df_checkout_path='/remote/df1'),
+            _make_runner_cfg('r2', df_checkout_path='/remote/df2'),
+        ])
+        # NO create=True: resolve_local_df_checkout is genuinely imported into
+        # merge_queue by _build_remote_runners, so the patch MUST bind to a real
+        # module attribute.  Dropping create=True makes this test fail loudly if a
+        # future refactor drops that import (the wiring guarantee it pins).
+        with patch(
+            'orchestrator.merge_queue.resolve_local_df_checkout',
+            return_value=sentinel,
+        ) as mock_resolve:
+            result = self._call(config)
+
+        assert all(r._df_local_checkout == sentinel for r in result)
+        # Resolved ONCE for the whole build (dispatcher root is call-invariant),
+        # not re-walked per runner.
+        assert mock_resolve.call_count == 1
 
 
 # ---------------------------------------------------------------------------

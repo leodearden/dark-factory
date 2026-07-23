@@ -2028,6 +2028,20 @@ class VerifyRunnerConfig(BaseModel):
             'None omits --config (remote uses its own ORCH_CONFIG_PATH).'
         ),
     )
+    df_checkout_path: str | None = Field(
+        default=None,
+        description=(
+            'Remote-host filesystem path to the Dark-Factory orchestrator '
+            '*code* checkout — the tree whose `orchestrator verify-merge` gate '
+            'this runner executes over ssh.  Distinct from git_remote (the '
+            'PROJECT checkout where the merge sha is pushed/tested).  When set, '
+            'enables the INV-2 contract-currency auto-sync at dispatch '
+            '(HEAD-compare vs the dispatcher, then git pull --ff-only + uv sync '
+            'when stale; plans/merge-verdict-integrity-prd.md §1, §3.1).  '
+            'Default None keeps auto-sync OFF (opt-in), byte-identical to the '
+            'pre-INV-2 behaviour for every not-yet-migrated runner.'
+        ),
+    )
     enabled: bool = Field(
         default=True,
         description=(

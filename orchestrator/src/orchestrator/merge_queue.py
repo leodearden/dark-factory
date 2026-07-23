@@ -207,6 +207,7 @@ from orchestrator.verify_runner import (
     build_merge_verify_spec,
     is_flock_contention_failure,
     is_unscoped_gate_failure,
+    resolve_local_df_checkout,
     unscoped_gate_failing_subprojects,
 )
 
@@ -233,7 +234,14 @@ def _build_remote_runners(
 
     _build_verify_runners passes main_branch=config.git.main_branch so the
     remote host receives a freshness push before the merge-sha transport.
+
+    Each runner also receives the INV-2 contract-currency paths (task 2884):
+    df_remote_checkout=r.df_checkout_path (per-runner, opt-in; None keeps
+    auto-sync OFF / byte-identical) and df_local_checkout=the dispatcher's own
+    DF code root, resolved ONCE here (call-invariant) and shared across every
+    runner so sync_if_stale can HEAD-compare remote-vs-local at dispatch.
     """
+    _local_df = resolve_local_df_checkout()
     return [
         RemoteRunner(
             name=r.name,
@@ -242,6 +250,8 @@ def _build_remote_runners(
             cwd=cwd,
             config_path=r.config_path,
             main_branch=config.git.main_branch,
+            df_remote_checkout=r.df_checkout_path,
+            df_local_checkout=_local_df,
         )
         for r in config.enabled_verify_runners
         if quarantine is None or r.name not in quarantine
