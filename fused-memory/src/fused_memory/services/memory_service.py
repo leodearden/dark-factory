@@ -4334,11 +4334,27 @@ class MemoryService:
         merged_uuids = {deprecated_uuid, surviving_uuid}
         expired = 0
         for row in rows:
-            if row.entity_uuid in merged_uuids:
+            if row.entity_uuid not in merged_uuids:
+                continue
+            # Per-row fail-safe: a single malformed row (e.g. a payload missing
+            # edge_count_at_decision, which the flip helper reads directly) must
+            # NOT block the sibling merged uuid's flip. Leave the bad row ACTIVE
+            # (re-caught later by TTL or the growth sweep) and continue — the
+            # same per-row guard _sweep_entity_standing_decision_growth uses.
+            try:
                 await expire_entity_standing_decision(
                     ledger, row, reason=EXPIRY_REASON_MERGE
                 )
                 expired += 1
+            except Exception:
+                logger.warning(
+                    '_expire_standing_decisions_for_merge: flip to expired/merge '
+                    'failed for entity_uuid=%s project_id=%s (left active for '
+                    'TTL/growth sweep)',
+                    row.entity_uuid,
+                    project_id,
+                    exc_info=True,
+                )
         return expired
 
     async def delete_entity(

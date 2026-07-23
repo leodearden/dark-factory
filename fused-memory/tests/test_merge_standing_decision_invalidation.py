@@ -21,10 +21,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import (
+    ReconLedgerRecord,
+    ReconLedgerStore,
+)
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_MERGE,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
     STATE_ACTIVE,
     STATE_EXPIRED,
 )
@@ -179,6 +183,54 @@ class TestExpireStandingDecisionsForMerge:
 
         assert count == 2
         assert await _active_uuids(ledger) == {_UNRELATED_UUID}
+
+    @pytest.mark.asyncio
+    async def test_malformed_row_does_not_block_sibling_flip(self, merge_memory_service):
+        """Per-row fail-safe: a malformed ACTIVE row on ONE merged uuid (payload
+        missing ``edge_count_at_decision`` → ``KeyError`` inside the flip helper)
+        must NOT abort the loop before the well-formed sibling row on the OTHER
+        merged uuid is flipped. The bad row is left ACTIVE (re-caught later by
+        TTL or the growth sweep); the good row still flips to expired/merge; the
+        returned count reflects only the successful flip — mirroring the per-row
+        guard in ``_sweep_entity_standing_decision_growth``."""
+        svc = merge_memory_service
+        ledger = svc.recon_ledger
+        # Well-formed ACTIVE row on the deprecated uuid.
+        await _seed_active_decision(ledger, entity_uuid=_DEPRECATED_UUID)
+        # Malformed ACTIVE row on the surviving uuid seeded via the low-level
+        # upsert: its payload OMITS edge_count_at_decision, which
+        # expire_entity_standing_decision reads directly (→ KeyError). The normal
+        # upsert_entity_standing_decision path always writes that key, so the raw
+        # record is the only faithful way to reproduce the malformed-payload case.
+        await ledger.upsert(
+            ReconLedgerRecord(
+                project_id=_PROJECT_ID,
+                record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+                flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+                run_id=_SURVIVING_UUID,
+                entity_uuid=_SURVIVING_UUID,
+                payload_json=json.dumps(
+                    {'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION}
+                ),
+                state=STATE_ACTIVE,
+                created_at=_DECIDED_AT,
+                expires_at=_EXPIRES_AT,
+            )
+        )
+
+        count = await svc._expire_standing_decisions_for_merge(
+            _PROJECT_ID, _DEPRECATED_UUID, _SURVIVING_UUID
+        )
+
+        # Only the well-formed row flipped; the malformed row's KeyError was
+        # swallowed per-row and did NOT abort the sibling's flip.
+        assert count == 1
+        good = await _expired_row(ledger, _DEPRECATED_UUID)
+        assert good is not None
+        assert good.state == STATE_EXPIRED
+        assert json.loads(good.payload_json)['expiry_reason'] == EXPIRY_REASON_MERGE
+        # The malformed row is left ACTIVE for TTL / the growth sweep to re-catch.
+        assert _SURVIVING_UUID in await _active_uuids(ledger)
 
 
 class TestMergeEntitiesInvalidationWiring:
