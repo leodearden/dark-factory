@@ -298,3 +298,40 @@ def list_parked_worktrees(repo: Path, parking_root: Path) -> list[ParkedWorktree
             continue
         records.append(ParkedWorktree(path=path, branch=branch, parked_at=parked_at))
     return records
+
+
+def is_worktree_dirty(path: Path) -> bool:
+    """Whether *path*'s working tree has uncommitted content (fail-safe DIRTY).
+
+    ``git status --porcelain`` is non-empty => dirty. Any git failure (nonzero
+    rc, or *path* is not a worktree / has vanished) is treated FAIL-SAFE as
+    dirty (``True``) + LOUD warning — mirroring ``GitOps._worktree_dirty``'s
+    fail-safe True, so a parking whose cleanliness cannot be PROVEN is never
+    removed without a park-commit first. Never raises.
+    """
+    rc, out, err = _run_git(['status', '--porcelain'], cwd=path)
+    if rc != 0:
+        logger.warning(
+            '%s `git status` failed in %s (rc=%s): %s — treating as DIRTY '
+            '(fail-safe)',
+            _LOG_PREFIX,
+            path,
+            rc,
+            err.strip(),
+        )
+        return True
+    return bool(out.strip())
+
+
+def branch_ref_resolves(repo: Path, branch: str) -> bool:
+    """Whether ``refs/heads/<branch>`` resolves in *repo* (content is on a ref).
+
+    ``git rev-parse --verify --quiet refs/heads/<branch>`` — ``rc == 0`` means
+    the branch exists (so the parking's content is safely reachable
+    INDEPENDENTLY of the worktree). Any other rc (or git failure) => ``False``.
+    Never raises.
+    """
+    rc, _out, _err = _run_git(
+        ['rev-parse', '--verify', '--quiet', f'refs/heads/{branch}'], cwd=repo
+    )
+    return rc == 0
