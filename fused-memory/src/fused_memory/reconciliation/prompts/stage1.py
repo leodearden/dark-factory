@@ -6,6 +6,7 @@ from fused_memory.reconciliation.prompts import (
     get_recon_report_tool_guidance,
 )
 from fused_memory.reconciliation.recon_self_model import (
+    render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
     render_suppression_schema_section,
@@ -544,6 +545,8 @@ carrying a non-empty `flag_types`). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
+
+{render_entity_standing_decision_schema_section()}
 
 ## Flag Deduplication
 You do NOT need to manually search for or skip duplicate flags — emit findings naturally and \

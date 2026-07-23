@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
+from fused_memory.reconciliation import standing_decision_constants as sdc
 
 # --------------------------------------------------------------------------- #
 # Static vocabulary constants (step-1/2)
@@ -425,3 +426,91 @@ class TestPremiseLint:
             # setattr, not a direct attribute assignment, so this stays pyright-clean
             # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
             setattr(v, 'premise', 'mutated')  # noqa: B010
+
+
+# --------------------------------------------------------------------------- #
+# render_entity_standing_decision_schema_section (task 2898 ε, step-1/2)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderEntityStandingDecisionSchemaSection:
+    """render_entity_standing_decision_schema_section() renders the SHARED
+    entity_standing_decision schema section (record kind + grounds enum), the
+    ad-hoc-kind demotion prose, and the pre-emission advisory-check prose —
+    rendered byte-identically into BOTH the Stage-1 and Stage-2 prompts."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_entity_standing_decision_schema_section(), str)
+        assert m.render_entity_standing_decision_schema_section()
+
+    def test_record_kind_is_single_sourced_from_constants(self):
+        """The rendered text contains the α record-kind constant VALUE (not a
+        re-hardcoded literal), proving it is single-sourced from
+        standing_decision_constants (INV-5)."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert sdc.RECORD_KIND_ENTITY_STANDING_DECISION in text
+        assert sdc.RECORD_KIND_ENTITY_STANDING_DECISION == 'entity_standing_decision'
+
+    def test_grounds_enum_value_is_single_sourced(self):
+        """The rendered text contains the α grounds enum constant VALUE."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION in text
+        assert sdc.GROUNDS_STRUCTURAL_SIZE_CONFLATION == 'structural_size_conflation'
+
+    def test_demotion_names_both_ad_hoc_kind_identifiers(self):
+        """Item 4: the demotion prose names the two exact ad-hoc mem0 kind
+        identifiers it demotes to evidence-only. These are specific identifier
+        tokens (not free-form prose), so pinning them guards that the renderer
+        keeps naming both demoted kinds. The weaker 'evidence-only'/'sole'
+        wording pin is intentionally dropped — it can pass on unrelated prose,
+        and the demotion prose is already pinned byte-identically into both
+        assembled prompts by test_standing_decision_prompt_drift.py."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert 'recurring_flag_standing_decision' in text
+        assert 'stage1_finding_correction' in text
+
+    def test_advisory_check_names_the_mem0_read_tool(self):
+        """Item 2: the pre-emission advisory check names the specific mem0-read
+        tool (`get_memories_by_metadata`) — the one real-invariant instruction
+        token worth pinning intentionally. The surrounding advisory wording
+        ('advisory', 'authoritative', 'never consult mem0') is left to the
+        byte-identical drift guard rather than pinned here as churny prose."""
+        text = m.render_entity_standing_decision_schema_section()
+        assert 'get_memories_by_metadata' in text
+
+
+# --------------------------------------------------------------------------- #
+# render_investigation_outcome_section (task 2898 ε, step-3/4)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderInvestigationOutcomeSection:
+    """render_investigation_outcome_section() renders the STAGE-2-ONLY
+    investigation_outcome mem0-kind schema plus the Stage-2 write instruction
+    (write one record on every not-actionable investigation conclusion; the
+    pool feeds β's authorization arm-2 evidence)."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_investigation_outcome_section(), str)
+        assert m.render_investigation_outcome_section()
+
+    def test_kind_is_single_sourced_from_constants(self):
+        """The rendered text contains the α mem0-kind constant VALUE (not a
+        re-hardcoded literal), proving it is single-sourced (INV-5)."""
+        text = m.render_investigation_outcome_section()
+        assert sdc.MEM0_KIND_INVESTIGATION_OUTCOME in text
+        assert sdc.MEM0_KIND_INVESTIGATION_OUTCOME == 'investigation_outcome'
+
+    def test_names_record_schema_field_identifiers(self):
+        """The record schema is defined by three exact metadata field
+        identifiers (`entity_uuid`, `actionable`, `run_id`) — structural schema
+        tokens, not free-form prose — so pinning them guards the record
+        convention this section introduces. The weaker prose pins the original
+        draft carried ('false', 'not-actionable', 'arm'/'authorization'/
+        'evidence') are dropped: they can pass on unrelated prose, and the full
+        section text is already pinned byte-identically into the Stage-2 prompt
+        by test_standing_decision_prompt_drift.py."""
+        text = m.render_investigation_outcome_section()
+        assert 'entity_uuid' in text
+        assert 'actionable' in text
+        assert 'run_id' in text
