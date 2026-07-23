@@ -517,6 +517,17 @@ cycle, do NOT re-act — instead note in your summary that the flag was carried 
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
 
+## Standing Decisions (Adjudicated Findings)
+A flagged item may carry a `standing_decision_id` field. This means the entity it \
+cites has an ACTIVE standing decision on record: a prior investigation already \
+adjudicated this class of complaint about that entity and dismissed it as a known \
+false positive. Do NOT re-investigate such a finding and do NOT spawn a curator task \
+for it — note in your summary that it is covered by standing decision \
+`standing_decision_id` and take no further action. The ONE exception: if the finding \
+ALSO presents a NEW CONCRETE FACT the standing decision could not have covered — most \
+commonly a newly cited edge uuid in its `cited_edges` — then the standing decision does \
+not apply and you should treat the finding as a normal finding and act on it.
+
 ## Consuming Stage 1 Refresh Failures (Task 1157)
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
 `entity_refresh_failed_uuids` list in its structured report. These are entities whose \
