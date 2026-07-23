@@ -8,6 +8,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 """
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -3670,6 +3671,48 @@ class TestCreateWorktreeWarmLaneRouting:
         assert not cold_dir.exists(), (
             f'Cold dir {cold_dir} must NOT be created on pool exhaustion'
         )
+
+    async def test_create_worktree_exhausted_logs_census_warning(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """Task 2984 step-07/08: the EXHAUSTED return emits exactly one WARNING
+        carrying the pool census (size=1, n_free=0, n_pinned_non_dispatched=...).
+
+        Mirrors test_create_worktree_exhausted_raises_pool_exhausted's forced
+        exhaustion recipe, adding a caplog assertion on the new WARNING.
+        """
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        # Exhaust the single-lane pool with a first successful create.
+        info_a = await git_ops.create_worktree('task-first')
+        assert isinstance(info_a, WorktreeInfo), (
+            f'Prerequisite: first create must succeed, got {info_a!r}'
+        )
+
+        # Capture WARNING logs emitted DURING the exhausted second call only.
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            with pytest.raises(WarmLanePoolExhausted):
+                await git_ops.create_worktree('task-second')
+
+        # Exactly one WARNING record carries the census (keyed on the
+        # contract-fixed n_pinned_non_dispatched token).
+        census_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'n_pinned_non_dispatched=' in r.getMessage()
+        ]
+        assert len(census_warnings) == 1, (
+            f'expected exactly one census WARNING at the EXHAUSTED return, got '
+            f'{[r.getMessage() for r in census_warnings]}'
+        )
+        msg = census_warnings[0].getMessage()
+        assert 'EXHAUSTED' in msg, msg
+        assert 'size=1' in msg, msg
+        assert 'n_free=0' in msg, msg
+        assert 'n_pinned_non_dispatched=' in msg, msg
 
     async def test_create_worktree_fault_raises_runtime_error(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
