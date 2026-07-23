@@ -1634,17 +1634,25 @@ class Scheduler:
         # dep_id (task 2692, reviewer_comprehensive performance amendment).
         # Populated by _phase_backfill_terminal_dep_records and consulted
         # there BEFORE issuing any get_task call: a terminal (done/
-        # cancelled) task's record is treated as immutable once observed,
-        # so a dep_id already present here is served for free on every
-        # later tick instead of being re-fetched — without this, a mature
-        # project's every pending task would re-fetch every one of its
-        # completed local deps on EVERY tick forever, even though the
-        # common case is a dep with no metadata.delivered_checks at all.
+        # cancelled) task's record with NO metadata.delivered_checks is
+        # treated as immutable once observed, so a dep_id already present
+        # here is served for free on every later tick instead of being
+        # re-fetched — without this, a mature project's every pending task
+        # would re-fetch every one of its completed local deps on EVERY
+        # tick forever, even though the common case is a dep with no
+        # metadata.delivered_checks at all.
         # Never evicted (process-local — an orchestrator restart is an
         # acceptable implicit reset, matching every other process-local
-        # cache above); a terminal task's metadata being edited in place
-        # after this cache is warmed is an accepted, rare staleness
-        # trade-off, not a correctness guarantee.
+        # cache above). A cached record that DOES carry
+        # metadata.delivered_checks is re-validated (re-fetched and the
+        # cache entry refreshed) on every sweep instead of served stale
+        # (task 2977) — otherwise an operator correcting a DONE dep's
+        # check descriptor in place, at a fixed main SHA, would be served
+        # the stale descriptor forever, freezing task 2975's descriptor-
+        # digest self-heal. The remaining accepted, rare staleness
+        # trade-off is narrower: adding delivered_checks to a previously-
+        # checkless, already-warmed record is not observed until an
+        # orchestrator restart resets the cache.
         self._terminal_dep_record_cache: dict[str, dict] = {}
         self._streak_registry = StreakRegistry()
         self._streak_registry.register('external_unresolved', self._streak_external_unresolved)
@@ -5268,13 +5276,24 @@ class Scheduler:
         Cross-tick record cache (task 2692, reviewer_comprehensive
         performance amendment): a dep_id already present in
         ``self._terminal_dep_record_cache`` is served straight into
-        ``ctx.terminal_dep_records`` with NO ``get_task`` call at all — a
-        terminal task's record is treated as immutable once fetched.
-        Without this, every pending task's completed local deps would be
-        re-fetched on EVERY tick forever, even in the common case where
-        none of them carry ``metadata.delivered_checks``. Only dep_ids
-        that miss this cache are actually fetched below (and then stashed
-        into it for next time).
+        ``ctx.terminal_dep_records`` with NO ``get_task`` call at all,
+        PROVIDED the cached record carries no ``metadata.delivered_checks``
+        — such a checkless terminal task's record is treated as immutable
+        once fetched. Without this, every pending task's completed local
+        deps would be re-fetched on EVERY tick forever, even in the common
+        case where none of them carry ``metadata.delivered_checks``. A
+        cached record that DOES carry ``metadata.delivered_checks`` is
+        instead treated as a cache MISS and re-fetched every sweep (task
+        2977, closing the loop with task 2975's descriptor-digest
+        self-heal): otherwise an operator's in-place correction of a DONE
+        dep's check descriptor, at a fixed main SHA, would be served
+        stale forever, since this phase is the sole source
+        ``ctx.terminal_dep_records`` is populated from. Only dep_ids that
+        miss this cache (absent, or present-but-checks-carrying) are
+        actually fetched below (and then (re)stashed into it for next
+        time). Boundary: adding delivered_checks to a previously-checkless,
+        already-warmed record is not observed until an orchestrator
+        restart resets the cache.
 
         Those still-uncached fetches are further bounded by
         ``config.delivered_checks.max_checks_per_tick`` — reusing the same
@@ -5330,7 +5349,26 @@ class Scheduler:
             _to_fetch: list[str] = []
             for _dep_id in needed:
                 _cached_record = self._terminal_dep_record_cache.get(_dep_id)
-                if _cached_record is not None:
+                # Task 2977: a warmed record is served from cache ONLY when
+                # it carries no delivered_checks. The record cache is never
+                # evicted, so if a checks-carrying record were always
+                # served from cache, an operator correcting a DONE dep's
+                # check descriptor in place (at a fixed main SHA) would be
+                # served the stale descriptor forever — freezing task
+                # 2975's (dep_id, main_sha, descriptor_digest) self-heal,
+                # whose digest is computed from whatever this phase serves
+                # into ctx.terminal_dep_records. Treating a checks-carrying
+                # cache entry as a MISS forces a re-fetch every sweep (the
+                # loop below overwrites the cache with the fresh record),
+                # so a corrected descriptor is observed on the very next
+                # tick. Checkless records — the common case and the entire
+                # performance rationale for this cache — are still served
+                # for free. Documented boundary: adding delivered_checks to
+                # a previously-checkless, already-warmed record is NOT
+                # observed until an orchestrator restart resets the cache.
+                if _cached_record is not None and not (
+                    (_cached_record.get('metadata') or {}).get('delivered_checks')
+                ):
                     ctx.terminal_dep_records[_dep_id] = _cached_record
                 else:
                     _to_fetch.append(_dep_id)
