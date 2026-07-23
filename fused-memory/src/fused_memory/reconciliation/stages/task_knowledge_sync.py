@@ -49,6 +49,13 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_GROWTH,
+    STATE_ACTIVE,
+)
+from fused_memory.reconciliation.standing_decision_writer import (
+    expire_entity_standing_decision,
+)
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
@@ -674,6 +681,34 @@ _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
+# --- Entity-standing-decision growth-freshness sweep (task 2899 ζ) -----------
+# PRD plans/stage1-entity-standing-decision-prd.md §Staleness: a standing
+# decision's decision-time edge-count snapshot (``edge_count_at_decision``) is
+# corroborated against the LIVE graph at each Stage-2 tail. An ACTIVE row is
+# flipped to expired/growth when the entity has grown materially since the
+# decision:
+#     live > edge_count_at_decision * FACTOR
+#     OR live >= edge_count_at_decision + ABS_DELTA
+# (whichever trips first). The two-armed rule keeps a small entity from expiring
+# on a single-edge wobble (the ABS_DELTA floor) while still catching proportional
+# growth on a large entity (the FACTOR). These are the PRD contract defaults; each
+# is overridable PER RECORD via optional payload keys ``growth_factor`` /
+# ``growth_abs_delta`` (α's row-schema override path) — a local sweep constant
+# mirrors the file's existing convention (STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS).
+STANDING_DECISION_GROWTH_FACTOR: float = 1.25
+STANDING_DECISION_GROWTH_ABS_DELTA: int = 15
+
+# Per-cycle Stage-2 stats recorded by the growth sweep (explicit-zero, like the
+# marker-sweep stats): whether >=1 active row could not be verified this cycle
+# (fail-safe: the row is left ACTIVE) and how many rows were flipped to
+# expired/growth.
+ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY = (
+    'entity_standing_decision_growth_sweep_failed'
+)
+ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
+    'entity_standing_decision_growth_expired'
+)
+
 
 async def _resolve_terminal_task_ids(
     taskmaster,
@@ -1118,6 +1153,124 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
     )
+
+
+async def _sweep_entity_standing_decision_growth(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> dict:
+    """Corroborate each ACTIVE entity_standing_decision against the live graph (ζ).
+
+    The growth-freshness sweep (task 2899), a sibling of the Stage-2-tail marker
+    sweeps. For each ACTIVE ``entity_standing_decision`` row it fetches the
+    entity's LIVE edge count via graphiti and EXPIRES the row (reason='growth',
+    through the single-source :func:`expire_entity_standing_decision` flip helper)
+    when the entity has grown materially past its decision-time snapshot:
+
+        live > edge_count_at_decision * factor
+        OR live >= edge_count_at_decision + abs_delta
+
+    ``factor`` / ``abs_delta`` default to :data:`STANDING_DECISION_GROWTH_FACTOR`
+    / :data:`STANDING_DECISION_GROWTH_ABS_DELTA` and are overridable per row via
+    optional payload keys ``growth_factor`` / ``growth_abs_delta`` (a non-numeric
+    override is ignored in favour of the default).
+
+    **Fail-safe (never raises):**
+
+    * Unwired ledger (``memory_service.recon_ledger`` is ``None``) ⇒
+      ``{'checked': 0, 'expired': 0, 'failed': False}`` — the sweep did not run,
+      which is NOT a failure (mirrors the writer's ledger-None convention).
+    * A failure LISTING the active rows ⇒ ``failed=True`` (nothing checked).
+    * A per-row error (unparseable/incomplete payload, live-edge fetch failure,
+      or flip failure) ⇒ that row is LEFT ACTIVE (TTL-bounded; re-verified next
+      cycle) and ``failed=True``; the sweep continues to the next row. Leaving a
+      row active on unverified information is strictly safer than expiring it —
+      the marker sweeps' uncertain⇒keep direction.
+
+    ``failed=True`` is the signal the Stage-2 tail feeds to the consecutive-
+    failure streak escalation (:func:`_maybe_escalate_growth_sweep_failures`).
+
+    Returns ``{'checked': int, 'expired': int, 'failed': bool}``.
+    """
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        return {'checked': 0, 'expired': 0, 'failed': False}
+
+    log_extra = {'project_id': project_id, 'run_id': run_id}
+    try:
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+    except Exception:
+        logger.warning(
+            '_sweep_entity_standing_decision_growth: listing active standing '
+            'decisions failed for project_id=%s (sweep did not run)',
+            project_id, extra=log_extra, exc_info=True,
+        )
+        return {'checked': 0, 'expired': 0, 'failed': True}
+
+    checked = 0
+    expired = 0
+    failed = False
+    for row in rows:
+        checked += 1
+
+        # Reconstruct the decision-time snapshot + optional per-record overrides.
+        try:
+            payload = json.loads(row.payload_json)
+            decision_count = payload['edge_count_at_decision']
+        except Exception:
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: unreadable payload/snapshot '
+                'for entity_uuid=%s project_id=%s (left active)',
+                row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+            )
+            continue
+        if not isinstance(decision_count, (int, float)):
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: non-numeric '
+                'edge_count_at_decision=%r for entity_uuid=%s project_id=%s (left active)',
+                decision_count, row.entity_uuid, project_id, extra=log_extra,
+            )
+            continue
+        factor = payload.get('growth_factor')
+        if not isinstance(factor, (int, float)):
+            factor = STANDING_DECISION_GROWTH_FACTOR
+        abs_delta = payload.get('growth_abs_delta')
+        if not isinstance(abs_delta, (int, float)):
+            abs_delta = STANDING_DECISION_GROWTH_ABS_DELTA
+
+        # Sample the live edge count — a fetch failure leaves the row ACTIVE.
+        try:
+            edges = await memory_service.graphiti.get_valid_edges_for_node(
+                row.entity_uuid, group_id=project_id
+            )
+            live = len(edges)
+        except Exception:
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: live edge fetch failed for '
+                'entity_uuid=%s project_id=%s (left active, TTL-bounded)',
+                row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+            )
+            continue
+
+        if live > decision_count * factor or live >= decision_count + abs_delta:
+            try:
+                await expire_entity_standing_decision(
+                    ledger, row, reason=EXPIRY_REASON_GROWTH
+                )
+                expired += 1
+            except Exception:
+                failed = True
+                logger.warning(
+                    '_sweep_entity_standing_decision_growth: flip to expired/growth '
+                    'failed for entity_uuid=%s project_id=%s (left active)',
+                    row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+                )
+
+    return {'checked': checked, 'expired': expired, 'failed': failed}
 
 
 async def _verify_task_count_snapshot_written(
