@@ -125,6 +125,14 @@ verify_env: {}
 # Task-phase verify rewrites cargo --workspace → cargo -p <crate> when
 # all task files live in one (or a few) workspace crates.
 scope_cargo: true
+# Cold-verify shared-venv pre-provision command (task 2997). Empty "" default =
+# no-op: the orchestrator is project-agnostic and verifies heterogeneous targets
+# (reify=cargo, autopilot-video), so the uv-workspace value lives ONLY in each
+# project's dark-factory-orchestrator.yaml, never here. When non-empty,
+# run_verification runs it ONCE per cold worktree before the test/lint/type
+# gather so the shared .venv is populated before full-repo-scope root LINT/TYPE
+# race the TEST-driven sync.
+verify_cold_preprovision_command: ""
 
 # Per-model USD price per 1M tokens, for backends without native cost
 # reporting (codex, gemini). Migrated from invoke.py's former hardcoded

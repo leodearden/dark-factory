@@ -2672,6 +2672,29 @@ class OrchestratorConfig(BaseSettings):
     # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
     # Post-merge verify always runs workspace-wide regardless.
     scope_cargo: bool = Field(default=True)
+    # Cold-verify shared-venv pre-provision command (task 2997, esc-2913-3).
+    # On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
+    # EFFECT of the TEST leg's ``cd <module> && uv run pytest``; the full-repo-
+    # scope root LINT (``uv run ruff check …``) and TYPE (``… npx pyright``)
+    # commands race that sync and fail spuriously (``Failed to spawn: ruff``;
+    # ``Import "pytest" could not be resolved``).  When non-empty,
+    # run_verification runs this command ONCE (coalesced per worktree) through
+    # ``_run_cmd`` BEFORE the concurrent test/lint/type gather, gated on
+    # ``is_cold``, so the venv is populated before the racing commands spawn.
+    #
+    # Split default: the Pydantic default is '' so every directly-constructed
+    # OrchestratorConfig (all ``_run_cmd`` test doubles) AND every unconfigured
+    # target (reify=cargo, autopilot-video) is a byte-identical no-op — the
+    # gate short-circuits on the empty command.  The deployed value
+    # (``uv sync --project shared --extra dev``) lives ONLY in
+    # dark-factory-orchestrator.yaml: the orchestrator is project-agnostic, so
+    # the ``shared`` uv-workspace assumption must NOT be hardcoded in verify.py.
+    # Mirrors the concurrent_verify / verify_cold_command_timeout_secs split-
+    # default convention.  Green-tier hot-reloadable (RELOADABLE_FIELDS, beside
+    # verify_env): read fresh each verify with no in-flight-split risk.
+    # Deliberately NOT in _OVERRIDABLE_FIELDS — it is a whole-worktree concern,
+    # not a per-module override.
+    verify_cold_preprovision_command: str = Field(default='')
 
     # Per-model USD/1M-token prices for backends without native cost
     # reporting (codex, gemini). Seeded from defaults.yaml's `prices:` block
@@ -4298,6 +4321,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_tasks',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
+        # Cold-verify shared-venv pre-provision command (task 2997) — green-tier
+        # beside verify_env: read fresh each verify (per-verify, no in-flight
+        # split), so an operator can tune or disable the pre-provision live
+        # without a restart.
+        'verify_cold_preprovision_command',
         # Per-land remote-green cross-check gate (task 2822, fix b) — green-tier
         # unlike its restart-only merge_verify_workspace/merge_verify_breadth
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
