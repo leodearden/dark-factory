@@ -49,6 +49,7 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
+from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_GROWTH,
     STATE_ACTIVE,
@@ -56,7 +57,6 @@ from fused_memory.reconciliation.standing_decision_constants import (
 from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
 )

@@ -17,13 +17,6 @@ import pytest_asyncio
 
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
-from fused_memory.reconciliation.standing_decision_constants import (
-    EXPIRY_REASON_GROWTH,
-    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
-    RECORD_KIND_ENTITY_STANDING_DECISION,
-    STATE_ACTIVE,
-    STATE_EXPIRED,
-)
 from fused_memory.reconciliation.stages import task_knowledge_sync as tks
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY,
@@ -35,6 +28,13 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _extract_growth_sweep_failed,
     _maybe_escalate_growth_sweep_failures,
     _sweep_entity_standing_decision_growth,
+)
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_GROWTH,
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
+    STATE_ACTIVE,
+    STATE_EXPIRED,
 )
 
 _PROJECT_ID = 'dark_factory'
@@ -388,7 +388,7 @@ def _stage(*, ledger=None, edges=0, raises=False, remediation=False, queue=None,
     stage = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
     stage.scope = ProjectScope(ProjectId(_PROJECT_ID), ProjectRoot('/x'))
     stage.memory = _svc(ledger, edges=edges, raises=raises) if ledger is not None else MagicMock()
-    stage.journal = journal if journal is not None else _FakeJournal([])
+    stage.journal = journal if journal is not None else _FakeJournal([])  # type: ignore[assignment]
     stage._escalation_queue = queue
     stage.remediation_mode = remediation
     return stage
@@ -404,7 +404,7 @@ class TestGrowthSweepStageWiring:
         await _seed(ledger, entity_uuid='u-w1', edge_count=10)
         stage = _stage(ledger=ledger, edges=13, queue=None)
         report = SimpleNamespace(stats={})
-        await stage._run_entity_standing_decision_growth_sweep(report, 'run-1')
+        await stage._run_entity_standing_decision_growth_sweep(report, 'run-1')  # type: ignore[arg-type]
         assert report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 0
         assert report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] == 1
         active, expired = await _states(ledger)
@@ -417,7 +417,7 @@ class TestGrowthSweepStageWiring:
         await _seed(ledger, entity_uuid='u-w2', edge_count=10)
         stage = _stage(ledger=ledger, raises=True, queue=None)
         report = SimpleNamespace(stats={})
-        await stage._run_entity_standing_decision_growth_sweep(report, 'run-1')
+        await stage._run_entity_standing_decision_growth_sweep(report, 'run-1')  # type: ignore[arg-type]
         assert report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 1
         assert report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] == 0
         active, expired = await _states(ledger)
@@ -432,7 +432,7 @@ class TestGrowthSweepStageWiring:
         monkeypatch.setattr(tks, '_maybe_escalate_growth_sweep_failures', spy)
         await _seed(ledger, entity_uuid='u-w3', edge_count=10)
         stage = _stage(ledger=ledger, raises=True, remediation=True, queue=MagicMock())
-        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-1')
+        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-1')  # type: ignore[arg-type]
         spy.assert_not_called()
 
     @pytest.mark.asyncio
@@ -442,7 +442,7 @@ class TestGrowthSweepStageWiring:
         monkeypatch.setattr(tks, '_maybe_escalate_growth_sweep_failures', spy)
         await _seed(ledger, entity_uuid='u-w4', edge_count=10)
         stage = _stage(ledger=ledger, raises=True, remediation=False, queue=None)
-        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-1')
+        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-1')  # type: ignore[arg-type]
         spy.assert_not_called()
 
     @pytest.mark.asyncio
@@ -454,7 +454,7 @@ class TestGrowthSweepStageWiring:
         await _seed(ledger, entity_uuid='u-w5', edge_count=10)
         queue = MagicMock()
         stage = _stage(ledger=ledger, raises=True, remediation=False, queue=queue)
-        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-9')
+        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-9')  # type: ignore[arg-type]
         spy.assert_called_once()
         args = spy.call_args.args
         assert args[0] is queue
