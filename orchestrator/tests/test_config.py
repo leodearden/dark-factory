@@ -2124,6 +2124,18 @@ class TestWarmLaneGcConfig:
             f'got {config.warm_lane_gc_interval_secs}'
         )
 
+    def test_lane_stale_report_days_defaults_7(self):
+        """lane_stale_report_days defaults to 7.0 days (leaf γ census threshold).
+
+        Beyond this age, a non-terminal warm-lane assignment is surfaced in the
+        digest's stale-lane census section.
+        """
+        config = OrchestratorConfig()
+        assert config.lane_stale_report_days == 7.0, (
+            f'lane_stale_report_days must default to 7.0 days; '
+            f'got {config.lane_stale_report_days}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task/2005 (config-hot-reload PRD, task alpha): RELOADABLE_FIELDS + diff_config
