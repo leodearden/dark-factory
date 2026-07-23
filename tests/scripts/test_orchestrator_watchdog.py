@@ -3172,8 +3172,11 @@ RESTART_ALL_SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
 # state["units"][UNIT], keyed by a "scenario" ("fresh" advances MainPID/
 # ActiveState/ActiveEnterTimestampMonotonic on restart, simulating a verified
 # restart; "stale" -- the default -- never advances, simulating a restart
-# that never came back up fresh). Every call is recorded into state["calls"]
-# for assertions. Verbatim reimplementation of
+# that never came back up fresh; "delayed-fresh" (task 2967) reports stale
+# for the first `fresh_after` post-restart `show` calls, then flips fresh --
+# simulating a slow-draining unit that only verifies during the
+# VERIFY_TIMEOUT grace re-probe, task 2961). Every call is recorded into
+# state["calls"] for assertions. Verbatim reimplementation of
 # scripts/tests/test_restart_all_orchestrators.py's FAKE_SYSTEMCTL_SRC.
 _BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake multi-unit `systemctl` for ε's --drain boundary scenarios."""
@@ -3221,6 +3224,9 @@ def main(argv):
                 ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
             )
             ustate["ActiveEnterTimestamp"] = "restarted"
+        elif scenario == "delayed-fresh":
+            ustate["restarted"] = True
+            ustate["post_restart_shows"] = 0
         _save(state)
         return 0
 
@@ -3242,6 +3248,15 @@ def main(argv):
                 unit = tok
                 i += 1
         ustate = state.get("units", {}).get(unit, {})
+        if ustate.get("scenario") == "delayed-fresh" and ustate.get("restarted"):
+            ustate["post_restart_shows"] = ustate.get("post_restart_shows", 0) + 1
+            if ustate["post_restart_shows"] > ustate.get("fresh_after", 0):
+                ustate["MainPID"] = ustate.get("MainPID", 1000) + 1
+                ustate["ActiveState"] = "active"
+                ustate["ActiveEnterTimestampMonotonic"] = (
+                    ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+                )
+                ustate["ActiveEnterTimestamp"] = "restarted"
         current = {
             "MainPID": str(ustate.get("MainPID", 0)),
             "ActiveState": ustate.get("ActiveState", "active"),
