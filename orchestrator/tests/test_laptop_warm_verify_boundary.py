@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -519,6 +520,129 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Task 2941 -- deterministic unit coverage for measure_uncontended_baseline_secs,
+# the same-shape uncontended-verify-merge baseline helper that replaces task
+# 2921's bare-import baseline in test_flock_wait_env_override_speeds_up_
+# contention_result below.  Both tests inject _spawn/_clock/_parse seams so
+# there is ZERO real subprocess/timing -- mirrors wait_for_marker_stable's
+# _read_mtime_ns seam (task 2819) above.
+# ---------------------------------------------------------------------------
+
+
+def measure_uncontended_baseline_secs(
+    *,
+    sha: str,
+    spec: MergeVerifySpec,
+    cfg_file: Path,
+    timeout: float = 60.0,
+    _spawn=spawn_verify_merge,
+    _clock=time.monotonic,
+    _parse=result_from_json,
+) -> float:
+    """Time a genuinely uncontended, SAME-SHAPE verify-merge end-to-end.
+
+    Spawns a verify-merge subprocess with no holder flock held (so it can
+    never contend) via the SAME spawn path, spec, and config shape as the
+    contended run under test, and returns its wall-clock duration. Unlike
+    task 2921's bare ``python -c 'from orchestrator.cli import main'``
+    baseline -- which measures only module-import cost -- this captures the
+    FULL pre-flock-wait CLI startup the contended run also pays before it
+    ever reaches the flock gate: interpreter startup, the same import, Click
+    dispatch, config load (pydantic/YAML), and GitOps construction. A
+    same-shape baseline cancels that shared startup term when subtracted
+    from the contended run's elapsed time (see
+    test_flock_wait_env_override_speeds_up_contention_result) -- but only
+    that term: because the baseline never contends, it also proceeds PAST
+    the flock gate into fast_spec's trivial build and the merge itself,
+    which the contended run never reaches (it returns immediately on
+    FLOCK_CONTENTION_CATEGORY). That post-gate build+merge work has no
+    counterpart in the contended run, so it biases the flock_component
+    discriminant downward by that (normally trivial) amount rather than
+    cancelling out.
+
+    Guards that the baseline itself never contends: a contended baseline
+    would fold a flock wait into the subtrahend and silently corrupt the
+    discriminant it feeds, so that case is a hard AssertionError rather than
+    a silently-accepted value.
+
+    The ``_spawn``/``_clock``/``_parse`` seams exist ONLY so this helper can
+    be unit-tested deterministically with zero real subprocess/timing (see
+    the two ``test_measure_uncontended_baseline_secs_*`` tests below) --
+    mirroring :func:`wait_for_marker_stable`'s ``_read_mtime_ns`` seam (task
+    2819). Production callers use the real defaults.
+    """
+    t0 = _clock()
+    proc = _spawn(
+        sha=sha, spec=spec, cfg_file=cfg_file,
+        extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
+    )
+    stdout, stderr = proc.communicate(timeout=timeout)
+    elapsed = _clock() - t0
+    assert proc.returncode == 0, (
+        f'expected the uncontended baseline probe to exit 0, got '
+        f'{proc.returncode}; stderr={stderr.decode()[:2000]!r}'
+    )
+    result = _parse(stdout.decode())
+    assert result.category != FLOCK_CONTENTION_CATEGORY, (
+        f'baseline probe unexpectedly reported flock contention '
+        f'(category={result.category!r}) -- the uncontended baseline must '
+        f'never itself contend, or its measured duration would silently '
+        f'fold a flock wait into the flock_component discriminant'
+    )
+    return elapsed
+
+
+def test_measure_uncontended_baseline_secs_returns_elapsed_for_passed_result():
+    """measure_uncontended_baseline_secs returns the _clock-measured elapsed duration.
+
+    Injects a fake proc (MagicMock) that exits 0 with empty stdout/stderr, a
+    scripted _clock yielding a start then end reading (100.0 -> 100.75), and
+    a fake _parse returning a passed-category result.  The helper must
+    return the clock delta (0.75) -- only reachable via the injected seams,
+    since nothing here touches a real subprocess or a real clock.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b'', b'')
+    clock_values = iter([100.0, 100.75])
+
+    result = measure_uncontended_baseline_secs(
+        sha='deadbeef',
+        spec=fast_spec(),
+        cfg_file=Path('unused-config.yaml'),
+        _spawn=lambda **kw: proc,
+        _clock=lambda: next(clock_values),
+        _parse=lambda _s: SimpleNamespace(category='passed'),
+    )
+
+    assert result == pytest.approx(0.75)
+
+
+def test_measure_uncontended_baseline_secs_rejects_contended_baseline():
+    """measure_uncontended_baseline_secs raises if the baseline run itself contended.
+
+    A contended baseline would fold its own flock wait into the subtrahend
+    and silently corrupt the flock_component discriminant it feeds -- so an
+    accidentally-contended baseline must be a hard AssertionError, never a
+    silently-accepted value.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.communicate.return_value = (b'', b'')
+    clock_values = iter([100.0, 100.75])
+
+    with pytest.raises(AssertionError):
+        measure_uncontended_baseline_secs(
+            sha='deadbeef',
+            spec=fast_spec(),
+            cfg_file=Path('unused-config.yaml'),
+            _spawn=lambda **kw: proc,
+            _clock=lambda: next(clock_values),
+            _parse=lambda _s: SimpleNamespace(category=FLOCK_CONTENTION_CATEGORY),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2309 step-1 RED -- env-var test seams for remote-side timing constants
 # (PRD SS11 Q1/Q2 tunability).  Production defaults are byte-identical when
 # unset; these overrides exist ONLY so the SS9 boundary rows below can run
@@ -528,7 +652,7 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(120)  # task 2921: two subprocesses now (import baseline + contended run)
+@pytest.mark.timeout(180)  # task 2941: two subprocesses now (same-shape baseline + contended run)
 def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
 
@@ -539,28 +663,50 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     under that fails until cli.py reads the override.
 
     task 2921 (load-robustness): `elapsed` (the contended-run wall-clock) is
-    DOMINATED by the child's bare ``from orchestrator.cli import main``
-    import cost (~8.7s measured on a loaded host), not the 0.5s flock wait
-    -- so any absolute ceiling below the 10s production default
-    (MERGE_VERIFY_FLOCK_WAIT_SECS) is import-bound, not flock-bound, and
-    cannot be made load-robust by widening alone (a ceiling >=
-    import_cost + 0.5 loses the un-wired-override discrimination). Instead,
-    `import_cost` measures a same-process bare-import baseline (step-7)
-    and this test asserts on `max(0, elapsed - import_cost)` -- cancelling
-    the load-sensitive import term while still catching an un-wired
-    override, which would leave the flock component at the full ~10s
-    production wait instead of the ~0.5s override.
+    dominated by the pre-flock-gate CLI startup cost, not the 0.5s flock
+    wait -- so any absolute ceiling below the 10s production default
+    (MERGE_VERIFY_FLOCK_WAIT_SECS) is startup-bound, not flock-bound, and
+    cannot be made load-robust by widening alone. This test instead
+    measures a baseline cost and asserts on
+    `max(0, elapsed - baseline_cost)` -- cancelling the load-sensitive
+    startup term while still catching an un-wired override, which would
+    leave the flock component at the full ~10s production wait instead of
+    the ~0.5s override.
 
-    task 2921 (reviewer amendment): the baseline probe runs cold, before
-    the contended run's own import benefits from a warm FS cache, and the
-    two subprocess measurements are sequential -- so under a full-suite
-    storm they can drift apart by a nontrivial fraction of a second on
-    their own. The fixed 5.0s ceiling is kept deliberately (rather than a
-    ratio of `import_cost`): the residual drift between the two
-    measurements is additive scheduler jitter, not a term proportional to
-    import_cost, so a fixed budget models it better than a ratio would,
-    and the 0.5s-honored vs ~10s-unwired gap leaves ample margin either
-    way.
+    task 2941 (baseline-shape fix): task 2921's baseline was a bare
+    ``python -c 'from orchestrator.cli import main'`` subprocess, which
+    measures ONLY module-import cost. The flock is a PRE-FLIGHT gate
+    (cli.py) the contended run reaches only AFTER interpreter startup +
+    the same import + Click dispatch + config load (pydantic/YAML) +
+    GitOps construction -- so under extreme host load those unaccounted
+    terms dominated `elapsed` while the bare-import baseline stayed low,
+    and the subtraction no longer cancelled them (the flock component
+    ballooned past the 5.0 ceiling even with the override honored).
+    `baseline_cost` is now measured via
+    :func:`measure_uncontended_baseline_secs`, a SAME-SHAPE uncontended
+    verify-merge (same spawn path, spec, and config as the contended run
+    below) that pays that same pre-flock-gate startup too, so the
+    subtraction cancels the shared startup term: an honored override
+    leaves flock_component ~= 0.0 (clamped); an un-wired override leaves
+    it at ~10s minus the shared startup tail -- load-robust and still
+    regression-catching either way. This cancellation is exact only for
+    the pre-flock-gate startup; past the flock gate the baseline (which
+    never contends) also runs fast_spec's trivial build and the merge,
+    work the contended run never reaches before returning on
+    FLOCK_CONTENTION_CATEGORY, so flock_component is biased slightly
+    downward by that (normally trivial) build+merge term -- see
+    measure_uncontended_baseline_secs's docstring.
+
+    task 2921 (reviewer amendment, still applicable to the new baseline):
+    the baseline probe runs cold, before the contended run's own startup
+    benefits from a warm FS cache, and the two subprocess measurements are
+    sequential -- so under a full-suite storm they can drift apart by a
+    nontrivial fraction of a second on their own. The fixed 5.0s ceiling is
+    kept deliberately (rather than a ratio of `baseline_cost`): the
+    residual drift between the two measurements is additive scheduler
+    jitter, not a term proportional to baseline_cost, so a fixed budget
+    models it better than a ratio would, and the 0.5s-honored vs
+    ~10s-unwired gap leaves ample margin either way.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     worktree_base = worktree_base_for(repo)
@@ -569,23 +715,20 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
 
-    # task 2921: same-process-shaped bare-import baseline, spawned BEFORE
+    # task 2941: same-shape uncontended verify-merge baseline, run BEFORE
     # the holder flock is acquired below -- measures the load-sensitive
-    # `from orchestrator.cli import main` import cost in isolation so it
-    # can be subtracted from the contended run's `elapsed` (see
-    # flock_component below).
-    import_started = time.monotonic()
-    import_proc = subprocess.Popen(
-        [sys.executable, '-c', 'from orchestrator.cli import main'],
-        env=subprocess_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    import_stdout, import_stderr = import_proc.communicate(timeout=45)
-    import_cost = time.monotonic() - import_started
-    assert import_proc.returncode == 0, (
-        f'expected the bare-import baseline probe to exit 0, got '
-        f'{import_proc.returncode}; stderr={import_stderr.decode()[:2000]!r}'
+    # pre-flock-gate CLI startup (interpreter + import + Click dispatch +
+    # config load + GitOps construction), in isolation, so it can be
+    # subtracted from the contended run's `elapsed` (see flock_component
+    # below). Because this baseline run never contends, it also proceeds
+    # past the flock gate into fast_spec's trivial build and the merge --
+    # work the contended run below never reaches -- so the subtraction is
+    # exact only for the shared startup term and is biased slightly
+    # downward by that extra (normally trivial) build+merge cost. See the
+    # helper's docstring and the "task 2941" docstring note above for the
+    # full baseline-shape rationale.
+    baseline_cost = measure_uncontended_baseline_secs(
+        sha=head_sha, spec=fast_spec(), cfg_file=cfg_file, timeout=60.0,
     )
 
     write_lock_holder_pgid(worktree_base, 999999)
@@ -603,8 +746,9 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         # task 2376: widened from 15s -- host oversubscription can delay
         # subprocess completion past a short deadline; the discriminating
         # invariant is the `flock_component < 5.0` assertion below (task
-        # 2921), not this ceiling.
-        stdout, stderr = proc.communicate(timeout=45)
+        # 2921), not this ceiling. task 2941: 45->60 for extra load headroom
+        # now that the baseline probe is a heavier cold verify-merge too.
+        stdout, stderr = proc.communicate(timeout=60)
         elapsed = time.monotonic() - started
     finally:
         with contextlib.suppress(OSError):
@@ -620,24 +764,30 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         f'expected flock-contention result, got category={result.category!r} '
         f'stdout={stdout.decode()[:2000]!r}'
     )
-    # task 2921: subtract the bare-import baseline (measured above, before
-    # the holder flock is acquired) to cancel the load-sensitive import
-    # term out of `elapsed`, isolating the flock-wait component. An honored
-    # 0.5s override keeps flock_component well under 5.0; an un-wired
-    # override leaves the full ~10s production wait (flock_component well
-    # over 5.0) -- so this discriminant is both load-robust and still
-    # catches a regression, unlike a bare absolute ceiling on `elapsed`.
-    # Clamped at 0.0: the baseline is a separate, earlier subprocess (see
-    # the docstring's "reviewer amendment" note above), so under load it
-    # can occasionally run slower than the in-run import and drive the
+    # task 2941: subtract the same-shape uncontended baseline (measured
+    # above, before the holder flock is acquired) to cancel the
+    # load-sensitive pre-flock-gate startup term out of `elapsed`,
+    # approximating the flock-wait component. (Not an exact isolation: the
+    # baseline never contends, so it also pays fast_spec's trivial
+    # build+merge past the flock gate that the contended run -- which
+    # returns immediately on contention -- never reaches; that extra,
+    # normally-trivial cost biases flock_component slightly downward. See
+    # measure_uncontended_baseline_secs's docstring.) An honored 0.5s
+    # override keeps flock_component well under 5.0; an un-wired override
+    # leaves the full ~10s production wait (flock_component well over 5.0)
+    # -- so this discriminant is both load-robust and still catches a
+    # regression, unlike a bare absolute ceiling on `elapsed`. Clamped at
+    # 0.0: the baseline is a separate, earlier subprocess (see the
+    # docstring's "reviewer amendment" note above), so under load it can
+    # occasionally run slower than the in-run startup and drive the
     # subtraction negative -- clamping keeps flock_component a well-formed
     # non-negative duration instead of a confusing negative value.
-    flock_component = max(0.0, elapsed - import_cost)
+    flock_component = max(0.0, elapsed - baseline_cost)
     assert flock_component < 5.0, (
         f'expected the flock-wait component of the contended run to be '
         f'well under the 10s production wait (env override=0.5s) once the '
-        f'import-bound baseline is subtracted out -- elapsed={elapsed:.2f}s, '
-        f'import_cost={import_cost:.2f}s, flock_component={flock_component:.2f}s; '
+        f'same-shape baseline is subtracted out -- elapsed={elapsed:.2f}s, '
+        f'baseline_cost={baseline_cost:.2f}s, flock_component={flock_component:.2f}s; '
         f'the env override is not wired up yet'
     )
 

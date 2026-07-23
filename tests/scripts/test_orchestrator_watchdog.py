@@ -3444,7 +3444,12 @@ def test_boundary3_failed_verify_leaves_clock_unchanged(tmp_path: pathlib.Path) 
 
     result = _boundary_run_drain_script(
         bin_dir, state_path, fleet_dir, clock_file,
-        env={"RESTART_VERIFY_TIMEOUT": "2"},
+        # RESTART_VERIFY_GRACE_SECS (task 2961): the real script re-probes
+        # for this many additional seconds past RESTART_VERIFY_TIMEOUT
+        # before declaring a unit failed -- kept small here so a
+        # genuinely-never-fresh unit still fails within this test's own
+        # bounded subprocess timeout.
+        env={"RESTART_VERIFY_TIMEOUT": "2", "RESTART_VERIFY_GRACE_SECS": "2"},
     )
 
     assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"

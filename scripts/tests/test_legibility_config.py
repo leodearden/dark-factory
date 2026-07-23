@@ -111,6 +111,51 @@ class TestNestedDefaults:
         assert cfg.models.census_synthesis == 'fable'
 
 
+class TestTimeouts:
+    """The ``timeouts:`` block — per-census-stage claude-CLI subprocess
+    budgets (census_mining_secs / census_verify_secs / census_synthesis_secs).
+
+    An omitted block loads with all three defaults (120/900/1800), so an
+    existing legibility.yaml that predates this block keeps working
+    unchanged — the driving acceptance criterion of the fix that gave
+    verify/synthesis their own budgets after the shared 120s coder default
+    killed the first dark_factory census.
+    """
+
+    def test_timeouts_defaults_when_block_omitted_entirely(self, tmp_path):
+        cfg = mod.load_config(_write(tmp_path, MINIMAL_YAML))
+        assert isinstance(cfg.timeouts, mod.Timeouts)
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_timeouts_defaults_when_block_present_but_empty(self, tmp_path):
+        text = MINIMAL_YAML + 'timeouts: {}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_partial_timeouts_block_keeps_other_defaults(self, tmp_path):
+        # Only census_verify_secs is overridden; mining and synthesis must
+        # still default rather than becoming required or vanishing.
+        text = MINIMAL_YAML + 'timeouts: {census_verify_secs: 1200}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_verify_secs == 1200
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_synthesis_secs == 1800
+
+    def test_full_timeouts_override_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + (
+            'timeouts: {census_mining_secs: 60, census_verify_secs: 1200, '
+            'census_synthesis_secs: 2400}\n'
+        )
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.timeouts.census_mining_secs == 60
+        assert cfg.timeouts.census_verify_secs == 1200
+        assert cfg.timeouts.census_synthesis_secs == 2400
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
@@ -236,6 +281,22 @@ class TestShippedDarkFactoryConfig:
         assert cfg.models.census_miner
         assert cfg.models.census_verify
         assert cfg.models.census_synthesis
+
+    def test_shipped_config_timeouts_set_live(self):
+        # The per-census-stage claude-CLI budgets are pinned EXPLICITLY in the
+        # shipped config, not merely riding the schema defaults, so a future
+        # change to Timeouts' defaults cannot silently alter dark_factory's
+        # census budgets. The raw-text assertion is load-bearing: the schema
+        # defaults happen to equal these values, so without an explicit
+        # ``timeouts:`` block the loaded-value asserts alone would pass on
+        # defaults — the text check is what pins the block's in-file presence.
+        raw = self.SHIPPED_CONFIG_PATH.read_text(encoding='utf-8')
+        assert 'timeouts:' in raw, 'shipped config must carry an explicit timeouts: block'
+
+        cfg = mod.load_config(self.SHIPPED_CONFIG_PATH)
+        assert cfg.timeouts.census_mining_secs == 120
+        assert cfg.timeouts.census_verify_secs == 900
+        assert cfg.timeouts.census_synthesis_secs == 1800
 
     def test_shipped_config_agent_transcript_roots_set_live(self):
         # The CRITICAL Leo ask (plans/agent-transcript-archival-prd.md, task γ):

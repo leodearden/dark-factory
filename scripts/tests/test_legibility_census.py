@@ -1451,10 +1451,73 @@ def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "run_census", raising_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    # Once main() routes fail-loud errors through escalate_fn, the failure path
+    # POSTs escalate_info; stub the single MCP boundary so this test never
+    # attempts a real localhost POST (conftest: no test hits a real endpoint).
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", lambda *a, **k: {})
 
     exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
 
     assert exit_code != 0
+
+
+def test_main_failure_files_escalation(tmp_path, monkeypatch):
+    """main()'s fail-loud catch-all must file an escalate_info via the reused
+    escalate_fn closure (PRD decision 8: degradation never silent) -- a hard
+    census failure exits non-zero AND leaves an operator signal, rather than
+    dying with only a stderr line (the silent-census incident this fixes)."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    posts = []
+
+    def rec(url, tool_name, arguments):
+        posts.append((url, tool_name, arguments))
+        return {}
+
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", rec)
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    escalations = [args for (_url, tool_name, args) in posts if tool_name == "escalate_info"]
+    assert len(escalations) == 1, "exactly one escalate_info POST for the hard failure"
+    arguments = escalations[0]
+    assert arguments["task_id"] == "legibility-census-dark_factory"
+    assert arguments["category"] == "infra_issue"
+    assert arguments["summary"] and "dark_factory" in arguments["summary"]
+    assert "codebook merge produced an invalid codebook" in arguments["detail"]
+
+
+def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, monkeypatch, caplog):
+    """The failure escalation is best-effort: if the escalation POST itself
+    raises, the closure swallows it (logging a WARNING) and main() STILL
+    returns 1 -- the escalation never masks the authoritative exit code."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    def raising_post(url, tool_name, arguments):
+        raise RuntimeError("escalation server down")
+
+    monkeypatch.setattr(mod, "_post_mcp_tool_call", raising_post)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    assert any(
+        r.levelno >= logging.WARNING for r in caplog.records
+    ), "a raising escalation poster must be logged, never propagated"
 
 
 # ---------------------------------------------------------------------------
@@ -1564,3 +1627,94 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(monkeypatch):
     assert envelope.get("method") == "tools/call"
     assert envelope.get("params", {}).get("name") == "submit_task"
     assert envelope.get("params", {}).get("arguments") == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# _build_stage_invokes — each census stage gets its OWN claude-CLI subprocess
+# timeout, threaded through the invoke(prompt, model) seam via
+# functools.partial(coder._invoke_cli, timeout=...). The shared 120s coder
+# default is fine for mining/headroom but fatal for the per-cluster Sonnet
+# verify-vs-main and the one large Fable synthesis; this is where that split
+# is bound.
+# ---------------------------------------------------------------------------
+
+def _config_with_timeouts(mining, verify, synthesis):
+    """A minimal valid LegibilityConfig carrying explicit stage timeouts."""
+    return config_mod.LegibilityConfig(
+        project_id="dark_factory",
+        project_root="/home/leo/src/dark-factory",
+        escalation_port=8103,
+        cwd_prefixes=["/home/leo/src/dark-factory"],
+        timeouts=config_mod.Timeouts(
+            census_mining_secs=mining,
+            census_verify_secs=verify,
+            census_synthesis_secs=synthesis,
+        ),
+    )
+
+
+def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
+    # Record the timeout every stage invoke threads to coder._invoke_cli.
+    recorded = []
+
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+        recorded.append(timeout)
+        return "dummy"
+
+    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
+
+    cfg = _config_with_timeouts(111, 222, 333)
+    mining, verify, synth = mod._build_stage_invokes(cfg)
+
+    # Drive each partial exactly as its census seam does: two positional
+    # args, no kwargs (invoke(prompt, model)).
+    mining("p", "haiku")
+    verify("p", "sonnet")
+    synth("p", "fable")
+
+    # Each stage's own timeout threads through, in [mining, verify, synth]
+    # order — proving every stage carries its distinct budget.
+    assert recorded == [111, 222, 333]
+
+
+def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
+    # REGRESSION for the exact bug: main() once handed the raw
+    # coder._invoke_cli (120s module default) to EVERY stage, so every
+    # per-cluster Sonnet verify-vs-main call and the large Fable synthesis
+    # call died at 120s and census-state.json never advanced. Pin that each
+    # stage now receives its own budget.
+    #
+    # DEFAULT config — NO timeouts block — so cfg.timeouts falls back to the
+    # schema defaults (120/900/1800). This is exactly the shape of a
+    # pre-existing legibility.yaml.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    recorded = []
+
+    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None):
+        recorded.append({"model": model, "timeout": timeout})
+        return '{"verified": true}'
+
+    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
+
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    # --force must never reach the gate.
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+    assert exit_code == 0
+
+    kwargs = fake_run_census.calls[0]
+
+    # (1) mining/headroom invoke -> mining budget 120 (unchanged; short calls).
+    kwargs["invoke"]("ping", "haiku")
+    assert recorded[-1] == {"model": "haiku", "timeout": 120}
+
+    # (2) verify_fn -> per-cluster Sonnet call carries 900 (was the fatal 120).
+    kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
+    assert recorded[-1] == {"model": "sonnet", "timeout": 900}
+
+    # (3) synthesize_fn -> the one large Fable call carries 1800.
+    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+    assert recorded[-1] == {"model": "fable", "timeout": 1800}

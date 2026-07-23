@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import subprocess
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -514,6 +515,44 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
 
     assert fire is True
     assert launcher_calls == [1]
+
+
+def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
+    """A non-zero census subprocess exit must be logged LOUD (naming the
+    returncode) rather than silently discarded -- the silent-census incident
+    this fixes (PRD decision 8: degradation never silent). The census files
+    its OWN escalation; the launcher's loud log is the trickle-side trace."""
+    def fake(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1)
+
+    monkeypatch.setattr(nightly.subprocess, "run", fake)
+
+    with caplog.at_level("WARNING", logger="legibility.nightly"):
+        result = nightly._default_census_launcher()
+
+    assert result is None, "the launcher never raises and returns None (never-crash-the-nightly)"
+    assert any(
+        "census" in r.getMessage() and "1" in r.getMessage()
+        for r in caplog.records if r.levelno >= logging.WARNING
+    ), "a non-zero census exit must be logged loud, naming the returncode"
+
+
+def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
+    """A zero-exit census (a deferred/no-fire outcome, or a clean run) must
+    stay quiet -- only a genuine non-zero exit gets the loud failure log."""
+    def fake0(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(nightly.subprocess, "run", fake0)
+
+    with caplog.at_level("WARNING", logger="legibility.nightly"):
+        result = nightly._default_census_launcher()
+
+    assert result is None
+    assert not any(
+        "census" in r.getMessage()
+        for r in caplog.records if r.levelno >= logging.WARNING
+    ), "a zero-exit census must not emit a census-failure warning"
 
 
 # ---------------------------------------------------------------------------

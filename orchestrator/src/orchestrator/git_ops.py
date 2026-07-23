@@ -2328,6 +2328,35 @@ class GitOps:
             )
         return predecessor_sha, predecessor.branch
 
+    async def disable_shared_repo_auto_maintenance(self) -> None:
+        """Disable git auto-gc/maintenance on this orchestrator-managed shared repo.
+
+        PRD plans/os-sandbox-worktree-containment-prd.md task α5 (D2 corollary):
+        under the OS-sandbox narrow shared-.git write-set (α2: the .git root and
+        packed-refs are read-only), background auto-gc/maintenance would fail
+        benignly-but-noisily.  Set ``gc.auto=0`` and ``maintenance.auto=false``
+        repo-locally (``.git/config``) so it never fires; gc ownership moves
+        out-of-band to the orchestrator/operator (see
+        docs/shared-repo-git-maintenance.md).
+
+        Idempotent: ``git config`` overwrites the value in place, so calling this
+        repeatedly (harness startup + every create_worktree) leaves the same
+        result.  Best-effort/loud: a non-zero git rc is logged at WARNING but
+        never raised — failing to set the key merely leaves auto-gc enabled
+        (itself only a benign-but-noisy failure), which must not block
+        orchestrator startup or a task dispatch (loud-over-silent-degradation).
+        """
+        for key, value in (('gc.auto', '0'), ('maintenance.auto', 'false')):
+            rc, _, stderr = await _run(
+                ['git', 'config', key, value], cwd=self.project_root,
+            )
+            if rc != 0:
+                logger.warning(
+                    'disable_shared_repo_auto_maintenance: failed to set '
+                    '%s=%s on %s (rc=%s): %s',
+                    key, value, self.project_root, rc, stderr.strip(),
+                )
+
     async def create_worktree(
         self,
         branch_name: str,
@@ -2368,6 +2397,15 @@ class GitOps:
             ['git', 'config', 'core.hooksPath', 'hooks'],
             cwd=self.project_root,
         )
+
+        # ── Disable auto-gc/maintenance on the shared repo ─────────────
+        # PRD os-sandbox α5 (D2 corollary): reassert gc.auto=0 /
+        # maintenance.auto=false on every worktree-create so background
+        # auto-gc never fires under the narrow shared-.git write-set (and
+        # any config drift/re-clone is re-covered).  Idempotent & best-effort
+        # (never raises) — same "safe to run every time" shape as the
+        # core.hooksPath block above.
+        await self.disable_shared_repo_auto_maintenance()
 
         # ── Resolve start-ref: train-predecessor tip or freshened main ──
         # PRD § 9.4: when a train member has order > 0, branch from the prior

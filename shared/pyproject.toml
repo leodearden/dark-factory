@@ -16,6 +16,14 @@ dependencies = [
     # pytest tests/scripts/` can collect tests/scripts/test_orchestrator_restart_config_drift.py,
     # which imports orchestrator.config (pydantic-settings-based). See task 2070.
     "pydantic-settings>=2.0",
+    # Not imported by shared/src itself. Needed so `uv run --project shared
+    # pytest tests/scripts/` can collect test_trial_module_tagger_haiku.py,
+    # which reaches orchestrator.mcp_lifecycle's module-level `import anyio`
+    # / `import httpx` via orchestrator.harness -> digest -> workflow ->
+    # agents.invoke. See task 2965 (recurrence of the same class of break as
+    # task 2070).
+    "anyio>=4.0",
+    "httpx>=0.27",
     "aiosqlite>=0.20",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
