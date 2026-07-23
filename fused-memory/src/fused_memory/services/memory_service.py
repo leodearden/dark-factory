@@ -3406,9 +3406,10 @@ class MemoryService:
         absent, the ledger is unwired, the row predates this change and
         lacks the key (legacy), or the key is present but holds a non-bool
         value (corrupted/hand-edited row) — lets Stage 3 disambiguate a
-        Stage-2-only remediation run's expected missing Stage 1
-        (``memory_consolidator``) cycle_summary from a genuine Stage 1 write
-        failure.
+        remediation run's expected missing Stage 1 (``memory_consolidator``)
+        cycle_summary — Stage 1 still runs a focused turn on such a pass and
+        may still emit findings; it only skips its own per-cycle summary
+        write, by design (task 2652) — from a genuine Stage 1 write failure.
         """
         ledger = getattr(self, 'recon_ledger', None)
         if ledger is None:

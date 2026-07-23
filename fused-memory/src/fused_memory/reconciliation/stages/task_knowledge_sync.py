@@ -2455,34 +2455,28 @@ class TaskKnowledgeSync(BaseStage):
         # Stage 1's remediation payload never asked for one. Do not "fix" this
         # to mirror Stage 1's full-cycle-only gating.
         #
-        # Data-fidelity consequence, confirmed intentional (reviewer finding
-        # robustness-data-fidelity, task 2229 amendment pass round 2): the
-        # ledger upsert's primary key is (project_id, 'cycle_summary',
-        # flag_type=stage, run_id) — it does not distinguish a full cycle
-        # from its own remediation pass(es), which share that one run_id. So
-        # a remediation pass's write REPLACES the ledger row's payload
-        # (items_flagged_count, stats, llm_calls, tokens_used) with that
-        # pass's own — typically smaller — numbers; the full cycle's numbers
-        # are not retained in the ledger once a remediation pass has run.
-        # This is intentional, not a bug: the ledger row is a single
-        # current-state control-plane record for (stage, run_id), not a
-        # per-pass audit log, so "last write wins" (see
-        # ReconLedgerStore.upsert's own docstring) is the correct semantics
-        # here. A downstream consumer that needs the full cycle's own
-        # numbers specifically — not "whatever the latest pass produced" —
-        # must not rely on the ledger row alone: the best-effort Mem0 mirror
-        # (`add_system_record` is a fresh unkeyed insert per call, unlike the
-        # ledger's upsert) retains a short per-pass history up to
-        # STAGE2_CYCLE_SUMMARY_POOL_CAP entries, oldest evicted first — but
-        # that pool is itself best-effort and bounded, not a durable audit
-        # trail either. See test_remediation_pass_overwrites_full_cycle_ledger_payload
-        # (tests/test_stages.py) for the behavior this confirms.
+        # Data-fidelity note, run_id claim corrected (task 2995): the ledger
+        # upsert's primary key is (project_id, 'cycle_summary', flag_type=stage,
+        # run_id). Each remediation pass runs under its OWN fresh run_id — a
+        # new uuid4() minted per pass in harness.py's _maybe_remediate (see
+        # `run_id = str(uuid4())` there) — NOT the parent full cycle's run_id.
+        # So in normal operation a remediation pass's Stage 2 write does not
+        # collide with, and cannot overwrite, the parent full cycle's ledger
+        # row: it upserts a brand-new row keyed on its own distinct run_id.
+        # test_remediation_pass_overwrites_full_cycle_ledger_payload
+        # (tests/test_stages.py) exercises write_cycle_summary's "last write
+        # wins" upsert semantics for two calls that are deliberately made to
+        # share one run_id (see ReconLedgerStore.upsert's own docstring for
+        # the general semantics) — it documents what the upsert does WHEN a
+        # run_id collides, not a claim that a remediation pass and its parent
+        # cycle actually share a run_id in production; they don't.
         # remediation=self.remediation_mode (task 2652): lets Stage 3
-        # distinguish a Stage-2-only remediation run's expected missing
-        # Stage 1 (memory_consolidator) cycle_summary — Stage 1 early-returns
-        # before its own write on a remediation pass, by design — from a
-        # genuine Stage 1 write failure on a full cycle. See
-        # prompts/stage3.py's Stage-2-only remediation run exception.
+        # distinguish a remediation pass's expected missing Stage 1
+        # (memory_consolidator) cycle_summary — Stage 1 still runs a focused
+        # turn and may emit findings on such a pass, but early-returns before
+        # reaching its own summary write, by design — from a genuine Stage 1
+        # write failure on a full cycle. See prompts/stage3.py's Remediation
+        # Run Exception.
         ledger_written = await write_cycle_summary(
             self.memory,
             self.project_id,
