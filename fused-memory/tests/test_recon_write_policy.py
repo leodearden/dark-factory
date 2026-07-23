@@ -198,6 +198,22 @@ class TestCheckGate1Terminal:
         assert 'set_task_status' in hint
         assert 'done_provenance' in hint
 
+    def test_terminal_hint_states_content_fields_have_no_recon_corrective_path(self):
+        """The Gate 1 hint must be honest that the done_provenance repair seam
+        is the ONLY recon-stage correction on a terminal task — load-bearing
+        string content fields (details/description/title) have NO recon-stage
+        corrective path and must be corrected via a human-gated workaround
+        task. Asserted on positive semantic substrings only (matching
+        ``test_terminal_hint_routes_to_set_task_status_done_provenance_repair``'s
+        style), to avoid a brittle wording pin: the hint must (a) name a
+        content-field example and (b) direct the caller to a human-gated
+        workaround task. This fails against the old over-promising hint (which
+        claimed the seam could 'correct done_provenance or other metadata' and
+        mentioned neither 'details' nor 'workaround')."""
+        hint = _check('update_task', live_status='done').hint
+        assert 'details' in hint
+        assert 'workaround' in hint
+
     def test_annotation_clear_exempts_done_task_from_gate_1(self):
         verdict = _check('update_task', live_status='done', is_annotation_clear=True)
         assert verdict.is_rejection is False

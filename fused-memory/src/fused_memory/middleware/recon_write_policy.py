@@ -313,11 +313,15 @@ def check(
             ),
             hint=(
                 'Terminal tasks (done, cancelled) are frozen against '
-                'recon-stage update_task writes. To correct done_provenance '
-                'or other metadata on a done task, use set_task_status('
-                'task_id, \'done\', done_provenance={\'kind\': \'merged\'|'
-                '\'found_on_main\', \'commit\': <ancestor-checked sha>}) '
-                '— a done->done repair that does not reopen the task. '
+                'recon-stage update_task writes. The ONLY recon-stage '
+                'correction on a terminal task is to done_provenance on a '
+                'done task, via set_task_status(task_id, \'done\', '
+                'done_provenance={\'kind\': \'merged\'|\'found_on_main\', '
+                '\'commit\': <ancestor-checked sha>}) — a done->done repair '
+                'that does not reopen the task and writes done_provenance '
+                'ONLY. Other terminal-task string content fields (e.g. '
+                'details, description, title) have NO recon-stage corrective '
+                'path: file a human-gated workaround task to correct them. '
                 'Note: update_task can never write done_provenance — it is '
                 'rejected for every caller by the write-authority floor.'
             ),
