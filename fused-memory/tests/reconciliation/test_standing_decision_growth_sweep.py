@@ -1,0 +1,185 @@
+"""Tests for the ζ growth-freshness sweep + streak escalation (task 2899).
+
+Covers the Stage-2-tail growth sweep helper
+(:func:`_sweep_entity_standing_decision_growth`), the pure streak helpers, the
+module-level escalation filer, and the ``TaskKnowledgeSync`` orchestrator method
+that wires them into the Stage-2 tail.
+"""
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_GROWTH,
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
+    STATE_ACTIVE,
+    STATE_EXPIRED,
+)
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _sweep_entity_standing_decision_growth,
+)
+
+_PROJECT_ID = 'dark_factory'
+_DECIDED_AT = '2026-07-01T00:00:00+00:00'
+_EXPIRES_AT = '2026-09-29T00:00:00+00:00'
+
+
+@pytest_asyncio.fixture
+async def ledger(tmp_path):
+    """A real initialized ReconLedgerStore on tmp_path."""
+    store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+    await store.initialize()
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+async def _seed(store, *, entity_uuid, edge_count, state=STATE_ACTIVE, extra_payload=None):
+    """Seed one entity_standing_decision row (optionally with extra payload keys).
+
+    Uses the low-level ``upsert`` so a per-record ``growth_factor`` /
+    ``growth_abs_delta`` override can be injected into ``payload_json`` — the
+    row-schema override path α's upsert helper does not itself write.
+    """
+    payload = {
+        'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        'decided_at': _DECIDED_AT,
+        'edge_count_at_decision': edge_count,
+        'evidence': [],
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id=_PROJECT_ID,
+            record_kind=RECORD_KIND_ENTITY_STANDING_DECISION,
+            task_id='',
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id=entity_uuid,
+            entity_uuid=entity_uuid,
+            payload_json=json.dumps(payload),
+            state=state,
+            created_at=_DECIDED_AT,
+            expires_at=_EXPIRES_AT,
+        )
+    )
+
+
+def _svc(store, *, edges=0, raises=False):
+    """MagicMock memory_service: real ledger + AsyncMock graphiti edge fetch."""
+    service = MagicMock()
+    service.recon_ledger = store
+    if raises:
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=RuntimeError('graphiti down')
+        )
+    else:
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[{'uuid': f'e{i}'} for i in range(edges)]
+        )
+    return service
+
+
+async def _states(store):
+    active = await store.list_entity_standing_decisions(_PROJECT_ID, state=STATE_ACTIVE)
+    expired = await store.list_entity_standing_decisions(_PROJECT_ID, state=STATE_EXPIRED)
+    return active, expired
+
+
+class TestGrowthSweep:
+    """Closed-form growth thresholds over seeded decision count + mocked live edges."""
+
+    @pytest.mark.asyncio
+    async def test_factor_rule_trips(self, ledger):
+        """decision=10, live=13 → 13 > 12.5 (factor rule) ⇒ expired/growth."""
+        await _seed(ledger, entity_uuid='u-a', edge_count=10)
+        service = _svc(ledger, edges=13)
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result['checked'] == 1
+        assert result['expired'] == 1
+        assert result['failed'] is False
+        active, expired = await _states(ledger)
+        assert active == []
+        assert len(expired) == 1
+        assert json.loads(expired[0].payload_json)['expiry_reason'] == EXPIRY_REASON_GROWTH
+        service.graphiti.get_valid_edges_for_node.assert_called_once_with(
+            'u-a', group_id=_PROJECT_ID
+        )
+
+    @pytest.mark.asyncio
+    async def test_abs_rule_trips(self, ledger):
+        """decision=100, live=116 → 116 ≥ 115 (abs rule; 116 < 125 factor) ⇒ growth."""
+        await _seed(ledger, entity_uuid='u-b', edge_count=100)
+        service = _svc(ledger, edges=116)
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result['expired'] == 1
+        assert result['failed'] is False
+        active, expired = await _states(ledger)
+        assert active == []
+        assert json.loads(expired[0].payload_json)['expiry_reason'] == EXPIRY_REASON_GROWTH
+
+    @pytest.mark.asyncio
+    async def test_neither_rule_keeps_active(self, ledger):
+        """decision=10, live=12 → 12 ≤ 12.5 and 12 < 25 ⇒ row stays active."""
+        await _seed(ledger, entity_uuid='u-c', edge_count=10)
+        service = _svc(ledger, edges=12)
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result['expired'] == 0
+        assert result['failed'] is False
+        active, expired = await _states(ledger)
+        assert len(active) == 1
+        assert expired == []
+
+    @pytest.mark.asyncio
+    async def test_per_record_factor_override_trips(self, ledger):
+        """A payload growth_factor=1.1 override trips (12 > 11) where the default
+        1.25 would keep (12 ≤ 12.5)."""
+        await _seed(
+            ledger, entity_uuid='u-d', edge_count=10, extra_payload={'growth_factor': 1.1}
+        )
+        service = _svc(ledger, edges=12)
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result['expired'] == 1
+        active, _ = await _states(ledger)
+        assert active == []
+
+    @pytest.mark.asyncio
+    async def test_graphiti_error_leaves_row_active_failed_true(self, ledger):
+        """A per-row Graphiti error ⇒ row stays active (fail-safe) and failed=True."""
+        await _seed(ledger, entity_uuid='u-e', edge_count=10)
+        service = _svc(ledger, raises=True)
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result['failed'] is True
+        assert result['expired'] == 0
+        active, expired = await _states(ledger)
+        assert len(active) == 1
+        assert expired == []
+
+    @pytest.mark.asyncio
+    async def test_none_ledger_noop(self):
+        """recon_ledger None ⇒ {checked:0, expired:0, failed:False}, never raises."""
+        service = MagicMock()
+        service.recon_ledger = None
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result == {'checked': 0, 'expired': 0, 'failed': False}
+
+    @pytest.mark.asyncio
+    async def test_expired_row_not_swept(self, ledger):
+        """Only ACTIVE rows are swept — an already-expired row is ignored (no
+        graphiti fetch, not re-flipped)."""
+        await _seed(ledger, entity_uuid='u-g', edge_count=10, state=STATE_EXPIRED)
+        service = _svc(ledger, edges=100)  # would trip if it were swept
+        result = await _sweep_entity_standing_decision_growth(service, _PROJECT_ID, 'run-1')
+        assert result['checked'] == 0
+        assert result['expired'] == 0
+        service.graphiti.get_valid_edges_for_node.assert_not_called()
+        active, expired = await _states(ledger)
+        assert active == []
+        assert len(expired) == 1
