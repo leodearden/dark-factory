@@ -16,6 +16,7 @@ from fused_memory.reconciliation.prompts import (
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
+    render_entity_standing_decision_schema_section,
     render_execution_class_section,
     render_source_completion_section,
 )
@@ -527,6 +528,8 @@ for it — note in your summary that it is covered by standing decision \
 ALSO presents a NEW CONCRETE FACT the standing decision could not have covered — most \
 commonly a newly cited edge uuid in its `cited_edges` — then the standing decision does \
 not apply and you should treat the finding as a normal finding and act on it.
+
+{render_entity_standing_decision_schema_section()}
 
 ## Consuming Stage 1 Refresh Failures (Task 1157)
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
