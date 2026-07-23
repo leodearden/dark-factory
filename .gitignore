@@ -13,6 +13,7 @@
 # Tracking them creates gitlink (160000) entries that conflict with
 # checkout, stash, and merge operations.
 .worktrees/
+.worktrees-orphaned/
 .eval-worktrees/
 .claude/worktrees/
 
