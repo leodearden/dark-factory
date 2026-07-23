@@ -138,11 +138,39 @@ before any write was attempted. Attempting
 
 All of the following held after the probe ran:
 
-- **`refs/heads/main` unchanged.** Pre-probe: `5c7607b6d6c050c9db58f4db84fb4e34e0ef9c20`.
-  Post-probe (`git rev-parse refs/heads/main`):
-  `5c7607b6d6c050c9db58f4db84fb4e34e0ef9c20`. Identical — the probe's own
-  in-script assertion (`assert ... == MAIN_SHA, "MAIN MOVED — abort"`) also
-  passed silently (no `AssertionError`, exit code 0).
+- **`refs/heads/main` unchanged across the probe's own execution**, checked
+  by tightly bracketing each invocation (the only valid way to test this on
+  a live fleet — see note below). Original run: pre-probe
+  `5c7607b6d6c050c9db58f4db84fb4e34e0ef9c20` → post-probe
+  `5c7607b6d6c050c9db58f4db84fb4e34e0ef9c20` (identical; the probe's own
+  in-script assertion, `assert ... == MAIN_SHA, "MAIN MOVED — abort"`, also
+  passed silently — no `AssertionError`, exit code 0). A second, independent
+  re-run performed for step-3's adversarial verification bracketed equally
+  tightly: pre-rerun `a9846130952bf633ff5c71c5caaf4e4a4f335490` → post-rerun
+  `a9846130952bf633ff5c71c5caaf4e4a4f335490` — also unchanged, and its
+  stdout was byte-for-byte identical to the original run (including row 6),
+  confirming the marker lines embedded below are the genuine, unedited
+  probe output.
+
+  > **Why the two runs show different shas, and why that's expected:**
+  > `refs/heads/main` legitimately advanced between the two runs —
+  > `5c7607b6d6c050c9db58f4db84fb4e34e0ef9c20` →
+  > `a9846130952bf633ff5c71c5caaf4e4a4f335490` — because this is an actively
+  > merging production fleet, not because row 6 succeeded. `git log
+  > 5c7607b6d6..a9846130 --oneline` shows exactly one intervening commit,
+  > `a984613095 fix(tests): disable sandbox in workflow-e2e config fixtures
+  > — unbreak main after sandbox-enablement`: a direct-to-main fix, landed by
+  > an unrelated process, with no connection to this probe. Confirmed two
+  > ways: `git merge-base --is-ancestor 5c7607b6d6 a9846130` reports the
+  > old sha is a strict linear ancestor of the new one (a forward commit, not
+  > a reset/rewrite), and `git log -g refs/heads/main` shows that sha's
+  > reflog entry is a plain `commit:` action — not an `update-ref` matching
+  > this probe's row 6 at all. **Comparing `refs/heads/main` against a sha
+  > captured much earlier in a long-running session will spuriously look
+  > like a containment failure on this fleet, for reasons entirely unrelated
+  > to containment.** The valid test always brackets tightly, immediately
+  > before and after one specific probe invocation, exactly as both runs
+  > above do — never against a stale reference point.
 - **No stray files created.** None of
   `/home/leo/src/dark-factory/CANARY-probe-2913`,
   `/home/leo/src/dark-factory-eval-worktrees/df_task_12/run-8181499e/CANARY-probe-2913`,
