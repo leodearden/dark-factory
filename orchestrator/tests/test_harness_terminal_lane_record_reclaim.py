@@ -216,3 +216,56 @@ class TestReclaimTerminalLaneRecords:
 
         released = await harness._reclaim_terminal_lane_records()
         assert released == 0
+
+    async def test_branch_ref_unresolved_skips_release(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Branch ref no longer resolves -> skip + WARN, never released.
+
+        Conservative assert-before-release: a terminal task whose branch has
+        already vanished is left for the in-memory reconciler / next acquire,
+        never silently destroyed.
+        """
+        harness, git_ops = _make_pool_harness(tmp_path)
+        _write_record(git_ops, '_lane-done', DurableLaneState.ASSIGNED, '100')
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'100': 'done'}, None)
+        )
+        harness.scheduler._dispatched = set()
+        git_ops.release_warm_lane = AsyncMock()
+        git_ops.resolve_branch_sha = AsyncMock(return_value=None)  # branch vanished
+
+        with caplog.at_level('WARNING'):
+            released = await harness._reclaim_terminal_lane_records()
+
+        assert released == 0
+        git_ops.release_warm_lane.assert_not_awaited()
+        assert _reaped_events(harness) == []
+        assert any(
+            '100' in rec.message or '_lane-done' in rec.message
+            for rec in caplog.records
+        ), 'a WARNING naming the lane/task must be logged on the skip'
+
+    async def test_branch_ref_resolved_releases_after_gate(
+        self, tmp_path: Path
+    ) -> None:
+        """Branch ref resolves -> release proceeds; gate awaited with prefixed branch."""
+        harness, git_ops = _make_pool_harness(tmp_path)
+        _write_record(git_ops, '_lane-done', DurableLaneState.ASSIGNED, '100')
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'100': 'done'}, None)
+        )
+        harness.scheduler._dispatched = set()
+        git_ops.release_warm_lane = AsyncMock()
+        git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeefcafe')
+
+        released = await harness._reclaim_terminal_lane_records()
+
+        assert released == 1
+        git_ops.release_warm_lane.assert_awaited_once_with(
+            git_ops.worktree_base / '_lane-done', '100'
+        )
+        # gate awaited with f'{branch_prefix}{task_id}' (branch_prefix default 'task/')
+        git_ops.resolve_branch_sha.assert_awaited_once_with('task/100')
