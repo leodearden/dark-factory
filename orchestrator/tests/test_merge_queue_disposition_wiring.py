@@ -756,3 +756,124 @@ class TestRunInflightVerifyBaseFactsWiring:
 
         assert captured.get('main_sha') == main_sha, captured
         assert captured.get('merge_base_sha') is None, captured
+
+
+# ---------------------------------------------------------------------------
+# Step-5 (task 2869) — _run_post_merge_verify resolves real main HEAD and
+# threads it into classification so an orphaned speculative base_sha stops
+# fabricating a false INTEGRATION_SKEW (reify esc-5260-8).
+# ---------------------------------------------------------------------------
+
+
+class TestRunPostMergeVerifyRealMainHeadFilter:
+    """_run_post_merge_verify resolves the CURRENT real main HEAD via a
+    fail-safe ``git_ops.get_main_sha()`` at classification time and threads it
+    into ``_classify_disposition_for_outcome``. main_sha stays frozen =
+    item.base_sha (a possibly ORPHANED speculative train tip); the ancestor
+    filter then prunes the orphan's dangling commits, flipping a would-be
+    false INTEGRATION_SKEW to the honest BRANCH_BUG."""
+
+    def test_orphan_speculative_base_yields_branch_bug_not_skew(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(
+            repo, 'src/x.py', 'v1', 'init x (merge-base / real fork)',
+        )
+        real_main_head = _commit_file(
+            repo, 'src/z.py', 'zzz', 'unrelated real-main advance',
+        )
+        # Orphan speculative tip off merge_base touching src/x.py, never merged
+        # onto real main (the 20-commit train tip in reify esc-5260-8).
+        subprocess.run(
+            ['git', 'checkout', '-q', '-b', 'orphan', merge_base_sha],
+            cwd=repo, check=True, capture_output=True,
+        )
+        orphan_tip = _commit_file(repo, 'src/x.py', 'v2-orphan', 'orphan speculative edit x')
+        subprocess.run(
+            ['git', 'checkout', '-q', 'main'], cwd=repo, check=True, capture_output=True,
+        )
+
+        config = _make_config(repo)
+        git_ops = _make_git_ops(repo)
+        # get_main_sha resolves the REAL main tip — which does NOT have the
+        # orphan tip as an ancestor.
+        git_ops.get_main_sha = AsyncMock(return_value=real_main_head)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req('2381', task_wt, config)
+
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        store.emit(
+            EventType.workflow_verify, task_id='2381',
+            data={'passed': True, 'base_sha': merge_base_sha, 'branch': 'task/2381'},
+        )
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=_XPY_FAILURE),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+            ):
+                return await _drive_verify_with_base_facts(
+                    req, merge_wt, git_ops,
+                    event_store=store,
+                    merge_base_sha=merge_base_sha,
+                    main_sha=orphan_tip,  # the frozen orphaned speculative base
+                )
+
+        outcome = asyncio.run(_run())
+        assert outcome is not None
+        assert outcome.disposition == MergeFailureDisposition.BRANCH_BUG, (
+            f'Expected BRANCH_BUG (orphan pruned by real-main ancestor filter); '
+            f'got {outcome.disposition!r}'
+        )
+        assert outcome.failure_diagnostic is None
+        assert 'port landed commit' not in outcome.reason, outcome.reason
+        assert 'do not hunt your own diff' not in outcome.reason, outcome.reason
+        assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
+
+    def test_classify_disposition_for_outcome_forwards_real_main_head_sha(
+        self, tmp_path: Path,
+    ) -> None:
+        """_classify_disposition_for_outcome forwards a supplied
+        real_main_head_sha into classify_merge_failure_disposition (RED today:
+        the wrapper does not accept the kwarg)."""
+        from orchestrator.merge_queue import _classify_disposition_for_outcome
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base_sha = _commit_file(repo, 'src/x.py', 'v1', 'init x')
+        config = _make_config(repo)
+        req = _make_req('2381', repo, config)
+
+        captured: dict = {}
+
+        async def _fake_classify(**kwargs):
+            captured.update(kwargs)
+            return MergeFailureDisposition.BRANCH_BUG, None
+
+        async def _run() -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+            with patch(
+                'orchestrator.merge_queue.classify_merge_failure_disposition',
+                new=_fake_classify,
+            ):
+                return await _classify_disposition_for_outcome(
+                    _XPY_FAILURE, req=req, merge_base_sha=merge_base_sha,
+                    main_sha='beadfeed', event_store=None,
+                    real_main_head_sha='realmainheadsha',
+                )
+
+        disposition, _diag, _reason_suffix = asyncio.run(_run())
+        assert captured.get('real_main_head_sha') == 'realmainheadsha', captured
+        assert disposition == MergeFailureDisposition.BRANCH_BUG

@@ -922,6 +922,7 @@ async def _classify_disposition_for_outcome(
     merge_base_sha: str,
     main_sha: str,
     event_store: EventStore | None,
+    real_main_head_sha: str | None = None,
 ) -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
     """Classify a non-preexisting merge-verify failure and render its I4
     surfaces (task 2383 β).
@@ -930,6 +931,12 @@ async def _classify_disposition_for_outcome(
     ``preexisting=False`` — I1: this is only ever reached on the non-
     preexisting bucket) and threads the result through
     ``_render_skew_surfaces``.
+
+    *real_main_head_sha* (task 2869, I6): the CURRENT real published main HEAD,
+    forwarded into the classifier's orphan/ancestor filter so an orphaned
+    speculative *main_sha* train tip never cites its dangling commits. ``None``
+    (default; caller could not resolve real main) skips the filter — today's
+    pre-2869 reference frame (fail-open, additive default).
 
     Belt-and-suspenders fail-open (I3): any exception — including one raised
     by the classifier itself, atop its own internal fail-open — is caught
@@ -943,6 +950,7 @@ async def _classify_disposition_for_outcome(
             merge_base_sha=merge_base_sha,
             main_sha=main_sha,
             preexisting=False,
+            real_main_head_sha=real_main_head_sha,
             task_id=req.task_id,
             repo_root=req.config.project_root,
             event_store=event_store,
@@ -2552,10 +2560,34 @@ async def _run_post_merge_verify(
         disposition = MergeFailureDisposition.INDETERMINATE
         failure_diagnostic: dict[str, str] | None = None
         if merge_base_sha is not None and main_sha is not None:
+            # Resolve the CURRENT real published main HEAD (task 2869, I6): the
+            # merge-skew classifier filters cited landings to ancestors of real
+            # main, so an ORPHANED speculative-train tip (main_sha=item.base_sha,
+            # frozen at dispatch, that never fast-forwarded onto real main) never
+            # cites its dangling commits as a false INTEGRATION_SKEW (reify
+            # esc-5260-8). main_sha stays frozen = item.base_sha (2357 dispatch
+            # invariant untouched); real_main_head_sha is a distinct, additional
+            # input used only for the ancestor filter. Resolved HERE (post-merge
+            # classification), NOT in _run_inflight_verify where main_sha is
+            # frozen. Fail-safe (loud-over-silent): any get_main_sha error
+            # degrades to None -> the filter is skipped (today's pre-2869
+            # reference frame), WARN-logged, never crashes classification.
+            try:
+                real_main_head_sha: str | None = (await git_ops.get_main_sha()) or None
+            except Exception:
+                real_main_head_sha = None
+                logger.warning(
+                    'Task %s: get_main_sha() failed while resolving real main '
+                    'HEAD for the merge-skew ancestor filter; degrading to None '
+                    '(filter skipped, fail-safe)',
+                    req.task_id,
+                    exc_info=True,
+                )
             disposition, failure_diagnostic, reason_suffix = (
                 await _classify_disposition_for_outcome(
                     verify, req=req, merge_base_sha=merge_base_sha,
                     main_sha=main_sha, event_store=event_store,
+                    real_main_head_sha=real_main_head_sha,
                 )
             )
             if reason_suffix:

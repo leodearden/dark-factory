@@ -865,6 +865,135 @@ class TestPhaseBackfillTerminalDepRecords:
         assert scheduler.get_task.await_count == 2
         assert ctx.terminal_dep_records == records
 
+    # --- (h) warmed record carrying delivered_checks -> re-fetched, not stale --
+
+    @pytest.mark.asyncio
+    async def test_warmed_record_carrying_delivered_checks_is_refetched_not_served_stale(
+        self, scheduler: Scheduler
+    ):
+        """Task 2977: a cached TERMINAL dep record that carries a non-empty
+        ``metadata.delivered_checks`` must be treated as a cache MISS (and
+        re-fetched) every sweep, not served straight from
+        ``_terminal_dep_record_cache`` — otherwise an operator's in-place
+        correction of a DONE dep's check descriptor at a fixed main SHA is
+        never observed, and task 2975's descriptor-digest self-heal (which
+        is computed from whatever this phase serves into
+        ``ctx.terminal_dep_records``) can never fire."""
+        stale_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [
+                    {'kind': 'grep', 'name': 'c', 'pattern': 'OLD_BAD_PATTERN'}
+                ]
+            },
+        }
+        scheduler._terminal_dep_record_cache['20'] = stale_record
+        corrected_record = {
+            'id': '20',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [
+                    {'kind': 'grep', 'name': 'c', 'pattern': 'FIXED_PATTERN'}
+                ]
+            },
+        }
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        scheduler.get_task = AsyncMock(return_value=corrected_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('20')
+        assert ctx.terminal_dep_records['20'] == corrected_record
+        assert scheduler._terminal_dep_record_cache['20'] == corrected_record
+
+    # --- (i) warmed CHECKLESS record -> still served from cache, no re-fetch --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cached_metadata',
+        [
+            {'delivered_checks': []},
+            {},  # no 'delivered_checks' key at all
+        ],
+        ids=['empty-list', 'key-absent'],
+    )
+    async def test_warmed_record_without_delivered_checks_still_served_from_cache_no_refetch(
+        self, scheduler: Scheduler, cached_metadata: dict
+    ):
+        """Boundary/regression guard pinning the cache's entire performance
+        rationale: a warmed record that carries NO delivered_checks (the
+        overwhelming common case) must still be served for free, with no
+        get_task call — this must keep passing after the task 2977 fix, or
+        that fix has become an over-broad 'always re-fetch'."""
+        cached_record = {'id': '20', 'status': 'done', 'metadata': cached_metadata}
+        scheduler._terminal_dep_record_cache['20'] = cached_record
+        dependent = self._dependent()
+        ctx = TickContext(
+            tasks=[dependent],
+            status_map={'20': 'done'},
+            tasks_by_id={'10': dependent},  # dep '20' genuinely absent
+        )
+        scheduler.get_task = AsyncMock(return_value={'id': '20', 'should': 'not-be-used'})
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_not_awaited()
+        assert ctx.terminal_dep_records['20'] is cached_record
+
+    # --- (j) budget contention: new dep_ids win over re-validation churn ---
+
+    @pytest.mark.asyncio
+    async def test_budget_prioritizes_new_dep_over_revalidation_dep(
+        self, scheduler: Scheduler
+    ):
+        """Task 2977 (reviewer_comprehensive performance amendment): when
+        the per-tick fetch budget can't cover both a genuinely-NEW dep_id
+        (never cached) and an already-warmed checks-carrying dep_id up for
+        re-validation, the new dep_id must win the budget — otherwise
+        steady-state re-validation churn of already-known checks-carrying
+        deps could chronically starve a brand-new dep out of the budget
+        tick after tick. Dep ids are chosen so plain alphabetical sort
+        ('21' < '29') would pick the WRONG (re-validation) dep first
+        without the fix, proving this isn't an accident of sort order."""
+        scheduler.config.delivered_checks.max_checks_per_tick = 1
+        stale_record = {
+            'id': '21',
+            'status': 'done',
+            'metadata': {
+                'delivered_checks': [{'kind': 'grep', 'name': 'c', 'pattern': 'OLD'}]
+            },
+        }
+        scheduler._terminal_dep_record_cache['21'] = stale_record
+        task_a = self._dependent(task_id='10', dep_id='21')  # re-validation candidate
+        task_b = self._dependent(task_id='11', dep_id='29')  # genuinely new candidate
+        ctx = TickContext(
+            tasks=[task_a, task_b],
+            status_map={'21': 'done', '29': 'done'},
+            tasks_by_id={'10': task_a, '11': task_b},  # both deps absent
+        )
+        new_record = {'id': '29', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=new_record)
+
+        result = await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert result is _CONTINUE
+        scheduler.get_task.assert_awaited_once_with('29')
+        assert ctx.terminal_dep_records == {'29': new_record}
+        assert '21' not in ctx.terminal_dep_records, (
+            'the deferred re-validation dep is not served this tick — '
+            'unchanged fail-open-on-deferral semantics, same as before task 2977'
+        )
+        # the stale cache entry is untouched (not overwritten, not evicted)
+        assert scheduler._terminal_dep_record_cache['21'] == stale_record
+
 
 # ---------------------------------------------------------------------------
 # TestSchedulerCallbacksOnDeliveredCheckBlock (task 2583 — step-3 RED / step-4 GREEN)

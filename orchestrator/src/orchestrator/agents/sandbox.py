@@ -68,7 +68,14 @@ def build_bwrap_command(
     - --tmpfs /tmp — writable tmp
     - --dev /dev — device nodes
     - --proc /proc — proc filesystem
-    - --bind $HOME/.claude — Claude Code config/OAuth (writable for session state)
+    - / is read-only; ~/.claude is read-only too except for whatever
+      subpaths are supplied here via writable_extras (e.g.
+      ~/.claude/fleet/, as computed by
+      orchestrator.agents.write_set.compute_write_set). The CLI's own
+      OAuth/session state is redirected to a per-task CLAUDE_CONFIG_DIR
+      inside the worktree (already writable via the module/.task binds),
+      so ~/.claude/settings.json stays read-only (PRD
+      deny-write-to-settings.json property).
     """
     cmd = [
         'bwrap',
@@ -92,16 +99,24 @@ def build_bwrap_command(
     os.makedirs(task_dir, exist_ok=True)
     cmd.extend(['--bind', task_dir, task_dir])
 
-    # Claude Code config/OAuth
-    claude_dir = os.path.join(os.path.expanduser('~'), '.claude')
-    if os.path.isdir(claude_dir):
-        cmd.extend(['--bind', claude_dir, claude_dir])
-
     # Extra writable directories
     if writable_extras:
         for extra in writable_extras:
             if os.path.isdir(extra):
                 cmd.extend(['--bind', extra, extra])
+            else:
+                # bwrap cannot --bind a nonexistent path, and compute_write_set
+                # is intentionally pure (no makedirs) — existence/creation is
+                # the backend's job, but this backend does not create extras
+                # (unlike the writable_modules/.task loops above, which do).
+                # Silently dropping the bind would let a requested writable
+                # path (e.g. ~/.claude/fleet on first run) go missing with no
+                # signal, contrary to the loud-over-silent-degradation norm —
+                # so surface it instead of degrading silently.
+                logger.warning(
+                    'build_bwrap_command: writable extra %r is not a directory '
+                    '— skipping bind (path missing or not created yet)', extra,
+                )
 
     cmd.append('--')
     cmd.extend(inner_cmd)

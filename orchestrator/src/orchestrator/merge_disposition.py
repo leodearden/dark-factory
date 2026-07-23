@@ -168,23 +168,94 @@ def _extract_failing_tests_and_candidate_files(
 _FULL_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 
 
+async def _is_commit_ancestor_of(
+    repo_root: Path,
+    commit: str,
+    ancestor_ref: str,
+) -> bool | None:
+    """Read-only, fail-safe ``git merge-base --is-ancestor <commit> <ancestor_ref>``.
+
+    Returns:
+        ``True``  — rc 0: *commit* is an ancestor of *ancestor_ref* (both
+                    objects resolved).
+        ``False`` — rc 1 ONLY: *commit* is DEFINITIVELY not an ancestor of
+                    *ancestor_ref* (both objects resolved, no ancestry).
+        ``None``  — any other rc (e.g. 128 = an object could not be resolved,
+                    such as an unresolvable/sentinel *ancestor_ref*), or any
+                    exception. Fail-open: an uncertain result is never read as
+                    a definitive negative, so it can never cause false pruning;
+                    never raises.
+
+    I2 (read-only): issues only ``git merge-base --is-ancestor`` — no worktree
+    add/mutation. I3 (fail-open): degrades to None on any uncertainty.
+    """
+    try:
+        rc, _stdout, _stderr = await _run(
+            ['git', 'merge-base', '--is-ancestor', commit, ancestor_ref],
+            cwd=repo_root,
+        )
+    except Exception:
+        logger.warning(
+            '_is_commit_ancestor_of: git merge-base --is-ancestor raised for '
+            'repo_root=%s (commit=%s, ancestor_ref=%s); degrading to None '
+            '(fail-safe)',
+            repo_root, commit, ancestor_ref,
+            exc_info=True,
+        )
+        return None
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    return None
+
+
 async def _implicated_landings(
     repo_root: Path,
     merge_base_sha: str,
     main_sha: str,
     candidate_files: Iterable[str],
+    real_main_head_sha: str | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Read-only ``git log --name-only`` over ``merge_base_sha..main_sha``,
     restricted to *candidate_files*, to find landings on main that touched a
     file implicated by the branch's failing tests.
 
-    I2 (read-only): issues only ``git log`` — no worktree add/mutation, no
-    verify run. 2357: ``merge_base_sha``/``main_sha`` are consumed exactly as
-    given (authoritative dispatch-time inputs) and never re-derived here.
+    I2 (read-only): issues only ``git log`` / ``git merge-base --is-ancestor``
+    — no worktree add/mutation, no verify run. 2357: ``merge_base_sha``/
+    ``main_sha`` are consumed exactly as given (authoritative dispatch-time
+    inputs) and never re-derived here.
+
+    Orphan/ancestor discriminator (task 2869, reify esc-5260-8): *main_sha* is
+    the frozen dispatch-time base (``item.base_sha``), which may be a
+    SPECULATIVE/coalesced merge-queue train tip that never fast-forwarded onto
+    real main. Walking ``merge_base_sha..main_sha`` then cites the ORPHANED
+    speculative-train commits — none of which are ancestors of the real
+    published main HEAD. When *real_main_head_sha* is supplied AND differs from
+    *main_sha*, each cited commit is filtered to ancestors of real main HEAD:
+    an orphaned speculative commit is DEFINITIVELY not an ancestor and is
+    pruned, while a genuine landing (still reachable from real main even after
+    main advances) survives. Pruning happens ONLY on a definitive
+    not-an-ancestor (``_is_commit_ancestor_of`` returns ``False``, i.e.
+    ``git merge-base --is-ancestor`` rc 1); a ``True`` or ``None`` (an
+    unresolvable/sentinel ref or a transient git error) KEEPS the commit
+    (fail-open: never falsely prune, never suppress a genuine INTEGRATION_SKEW).
+    When *real_main_head_sha* is ``None`` or ``== main_sha``, every cited
+    commit is kept — byte-identical to the pre-2869 reference frame.
+
+    This discriminates by commit SHA and so assumes a genuine landing keeps its
+    SHA on real main (the lane CAS-advances main to the exact rebased-onto-main
+    train tip via ``git_ops.advance_main``); a landing that re-lands under a NEW
+    SHA (a CAS-retry re-rebase), or a real-main read lagging a just-landed
+    commit, is conservatively pruned to BRANCH_BUG and never re-cited — the
+    opposite failure mode from the false-INTEGRATION_SKEW this filter targets.
+    See the SHA-identity note at the filter site below for the full rationale.
 
     Returns ``(implicated_commits, overlap_files)`` — empty tuples when
     *candidate_files* is empty, on any git error (non-zero exit, missing/
     non-git *repo_root*), or on any exception (fail-safe: never raises).
+    ``overlap_files`` is rebuilt from the SURVIVING commits only, so the
+    evidence stays honest after any pruning.
     """
     candidate_files = tuple(candidate_files)
     if not candidate_files:
@@ -202,18 +273,72 @@ async def _implicated_landings(
             return (), ()
 
         candidate_set = set(candidate_files)
-        implicated_commits: list[str] = []
-        overlap_files: set[str] = set()
+        # Parse the git-log output into ORDERED per-commit groups: each %H SHA
+        # line opens a new group; subsequent candidate-file lines accumulate
+        # into that group's touched-files set.
+        groups: list[tuple[str, set[str]]] = []
+        current: tuple[str, set[str]] | None = None
         for raw_line in stdout.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             if _FULL_SHA_RE.fullmatch(line):
-                if line not in implicated_commits:
-                    implicated_commits.append(line)
+                current = (line, set())
+                groups.append(current)
                 continue
-            if line in candidate_set:
-                overlap_files.add(line)
+            if line in candidate_set and current is not None:
+                current[1].add(line)
+
+        # Ancestor filter (task 2869): prune orphaned speculative-train commits
+        # that are DEFINITIVELY not ancestors of the real main HEAD. Applied
+        # only when a distinct real main HEAD is supplied; a None/definitively-
+        # negative gate never falsely prunes (fail-open, see docstring).
+        #
+        # SHA-identity assumption (reviewer_comprehensive robustness note, task
+        # 2869): this discriminates by COMMIT SHA, so it relies on a genuinely-
+        # landed change keeping the SAME SHA on real main that it carried on the
+        # speculative base walked above. The merge lane upholds this on the
+        # common path — a speculative train is built by rebasing its members
+        # onto CURRENT real main, and ``git_ops.advance_main`` CAS-advances
+        # refs/heads/main to that exact pre-computed tip SHA, so member SHAs are
+        # preserved verbatim. The lane's OWN landed-detection uses the identical
+        # test (``reconcile_landed_row`` -> ``git_ops.is_ancestor(
+        # row.advanced_sha, main_sha)``), so this filter matches the lane's
+        # definition of "landed" rather than inventing a new one.
+        #
+        # When the assumption does NOT hold, the fallback is conservative, not
+        # the bug this fix targets. If a CAS retry re-rebases a landing to a NEW
+        # advanced_sha (real main moved under the train), or ``get_main_sha()``
+        # resolves a real-main HEAD lagging a just-landed commit not yet
+        # reachable, that genuine landing's speculative SHA is correctly not an
+        # ancestor of the resolved real main and is pruned — so classify() falls
+        # through to BRANCH_BUG. That is the OPPOSITE failure mode from the
+        # original bug: it never fabricates a phantom "port landed commit X"
+        # citation for a commit that is not on real main; at worst it under-cites
+        # a genuine skew and degrades to the same "nothing implicated -> hunt
+        # your own diff" the module already emits, self-healing on the next
+        # classification once the advance/read catches up. A rebased-under-a-new-
+        # SHA landing is therefore INTENTIONALLY treated as BRANCH_BUG rather
+        # than risk re-citing a dangling SHA.
+        if real_main_head_sha and real_main_head_sha != main_sha:
+            surviving: list[tuple[str, set[str]]] = []
+            for sha, files in groups:
+                is_ancestor = await _is_commit_ancestor_of(
+                    repo_root, sha, real_main_head_sha,
+                )
+                if is_ancestor is False:
+                    continue  # definitively not on real main -> orphan, prune
+                surviving.append((sha, files))
+            groups = surviving
+
+        # Rebuild implicated_commits (ordered, deduped) and overlap_files
+        # (sorted union) from the surviving groups only.
+        implicated_commits: list[str] = []
+        overlap_files: set[str] = set()
+        for sha, files in groups:
+            if sha not in implicated_commits:
+                implicated_commits.append(sha)
+            overlap_files.update(files)
 
         return tuple(implicated_commits), tuple(sorted(overlap_files))
     except Exception:
@@ -292,20 +417,43 @@ async def classify_merge_failure_disposition(
     merge_base_sha: str,
     main_sha: str,
     preexisting: bool,
+    real_main_head_sha: str | None = None,
     task_id: str | None = None,
     repo_root: Path | None = None,
     event_store: EventStore | None = None,
 ) -> tuple[MergeFailureDisposition, SkewEvidence | None]:
     """Classify a merge-verify failure's disposition (git-only, read-only, fail-open).
 
+    Invariants (continued from the module docstring):
+      I6 — orphan/ancestor discriminator (task 2869, reify esc-5260-8):
+           implicated landings are filtered to ancestors of the CURRENT real
+           main HEAD (*real_main_head_sha*), so orphaned speculative-train
+           commits — the frozen dispatch-time *main_sha* may be a coalesced
+           merge-queue TRAIN TIP that never fast-forwarded onto real main, and
+           walking ``merge_base_sha..main_sha`` then cites its dangling
+           commits — are never cited. Filtering is purely subtractive and
+           fail-open: an emptied implicated set falls through the existing
+           ``if not implicated_commits: return BRANCH_BUG`` branch (no new
+           disposition), while ``real_main_head_sha=None`` (unresolved real
+           main) or an unresolvable/sentinel ref keeps today's pre-2869
+           reference frame (see ``_implicated_landings``). *main_sha* stays the
+           frozen dispatch-time input (2357 untouched); *real_main_head_sha* is
+           a distinct, additional input used only for the ancestor filter.
+
     Args:
         verify_result: the failing VerifyResult from the branch's merge-time verify.
         branch: the task branch name (informational; not used for git plumbing).
         merge_base_sha: merge-base(branch, main) at dispatch time (2357 constraint:
             authoritative caller-supplied input, never re-derived here).
-        main_sha: main's tip SHA at dispatch time (same constraint as above).
+        main_sha: main's tip SHA at dispatch time (same constraint as above) —
+            may be a SPECULATIVE/coalesced merge-queue train tip (item.base_sha).
         preexisting: caller-computed result of
             ``verify_failure_is_preexisting_on_main`` (I1: never re-probed here).
+        real_main_head_sha: the CURRENT real published main HEAD (I6). When
+            supplied AND != main_sha, implicated landings are filtered to
+            ancestors of it (orphaned speculative commits pruned). None (the
+            caller could not resolve real main) skips the filter -> today's
+            pre-2869 reference frame (fail-open, additive default).
         task_id: scheduler task id, used to key the I5 event-store green lookup.
             None degrades I5 to indeterminate (fail-open).
         repo_root: git repository root for read-only ``git log`` plumbing. None
@@ -341,9 +489,12 @@ async def classify_merge_failure_disposition(
         # Map candidate files to landings on main between the branch's merge-base
         # and main's tip (I2 read-only git log; 2357: both SHAs are the
         # authoritative dispatch-time inputs, consumed as-given, never
-        # re-derived here).
+        # re-derived here). I6 (task 2869): implicated landings are filtered to
+        # ancestors of the CURRENT real main HEAD, so an orphaned speculative
+        # main_sha train tip never cites its dangling commits.
         implicated_commits, overlap_files = await _implicated_landings(
             repo_root, merge_base_sha, main_sha, candidate_files,
+            real_main_head_sha=real_main_head_sha,
         )
 
         # Searched, and nothing on main touching a failing file is implicated
