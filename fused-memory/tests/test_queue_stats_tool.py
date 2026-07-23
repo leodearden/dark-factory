@@ -6,12 +6,12 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from test_backlog_policy import _seed_buffered, _StubQueue
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.durable_queue import DurableWriteQueue
-from test_backlog_policy import _StubQueue, _seed_buffered
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -200,9 +200,7 @@ class TestGetQueueStatsReconciliationBacklog:
             svc = _make_mock_service(
                 get_stats_return={'counts': {'completed': 1, 'dead': 0}},
             )
-            server = create_mcp_server(
-                svc, backlog_policy=policy, event_queue=_StubQueue(),
-            )
+            server = create_mcp_server(svc, backlog_policy=policy)
             result = await server._tool_manager.call_tool(
                 'get_queue_stats', {'project_id': 'proj'},
             )

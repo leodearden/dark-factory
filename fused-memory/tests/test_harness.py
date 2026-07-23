@@ -2538,6 +2538,7 @@ async def test_auto_unhalt_resumes_after_cooldown_expiry(
         await asyncio.wait_for(harness.run_loop(), timeout=0.5)
 
     unhalt_spy.assert_awaited()
+    assert unhalt_spy.await_args is not None
     assert unhalt_spy.await_args.args[0] == 'test-project'
     assert not harness.judge.is_halted('test-project')  # halt cleared
     assert rfc_mock.called, 'cycle must NOT be early-returned after auto-unhalt'
