@@ -213,9 +213,13 @@ class TestBuildRemoteRunnersDfCheckout:
             _make_runner_cfg('r1', df_checkout_path='/remote/df1'),
             _make_runner_cfg('r2', df_checkout_path='/remote/df2'),
         ])
+        # NO create=True: resolve_local_df_checkout is genuinely imported into
+        # merge_queue by _build_remote_runners, so the patch MUST bind to a real
+        # module attribute.  Dropping create=True makes this test fail loudly if a
+        # future refactor drops that import (the wiring guarantee it pins).
         with patch(
             'orchestrator.merge_queue.resolve_local_df_checkout',
-            return_value=sentinel, create=True,
+            return_value=sentinel,
         ) as mock_resolve:
             result = self._call(config)
 
