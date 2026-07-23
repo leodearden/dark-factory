@@ -341,3 +341,65 @@ def test_branch_ref_resolves_true_for_existing_branch(tmp_path):
 def test_branch_ref_resolves_false_for_missing_branch(tmp_path):
     repo = _init_repo(tmp_path)
     assert row.branch_ref_resolves(repo, "task/does-not-exist") is False
+
+
+# ---------------------------------------------------------------------------
+# step-9: park_commit(worktree, reason) — zero content lost
+# ---------------------------------------------------------------------------
+
+def _install_failing_precommit_hook(repo: Path) -> None:
+    """Install an always-failing pre-commit hook in the repo's COMMON git dir
+    (shared by linked worktrees), so a plain ``git commit`` would fail unless
+    ``--no-verify`` bypasses it."""
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\necho 'pre-commit rejects' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+
+def test_park_commit_commits_dirty_and_preserves_all_content(tmp_path):
+    """A dirty parking (untracked file + modified tracked file) is park-committed
+    onto its branch: a NEW commit lands, ``git status`` is EMPTY afterwards, and
+    BOTH files' content is retrievable from the branch — proving zero content
+    lost."""
+    repo = _init_repo(tmp_path)
+    name = f"2920-{TS_OLD}"
+    branch = f"task/{name}"
+    parking = _add_parking(repo, name, dirty=True, modify_tracked=True)
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    sha = row.park_commit(parking, "age")
+
+    assert sha is not None
+    head_after = _git(parking, "rev-parse", "HEAD").stdout.strip()
+    assert head_after == sha
+    assert head_after != head_before  # a new commit exists on the branch
+    assert _git(parking, "status", "--porcelain").stdout.strip() == ""
+    # Content provably recoverable from the branch ref (independent of the tree).
+    assert _git(parking, "show", f"{branch}:wip.txt").stdout == "uncommitted work\n"
+    assert _git(parking, "show", f"{branch}:README.md").stdout == "modified in parking\n"
+
+
+def test_park_commit_noop_on_clean_worktree(tmp_path):
+    """A CLEAN worktree -> park_commit is a no-op: returns None, no new commit."""
+    repo = _init_repo(tmp_path)
+    parking = _add_parking(repo, f"2920-{TS_OLD}")
+    head_before = _git(parking, "rev-parse", "HEAD").stdout.strip()
+
+    assert row.park_commit(parking, "age") is None
+
+    assert _git(parking, "rev-parse", "HEAD").stdout.strip() == head_before
+
+
+def test_park_commit_uses_no_verify_bypassing_failing_hook(tmp_path):
+    """A repo with an always-failing pre-commit hook still park-commits — proves
+    the ``--no-verify`` bypass (a parking branch must accept the snapshot
+    unconditionally)."""
+    repo = _init_repo(tmp_path)
+    _install_failing_precommit_hook(repo)
+    parking = _add_parking(repo, f"2920-{TS_OLD}", dirty=True)
+
+    sha = row.park_commit(parking, "age")
+
+    assert sha is not None, "park_commit must bypass the failing hook via --no-verify"
+    assert _git(parking, "status", "--porcelain").stdout.strip() == ""
