@@ -3172,8 +3172,11 @@ RESTART_ALL_SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
 # state["units"][UNIT], keyed by a "scenario" ("fresh" advances MainPID/
 # ActiveState/ActiveEnterTimestampMonotonic on restart, simulating a verified
 # restart; "stale" -- the default -- never advances, simulating a restart
-# that never came back up fresh). Every call is recorded into state["calls"]
-# for assertions. Verbatim reimplementation of
+# that never came back up fresh; "delayed-fresh" (task 2967) reports stale
+# for the first `fresh_after` post-restart `show` calls, then flips fresh --
+# simulating a slow-draining unit that only verifies during the
+# VERIFY_TIMEOUT grace re-probe, task 2961). Every call is recorded into
+# state["calls"] for assertions. Verbatim reimplementation of
 # scripts/tests/test_restart_all_orchestrators.py's FAKE_SYSTEMCTL_SRC.
 _BOUNDARY_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake multi-unit `systemctl` for ε's --drain boundary scenarios."""
@@ -3221,6 +3224,9 @@ def main(argv):
                 ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
             )
             ustate["ActiveEnterTimestamp"] = "restarted"
+        elif scenario == "delayed-fresh":
+            ustate["restarted"] = True
+            ustate["post_restart_shows"] = 0
         _save(state)
         return 0
 
@@ -3242,6 +3248,15 @@ def main(argv):
                 unit = tok
                 i += 1
         ustate = state.get("units", {}).get(unit, {})
+        if ustate.get("scenario") == "delayed-fresh" and ustate.get("restarted"):
+            ustate["post_restart_shows"] = ustate.get("post_restart_shows", 0) + 1
+            if ustate["post_restart_shows"] > ustate.get("fresh_after", 0):
+                ustate["MainPID"] = ustate.get("MainPID", 1000) + 1
+                ustate["ActiveState"] = "active"
+                ustate["ActiveEnterTimestampMonotonic"] = (
+                    ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+                )
+                ustate["ActiveEnterTimestamp"] = "restarted"
         current = {
             "MainPID": str(ustate.get("MainPID", 0)),
             "ActiveState": ustate.get("ActiveState", "active"),
@@ -3862,6 +3877,69 @@ def test_boundary10_recover_pending_merges_link_seam() -> None:
         "on recover_pending_merges for crash-safe recovery on boot -- it "
         "must be present and callable"
     )
+
+
+# NOTE: this test is intentionally NOT named test_boundaryN_ -- that prefix
+# is reserved for THIS PRD's own fixed 1-10 scenario numbering (see the
+# module comment above test_boundary1), which scenarios 1-10 above already
+# fully occupy. This is follow-up coverage (task 2967, from task 2961's
+# grace re-probe + a reviewer test-coverage gap), not an 11th PRD scenario.
+def test_drain_grace_reprobe_delayed_fresh_unit_verifies_and_stamps_clock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Follow-up (task 2967, from task 2961's VERIFY_TIMEOUT grace re-probe
+    + a reviewer test-coverage gap): the SUCCESSFUL grace re-probe under
+    `--drain`.
+
+    restart_and_verify()'s grace re-probe (task 2961,
+    scripts/restart-all-orchestrators.sh: "...re-probing for up to
+    ${VERIFY_GRACE}s more..." then "OK (... verified fresh during grace
+    re-probe)") is covered on the non-drain path by tests/scripts/
+    test_restart_all_orchestrators.py::
+    test_unit_fresh_only_during_grace_still_verifies_and_stamps. Scenarios
+    2-6 above cover fresh-on-first-check (test_boundary2) and never-fresh
+    (test_boundary3) under --drain, but none exercise a unit that is still
+    stale when VERIFY_TIMEOUT expires and only turns fresh during the grace
+    re-probe window while --drain is active. This closes that gap, mirroring
+    the non-drain reference test's timing (verify_timeout=1/grace=5/
+    fresh_after=2) against the boundary suite's REAL script + fake
+    multi-unit systemctl harness.
+
+    The unit's heartbeat is fresh+idle so drain_gate is transparent (returns
+    immediately with zero extra `show` calls), keeping the post-restart
+    show-counter cadence identical to the non-drain reference test.
+    """
+    fleet_dir = tmp_path / "fleet"
+    unit_r = "orchestrator-reify.service"
+    bin_dir, state_path = _boundary_make_fake_systemctl(
+        tmp_path,
+        running_units=[unit_r],
+        units={unit_r: {"scenario": "delayed-fresh", "fresh_after": 2}},
+    )
+    _boundary_write_heartbeat(fleet_dir, unit_r, merge_idle=True, ts_epoch=time.time())
+
+    clock_file = tmp_path / "clock.json"
+    assert not clock_file.exists()
+
+    result = _boundary_run_drain_script(
+        bin_dir, state_path, fleet_dir, clock_file,
+        env={"RESTART_VERIFY_TIMEOUT": "1", "RESTART_VERIFY_GRACE_SECS": "5"},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "FAILED" not in result.stdout, (
+        f"must not declare FAILED; got stdout={result.stdout!r}"
+    )
+    assert "re-probing" in result.stdout, (
+        f"expected the grace re-probe line; got stdout={result.stdout!r}"
+    )
+    state = _boundary_load_state(state_path)
+    assert ["--user", "restart", unit_r] in state["calls"], (
+        f"expected a restart call for {unit_r}; got calls={state['calls']!r}"
+    )
+    assert clock_file.exists(), "a verified-fresh drain-aware restart must stamp the clock"
+    stamped = json.loads(clock_file.read_text())
+    assert isinstance(stamped["ts"], (int, float)), f"ts must be numeric; got {stamped!r}"
 
 
 # ---------------------------------------------------------------------------
