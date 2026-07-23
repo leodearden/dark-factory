@@ -580,6 +580,24 @@ class MergeDispatchResult:
     Set on coalesce from the _InFlightEntry's stored request_id; None when
     dispatched=True or the entry predates request_id tracking."""
 
+    rejected: bool = False
+    """True when the C3 submit gate REJECTed the request: a NEWER SHA was
+    submitted for *branch* while its EARLIER SHA is already in verify
+    (PRD §5 D3).  The live in-flight entry is left undisturbed.  Mutually
+    exclusive with ``dispatched``/``in_flight`` — a rejected result is neither
+    enqueued nor coalesced."""
+    reject_code: str | None = None
+    """Machine-readable reject code (e.g. ``'duplicate_in_verify'``) when
+    ``rejected=True``; None otherwise.  Surfaced as ``code`` in the
+    escalation ``merge_request`` MCP error envelope."""
+    existing_sha: str | None = None
+    """snapshot_tip of the IN-FLIGHT entry the submission collided with (D8:
+    correlate with the existing entry, not the rejected submission).  Set on a
+    C3 reject; None otherwise."""
+    verify_age_secs: int | None = None
+    """Age in seconds of the in-flight verify at reject time, sourced from the
+    live worker snapshot entry.  Set on a C3 reject; None otherwise."""
+
 
 @dataclass
 class WaiterRecord:

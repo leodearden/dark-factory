@@ -12287,6 +12287,11 @@ class TestCoalesceOrEnqueueRegistryOnly:
             async def cleanup_merge_worktree(self, merge_wt: object) -> None:
                 pass  # never reached — find_inflight returns None
 
+            async def remove_merge_worktree_guarded(
+                self, path: Path, *, reason: str,
+            ) -> str:
+                return 'not_present'  # never reached — find_inflight returns None
+
         other_future: asyncio.Future = asyncio.get_running_loop().create_future()
 
         async def _acquirer() -> None:
