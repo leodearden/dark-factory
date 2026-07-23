@@ -201,9 +201,12 @@ class BacklogPolicy:
                 f'{backlog}/{limit}'
             ),
             detail=(
-                f'Buffered events + queue depth = {backlog}, threshold = '
-                f'{limit}. Drain the backlog (run reconciliation '
-                f'or trigger_reconciliation) before retrying.'
+                f'reconciliation_backlog (buffered events + queue depth + '
+                f'retries) = {backlog} vs threshold {limit}. Drain the backlog '
+                f'(run reconciliation or trigger_reconciliation), then confirm '
+                f"the drain via get_queue_stats(project_id='{project_id}')."
+                f'reconciliation_backlog — NOT the durable-write-queue counts, '
+                f'a different subsystem that stays ~0.'
             ),
             suggested_action='drain_reconciliation',
         )
