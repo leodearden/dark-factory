@@ -3693,9 +3693,11 @@ class TestCreateWorktreeWarmLaneRouting:
         )
 
         # Capture WARNING logs emitted DURING the exhausted second call only.
-        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            with pytest.raises(WarmLanePoolExhausted):
-                await git_ops.create_worktree('task-second')
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            pytest.raises(WarmLanePoolExhausted),
+        ):
+            await git_ops.create_worktree('task-second')
 
         # Exactly one WARNING record carries the census (keyed on the
         # contract-fixed n_pinned_non_dispatched token).
