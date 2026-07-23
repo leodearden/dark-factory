@@ -18,7 +18,7 @@ decided node.  Active rows are seeded directly via the α writer
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -150,6 +150,37 @@ class TestHookBCiteEntityAnnotation:
         result = await state.cite_entity(run_id, finding_id, 'X')
 
         assert 'standing_decision' not in result
+        resolved = state._resolve_finding(run_id, finding_id)
+        assert resolved is not None
+        _, finding = resolved
+        assert finding.standing_decision_id is None
+
+    @pytest.mark.asyncio
+    async def test_ledger_lookup_error_fails_open(self):
+        """(c) fail-open on a RAISING ledger: ANY lookup error is swallowed
+        (logged) — cite_entity returns a plain citation with no
+        ``standing_decision`` key, finding.standing_decision_id stays None, and
+        NO exception escapes (never-drops).  Guards the ``except Exception``
+        branch (recon_report.py) against a future refactor letting the error
+        escape and drop the finding — the whole risk-mitigation point of Hook B.
+        """
+        raising_ledger = Mock()
+        raising_ledger.get_active_entity_standing_decision = AsyncMock(
+            side_effect=RuntimeError('ledger boom')
+        )
+        service = _service(raising_ledger)
+        state, run_id, finding_id = _state_with_finding(service)
+
+        # Must NOT raise — the lookup error is caught and annotation skipped.
+        result = await state.cite_entity(run_id, finding_id, 'X')
+
+        # The raising lookup WAS attempted (exercises the except branch)...
+        raising_ledger.get_active_entity_standing_decision.assert_awaited_once()
+        # ...yet the citation is plain and the finding is neither annotated
+        # nor dropped.
+        assert 'standing_decision' not in result
+        assert result['entity_uuid'] == _ENTITY_UUID
+        assert result['canonical_name'] == 'X'
         resolved = state._resolve_finding(run_id, finding_id)
         assert resolved is not None
         _, finding = resolved
