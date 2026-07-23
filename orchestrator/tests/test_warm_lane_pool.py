@@ -19,7 +19,7 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
-from orchestrator.warm_lane_pool import LaneState, WarmLanePool
+from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolCensus
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -297,6 +297,82 @@ class TestAssignmentsSnapshot:
         assert snap is not pool._assignments, (
             'assignments_snapshot() must return a copy, not the live dict'
         )
+
+
+# ===========================================================================
+# Task 2984 step-01/02: WarmLanePoolCensus dataclass (pure, git-free)
+# ===========================================================================
+
+
+class TestWarmLanePoolCensus:
+    """The typed census carried on the warm-lane exhaustion path.
+
+    A frozen dataclass with six int fields whose render() emits a single-line
+    key=value string reused verbatim by both the WarmLanePoolExhausted message
+    and the EXHAUSTED-return WARNING log (single format source).
+    """
+
+    def _census(self, **overrides: int) -> WarmLanePoolCensus:
+        fields = dict(
+            size=0,
+            n_free=0,
+            n_assigned_dispatched=0,
+            n_pinned_non_dispatched=0,
+            n_unknown_dispatch=0,
+            n_quarantined=0,
+        )
+        fields.update(overrides)
+        return WarmLanePoolCensus(**fields)
+
+    def test_constructs_with_six_int_fields(self):
+        """Constructs positionally/by-keyword with the six contract-fixed int fields."""
+        census = WarmLanePoolCensus(
+            size=6,
+            n_free=1,
+            n_assigned_dispatched=2,
+            n_pinned_non_dispatched=1,
+            n_unknown_dispatch=2,
+            n_quarantined=3,
+        )
+        assert census.size == 6
+        assert census.n_free == 1
+        assert census.n_assigned_dispatched == 2
+        # n_pinned_non_dispatched is the contract-fixed literal (delivered_check anchor)
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 2
+        assert census.n_quarantined == 3
+
+    def test_render_is_single_line(self):
+        """render() returns a single-line string (no embedded newline)."""
+        rendered = self._census(size=4, n_free=4).render()
+        assert isinstance(rendered, str)
+        assert '\n' not in rendered
+
+    def test_render_contains_every_field_as_key_value_token(self):
+        """render() surfaces every field as a `name=<value>` token."""
+        census = WarmLanePoolCensus(
+            size=6,
+            n_free=1,
+            n_assigned_dispatched=2,
+            n_pinned_non_dispatched=1,
+            n_unknown_dispatch=2,
+            n_quarantined=3,
+        )
+        rendered = census.render()
+        assert 'size=6' in rendered
+        assert 'n_free=1' in rendered
+        assert 'n_assigned_dispatched=2' in rendered
+        # Explicit: the delivered_check / user-observable signal key must be present.
+        assert 'n_pinned_non_dispatched=' in rendered
+        assert 'n_pinned_non_dispatched=1' in rendered
+        assert 'n_unknown_dispatch=2' in rendered
+        assert 'n_quarantined=3' in rendered
+
+    def test_is_frozen(self):
+        """The dataclass is frozen (immutable value object)."""
+        census = self._census(size=1, n_free=1)
+        with pytest.raises((AttributeError, Exception)):
+            census.size = 99  # type: ignore[misc]
 
 
 # ===========================================================================
