@@ -508,3 +508,56 @@ def test_cli_unknown_arg_returns_2(tmp_path):
     e, t, r = _make_green_fixture(tmp_path)
     res = _run_cli(e, t, r, "--bogus-flag")
     assert res.returncode == 2, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# scripts/check_sandbox_soak.sh wrapper — arg-forwarding + exit-code passthrough
+# via a lightweight CHECK_SANDBOX_SOAK_PY stub (no uv spin-up); and the γ1
+# delivered-check contract that the STUB-NOT-IMPLEMENTED marker is gone.
+# ---------------------------------------------------------------------------
+
+WRAPPER = Path(__file__).resolve().parents[2] / "scripts" / "check_sandbox_soak.sh"
+
+
+def _make_echo_stub(tmp_path):
+    """A stub command that echoes its argv (one per line) and exits with the
+    code in $STUB_EXIT — substituted for the wrapper's python invocation."""
+    stub = tmp_path / "stub.py"
+    stub.write_text(
+        "import os, sys\n"
+        "sys.stdout.write('\\n'.join(sys.argv[1:]))\n"
+        "sys.exit(int(os.environ.get('STUB_EXIT', '0')))\n"
+    )
+    return stub
+
+
+def _run_wrapper(tmp_path, *args, stub_exit="0"):
+    stub = _make_echo_stub(tmp_path)
+    env = dict(os.environ)
+    env["CHECK_SANDBOX_SOAK_PY"] = f"{sys.executable} {stub}"
+    env["STUB_EXIT"] = stub_exit
+    return subprocess.run(
+        [str(WRAPPER), *args],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+
+
+def test_wrapper_forwards_args_and_passes_exit_0(tmp_path):
+    res = _run_wrapper(tmp_path, "--min-done", "7", "--tag", "master", stub_exit="0")
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    # The wrapper injects --repo-root <root> then forwards our args verbatim.
+    assert "--repo-root" in res.stdout
+    assert "--min-done" in res.stdout and "7" in res.stdout
+    assert "--tag" in res.stdout and "master" in res.stdout
+
+
+def test_wrapper_preserves_nonzero_exit_codes(tmp_path):
+    # Exit-code passthrough proves the always-exit-2 stub is gone.
+    assert _run_wrapper(tmp_path, stub_exit="1").returncode == 1
+    assert _run_wrapper(tmp_path, stub_exit="0").returncode == 0
+    assert _run_wrapper(tmp_path, stub_exit="2").returncode == 2
+
+
+def test_wrapper_no_longer_carries_stub_marker():
+    # γ1 delivered-check greps for the marker's absence.
+    assert "STUB-NOT-IMPLEMENTED" not in WRAPPER.read_text()
