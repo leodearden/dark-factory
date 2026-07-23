@@ -1907,17 +1907,45 @@ class VerifyRunnerPool:
         _log = logging.getLogger(__name__)
 
         selected = self._select_runner()
+
+        # INV-2 (task 2884): pre-dispatch contract-currency gate.  A RemoteRunner's
+        # verdict is adoptable only if it executed CURRENT gate logic, so bring its
+        # DF *code* checkout current before dispatch (HEAD-compare + git pull/uv
+        # sync inside sync_if_stale).  On a fail-closed sync (configured & not ok)
+        # bench the runner: quarantine it and re-select the local trust anchor when
+        # one is distinct (2-runner pools), else raise RunnerUnavailable so the
+        # single-runner production pool's caller benches + re-dispatches on a free
+        # host (merge_queue._run_inflight_verify → _finalize_inflight
+        # quarantine_and_release).  A not-configured runner (default None df paths)
+        # returns configured=False/ok=True → byte-identical to the pre-INV-2 path.
+        if isinstance(selected, RemoteRunner):
+            outcome = await selected.sync_if_stale(
+                event_store=self._event_store, task_id=self._task_id,
+            )
+            if outcome.configured and not outcome.ok:
+                self.quarantine(selected.name)
+                if self._local is not None and self._local is not selected:
+                    selected = self._local
+                else:
+                    raise RunnerUnavailable(
+                        f'runner {selected.name!r} benched: INV-2 contract-currency '
+                        f'sync failed ({outcome.detail})'
+                    )
+
         t0 = time.monotonic()
         try:
             # task-1920: thread archive_root + task_id into RemoteRunner only.
             # Existing 2-arg test doubles and LocalRunner (which archives via its own
             # constructor) are left untouched — the isinstance branch confines the
             # change to the one runner that needs it.
+            # INV-2: event_store is threaded too so run_merge_verify can emit the
+            # project-main mirror-push runner_synced event.
             if isinstance(selected, RemoteRunner):
                 result = await selected.run_merge_verify(
                     merge_sha, spec,
                     task_id=self._task_id,
                     archive_root=self._archive_root,
+                    event_store=self._event_store,
                 )
             else:
                 result = await selected.run_merge_verify(merge_sha, spec)
