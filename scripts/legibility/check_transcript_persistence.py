@@ -362,18 +362,40 @@ def find_missing_transcripts(
 # ---------------------------------------------------------------------------
 
 _FORCE_PERSISTENCE_RE = re.compile(
-    r'^[ \t]*(?:export[ \t]+)?CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=(["\']?)1\1(?![0-9])',
+    r'(?:^[ \t]*(?:export[ \t]+)?'
+    r'|(?<=[;{}])[ \t]*export[ \t]+)'
+    r'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=(["\']?)1\1(?![0-9])',
     re.MULTILINE,
 )
 """Matches ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` set to ``1`` in
 ``export VAR=1`` / plain ``VAR=1`` / quoted ``VAR="1"`` forms, while rejecting
 ``=0`` and any longer number (``=10``) via the closing backreference +
-no-trailing-digit lookahead. Anchored to an ASSIGNMENT context (line start,
-optional indentation, optional ``export`` prefix) so a commented-out or
-documentary reference (``# do NOT set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``)
-or the token embedded in a larger identifier (``FOO_CLAUDE_..._PERSISTENCE=1``)
-does NOT falsely report the preventer as present. No ``\\s*`` after ``=`` — a
-space there (``VAR= 1``) is not a valid shell assignment."""
+no-trailing-digit lookahead.
+
+Two ASSIGNMENT-context alternatives, so a commented-out or documentary
+reference (``# do NOT set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``) or the
+token embedded in a larger identifier (``FOO_CLAUDE_..._PERSISTENCE=1``) does
+NOT falsely report the preventer as present:
+
+1. Line start (optional indentation, optional ``export`` prefix) — the
+   original anchored form, for a script that sets the var on its own line.
+2. Mid-line, immediately after a ``;``, ``{``, or ``}`` boundary (optional
+   indentation), with a MANDATORY ``export`` keyword — covers a payload
+   built by string concatenation, e.g. ``skills/spawn/spawn-claude.sh``'s
+   ``${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd ...``
+   (task 2923), where the real export is neither at line start nor preceded
+   by whitespace. Requiring ``export`` (not optional, unlike alternative 1)
+   on this branch keeps a bare mid-line ``VAR=1`` embedded in prose from
+   matching, and the explicit boundary-char lookbehind keeps a ``# ...``
+   comment continuation from matching (a space is not a boundary char).
+   ``"``/``'`` are deliberately EXCLUDED from the boundary set — including
+   them would match a merely-quoted/echoed token, e.g.
+   ``echo "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"``, as if it were
+   a real export (reviewer_comprehensive/robustness, task 2923 amendment);
+   the shipped ``spawn-claude.sh`` payload only ever needs ``;``/``{``/``}``.
+
+No ``\\s*`` after ``=`` — a space there (``VAR= 1``) is not a valid shell
+assignment."""
 
 
 def payload_exports_force_persistence(script_text: str) -> bool:

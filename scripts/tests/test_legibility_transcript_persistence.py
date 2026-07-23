@@ -428,6 +428,60 @@ def test_payload_exports_force_persistence_true_for_indented_assignment():
     ) is True
 
 
+def test_payload_exports_force_persistence_true_for_midline_after_semicolon():
+    # A `;`-separated export mid-line (no line-start anchor) must still match
+    # (task 2923 regression: the line-start-only regex missed this).
+    assert mod.payload_exports_force_persistence(
+        "trap 'exit 143' TERM; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; "
+        "cd /tmp && claude\n"
+    ) is True
+
+
+def test_payload_exports_force_persistence_true_for_midline_after_interpolation():
+    # Mirrors skills/spawn/spawn-claude.sh:350's real construction: prior
+    # `${..._export}` vars (each either empty or `export VAR=val; `)
+    # concatenate directly before `export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`
+    # inside an eval'd string — neither at line start nor preceded by
+    # whitespace, just a `}` boundary from the preceding interpolation
+    # (task 2923).
+    assert mod.payload_exports_force_persistence(
+        'inner="trap foo EXIT; '
+        '${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}'
+        'export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude '
+        '$flags $q_prompt; ec=\\$?; exit \\$ec"\n'
+    ) is True
+
+
+def test_payload_exports_force_persistence_false_for_midline_without_export_keyword():
+    # Mid-line WITHOUT the `export` keyword must still be rejected — the
+    # mandatory-`export` branch exists precisely so a bare mid-line `VAR=1`
+    # substring embedded in prose can't false-positive.
+    assert mod.payload_exports_force_persistence(
+        "trap foo; CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd /tmp && claude\n"
+    ) is False
+
+
+def test_payload_exports_force_persistence_false_for_commented_midline_continuation():
+    # A comment continuing mid-line after a semicolon (a space, not a
+    # boundary char, precedes the token) must not match either.
+    assert mod.payload_exports_force_persistence(
+        "cd /tmp; # do not export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 here\n"
+    ) is False
+
+
+def test_payload_exports_force_persistence_false_for_quoted_echo():
+    # A merely-quoted/echoed token must NOT satisfy the guard — `"`/`'` are
+    # deliberately excluded from the mid-line boundary set, since including
+    # them would match an `echo "export ...=1"` that never actually exports
+    # anything (reviewer_comprehensive/robustness, task 2923 amendment).
+    assert mod.payload_exports_force_persistence(
+        'echo "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"\n'
+    ) is False
+    assert mod.payload_exports_force_persistence(
+        "echo 'export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1'\n"
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # step-11/12: escalation envelope + best-effort poster
 # ---------------------------------------------------------------------------
