@@ -54,13 +54,17 @@ emergency hotfix) it's fine to edit directly:
    ```bash
    git worktree add ../dark-factory.<short-name> -b task/<short-slug>
    ```
-2. Branch from `main` as **`task/<short-slug>` with a non-numeric slug**
-   (e.g. `task/docs-user-docs`) — the same convention `/do` and `/warm`
-   produce, and the shape `/merge-queue` expects (`merge_request` prepends
-   the configured `task/` prefix to whatever you submit). Never use a bare
-   number as the slug: numeric `task/<id>` branches are orchestrator task
-   ids, and reusing a real task's id can corrupt that task's merge
-   bookkeeping.
+2. Branch from `main`. The merge queue accepts **any** branch name — the
+   worker resolves the prefixed form (`task/<what-you-submitted>`) first
+   and falls back to the literal name — but prefer **`task/<short-slug>`
+   with a non-numeric slug** (e.g. `task/docs-user-docs`), the same
+   convention `/do` and `/warm` produce: a couple of ancillary paths (the
+   submit-time already-merged fast path, and `merge_status`'s
+   git-authority recovery tier after an orchestrator restart) derive the
+   ref by blindly prepending `task/`, so only prefixed branches get their
+   full benefit. Never use a bare number as the slug: numeric `task/<id>`
+   branches are orchestrator task ids, and reusing a real task's id can
+   corrupt that task's merge bookkeeping.
 3. Make your change, run the quality gates (§4), then merge via
    `/merge-queue` (§5) — not a direct `git merge --no-ff` into `main`
    whenever the orchestrator might be running.
@@ -180,10 +184,14 @@ the main checkout").
 
 ## 5. Git workflow
 
-- Branch from `main`. Anything you'll land via `/merge-queue` sits on a
-  `task/<short-slug>` branch with a **non-numeric** slug
-  (`task/docs-user-docs`, `task/fix-merge-liveness`, …). Numeric
-  `task/<id>` names are orchestrator task ids — treat those as reserved.
+- Branch from `main`. The merge queue merges **any** branch name (the
+  worker tries `task/<submitted>` first, then the literal name), but
+  prefer a `task/<short-slug>` branch with a **non-numeric** slug
+  (`task/docs-user-docs`, `task/fix-merge-liveness`, …) so the
+  already-merged fast path and post-restart status recovery — which
+  derive the ref by prepending `task/` — work for your branch too.
+  Numeric `task/<id>` names are orchestrator task ids — treat those as
+  reserved.
 - **Never `git stash` in the main checkout** (`/home/leo/src/dark-factory`
   or wherever `project_root` points). The merge worker's advance path
   consumes the stash stack as part of its own bookkeeping — a stash you
@@ -297,4 +305,4 @@ chore: <housekeeping>
 - **Don't use a bare task number as a branch slug**, or reuse a
   blocked/in-flight task's id for unrelated work — either can corrupt that
   task's merge bookkeeping (non-numeric `task/<slug>` branches are the
-  sanctioned interactive form — §5).
+  preferred interactive form — §5).
