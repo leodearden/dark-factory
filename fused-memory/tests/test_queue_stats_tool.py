@@ -7,8 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.durable_queue import DurableWriteQueue
+from test_backlog_policy import _StubQueue, _seed_buffered
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -164,3 +167,57 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
             assert stats_c['counts'].get('dead', 0) == dead_letters_c['counts']['durable_queue']
         finally:
             await q.close()
+
+
+# ── deliverable (b): reconciliation_backlog probe on get_queue_stats ─────────
+
+
+class TestGetQueueStatsReconciliationBacklog:
+    """get_queue_stats must expose the reconciliation event backlog — the metric
+    backlog escalations actually govern. The auto-watcher/L2 mis-triaged the
+    2026-07-20 judge-halt incident for 2 days by reading this tool's
+    durable-write-queue counts (a distinct subsystem, ~0) while the true
+    reconciliation backlog grew to 1548 (task 2920 deliverable b)."""
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_backlog_present_when_policy_wired(self, tmp_path):
+        """When a BacklogPolicy is wired and a project_id is given, the result
+        carries reconciliation_backlog == policy.current_backlog(project_id)
+        (buffered events + queue depth + retries)."""
+        buf = EventBuffer(db_path=tmp_path / 'qs_eb.db', buffer_size_threshold=100)
+        await buf.initialize()
+        try:
+            await _seed_buffered(buf, 'proj', n=5)
+            policy = BacklogPolicy(
+                buf,
+                _StubQueue(queue_depth=7, retry_in_flight=2),
+                lambda _: False,
+                hard_limit=500,
+            )
+            expected = await policy.current_backlog('proj')
+            assert expected == 5 + 7 + 2  # fixture sanity
+
+            svc = _make_mock_service(
+                get_stats_return={'counts': {'completed': 1, 'dead': 0}},
+            )
+            server = create_mcp_server(
+                svc, backlog_policy=policy, event_queue=_StubQueue(),
+            )
+            result = await server._tool_manager.call_tool(
+                'get_queue_stats', {'project_id': 'proj'},
+            )
+            assert result['reconciliation_backlog'] == expected
+            assert result['reconciliation_backlog'] == 14
+        finally:
+            await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_backlog_absent_when_no_policy(self):
+        """With no BacklogPolicy wired the field is NOT emitted — this keeps the
+        existing exact-equality scoping tests byte-identical."""
+        svc = _make_mock_service(get_stats_return=_FAKE_STATS)
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool(
+            'get_queue_stats', {'project_id': 'proj'},
+        )
+        assert 'reconciliation_backlog' not in result
