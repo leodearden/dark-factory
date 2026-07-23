@@ -7380,6 +7380,35 @@ class Harness:
         from datetime import UTC, datetime
         if self._escalation_queue is None:
             raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
+        # Task 2983 fix (b): dispatch-time double-dispatch guard.  The scheduler
+        # can re-select a deterministic task off a STALE eligibility snapshot
+        # (deterministic tasks hold no module locks and arm no requeue cooldown
+        # on a clean DONE, so nothing but the fused-memory snapshot prevents
+        # re-selection).  If the first dispatch already drove the task terminal,
+        # a fresh single-task get_status (~30ms) collapses the seconds-wide
+        # snapshot-age window: short-circuit WITHOUT constructing or invoking
+        # the runner (no second workflow, no crash-window false-positive
+        # escalation — the reported esc-2912-1 mode).  Mirrors the terminal-skip
+        # idiom in _action_teardown_and_set_status.  Fail-open: get_status
+        # returns None on a read failure/absence → not in TERMINAL_STATUSES →
+        # dispatch proceeds normally (fix (a) + the runner's own idempotency
+        # guards are the backstop, so a transient read failure never strands a
+        # legitimately-pending task).
+        current_status = await self.scheduler.get_status(assignment.task_id)
+        if current_status in TERMINAL_STATUSES:
+            logger.info(
+                'Task %s: deterministic dispatch skipped — task is already %s '
+                '(terminal) at dispatch time; no workflow started '
+                '(double-dispatch guard, task 2983)',
+                assignment.task_id, current_status,
+            )
+            return TaskReport(
+                task_id=assignment.task_id,
+                title=assignment.task.get('title', ''),
+                outcome=WorkflowOutcome.DONE,
+                completed_at=datetime.now(UTC).isoformat(),
+                block_reason='',
+            )
         runner = DeterministicRunner(
             scheduler=self.scheduler,
             escalation_queue=self._escalation_queue,

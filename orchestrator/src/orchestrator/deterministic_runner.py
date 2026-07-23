@@ -400,6 +400,52 @@ def _is_operational_llm_gate(metadata: dict) -> bool:
     return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
 
 
+def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
+    """Return True iff *task* is an already-completed scheduled self-deploy.
+
+    Task 2983 fix (a).  A deterministic self-restart deploy that took the ε
+    scheduled path completes by stamping ``before_done_scheduled_at`` and
+    setting the task ``done`` with
+    ``done_provenance.kind == 'deterministic-deploy-scheduled'`` (done =
+    *scheduled*, not *verified*; verification is out-of-band).  When a STALE
+    eligibility snapshot re-selects such a task after its first dispatch has
+    completed, ``run()`` must recognize the FRESH task shape as deploy-complete
+    rather than tripping the crash-window detector.
+
+    True iff a fresh read of *task* shows EITHER ``metadata['done_provenance']``
+    is a dict with ``kind == 'deterministic-deploy-scheduled'`` OR
+    ``metadata['before_done_scheduled_at']`` is truthy.
+
+    Fail-safe (mirrors ``harness._is_terminal_merged``'s shape): a ``None``
+    *task* (``get_task`` failure or absence) or a missing/non-dict ``metadata``
+    is treated as non-matching rather than raising — the caller then falls
+    through to the unchanged crash-window re-escalation path, so a genuine
+    crash-window is never silently dismissed.
+
+    This detects the scheduled-self-deploy SHAPE only; it deliberately does
+    NOT read ``always_escalates`` (the before_done_scheduled_at stamp is
+    written on BOTH the always_escalates=False done path AND the act-then-ask
+    always_escalates=True gate path).  A True result therefore means "drive
+    to DONE" ONLY for always_escalates=False — the caller MUST apply the
+    always_escalates policy split (re-file the milestone gate + block when
+    always_escalates=True), exactly as the (b-self) branch does; short-
+    circuiting to DONE on a bare True would bypass a still-open act-then-ask
+    gate (reviewer_comprehensive amendment, task 2983).
+    """
+    if not isinstance(task, dict):
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    provenance = metadata.get('done_provenance')
+    if (
+        isinstance(provenance, dict)
+        and provenance.get('kind') == 'deterministic-deploy-scheduled'
+    ):
+        return True
+    return bool(metadata.get('before_done_scheduled_at'))
+
+
 def build_milestone_gate_escalation_fields(
     task: dict | None, metadata: dict,
 ) -> tuple[str, str, list]:
@@ -2096,6 +2142,59 @@ class DeterministicRunner:
                         task_id,
                     )
                     return await self._file_milestone_gate_and_block(task_id, task, metadata)
+
+                # (b-self-stale) Task 2983 fix (a): the b-self branch above only
+                # fires when before_done_scheduled_at is present in the IN-HAND
+                # snapshot.  The reported incident (task 2912 / γ3 self-unit
+                # restart) re-selected this deterministic self-deploy off a
+                # STALE eligibility snapshot that carried ONLY
+                # before_done_ran_at — the scheduled stamp and the done-writeback
+                # had not yet landed when the snapshot was read — so b-self was
+                # skipped and the second dispatch fell through to the
+                # crash-window detector below, filing a born-at-L2 infra_issue
+                # false positive.  Re-read the CURRENT task (a fresh get_task,
+                # taken at execution time ~seconds later, after the first
+                # dispatch's writes landed): if it is an already-completed
+                # scheduled self-deploy, the deploy is done (scheduled) — return
+                # DONE with NO escalation and NO status write (the task is
+                # already terminal; a status write would trip the terminal-exit
+                # gate that produced the observed TerminalExitRejection).  A
+                # fresh read that is NOT scheduled-complete falls through to the
+                # unchanged re-verify/re-escalate handling below, so a genuine
+                # crash-window still re-escalates exactly as today.
+                current_task = await self.scheduler.get_task(task_id)
+                if _is_scheduled_self_deploy_complete(current_task):
+                    # Amendment (reviewer_comprehensive): the scheduled stamp is
+                    # written on BOTH the always_escalates=False path (task set
+                    # 'done' via 'deterministic-deploy-scheduled') AND the
+                    # act-then-ask always_escalates=True path (b-self above,
+                    # which RE-FILES the milestone gate and BLOCKS).  Mirror
+                    # b-self's policy split here so the DONE short-circuit
+                    # applies ONLY to the always_escalates=False shape: for an
+                    # always_escalates=True self-deploy whose fresh get_task now
+                    # carries before_done_scheduled_at, re-file the gate and
+                    # block instead of silently bypassing the still-open
+                    # act-then-ask gate with a phantom-done.
+                    if always_escalates:
+                        logger.info(
+                            'DeterministicRunner: task %s stale-snapshot '
+                            'double-dispatch of a scheduled self-deploy with '
+                            'always_escalates=True — re-filing milestone gate '
+                            '(gate not bypassed, task 2983)',
+                            task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
+                    logger.info(
+                        'DeterministicRunner: task %s double-dispatch of a '
+                        'completed scheduled self-deploy detected via fresh '
+                        'get_task — returning DONE with no escalation and no '
+                        'status write (crash-window false positive avoided, '
+                        'task 2983)',
+                        task_id,
+                    )
+                    return WorkflowOutcome.DONE
 
                 if resolution_proven:
                     # (b) A failure escalation was filed and resolved by a human.

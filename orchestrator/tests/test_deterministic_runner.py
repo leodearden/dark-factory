@@ -4150,6 +4150,220 @@ class TestBeforeDoneCrashWindow:
 
 
 @pytest.mark.asyncio
+class TestCrashWindowScheduledDoubleDispatch:
+    """Task 2983 fix (a): a double-dispatched, already-completed scheduled
+    self-deploy must NOT trip the crash-window false positive.
+
+    The reported incident (task 2912 / γ3 self-unit restart deploy): the
+    scheduler re-selected a deterministic self-deploy off a STALE eligibility
+    snapshot that carried ONLY before_done_ran_at — the before_done_scheduled_at
+    stamp and the done-writeback had not yet landed when the snapshot was read.
+    By execution time the first dispatch had completed (task 'done' with
+    done_provenance.kind='deterministic-deploy-scheduled'), but run() holds the
+    stale snapshot, so the b-self (before_done_scheduled_at) branch is skipped
+    and the second run falls through to the crash-window detector, filing a
+    born-at-L2 infra_issue false positive.
+
+    Fix (a): before re-escalating, re-read the CURRENT task via
+    scheduler.get_task and, if it is an already-completed scheduled self-deploy
+    (_is_scheduled_self_deploy_complete), treat it as deploy-complete — return
+    DONE with NO escalation and NO status write.  A fresh read that is NOT
+    scheduled-complete still re-escalates exactly as today.
+    """
+
+    def _stale_snapshot(self, task_id: str = '2912') -> dict:
+        """The stale eligibility snapshot: before_done_ran_at only (no
+        before_done_scheduled_at, no before_done_verified_at, no done_provenance).
+        """
+        return _deploy_task(
+            task_id=task_id,
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+        )
+
+    async def test_double_dispatch_via_done_provenance_returns_done_no_side_effects(
+        self, tmp_path: Path,
+    ):
+        """Fresh get_task shows status='done' + done_provenance.kind=
+        'deterministic-deploy-scheduled' → DONE, no escalation, no status write."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        snapshot = self._stale_snapshot('2912')
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)  # empty — no escalation ever filed
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read at execution time: the first dispatch already completed.
+        current_task = {
+            'id': '2912',
+            'status': 'done',
+            'metadata': {
+                'before_done_ran_at': '2026-07-23T10:00:00+00:00',
+                'done_provenance': {
+                    'kind': 'deterministic-deploy-scheduled',
+                    'unit': 'orchestrator.service',
+                },
+            },
+        }
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert queue.get_by_task('2912') == [], (
+            'a double-dispatched completed scheduled self-deploy must NOT re-escalate'
+        )
+        scheduler.set_task_status.assert_not_awaited()
+
+    async def test_double_dispatch_via_scheduled_stamp_returns_done_no_side_effects(
+        self, tmp_path: Path,
+    ):
+        """Fresh get_task carries before_done_scheduled_at → DONE, no escalation,
+        no status write (recognized via the stamp even without done_provenance)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        snapshot = self._stale_snapshot('2912')
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read carries the scheduled stamp the snapshot lacked.
+        current_task = _deploy_task(
+            task_id='2912',
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-07-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-2912.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert queue.get_by_task('2912') == []
+        scheduler.set_task_status.assert_not_awaited()
+
+    async def test_genuine_crash_window_still_reescalates_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """Negative / no-over-match: fresh get_task is NOT scheduled-complete
+        (the stale snapshot itself) → the genuine crash-window still re-escalates
+        exactly once and blocks (existing behavior preserved)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        snapshot = self._stale_snapshot('2912')
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read shows NO scheduled shape (still just the stale snapshot):
+        # a genuine crash mid-deploy before any terminal decision.
+        scheduler.get_task = AsyncMock(return_value=snapshot)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2912', status='pending')
+        assert len(pending) == 1, (
+            f'genuine crash-window must re-escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        blocked_calls = [
+            c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked'
+        ]
+        assert blocked_calls, 'genuine crash-window must leave the task blocked'
+
+    async def test_stale_redispatch_always_escalates_true_refiles_gate_not_done(
+        self, tmp_path: Path,
+    ):
+        """Amendment (reviewer_comprehensive): a STALE re-dispatch of an
+        always_escalates=True scheduled self-deploy must NOT be short-circuited
+        to DONE by the fresh-read backstop.
+
+        The before_done_scheduled_at stamp is written on BOTH the
+        always_escalates=False path (which sets the task 'done') AND the
+        act-then-ask always_escalates=True path (b-self, which re-files the
+        milestone gate and BLOCKS — the gate must not be bypassed).  When the
+        in-hand snapshot lacks the stamp (so b-self is skipped) but the fresh
+        get_task now carries before_done_scheduled_at, the DONE short-circuit
+        must apply ONLY to always_escalates=False; the act-then-ask gate must be
+        re-filed (mirroring b-self), never silently bypassed with a done write.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # Stale snapshot: before_done_ran_at only, always_escalates=True.
+        snapshot = self._stale_snapshot('2913')
+        snapshot['metadata']['always_escalates'] = True
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)  # empty — gate not yet re-observed
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read carries the scheduled stamp the snapshot lacked, still
+        # always_escalates=True (act-then-ask; the gate is NOT resolved).
+        current_task = _deploy_task(
+            task_id='2913',
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-07-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-2913.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        current_task['metadata']['always_escalates'] = True
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            'a stale re-dispatch of an always_escalates=True scheduled self-deploy '
+            'must re-file the gate and BLOCK, not return DONE'
+        )
+        pending = queue.get_by_task('2913', status='pending')
+        assert len(pending) == 1, (
+            f'the act-then-ask milestone gate must be re-filed exactly once, '
+            f'got {len(pending)}'
+        )
+        assert pending[0].category == 'milestone_gate', (
+            f'the gate re-file must be a milestone_gate, not {pending[0].category!r}'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done'
+        ]
+        assert not done_calls, (
+            'the still-open act-then-ask gate must never be bypassed with a done write'
+        )
+
+
+@pytest.mark.asyncio
 class TestCrashWindowReverify:
     """Task 2618: before re-firing 'Deploy state unknown after crash', re-run
     the read-only verify inspect against a PERSISTED verify_baseline and reuse
