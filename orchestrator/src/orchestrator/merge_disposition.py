@@ -507,6 +507,24 @@ async def classify_merge_failure_disposition(
         # -> the failure is the branch's own. (workflow_verify presence is
         # irrelevant here: with nothing on main to blame, a recorded green
         # cannot turn a branch bug into a skew.)
+        #
+        # Review note (task 2871): I7's failing_tests requirement below (see
+        # the implicated-commits branch) does NOT gate this return — a
+        # harness-ratchet/guard failure with zero parsed failing-test ids
+        # whose candidate files happen to overlap no main landing at all
+        # still resolves to BRANCH_BUG here, unconditionally on failing_tests.
+        # This is deliberate, not an oversight: I7 exists to hedge the
+        # heterogeneous true-cause ambiguity (own-diff vs main-red) that only
+        # arises once a main landing IS implicated (2871's census: 5053/5056
+        # vs 5288/5266). With NO landing implicated at all, there is nothing
+        # on main left to spuriously blame, so the branch's own diff is the
+        # only remaining candidate cause and BRANCH_BUG stays the correct
+        # fail-open default regardless of failing_tests. Precisely
+        # discriminating a genuine own-diff guard trip from a mis-extracted
+        # candidate-file false negative here would need guard-text detection
+        # (e.g. recognizing kLOC-cap/baseline-manifest guard output
+        # specifically) — a separate, not-yet-scoped follow-up, not a gap in
+        # this task's I7 fix.
         if not implicated_commits:
             return (MergeFailureDisposition.BRANCH_BUG, None)
 
