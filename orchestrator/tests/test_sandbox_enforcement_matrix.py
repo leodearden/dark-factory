@@ -321,3 +321,36 @@ class TestSandboxEnforcementMatrix:
         )
         for token in noise_tokens:
             assert token not in result.stderr, result.stderr
+
+    # -- Group 4: child-tree + uv-cache (rows 7/8) ------------------------
+
+    def test_row07_child_writes_task_meta_via_symlink(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        inner = [
+            '/bin/sh', '-c',
+            f"/bin/sh -c 'printf PLAN > {scaffold.plan_symlink}'",
+        ]
+        result = _run_sandboxed(scaffold, inner)
+        assert result.returncode == 0, result.stderr
+        assert scaffold.plan_target.read_text() == 'PLAN'
+
+    def test_row08_uv_cache_writable_data_ro(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        probe = uuid.uuid4().hex
+        cache_marker = scaffold.uv_cache / probe
+        data_marker = scaffold.uv_data / probe
+        inner = [
+            '/bin/sh', '-c',
+            (
+                f'(touch {cache_marker} 2>/dev/null && echo cache_ok || echo cache_denied) && '
+                f'(touch {data_marker} 2>/dev/null && echo data_ok || echo data_denied) && '
+                'echo end'
+            ),
+        ]
+        result = _run_sandboxed(scaffold, inner)
+        assert result.returncode == 0, result.stderr
+        assert 'end' in result.stdout
+        assert 'cache_ok' in result.stdout, result.stdout
+        assert cache_marker.exists()
+        assert 'data_denied' in result.stdout, result.stdout
+        assert not data_marker.exists()
