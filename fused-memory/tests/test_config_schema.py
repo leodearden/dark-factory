@@ -28,6 +28,7 @@ from fused_memory.config.schema import (
     TaskStatusConfig,
     YamlSettingsSource,
 )
+from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
 
 
@@ -1266,3 +1267,61 @@ class TestProceduralTopicGuardClustersDefault:
             assert isinstance(cluster, ProceduralTopicCluster)
             assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
             assert cluster.min_phrase_hits >= 1
+
+
+class TestReportTaskAlreadyDoneMainReachabilityCluster:
+    """Topic-guard cluster for the architect report_task_already_done /
+    main-reachable-commit family (gate task 3011, still open -- its 12-entry
+    cluster awaits a consolidation ruling). Registered prospectively so the
+    cluster stops growing while 3011 is parked; see the guard's other
+    known-contradictory seeds (plan-tools, venv-shadowing) above.
+    """
+
+    def test_cluster_present_with_expected_phrases_and_hint(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(
+            c
+            for c in clusters
+            if c.topic_id == 'architect-report-task-already-done-main-reachability'
+        )
+        assert cluster.phrases == [
+            'report_task_already_done',
+            'main-reachable',
+            'merge-base --is-ancestor',
+            '_handle_already_done_report',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert '3011' in cluster.hint
+        assert 'Do NOT add another entry' in cluster.hint
+
+    def test_matches_representative_near_duplicate_note(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(
+            c
+            for c in clusters
+            if c.topic_id == 'architect-report-task-already-done-main-reachability'
+        )
+        note = (
+            'The architect report_task_already_done requires a main-reachable '
+            'commit, verified via git merge-base --is-ancestor by '
+            '_handle_already_done_report.'
+        )
+        result = find_matching_topic_cluster(note, [cluster])
+        assert result is not None
+        assert result[0].topic_id == 'architect-report-task-already-done-main-reachability'
+
+    def test_does_not_match_unrelated_merge_base_note(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(
+            c
+            for c in clusters
+            if c.topic_id == 'architect-report-task-already-done-main-reachability'
+        )
+        # Only 'merge-base --is-ancestor' occurs here (1 distinct hit) -- a
+        # plain git-ancestry-check note unrelated to report_task_already_done
+        # must NOT reach min_phrase_hits and mis-route to gate 3011.
+        unrelated_note = (
+            'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+            'commit is an ancestor of a branch tip before cherry-picking.'
+        )
+        assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
