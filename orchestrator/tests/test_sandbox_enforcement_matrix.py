@@ -29,7 +29,12 @@ matching rationale at its ``TestLandlockEnforcement`` docstring).
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -37,7 +42,29 @@ import pytest
 from orchestrator.agents.landlock import (
     _reset_probe as _landlock_reset_probe,
 )
-from orchestrator.agents.landlock import is_landlock_available
+from orchestrator.agents.landlock import build_landlock_command, is_landlock_available
+from orchestrator.agents.write_set import compute_write_set
+
+# subprocess timeout for each sandboxed inner command — comfortably under
+# this suite's 60s per-test pytest-timeout even accounting for scaffold
+# setup (real git init/worktree-add), matching test_landlock.py's own
+# bounded subprocess.run calls.
+_RUN_TIMEOUT = 30
+
+# Denial rows accept EITHER EACCES (landlock) or EROFS (bwrap) as a
+# permission-error-class signal (PRD D9: denial errno is backend-specific;
+# assertions must say "permission error", not a single errno). This suite
+# only ever drives the landlock backend directly (build_landlock_command),
+# so only EACCES-shaped messages are actually reachable here, but the
+# tolerant token list keeps the shared helper's contract aligned with the
+# PRD wording rather than hardcoding one backend's errno.
+_PERMISSION_SIGNALS = (
+    'Permission denied',
+    'Read-only file system',
+    'Operation not permitted',
+    'EACCES',
+    'EROFS',
+)
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +73,130 @@ def _reset_landlock_probe():
     _landlock_reset_probe()
     yield
     _landlock_reset_probe()
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    """Run a git command in ``cwd``, returning stripped stdout.
+
+    Raises ``RuntimeError`` (naming the failed command) on non-zero exit —
+    every call site here is scaffold setup or a post-run assertion that is
+    expected to succeed outside the sandbox (reads/writes as the real
+    test-runner user, never itself sandboxed).
+    """
+    result = subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'git {args} failed in {cwd}: {result.stderr}')
+    return result.stdout.strip()
+
+
+@dataclass
+class _Scaffold:
+    """A realistic linked-worktree environment for one enforcement-matrix row,
+    built entirely under ``/var/tmp`` by the ``landlock_matrix_scaffold``
+    fixture (grown incrementally alongside the row groups that need each
+    field).
+    """
+
+    base: Path
+    main: Path
+    worktree: Path
+    name: str
+    home: Path
+    task_meta: Path
+
+
+def _run_sandboxed(
+    scaffold: _Scaffold, inner_cmd: list[str], *, cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
+    """Run ``inner_cmd`` landlock-sandboxed, mirroring workflow.py:9911-9914
+    exactly: derive the write-set from the scaffold's worktree/home via the
+    real ``compute_write_set()``, feed its ``writable_paths()`` into
+    ``build_landlock_command()`` as ``writable_extras`` (never a hand-rolled
+    path list — INV-5), and run with ``HOME`` redirected to the scaffold's
+    hermetic fake home.
+    """
+    write_set = compute_write_set(scaffold.worktree, home=scaffold.home)
+    cmd = build_landlock_command(
+        inner_cmd, scaffold.worktree, [],
+        writable_extras=[str(p) for p in write_set.writable_paths()],
+    )
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd or scaffold.worktree),
+        env={**os.environ, 'HOME': str(scaffold.home)},
+        capture_output=True,
+        text=True,
+        timeout=_RUN_TIMEOUT,
+    )
+
+
+def _assert_denied(result: subprocess.CompletedProcess, *, side_effect_verified: bool) -> None:
+    """Assert ``result`` represents a denied write.
+
+    Primary signal (mandatory): non-zero exit. Secondary signal: EITHER a
+    permission-error-class token appears in stderr, OR the caller has
+    already verified the deterministic side effect itself (target absent /
+    ref byte-unchanged) and passes ``side_effect_verified=True`` — per PRD
+    D9 the denial errno is backend-specific, so the side-effect check is
+    the robust primary pin and the stderr token match is a tolerant bonus.
+    """
+    assert result.returncode != 0, (
+        f'expected denial (non-zero exit); got 0. '
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    permission_signal = any(tok in result.stderr for tok in _PERMISSION_SIGNALS)
+    assert permission_signal or side_effect_verified, (
+        f'expected a permission-error-class signal in stderr or a '
+        f'caller-verified side effect; stderr={result.stderr!r}'
+    )
+
+
+@pytest.fixture
+def landlock_matrix_scaffold():
+    """Build a realistic linked-worktree environment under ``/var/tmp``.
+
+    BASE layout (grown per row group across this suite's paired impl
+    steps): a real ``git init`` main repo with one seed commit and
+    repo-local identity; a real linked worktree created via
+    ``git worktree add -b task/<name> <base>/<name> main`` (so its
+    ``.git`` gitdir file is exactly what ``compute_write_set`` parses in
+    production); ``<base>/.task-meta/<name>/`` (the writable task-meta
+    carve-out, via the same path shape ``TaskArtifacts.meta_root_for``
+    owns); and a hermetic fake ``HOME`` with ``~/.cache/uv/`` seeded so the
+    uv-cache carve-out is grantable at wrap time.
+
+    Built under ``/var/tmp`` (never ``/tmp`` — see module docstring) via
+    ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
+    test outcome.
+    """
+    base = Path(tempfile.mkdtemp(prefix='landlock-matrix-', dir='/var/tmp'))
+    try:
+        main = base / 'main'
+        main.mkdir()
+        _git(['init', '-b', 'main'], main)
+        _git(['config', 'user.email', 'landlock-matrix@test.local'], main)
+        _git(['config', 'user.name', 'Landlock Matrix Test'], main)
+        (main / 'README.md').write_text('seed\n')
+        _git(['add', '-A'], main)
+        _git(['commit', '-m', 'seed commit'], main)
+
+        name = 'wt-a'
+        worktree = base / name
+        _git(['worktree', 'add', '-b', f'task/{name}', str(worktree), 'main'], main)
+
+        task_meta = base / '.task-meta' / name
+        task_meta.mkdir(parents=True)
+
+        home = base / 'home'
+        home.mkdir()
+        (home / '.cache' / 'uv').mkdir(parents=True)
+
+        yield _Scaffold(
+            base=base, main=main, worktree=worktree, name=name, home=home,
+            task_meta=task_meta,
+        )
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 @pytest.mark.skipif(
