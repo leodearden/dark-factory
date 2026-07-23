@@ -305,6 +305,11 @@ class _Finding:
     cited_tasks: list[dict] = field(default_factory=list)
     cited_memories: list[dict] = field(default_factory=list)
     cited_runs: list[dict] = field(default_factory=list)  # task-2595
+    # Hook B (task 2897 δ): the composite id of the ACTIVE entity standing
+    # decision that adjudicates this finding, or None. Set by cite_entity when a
+    # cited entity carries an active decision; defaults None so old persisted
+    # rows hydrate round-trip-safe via _Finding(**fd).
+    standing_decision_id: str | None = None
 
 
 @dataclass
@@ -1590,7 +1595,50 @@ class ReconReportState:
         node = nodes[0]
         citation = {'entity_uuid': node['uuid'], 'canonical_name': node['name']}
         finding.cited_entities.append(citation)
+
+        # Hook B (task 2897 δ): annotate the finding with an ACTIVE entity
+        # standing decision, if one exists. Best-effort / fail-open — a missing
+        # recon_ledger or ANY lookup error skips annotation and NEVER drops the
+        # citation or the finding (PRD decision 3 never-drops + fail-open
+        # ledger-read posture). Only the RETURNED response (nested under a
+        # `standing_decision` key, keeping the {entity_uuid, canonical_name}
+        # contract intact) and finding.standing_decision_id carry it; the stored
+        # cited_entities citation is left unannotated so citation-identity /
+        # cross-channel dedup are unaffected. Reuses the shared Hook A/B
+        # active-decision-by-uuid lookup (INV-5) — no duplicate lookup.
+        annotation: dict[str, Any] | None = None
+        ledger = getattr(self._memory_service, 'recon_ledger', None)
+        if ledger is not None:
+            try:
+                record = await ledger.get_active_entity_standing_decision(
+                    finding_entry.project_id, node['uuid']
+                )
+            except Exception:
+                logger.warning(
+                    'Hook B: standing-decision lookup failed for entity %s '
+                    '(project %s); skipping annotation (finding not dropped)',
+                    node['uuid'],
+                    finding_entry.project_id,
+                    exc_info=True,
+                )
+            else:
+                if record is not None:
+                    standing_decision_id = f'{record.entity_uuid}:{record.flag_type}'
+                    annotation = {
+                        'standing_decision_id': standing_decision_id,
+                        'grounds': record.flag_type,
+                        'decided_at': record.created_at,
+                        'summary': (
+                            'Entity already adjudicated by an active standing '
+                            f'decision (grounds={record.flag_type}); no '
+                            're-investigation needed absent a new concrete fact.'
+                        ),
+                    }
+                    finding.standing_decision_id = standing_decision_id
+
         self._persist_run(run_id)
+        if annotation is not None:
+            return {**citation, 'standing_decision': annotation}
         return citation
 
     async def cite_edge(
