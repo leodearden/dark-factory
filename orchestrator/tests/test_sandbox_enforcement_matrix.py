@@ -106,6 +106,10 @@ class _Scaffold:
     task_meta: Path
     sibling_worktree: Path
     other_task_meta: Path
+    plan_symlink: Path
+    plan_target: Path
+    uv_cache: Path
+    uv_data: Path
 
 
 def _run_sandboxed(
@@ -173,7 +177,13 @@ def landlock_matrix_scaffold():
     carve-out is grantable at wrap time; and the git-row setup — auto-gc/
     maintenance disabled on the shared main repo (PRD α5 corollary, mirrors
     ``GitOps.disable_shared_repo_auto_maintenance``) plus one staged
-    change in the worktree, ready for a row's own ``git commit``.
+    change in the worktree, ready for a row's own ``git commit``; a
+    ``<worktree>/.task/plan.json`` symlink into ``<base>/.task-meta/<name>/
+    plan.json`` (the target itself is left ABSENT — row 7's child write is
+    what creates it, mirroring ``TaskArtifacts.ensure_lane_plan_symlink``'s
+    real production symlink shape); and ``~/.local/share/uv/`` pre-created
+    as an empty, non-writable-by-contract sibling of the (writable)
+    ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT.
 
     Built under ``/var/tmp`` (never ``/tmp`` — see module docstring) via
     ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
@@ -217,7 +227,10 @@ def landlock_matrix_scaffold():
 
         home = base / 'home'
         home.mkdir()
-        (home / '.cache' / 'uv').mkdir(parents=True)
+        uv_cache = home / '.cache' / 'uv'
+        uv_cache.mkdir(parents=True)
+        uv_data = home / '.local' / 'share' / 'uv'
+        uv_data.mkdir(parents=True)
 
         # One staged change so a row's `git commit` has something to
         # commit (rows 2/12 — each test gets its own fresh scaffold
@@ -226,10 +239,22 @@ def landlock_matrix_scaffold():
         (worktree / 'staged.txt').write_text('staged content\n')
         _git(['add', 'staged.txt'], worktree)
 
+        # Row 7: <worktree>/.task/plan.json -> <base>/.task-meta/<name>/
+        # plan.json. The target's parent (task_meta, above) already exists
+        # and is a writable carve-out; the target FILE itself is left
+        # absent — row 7's sandboxed child write is what creates it.
+        lane_task_dir = worktree / '.task'
+        lane_task_dir.mkdir(parents=True, exist_ok=True)
+        plan_target = task_meta / 'plan.json'
+        plan_symlink = lane_task_dir / 'plan.json'
+        os.symlink(plan_target, plan_symlink)
+
         yield _Scaffold(
             base=base, main=main, worktree=worktree, name=name, home=home,
             main_sha=main_sha, task_meta=task_meta,
             sibling_worktree=sibling_worktree, other_task_meta=other_task_meta,
+            plan_symlink=plan_symlink, plan_target=plan_target,
+            uv_cache=uv_cache, uv_data=uv_data,
         )
     finally:
         shutil.rmtree(base, ignore_errors=True)
