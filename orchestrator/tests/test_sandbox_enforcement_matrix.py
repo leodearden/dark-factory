@@ -238,3 +238,19 @@ class TestSandboxEnforcementMatrix:
             assert scratch.read_text() == 'X'
         finally:
             scratch.unlink(missing_ok=True)
+
+    # -- Group 2: neighbor denial (rows 4/5) ------------------------------
+
+    def test_row04_sibling_worktree_denied(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.sibling_worktree / 'f'
+        result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
+        assert not target.exists()
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row05_other_task_meta_denied(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.other_task_meta / 'x'
+        result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
+        assert not target.exists()
+        _assert_denied(result, side_effect_verified=True)
