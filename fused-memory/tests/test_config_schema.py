@@ -1236,7 +1236,12 @@ class TestProceduralTopicClusterModel:
 
 
 class TestProceduralTopicGuardClustersDefault:
-    """ReconciliationConfig seeds both known-contradictory clusters by default."""
+    """ReconciliationConfig seeds all known topic-guard clusters by default.
+
+    Mix of known-contradictory (plan-tools, venv-shadowing) and
+    known-recurring (pytest-xdist) topics -- see the >=3 count and the
+    per-topic-id assertions below.
+    """
 
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters

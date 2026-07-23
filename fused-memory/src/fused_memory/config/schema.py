@@ -482,6 +482,17 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # "unrecognized arguments").
             phrases=[
                 'pytest-xdist',
+                # Reviewer (robustness): bare '-n0' is a short 3-char substring
+                # that could incidentally match an unrelated '-n0.5' / '-n01'
+                # token. Verified against canonical memory 8bb3eb15's actual
+                # text: neither 'pytest -n0' nor 'run -n0' occurs literally
+                # there (only bare '-n0', twice) -- so anchoring would violate
+                # this module's literal-substring-from-canonical-text
+                # convention AND wouldn't even close the gap, since a prefix
+                # anchor like 'pytest -n0' is still a substring of a
+                # hypothetical 'pytest -n0.5'. Left bare; min_phrase_hits=2
+                # already requires a second, unrelated phrase to co-occur
+                # before a write is blocked, which covers the residual risk.
                 '-n0',
                 '--dist loadgroup',
                 'max-worker-restart',
