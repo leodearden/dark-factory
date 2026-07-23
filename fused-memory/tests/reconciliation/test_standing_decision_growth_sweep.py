@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_GROWTH,
@@ -23,9 +24,12 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STATE_ACTIVE,
     STATE_EXPIRED,
 )
+from fused_memory.reconciliation.stages import task_knowledge_sync as tks
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY,
     ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY,
     ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY,
+    TaskKnowledgeSync,
     _compute_growth_sweep_failure_streak,
     _evaluate_growth_sweep_escalation,
     _extract_growth_sweep_failed,
@@ -370,3 +374,90 @@ class TestGrowthSweepEscalationFiler:
             None, _FakeJournal([]), _PROJECT_ID, 'run-current', True,
         )
         assert filed is False
+
+
+# ---------------------------------------------------------------------------
+# TaskKnowledgeSync._run_entity_standing_decision_growth_sweep — orchestration
+# ---------------------------------------------------------------------------
+
+
+def _stage(*, ledger=None, edges=0, raises=False, remediation=False, queue=None,
+           journal=None):
+    """A lightweight TaskKnowledgeSync (via __new__) with only the attributes the
+    growth-sweep orchestrator method reads."""
+    stage = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
+    stage.scope = ProjectScope(ProjectId(_PROJECT_ID), ProjectRoot('/x'))
+    stage.memory = _svc(ledger, edges=edges, raises=raises) if ledger is not None else MagicMock()
+    stage.journal = journal if journal is not None else _FakeJournal([])
+    stage._escalation_queue = queue
+    stage.remediation_mode = remediation
+    return stage
+
+
+class TestGrowthSweepStageWiring:
+    """The orchestrator method records the explicit-zero stats and gates the
+    escalation filer on ``not remediation_mode and _escalation_queue``."""
+
+    @pytest.mark.asyncio
+    async def test_grown_row_records_stats_and_flips(self, ledger):
+        """A grown active row ⇒ failed stat 0, expired stat 1, row expired/growth."""
+        await _seed(ledger, entity_uuid='u-w1', edge_count=10)
+        stage = _stage(ledger=ledger, edges=13, queue=None)
+        report = SimpleNamespace(stats={})
+        await stage._run_entity_standing_decision_growth_sweep(report, 'run-1')
+        assert report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 0
+        assert report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] == 1
+        active, expired = await _states(ledger)
+        assert active == []
+        assert json.loads(expired[0].payload_json)['expiry_reason'] == EXPIRY_REASON_GROWTH
+
+    @pytest.mark.asyncio
+    async def test_graphiti_error_records_failed_and_keeps_row(self, ledger):
+        """A graphiti error ⇒ failed stat 1, expired stat 0, row stays active."""
+        await _seed(ledger, entity_uuid='u-w2', edge_count=10)
+        stage = _stage(ledger=ledger, raises=True, queue=None)
+        report = SimpleNamespace(stats={})
+        await stage._run_entity_standing_decision_growth_sweep(report, 'run-1')
+        assert report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 1
+        assert report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] == 0
+        active, expired = await _states(ledger)
+        assert len(active) == 1
+        assert expired == []
+
+    @pytest.mark.asyncio
+    async def test_remediation_mode_skips_filer(self, ledger, monkeypatch):
+        """remediation_mode True ⇒ the escalation filer is NOT invoked even on a
+        confirmed failure."""
+        spy = AsyncMock(return_value=False)
+        monkeypatch.setattr(tks, '_maybe_escalate_growth_sweep_failures', spy)
+        await _seed(ledger, entity_uuid='u-w3', edge_count=10)
+        stage = _stage(ledger=ledger, raises=True, remediation=True, queue=MagicMock())
+        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-1')
+        spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_queue_skips_filer(self, ledger, monkeypatch):
+        """_escalation_queue None ⇒ the filer is NOT invoked."""
+        spy = AsyncMock(return_value=False)
+        monkeypatch.setattr(tks, '_maybe_escalate_growth_sweep_failures', spy)
+        await _seed(ledger, entity_uuid='u-w4', edge_count=10)
+        stage = _stage(ledger=ledger, raises=True, remediation=False, queue=None)
+        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-1')
+        spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_full_nonremediation_failure_invokes_filer(self, ledger, monkeypatch):
+        """A confirmed failure on a full non-remediation cycle with a wired queue
+        ⇒ the filer IS invoked with current_failed=True."""
+        spy = AsyncMock(return_value=False)
+        monkeypatch.setattr(tks, '_maybe_escalate_growth_sweep_failures', spy)
+        await _seed(ledger, entity_uuid='u-w5', edge_count=10)
+        queue = MagicMock()
+        stage = _stage(ledger=ledger, raises=True, remediation=False, queue=queue)
+        await stage._run_entity_standing_decision_growth_sweep(SimpleNamespace(stats={}), 'run-9')
+        spy.assert_called_once()
+        args = spy.call_args.args
+        assert args[0] is queue
+        assert args[2] == _PROJECT_ID
+        assert args[3] == 'run-9'
+        assert args[4] is True  # current_failed
