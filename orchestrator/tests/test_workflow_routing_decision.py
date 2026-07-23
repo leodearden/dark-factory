@@ -118,6 +118,10 @@ def _make_workflow(
     cfg.routing.ladder = ['haiku', 'sonnet', 'opus']
     cfg.routing.per_model_daily_ceiling_usd = {}
     cfg.routing.rules = [_RUST_RULE]
+    # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
+    # do not assert on sandbox wiring; disable the sandbox block so _invoke does
+    # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
+    cfg.sandbox.enabled = False
 
     wf = TaskWorkflow(
         assignment=assignment,
