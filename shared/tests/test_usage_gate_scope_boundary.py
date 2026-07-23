@@ -59,116 +59,28 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
-from shared.cli_invoke import AgentResult, invoke_with_cap_retry
-from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountPhase, ScopeCap, UsageGate
+from _usage_gate_test_helpers import (
+    SCOPE,
+    cap_result,
+    make_gate,
+    make_mock_cost_store,
+    ok_result,
+    scripted_invoke,
+    set_scope_cap,
+)
+
+from shared.cli_invoke import invoke_with_cap_retry
+from shared.usage_gate import AccountPhase
 
 # NOTE: this scaffold (prerequisite P1) imports only what the harness below
 # uses today; each Bn step below adds the specific additional imports its
 # own test needs, keeping every commit ruff-clean rather than
 # pre-importing the whole suite's eventual closure.
 
-SCOPE = 'claude-fable-5'
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
-
-
-# ---------------------------------------------------------------------------
-# Local helpers (mirroring test_usage_gate_scope_selection.py:46-84 and
-# test_cap_retry.py's make_gate/make_result/_SLEEP_PATCH).
-#
-# make_gate/set_scope_cap are intentionally duplicated here rather than
-# imported: task 2859's locked scope covered only this file and
-# orchestrator/tests/test_scope_capacity_gate_integration.py, not
-# test_cap_retry.py or test_usage_gate_scope_selection.py, so extracting a
-# shared helper module wasn't an in-scope amendment. Consolidating all
-# three shared-side copies (this file, test_cap_retry.py,
-# test_usage_gate_scope_selection.py) into one shared/tests helper is
-# tracked as a follow-up (ticket tkt_0RRGS6H40KB28XBYSRX5HR4HNX); the
-# orchestrator/tests copy stays a separate replica regardless (it cannot
-# import from shared/tests).
-# ---------------------------------------------------------------------------
-
-
-def make_gate(account_names: list[str], *, cost_store=None, **cfg) -> UsageGate:
-    """Create a real UsageGate with fake accounts, probe + reset-wait disabled."""
-    acct_cfgs = []
-    env_vars: dict[str, str] = {}
-    for name in account_names:
-        env_key = f'TEST_TOKEN_{name.upper().replace("-", "_")}'
-        env_vars[env_key] = f'fake-token-{name}'
-        acct_cfgs.append(AccountConfig(name=name, oauth_token_env=env_key))
-    cfg.setdefault('wait_for_reset', False)
-    config = UsageCapConfig(accounts=acct_cfgs, **cfg)
-    with patch.dict(os.environ, env_vars):
-        gate = UsageGate(config, cost_store=cost_store)
-    # Mock _run_probe to prevent real subprocess spawning.
-    gate._run_probe = AsyncMock(return_value=True)
-    return gate
-
-
-def make_mock_cost_store() -> AsyncMock:
-    store = AsyncMock()
-    store.save_account_event = AsyncMock(return_value=None)
-    store.save_invocation = AsyncMock(return_value=None)
-    return store
-
-
-def set_scope_cap(
-    acct,
-    scope: str = SCOPE,
-    *,
-    capped: bool = True,
-    resets_at: datetime | None = None,
-    capped_at: datetime | None = None,
-    near_cap: bool = False,
-) -> ScopeCap:
-    """Directly install a ScopeCap overlay on *acct* (bypassing the β handler)."""
-    sc = ScopeCap(
-        capped=capped, resets_at=resets_at, near_cap=near_cap, capped_at=capped_at,
-    )
-    acct.scope_caps[scope] = sc
-    return sc
-
-
-class scripted_invoke:
-    """Async fake ``invoke_fn`` yielding each of *results* in call order
-    (the last result repeats if called more times than results supplied).
-
-    Tolerates arbitrary ``**kwargs`` (``prompt``/``model``/``oauth_token``/
-    ``config_dir``/``backend`` -- everything ``invoke_with_cap_retry``
-    forwards to ``invoke_fn``) and records every call's kwargs onto
-    ``self.calls`` for assertions (e.g. B8's backend-forwarding check).
-    """
-
-    def __init__(self, *results: AgentResult) -> None:
-        self._results = list(results)
-        self.calls: list[dict] = []
-
-    async def __call__(self, **kwargs) -> AgentResult:
-        self.calls.append(kwargs)
-        idx = min(len(self.calls) - 1, len(self._results) - 1)
-        return self._results[idx]
-
-
-def cap_result(stderr: str, output: str = 'partial') -> AgentResult:
-    """A capped AgentResult carrying a cap-hit stderr pattern.
-
-    ``success=True`` mirrors ``test_cap_retry.py::test_real_gate_failover``'s
-    ``capped`` fixture: cap detection happens via ``slot.detect_cap_hit``,
-    which builds its OWN synthetic ``success=False`` result internally
-    (``UsageGate.detect_cap_hit``), so the raw result's ``success`` value is
-    irrelevant to cap classification here.
-    """
-    return AgentResult(success=True, output=output, stderr=stderr, cost_usd=0.5)
-
-
-def ok_result(output: str = 'complete') -> AgentResult:
-    """A successful AgentResult (mirrors make_result in test_cap_retry.py)."""
-    return AgentResult(success=True, output=output, cost_usd=0.5)
 
 
 # ===========================================================================
