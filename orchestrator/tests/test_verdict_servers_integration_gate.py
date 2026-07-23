@@ -1,4 +1,4 @@
-"""θ — Verdict-servers integration gate (end-to-end boundary tests, task 2488).
+"""θ — Verdict-servers integration gate (artifact-read boundary tests, task 2488).
 
 TERMINAL integration gate for the mcp-verdict-servers PRD
 (``plans/mcp-verdict-servers-prd.md`` §Boundary-test sketch). All five
@@ -279,9 +279,11 @@ def _fake_invoke_writes_reviewer_verdict(
 ) -> Callable[..., Any]:
     """``verdict=None`` writes NO verdict at all (agent never called
     ``submit_review_verdict``). Routes a real write through
-    ``_submit_review_verdict`` (not a hand-built envelope) so the
-    reviewer==role identity check is exercised here too, mirroring
-    ``AgentStub``'s reviewer stub in ``_workflow_helpers.py``.
+    ``_submit_review_verdict`` (not a hand-built envelope), mirroring
+    ``AgentStub``'s reviewer stub in ``_workflow_helpers.py`` — this fake
+    always passes reviewer==role, so it does NOT exercise the
+    reviewer==role identity-mismatch rejection (verdict_tools.py:86); that
+    case belongs to the verdict-tools server's own unit tests.
     """
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
@@ -387,6 +389,11 @@ class TestMergerBoundary:
     Distinguishes θ from ``test_merger_disposition_verdict.py``, which mocks
     ``_invoke`` wholesale and never exercises ``_inject_verdict_tools_mcp``,
     route resolution, or the real clear→spawn→read sequencing.
+
+    Plus one amendment scenario beyond the original 1-3: an invocation
+    failure is untrusted even when a valid verdict was written before it
+    failed (I-FAIL-SAFE's "success" leg, distinct from the absent/malformed
+    leg already covered by scenario 3).
     """
 
     async def test_blocked_false_verdict_proceeds_despite_blocked_prose(
@@ -456,6 +463,34 @@ class TestMergerBoundary:
         workflow._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
+    async def test_invocation_failure_is_untrusted_despite_valid_verdict(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """An invocation failure is untrusted even when a valid verdict was
+        written before it failed (workflow.py: ``if not merger_result.success
+        or verdict is None`` — "an invocation failure ... is untrusted even
+        if it happened to write a verdict before failing"). A written
+        blocked=False disposition must NOT override success=False; the
+        merger still fails safe to BLOCKED and never reaches the merge queue.
+        """
+        workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_agent',
+            _fake_invoke_writes_merger_verdict(
+                blocked=False, success=False, output='crashed after writing disposition',
+            ),
+        )
+
+        outcome = await workflow._resolve_and_resubmit(
+            'task/42', 'conflict in lib.py', merge_phase=True,
+        )
+
+        workflow._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        args, _kwargs = workflow._mark_blocked.await_args  # type: ignore[attr-defined]
+        assert 'Merger invocation failed' in args[0]
+        workflow._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
+        assert outcome == WorkflowOutcome.BLOCKED
+
 
 # ---------------------------------------------------------------------------
 # S2 — Reviewer boundary (scenarios 4-5)
@@ -466,6 +501,11 @@ class TestMergerBoundary:
 class TestReviewerBoundary:
     """Scenarios 4-5: ``TaskWorkflow._run_reviewer`` driven through the REAL
     ``_invoke``, with only ``orchestrator.workflow.invoke_agent`` faked.
+
+    Plus one amendment scenario beyond the original 4-5: an invocation
+    failure is untrusted even when a valid PASS verdict was written before
+    it failed (I-FAIL-SAFE's "success" leg, distinct from the absent-verdict
+    leg already covered by scenario 5).
     """
 
     async def test_pass_verdict_is_aggregate_consumable_prose_ignored(
@@ -511,6 +551,30 @@ class TestReviewerBoundary:
         assert result['verdict'] == 'ERROR'
         assert result['reviewer'] == 'reviewer_comprehensive'
 
+    async def test_invocation_failure_is_untrusted_despite_valid_verdict(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """An invocation failure is untrusted even when a valid PASS verdict
+        was written before it failed (workflow.py: ``not result.success or
+        ...`` — "an invocation failure ... is untrusted even if it happened
+        to write a verdict before failing"). A written PASS verdict must NOT
+        override success=False; the reviewer still degrades to the fail-safe
+        ERROR disposition.
+        """
+        workflow = _setup_reviewer_workflow(config, git_ops, task_assignment, tmp_path)
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_agent',
+            _fake_invoke_writes_reviewer_verdict(
+                verdict='PASS', summary='Looks good.', success=False,
+                output='crashed after writing verdict',
+            ),
+        )
+
+        result = await workflow._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff --git a/x b/x')
+
+        assert result['verdict'] == 'ERROR'
+        assert result['reviewer'] == 'reviewer_comprehensive'
+
 
 # ---------------------------------------------------------------------------
 # S3 — Judge boundary (scenarios 6, 7, 9)
@@ -523,6 +587,11 @@ class TestJudgeBoundary:
     through the REAL ``_invoke``, with only ``orchestrator.workflow.invoke_agent``
     faked. ``get_diff_from_base`` is mocked to a non-empty diff so the judge
     is actually invoked (not empty-diff-skipped).
+
+    Plus one amendment scenario beyond the original 6, 7, 9: an invocation
+    failure is untrusted even when a valid complete=True verdict was written
+    before it failed — checked BEFORE the artifact is even read, distinct
+    from scenario 9's absent-both leg.
     """
 
     async def test_complete_substantive_verdict_returned_verbatim(
@@ -584,6 +653,32 @@ class TestJudgeBoundary:
         monkeypatch.setattr(
             'orchestrator.workflow.invoke_agent',
             _fake_invoke_writes_judge_verdict(artifact=None, structured_output=None),
+        )
+
+        verdict = await workflow._run_completion_judge([])
+
+        assert verdict is None
+
+    async def test_invocation_failure_is_untrusted_despite_valid_verdict(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """An invocation failure is untrusted even when a valid complete=True
+        verdict was written before it failed (workflow.py: ``if not
+        result.success: ... return None``, checked BEFORE the verdict
+        artifact is even read). A written complete=True/substantive_work=True
+        verdict must NOT override success=False; the judge still fails safe
+        to None (keep iterating, never a false completion — I-FAIL-SAFE).
+        """
+        workflow = _setup_judge_workflow(config, git_ops, task_assignment, tmp_path)
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_agent',
+            _fake_invoke_writes_judge_verdict(
+                artifact={
+                    'complete': True, 'reasoning': 'all plan steps covered',
+                    'uncovered_plan_steps': [], 'substantive_work': True,
+                },
+                success=False,
+            ),
         )
 
         verdict = await workflow._run_completion_judge([])
