@@ -182,10 +182,12 @@ class TestColdPreprovisionFailOpen:
         config = _make_config(tmp_path, preprovision=PROVISION_CMD)
         invoked: list[tuple[str, Path]] = []
         spy = _spy(invoked, provision_rc=1, provision_out='error: Failed to spawn: ruff')
-        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            with patch('orchestrator.verify._run_cmd', side_effect=spy):
-                # (1) does not raise — reaching the asserts below is the proof.
-                result = await verify.run_verification(tmp_path, config, is_merge_verify=True)
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=spy),
+        ):
+            # (1) does not raise — reaching the asserts below is the proof.
+            result = await verify.run_verification(tmp_path, config, is_merge_verify=True)
 
         # Provision was attempted (and failed rc=1) ...
         assert [c for (c, _) in invoked if _is_provision(c)], f'provision must run: {invoked!r}'
