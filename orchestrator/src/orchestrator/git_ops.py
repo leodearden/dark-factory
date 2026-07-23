@@ -442,6 +442,56 @@ PROTECTED_PREFIXES: dict[str, str] = {
 }
 
 
+# Positive-match namespace classifier for a worktree_base entry name (C2).
+WorktreeClass = Literal['task', 'merge', 'infra']
+
+
+def classify_worktree_entry(name: str) -> WorktreeClass:
+    """Classify a ``worktree_base`` directory-entry name by namespace (C2).
+
+    PRD: docs/prds/merge-worktree-lifecycle-integrity.md, task beta (§4
+    Contract C2 — namespace invariant).
+
+    This is the POSITIVE-match complement of :data:`PROTECTED_PREFIXES`
+    (and reify's ``warm-lane-gc`` PROTECT_GLOB): rather than a NEGATIVE,
+    hand-maintained per-name exclusion list — the whack-a-mole the
+    2026-07-22 task/5326 incident proved unmaintainable, when the
+    crash-recovery sweep force-removed the persistent ``_merge-verify`` 21s
+    after the same process dispatched a verify into it — it encodes ONE
+    invariant keyed on the ``_``/``.`` name prefix that every current AND
+    future infra band already obeys (see PROTECTED_PREFIXES: ``_lane-``,
+    ``_spec-``, ``_merge-``, ``_solo-``, ``_substrate-gate-``,
+    ``_mainprobe-``, ``_mainsweep-``, ``_offline-deep``, ``.lane-state``,
+    ``.task-meta``):
+
+        * ``_merge-``-prefixed          => ``'merge'`` — the merge-queue band.
+          The crash-recovery sweep / orphan reaper only SKIP + REPORT these
+          to the merge reaper (``_reap_orphaned_merge_worktrees``, which
+          owns their guarded readopt/age-grace disposition via
+          :meth:`GitOps.remove_merge_worktree_guarded`); they NEVER remove a
+          ``_merge-*`` directly.
+        * any other ``_``/``.``-prefixed => ``'infra'`` — an infra-owned band
+          left to its owner (the sweep/reaper skip it explicitly).
+        * everything else                => ``'task'`` — the task-id-shaped
+          namespace the sweep/reaper may act on.
+
+    WARNING — adoptable warm/spec lanes (``_lane-`` / ``_spec-``) are
+    ``_``-prefixed, so this classifier labels them ``'infra'``.  They are
+    NOT infra: they carry recoverable task work and have their own
+    adopt/release/quarantine handling.  Every caller MUST therefore check
+    ``pool.is_lane()`` (warm AND spec pools) FIRST and only consult this
+    classifier for non-lane entries.
+
+    Fail-safe direction: a mis-shaped task name is left alone / leaked
+    (recoverable by an operator), never destroyed.
+    """
+    if name.startswith('_merge-'):
+        return 'merge'
+    if name.startswith(('_', '.')):
+        return 'infra'
+    return 'task'
+
+
 # ---------------------------------------------------------------------------
 # Final-defense gate helpers (advance_main)
 # ---------------------------------------------------------------------------
