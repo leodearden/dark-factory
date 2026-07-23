@@ -4003,7 +4003,11 @@ async def coalesce_or_enqueue_merge_request(
                 #     during the await above; re-fetch and fall through to a
                 #     fresh dispatch (section 2/3) when it did.
                 entry = registry.entry(branch)
-                if entry is not None:
+                # Re-narrow snapshot_tip: the classification await above may have
+                # released+reacquired the slot with a tip-less entry, in which
+                # case fall through to the safe coalesce/fresh-dispatch path
+                # rather than making a C3 ancestry decision without a tip.
+                if entry is not None and entry.snapshot_tip is not None:
                     snap_verifying, verify_age = _snapshot_verify_state(
                         live_snapshot, entry.request_id,
                     )
