@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from orchestrator.lane_lifecycle import IllegalLaneTransition
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 
 if TYPE_CHECKING:
     from orchestrator.lane_lifecycle import LaneLifecycle
@@ -189,6 +190,14 @@ class WarmLanePool:
         Idempotent: releasing a FREE lane or an unknown path is a no-op
         (never raises).  Also drops any ``_assignments`` entry whose value
         resolves to *lane* so the assignment map stays coherent.
+
+        When a ``LaneLifecycle`` is wired, the durable record is mirrored
+        through to ``RELEASED`` at the SAME moment the in-memory state flips to
+        FREE (single-writer coherence, PRD warm-lane-exhaustion-hardening W2b
+        I1 / boundary row 2). The durable write-through is issued AFTER the lock
+        is released (no ``await`` between the in-memory flip and the synchronous
+        durable write, so no coroutine interleaves on the single asyncio loop;
+        blocking file I/O never runs inside the lock).
         """
         async with self._lock:
             matched = self._match_lane(lane)
@@ -203,6 +212,8 @@ class WarmLanePool:
             ]
             for br in to_drop:
                 del self._assignments[br]
+        # Durable write-through (ASSIGNED/IN_USE -> RELEASED), outside the lock.
+        self._note_released_durable(matched)
 
     async def acquire_for(
         self,
@@ -531,4 +542,47 @@ class WarmLanePool:
                 'warm_lane_pool: durable record mirror for lane %s failed '
                 'for task %r — cache updated, durable record left as-is',
                 lane.name, task_id, exc_info=True,
+            )
+
+    def _note_released_durable(self, lane: Path) -> None:
+        """Best-effort durable-record mirror for the single-writer RELEASED
+        write (PRD dec.3, I1: record ↔ cache never drift).
+
+        Called from ``release`` (and, on the steal path, ``reclaim_victim``)
+        so the pool is the SOLE writer of the durable RELEASED record (PRD
+        warm-lane-exhaustion-hardening W2b I2) — mirrors the removed GitOps
+        ``_lifecycle_note_released``.
+
+        No-op when no ``LaneLifecycle`` is wired (``self._lane_lifecycle is
+        None``) — the pool then stays a pure in-memory cache, byte-identical
+        to its pre-record-routing behavior.
+
+        Only transitions a lane whose durable record is currently ``ASSIGNED``
+        or ``IN_USE`` (the two states with a legal edge to ``RELEASED``). A
+        lane with no record yet, an already-``RELEASED`` record, or a
+        ``REGISTERED``/``SEED``/``QUARANTINED`` record is left UNTOUCHED — the
+        record is only re-keyed off a live assignment, never forced onto an
+        illegal ``RELEASED``-target edge. This mirrors the removed GitOps
+        ``_lifecycle_note_released`` guard.
+
+        Best-effort (I3: release always succeeds). ``IllegalLaneTransition``
+        (a record that conflicts, or a corrupt record) or ``OSError`` (the
+        ``.lane-state`` write/read itself failed — disk full, EACCES,
+        read-only mount) is logged and swallowed rather than propagated out of
+        ``release``.
+        """
+        if self._lane_lifecycle is None:
+            return
+        try:
+            record = self._lane_lifecycle.read(lane)
+            if record is not None and record.state in (
+                DurableLaneState.ASSIGNED,
+                DurableLaneState.IN_USE,
+            ):
+                self._lane_lifecycle.transition(lane, DurableLaneState.RELEASED)
+        except (IllegalLaneTransition, OSError):
+            logger.warning(
+                'warm_lane_pool: durable record RELEASED mirror for lane %s '
+                'failed — cache updated (FREE), durable record left as-is',
+                lane.name, exc_info=True,
             )
