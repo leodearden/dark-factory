@@ -154,3 +154,51 @@ class TestHookBCiteEntityAnnotation:
         assert resolved is not None
         _, finding = resolved
         assert finding.standing_decision_id is None
+
+
+class TestHookBFindingProjections:
+    """standing_decision_id flows through BOTH finding-dict projections
+    (get_findings_for_run — the Stage-2 recon_report channel — and
+    get_assembled_report) and NEVER changes finding counts."""
+
+    @pytest.mark.asyncio
+    async def test_projections_expose_standing_decision_id(self, ledger):
+        await _seed_active(ledger)
+        service = _service(ledger)
+        state, run_id, finding_id = _state_with_finding(service)
+        await state.cite_entity(run_id, finding_id, 'X')
+
+        # (a) get_findings_for_run (the task-1966 channel Stage 2 polls).
+        findings = state.get_findings_for_run(run_id)
+        assert len(findings) == 1
+        assert findings[0]['standing_decision_id'] == _expected_id()
+
+        # (b) get_assembled_report flagged_items (sibling projection).
+        report = state.get_assembled_report(run_id, 'reconciler')
+        assert report is not None
+        flagged = report['flagged_items']
+        assert len(flagged) == 1
+        assert flagged[0]['standing_decision_id'] == _expected_id()
+
+    @pytest.mark.asyncio
+    async def test_never_drops_finding_count_unchanged(self, ledger):
+        """NEVER-DROPS: two equivalent runs — one whose cited entity has an
+        active decision, one whose entity has none — yield the SAME finding
+        count, and the no-decision finding carries standing_decision_id None."""
+        # Run A: cited entity HAS an active decision.
+        await _seed_active(ledger)
+        service_a = _service(ledger, uuid=_ENTITY_UUID, name='X')
+        state_a, run_a, finding_a = _state_with_finding(service_a)
+        await state_a.cite_entity(run_a, finding_a, 'X')
+        findings_a = state_a.get_findings_for_run(run_a)
+
+        # Run B: cited entity has NO active decision (fresh, unseeded uuid).
+        service_b = _service(ledger, uuid=_OTHER_UUID, name='Y')
+        state_b, run_b, finding_b = _state_with_finding(service_b)
+        await state_b.cite_entity(run_b, finding_b, 'Y')
+        findings_b = state_b.get_findings_for_run(run_b)
+
+        # Finding count is identical with/without a decision (annotation-only).
+        assert len(findings_a) == len(findings_b) == 1
+        assert findings_a[0]['standing_decision_id'] == _expected_id()
+        assert findings_b[0]['standing_decision_id'] is None
