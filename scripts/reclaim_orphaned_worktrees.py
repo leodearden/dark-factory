@@ -420,3 +420,107 @@ def remove_worktree(repo: Path, path: Path) -> bool:
         return False
     logger.info('%s removed worktree %s (branch intact)', _LOG_PREFIX, path)
     return True
+
+
+@dataclass
+class ReclaimOutcome:
+    """Result of a :func:`reclaim_worktrees` sweep (paths, for the JSON report).
+
+    ``reclaimed`` — parkings whose worktree was removed (branch left intact);
+    ``park_committed`` — parkings whose dirty content was committed onto the
+    branch before removal (a subset relationship with ``reclaimed`` in the happy
+    path); ``skipped`` — parkings NOT removed by the data-loss guard
+    (detached / unresolvable branch, or an un-park-committable dirty tree);
+    ``failed`` — parkings whose removal (or processing) errored. Pure value
+    object.
+    """
+
+    reclaimed: list[Path] = field(default_factory=list)
+    park_committed: list[Path] = field(default_factory=list)
+    skipped: list[Path] = field(default_factory=list)
+    failed: list[Path] = field(default_factory=list)
+
+
+def reclaim_worktrees(
+    repo: Path,
+    records: list[ParkedWorktree],
+    *,
+    dry_run: bool,
+) -> ReclaimOutcome:
+    """Reclaim each parking, in the fixed data-loss-guard order (best-effort).
+
+    Per record: (1) require a RESOLVABLE branch (``branch is None`` — detached —
+    or ``rev-parse`` fails => SKIP + LOUD, never removed); (2) in ``dry_run``,
+    log ``would reclaim`` and stop; (3) if dirty, :func:`park_commit` onto the
+    branch FIRST (a park-commit failure => SKIP, never removed) then re-verify
+    the branch still resolves; (4) :func:`remove_worktree`, recording
+    ``reclaimed`` on success or ``failed`` on failure. Content is never removed
+    until it is provably on a branch ref INDEPENDENT of the worktree, so
+    "zero content lost" holds.
+
+    Each record is wrapped in ``try/except`` so one wedged parking is logged +
+    counted (``failed``) while its siblings are still reclaimed — the sweep
+    NEVER raises. Callers do the age selection upstream (:func:`select_reclaimable`);
+    everything passed here is treated as eligible.
+    """
+    outcome = ReclaimOutcome()
+    for record in records:
+        path = record.path
+        branch = record.branch
+        try:
+            # (1) Data-loss guard: content must be reachable on a branch ref.
+            if branch is None or not branch_ref_resolves(repo, branch):
+                logger.warning(
+                    '%s SKIP %s — branch %r is detached/unresolvable; never '
+                    'removing a parking whose content is not provably on a ref',
+                    _LOG_PREFIX,
+                    path,
+                    branch,
+                )
+                outcome.skipped.append(path)
+                continue
+
+            # (2) Dry-run: classify only, mutate nothing.
+            if dry_run:
+                logger.info(
+                    '%s would reclaim %s (branch=%s)', _LOG_PREFIX, path, branch
+                )
+                continue
+
+            # (3) Dirty -> park-commit onto the branch FIRST, then re-verify.
+            if is_worktree_dirty(path):
+                if park_commit(path, 'reclaim') is None:
+                    logger.warning(
+                        '%s SKIP %s — dirty parking could not be park-committed; '
+                        'NOT removing (data-loss guard)',
+                        _LOG_PREFIX,
+                        path,
+                    )
+                    outcome.skipped.append(path)
+                    continue
+                outcome.park_committed.append(path)
+                if not branch_ref_resolves(repo, branch):
+                    logger.warning(
+                        '%s SKIP %s — branch %r stopped resolving after '
+                        'park-commit; NOT removing (data-loss guard)',
+                        _LOG_PREFIX,
+                        path,
+                        branch,
+                    )
+                    outcome.skipped.append(path)
+                    continue
+
+            # (4) Content is safe on the branch — remove the worktree.
+            if remove_worktree(repo, path):
+                outcome.reclaimed.append(path)
+            else:
+                outcome.failed.append(path)
+        except Exception as err:  # noqa: BLE001 — never let one record abort the sweep
+            logger.warning(
+                '%s unexpected error reclaiming %s: %s — counting as failed',
+                _LOG_PREFIX,
+                path,
+                err,
+            )
+            outcome.failed.append(path)
+    return outcome
