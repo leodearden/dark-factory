@@ -9912,6 +9912,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             write_set = compute_write_set(cwd)
             sandbox_modules = []
             sandbox_extras = [str(p) for p in write_set.writable_paths()]
+            # Fail-CLOSED (task 2908, PRD D4 / INV-4): refuse to dispatch this
+            # sandboxed role when no OS backend resolves rather than silently
+            # running unconfined. backend=none is the explicit operator escape
+            # hatch (runs UNSANDBOXED with a WARN, no refusal); a
+            # required-yet-unavailable backend raises SandboxUnavailable, which
+            # propagates out of _invoke to refuse the invocation.
+            self._guard_sandbox(role.name)
 
         # Warn once per workflow instance when an escalation-capable role is
         # dispatched without an escalation queue wired up.
@@ -11024,6 +11031,122 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 data={'escalation_id': esc.id, 'category': esc.category,
                       'severity': esc.severity, 'summary': summary[:200]},
             )
+
+    def _escalate_sandbox_unavailable(
+        self, role_name: str, backend_state: str, detail: str,
+    ) -> None:
+        """Submit a blocking escalation when the sandboxed-dispatch guard refuses.
+
+        Filed at the fail-CLOSED refusal point in :meth:`_guard_sandbox` (task
+        2908, PRD plans/os-sandbox-worktree-containment-prd.md D4 / invariant
+        INV-4): sandboxing is required (``config.sandbox.enabled`` +
+        ``role.sandboxed``) but the configured backend resolved to no available
+        OS sandbox (landlock/bwrap), so the agent invocation is REFUSED rather
+        than run unconfined — mirroring reconciliation's
+        ``RemediationSandboxUnavailable`` (task 1935). The escalation is DEDUPED
+        upstream by the process-global dedup in ``sandbox_dispatch`` (exactly one
+        filing across N refused invocations, re-armed on any backend-state
+        change), so this method is only ever called for the one refusal that
+        should escalate.
+
+        The summary/detail are phrased as a HOST-LEVEL condition (an unavailable
+        backend affects every sandboxed role on the host, not just the one task
+        that happened to refuse first) — ``task_id`` still names the first
+        refusal for traceability, but the text makes clear other sandboxed tasks
+        are equally impacted (task 2908 review). The detail also spells out the
+        re-arm caveat: because the dedup re-arms only on a backend-STATE change,
+        resolving this escalation without actually installing/enabling a backend
+        will NOT cause a fresh one to be filed — continued refusals stay deduped
+        (still fail-closed) until the backend state changes.
+
+        Filed by the orchestrator (not a harness sentinel): ``agent_role``
+        'orchestrator', ``severity`` 'blocking' (L0->steward), ``category``
+        'infra_issue' — an unavailable host sandbox backend is an infra
+        condition. Submission shape mirrors the sibling
+        :meth:`_escalate_plan_overwrite`.
+        """
+        summary = (
+            f'sandbox unavailable — sandboxed dispatch refused for '
+            f'backend={backend_state} (host-level: affects all sandboxed roles '
+            f'on this host). First refusal: role {role_name}, task {self.task_id}'
+        )
+        detail_msg = (
+            f'Sandboxing is required (sandbox.enabled + role.sandboxed) but the '
+            f'configured backend={backend_state!r} resolved to no available OS '
+            f'sandbox (landlock/bwrap) on this host, so sandboxed dispatch is '
+            f'REFUSED fail-closed (PRD D4, mirrors recon '
+            f'RemediationSandboxUnavailable / task 1935). This is a HOST-LEVEL '
+            f'infra condition: EVERY sandboxed role on this host is affected, '
+            f'not only the task named here. The first refusal observed was role '
+            f'{role_name!r} for task {self.task_id}; other sandboxed tasks that '
+            f'refuse against the same backend propagate SandboxUnavailable to '
+            f'their own failure handlers but are NOT individually escalated. '
+            f'This escalation is deduped process-wide: exactly one filing across '
+            f'N refused invocations, re-armed only on a backend-STATE change '
+            f'(INV-4). NOTE: resolving THIS escalation alone will NOT re-file a '
+            f'new one — the dedup re-arms only when the backend state changes (a '
+            f'config edit via sandbox.backend / reload) or a backend recovers '
+            f'(landlock/bwrap becomes available). If you resolve this without '
+            f'installing/enabling a backend, subsequent refusals stay deduped '
+            f'and silent (they still fail-closed) until the backend state '
+            f'actually changes. Remediation: install/enable landlock or bwrap on '
+            f'this host, or set sandbox.backend=none to explicitly run '
+            f'UNSANDBOXED. Underlying refusal: {detail}'
+        )
+        logger.error(f'Task {self.task_id}: {summary}')
+
+        if not self.escalation_queue:
+            return
+
+        from escalation.models import Escalation
+
+        esc = Escalation(
+            id=self.escalation_queue.make_id(self.task_id),
+            task_id=self.task_id,
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+            detail=detail_msg,
+            suggested_action='install_sandbox_backend_or_set_backend_none',
+            worktree=str(self.worktree) if self.worktree else None,
+            workflow_state=self.state.value,
+        )
+        self.escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id, phase=self.state.value,
+                data={'escalation_id': esc.id, 'category': esc.category,
+                      'severity': esc.severity, 'summary': summary[:200]},
+            )
+
+    def _guard_sandbox(self, role_name: str) -> None:
+        """Fail-CLOSED sandbox check for the sandboxed-dispatch call-site (task 2908).
+
+        Called from :meth:`_invoke` inside the ``config.sandbox.enabled +
+        role.sandboxed`` block. Delegates backend resolution to
+        ``sandbox_dispatch.resolve_backend_or_refuse``: a healthy backend and the
+        operator ``backend=none`` escape hatch both return without raising, but a
+        required-yet-unavailable backend raises ``SandboxUnavailable`` — at which
+        point we file a DEDUPED escalation (only when ``exc.should_escalate``, the
+        process-global dedup decision — INV-4) and re-raise to REFUSE the agent
+        invocation rather than run it unconfined (PRD D4). The re-raised exception
+        propagates out of ``_invoke`` to ``_drive``'s generic failure handler.
+        """
+        from orchestrator.agents.sandbox_dispatch import (
+            SandboxUnavailable,
+            resolve_backend_or_refuse,
+        )
+
+        try:
+            resolve_backend_or_refuse()
+        except SandboxUnavailable as exc:
+            if exc.should_escalate:
+                self._escalate_sandbox_unavailable(
+                    role_name, exc.backend_state, str(exc),
+                )
+            raise
 
     async def _check_scope_invariant(self) -> None:
         """Tripwire (task 2505): warn + escalate if ``plan.files`` and
