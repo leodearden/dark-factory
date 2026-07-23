@@ -13946,6 +13946,58 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # ── (a) FAIL / skip ──────────────────────────────────────────────
             if vr is not None and vr.outcome is not None:
+                # ── INV-3 chain-intact enforcement — FAIL adoption ───────────
+                # (PRD plans/merge-verdict-integrity-prd.md leaf γ, §1 INV-3.)
+                # Before adopting this FAIL as a task block, re-check that the
+                # item's chain is still intact.  A FAIL verified against a DEAD
+                # base — a predecessor merge commit that was failed / ejected /
+                # superseded / re-merged since verify dispatch (the reify-5260
+                # built-awaiting-host straggler: a 43-min FAIL from an orphaned
+                # base blocked its task for ~30h) — describes a tree that will
+                # NEVER be on main, so the verdict is PHANTOM and must NEVER
+                # block the task.  VOID it: emit verdict_voided naming the dead
+                # link, re-merge the item against real main, re-park it on
+                # _redispatch for a fresh verify, and leave req UNRESOLVED.
+                # _n_failed_val is False — a merely-voided item is NOT a failure,
+                # so it must not spuriously trigger the downstream head-failure
+                # cascade off a request that never actually failed.  Mirrors the
+                # RUNNER_UNAVAILABLE remerge→REDISPATCH_PARKED template above.
+                # (PASS adoption gets the same guard in a later step; this step
+                # wires the load-bearing FAIL branch only.)
+                #
+                # Fail-open: a get_main_sha() error (or an empty read) SKIPS the
+                # check and proceeds to normal FAIL adoption — INV-3 must never
+                # wedge finalize on the #1-reliability hot path (PRD design
+                # decision 4: degrade never).  A void missed here is caught again
+                # at the item's next dispatch-time re-check.
+                try:
+                    _void_main = await self._git_ops.get_main_sha()
+                except Exception:
+                    _void_main = ''
+                _dead_link = (
+                    self._chain_dead_link(item, _void_main) if _void_main else None
+                )
+                if _dead_link is not None:
+                    await self._release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)
+                    self._emit_speculative(
+                        EventType.verdict_voided, req.task_id,
+                        dead_link=_dead_link, reason='chain_dead', point='adoption',
+                    )
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.FINALIZING,
+                        ItemLifecycleState.MERGING, live_obj=entry,
+                    )
+                    _remerged_void = await self._remerge(
+                        item.request, item.started_monotonic,
+                    )
+                    self._note_transition(
+                        req.request_id, ItemLifecycleState.MERGING,
+                        ItemLifecycleState.REDISPATCH_PARKED, live_obj=_remerged_void,
+                    )
+                    self._redispatch.appendleft(_remerged_void)
+                    _n_failed_val = False  # voided ≠ failed → no false cascade
+                    return False
+
                 fail_merge_wt = vr.merge_wt
                 await self._release_or_cleanup(fail_merge_wt, spec_warm=vr.spec_warm)
                 # I4 runs.db surface (task 2383 β, step 18): thread the skew
