@@ -3500,9 +3500,6 @@ class Harness:
             if not entry.is_dir():
                 continue
             name = entry.name
-            # Skip reserved (merge / auto-eval skip-attempt) worktrees.
-            if name.startswith('_merge-') or name.endswith('-skip-attempt'):
-                continue
             # Skip warm pool lanes.  quarantine_worktree is NOT pool-aware
             # (it moves the dir), so moving a lane would leave the pool's
             # registered path dangling.  Crash-recovery already handles
@@ -3512,6 +3509,10 @@ class Harness:
             # members of warm_lane_pool, and their names are not live task
             # ids, so they would otherwise fall through to the orphan branch
             # and get moved/removed mid-verify.  Protect them identically.
+            # Checked FIRST — before the C2 classifier below: adoptable
+            # '_lane-'/'_spec-' lanes are '_'-prefixed, so the classifier
+            # would mislabel them 'infra'; is_lane (actual pool registration)
+            # must win.
             if (
                 self.git_ops.warm_lane_pool is not None
                 and self.git_ops.warm_lane_pool.is_lane(entry)
@@ -3522,6 +3523,40 @@ class Harness:
                 and self.git_ops.spec_warm_lane_pool.is_lane(entry)
             ):
                 continue
+            # Skip auto-eval '*-skip-attempt' worktrees: a SUFFIX namespace
+            # orthogonal to C2's prefix rule (these names are NOT '_'/'.'-
+            # prefixed, so the classifier would call them 'task').  Preserved
+            # exactly as before.
+            if name.endswith('-skip-attempt'):
+                continue
+            # ── C2 namespace invariant (task 2925, merge-worktree-lifecycle
+            # -integrity PRD §4) ───────────────────────────────────────────
+            # The positive-match classifier replaces the old '_merge-'
+            # per-name skip.  '_merge-*' is REPORTED to the merge reaper
+            # (_reap_orphaned_merge_worktrees owns its guarded readopt/
+            # age-grace disposition — the sweep NEVER reaps/quarantines a
+            # '_merge-*' directly); every OTHER '_'/'.'-prefixed infra band
+            # (_mainprobe-*, _offline-deep, _iact-*, .reseed-trash, ...) is
+            # left to its owner.  This closes the latent bug where those
+            # bands fell through to the orphan quarantine/reap branch below.
+            # Both dispositions are OBSERVED via an explicit journal line,
+            # never silence.
+            worktree_class = classify_worktree_entry(name)
+            if worktree_class == 'merge':
+                logger.info(
+                    'Orphan reaper: %s is a merge worktree — reporting to the '
+                    'merge reaper, never reaped here',
+                    name,
+                )
+                continue
+            if worktree_class == 'infra':
+                logger.info(
+                    'Orphan reaper: %s is infra-owned (C2) — left to its owner',
+                    name,
+                )
+                continue
+            # 'task' falls through to the live/recovered/preserved/session/
+            # dispatched checks and the orphan quarantine/reap branch below.
             # Skip live, recovered, preserved, and in-flight worktrees.
             if (
                 name in live_ids
