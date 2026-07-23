@@ -1013,6 +1013,8 @@ class RemoteRunner:
         *,
         config_path: str | None = None,
         main_branch: str | None = None,
+        df_remote_checkout: str | None = None,
+        df_local_checkout: str | Path | None = None,
         run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         ssh_run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
         heartbeat_interval: float | None = None,
@@ -1024,6 +1026,17 @@ class RemoteRunner:
         self._cwd = cwd
         self._config_path = config_path
         self._main_branch = main_branch
+        # INV-2 (task 2884): the remote DF *code* checkout (where `orchestrator
+        # verify-merge` resolves) and the dispatcher's own local DF root — the
+        # HEAD-compare pair for contract-currency auto-sync.  Both None keeps
+        # sync_if_stale a byte-identical no-op (opt-in).  Distinct from
+        # _git_remote/_cwd, which are the PROJECT checkout.
+        self._df_remote_checkout = df_remote_checkout
+        self._df_local_checkout = df_local_checkout
+        # Per-runner lock serialising the mutating sync (pull + uv sync) so two
+        # concurrent dispatches never `git pull` the same checkout at once
+        # (PRD §3.1).  Read-only HEAD probes run outside it.
+        self._sync_lock = asyncio.Lock()
         self._run = run if run is not None else _default_subprocess_run
         # γ: connection-death heartbeat-watchdog (PRD §8.1). The ssh dispatch is
         # load-bearing (it's the call that blocks for the whole remote build), so
@@ -1079,6 +1092,150 @@ class RemoteRunner:
             return rc == 0
         except Exception:
             return False
+
+    async def sync_if_stale(
+        self,
+        *,
+        event_store: Any = None,
+        task_id: str | None = None,
+    ) -> SyncOutcome:
+        """INV-2 contract-currency gate — bring the remote DF *code* checkout
+        current with the dispatcher before its verdict is adopted.
+
+        Cadence = HEAD-compare PER DISPATCH (PRD §9, architect's call): resolve
+        the local DF HEAD (network-free ``git rev-parse``) and the remote DF
+        checkout HEAD (over ssh).  Equal ⇒ the remote already runs the
+        dispatcher's gate code — no pull.  Different ⇒ emit ``runner_stale`` and,
+        serialised on the per-runner lock and only when NO verify is in flight
+        (never ``git pull`` under a live verify), run ``git pull --ff-only`` +
+        ``uv sync`` on the remote DF checkout, emitting ``runner_synced``
+        (kind='df_checkout') on success.  Success is keyed on the two return
+        codes, NOT a post-sync HEAD-equality check — the dispatcher's local DF
+        HEAD may legitimately lead origin (unpushed commits), and the remote
+        pulls from origin (design_decisions[3]).
+
+        Fail-closed and never-raises: staleness with a failed pull/uv-sync, or
+        any subprocess/transport error, returns ``ok=False`` so the pool benches
+        the runner (PRD §3.1).  Not configured (no ``df_remote_checkout`` / no
+        resolvable ``df_local_checkout``) returns ``configured=False, ok=True``
+        and issues ZERO ssh/git calls — byte-identical to the pre-INV-2 path.
+        ``event_store`` is None-safe (emit only when set), mirroring LocalRunner.
+        """
+        df_remote = self._df_remote_checkout
+        df_local = self._df_local_checkout
+        # Opt-in gate: either path unset ⇒ inert pass-through, no bench, no I/O.
+        if not df_remote or df_local is None:
+            return SyncOutcome(configured=False, ok=True)
+
+        df_local_str = str(df_local)
+
+        def _emit(event_type: Any, data: dict[str, Any]) -> None:
+            if event_store is not None:
+                event_store.emit(event_type, task_id=task_id, data=data)
+
+        try:
+            from orchestrator.event_store import EventType
+
+            # 1) Resolve local DF HEAD (network-free) + remote DF HEAD (ssh).
+            local_rc, local_out, _ = await self._run(
+                ['git', 'rev-parse', 'HEAD'], cwd=df_local_str,
+            )
+            remote_rc, remote_out, _ = await self._run(
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                 f'git -C {shlex.quote(df_remote)} rev-parse HEAD'],
+            )
+            if local_rc != 0 or remote_rc != 0:
+                return SyncOutcome(
+                    configured=True, ok=False,
+                    detail=f'HEAD resolve failed (local rc={local_rc}, remote rc={remote_rc})',
+                )
+            local_head = local_out.strip()
+            remote_head = remote_out.strip()
+
+            # 2) Current — remote already runs the dispatcher's gate code.
+            if local_head == remote_head:
+                return SyncOutcome(
+                    configured=True, ok=True, stale=False,
+                    local_head=local_head, remote_head=remote_head,
+                    detail='current',
+                )
+
+            # 3) Stale — announce BEFORE any mutation so the bench/sync is
+            #    auditable even if the sync is skipped (inflight) or fails.
+            _emit(EventType.runner_stale, {
+                'runner': self.name,
+                'local_head': local_head,
+                'remote_head': remote_head,
+            })
+
+            async with self._sync_lock:
+                # Never git-pull under a live verify — it would disturb the
+                # checkout the running verify is executing against.  Skip (do
+                # NOT bench): the next dispatch re-checks with no verify in
+                # flight; in the production pre-dispatch flow no verify is ever
+                # in flight here, so INV-2's fail-closed guarantee is unaffected.
+                if self.dispatch_in_flight:
+                    return SyncOutcome(
+                        configured=True, ok=True, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail='skipped: verify in flight',
+                    )
+
+                pull_rc, _, pull_err = await self._run(
+                    ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                     f'git -C {shlex.quote(df_remote)} pull --ff-only'],
+                )
+                if pull_rc != 0:
+                    return SyncOutcome(
+                        configured=True, ok=False, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail=f'git pull --ff-only failed (rc={pull_rc}): {pull_err}',
+                    )
+
+                uv_rc, _, uv_err = await self._run(
+                    ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                     f'cd {shlex.quote(df_remote)} && uv sync'],
+                )
+                if uv_rc != 0:
+                    return SyncOutcome(
+                        configured=True, ok=False, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail=f'uv sync failed (rc={uv_rc}): {uv_err}',
+                    )
+
+                # Best-effort post-sync HEAD for the runner_synced.to_head
+                # payload — informational only, never gates ok.
+                to_head: str | None = None
+                try:
+                    ph_rc, ph_out, _ = await self._run(
+                        ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
+                         f'git -C {shlex.quote(df_remote)} rev-parse HEAD'],
+                    )
+                    if ph_rc == 0:
+                        to_head = ph_out.strip() or None
+                except Exception:
+                    to_head = None
+
+                _emit(EventType.runner_synced, {
+                    'runner': self.name,
+                    'kind': 'df_checkout',
+                    'from_head': remote_head,
+                    'to_head': to_head,
+                    'forced': False,
+                })
+                return SyncOutcome(
+                    configured=True, ok=True, stale=True, synced=True,
+                    local_head=local_head, remote_head=to_head or remote_head,
+                    detail='synced (df_checkout)',
+                )
+        except Exception as exc:
+            # Any subprocess/transport error anywhere above ⇒ fail-closed.
+            # Exception (not BaseException) so asyncio.CancelledError still
+            # propagates.  Never raises to the caller.
+            return SyncOutcome(
+                configured=True, ok=False,
+                detail=f'sync transport error: {exc!r}',
+            )
 
     async def run_merge_verify(
         self,
