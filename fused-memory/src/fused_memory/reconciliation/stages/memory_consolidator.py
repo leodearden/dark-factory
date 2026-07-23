@@ -29,6 +29,7 @@ from fused_memory.reconciliation.flag_dedup import (
     dedup_flags,
     filter_already_tracked_systemic_patterns,
     filter_false_absence_flags,
+    filter_stale_bulk_get_statuses_flags,
     filter_stale_count_snapshot_corrections,
     filter_terminal_metadata_flags,
 )
@@ -261,6 +262,29 @@ class MemoryConsolidator(BaseStage):
                 taskmaster=self.taskmaster,
                 project_root=self.project_root,
                 flags=report.items_flagged,
+            )
+            # ── Stale bulk get_statuses guard (task-3007): drop ───────────────────
+            # stale_bulk_get_statuses_recurrence flags whose alleged bulk-vs-scoped
+            # census divergence does NOT reproduce on a fresh LIVE A/B read.  The
+            # recurrence is a misdiagnosis of the harness's frozen cycle-start
+            # unscoped census compared against live reads minutes later (not a
+            # backend defect — the read path is provably write-synchronous-fresh);
+            # dropping the phantom flag before dedup_flags stops the per-cycle
+            # marker churn AND the phantom backend-investigation task each
+            # recurrence would otherwise mint.  Fail-safe: only drops on
+            # positively-confirmed live agreement; a reproduced divergence, a
+            # missing/None cited status, or a read error KEEP the flag so a genuine
+            # regression is never silenced.  Surfaces the dropped count as
+            # report.stats['stale_bulk_get_statuses_flags_dropped'] (mirrors the
+            # stale_count_snapshot_corrections_dropped before/after idiom above).
+            _before_stale_bulk_get_statuses_filter = len(report.items_flagged)
+            report.items_flagged = await filter_stale_bulk_get_statuses_flags(
+                taskmaster=self.taskmaster,
+                project_root=self.project_root,
+                flags=report.items_flagged,
+            )
+            report.stats['stale_bulk_get_statuses_flags_dropped'] = (
+                _before_stale_bulk_get_statuses_filter - len(report.items_flagged)
             )
             # ── Already-tracked systemic-pattern guard (task-2416): drop ──────────
             # systemic_pattern "never tracked" findings BEFORE dedup_flags so a
