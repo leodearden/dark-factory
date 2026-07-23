@@ -269,3 +269,96 @@ class TestReclaimTerminalLaneRecords:
         )
         # gate awaited with f'{branch_prefix}{task_id}' (branch_prefix default 'task/')
         git_ops.resolve_branch_sha.assert_awaited_once_with('task/100')
+
+
+# ---------------------------------------------------------------------------
+# step-11: _stale_lane_assignment_census
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStaleLaneAssignmentCensus:
+    """Census surfaces NON-terminal warm-lane assignments idle past the threshold.
+
+    The reporting complement to the reclaim pass: the non-terminal lanes it
+    deliberately leaves alone (WIP-preserving) but which are stale enough that
+    an operator should look (e.g. the incident-07-21 5260 lane held
+    verified-green work while its task sat pending).
+    """
+
+    async def test_reports_only_stale_non_terminal_lanes(
+        self, tmp_path: Path
+    ) -> None:
+        """Exactly the stale non-terminal lane is reported; fresh + terminal excluded."""
+        harness, git_ops = _make_pool_harness(tmp_path, lane_stale_report_days=7.0)
+        now = datetime.now(UTC)
+        _write_record(
+            git_ops, '_lane-stale', DurableLaneState.ASSIGNED, '5260',
+            updated_at=(now - timedelta(days=10)).isoformat(),
+        )
+        _write_record(
+            git_ops, '_lane-fresh', DurableLaneState.ASSIGNED, '5261',
+            updated_at=(now - timedelta(days=1)).isoformat(),
+        )
+        _write_record(
+            git_ops, '_lane-done', DurableLaneState.ASSIGNED, '5262',
+            updated_at=(now - timedelta(days=30)).isoformat(),
+        )
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=(
+                {'5260': 'blocked', '5261': 'pending', '5262': 'done'}, None,
+            )
+        )
+
+        census = await harness._stale_lane_assignment_census()
+
+        assert len(census) == 1
+        line = census[0]
+        # names lane, task id, status, and conveys staleness/age
+        assert '_lane-stale' in line
+        assert '5260' in line
+        assert 'blocked' in line
+        assert 'stale' in line.lower()
+        assert '10.0' in line  # ~10.0d age
+        # fresh non-terminal + terminal excluded
+        assert not any('5261' in ln for ln in census)
+        assert not any('5262' in ln for ln in census)
+
+    async def test_resolver_failed_returns_empty(self, tmp_path: Path) -> None:
+        """Fail-safe: a degraded get_statuses read -> [] (no census)."""
+        harness, git_ops = _make_pool_harness(tmp_path, lane_stale_report_days=7.0)
+        _write_record(
+            git_ops, '_lane-stale', DurableLaneState.ASSIGNED, '5260',
+            updated_at=(datetime.now(UTC) - timedelta(days=10)).isoformat(),
+        )
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({}, RuntimeError('db down'))
+        )
+        assert await harness._stale_lane_assignment_census() == []
+
+    async def test_no_pool_returns_empty(self, tmp_path: Path) -> None:
+        """Guard: no warm-lane pool -> []."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        (repo / '.git').mkdir()
+        config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=0)
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+        assert git_ops.warm_lane_pool is None
+        assert await harness._stale_lane_assignment_census() == []
+
+    async def test_malformed_updated_at_skipped(self, tmp_path: Path) -> None:
+        """A record with empty/unparseable updated_at is skipped, not counted."""
+        harness, git_ops = _make_pool_harness(tmp_path, lane_stale_report_days=7.0)
+        _write_record(
+            git_ops, '_lane-empty', DurableLaneState.ASSIGNED, '7000', updated_at=''
+        )
+        _write_record(
+            git_ops, '_lane-bad', DurableLaneState.ASSIGNED, '7001',
+            updated_at='not-a-date',
+        )
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'7000': 'blocked', '7001': 'blocked'}, None)
+        )
+        assert await harness._stale_lane_assignment_census() == []
