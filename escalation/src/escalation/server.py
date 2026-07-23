@@ -1207,6 +1207,13 @@ def create_server(
           already in-flight; request_id is the *existing* entry's id (D8), not
           the submitting call's id.  ``inflight_task_id`` is the authoritative
           poll handle (merge_status accepts task_id per D10).
+        - Duplicate-in-verify reject (C3/D3): ``{error, code='duplicate_in_verify',
+          existing_mr, existing_sha, verify_age_secs, hint='merge_cancel then
+          resubmit'}``.  Returned when a *newer* SHA for the branch is submitted
+          while its earlier SHA is already IN VERIFY — the gate refuses to
+          supersede a live verify.  ``existing_mr``/``existing_sha`` identify the
+          in-flight entry's request_id/tip (D8); ``verify_age_secs`` is how long
+          that verify has been running.  Cancel it (merge_cancel) then resubmit.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
           already an ancestor of main (fast-path — no enqueue, no request_id)
@@ -1411,6 +1418,28 @@ def create_server(
                 'position': position,
                 'queue_depth': queue_depth,
                 'eta_seconds': eta,
+            }
+
+        if dispatch.rejected:
+            # C3/D3: a newer SHA for this branch was submitted while its earlier
+            # SHA is IN VERIFY.  The submit gate rejects it structurally
+            # (duplicate_in_verify) rather than tearing down the live verify.
+            # Envelope aligns with the server's existing {error, code}
+            # convention; existing_mr/existing_sha carry the IN-FLIGHT entry's
+            # request_id/snapshot_tip (D8) so the caller correlates with the
+            # live verify, not the rejected submission.  The hint tells the
+            # caller how to proceed: merge_cancel the in-flight entry, then
+            # resubmit the newer tip.
+            return {
+                'error': (
+                    f'a newer SHA for {branch} cannot be submitted while its '
+                    'earlier SHA is in verify; merge_cancel then resubmit'
+                ),
+                'code': dispatch.reject_code,
+                'existing_mr': dispatch.inflight_request_id,
+                'existing_sha': dispatch.existing_sha,
+                'verify_age_secs': dispatch.verify_age_secs,
+                'hint': 'merge_cancel then resubmit',
             }
 
         if dispatch.in_flight:
