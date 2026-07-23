@@ -2630,7 +2630,51 @@ class TaskKnowledgeSync(BaseStage):
             self.memory, self.project_id, run_id,
         )
 
+        # Entity-standing-decision growth-freshness sweep (task 2899 ζ) — a
+        # sibling of the marker sweeps above, run at the Stage-2 TAIL (Stage 3 is
+        # read-only by design; PRD decision 9). Corroborates each ACTIVE standing
+        # decision's decision-time edge-count snapshot against the live graph and
+        # expires grown rows (reason='growth'); records explicit-zero stats and,
+        # on a full non-remediation cycle, evaluates the failure-streak escalation.
+        await self._run_entity_standing_decision_growth_sweep(report, run_id)
+
         return report
+
+    async def _run_entity_standing_decision_growth_sweep(
+        self,
+        report: StageReport,
+        run_id: str,
+    ) -> None:
+        """Run the ζ growth-freshness sweep and record its per-cycle stats (task 2899).
+
+        Delegates the row work to :func:`_sweep_entity_standing_decision_growth`
+        (best-effort, never raises), then records explicit-zero stats — the
+        ``failed`` flag (``1``/``0``) that the streak escalation reads next cycle
+        and the count of rows flipped to expired/growth — so downstream consumers
+        never need a ``.get(..., default)`` fallback.
+
+        The consecutive-failure streak escalation is evaluated ONLY on a full,
+        non-remediation cycle with a wired escalation queue: a remediation/targeted
+        pass must not inflate or reset the streak (mirroring the task-count-snapshot
+        cadence), and an unwired queue has nothing to file to. The filer itself is
+        journal-recompute + ``has_open_l1``-deduped and never raises.
+        """
+        result = await _sweep_entity_standing_decision_growth(
+            self.memory, self.project_id, run_id,
+        )
+        report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] = (
+            1 if result['failed'] else 0
+        )
+        report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] = result['expired']
+
+        if not self.remediation_mode and self._escalation_queue is not None:
+            await _maybe_escalate_growth_sweep_failures(
+                self._escalation_queue,
+                self.journal,
+                self.project_id,
+                run_id,
+                result['failed'],
+            )
 
     async def _apply_post_flight_guards(
         self,
