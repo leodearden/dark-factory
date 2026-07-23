@@ -409,6 +409,98 @@ class TestOrphanL0Reaper:
         assert len(l1s) == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'case',
+        [
+            pytest.param('stale-routing', id='stale-routing'),
+            pytest.param('get-task-none', id='get-task-none'),
+            pytest.param('no-routing', id='no-routing'),
+        ],
+    )
+    async def test_stranded_divergence_still_promoted(
+        self, harness: Harness, case: str,
+    ):
+        """Task 2931 boundary guard: the routing-freshness gate defers ONLY
+        live/fresh dispatches and never drops a genuinely stranded orphan
+        (preserves task 2878's boundary).
+
+        Same aged (300s) divergence-class L0 and ``is_actively_held=False``
+        as ``test_live_lockfree_dispatch_divergence_not_promoted``, but here
+        the ``routing.latest`` liveness signal is NOT fresh, so
+        ``_has_fresh_dispatch`` returns False and the orphan is promoted:
+
+        - 'stale-routing': ``decided_at`` is 300s old (> the 120s grace) —
+          the decision aged out, so the task is stranded, not live.
+        - 'get-task-none': ``get_task`` cannot confirm the task (``None``) —
+          fail open (promote).
+        - 'no-routing': ``metadata`` has no ``routing`` key — no liveness
+          signal to confirm — fail open (promote).
+        """
+        assert harness._escalation_queue is not None
+        harness.config.orphan_l0_dispatch_freshness_secs = 120.0
+        harness.scheduler.is_actively_held = MagicMock(return_value=False)
+
+        # Build the get_task return at runtime so relative timestamps compute
+        # against the current sweep clock.
+        if case == 'stale-routing':
+            stale_decided_at = (
+                datetime.now(UTC) - timedelta(seconds=300.0)
+            ).isoformat()
+            harness.scheduler.get_task = AsyncMock(
+                return_value={
+                    'status': 'in-progress',
+                    'metadata': {
+                        'routing': {
+                            'latest': {'decided_at': stale_decided_at},
+                        },
+                    },
+                },
+            )
+        elif case == 'get-task-none':
+            harness.scheduler.get_task = AsyncMock(return_value=None)
+        else:  # 'no-routing'
+            harness.scheduler.get_task = AsyncMock(
+                return_value={'status': 'in-progress', 'metadata': {}},
+            )
+
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-stranded'),
+            task_id='task-stranded',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task '
+                'task-stranded'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Not in _escalation_events, is_actively_held False — genuinely
+        # stranded, and the routing signal is non-fresh for every case.
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-stranded'
+
+    @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
