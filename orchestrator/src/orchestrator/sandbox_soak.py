@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -259,3 +260,39 @@ def read_task_status(db, tag: str = "master") -> dict[str, str]:
     finally:
         conn.close()
     return {str(row[0]): row[1] for row in rows}
+
+
+def _report_present_on_main(repo_root, ref: str = "main", path: str = PROBE_REPORT_PATH) -> bool:
+    """True iff *path* is tracked in the tree of *ref* (default ``main``).
+
+    Uses ``git cat-file -e <ref>:<path>`` — a tracked-on-main check, not bare
+    filesystem existence, so a stray untracked/uncommitted docs/ file does not
+    false-pass. A git invocation error (not a git repository, unknown ref, git
+    missing) raises SoakInputError (-> exit 2); a path simply absent at an
+    otherwise-valid ref returns False. Never lets a git failure masquerade as
+    False.
+    """
+    def _run(args):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True, text=True,
+            )
+        except OSError as exc:  # git binary missing / repo_root unusable
+            raise SoakInputError(
+                f"git invocation failed in {repo_root}: {exc}"
+            ) from exc
+
+    # 1) Validate the ref resolves — separates a real git error (not a repo /
+    #    unknown ref -> SoakInputError) from a path merely absent at a valid ref
+    #    (-> False). rev-parse --verify --quiet exits non-zero (silently) on an
+    #    unknown ref and 128 (with stderr) outside a git repo.
+    ref_check = _run(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+    if ref_check.returncode != 0:
+        raise SoakInputError(
+            f"cannot resolve git ref {ref!r} in {repo_root} "
+            "(not a git repository or unknown ref): "
+            f"{(ref_check.stderr or '').strip() or 'no such ref'}"
+        )
+    # 2) The ref is valid — presence of the path in its tree IS the verdict.
+    return _run(["cat-file", "-e", f"{ref}:{path}"]).returncode == 0
