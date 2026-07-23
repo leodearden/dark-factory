@@ -5910,6 +5910,66 @@ class TestPersistentMergeWorktree:
             'ephemeral _merge-<uuid> must be unregistered after cleanup'
         )
 
+    async def test_cleanup_merge_worktree_crash_safe_shape1_leak(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree crash-safely removes a shape-1 leak (task 2922).
+
+        Shape-1: an interrupted teardown (SIGTERM/restart mid-merge) leaves a
+        full ``_merge-<uuid>`` checkout on disk while its
+        ``.git/worktrees/<name>`` admin dir is already gone, so
+        ``git worktree remove --force`` errors ('not a working tree') and the
+        guarded primitive returns 'failed', leaving the tree. cleanup must
+        inspect that outcome and crash-safely rmtree the on-disk tree + unlink
+        the sibling ``.lock``, leaving NO ``_merge-*`` leak — and a re-call
+        must be an idempotent clean no-op.
+
+        RED on base: cleanup_merge_worktree fires-and-forgets the primitive's
+        'failed' outcome, so the tree (and its orphan ``.lock``) survive.
+        """
+        import shutil
+
+        merge_wt, _ = await git_ops._create_merge_worktree()
+        assert merge_wt.exists()
+
+        # Simulate shape-1: remove the .git/worktrees/<name> admin dir the
+        # lane's .git pointer names — registration is gone while the on-disk
+        # tree survives, exactly the interrupted-teardown on-disk shape.
+        shutil.rmtree(_lane_admin_dir(merge_wt))
+
+        await git_ops.cleanup_merge_worktree(merge_wt)
+
+        # The on-disk tree is gone...
+        assert not merge_wt.exists(), (
+            'shape-1 leak tree must be removed by crash-safe cleanup'
+        )
+        # ...absent from git worktree list...
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        assert str(merge_wt) not in registered, (
+            f'shape-1 leak must be gone from git worktree list: {registered}'
+        )
+        # ...and NO _merge-* directory OR sibling .lock orphan survives under
+        # worktree_base (task 2924's strict no-leak glob).
+        leaks = list(git_ops.worktree_base.glob('_merge-*'))
+        assert not leaks, (
+            f'no _merge-* dir OR lock-file orphan may survive crash-safe '
+            f'cleanup: {leaks}'
+        )
+
+        # Idempotent: a SECOND cleanup is a clean no-op that never raises
+        # (primitive → 'not_present' → wrapper early-return).
+        await git_ops.cleanup_merge_worktree(merge_wt)
+        assert not merge_wt.exists()
+
     # ------------------------------------------------------------------
     # Step 9 — _iter_merge_worktrees exempts _merge-verify
     # ------------------------------------------------------------------

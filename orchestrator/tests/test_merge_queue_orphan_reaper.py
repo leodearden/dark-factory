@@ -123,6 +123,21 @@ async def _registered_worktree_paths(git_ops: GitOps) -> list[str]:
     ]
 
 
+def _lane_admin_dir(lane: Path) -> Path:
+    """Parse the ``.git/worktrees/<name>`` admin dir out of a lane's ``.git``
+    pointer file (``gitdir: <repo>/.git/worktrees/<name>``).
+
+    Local per-file duplication (see module docstring / the same helper in
+    test_git_ops.py:_lane_admin_dir) — used to simulate the task-2922 shape-1
+    interrupted-teardown leak by rmtree-ing the admin dir while the on-disk
+    tree survives, so ``git worktree remove --force`` errors.
+    """
+    content = (lane / '.git').read_text().strip()
+    prefix = 'gitdir:'
+    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
+    return Path(content[len(prefix):].strip())
+
+
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: core reap + headline signal
 # ---------------------------------------------------------------------------
@@ -407,3 +422,63 @@ class TestReapOrphanedMergeWorktreesFailOpen:
         assert inflight.resolve() in {
             p.resolve() for p in worker._owned_merge_worktrees
         }
+
+
+# ---------------------------------------------------------------------------
+# task 2922: crash-safe shape-1 interrupted-teardown leak — end-to-end
+# (reaper reaps it via the fixed cleanup + the ledger audit reads clean)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapShape1InterruptedTeardown:
+    """End-to-end acceptance for the task-2922 shape-1 leak.
+
+    Shape-1: an interrupted teardown (SIGTERM/restart mid-merge) leaves a
+    full ``_merge-<uuid>`` checkout on disk while its
+    ``.git/worktrees/<name>`` admin dir is already gone, so
+    ``git worktree remove --force`` errors ('not a working tree') and
+    ``cleanup_merge_worktree``'s guarded primitive returns 'failed'. The
+    existing startup reaper (which calls cleanup_merge_worktree per aged
+    candidate) must still remove the tree — via the crash-safe cleanup
+    fallback added in step-2 — and the observation-only ledger audit
+    (``worktree_ledger_violations``) must then read clean, satisfying the
+    acceptance criterion "zero unregistered _merge-* violations after a
+    simulated mid-teardown crash".
+
+    RED on base: cleanup_merge_worktree fires-and-forgets the primitive's
+    'failed' outcome, so the reaper leaves the on-disk tree (and its orphan
+    ``.lock``) and the audit keeps flagging it forever.
+    """
+
+    async def test_aged_shape1_orphan_reaped_and_ledger_clears(
+        self, git_ops: GitOps,
+    ) -> None:
+        import shutil
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        wt = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        # Simulate shape-1: remove the .git/worktrees/<name> admin dir (located
+        # via the lane's <wt>/.git gitdir pointer) so the on-disk tree survives
+        # but `git worktree remove` errors — the interrupted-teardown shape.
+        shutil.rmtree(_lane_admin_dir(wt))
+
+        # Sanity: the audit flags this shape-1 orphan BEFORE the sweep.
+        before = worker.worktree_ledger_violations(now=_NOW)
+        assert len(before) == 1, f'expected exactly one violation, got: {before!r}'
+
+        report = await worker.reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert not wt.exists(), 'shape-1 orphan must be removed from disk'
+        assert str(wt.resolve()) in report['reaped']
+        assert report['readopted'] == []
+        # No _merge-* directory OR sibling .lock orphan survives the sweep
+        # (task 2924's strict no-leak glob).
+        leaks = list(git_ops.worktree_base.glob('_merge-*'))
+        assert not leaks, f'no _merge-* leak may survive the sweep: {leaks}'
+        # The audit reads clean AFTER the sweep — the acceptance criterion.
+        assert worker.worktree_ledger_violations(now=_NOW) == []
