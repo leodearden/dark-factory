@@ -60,6 +60,7 @@ from fused_memory.middleware.operational_routing_guard import (
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
+    all_files_foreign_owner,
     check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
@@ -1599,6 +1600,39 @@ class TaskInterceptor:
         )
         return check_files_for_scope(files, project_id, registry)
 
+    def _all_files_foreign_owner(
+        self,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> str | None:
+        """Return the single foreign owner iff EVERY declared file is owned by
+        ONE other project (the cross-repo deliverable shape, task 3004).
+
+        Reads the same ``metadata.files`` list as :meth:`_files_scope_check`
+        and delegates to the pure :func:`all_files_foreign_owner`. This is the
+        cross-repo *allow-and-tag* counterpart to the FILES-certain hard reject
+        (:func:`check_files_for_scope`): a task filed under *project_id* whose
+        files are ALL owned by one OTHER registered project (the reify-task
+        5308 shape) is a legitimate cross-repo deliverable, not a scope error —
+        its own branch is empty because the deliverable lands on that project's
+        branch.
+
+        Returns ``None`` when no :attr:`_prefix_registry` is configured (the
+        caller then falls through to the existing hard reject), when any file
+        is locally owned, when no file is foreign, or when foreign files span
+        more than one owner — i.e. the partial/mixed case that
+        :func:`check_files_for_scope` still hard-rejects (task 2206 preserved).
+        """
+        registry = self._prefix_registry
+        if registry is None:
+            return None
+        files = (
+            candidate.files_to_modify if candidate is not None
+            else self._extract_meta_files(kwargs)
+        )
+        return all_files_foreign_owner(files, project_id, registry)
+
     def _path_guard_check(
         self,
         candidate: CandidateTask | None,
@@ -1759,6 +1793,22 @@ class TaskInterceptor:
         # below.
         files_verdict = self._files_scope_check(candidate, kwargs, project_id)
         if files_verdict.is_rejection:
+            # CROSS-REPO DELIVERABLE (task 3004): a submission whose declared
+            # files are ALL owned by ONE other project is not a scope error —
+            # its own branch is legitimately empty because the deliverable
+            # lands on the owner's branch (the reify-task 5308 shape). Tag it
+            # (cross_repo=True + cross_repo_project=<owner>) and ALLOW it, so
+            # the orchestrator pre-merge gate routes it to
+            # OutcomeKind.plan_files_cross_repo instead of flagging 'files not
+            # touched'. Only the ALL-foreign single-owner shape qualifies; a
+            # partial/mixed submission returns None here and falls through to
+            # the existing hard reject (task 2206 preserved).
+            cross_repo_owner = self._all_files_foreign_owner(
+                candidate, kwargs, project_id,
+            )
+            if cross_repo_owner is not None:
+                self._attach_cross_repo_marker(kwargs, cross_repo_owner)
+                return None
             self._emit_scope_violation_escalation(
                 files_verdict, candidate, kwargs, project_root, project_id,
                 llm_reason=None,
@@ -2065,6 +2115,43 @@ class TaskInterceptor:
             'suggested_project': verdict.suggested_project,
             'source': 'prose',
         }
+        kwargs['metadata'] = meta
+
+    @staticmethod
+    def _attach_cross_repo_marker(kwargs: dict[str, Any], owner: str) -> None:
+        """Tag ``kwargs['metadata']`` as a cross-repo deliverable (task 3004).
+
+        Set when every declared ``metadata.files`` entry is owned by ONE other
+        project (:meth:`_all_files_foreign_owner` / :func:`all_files_foreign_owner`):
+        the task's own branch is legitimately empty because the deliverable
+        lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
+        :meth:`_attach_possible_scope_mismatch`'s in-place metadata
+        normalisation (None / JSON-string / dict / unparseable via
+        :meth:`_extract_metadata_dict`; malformed input discarded with a
+        WARNING) and, like it, runs inside :meth:`_path_guard_or_skip` BEFORE
+        ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
+        so the in-place write carries the marker with no new plumbing.
+
+        The orchestrator pre-merge narrowing gate reads ``metadata.cross_repo``
+        + ``cross_repo_project`` to route the task to
+        ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
+        touched'.
+        """
+        metadata = kwargs.get('metadata')
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            if metadata is not None:
+                logger.warning(
+                    'cross-repo-marker: non-dict metadata discarded (type=%s); '
+                    'using fresh dict. Original value: %r',
+                    type(metadata).__name__,
+                    metadata,
+                )
+            meta = {}
+        else:
+            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta['cross_repo'] = True
+        meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
 
     async def _check_escalation_idempotency(
