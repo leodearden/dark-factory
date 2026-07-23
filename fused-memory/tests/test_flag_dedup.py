@@ -4755,6 +4755,63 @@ class TestFilterStaleBulkGetStatusesFlags:
         assert result == [flag], 'Empty project_root must pass all flags through unchanged'
         taskmaster.get_statuses.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_mixed_flags_position_mapping_drops_only_agreeing(self):
+        """Multi-flag input exercises gather / zip(strict) / results_by_pos mapping.
+
+        A mixed list [non-matching, stale-agree, stale-diverge, stale-no-task-id]
+        must drop EXACTLY the agreeing matching flag while keeping the other three
+        in their original order — proving the check_positions↔lookup_results
+        pairing stays aligned when matching and non-matching flags interleave
+        (a mis-mapping would drop the wrong flag).  Reads must be issued only for
+        the two task-bearing matching flags, and the shared unscoped census must
+        be read exactly once (hoisted out of the per-task gather).
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        # Live census: task 100 agrees (done/done → DROP); task 200 diverges
+        # (pending/done → KEEP).  999 is present but its flag is non-matching, so
+        # it must never be scoped-read.
+        bulk_census = {'100': 'done', '200': 'pending', '999': 'in-progress'}
+        scoped_map = {'100': 'done', '200': 'done'}
+
+        def _fake(project_root_arg, ids=None, tag=None):
+            if ids is None:
+                return dict(bulk_census)
+            return {tid: scoped_map[tid] for tid in ids if tid in scoped_map}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(side_effect=_fake)
+        project_root = '/proj'
+
+        non_matching = {'task_id': '999', 'flag_type': 'orphaned_knowledge'}
+        stale_agree = {'task_id': '100', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        stale_diverge = {'task_id': '200', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        stale_no_task_id = {'task_id': None, 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        flags = [non_matching, stale_agree, stale_diverge, stale_no_task_id]
+
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, flags)
+
+        assert result == [non_matching, stale_diverge, stale_no_task_id], (
+            'only the agreeing matching flag (task 100) must be dropped; the '
+            'non-matching, diverging, and no-task-id flags survive in original '
+            'order — a position mis-mapping would drop the wrong flag'
+        )
+
+        calls = taskmaster.get_statuses.call_args_list
+        bulk_calls = [c for c in calls if c.kwargs.get('ids') is None]
+        scoped_ids = sorted(
+            c.kwargs.get('ids') for c in calls if c.kwargs.get('ids') is not None
+        )
+        assert len(bulk_calls) == 1, (
+            'the unscoped bulk census must be read exactly once and shared across '
+            'both scoped re-checks (not re-fetched per matching flag)'
+        )
+        assert scoped_ids == [['100'], ['200']], (
+            'scoped reads must be issued only for the two task-bearing matching '
+            'flags (100, 200) — never for the non-matching (999) or no-task-id flag'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task-1786 step-1 — filter_stale_count_snapshot_corrections
