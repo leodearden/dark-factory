@@ -801,6 +801,50 @@ class TestPureGateResumeHardening:
             },
         )
 
+    async def test_always_escalates_gate_stamp_implies_queryable_escalation(self, tmp_path: Path):
+        """Regression guard (task 2954, the explicitly-requested end-to-end
+        deliverable): a fresh always_escalates pure-gate dispatch must yield a
+        DURABLY queryable L2 escalation AND stamp gate_escalated_at — pinning the
+        'stamp ⟹ queryable escalation' invariant whose violation (stamp present,
+        record absent) is the reported bug, and guarding the file-before-stamp
+        durability contract against regression."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='2954', gate_options=['approve', 'reject'])
+        assert 'gate_escalated_at' not in task['metadata']  # fresh dispatch
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        # (d) a fresh gate blocks awaiting a human decision
+        assert outcome == WorkflowOutcome.BLOCKED
+        # (a) exactly one queryable born-at-L2 escalation, scoped to the runner role
+        pending = queue.get_by_task(
+            '2954', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.category == 'milestone_gate'
+        # (b) the record round-trips from DISK — durable persistence, not just an
+        # in-memory list — proving the invariant end-to-end.
+        on_disk = queue.get(esc.id)
+        assert on_disk is not None
+        assert on_disk.id == esc.id
+        assert on_disk.task_id == '2954'
+        # (c) gate_escalated_at is stamped via a metadata merge
+        stamp_calls = [
+            c for c in scheduler.update_task.await_args_list
+            if len(c.args) >= 2 and isinstance(c.args[1], dict)
+            and 'gate_escalated_at' in c.args[1]
+        ]
+        assert stamp_calls, 'gate_escalated_at must be stamped on first dispatch'
+        assert stamp_calls[0].kwargs.get('metadata_mode') == 'merge'
+
 
 # ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
