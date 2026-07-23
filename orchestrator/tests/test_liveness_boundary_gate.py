@@ -154,6 +154,10 @@ def _make_workflow(
     config.recycle_config_dir_on_zero_output = False
     config.judge_after_each_iteration = False
     config.inter_iteration_rebase = False
+    # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
+    # do not assert on sandbox wiring; disable the sandbox block so _invoke does
+    # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
+    config.sandbox.enabled = False
 
     scheduler = MagicMock()
     git_ops = MagicMock()

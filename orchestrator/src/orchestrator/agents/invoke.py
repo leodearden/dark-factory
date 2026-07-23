@@ -103,6 +103,7 @@ async def invoke_agent(
     output_schema: dict | None = None,
     permission_mode: str = 'bypassPermissions',
     sandbox_modules: list[str] | None = None,
+    sandbox_extras: list[str] | None = None,
     effort: str | None = None,
     backend: str = 'claude',
     oauth_token: str | None = None,
@@ -150,6 +151,7 @@ async def invoke_agent(
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
             mcp_config=mcp_config, output_schema=output_schema,
             permission_mode=permission_mode, sandbox_modules=sandbox_modules,
+            sandbox_extras=sandbox_extras,
             effort=effort, oauth_token=oauth_token,
             resume_session_id=resume_session_id,
             session_id=session_id,
@@ -166,7 +168,8 @@ async def invoke_agent(
         return await _invoke_codex(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
+            sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
+            effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
             max_turns=max_turns,
         )
@@ -174,7 +177,8 @@ async def invoke_agent(
         return await _invoke_gemini(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
+            sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
+            effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
         )
     elif backend == 'pi':
@@ -182,7 +186,8 @@ async def invoke_agent(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
+            sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
+            effort=effort,
             oauth_token=oauth_token, resume_session_id=resume_session_id,
             session_id=session_id, timeout_seconds=timeout_seconds,
             env_overrides=env_overrides, prices=prices,
@@ -209,6 +214,7 @@ async def _invoke_claude_with_sandbox(
     permission_mode: str,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
     session_id: str | None = None,
@@ -265,7 +271,7 @@ async def _invoke_claude_with_sandbox(
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
 
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
             if env_overrides:
@@ -327,6 +333,7 @@ async def _invoke_codex(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
     max_turns: int | None = None,
@@ -384,7 +391,7 @@ async def _invoke_codex(
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
@@ -538,6 +545,7 @@ async def _invoke_gemini(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -560,7 +568,7 @@ async def _invoke_gemini(
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         env = dict(os.environ)
 
@@ -909,6 +917,7 @@ async def _invoke_pi(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
     session_id: str | None = None,
@@ -1013,7 +1022,7 @@ async def _invoke_pi(
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         _warn_if_argv_near_arg_max(cmd)
 

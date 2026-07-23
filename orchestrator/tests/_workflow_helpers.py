@@ -664,6 +664,7 @@ class AgentStub:
         output_schema: dict | None = None,
         permission_mode: str = 'bypassPermissions',
         sandbox_modules: list[str] | None = None,
+        sandbox_extras: list[str] | None = None,
         effort: str | None = None,
         backend: str = 'claude',
         oauth_token: str | None = None,
