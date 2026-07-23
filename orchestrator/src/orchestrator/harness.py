@@ -49,7 +49,11 @@ from orchestrator.delivered_checks import (
     verify_delivered_checks_on_main,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
-from orchestrator.deterministic_runner import DeterministicRunner
+from orchestrator.deterministic_runner import (
+    DETERMINISTIC_AGENT_ROLE,
+    DeterministicRunner,
+    build_milestone_gate_escalation_fields,
+)
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
@@ -533,6 +537,52 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
         metadata.get('before_done_verified_at')
         or metadata.get('gate_escalated_at')
         or metadata.get('done_provenance')
+    )
+
+
+def _deterministic_gate_stranded(metadata: dict | None) -> bool:
+    """Return True iff *metadata* represents a stranded deterministic GATE.
+
+    Task 2954: the sibling of ``_deterministic_deploy_stranded`` for pure-gate
+    / ``always_escalates=true`` strands — a ``task_kind=='deterministic'`` task
+    that stamped ``gate_escalated_at`` (proof a born-at-L2 ``milestone_gate``
+    was supposed to be filed) but whose escalation record never landed or was
+    lost across a restart.  ``gate_escalated_at`` is written ONLY by the
+    gate-filing paths (``DeterministicRunner._file_milestone_gate_and_block`` /
+    ``_file_milestone_check_failed_and_block`` / the predicate leg), so it is
+    the sole reliable "a gate was supposed to be filed" signal.
+
+    Metadata-only predicate — the archive-inclusive empty-escalation-queue
+    I/O check (the strand-vs-resolved discriminator) is performed by the
+    caller (``_run_deterministic_recon_sweep`` Source A), mirroring
+    ``_deterministic_deploy_stranded``'s "the I/O check is the caller's job"
+    contract.
+
+    DISJOINT from ``_deterministic_deploy_stranded`` by construction — this
+    one REQUIRES ``gate_escalated_at`` whereas that predicate never matches a
+    task once it is set, though for DIFFERENT reasons in its two branches:
+      - ``deploy_state`` PRESENT: it matches ONLY ``deploy_state.phase == RAN``
+        and never inspects ``gate_escalated_at`` directly.  Disjointness rests
+        on the atomic stamp+phase-advance invariant, not an explicit exclusion:
+        stamping ``gate_escalated_at`` on a deploy is done ATOMICALLY with
+        advancing ``phase`` to ``ESCALATED`` (the runner's single
+        ``_advance_deploy_phase`` merge in ``_file_milestone_gate_and_block``),
+        so a deploy with ``gate_escalated_at`` set is ``phase == ESCALATED``,
+        never ``RAN`` — the deploy predicate returns False.
+      - ``deploy_state`` ABSENT (pre-ζ legacy shim): THAT branch is the one
+        that EXPLICITLY excludes ``gate_escalated_at`` being set.
+    So no task is ever matched by both, and a gate strand and a deploy strand
+    are handled by separate recovery paths with no double-handling.  (Were the
+    atomic stamp+phase-advance invariant ever to regress, the sweep's
+    deploy-before-gate branch ordering is a belt-and-braces backstop.)
+
+    None/non-dict *metadata* is treated as non-matching rather than raising.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get('task_kind') == 'deterministic'
+        and bool(metadata.get('gate_escalated_at'))
     )
 
 
@@ -9983,6 +10033,84 @@ class Harness:
             tid, verdict, esc.id, category, suggested_action,
         )
 
+    async def _recover_stranded_deterministic_gate(
+        self, tid: str, task: dict, metadata: dict,
+    ) -> None:
+        """Recover a stranded deterministic pure-gate / always_escalates GATE (Source A).
+
+        Task 2954: the GATE-strand sibling of
+        ``_recover_stranded_deterministic_task``.  A ``task_kind=='deterministic'``
+        task stamped ``gate_escalated_at`` (proof a born-at-L2 ``milestone_gate``
+        was supposed to be filed by
+        ``DeterministicRunner._file_milestone_gate_and_block``) but its
+        escalation record never landed — lost across a merge-triggered restart
+        or a queue_dir storage/scoping divergence (the failure mode named in
+        ``EscalationQueue.submit``'s docstring).  RE-FILES the born-at-L2 gate
+        mirroring what the runner itself would have filed (same agent_role,
+        level, severity, category, and summary/detail/options — the latter three
+        built through the SHARED ``build_milestone_gate_escalation_fields`` seam
+        the runner uses, so even the operational-LLM token prefix (task 2803 γ)
+        on an operational-mode gate is reproduced verbatim rather than dropped
+        and misrouted) so the runner's section-1 resume quiescence/resolve-to-
+        done machinery — which scopes its scans on ``DETERMINISTIC_AGENT_ROLE``
+        — integrates cleanly: a human resolving the re-filed gate drives the
+        task to done exactly as designed.
+
+        Unlike ``_recover_stranded_deterministic_task`` this is a HUMAN-decision
+        gate: there is no target unit, no live systemd health check, and — like
+        that method — it NEVER calls ``set_task_status`` (RE-FILE-NEVER-FLIP;
+        the subject task is already blocked).  The archive-inclusive
+        role-scoped emptiness check that discriminates a genuine strand from a
+        filed+resolved gate is the caller's job
+        (``_run_deterministic_recon_sweep`` Source A), which also self-dedupes
+        across passes.
+        """
+        if self._escalation_queue is None:
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        # Task 2954 amendment: build summary/detail/options via the SAME
+        # `build_milestone_gate_escalation_fields` seam the runner's own
+        # `_file_milestone_gate_and_block` uses, so the re-filed gate is
+        # byte-identical to what the runner would have filed — including the
+        # operational-LLM token prefix (task 2803 γ) that a hand-rolled
+        # re-build here would otherwise drop and misroute.
+        summary, detail, options = build_milestone_gate_escalation_fields(
+            task, metadata,
+        )
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='milestone_gate',
+            summary=summary,
+            detail=detail,
+            options=options,
+            level=2,
+        )
+        self._escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=tid,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'milestone_gate',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': 'deterministic-recon-sweep-gate-strand-recovery',
+                },
+            )
+        logger.warning(
+            'Deterministic-recon-sweep: task %s pure-gate strand '
+            '(gate_escalated_at stamped, no escalation record) — re-filed L2 '
+            'milestone_gate %s (agent_role=%s, no status change)',
+            tid, esc.id, DETERMINISTIC_AGENT_ROLE,
+        )
+
     async def _revalidate_open_deterministic_escalation(
         self, esc, task: dict, metadata: dict,
     ) -> None:
@@ -10131,7 +10259,14 @@ class Harness:
         """Single testable pass of the deterministic-strand reconciliation sweep.
 
         Source A: enumerate blocked tasks and recover any absent-escalation
-        strand (task-2059 shape) via ``_recover_stranded_deterministic_task``.
+        strand via one of two DISJOINT detectors (task 2954): a deploy
+        RAN-strand (task-2059 shape) via
+        ``_recover_stranded_deterministic_task``, or a pure-gate /
+        ``always_escalates`` GATE-strand (``gate_escalated_at`` stamped but no
+        escalation record) via ``_recover_stranded_deterministic_gate``.  The
+        gate branch's strand-vs-resolved discriminator is an archive-inclusive
+        role-scoped emptiness check (a pending OR resolved record ⇒ not a
+        strand), which also self-dedupes across passes.
 
         Source B: enumerate all pending escalations and re-validate any open
         deterministic-deploy ``infra_issue`` escalation via
@@ -10190,13 +10325,44 @@ class Harness:
             if task.get('status') != 'blocked':
                 continue
             metadata = task.get('metadata') or {}
-            if not _deterministic_deploy_stranded(metadata):
+            # Two DISJOINT Source-A strand detectors (task 2954): a deploy
+            # RAN-strand and a pure-gate / always_escalates GATE-strand. They
+            # never both match one task — _deterministic_gate_stranded REQUIRES
+            # gate_escalated_at, and _deterministic_deploy_stranded matches only
+            # phase==RAN, but stamping gate_escalated_at on a deploy atomically
+            # advances phase to ESCALATED (never RAN); its pre-ζ legacy shim
+            # branch separately excludes gate_escalated_at outright. The
+            # if/elif below orders deploy-before-gate as a belt-and-braces
+            # backstop should that atomic invariant ever regress. Both share the
+            # per-task fail-soft try/except and recovered_this_pass bookkeeping.
+            _is_deploy = _deterministic_deploy_stranded(metadata)
+            _is_gate = _deterministic_gate_stranded(metadata)
+            if not (_is_deploy or _is_gate):
                 continue
             try:
-                if self._escalation_queue.get_by_task(tid, status='pending'):
-                    continue
-                await self._recover_stranded_deterministic_task(tid, task, metadata)
-                recovered_this_pass.add(tid)
+                if _is_deploy:
+                    # Deploy strand: dedup on the pending queue, then re-file an
+                    # L1 whose category depends on live systemd unit health.
+                    if self._escalation_queue.get_by_task(tid, status='pending'):
+                        continue
+                    await self._recover_stranded_deterministic_task(tid, task, metadata)
+                    recovered_this_pass.add(tid)
+                elif _is_gate:
+                    # Gate strand: the discriminator is an archive-INCLUSIVE,
+                    # role-scoped emptiness check (status=None scans queue root +
+                    # archive).  A PENDING record means the gate is still open
+                    # (not a strand); a RESOLVED/archived record means a human
+                    # already acted (genuinely-resolved, not a strand) — in
+                    # either case leave it alone.  Only a TOTAL absence (never
+                    # landed / lost across a restart) re-fires.  This also
+                    # self-dedupes across passes: once re-filed, the next pass
+                    # sees the pending record and skips.
+                    if self._escalation_queue.get_by_task(
+                        tid, agent_role=DETERMINISTIC_AGENT_ROLE,
+                    ):
+                        continue
+                    await self._recover_stranded_deterministic_gate(tid, task, metadata)
+                    recovered_this_pass.add(tid)
             except Exception as exc:
                 logger.error(
                     'Deterministic-recon-sweep: Source-A recovery failed for '

@@ -400,6 +400,60 @@ def _is_operational_llm_gate(metadata: dict) -> bool:
     return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
 
 
+def build_milestone_gate_escalation_fields(
+    task: dict | None, metadata: dict,
+) -> tuple[str, str, list]:
+    """Build ``(summary, detail, options)`` for a born-at-L2 ``milestone_gate``.
+
+    THE single seam both born-at-L2 pure-gate producers route through:
+      - the runner's own gate filing
+        (``DeterministicRunner._file_milestone_gate_and_block``), and
+      - the harness recon-sweep's strand recovery
+        (``Harness._recover_stranded_deterministic_gate``, task 2954).
+
+    Extracted (task 2954 amendment) so a re-filed gate is byte-identical to
+    what the runner would have filed.  Critically this includes the
+    operational-LLM token prefix (task 2803 γ): a naive re-build in the sweep
+    would DROP the ``OPERATIONAL_LLM_NEEDS_LANE_TOKEN`` on summary+detail and
+    misroute the human handling lane, so centralizing the construction keeps
+    the two producers in lockstep.
+
+    ``detail`` = description + a "Landed dependencies:" line when the task has
+    dependencies; ``summary`` = ``title[:200]``.  For an operational-LLM gate
+    (``_is_operational_llm_gate``) both are token-prefixed (token-first so the
+    token survives the summary's ``[:200]`` truncation and any tail-only log
+    scrape; ``detail`` itself is not truncated).  Plain gates (marker absent)
+    are byte-unchanged.  ``options`` is the task's ``gate_options`` (empty list
+    when absent).  None/empty *task* is tolerated (defensive; the sweep's task
+    dict is read back from the scheduler).
+    """
+    task = task or {}
+    title = task.get('title', '')
+    description = task.get('description', '')
+    deps = task.get('dependencies', []) or []
+    dep_ids = [
+        str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
+    ]
+    detail_parts = [description]
+    if dep_ids:
+        detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
+    detail = '\n'.join(detail_parts)
+    summary = title[:200]
+    if _is_operational_llm_gate(metadata):
+        # Task 2803 (γ): token-first prefix/build so the token survives
+        # downstream truncation (the summary's [:200] slice) and any
+        # tail-only log scrape; detail itself is not truncated. Plain
+        # gates (marker absent) are byte-unchanged.
+        detail = (
+            f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
+            'LLM-operational handling; no automated lane exists yet — resolve '
+            'by hand.\n\n'
+        ) + detail
+        summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
+    options = list(metadata.get('gate_options') or [])
+    return summary, detail, options
+
+
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
 
@@ -1350,29 +1404,13 @@ class DeterministicRunner:
         """
         from escalation.models import Escalation
 
-        title = task.get('title', '')
-        description = task.get('description', '')
-        deps = task.get('dependencies', [])
-        dep_ids = [
-            str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
-        ]
-        detail_parts = [description]
-        if dep_ids:
-            detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
-        detail = '\n'.join(detail_parts)
-        summary = title[:200]
-        if _is_operational_llm_gate(metadata):
-            # Task 2803 (γ): token-first prefix/build so the token survives
-            # downstream truncation (the summary's [:200] slice) and any
-            # tail-only log scrape; detail itself is not truncated. Plain
-            # gates (marker absent) are byte-unchanged.
-            detail = (
-                f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
-                'LLM-operational handling; no automated lane exists yet — resolve '
-                'by hand.\n\n'
-            ) + detail
-            summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
-        gate_options = metadata.get('gate_options') or []
+        # Task 2954 amendment: summary/detail/options built via the shared
+        # `build_milestone_gate_escalation_fields` seam so the harness recon-
+        # sweep's strand recovery re-files a byte-identical gate (including the
+        # operational-LLM token prefix) and the two producers stay in lockstep.
+        summary, detail, gate_options = build_milestone_gate_escalation_fields(
+            task, metadata,
+        )
 
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
@@ -1853,6 +1891,36 @@ class DeterministicRunner:
                         'before_done_ran_at=%s, gate resolved — setting done',
                         task_id, before_done_ran_at_check,
                     )
+                else:
+                    # Pure-gate resume (before_done is None): an empty PENDING
+                    # queue is NOT proof a human resolved the gate.  Require the
+                    # SAME archive-inclusive positive proof the deploy path
+                    # demands below (section 2's own_escalation_resolved) before
+                    # driving to done — otherwise a LOST born-at-L2 gate
+                    # escalation (task 2954 strand) would let an operator's
+                    # re-pend of the stuck task silently BYPASS the human gate.
+                    # status=None scans the archive too, so a resolved/dismissed
+                    # record counts as proof a human was in the loop; agent_role
+                    # scopes it to the runner's OWN gate escalations.  When NO
+                    # record ever landed, re-establish the gate via
+                    # _file_milestone_gate_and_block and stay BLOCKED rather than
+                    # phantom-completing.
+                    own_escalation_resolved = bool(self.escalation_queue.get_by_task(
+                        task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
+                    ))
+                    if not own_escalation_resolved:
+                        logger.warning(
+                            'DeterministicRunner: task %s pure-gate resume — '
+                            'gate_escalated_at stamped but NO escalation record '
+                            'exists (pending or archived); the gate was never '
+                            'proven resolved (likely lost across a restart) — '
+                            're-filing the born-at-L2 gate instead of driving to '
+                            'done (task 2954)',
+                            task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
                     task_id,

@@ -94,6 +94,25 @@ def _mock_scheduler(task: dict):
     return scheduler
 
 
+def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
+    """Seed a RESOLVED+ARCHIVED deterministic gate escalation for *task_id*.
+
+    This is the true state after a human ``resume``: the L2 gate is archived
+    (resolved) BEFORE the task is re-pended (task 2954).  It makes the pure-gate
+    resume's archive-inclusive ``own_escalation_resolved`` proof pass, so the
+    legitimate drive-to-done stays green — as distinct from a truly-empty queue
+    (a LOST escalation), which the hardened resume treats as a strand.
+    """
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id,
+        agent_role='orchestrator-deterministic', severity='critical',
+        category='milestone_gate', summary='Ship feature gate', level=2,
+    )
+    queue.submit(esc)
+    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human')
+    return esc
+
+
 def _deploy_task(
     task_id: str = '200',
     target_unit: str | None = 'orchestrator-reify.service',
@@ -516,10 +535,13 @@ class TestIdempotentResumeAndQuiescence:
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
-        # gate already escalated; escalation already resolved (no pending)
+        # gate already escalated; escalation resolved+archived (task 2954: the
+        # true post-`resume` state — an empty archive would be a LOST-escalation
+        # strand, which the hardened resume re-files rather than driving to done).
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty queue — no pending escalation
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '100')
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -544,6 +566,7 @@ class TestIdempotentResumeAndQuiescence:
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '100')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -679,7 +702,8 @@ class TestIdempotentResumeAndQuiescence:
 
         task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty — gate escalation resolved
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '99')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -694,6 +718,132 @@ class TestIdempotentResumeAndQuiescence:
                 'note': 'pure gate resolved',
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2954 step-7/step-8: pure-gate resume-proof hardening.
+#
+# Today the pure-gate section-1 resume drives a stamped gate to `done` whenever
+# the PENDING queue is empty — which, if the born-at-L2 escalation was LOST
+# (the reported strand), silently BYPASSES the human gate the moment an operator
+# re-pends the stuck task.  Hardening requires the SAME archive-inclusive
+# positive proof the deploy path already demands: drive to done only when a
+# resolved/archived deterministic escalation actually exists; otherwise re-file
+# the gate and stay BLOCKED.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPureGateResumeHardening:
+    """DeterministicRunner — pure-gate resume requires archive-inclusive proof."""
+
+    async def test_pure_gate_resume_no_record_refiles_and_blocks(self, tmp_path: Path):
+        """gate_escalated_at set + ZERO records anywhere (no pending, no archived)
+        → must NOT drive to done; re-files the born-at-L2 gate and returns BLOCKED."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # ZERO records — no pending, no archived
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Must NOT silently drive to done — the human gate was never proven resolved.
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, 'pure-gate resume must not drive to done without proof'
+        # Instead it re-files the born-at-L2 milestone_gate to re-establish the gate.
+        pending = queue.get_by_task(
+            '100', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate'
+        assert pending[0].level == 2
+
+    async def test_pure_gate_resume_with_resolved_record_drives_to_done(self, tmp_path: Path):
+        """GREEN-preserving: a RESOLVED+ARCHIVED deterministic escalation (the true
+        post-`resume` state) IS positive proof a human acted → drive to done with
+        deterministic-gate provenance, exactly as before the hardening."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        # A human `resume` archives the escalation before the task is re-pended.
+        existing = Escalation(
+            id=queue.make_id('99'), task_id='99',
+            agent_role='orchestrator-deterministic', severity='critical',
+            category='milestone_gate', summary='Ship feature gate', level=2,
+        )
+        queue.submit(existing)
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        # Sanity: resolved record is archived (not pending) but archive-visible.
+        assert queue.get_by_task('99', status='pending') == []
+        assert len(queue.get_by_task('99', agent_role='orchestrator-deterministic')) == 1
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
+
+    async def test_always_escalates_gate_stamp_implies_queryable_escalation(self, tmp_path: Path):
+        """Regression guard (task 2954, the explicitly-requested end-to-end
+        deliverable): a fresh always_escalates pure-gate dispatch must yield a
+        DURABLY queryable L2 escalation AND stamp gate_escalated_at — pinning the
+        'stamp ⟹ queryable escalation' invariant whose violation (stamp present,
+        record absent) is the reported bug, and guarding the file-before-stamp
+        durability contract against regression."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='2954', gate_options=['approve', 'reject'])
+        assert 'gate_escalated_at' not in task['metadata']  # fresh dispatch
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        # (d) a fresh gate blocks awaiting a human decision
+        assert outcome == WorkflowOutcome.BLOCKED
+        # (a) exactly one queryable born-at-L2 escalation, scoped to the runner role
+        pending = queue.get_by_task(
+            '2954', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.category == 'milestone_gate'
+        # (b) the record round-trips from DISK — durable persistence, not just an
+        # in-memory list — proving the invariant end-to-end.
+        on_disk = queue.get(esc.id)
+        assert on_disk is not None
+        assert on_disk.id == esc.id
+        assert on_disk.task_id == '2954'
+        # (c) gate_escalated_at is stamped via a metadata merge
+        stamp_calls = [
+            c for c in scheduler.update_task.await_args_list
+            if len(c.args) >= 2 and isinstance(c.args[1], dict)
+            and 'gate_escalated_at' in c.args[1]
+        ]
+        assert stamp_calls, 'gate_escalated_at must be stamped on first dispatch'
+        assert stamp_calls[0].kwargs.get('metadata_mode') == 'merge'
 
 
 # ---------------------------------------------------------------------------
