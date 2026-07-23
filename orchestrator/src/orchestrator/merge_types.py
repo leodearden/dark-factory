@@ -1137,6 +1137,7 @@ class OutcomeKind(StrEnum):
     post_merge_pyright_broken = 'post_merge_pyright_broken'
     plan_files_not_touched = 'plan_files_not_touched'
     plan_files_narrowed = 'plan_files_narrowed'
+    plan_files_cross_repo = 'plan_files_cross_repo'
     cas_retry = 'cas_retry'
     gate_retry = 'gate_retry'
     post_merge_generation_chained = 'post_merge_generation_chained'
