@@ -1279,6 +1279,40 @@ def _make_infix(module_prefix: 'str | None') -> str:
     return f'.{safe}'
 
 
+def _prepare_junit_report_path(
+    worktree: Path, module_prefix: 'str | None',
+) -> 'Path | None':
+    """Build the merge-verify junit report path under *worktree*, or None.
+
+    Returns the absolute ``<worktree>/.df-verify-junit/report{infix}.xml`` path
+    (creating ONLY the ``.df-verify-junit`` child dir) for a live worktree, or
+    None WITHOUT creating anything when the worktree is gone or unwritable.
+
+    Shape-2 husk guard (task 2922): a late merge-role verify writer can fire
+    AFTER its worktree was torn down. The previous inline
+    ``mkdir(parents=True, exist_ok=True)`` would re-create the entire
+    torn-down ``<worktree>`` path as an empty husk that the merge-worktree
+    ledger audit then flags as an unregistered ``_merge-*`` directory. Two
+    guards prevent that: an explicit :meth:`~pathlib.Path.is_dir` check
+    returns None without touching the filesystem, and ``mkdir(exist_ok=True)``
+    (NOTE: no ``parents=True``) so a missing worktree ancestor raises
+    ``FileNotFoundError`` — a subclass of ``OSError`` — routed to the same
+    None return (the already-tolerated B3 "no junit collected" late-write
+    degrade).
+
+    Reuses :func:`_make_infix` for the per-module sanitized filename infix
+    (``pkg/sub`` -> ``.pkg_sub``) so a per-module fan-out never collides.
+    """
+    if not worktree.is_dir():
+        return None
+    junit_dir = worktree / '.df-verify-junit'
+    try:
+        junit_dir.mkdir(exist_ok=True)
+    except OSError:
+        return None
+    return (junit_dir / f'report{_make_infix(module_prefix)}.xml').resolve()
+
+
 def _write_run_log(
     target_dir: Path,
     attempt_id: int,
@@ -3801,18 +3835,10 @@ async def run_verification(
     # so a relative --junitxml would land in the wrong directory.
     junit_path: Path | None = None
     if role == 'merge' and verify_plan._merge_breadth_is_full(config):
-        if module_prefix is not None:
-            _safe_prefix = module_prefix.replace('/', '_').replace(' ', '_')
-            _junit_infix = f'.{_safe_prefix}'
-        else:
-            _junit_infix = ''
-        _junit_dir = worktree / '.df-verify-junit'
-        try:
-            _junit_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            junit_path = None
-        else:
-            junit_path = (_junit_dir / f'report{_junit_infix}.xml').resolve()
+        # Shape-2 husk guard (task 2922): _prepare_junit_report_path returns
+        # None WITHOUT re-creating a torn-down worktree as an empty husk when a
+        # late merge-role verify writer fires after teardown.
+        junit_path = _prepare_junit_report_path(worktree, module_prefix)
 
     if is_merge_verify:
         # Merge worktrees are freshly created per merge — cargo caches are
