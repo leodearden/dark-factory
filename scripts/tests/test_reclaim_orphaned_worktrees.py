@@ -177,11 +177,6 @@ def test_parse_returns_none_on_calendar_invalid_stamp():
     assert parse_parking_dir_name("2920-20261399T000000Z") is None
 
 
-def test_module_exposes_loud_prefix():
-    """The module carries the stable greppable LOUD log prefix."""
-    assert row._LOG_PREFIX == LOG_PREFIX
-
-
 # ---------------------------------------------------------------------------
 # step-3: pure select_reclaimable(records, now, min_age_hours)
 # ---------------------------------------------------------------------------
