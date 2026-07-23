@@ -1064,27 +1064,32 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
 
 
 # ---------------------------------------------------------------------------
-# CLI failure path surfaces stderr + summary in RuntimeError
+# CLI failure path surfaces stderr + summary in JudgeInfraError
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_error(
+async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_judge_infra_error(
     mock_journal,
 ):
-    """_call_judge_cli embeds stderr and classify_agent_failure summary in the RuntimeError.
+    """_call_judge_cli embeds stderr and classify_agent_failure summary in the JudgeInfraError.
 
-    Red test (step-3): the current code raises RuntimeError(f'Claude CLI judge
-    failed: {result.output[:500]}').  When result.output is '' (e.g. a JSON
-    parse crash), the message is empty and the diagnostic signal lives in
-    result.stderr.  This test asserts the RuntimeError message after the fix:
+    Task 2947 (ask a) replaced the previous generic RuntimeError on the
+    not-result.success path with a typed JudgeInfraError (transport/infra
+    signal). The message is still build_failure_message('Claude CLI judge',
+    result), so when result.output is '' (e.g. a JSON parse crash) the
+    diagnostic signal still lives in result.stderr. This test asserts the
+    JudgeInfraError message:
       - starts with 'Claude CLI judge failed:'
       - contains the stderr content ('Traceback: JSONDecodeError in line 42')
       - contains 'error_unexpected' (the subtype, present in diagnostic_detail)
-    The subtype is NOT 'error_empty_output', so the early-return on lines
-    264-265 does not apply — the not-result.success branch must fire.
+    The subtype is NOT 'error_empty_output' (it classifies UNKNOWN, not
+    EMPTY_OUTPUT), so the benign '' short-circuit does not apply — the
+    infra-failure branch must fire.
     """
     from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JudgeInfraError
 
     fake_gate = make_gate_mock()
     config = _make_judge_config(
@@ -1106,7 +1111,7 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_runtime_err
     ) as mock_invoke:
         mock_invoke.return_value = failing_result
 
-        with pytest.raises(RuntimeError) as excinfo:
+        with pytest.raises(JudgeInfraError) as excinfo:
             await judge._call_judge_cli('Evaluate this run.')
 
     msg = str(excinfo.value)
@@ -1149,3 +1154,406 @@ class TestJudgeCapWaitSanityBound:
         ):
             await judge._call_judge_cli('p')
         assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Judge._call_judge_cli infra-vs-content taxonomy (task 2947 ask a)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCallJudgeCliTaxonomy:
+    """_call_judge_cli distinguishes transport/infra failures (JudgeInfraError)
+    from a genuine benign empty verdict ('') and success (output.strip()).
+
+    Infra failures must NOT reach _parse_verdict (where a cap-storm CLI failure
+    was being fabricated into a phantom severity=serious halt); they must raise
+    a typed JudgeInfraError so review_run can apply bounded backoff and a
+    truthful judge-unreachable halt at threshold.
+    """
+
+    def _judge(self):
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+        )
+        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+
+    @pytest.mark.asyncio
+    async def test_api_error_raises_judge_infra_error(self):
+        """(a) A cap-storm api_error (api_error_status set, empty stdout) is
+        classified API_ERROR → JudgeInfraError, NOT a benign '' or a plain
+        RuntimeError, and never reaches _parse_verdict."""
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(success=False, output='', api_error_status=429)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError):
+            await judge._call_judge_cli('prompt')
+
+    @pytest.mark.asyncio
+    async def test_timed_out_raises_judge_infra_error(self):
+        """(b) A judge CLI timeout is classified TIMED_OUT → JudgeInfraError."""
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(success=False, output='', timed_out=True)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError):
+            await judge._call_judge_cli('prompt')
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_output_stays_benign(self):
+        """(c) A genuine exit-0/empty-stdout run (subtype='error_empty_output',
+        no api_error, not timed out) stays the benign '' legacy contract."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            api_error_status=None,
+            timed_out=False,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            assert await judge._call_judge_cli('prompt') == ''
+
+    @pytest.mark.asyncio
+    async def test_success_returns_stripped_output(self):
+        """(d) A successful run returns result.output.strip()."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        result = AgentResult(success=True, output='  {"severity": "ok"}  \n')
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            assert await judge._call_judge_cli('prompt') == '{"severity": "ok"}'
+
+    @pytest.mark.asyncio
+    async def test_all_accounts_capped_raises_judge_infra_error(self):
+        """(e) AllAccountsCappedException (cap-wait exhaustion) is re-raised as
+        JudgeInfraError so cap-wait exhaustion is counted/backed-off like other
+        transport failures instead of propagating opaquely to review_run's broad
+        except."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
+        ), pytest.raises(JudgeInfraError):
+            await judge._call_judge_cli('prompt')
+
+
+# ─────────────────────────────────────────────────────────────────────
+# review_run bounded-backoff handling of JudgeInfraError (task 2947 ask a)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestReviewRunInfraFailureHandling:
+    """review_run treats JudgeInfraError (transport/infra) as bounded backoff,
+    NOT a phantom serious verdict (task 2947 ask a).
+
+    Below judge_infra_max_consecutive_failures consecutive infra failures,
+    review_run returns None WITHOUT stamping a verdict or halting. At the
+    threshold it applies a TRUTHFUL 'judge-unreachable' halt (never the lying
+    'Serious verdict' reason, and never a persisted verdict). Any successful
+    transport resets the per-project streak. The infra halt is gated on the
+    same halt_on_judge_serious master switch as the serious-verdict halt.
+    """
+
+    def _setup(self, mock_journal, project_id, **cfg):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+
+        config = _make_judge_config(**cfg)
+        judge = Judge(config=config, journal=mock_journal)
+        now = datetime.now(UTC)
+        run = ReconciliationRun(
+            id='run-infra',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=now,
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        )
+        mock_journal.get_run = AsyncMock(return_value=run)
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+        return judge
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_infra_failures_do_not_halt_or_stamp(self, mock_journal):
+        """(a) The first two (< 3) consecutive infra failures return None, stamp
+        no verdict, and do not halt — bounded backoff, not a phantom verdict."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-a',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            v1 = await judge.review_run('run-infra')
+            v2 = await judge.review_run('run-infra')
+
+        assert v1 is None
+        assert v2 is None
+        mock_journal.set_halt.assert_not_called()
+        mock_journal.add_verdict.assert_not_called()
+        assert not judge.is_halted('proj-infra-a')
+
+    @pytest.mark.asyncio
+    async def test_threshold_infra_failure_applies_truthful_judge_unreachable_halt(
+        self, mock_journal
+    ):
+        """(b) The 3rd consecutive infra failure halts the project with a truthful
+        'judge-unreachable' reason — NOT the phantom 'Serious verdict' reason —
+        and persists no fabricated verdict."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-b',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            await judge.review_run('run-infra')
+            await judge.review_run('run-infra')
+            await judge.review_run('run-infra')
+
+        assert judge.is_halted('proj-infra-b')
+        mock_journal.set_halt.assert_called_once()
+        reason = mock_journal.set_halt.call_args.kwargs['reason']
+        assert 'judge-unreachable' in reason
+        assert 'Serious verdict' not in reason
+        mock_journal.add_verdict.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_review_resets_infra_streak(self, mock_journal):
+        """(c) A successful review between infra failures resets the per-project
+        streak, so a later lone infra failure is well below the threshold and
+        does not halt."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-c',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        # Two infra failures (streak → 2)
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            await judge.review_run('run-infra')
+            await judge.review_run('run-infra')
+        # A clean 'ok' verdict is a successful transport — resets the streak
+        with patch.object(
+            judge, '_call_llm',
+            AsyncMock(return_value='{"severity": "ok", "findings": []}'),
+        ):
+            await judge.review_run('run-infra')
+        # A further lone infra failure is streak #1, below threshold → no halt
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            v = await judge.review_run('run-infra')
+
+        assert v is None
+        assert not judge.is_halted('proj-infra-c')
+        mock_journal.set_halt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_infra_halt_when_halt_on_judge_serious_disabled(self, mock_journal):
+        """With halt_on_judge_serious=False, even many consecutive infra failures
+        past the threshold never halt (same master switch as the serious halt)."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._setup(
+            mock_journal, 'proj-infra-d',
+            halt_on_judge_serious=False, judge_infra_max_consecutive_failures=3,
+        )
+        with patch.object(
+            judge, '_call_llm', AsyncMock(side_effect=JudgeInfraError('cap storm'))
+        ):
+            for _ in range(5):
+                await judge.review_run('run-infra')
+
+        assert not judge.is_halted('proj-infra-d')
+        mock_journal.set_halt.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Truthful content-serious halt reasons (task 2947 ask b)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_parse_verdict_unparseable_tags_code_marker(mock_journal):
+    """_parse_verdict tags its single fabricated finding with a machine-readable
+    code='unparseable_judge_response' marker (severity stays serious).
+
+    The marker lets review_run pick a TRUTHFUL 'Unparseable judge response'
+    halt reason instead of the lying 'Serious verdict' one, via a structured
+    field rather than fragile substring matching. Keeping it on the SAME single
+    finding preserves len(findings)==1 (the existing
+    test_parse_verdict_unparseable_response_is_loud_not_fabricated contract).
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict('garbage {{{', 'run-code-marker')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('code') == 'unparseable_judge_response'
+
+
+@pytest.mark.asyncio
+async def test_review_run_unparseable_content_halts_with_unparseable_reason(mock_journal):
+    """Genuinely-malformed REACHABLE content (success, non-empty, non-JSON) still
+    halts loudly (fail-closed preserved), but with the truthful 'Unparseable
+    judge response' reason — NOT the phantom 'Serious verdict' reason."""
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-unparseable',
+        project_id='proj-unparseable',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    with patch.object(
+        judge, '_call_llm', AsyncMock(return_value='not valid json at all {{{')
+    ):
+        verdict = await judge.review_run('run-unparseable')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.serious
+    assert judge.is_halted('proj-unparseable')
+    mock_journal.set_halt.assert_called_once()
+    reason = mock_journal.set_halt.call_args.kwargs['reason']
+    assert 'Unparseable judge response' in reason
+    assert 'Serious verdict' not in reason
+
+
+@pytest.mark.asyncio
+async def test_review_run_genuine_serious_halts_with_serious_verdict_reason(mock_journal):
+    """A genuine content severity=serious verdict keeps the already-truthful
+    'Serious verdict in run X' reason (not the unparseable relabel)."""
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-genuine-serious',
+        project_id='proj-genuine-serious',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    serious_json = '{"severity": "serious", "findings": [{"issue": "real corruption"}]}'
+    with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_json)):
+        verdict = await judge.review_run('run-genuine-serious')
+
+    assert verdict is not None
+    assert verdict.severity == VerdictSeverity.serious
+    assert judge.is_halted('proj-genuine-serious')
+    mock_journal.set_halt.assert_called_once()
+    reason = mock_journal.set_halt.call_args.kwargs['reason']
+    assert 'Serious verdict in run' in reason
+    assert 'Unparseable' not in reason
+
+
+# ─────────────────────────────────────────────────────────────────────
+# halt_reason accessor exposes the real halt reason (task 2947 ask b)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_halt_reason_returns_truthful_reason_after_halt(mock_journal):
+    """halt_reason(project_id) returns the exact reason passed to _apply_halt so
+    the harness can thread the REAL reason into the on_judge_halt escalation;
+    it returns None for a never-halted project."""
+    from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
+
+    config = _make_judge_config(halt_on_judge_serious=True)
+    judge = Judge(config=config, journal=mock_journal)
+
+    # Never-halted project → None
+    assert judge.halt_reason('proj-halt-reason') is None
+
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='run-halt-reason',
+        project_id='proj-halt-reason',
+        run_type=RunType.full,
+        trigger_reason='buffer_size:3',
+        started_at=now,
+        events_processed=3,
+        status=RunStatus.completed,
+        stage_reports={},
+    )
+    mock_journal.get_run = AsyncMock(return_value=run)
+    mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+
+    serious_json = '{"severity": "serious", "findings": [{"issue": "real corruption"}]}'
+    with patch.object(judge, '_call_llm', AsyncMock(return_value=serious_json)):
+        await judge.review_run('run-halt-reason')
+
+    assert judge.is_halted('proj-halt-reason')
+    # Matches the reason _apply_halt was called with (verified via set_halt too).
+    expected = mock_journal.set_halt.call_args.kwargs['reason']
+    assert judge.halt_reason('proj-halt-reason') == expected
+    assert expected == 'Serious verdict in run run-halt-reason'
+    # A different, never-halted project still returns None.
+    assert judge.halt_reason('some-other-project') is None
+
+
+@pytest.mark.asyncio
+async def test_halt_reason_cleared_on_unhalt(mock_journal):
+    """unhalt(project_id) clears the stored halt reason (halt_reason → None)."""
+    judge = Judge(config=_make_judge_config(halt_on_judge_serious=True), journal=mock_journal)
+
+    await judge._apply_halt('proj-unhalt-reason', reason='judge-unreachable halt: test')
+    assert judge.halt_reason('proj-unhalt-reason') == 'judge-unreachable halt: test'
+
+    await judge.unhalt('proj-unhalt-reason')
+    assert judge.halt_reason('proj-unhalt-reason') is None

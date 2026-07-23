@@ -6,7 +6,13 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from shared.cli_invoke import build_failure_message, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AllAccountsCappedException,
+    build_failure_message,
+    classify_agent_failure,
+    invoke_with_cap_retry,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -25,6 +31,26 @@ logger = logging.getLogger(__name__)
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
 
 
+class JudgeInfraError(Exception):
+    """Judge CLI transport/infra failure signal (task 2947 ask a).
+
+    Raised by ``_call_judge_cli`` when the judge invocation fails for a
+    transport/infra reason — api_error, timeout, model-not-found, max-turns,
+    ended-awaiting-background, cap-wait exhaustion, or an otherwise-unknown
+    non-success — as opposed to a genuinely-malformed *reachable* judge
+    response (which stays fail-closed serious via ``_parse_verdict``) or a
+    benign exit-0/empty-stdout run (which stays the benign ``''`` contract).
+
+    The distinction matters because an infra failure carries NO verdict: prior
+    to this taxonomy a cap-storm CLI failure was fabricated into a phantom
+    ``severity=serious`` halt whose reason ("Serious verdict in run X") lied
+    about a review that never happened. ``review_run`` catches this exception,
+    applies bounded backoff, and only halts (truthfully, "judge-unreachable")
+    after ``judge_infra_max_consecutive_failures`` consecutive occurrences.
+    Carries a human-readable message (the ``build_failure_message`` dump).
+    """
+
+
 class Judge:
     """Async LLM reviewer that evaluates reconciliation run quality."""
 
@@ -41,6 +67,15 @@ class Judge:
         self._halted_projects: set[str] = set()
         self._halt_cooldown_until: dict[str, datetime] = {}
         self._unhalt_grace_remaining: dict[str, int] = {}
+        # Per-project count of CONSECUTIVE judge transport/infra failures
+        # (JudgeInfraError). Incremented on each infra failure, reset on any
+        # successful transport or once a judge-unreachable halt fires. Bounds
+        # the phantom-halt blast radius (task 2947 ask a).
+        self._consecutive_infra_failures: dict[str, int] = {}
+        # Last halt reason per project (task 2947 ask b), so the harness can
+        # thread the REAL reason into the on_judge_halt escalation instead of a
+        # hardcoded generic string. Set in _apply_halt, cleared in unhalt.
+        self._halt_reason: dict[str, str] = {}
         self._usage_gate = usage_gate
         self._on_unhalt_cb = on_unhalt_cb
 
@@ -100,7 +135,23 @@ class Judge:
             )
 
             prompt = self._build_review_prompt(run, entries, recent_verdicts, combined_actions)
-            response_text = await self._call_llm(prompt)
+            try:
+                response_text = await self._call_llm(prompt)
+            except JudgeInfraError as err:
+                # Transport/infra failure (cap-storm CLI failure, timeout,
+                # api_error, cap-wait exhaustion, …) carries NO verdict. Do NOT
+                # fabricate a phantom severity=serious halt (the defect this
+                # fixes) — apply bounded backoff and only halt (truthfully) after
+                # judge_infra_max_consecutive_failures in a row. This except is
+                # deliberately INSIDE the broad try so its return short-circuits
+                # before _parse_verdict / add_verdict.
+                return await self._handle_infra_failure(run.project_id, run_id, err)
+
+            # Successful transport (even a malformed-content verdict, which stays
+            # fail-closed serious below) clears the per-project infra streak so a
+            # recovered judge starts fresh.
+            self._consecutive_infra_failures.pop(run.project_id, None)
+
             verdict = self._parse_verdict(response_text, run_id)
 
             # Act on verdict — must happen BEFORE persisting so the DB receives the
@@ -111,12 +162,30 @@ class Judge:
             elif verdict.severity == 'serious':
                 if self.config.halt_on_judge_serious:
                     verdict.action_taken = VerdictAction.halt
-                    await self._apply_halt(
-                        run.project_id,
-                        reason=f'Serious verdict in run {run_id}',
+                    # A serious verdict fabricated by _parse_verdict for
+                    # genuinely-malformed REACHABLE content (success, non-empty,
+                    # non-JSON) carries the code='unparseable_judge_response'
+                    # marker. It still halts (fail-closed preserved) but with a
+                    # truthful reason instead of the lying 'Serious verdict'
+                    # string. A genuine content severity=serious verdict has no
+                    # such marker and keeps the already-truthful reason. (Infra
+                    # failures never reach here — they are diverted to
+                    # _handle_infra_failure before _parse_verdict.)
+                    is_parse_failure = any(
+                        f.get('code') == 'unparseable_judge_response'
+                        for f in verdict.findings
                     )
+                    if is_parse_failure:
+                        halt_reason = (
+                            f'Unparseable judge response in run {run_id} '
+                            f'(judge output present but not valid JSON)'
+                        )
+                    else:
+                        halt_reason = f'Serious verdict in run {run_id}'
+                    await self._apply_halt(run.project_id, reason=halt_reason)
                     logger.error(
-                        f'Judge: SERIOUS issues in run {run_id}, halting project {run.project_id}'
+                        f'Judge: SERIOUS issues in run {run_id}, halting project '
+                        f'{run.project_id} — {halt_reason}'
                     )
 
             await self.journal.add_verdict(verdict)
@@ -139,6 +208,69 @@ class Judge:
         except Exception as e:
             logger.error(f'Judge review failed for run {run_id}: {e}')
             return None
+
+    async def _handle_infra_failure(
+        self, project_id: str, run_id: str, err: JudgeInfraError,
+    ) -> None:
+        """Bounded-backoff handling for a judge transport/infra failure (task 2947).
+
+        A JudgeInfraError means the judge CLI was unreachable/broken for this run
+        — there is NO verdict to trust. Rather than fabricating a phantom
+        severity=serious halt whose "Serious verdict in run X" reason lies about a
+        review that never happened (the defect this fixes), count consecutive
+        infra failures per project:
+
+        - below ``config.judge_infra_max_consecutive_failures``: log a structured
+          warning and return None — no verdict is stamped and no halt fires, so a
+          transient outage (e.g. an account-cap storm) is given room to recover.
+        - at/above the threshold: reset the counter (so a post-halt recovery
+          starts clean) and, when ``halt_on_judge_serious`` is set, apply a
+          TRUTHFUL 'judge-unreachable' halt — which routes the existing
+          infra_issue escalation via the harness. Gated on the same master switch
+          as the serious-verdict halt.
+
+        Always returns None (review_run propagates it as the run's result). The
+        infra streak is reset elsewhere on any successful transport (see
+        review_run), so only genuinely-consecutive failures reach the threshold.
+        """
+        count = self._consecutive_infra_failures.get(project_id, 0) + 1
+        self._consecutive_infra_failures[project_id] = count
+        threshold = self.config.judge_infra_max_consecutive_failures
+
+        if count < threshold:
+            logger.warning(
+                'reconciliation.judge_infra_failure',
+                extra={
+                    'run_id': run_id,
+                    'project_id': project_id,
+                    'consecutive_failures': count,
+                    'threshold': threshold,
+                    'error': str(err),
+                },
+            )
+            return None
+
+        # Threshold reached: reset the streak so a later recovery starts clean,
+        # then (if enabled) halt truthfully.
+        self._consecutive_infra_failures.pop(project_id, None)
+        if self.config.halt_on_judge_serious:
+            reason = (
+                f'judge-unreachable halt: reconciliation judge outage '
+                f'(cap-storm/CLI failure) — project halted after {count} '
+                f'consecutive infra failures; last error: {err}'
+            )
+            await self._apply_halt(project_id, reason=reason)
+            logger.error(
+                f'Judge: judge-unreachable — halting project {project_id} after '
+                f'{count} consecutive infra failures; last error: {err}'
+            )
+        else:
+            logger.error(
+                f'Judge: {count} consecutive judge infra failures for project '
+                f'{project_id}, but halt_on_judge_serious is disabled — not '
+                f'halting; last error: {err}'
+            )
+        return None
 
     def _build_review_prompt(self, run, entries, recent_verdicts,
                              combined_actions: list[dict] | None = None) -> str:
@@ -241,45 +373,62 @@ Review this run and provide your verdict as JSON.
         Judge output is free-form text — no output_schema is passed.
         InvokeSlot owns probe-slot release and terminate_process_group on timeout.
         """
-        result = await invoke_with_cap_retry(
-            usage_gate=self._usage_gate,
-            label=f'Reconciliation judge ({self.config.judge_llm_model})',
-            prompt=prompt,
-            system_prompt=JUDGE_SYSTEM_PROMPT,
-            model=self.config.judge_llm_model,
-            disallowed_tools=['*'],
-            # max_turns=1: the judge is deliberately single-shot.  One turn is
-            # sufficient to produce a free-form verdict; allowing more would
-            # widen cost/duration exposure with no benefit.
-            max_turns=1,
-            permission_mode='bypassPermissions',
-            timeout_seconds=float(self.config.judge_cli_timeout_seconds),
-            # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-            # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
-            # grounding/proportionality ("were codebase verifications used
-            # when appropriate?"), which plausibly draws on the auto-loaded
-            # CLAUDE.md's project architecture context.
-            cwd=Path(self.config.explore_codebase_root),
-            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
-        )
+        try:
+            result = await invoke_with_cap_retry(
+                usage_gate=self._usage_gate,
+                label=f'Reconciliation judge ({self.config.judge_llm_model})',
+                prompt=prompt,
+                system_prompt=JUDGE_SYSTEM_PROMPT,
+                model=self.config.judge_llm_model,
+                disallowed_tools=['*'],
+                # max_turns=1: the judge is deliberately single-shot.  One turn is
+                # sufficient to produce a free-form verdict; allowing more would
+                # widen cost/duration exposure with no benefit.
+                max_turns=1,
+                permission_mode='bypassPermissions',
+                timeout_seconds=float(self.config.judge_cli_timeout_seconds),
+                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
+                # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
+                # grounding/proportionality ("were codebase verifications used
+                # when appropriate?"), which plausibly draws on the auto-loaded
+                # CLAUDE.md's project architecture context.
+                cwd=Path(self.config.explore_codebase_root),
+                cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+            )
+        except AllAccountsCappedException as e:
+            # Cap-wait exhaustion (all accounts capped past the 1800s recon
+            # sanity bound) is a transport/infra failure, not a verdict. Re-raise
+            # as JudgeInfraError so review_run counts/backs-off/escalates it
+            # identically to other transport failures, instead of letting it
+            # propagate opaquely into review_run's broad except (which would
+            # swallow it as a generic failure with no infra-failure accounting).
+            raise JudgeInfraError(f'Claude CLI judge cap-wait exhausted: {e}') from e
 
-        # Preserve legacy "empty stdout = valid empty verdict" semantics.
-        # _parse_claude_output maps empty stdout → success=False / subtype
-        # 'error_empty_output'.  Treat that as a benign empty string rather
-        # than an error so callers remain consistent with the prior subprocess
-        # implementation that returned '' on exit-0 + empty stdout.  This
-        # benign contract depends on _parse_verdict special-casing empty
-        # text (see its early-return below) rather than routing it through
-        # the loud severity=serious parse-failure path — otherwise a quiet,
-        # successful CLI run would be indistinguishable from a systemic
-        # judge/CLI outage and could halt the project.
-        if not result.success and result.subtype == 'error_empty_output':
+        if result.success:
+            return result.output.strip()
+
+        # Not successful: distinguish a genuine benign empty verdict from a
+        # transport/infra failure via the shared failure taxonomy
+        # (classify_agent_failure), so infra failures never reach
+        # _parse_verdict's fabricated severity=serious path (the phantom-halt
+        # defect this task fixes).
+        #
+        # EMPTY_OUTPUT (genuine exit-0/empty-stdout) preserves the legacy
+        # "empty stdout = valid empty verdict" semantics: return '' so
+        # _parse_verdict's empty-text short-circuit yields a benign minor
+        # verdict.  Crucially, classify_agent_failure orders API_ERROR (rule 6)
+        # ABOVE EMPTY_OUTPUT (rule 7): a cap-storm run whose stdout is empty but
+        # whose api_error_status is set classifies as API_ERROR, so it is
+        # correctly treated as infra rather than a benign empty verdict.
+        #
+        # Every other failure kind (API_ERROR / TIMED_OUT / MODEL_NOT_FOUND /
+        # MAX_TURNS / ENDED_AWAITING_BACKGROUND / UNKNOWN) is a transport/infra
+        # failure: raise JudgeInfraError (replacing the previous generic
+        # RuntimeError) so review_run can branch on it explicitly.
+        if classify_agent_failure(result).kind == AgentFailureKind.EMPTY_OUTPUT:
             return ''
 
-        if not result.success:
-            raise RuntimeError(build_failure_message('Claude CLI judge', result))
-
-        return result.output.strip()
+        raise JudgeInfraError(build_failure_message('Claude CLI judge', result))
 
     def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
         """Parse judge response into JudgeVerdict."""
@@ -346,6 +495,12 @@ Review this run and provide your verdict as JSON.
                 findings=[{
                     'issue': f'Judge response could not be parsed: {e}',
                     'severity': 'serious',
+                    # Machine-readable marker (task 2947 ask b): lets review_run
+                    # pick the truthful 'Unparseable judge response' halt reason
+                    # via a structured field rather than fragile substring
+                    # matching. Kept on this SINGLE finding so len(findings)==1
+                    # (the existing loud-not-fabricated test) still holds.
+                    'code': 'unparseable_judge_response',
                     'recommendation': (
                         'This verdict was not a real review — the judge output was '
                         'unparseable. Investigate the judge LLM/CLI output before '
@@ -429,6 +584,9 @@ Review this run and provide your verdict as JSON.
         self._halted_projects.add(project_id)
         self._halt_cooldown_until[project_id] = cooldown_until
         self._unhalt_grace_remaining.pop(project_id, None)
+        # Remember the reason in-memory so the harness can thread the REAL reason
+        # into the on_judge_halt escalation (task 2947 ask b).
+        self._halt_reason[project_id] = reason
         try:
             await self.journal.set_halt(
                 project_id,
@@ -441,6 +599,15 @@ Review this run and provide your verdict as JSON.
 
     def is_halted(self, project_id: str) -> bool:
         return project_id in self._halted_projects
+
+    def halt_reason(self, project_id: str) -> str | None:
+        """The reason the project was last halted, or None if not halted.
+
+        Threaded by the harness into the on_judge_halt escalation so an infra
+        ('judge-unreachable …') or unparseable-content halt surfaces with its
+        real reason instead of a hardcoded generic string (task 2947 ask b).
+        """
+        return self._halt_reason.get(project_id)
 
     def unhalt_grace_remaining(self, project_id: str) -> int:
         return self._unhalt_grace_remaining.get(project_id, 0)
@@ -478,6 +645,7 @@ Review this run and provide your verdict as JSON.
         was_halted = project_id in self._halted_projects
         self._halted_projects.discard(project_id)
         self._halt_cooldown_until.pop(project_id, None)
+        self._halt_reason.pop(project_id, None)
 
         grace = max(int(self.config.halt_grace_cycles), 0)
         if grace > 0:

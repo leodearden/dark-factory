@@ -923,6 +923,107 @@ async def test_recover_pending_judge_reviews_caps_fanout_and_warns(
     await asyncio.gather(*harness._judge_tasks, return_exceptions=True)
 
 
+async def _seed_pending_judge_markers(journal, project_id: str, n: int) -> list[str]:
+    """Seed *n* completed runs each with a judge_pending marker (no verdict).
+
+    DRYs the account-availability recovery-gating tests below (task 2947 ask c).
+    """
+    rids: list[str] = []
+    for _ in range(n):
+        rid = str(uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=datetime.now(UTC),
+            status=RunStatus.completed,
+        )
+        await journal.start_run(run)
+        await journal.complete_run(rid, 'completed')
+        await journal.mark_judge_pending(rid, project_id)
+        rids.append(rid)
+    return rids
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_judge_reviews_defers_when_all_accounts_capped(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """Startup recovery defers entirely when every account is capped (task 2947
+    ask c): re-firing judges under a fully-capped pool only churns infra-failure
+    counters and can re-mint phantom halts, so recovery skips spawning and leaves
+    the judge_pending markers intact for a later restart once capacity returns."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.judge = MagicMock()
+    harness._spawn_judge = AsyncMock()
+
+    # All accounts capped/auth-failed: active_account_name is None.
+    harness.usage_gate = MagicMock()
+    harness.usage_gate.active_account_name = None
+
+    await _seed_pending_judge_markers(journal, 'test-project', 2)
+
+    with caplog.at_level(logging.WARNING):
+        await harness._recover_pending_judge_reviews()
+
+    harness._spawn_judge.assert_not_called()
+    assert any(
+        'deferr' in r.message.lower() and 'capped' in r.message.lower()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ), 'an all-accounts-capped recovery must WARN-log a deferral'
+    # Markers persist untouched for a later restart once capacity returns.
+    assert len(await journal.get_pending_judge_runs()) == 2
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_judge_reviews_spawns_when_account_available(
+    journal, event_buffer, mock_memory_service
+):
+    """When at least one account has capacity, startup recovery spawns pending
+    judge reviews as before — the task 2947 ask-c gate is transparent whenever
+    active_account_name resolves to a usable account."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.judge = MagicMock()
+    harness._spawn_judge = AsyncMock()
+
+    harness.usage_gate = MagicMock()
+    harness.usage_gate.active_account_name = 'acct-1'
+
+    await _seed_pending_judge_markers(journal, 'test-project', 2)
+
+    await harness._recover_pending_judge_reviews()
+
+    assert harness._spawn_judge.await_count == 2, (
+        'recovery must spawn all pending reviews when an account is available'
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_judge_reviews_spawns_when_no_usage_gate(
+    journal, event_buffer, mock_memory_service
+):
+    """With no usage gate configured, startup recovery spawns pending reviews
+    unchanged — the task 2947 ask-c gate only fires when a gate EXISTS and reports
+    every account capped, never when self.usage_gate is None."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.judge = MagicMock()
+    harness._spawn_judge = AsyncMock()
+
+    # Model a deployment with no usage gate wired (the gate is optional — built
+    # only when config.usage_cap.enabled). The ask-c defer must never trigger here.
+    harness.usage_gate = None
+
+    await _seed_pending_judge_markers(journal, 'test-project', 2)
+
+    await harness._recover_pending_judge_reviews()
+
+    assert harness._spawn_judge.await_count == 2, (
+        'recovery must spawn all pending reviews when no usage gate is configured'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2734: pure predicate helper backing arm 2 of the widened Stage 1
 # cycle_summary harness backstop below — "Stage 1 completed but its own
@@ -2272,6 +2373,70 @@ async def test_judge_unhalt_clears_halt_escalated(journal, event_buffer, mock_me
     assert not harness.judge.is_halted('test-project')
     # Harness callback must have fired and cleared the sentinel
     assert 'test-project' not in harness._halt_escalated
+
+
+async def _drive_halt_notify(harness, event_buffer):
+    """Drive one run_loop iteration for a pre-halted project so the halt-check
+    branch (which calls _notify_judge_halt) fires. Mirrors
+    test_halted_project_skips_cycle's run_loop-driving setup."""
+    import asyncio
+    import contextlib
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+
+@pytest.mark.asyncio
+async def test_notify_judge_halt_threads_truthful_reason(
+    journal, event_buffer, mock_memory_service
+):
+    """The halt-check call site threads judge.halt_reason(project_id) into
+    backlog_policy.on_judge_halt — so an infra ('judge-unreachable …') halt
+    escalates with the REAL reason, not the hardcoded generic string."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+    harness.judge._halted_projects.add('test-project')
+    truthful = 'judge-unreachable halt: reconciliation judge outage (cap-storm/CLI failure)'
+    harness.judge.halt_reason = MagicMock(return_value=truthful)
+
+    harness._backlog_policy = MagicMock()
+    harness._backlog_policy.on_judge_halt = AsyncMock()
+    harness._halt_escalated.discard('test-project')
+
+    await _drive_halt_notify(harness, event_buffer)
+
+    harness._backlog_policy.on_judge_halt.assert_called_once()
+    args = harness._backlog_policy.on_judge_halt.call_args.args
+    assert args[0] == 'test-project'
+    assert args[1] == truthful
+
+
+@pytest.mark.asyncio
+async def test_notify_judge_halt_falls_back_to_generic_reason_when_none(
+    journal, event_buffer, mock_memory_service
+):
+    """When judge.halt_reason returns None the call site falls back to the
+    generic 'judge halted reconciliation' string (no crash, no empty reason)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+    harness.judge._halted_projects.add('test-project')
+    harness.judge.halt_reason = MagicMock(return_value=None)
+
+    harness._backlog_policy = MagicMock()
+    harness._backlog_policy.on_judge_halt = AsyncMock()
+    harness._halt_escalated.discard('test-project')
+
+    await _drive_halt_notify(harness, event_buffer)
+
+    harness._backlog_policy.on_judge_halt.assert_called_once()
+    args = harness._backlog_policy.on_judge_halt.call_args.args
+    assert args[0] == 'test-project'
+    assert args[1] == 'judge halted reconciliation'
 
 
 @pytest.mark.asyncio
