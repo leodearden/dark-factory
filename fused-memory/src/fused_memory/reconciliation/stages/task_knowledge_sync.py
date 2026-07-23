@@ -83,6 +83,11 @@ from fused_memory.services.live_workflow_detector import detect_live_workflow
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 from fused_memory.utils.async_utils import gather_collect
 
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - escalation package is optional
+    Escalation = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -714,6 +719,14 @@ ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
 # miss-streak threshold; recomputed from the journal each cycle (no stored
 # counter), so any successful sweep resets it.
 GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD: int = 3
+
+# Escalation category for the growth-sweep failure streak (INV-4). Free-form str
+# on ``Escalation.category``; kept distinct from the Stage-1/Stage-2 recon
+# categories (reconciliation_stale_human_operator / reconciliation_stale_flag /
+# recon_stale_task_count_snapshot) so it can be filtered independently.
+ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY = (
+    'reconciliation_growth_sweep_failure'
+)
 
 
 async def _resolve_terminal_task_ids(
@@ -1353,6 +1366,108 @@ def _evaluate_growth_sweep_escalation(
         return {'streak': 0, 'escalate': False}
     streak = _compute_growth_sweep_failure_streak(prior_flags) + 1
     return {'streak': streak, 'escalate': streak >= threshold}
+
+
+async def _maybe_escalate_growth_sweep_failures(
+    escalation_queue,
+    journal,
+    project_id: str,
+    run_id: str,
+    current_failed: bool | None,
+    *,
+    threshold: int = GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD,
+) -> bool:
+    """File a level-1 recon escalation on a sustained growth-sweep failure streak.
+
+    Mirrors ``stage1_stall_detector.maybe_escalate_stalled_tasks`` (a Stage may
+    file a recon escalation directly via ``self._escalation_queue``) and the
+    harness's ``_maybe_escalate_stale_task_count_snapshot`` journal-recompute:
+    the consecutive-failure streak is recomputed each cycle from
+    ``journal.get_recent_runs`` rather than a stored counter, so it resets on any
+    successful sweep and survives a restart with no new schema.
+
+    * Fail-safe short-circuit: only a CONFIRMED current failure
+      (*current_failed* is ``True``) is eligible — a successful or inconclusive
+      cycle returns ``False`` WITHOUT a journal read (cheap steady state).
+    * Prior runs are filtered to full-cycle COMPLETED runs only, EXCLUDING the
+      current *run_id* (a remediation/targeted or still-running run neither
+      counts toward nor resets the streak — matching the snapshot cadence).
+    * On reaching *threshold*, a single ``Escalation`` (level=1) is filed under
+      a STABLE per-project synthetic key ``recon-esd-growth-sweep:<project_id>``
+      and deduped via ``escalation_queue.has_open_l1`` so a persistent streak
+      folds into one open escalation rather than re-filing every cycle.
+
+    Fails open — never raises (the journal read is wrapped too), so a journal
+    hiccup never aborts the Stage-2 tail. Returns whether a NEW escalation was
+    filed. No-op (``False``) when the ``escalation`` package is unavailable or
+    *escalation_queue* is ``None``.
+    """
+    if Escalation is None or escalation_queue is None:
+        return False
+    if current_failed is not True:
+        return False
+    try:
+        recent = await journal.get_recent_runs(project_id, limit=max(20, threshold * 4))
+        prior_runs = [
+            r for r in recent
+            if getattr(r, 'id', None) != run_id
+            and str(getattr(r, 'run_type', '')) == 'full'
+            and str(getattr(r, 'status', '')) == 'completed'
+        ]
+        # Defensive re-sort most-recent-first: get_recent_runs already orders by
+        # started_at DESC, but _compute_growth_sweep_failure_streak depends on it.
+        prior_runs.sort(
+            key=lambda r: getattr(r, 'started_at', None) or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        prior_flags: list[bool | None] = []
+        for r in prior_runs:
+            stage_reports = getattr(r, 'stage_reports', None)
+            report = stage_reports.get('task_knowledge_sync') if isinstance(stage_reports, dict) else None
+            prior_flags.append(_extract_growth_sweep_failed(report))
+
+        result = _evaluate_growth_sweep_escalation(current_failed, prior_flags, threshold=threshold)
+        if not result['escalate']:
+            return False
+
+        key = f'recon-esd-growth-sweep:{project_id}'
+        if escalation_queue.has_open_l1(key):
+            logger.info(
+                'reconciliation.growth_sweep_failure_escalation_suppressed: '
+                'project_id=%s already has an open level-1 escalation',
+                project_id, extra={'project_id': project_id, 'run_id': run_id},
+            )
+            return False
+
+        streak = result['streak']
+        esc = Escalation(
+            id=escalation_queue.make_id(key),
+            task_id=key,
+            agent_role='reconciliation-stage2',
+            severity='blocking',
+            category=ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY,
+            summary=(
+                f'entity_standing_decision growth sweep failed for {streak} '
+                f'consecutive full cycles (project {project_id})'
+            ),
+            detail=(
+                'The reconciliation Stage-2 entity_standing_decision '
+                'growth-freshness sweep left >=1 ACTIVE row unverified (a Graphiti '
+                f'error) for {streak} consecutive completed full reconciliation '
+                f'cycles for project {project_id!r} (latest run_id={run_id}). '
+                'Active standing decisions may be growing stale without '
+                'corroboration; investigate Graphiti reachability for this project.'
+            ),
+            level=1,
+        )
+        escalation_queue.submit(esc)
+        return True
+    except Exception as e:
+        logger.warning(
+            'reconciliation.growth_sweep_failure_escalation_failed',
+            extra={'project_id': project_id, 'run_id': run_id, 'error': str(e)},
+        )
+        return False
 
 
 async def _verify_task_count_snapshot_written(
