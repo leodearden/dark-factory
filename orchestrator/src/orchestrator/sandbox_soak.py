@@ -16,8 +16,13 @@ records — never transcript-grep (INV-2). See the module design in the task
 """
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+
+from orchestrator.event_store import EventType
 
 # Canonical location of the containment probe report (γ4 commits it to main).
 PROBE_REPORT_PATH = "docs/sandbox-containment-probe-report.md"
@@ -30,6 +35,16 @@ MIN_DONE_DEFAULT = 10
 # (never the word "sandbox"), keeping arm 2 precise and non-overlapping with
 # arm 1.
 _ERRNO_RE = re.compile(r"\b(EACCES|EROFS)\b")
+
+
+class SoakInputError(Exception):
+    """A soak input could not be measured — a missing/unreadable store, a bad
+    argument, or a git error resolving the report. Distinct from an exit-1
+    not-yet-green verdict: it maps to the CLI's exit 2 (usage/infra error) so an
+    infra failure is never misread as a soak verdict. Loud-over-silent (project
+    norm): a mispointed path must not degrade to an empty '0 tasks, keep
+    waiting' for the entire >=3-day soak.
+    """
 
 
 @dataclass
@@ -147,3 +162,100 @@ def evaluate_soak(
         ),
         metrics=metrics,
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-only structured readers over the event store + task records.
+#
+# Both stores are opened strictly read-only via the `file:<db>?mode=ro` URI
+# (mirrors b3_gate._read_task_description / evals.task_sampler) — a predicate
+# must never mutate the stores it measures. A missing/unreadable store raises
+# SoakInputError rather than degrading to an empty result.
+# ---------------------------------------------------------------------------
+
+def _connect_ro(db) -> sqlite3.Connection:
+    """Open *db* strictly read-only, or raise SoakInputError."""
+    path = Path(db)
+    if not path.exists():
+        raise SoakInputError(f"database not found: {path}")
+    try:
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise SoakInputError(f"cannot open database {path}: {exc}") from exc
+
+
+def _read_distinct_task_ids(db, event_type: str) -> set[str]:
+    """DISTINCT non-null task_ids for *event_type* across ALL runs (no run_id
+    scope — the soak spans >=3 days and orchestrator restarts, so a run-scoped
+    query would undercount; same rationale as fetch_events_by_type_all_runs)."""
+    conn = _connect_ro(db)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT task_id FROM events "
+            "WHERE event_type = ? AND task_id IS NOT NULL",
+            (event_type,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise SoakInputError(f"failed reading events from {db}: {exc}") from exc
+    finally:
+        conn.close()
+    return {str(r[0]) for r in rows}
+
+
+def read_sandbox_applied_task_ids(db) -> set[str]:
+    """Distinct task_ids with a ``sandbox_applied`` event (condition-a pool)."""
+    return _read_distinct_task_ids(db, EventType.sandbox_applied.value)
+
+
+def read_sandbox_unavailable_task_ids(db) -> set[str]:
+    """Distinct task_ids with a ``sandbox_unavailable`` event (arm-1 pool)."""
+    return _read_distinct_task_ids(db, EventType.sandbox_unavailable.value)
+
+
+def read_escalations(db) -> list[dict]:
+    """All ``escalation_created`` rows as ``{task_id, summary, category}`` dicts,
+    with the ``data`` JSON decoded (arm-2 pool). Run-agnostic."""
+    conn = _connect_ro(db)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, data FROM events WHERE event_type = ?",
+            (EventType.escalation_created.value,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise SoakInputError(f"failed reading escalations from {db}: {exc}") from exc
+    finally:
+        conn.close()
+    out = []
+    for task_id, raw in rows:
+        summary = ""
+        category = ""
+        if raw:
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                data = {}
+            if isinstance(data, dict):
+                summary = data.get("summary") or ""
+                category = data.get("category") or ""
+        out.append(
+            {
+                "task_id": None if task_id is None else str(task_id),
+                "summary": summary,
+                "category": category,
+            }
+        )
+    return out
+
+
+def read_task_status(db, tag: str = "master") -> dict[str, str]:
+    """``{task_id(str): status}`` for the given *tag* (default 'master')."""
+    conn = _connect_ro(db)
+    try:
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE tag = ?", (tag,)
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise SoakInputError(f"failed reading tasks from {db}: {exc}") from exc
+    finally:
+        conn.close()
+    return {str(row[0]): row[1] for row in rows}
