@@ -39,7 +39,6 @@ from orchestrator.background_service import (
     ManagedService,
 )
 from orchestrator.config import (
-    TASK_META_DIRNAME,
     OrchestratorConfig,
     apply_reload,
     load_config,
@@ -56,14 +55,14 @@ from orchestrator.deterministic_runner import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
     file_unattributed_landing_escalation,
     validate_landing_evidence,
 )
-from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME, LaneRecord
+from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
@@ -2690,14 +2689,6 @@ class Harness:
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
                 continue
-            if entry.name in (LANE_STATE_DIRNAME, TASK_META_DIRNAME):
-                # Sibling state-store dirs living directly under worktree_base
-                # (W11 alpha/beta/gamma), never a worktree/lane themselves —
-                # must never be scanned as one (the no-plan heuristic below
-                # would otherwise call cleanup_worktree on the durable
-                # .lane-state records / .task-meta artifacts on every
-                # restart, destroying the very state this task reads).
-                continue
             pool = self.git_ops.warm_lane_pool
             spec_pool = self.git_ops.spec_warm_lane_pool
             # '_spec-' merge-speculation lanes are a SEPARATE pool: they have
@@ -2711,6 +2702,41 @@ class Harness:
                 spec_pool is not None and spec_pool.is_lane(entry)
             )
             task_id = entry.name
+
+            # ── C2 namespace invariant (task 2925, merge-worktree-lifecycle
+            # -integrity PRD §4) ───────────────────────────────────────────
+            # is_lane is checked FIRST above: adoptable warm/spec lanes are
+            # `_`-prefixed, so they MUST bypass the classifier (which would
+            # label them 'infra') and keep their adopt/release/quarantine
+            # handling below.  For every NON-lane entry, the positive-match
+            # classifier replaces the old NEGATIVE per-name exclusion lists
+            # (D7): only task-id-shaped names reach the plan.json/cleanup
+            # heuristic.  `_merge-*` and other `_`/`.`-prefixed infra bands
+            # are SKIPPED with an EXPLICIT journal line (never the silent
+            # 5326 "Cleaned up worktree _merge-verify" force-removal): the
+            # merge reaper (`_reap_orphaned_merge_worktrees`) owns the
+            # `_merge-*` disposition; every other infra band is left to its
+            # owner.  This subsumes the former dedicated `.lane-state`/
+            # `.task-meta` (LANE_STATE_DIRNAME/TASK_META_DIRNAME) skip —
+            # both are `.`-prefixed => classified 'infra'.
+            if not is_lane:
+                worktree_class = classify_worktree_entry(entry.name)
+                if worktree_class == 'merge':
+                    logger.info(
+                        'Recovery: %s is a merge worktree (infra) — reporting '
+                        'to the merge reaper, never cleaned by the '
+                        'crash-recovery sweep',
+                        entry.name,
+                    )
+                    continue
+                if worktree_class == 'infra':
+                    logger.info(
+                        'Recovery: %s is infra-owned (C2 namespace) — left to '
+                        'its owner',
+                        entry.name,
+                    )
+                    continue
+                # 'task' falls through unchanged to the heuristic below.
 
             # ── Record-driven recovery (W11 delta, PRD mechanism 1) ─────
             # Consult the durable LaneLifecycle record FIRST, before any of
