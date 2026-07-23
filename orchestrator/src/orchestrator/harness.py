@@ -52,6 +52,7 @@ from orchestrator.deploy_state import DeployPhase, DeployState
 from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
     DeterministicRunner,
+    build_milestone_gate_escalation_fields,
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
@@ -557,12 +558,23 @@ def _deterministic_gate_stranded(metadata: dict | None) -> bool:
     ``_deterministic_deploy_stranded``'s "the I/O check is the caller's job"
     contract.
 
-    DISJOINT from ``_deterministic_deploy_stranded`` by construction: that
-    predicate requires ``deploy_state.phase == RAN`` (or the pre-ζ legacy
-    shim) and EXPLICITLY EXCLUDES ``gate_escalated_at`` being set (see the
-    exclusion above), whereas this one REQUIRES ``gate_escalated_at`` — so no
-    task is ever matched by both, and a gate strand and a deploy strand are
-    handled by separate recovery paths with no double-handling.
+    DISJOINT from ``_deterministic_deploy_stranded`` by construction — this
+    one REQUIRES ``gate_escalated_at`` whereas that predicate never matches a
+    task once it is set, though for DIFFERENT reasons in its two branches:
+      - ``deploy_state`` PRESENT: it matches ONLY ``deploy_state.phase == RAN``
+        and never inspects ``gate_escalated_at`` directly.  Disjointness rests
+        on the atomic stamp+phase-advance invariant, not an explicit exclusion:
+        stamping ``gate_escalated_at`` on a deploy is done ATOMICALLY with
+        advancing ``phase`` to ``ESCALATED`` (the runner's single
+        ``_advance_deploy_phase`` merge in ``_file_milestone_gate_and_block``),
+        so a deploy with ``gate_escalated_at`` set is ``phase == ESCALATED``,
+        never ``RAN`` — the deploy predicate returns False.
+      - ``deploy_state`` ABSENT (pre-ζ legacy shim): THAT branch is the one
+        that EXPLICITLY excludes ``gate_escalated_at`` being set.
+    So no task is ever matched by both, and a gate strand and a deploy strand
+    are handled by separate recovery paths with no double-handling.  (Were the
+    atomic stamp+phase-advance invariant ever to regress, the sweep's
+    deploy-before-gate branch ordering is a belt-and-braces backstop.)
 
     None/non-dict *metadata* is treated as non-matching rather than raising.
     """
@@ -10035,10 +10047,14 @@ class Harness:
         or a queue_dir storage/scoping divergence (the failure mode named in
         ``EscalationQueue.submit``'s docstring).  RE-FILES the born-at-L2 gate
         mirroring what the runner itself would have filed (same agent_role,
-        level, severity, category, summary/detail/options shape) so the runner's
-        section-1 resume quiescence/resolve-to-done machinery — which scopes its
-        scans on ``DETERMINISTIC_AGENT_ROLE`` — integrates cleanly: a human
-        resolving the re-filed gate drives the task to done exactly as designed.
+        level, severity, category, and summary/detail/options — the latter three
+        built through the SHARED ``build_milestone_gate_escalation_fields`` seam
+        the runner uses, so even the operational-LLM token prefix (task 2803 γ)
+        on an operational-mode gate is reproduced verbatim rather than dropped
+        and misrouted) so the runner's section-1 resume quiescence/resolve-to-
+        done machinery — which scopes its scans on ``DETERMINISTIC_AGENT_ROLE``
+        — integrates cleanly: a human resolving the re-filed gate drives the
+        task to done exactly as designed.
 
         Unlike ``_recover_stranded_deterministic_task`` this is a HUMAN-decision
         gate: there is no target unit, no live systemd health check, and — like
@@ -10054,16 +10070,15 @@ class Harness:
 
         from escalation.models import Escalation  # noqa: PLC0415
 
-        title = (task or {}).get('title', '')
-        description = (task or {}).get('description', '')
-        deps = (task or {}).get('dependencies', []) or []
-        dep_ids = [
-            str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
-        ]
-        detail_parts = [description]
-        if dep_ids:
-            detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
-        detail = '\n'.join(detail_parts)
+        # Task 2954 amendment: build summary/detail/options via the SAME
+        # `build_milestone_gate_escalation_fields` seam the runner's own
+        # `_file_milestone_gate_and_block` uses, so the re-filed gate is
+        # byte-identical to what the runner would have filed — including the
+        # operational-LLM token prefix (task 2803 γ) that a hand-rolled
+        # re-build here would otherwise drop and misroute.
+        summary, detail, options = build_milestone_gate_escalation_fields(
+            task, metadata,
+        )
 
         esc = Escalation(
             id=self._escalation_queue.make_id(tid),
@@ -10071,9 +10086,9 @@ class Harness:
             agent_role=DETERMINISTIC_AGENT_ROLE,
             severity='critical',
             category='milestone_gate',
-            summary=title[:200],
+            summary=summary,
             detail=detail,
-            options=list(metadata.get('gate_options') or []),
+            options=options,
             level=2,
         )
         self._escalation_queue.submit(esc)
@@ -10312,11 +10327,14 @@ class Harness:
             metadata = task.get('metadata') or {}
             # Two DISJOINT Source-A strand detectors (task 2954): a deploy
             # RAN-strand and a pure-gate / always_escalates GATE-strand. They
-            # never both match one task — _deterministic_deploy_stranded requires
-            # deploy_state.phase==RAN and EXCLUDES gate_escalated_at, while
-            # _deterministic_gate_stranded REQUIRES gate_escalated_at — so no
-            # task is ever handled by both.  Both share the per-task fail-soft
-            # try/except and recovered_this_pass bookkeeping below.
+            # never both match one task — _deterministic_gate_stranded REQUIRES
+            # gate_escalated_at, and _deterministic_deploy_stranded matches only
+            # phase==RAN, but stamping gate_escalated_at on a deploy atomically
+            # advances phase to ESCALATED (never RAN); its pre-ζ legacy shim
+            # branch separately excludes gate_escalated_at outright. The
+            # if/elif below orders deploy-before-gate as a belt-and-braces
+            # backstop should that atomic invariant ever regress. Both share the
+            # per-task fail-soft try/except and recovered_this_pass bookkeeping.
             _is_deploy = _deterministic_deploy_stranded(metadata)
             _is_gate = _deterministic_gate_stranded(metadata)
             if not (_is_deploy or _is_gate):
