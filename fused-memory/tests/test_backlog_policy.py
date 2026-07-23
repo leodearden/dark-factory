@@ -724,3 +724,30 @@ class TestDistinctLoudHaltEscalation:
         assert v2.escalation_path is None
         esc_files = list((project_root / 'data' / 'escalations').iterdir())
         assert len(esc_files) == 1
+
+
+@pytest.mark.asyncio
+async def test_backlog_escalation_detail_names_correct_probe(event_buffer, tmp_path):
+    """The backlog escalation detail must name the EXACT verification probe a
+    watcher uses to confirm a drain (get_queue_stats → reconciliation_backlog)
+    and contrast it with the durable-write-queue counts (a different subsystem
+    that stays ~0). This is the anti-mis-triage contract — task 2920 (b)."""
+    await _seed_buffered(event_buffer, 'proj', n=12)
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+
+    policy = BacklogPolicy(
+        event_buffer,
+        _StubQueue(),
+        lambda _: True,  # orchestrator live
+        hard_limit=10,
+    )
+    verdict = await policy.check('proj', project_root=str(project_root))
+    assert verdict.outcome == 'escalated'
+    assert verdict.escalation_path is not None
+    body = json.loads(Path(verdict.escalation_path).read_text())
+    detail = body['detail']
+    assert 'reconciliation_backlog' in detail, detail
+    assert 'get_queue_stats' in detail, detail
+    # Explicitly contrasts against the durable-write-queue subsystem.
+    assert 'durable' in detail.lower(), detail
