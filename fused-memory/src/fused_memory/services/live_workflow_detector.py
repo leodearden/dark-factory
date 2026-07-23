@@ -93,6 +93,28 @@ orchestrator lock. Both gates are fail-safe TOWARD live: a missing branch, a
 subprocess error, or an unparseable ``rev-list`` count never marks a worktree
 prunable or a branch bare — only positive evidence does.
 
+**In-progress corroboration gate (task 2963).** The three rules above force
+the *project-wide* ``orchestrator_live`` signal False for statuses/task_kinds
+where the bare lock is not per-task evidence. A separate, orthogonal failure
+mode remains for **in-progress** tasks after a fleet redeploy: the redeploy
+KILLS the running workflow, yet its git worktree registration lingers
+(``worktree_registered`` stays True until pruned) and the freshly-restarted
+orchestrator re-acquires the project-wide PID lock (``orchestrator_live`` stays
+True), so an in-progress task whose only signals are those two — no
+``recent_commit`` — is falsely reported live. ``detect_live_workflow`` accepts
+an opt-in ``corroborated: bool | None`` verdict: when ``status ==
+'in-progress'`` AND not ``recent_commit`` AND (``worktree_registered`` OR
+``orchestrator_live``) AND ``corroborated is False`` (the caller found no fresh
+per-task corroborating signal — see :func:`corroboration_for_task`), ``is_live``
+is forced False and the result is flagged ``indeterminate=True`` (distinct from
+an all-signals-false genuine not-live result). ``corroborated is None`` (the
+default, used by every existing caller and by the two consumers that lack the
+task dict) or ``True`` leaves the detector byte-for-byte unchanged. This lets
+the stranded-remediation path proceed for a killed-but-lingering in-progress
+task while never racing a genuinely live pipeline (any one fresh signal keeps
+it live). ``recent_commit`` is deliberately exempt — it is genuine per-task
+work evidence.
+
 Branch convention: ``task/<task_id>`` (matches the orchestrator's worktree naming).
 Injectable ``now`` for deterministic tests.
 """
@@ -180,6 +202,18 @@ class WorkflowLiveness:
         branch: The branch name inspected (e.g. ``task/4321``).
         last_commit_at: Parsed commit timestamp when ``recent_commit`` was evaluated.
             ``None`` when the branch was absent or the timestamp was unparseable.
+        indeterminate: True when the per-task corroboration gate (task 2963)
+            downgraded ``is_live`` to False for an in-progress task whose only
+            liveness signals were the project-wide ``orchestrator_live`` and/or
+            a lingering ``worktree_registered`` (no ``recent_commit``) and for
+            which the caller supplied ``corroborated=False`` (no fresh per-task
+            signal). This is SEMANTICALLY DISTINCT from an all-signals-false
+            genuine not-live result (``indeterminate`` False): the former had a
+            worktree/orchestrator signal but no corroboration — stranded but was
+            dispatched — while the latter never had any signal. Both carry
+            ``is_live=False`` so ``if is_live`` consumers stop treating the task
+            as owned, permitting the stranded-remediation path. Always False
+            unless the gate fired.
     """
 
     is_live: bool
@@ -188,6 +222,7 @@ class WorkflowLiveness:
     orchestrator_live: bool
     branch: str
     last_commit_at: datetime | None
+    indeterminate: bool = False
 
 
 def detect_live_workflow(
@@ -200,6 +235,7 @@ def detect_live_workflow(
     base_branch: str = DEFAULT_BASE_BRANCH,
     status: str | None = None,
     task_kind: str | None = None,
+    corroborated: bool | None = None,
     _orchestrator_live: bool | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
@@ -244,6 +280,25 @@ def detect_live_workflow(
             blocked task with genuine per-task evidence (a registered worktree
             or a recent commit), or for any non-blocked status, the
             orchestrator_live computation is unaffected by ``task_kind``.
+        corroborated: Per-task corroboration verdict for the in-progress
+            liveness gate (task 2963). Only an explicit ``False`` downgrades:
+            when ``status == 'in-progress'`` AND there is no ``recent_commit``
+            AND at least one of ``worktree_registered``/``orchestrator_live``
+            is set AND ``corroborated is False`` (the caller found no fresh
+            per-task corroborating signal — live claimant/heartbeat, scheduler
+            holder/park, or a post-restart routing decision), ``is_live`` is
+            forced ``False`` and ``indeterminate`` is set ``True`` on the
+            result. This targets the fleet-redeploy false positive: a KILLED
+            in-progress workflow whose lingering worktree registration and the
+            freshly-restarted project-wide orchestrator lock both still assert
+            liveness. ``recent_commit`` is EXEMPT (genuine per-task work
+            evidence). ``corroborated is None`` (the default — used by every
+            existing caller, and by ``recon_write_policy``/integrity-escalation
+            which lack the task dict) and ``corroborated is True`` both leave
+            the gate inert, so the detector's behavior is byte-for-byte
+            unchanged for all existing callers. The verdict is computed by
+            :func:`corroboration_for_task` and passed in only by
+            :func:`_render_live_workflow_section`, which HAS the task dict.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
@@ -311,7 +366,30 @@ def detect_live_workflow(
             else is_orchestrator_live_for(project_root)
         )
 
-    is_live = worktree_registered or recent_commit or orchestrator_live
+    # Per-task corroboration gate (task 2963). Composes with — and runs after —
+    # the _orchestrator_signal_ineligible block above (which may already have
+    # zeroed orchestrator_live). For an IN-PROGRESS task whose liveness rests
+    # SOLELY on the project-wide orchestrator lock and/or a lingering worktree
+    # registration (no recent_commit), a fleet redeploy that KILLED the
+    # workflow leaves those two signals falsely asserting liveness. An explicit
+    # corroborated=False (the caller found no fresh per-task signal) downgrades
+    # is_live to False and flags the result indeterminate — distinct from an
+    # all-signals-false genuine not-live result (indeterminate stays False when
+    # there was no worktree/orchestrator signal to downgrade). corroborated is
+    # None (default, every existing caller) or True leaves behavior unchanged.
+    # recent_commit is exempt: it is genuine per-task work evidence.
+    gate_fires = (
+        status == 'in-progress'
+        and not recent_commit
+        and (worktree_registered or orchestrator_live)
+        and corroborated is False
+    )
+    if gate_fires:
+        is_live = False
+        indeterminate = True
+    else:
+        is_live = worktree_registered or recent_commit or orchestrator_live
+        indeterminate = False
 
     return WorkflowLiveness(
         is_live=is_live,
@@ -320,6 +398,7 @@ def detect_live_workflow(
         orchestrator_live=orchestrator_live,
         branch=branch,
         last_commit_at=last_commit_at,
+        indeterminate=indeterminate,
     )
 
 
