@@ -697,6 +697,88 @@ class TestIdempotentResumeAndQuiescence:
 
 
 # ---------------------------------------------------------------------------
+# task 2954 step-7/step-8: pure-gate resume-proof hardening.
+#
+# Today the pure-gate section-1 resume drives a stamped gate to `done` whenever
+# the PENDING queue is empty — which, if the born-at-L2 escalation was LOST
+# (the reported strand), silently BYPASSES the human gate the moment an operator
+# re-pends the stuck task.  Hardening requires the SAME archive-inclusive
+# positive proof the deploy path already demands: drive to done only when a
+# resolved/archived deterministic escalation actually exists; otherwise re-file
+# the gate and stay BLOCKED.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPureGateResumeHardening:
+    """DeterministicRunner — pure-gate resume requires archive-inclusive proof."""
+
+    async def test_pure_gate_resume_no_record_refiles_and_blocks(self, tmp_path: Path):
+        """gate_escalated_at set + ZERO records anywhere (no pending, no archived)
+        → must NOT drive to done; re-files the born-at-L2 gate and returns BLOCKED."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # ZERO records — no pending, no archived
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Must NOT silently drive to done — the human gate was never proven resolved.
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, 'pure-gate resume must not drive to done without proof'
+        # Instead it re-files the born-at-L2 milestone_gate to re-establish the gate.
+        pending = queue.get_by_task(
+            '100', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate'
+        assert pending[0].level == 2
+
+    async def test_pure_gate_resume_with_resolved_record_drives_to_done(self, tmp_path: Path):
+        """GREEN-preserving: a RESOLVED+ARCHIVED deterministic escalation (the true
+        post-`resume` state) IS positive proof a human acted → drive to done with
+        deterministic-gate provenance, exactly as before the hardening."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        # A human `resume` archives the escalation before the task is re-pended.
+        existing = Escalation(
+            id=queue.make_id('99'), task_id='99',
+            agent_role='orchestrator-deterministic', severity='critical',
+            category='milestone_gate', summary='Ship feature gate', level=2,
+        )
+        queue.submit(existing)
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        # Sanity: resolved record is archived (not pending) but archive-visible.
+        assert queue.get_by_task('99', status='pending') == []
+        assert len(queue.get_by_task('99', agent_role='orchestrator-deterministic')) == 1
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
 # (RED until step-2 adds the before_done execution path)
 # ---------------------------------------------------------------------------
