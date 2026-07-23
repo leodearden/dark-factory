@@ -31,7 +31,9 @@ support and PER-UNIT state. State shape:
       "units": {<unit>: {"MainPID": int, "ActiveState": str,
                           "ActiveEnterTimestamp": str,
                           "ActiveEnterTimestampMonotonic": int,
-                          "scenario": "fresh"|"stale"}},
+                          "scenario": "fresh"|"stale"|"delayed-fresh",
+                          "fresh_after": int, "restarted": bool,
+                          "post_restart_shows": int}},
       "calls": [...],
     }
 `list-units` prints one line per entry in running_units (first
@@ -39,7 +41,12 @@ whitespace-delimited field is the unit name, matching the real script's
 `awk '{print $1}'` parse). `show -p FIELDS UNIT` and `restart UNIT`
 operate on state["units"][UNIT]; a unit with no configured scenario
 defaults to "stale" (restart is a no-op, mirroring the single-unit fake's
-default).
+default). Scenario "delayed-fresh" (task 2967) reports stale for the
+first `fresh_after` post-restart `show` calls, then flips fresh --
+mirroring tests/scripts/test_restart_all_orchestrators.py's bash
+"delayed-fresh" fake's semantics, but keyed by per-unit state
+(`restarted`, `post_restart_shows`, `fresh_after`) rather than an env var,
+since this fake is already per-unit-state-based.
 """
 import json
 import os
@@ -85,6 +92,9 @@ def main(argv):
                 ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
             )
             ustate["ActiveEnterTimestamp"] = "restarted"
+        elif scenario == "delayed-fresh":
+            ustate["restarted"] = True
+            ustate["post_restart_shows"] = 0
         _save(state)
         return 0
 
@@ -106,6 +116,15 @@ def main(argv):
                 unit = tok
                 i += 1
         ustate = state.get("units", {}).get(unit, {})
+        if ustate.get("scenario") == "delayed-fresh" and ustate.get("restarted"):
+            ustate["post_restart_shows"] = ustate.get("post_restart_shows", 0) + 1
+            if ustate["post_restart_shows"] > ustate.get("fresh_after", 0):
+                ustate["MainPID"] = ustate.get("MainPID", 1000) + 1
+                ustate["ActiveState"] = "active"
+                ustate["ActiveEnterTimestampMonotonic"] = (
+                    ustate.get("ActiveEnterTimestampMonotonic", 0) + 5_000_000
+                )
+                ustate["ActiveEnterTimestamp"] = "restarted"
         current = {
             "MainPID": str(ustate.get("MainPID", 0)),
             "ActiveState": ustate.get("ActiveState", "active"),
