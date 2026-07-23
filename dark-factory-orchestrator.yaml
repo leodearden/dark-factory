@@ -108,6 +108,23 @@ usage_cap:
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
 
+# OS filesystem sandbox (Landlock) — DF canary flip, γ2.
+# Per plans/os-sandbox-worktree-containment-prd.md task γ2 (D6, D7): enable
+# the OS-enforced writable-set containment (SandboxConfig,
+# orchestrator/src/orchestrator/config.py) for sandboxed roles
+# (implementer/debugger/simple_task) on the DF fleet, backend pinned to
+# landlock (the proven fleet backend per PRD Background; bwrap is
+# effectively dead fleet-wide).
+#
+# ACTIVATION NOTE: like the U2 restart-on-merge and verify-scope-inversion
+# flips above, `sandbox.*` is NOT in the config hot-reload allowlist
+# (RELOADABLE_FIELDS, orchestrator/src/orchestrator/config.py) — this edit
+# is inert in the running daemon until the next orchestrator restart.
+# Activation is the separate γ3 deterministic-deploy capstone task.
+sandbox:
+  enabled: true
+  backend: landlock
+
 # Post-merge staleness hook — U2 restart-on-merge for the orchestrator fleet
 # itself. Flips the (previously dormant, enabled=False-by-default) coordinator
 # on for dark-factory's own daemon. All six orchestrator-*.service units are
