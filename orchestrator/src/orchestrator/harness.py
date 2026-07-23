@@ -670,6 +670,83 @@ def _is_terminal_merged(task: dict | None) -> bool:
     return provenance.get('kind') in _MERGED_DONE_PROVENANCE_KINDS
 
 
+def _is_scope_divergence_orphan(esc: Escalation) -> bool:
+    """Return True iff *esc* is the plan.files/metadata.files divergence
+    orphan class filed by ``TaskWorkflow._escalate_scope_invariant_violation``
+    (workflow.py:11277).
+
+    Task 2931: this class recurred as a false positive post-2878
+    (esc-2865-19, esc-2869-10) because the lock-free
+    ``reviewer_comprehensive`` / ``resettled_adjudicator`` stages hold no
+    module locks and are absent from ``_dispatched``, so
+    ``Scheduler.is_actively_held`` returns False for a task that is genuinely
+    live mid-dispatch (its ``metadata.files`` legitimately lagging
+    ``plan.files`` during in-flight scope reconciliation). The reaper gates
+    this specific class on ``routing.latest`` freshness — see
+    :func:`_has_fresh_dispatch`.
+
+    Unlike the done-step-commit class, ``suggested_action`` is NOT a unique
+    discriminator here — ``'investigate_and_retry'`` is shared by several
+    other filing sites (scheduler.py, workflow.py). The distinctive summary
+    substring ``'plan.files/metadata.files divergence detected'`` is
+    grep-confirmed unique to that one filing site, so it is the robust
+    discriminator (plus ``agent_role``/``category``).
+    """
+    return (
+        esc.agent_role == 'orchestrator'
+        and esc.category == 'infra_issue'
+        and 'plan.files/metadata.files divergence detected'
+        in (esc.summary or '')
+    )
+
+
+def _has_fresh_dispatch(
+    task: dict | None, now: datetime, grace_secs: float,
+) -> bool:
+    """Return True iff *task* has a routing decision stamped within
+    *grace_secs* of *now* — i.e. a live in-flight LLM dispatch.
+
+    Task 2931: the lock-free reviewer/adjudicator stages leave no lock or
+    ``_dispatched`` trace, but they DO stamp
+    ``metadata.routing.latest.decided_at`` fresh per LLM invocation
+    (``RoutingDecisionMirror``, shared/task_metadata.py). The orphan-L0
+    reaper reads it as the missing liveness dimension ``is_actively_held``
+    lacks, to defer (not drop) the divergence class while a dispatch is
+    genuinely live.
+
+    Fail-safe (mirrors :func:`_is_terminal_merged`): a ``None`` *task*, a
+    missing/non-dict ``metadata``/``routing``/``latest``, an absent/non-str
+    ``decided_at``, and an unparseable or tz-mismatched timestamp are all
+    treated as "not fresh" (return False) rather than raising — the caller
+    then promotes (surfaces) instead of silently suppressing whenever
+    liveness cannot be positively confirmed, preserving task 2878's boundary
+    guard and the loud-over-silent-degradation norm. A ``decided_at`` newer
+    than *now* (a dispatch that landed after the sweep snapshot) yields a
+    negative delta ``< grace_secs`` -> True (fresh), matching the "newer than
+    the sweep snapshot" wording.
+    """
+    if task is None:
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    routing = metadata.get('routing')
+    if not isinstance(routing, dict):
+        return False
+    latest = routing.get('latest')
+    if not isinstance(latest, dict):
+        return False
+    decided_at = latest.get('decided_at')
+    if not isinstance(decided_at, str):
+        return False
+    try:
+        decided_dt = datetime.fromisoformat(decided_at)
+        delta_secs = (now - decided_dt).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return delta_secs < grace_secs
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
@@ -9488,6 +9565,38 @@ class Harness:
                     resolved_by='harness-orphan-reaper',
                 )
                 continue
+
+            # Live lock-free-stage race (task 2931): defer — don't promote —
+            # a plan.files/metadata.files divergence orphan whose task is
+            # live inside a lock-free reviewer_comprehensive /
+            # resettled_adjudicator stage. Those stages hold no module locks
+            # and are absent from _dispatched, so the is_actively_held gate
+            # above cannot see them — but they stamp
+            # metadata.routing.latest.decided_at fresh per LLM invocation. A
+            # decided_at within orphan_l0_dispatch_freshness_secs of this
+            # sweep's `now` means the task is live mid-dispatch and its
+            # divergence (metadata.files legitimately lagging plan.files) is
+            # self-healing, not stranded: defer, and the next sweep re-checks
+            # and promotes once the decision ages out. A genuinely stranded
+            # task has stale/absent routing.latest -> _has_fresh_dispatch
+            # False -> still promoted (preserves task 2878's boundary guard).
+            # Placed after the age check so only aged-out divergence orphans
+            # pay the get_task cost; the divergence and done-step-commit
+            # classes are mutually exclusive, so at most one get_task fires.
+            if _is_scope_divergence_orphan(esc):
+                task = await self.scheduler.get_task(esc.task_id)
+                if _has_fresh_dispatch(
+                    task, now, self.config.orphan_l0_dispatch_freshness_secs,
+                ):
+                    logger.info(
+                        'Orphan L0 reaper: deferred divergence orphan for '
+                        'task_id=%s — fresh routing.latest dispatch within '
+                        '%.0fs grace (live lock-free reviewer/adjudicator '
+                        'stage); next sweep re-checks',
+                        esc.task_id,
+                        self.config.orphan_l0_dispatch_freshness_secs,
+                    )
+                    continue
 
             # Rebase-superseded false positive (task 2725): a done-step-commit
             # orphan (_is_done_step_commit_orphan) whose subject task is done
