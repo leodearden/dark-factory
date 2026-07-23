@@ -117,8 +117,14 @@ fatal: update_ref failed for ref 'refs/heads/main': cannot lock ref 'refs/heads/
 errno on its own stderr, so the probe maps git's textual reason to an
 errno name (`"Permission denied"` → `EACCES`, `"Read-only file system"` →
 `EROFS`); here it mapped to `EACCES`, consistent with every other row on
-this landlock fleet. `refs/heads/main` was independently re-read after the
-probe and confirmed unchanged (see §Non-destructiveness verification).
+this landlock fleet. Any other failure text — e.g. a concurrent lock held
+by another process, or a corrupt ref — is deliberately *not* treated as a
+denial: per the amended script (§Reproducibility below), only a recognized
+`EACCES`/`EROFS` mapping yields `verdict=DENIED`; anything else prints
+`CONTAINMENT-PROBE-UNEXPECTED` and raises, so a non-containment git
+failure can never be recorded as a false denial. `refs/heads/main` was
+independently re-read after the probe and confirmed unchanged (see
+§Non-destructiveness verification).
 
 ### Row 9 — write `~/.claude/settings.json`
 
@@ -192,12 +198,15 @@ All of the following held after the probe ran:
 
 ## Reproducibility: verbatim probe script
 
-This is the exact script executed for this report (byte-for-byte; also
-embedded verbatim in the task's plan analysis). It derives every path at
-run time from the live worktree/repo state, so it is safe to re-run from
-any task worktree on this fleet without modification — it is read-only
-except for the five write-intent probes below, which by construction here
-observed denial and wrote zero bytes.
+This is the script executed for this report. The row-6 failure-
+classification branch below was tightened post-review (see amendment note
+after the script); with that one exception it is byte-for-byte the script
+that was actually run, and is also embedded verbatim (pre-amendment) in
+the task's plan analysis, which is frozen and out of scope for this fix.
+It derives every path at run time from the live worktree/repo state, so it
+is safe to re-run from any task worktree on this fleet without
+modification — it is read-only except for the five write-intent probes
+below, which by construction here observed denial and wrote zero bytes.
 
 ```python
 import errno, os, subprocess, sys
@@ -243,12 +252,31 @@ if r.returncode==0:
 else:
     st=r.stderr; last=st.strip().splitlines()[-1] if st.strip() else ""
     name = "EACCES" if "Permission denied" in st else ("EROFS" if "Read-only file system" in st else "UNKNOWN")
-    print(f'CONTAINMENT-PROBE-RESULT: row=6 scenario="git update-ref refs/heads/main" target=refs/heads/main errno={name} verdict=DENIED  # {last}')
+    if name in ("EACCES", "EROFS"):
+        print(f'CONTAINMENT-PROBE-RESULT: row=6 scenario="git update-ref refs/heads/main" target=refs/heads/main errno={name} verdict=DENIED  # {last}')
+    else:
+        print(f"CONTAINMENT-PROBE-UNEXPECTED row=6 target=refs/heads/main errno={name}", file=sys.stderr)
+        raise RuntimeError(f"row 6 update-ref failed for a non-permission reason (not a containment denial): {last}")
 probe_open(9, "write ~/.claude/settings.json",    os.path.expanduser("~/.claude/settings.json"))
 assert sh(["git","rev-parse","refs/heads/main"]).stdout.strip()==MAIN_SHA, "MAIN MOVED — abort"
 if BREACH:
     print(f"SANDBOX NOT ENFORCING — breaches={BREACH}", file=sys.stderr); sys.exit(3)
 ```
+
+> **Amendment note (post-review):** the row-6 `else` branch originally
+> mapped *any* non-zero `git update-ref` exit to `verdict=DENIED`,
+> including the `UNKNOWN` fallback for failure text matching neither
+> `"Permission denied"` nor `"Read-only file system"` (e.g. a concurrent
+> lock held by another process, or a corrupt ref) — silently recording a
+> non-containment git failure as a successful denial, contrary to this
+> project's loud-over-silent-degradation norm. It now emits
+> `verdict=DENIED` only when the mapped name is `EACCES` or `EROFS`;
+> anything else prints `CONTAINMENT-PROBE-UNEXPECTED` and raises, mirroring
+> `probe_open()`'s existing handling of an unrecognized errno. This run's
+> actual git failure text was `"Permission denied"` (mapped to `EACCES`),
+> so the amendment changes nothing about the historical result: §Raw
+> captured output below remains the genuine, unedited output of the probe
+> as executed.
 
 Invocation: `python3 - <<'PY' ... PY` (piped as stdin to a bare `python3 -`),
 per the task's canonical-probe contract. Exit code: `0`.
