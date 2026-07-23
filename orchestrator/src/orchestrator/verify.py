@@ -476,7 +476,7 @@ _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$'
 # patterns above) since xdist's crash notices can be prefixed by pytest's own
 # progress/worker-id decoration.
 _XDIST_WORKER_CRASH_RE = re.compile(
-    r'node down: Not properly terminated|worker gw\d+ crashed|\[gw\d+\] node down',
+    r"node down: Not properly terminated|worker '?gw\d+'? crashed|\[gw\d+\] node down",
     re.MULTILINE,
 )
 

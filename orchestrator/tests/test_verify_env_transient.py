@@ -646,6 +646,18 @@ _XDIST_WORKER_CRASH_OUTPUT = (
     "worker gw3 crashed while running 'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
 )
 
+# esc-2971-13 (steward-verified): the installed pytest-xdist actually quotes
+# the worker id too — ``worker 'gw24' crashed while running '<nodeid>'`` —
+# not just the trailing nodeid as _XDIST_WORKER_CRASH_OUTPUT above models.
+# Without quote-tolerance on the worker-id alternative,
+# _XDIST_WORKER_CRASH_RE.search() misses this real-world form entirely and
+# _is_bare_xdist_worker_crash never reclassifies it.
+_XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT = (
+    'orchestrator/tests/test_config.py ....\n'
+    '[gw24] node down: Not properly terminated\n'
+    "worker 'gw24' crashed while running 'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
+)
+
 # Same crash signature, but WITH a genuine failure alongside it (collateral
 # FAILED line from the dead worker's run) — the conservative discriminator
 # must treat this as a real failure and NOT reclassify it.
@@ -728,6 +740,20 @@ class TestBareXdistWorkerCrashDetector:
     def test_bare_worker_crash_is_true(self):
         """A bare node-down/worker-crash signature with no real failure marker -> True."""
         assert verify._is_bare_xdist_worker_crash(_XDIST_WORKER_CRASH_OUTPUT) is True
+
+    def test_bare_worker_crash_with_quoted_worker_id_is_true(self):
+        """esc-2971-13: the real pytest-xdist quoted form -- ``worker 'gwNN'
+        crashed while running '...'`` -- with no real failure marker -> True.
+
+        The installed pytest-xdist quotes the worker id itself, not just the
+        trailing nodeid; _XDIST_WORKER_CRASH_RE must tolerate the optional
+        quotes or this class of bare worker-crash silently falls through to
+        the debugger/human instead of the bounded infra retry.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT
+        )
+        assert result is True
 
     def test_crash_with_real_failure_markers_is_false(self):
         """The same crash signature PLUS genuine E/FAILED/summary lines -> False.
