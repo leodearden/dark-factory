@@ -1610,19 +1610,29 @@ class TestReclaimOnExhaustionKnobWiring:
     """Config knob + knob-gated wiring tests (task 1933, step-7).
 
     (a) knob=True → git_ops callbacks are wired.
-    (b) knob=False (default) → callbacks stay None (byte-identical).
-    (c) GitConfig() default has warm_lane_reclaim_on_exhaustion == False.
+    (b) knob=False (explicit) → callbacks stay None (byte-identical).
+    (c) GitConfig() default has warm_lane_reclaim_on_exhaustion == True.
 
     RED today: GitConfig.warm_lane_reclaim_on_exhaustion does not exist
     (ValidationError) and the Harness wiring block is absent.
     """
 
-    def test_default_gitconfig_has_knob_false(self):
-        """(c) GitConfig() default: warm_lane_reclaim_on_exhaustion == False."""
+    def test_default_gitconfig_has_knob_true(self):
+        """(c) GitConfig() default: warm_lane_reclaim_on_exhaustion == True."""
         cfg = GitConfig()
-        assert cfg.warm_lane_reclaim_on_exhaustion is False, (
-            'GitConfig.warm_lane_reclaim_on_exhaustion must default to False '
-            '(byte-identical, trivially revertible)'
+        assert cfg.warm_lane_reclaim_on_exhaustion is True, (
+            'GitConfig.warm_lane_reclaim_on_exhaustion must default to True '
+            '(1933 reclaim-on-exhaustion safety valve on by default fleet-wide)'
+        )
+
+    def test_warm_lane_reclaim_on_exhaustion_default_true(self):
+        """Stock OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion is
+        True (full config-load default resolution; proves defaults.yaml does
+        not shadow the Field default — the knob is deliberately absent from
+        defaults.yaml, per PRD W4 decision 6)."""
+        assert OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion is True, (
+            'OrchestratorConfig().git.warm_lane_reclaim_on_exhaustion must '
+            'default to True (1933 valve on by default fleet-wide, PRD W4)'
         )
 
     def test_callbacks_wired_when_knob_on(self, tmp_path: Path):
@@ -1649,7 +1659,7 @@ class TestReclaimOnExhaustionKnobWiring:
         )
 
     def test_callbacks_none_when_knob_off(self, tmp_path: Path):
-        """(b) knob=False (default) → both callbacks stay None."""
+        """(b) knob=False (explicit) → both callbacks stay None."""
         config = _make_reclaim_config(
             max_concurrent_tasks=4,
             warm_lane_pool=True,
