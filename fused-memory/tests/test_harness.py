@@ -2619,6 +2619,93 @@ async def test_no_auto_unhalt_before_cooldown_expiry(
 
 
 @pytest.mark.asyncio
+async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
+    journal, event_buffer, mock_memory_service
+):
+    """The self-healing/re-latch contract (task 2920 RCA): an auto-unhalt seeds
+    post-unhalt grace just like a manual unhalt, AND clears the per-process
+    _halt_escalated sentinel so a subsequent re-halt re-fires a distinct, loud
+    escalation (the ~30-min drumbeat). Guards against a regression that broke
+    grace-seeding or _halt_escalated clearing on the AUTO path specifically."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+    assert harness.config.halt_grace_cycles > 0  # precondition for grace-seeding
+
+    # Wire a backlog policy so _notify_judge_halt actually escalates, and
+    # pre-seed the sentinel as if the halt had already been escalated once
+    # before its cooldown expired (the incident's starting state).
+    harness._backlog_policy = MagicMock()
+    harness._backlog_policy.on_judge_halt = AsyncMock()
+    harness._halt_escalated.add('test-project')
+
+    harness.config.auto_unhalt_after_cooldown = True
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) - timedelta(hours=1)  # expired
+    )
+
+    # Capture the grace counter at the instant the auto path calls judge.unhalt,
+    # BEFORE the resumed cycles consume it down — so assertion (1) isolates the
+    # SEEDING performed by the auto path from later per-cycle consumption (the
+    # driven loop spins several cycles because the mocked run_full_cycle never
+    # drains the buffer, so a post-loop read would race that consumption to 0).
+    grace_at_unhalt: dict[str, int] = {}
+    # Bind the bound methods here (harness.judge is narrowed non-None by the
+    # assert above) so the closure captures them already-narrowed.
+    real_unhalt = harness.judge.unhalt
+    grace_remaining = harness.judge.unhalt_grace_remaining
+
+    async def _capture_grace(pid):
+        await real_unhalt(pid)  # real unhalt seeds grace + clears _halt_escalated
+        grace_at_unhalt[pid] = grace_remaining(pid)
+
+    unhalt_mock = AsyncMock(side_effect=_capture_grace)
+    harness.judge.unhalt = unhalt_mock
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ),
+        contextlib.suppress(TimeoutError),
+    ):
+        # 1.0s (vs the sibling tests' 0.5s) gives the driven loop extra headroom
+        # to reach the auto-unhalt branch under parallel-suite load, so a timing
+        # miss can't masquerade as a grace/sentinel regression.
+        await asyncio.wait_for(harness.run_loop(), timeout=1.0)
+
+    # Precondition: the auto-unhalt branch actually fired (distinguishes a real
+    # grace/sentinel regression below from a mere timing miss reaching the branch).
+    unhalt_mock.assert_awaited()
+
+    # (1) The auto path seeded post-unhalt grace exactly like a manual unhalt
+    # (halt_grace_cycles=3), captured at unhalt-time before the resumed cycles
+    # consumed it down.
+    assert grace_at_unhalt.get('test-project', 0) > 0
+    assert not harness.judge.is_halted('test-project')  # halt cleared
+
+    # (2) The unhalt callback cleared the _halt_escalated sentinel — the auto
+    # path did NOT re-escalate itself (skip branch was bypassed)...
+    assert 'test-project' not in harness._halt_escalated
+    harness._backlog_policy.on_judge_halt.assert_not_called()
+
+    # ...so if the judge re-halts (still-sick pipeline), the halt re-escalates
+    # rather than being deduped away — a distinct, loud signal per re-halt.
+    harness.judge._halted_projects.add('test-project')
+    await harness._notify_judge_halt('test-project', reason='re-halt after auto-resume')
+    harness._backlog_policy.on_judge_halt.assert_called_once()
+    args = harness._backlog_policy.on_judge_halt.call_args.args
+    assert args[0] == 'test-project'
+    assert args[1] == 're-halt after auto-resume'
+
+
+@pytest.mark.asyncio
 async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_memory_service):
     """_make_stages() returns fresh stage instances with no leftover per-run state.
 

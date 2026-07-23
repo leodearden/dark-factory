@@ -2208,18 +2208,24 @@ class ReconciliationHarness:
                         # next serious verdict / infra-failure threshold if the
                         # pipeline is still sick — re-firing a distinct, loud halt
                         # escalation — rather than resuming silently forever.
-                        reason = (
+                        halt_reason_text = (
                             self.judge.halt_reason(project_id)
                             or 'judge halted reconciliation'
                         )
                         logger.warning(
                             f'Auto-unhalting {project_id} after halt cooldown '
-                            f'expiry — {reason}; resuming with post-unhalt grace '
-                            f'(judge will re-halt if still sick)'
+                            f'expiry — {halt_reason_text}; resuming with '
+                            f'post-unhalt grace (judge will re-halt if still sick)'
                         )
                         await self.judge.unhalt(project_id)
+                        # Record the resumed cycle's provenance as the auto-unhalt
+                        # resume — NOT the stale halt reason — so run history
+                        # reflects the true cause. `reason` (the buffer's
+                        # should_trigger reason) is preserved for context and is
+                        # passed to run_full_cycle below as trigger_reason.
                         # Deliberately NO return: fall through to the normal
                         # consume_grace_cycle + cycle path below.
+                        reason = f'auto_unhalt_after_cooldown (buffer: {reason})'
                     else:
                         logger.warning(f'Skipping cycle for halted project {project_id}')
                         await self._notify_judge_halt(
