@@ -175,6 +175,28 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
+    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1,
+    # §3.7) telemetry for the RemoteRunner auto-sync-at-dispatch gate.  A
+    # RemoteRunner's adoptable post-merge verdict is trustworthy only if the
+    # runner executed CURRENT gate logic; incident bb834dd42a is the laptop's
+    # Dark-Factory *code* checkout frozen ~5 weeks, rubber-stamping trivial
+    # PASSes (966f23a6).  Both are queue/runner-scoped (task_id optional; the
+    # sync happens before/around dispatch, not necessarily bound to one task).
+    #
+    # runner_stale: emitted by RemoteRunner.sync_if_stale when the remote
+    # DF-code checkout HEAD differs from the dispatcher's local DF HEAD
+    # (staleness detected, BEFORE any sync/pull is attempted).  data carries
+    # {runner, local_head, remote_head}.
+    #
+    # runner_synced: emitted when the remote git state was brought current with
+    # the dispatcher — either the DF-code checkout (git pull --ff-only + uv
+    # sync, kind='df_checkout') or the project checkout's main ref (mirror
+    # force-push after a non-fast-forward, kind='project_main_mirror').  data
+    # carries {runner, kind, from_head, to_head, forced}; kind ∈ {'df_checkout',
+    # 'project_main_mirror'}; forced is True only on the project-main mirror
+    # force-push arm.
+    runner_stale = 'runner_stale'
+    runner_synced = 'runner_synced'
 
     # Task lifecycle
     task_started = 'task_started'
