@@ -476,3 +476,44 @@ class TestRenderEntityStandingDecisionSchemaSection:
         assert 'authoritative' in text
         assert 'Stage 1' in text
         assert 'never consult mem0' in text
+
+
+# --------------------------------------------------------------------------- #
+# render_investigation_outcome_section (task 2898 ε, step-3/4)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderInvestigationOutcomeSection:
+    """render_investigation_outcome_section() renders the STAGE-2-ONLY
+    investigation_outcome mem0-kind schema plus the Stage-2 write instruction
+    (write one record on every not-actionable investigation conclusion; the
+    pool feeds β's authorization arm-2 evidence)."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_investigation_outcome_section(), str)
+        assert m.render_investigation_outcome_section()
+
+    def test_kind_is_single_sourced_from_constants(self):
+        """The rendered text contains the α mem0-kind constant VALUE (not a
+        re-hardcoded literal), proving it is single-sourced (INV-5)."""
+        text = m.render_investigation_outcome_section()
+        assert sdc.MEM0_KIND_INVESTIGATION_OUTCOME in text
+        assert sdc.MEM0_KIND_INVESTIGATION_OUTCOME == 'investigation_outcome'
+
+    def test_describes_record_metadata(self):
+        """The record metadata: entity_uuid, actionable=false, and a run id."""
+        text = m.render_investigation_outcome_section()
+        assert 'entity_uuid' in text
+        assert 'actionable' in text
+        assert 'false' in text
+        assert 'run_id' in text or 'run id' in text
+
+    def test_write_on_not_actionable_conclusion(self):
+        """The write is triggered on a not-actionable investigation conclusion."""
+        text = m.render_investigation_outcome_section()
+        assert 'not-actionable' in text or 'not actionable' in text
+
+    def test_feeds_authorization_arm2_evidence_pool(self):
+        """The records feed the β authorization arm-2 evidence pool."""
+        text = m.render_investigation_outcome_section()
+        assert 'arm' in text or 'authorization' in text or 'evidence' in text
