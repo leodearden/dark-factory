@@ -3752,6 +3752,36 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
                 cm.__exit__(None, None, None)
 
 
+async def _preprovision_shared_venv(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    verify_env: dict[str, str],
+    timeout: float,
+) -> None:
+    """Synchronously populate the shared ``.venv`` before the test/lint/type gather.
+
+    On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
+    EFFECT of the TEST leg's ``cd <module> && uv run pytest``.  The full-repo-
+    scope root LINT (``uv run ruff check …``) and TYPE (``… npx pyright``)
+    commands race that sync in the concurrent gather and fail spuriously
+    (``Failed to spawn: ruff``; ``Import "pytest" could not be resolved``).
+    Running ``config.verify_cold_preprovision_command`` here, synchronously,
+    before the gather closes that race by populating the venv first.
+
+    No-op when the knob is empty (the project-agnostic default — the deployed
+    uv-workspace value lives only in dark-factory-orchestrator.yaml).  Runs
+    through ``_run_cmd`` so it inherits the ghost-venv isolation scrub from
+    ``_target_subprocess_env`` (the TARGET's ``uv`` resolves the TARGET's
+    ``.venv``) with no new isolation code.
+    """
+    cmd = config.verify_cold_preprovision_command
+    if not cmd:
+        return
+    logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
+    await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -4021,6 +4051,19 @@ async def run_verification(
             timed_out=timed_out_flag,
             started_at=started_at,
             duration_secs=time.monotonic() - t0,
+        )
+
+    # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
+    # the shared .venv ONCE, synchronously, before the concurrent test/lint/type
+    # gather below, so the full-repo-scope root LINT/TYPE commands don't race the
+    # TEST-driven `uv run pytest` sync and fail spuriously on an empty venv.
+    # Gated on is_cold — the race's defining condition (a cold/possibly-empty
+    # venv) — so it is a no-op on warm lanes and also covers the post-merge
+    # type-only pyright path (test/lint=None → no TEST leg to populate the venv).
+    # No-op when the knob is unset (project-agnostic empty default).
+    if is_cold:
+        await _preprovision_shared_venv(
+            worktree, config, verify_env=verify_env, timeout=timeout,
         )
 
     retries = 0
