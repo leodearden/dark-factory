@@ -5363,3 +5363,66 @@ class TestReclaimVictim:
         victim, lane = result
         assert victim == 'A', f'self skipped, must pick A, got {victim!r}'
         assert lane == lane_a
+
+
+# ===========================================================================
+# Task 2986 (W2b) step-5 RED: single-writer — reclaim_victim (steal) re-keys
+# the durable record victim -> thief at the moment it re-keys the in-memory
+# map (PRD warm-lane-exhaustion-hardening boundary row 3). Because
+# LaneLifecycle.note_assigned never STEALS (a different-task ASSIGNED->ASSIGNED
+# raises), the durable re-key is release-then-assign: victim ASSIGNED->RELEASED,
+# then thief RELEASED->ASSIGNED. Fails today (reclaim_victim is cache-only).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReclaimVictimWritesThroughDurable:
+    async def test_steal_rekeys_durable_record_to_thief(self, tmp_path: Path):
+        """boundary row 3: after the steal the durable record is ASSIGNED:thief
+        (victim released, thief assigned) on the SAME lane."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+
+        pool = _make_pool(tmp_path, size=1)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Assign the victim (durable ASSIGNED:victim via write-through acquire).
+        acq_v = await pool.acquire_for('victim')
+        assert acq_v is not None
+        lane_v, _ = acq_v
+        assert lifecycle.read(lane_v).state == DurableLaneState.ASSIGNED
+        assert lifecycle.read(lane_v).task_id == 'victim'
+
+        # Steal victim's lane for thief (victim non-dispatched).
+        result = await pool.reclaim_victim('thief', {'victim'}, lambda b: False)
+
+        assert result is not None
+        victim, lane = result
+        assert victim == 'victim'
+        assert lane == lane_v
+        # (a) in-memory map re-keyed victim -> thief; lane stays ASSIGNED
+        assert pool.assignment_for('victim') is None
+        assert pool.assignment_for('thief') == lane_v
+        assert pool.state(lane_v) == LaneState.ASSIGNED
+        # (b) durable record: ASSIGNED with task_id == thief
+        record = lifecycle.read(lane_v)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == 'thief'
+
+    async def test_steal_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): reclaim_victim writes no record."""
+        pool = _make_pool(tmp_path, size=1)
+        base = tmp_path / 'worktrees'
+
+        acq_v = await pool.acquire_for('victim')
+        assert acq_v is not None
+        lane_v, _ = acq_v
+
+        result = await pool.reclaim_victim('thief', {'victim'}, lambda b: False)
+
+        assert result is not None
+        assert pool.assignment_for('thief') == lane_v
+        assert pool.state(lane_v) == LaneState.ASSIGNED
+        assert not (base / '.lane-state').exists()
