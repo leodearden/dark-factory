@@ -4518,6 +4518,302 @@ class TestFilterTerminalMetadataFlags:
 
 
 # ---------------------------------------------------------------------------
+# task-3007 step-1 — filter_stale_bulk_get_statuses_flags
+# ---------------------------------------------------------------------------
+
+
+class TestFilterStaleBulkGetStatusesFlags:
+    """RED tests for async filter_stale_bulk_get_statuses_flags(taskmaster, project_root, flags).
+
+    The recurring ``stale_bulk_get_statuses_recurrence`` flag is a misdiagnosis
+    of benign capture-time-vs-live read-skew in the reconciliation harness (the
+    cycle-start unscoped census is frozen and compared against live reads minutes
+    later).  This filter re-runs the flag's OWN A/B claim LIVE — a fresh unscoped
+    ``get_statuses(project_root)`` and a fresh scoped
+    ``get_statuses(project_root, ids=[tid])`` — and DROPS the flag iff the two now
+    AGREE on the cited task (proving the alleged divergence was a capture-time
+    artifact that does not reproduce).
+
+    Fail-CLOSED (KEEP) on: a live-reproduced divergence, a cited status
+    absent/None on either read, a read error, a missing task_id, or falsy
+    taskmaster/project_root — so a genuine backend regression is never silenced.
+    """
+
+    @staticmethod
+    def _statuses_stub(bulk, scoped):
+        """AsyncMock side_effect keyed on the ``ids`` kwarg.
+
+        Returns *bulk* for the unscoped bulk census call (``ids is None``) and
+        *scoped* for the scoped re-verification call (``ids=[tid]``), so the stub
+        is robust to the order in which the filter issues the two reads.
+        """
+        def _fake(project_root, ids=None, tag=None):
+            return scoped if ids is not None else bulk
+        return _fake
+
+    @pytest.mark.asyncio
+    async def test_agreement_drops_flag(self):
+        """(a) DROP when live unscoped and scoped get_statuses AGREE on the cited task."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {'2992': 'done'})
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            'flag must be DROPPED when live unscoped and scoped get_statuses agree '
+            'on the cited task (the alleged divergence does not reproduce → benign '
+            'capture-time read-skew artifact)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_divergence_keeps_flag(self):
+        """(b) KEEP when live unscoped and scoped reads DISAGREE (live-reproduced divergence)."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'pending'}, {'2992': 'done'})
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'flag must be KEPT when the live A/B reads still disagree — a genuine '
+            'backend regression must never be silenced (fail-closed)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_raising_keeps_flag(self):
+        """(c) KEEP when get_statuses raises (fail-safe)."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('backend down'))
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'get_statuses raising must KEEP the flag (fail-safe: only drop on '
+            'positively confirmed live agreement)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cited_status_absent_on_bulk_keeps_flag(self):
+        """(d) KEEP when the cited status is absent from the bulk read (None)."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({}, {'2992': 'done'})
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'a cited status absent from the bulk read (None) must KEEP the flag — '
+            'agreement cannot be positively confirmed'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cited_status_absent_on_scoped_keeps_flag(self):
+        """(d) KEEP when the cited status is absent from the scoped read (None)."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {})
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'a cited status absent from the scoped read (None) must KEEP the flag — '
+            "'done' != None is a divergence, not agreement"
+        )
+
+    @pytest.mark.asyncio
+    async def test_flag_without_task_id_passes_through_without_read(self):
+        """(e) KEEP a matching flag that has no task_id, with NO get_statuses call."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock()
+        project_root = '/proj'
+
+        flag = {'task_id': None, 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'a stale_bulk_get_statuses_recurrence flag with task_id=None must pass '
+            'through unchanged (no task to re-verify)'
+        )
+        taskmaster.get_statuses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_matching_flag_type_passes_through_without_read(self):
+        """(f) A non-matching flag_type passes through untouched, with NO get_statuses call."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {'2992': 'done'})
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'orphaned_knowledge'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [flag], (
+            'a non-matching flag_type must pass through untouched; this filter only '
+            'targets the stale_bulk_get_statuses family'
+        )
+        taskmaster.get_statuses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_family_variant_spelling_is_matched_and_dropped(self):
+        """(g) A case/separator/word-order variant of the flag_type still matches and DROPS."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {'2992': 'done'})
+        )
+        project_root = '/proj'
+
+        # Same token multiset as 'stale_bulk_get_statuses_recurrence' — reordered,
+        # re-cased, and hyphen-separated — must collapse to the same family.
+        flag = {'task_id': '2992', 'flag_type': 'Bulk-Get-Statuses-Stale-Recurrence'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            'a family-variant spelling (via canonical_flag_type_family) must still be '
+            'matched and DROPPED on live agreement'
+        )
+
+    @pytest.mark.asyncio
+    async def test_recurrence_less_alias_is_matched_and_dropped(self):
+        """(g, cont.) The recurrence-less alias 'stale_bulk_get_statuses' is also matched."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {'2992': 'done'})
+        )
+        project_root = '/proj'
+
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses'}
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, [flag])
+
+        assert result == [], (
+            "the recurrence-less alias 'stale_bulk_get_statuses' must also be matched "
+            'and DROPPED on live agreement'
+        )
+
+    @pytest.mark.asyncio
+    async def test_passthrough_when_taskmaster_is_none(self):
+        """(h) No-op pass-through when taskmaster is None — get_statuses not called."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {'2992': 'done'})
+        )
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+
+        result = await filter_stale_bulk_get_statuses_flags(None, '/proj', [flag])
+
+        assert result == [flag], 'None taskmaster must pass all flags through unchanged'
+        taskmaster.get_statuses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_passthrough_when_project_root_is_empty(self):
+        """(h) No-op pass-through when project_root is '' — get_statuses not called."""
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=self._statuses_stub({'2992': 'done'}, {'2992': 'done'})
+        )
+        flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, '', [flag])
+
+        assert result == [flag], 'Empty project_root must pass all flags through unchanged'
+        taskmaster.get_statuses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_flags_position_mapping_drops_only_agreeing(self):
+        """Multi-flag input exercises gather / zip(strict) / results_by_pos mapping.
+
+        A mixed list [non-matching, stale-agree, stale-diverge, stale-no-task-id]
+        must drop EXACTLY the agreeing matching flag while keeping the other three
+        in their original order — proving the check_positions↔lookup_results
+        pairing stays aligned when matching and non-matching flags interleave
+        (a mis-mapping would drop the wrong flag).  Reads must be issued only for
+        the two task-bearing matching flags, and the shared unscoped census must
+        be read exactly once (hoisted out of the per-task gather).
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        # Live census: task 100 agrees (done/done → DROP); task 200 diverges
+        # (pending/done → KEEP).  999 is present but its flag is non-matching, so
+        # it must never be scoped-read.
+        bulk_census = {'100': 'done', '200': 'pending', '999': 'in-progress'}
+        scoped_map = {'100': 'done', '200': 'done'}
+
+        def _fake(project_root_arg, ids=None, tag=None):
+            if ids is None:
+                return dict(bulk_census)
+            return {tid: scoped_map[tid] for tid in ids if tid in scoped_map}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(side_effect=_fake)
+        project_root = '/proj'
+
+        non_matching = {'task_id': '999', 'flag_type': 'orphaned_knowledge'}
+        stale_agree = {'task_id': '100', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        stale_diverge = {'task_id': '200', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        stale_no_task_id = {'task_id': None, 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        flags = [non_matching, stale_agree, stale_diverge, stale_no_task_id]
+
+        result = await filter_stale_bulk_get_statuses_flags(taskmaster, project_root, flags)
+
+        assert result == [non_matching, stale_diverge, stale_no_task_id], (
+            'only the agreeing matching flag (task 100) must be dropped; the '
+            'non-matching, diverging, and no-task-id flags survive in original '
+            'order — a position mis-mapping would drop the wrong flag'
+        )
+
+        calls = taskmaster.get_statuses.call_args_list
+        bulk_calls = [c for c in calls if c.kwargs.get('ids') is None]
+        scoped_ids = sorted(
+            c.kwargs.get('ids') for c in calls if c.kwargs.get('ids') is not None
+        )
+        assert len(bulk_calls) == 1, (
+            'the unscoped bulk census must be read exactly once and shared across '
+            'both scoped re-checks (not re-fetched per matching flag)'
+        )
+        assert scoped_ids == [['100'], ['200']], (
+            'scoped reads must be issued only for the two task-bearing matching '
+            'flags (100, 200) — never for the non-matching (999) or no-task-id flag'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1786 step-1 — filter_stale_count_snapshot_corrections
 # ---------------------------------------------------------------------------
 

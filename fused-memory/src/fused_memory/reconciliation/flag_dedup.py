@@ -1915,6 +1915,183 @@ async def filter_terminal_metadata_flags(
 
 
 # --------------------------------------------------------------------------- #
+# Stale-bulk-get_statuses guard helpers (task-3007)
+# --------------------------------------------------------------------------- #
+
+#: Flag types asserting the SQLite backend's bulk ``get_statuses`` returned a
+#: census that is stale relative to a live/scoped read.  The canonical spelling
+#: the Stage-1/Stage-3 harness emits is ``stale_bulk_get_statuses_recurrence``;
+#: the recurrence-less ``stale_bulk_get_statuses`` is included to be robust
+#: against LLM naming drift.  Case / separator / word-order variants of either
+#: spelling are ALSO matched at filter time via
+#: :func:`canonical_flag_type_family`, so only genuinely-distinct token multisets
+#: need to be listed here.
+STALE_BULK_GET_STATUSES_FLAG_TYPES: frozenset[str] = frozenset({
+    'stale_bulk_get_statuses_recurrence',
+    'stale_bulk_get_statuses',
+})
+
+#: Precomputed canonical-family keys for :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES`
+#: so a reworded / reordered LLM spelling of the flag_type still matches (mirrors
+#: the family matching used by ``filter_suppressed`` / ``write_suppression_record``).
+_STALE_BULK_GET_STATUSES_FAMILIES: frozenset[str] = frozenset(
+    canonical_flag_type_family(ft) for ft in STALE_BULK_GET_STATUSES_FLAG_TYPES
+)
+
+
+async def filter_stale_bulk_get_statuses_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop ``stale_bulk_get_statuses_recurrence`` flags whose divergence does not reproduce live.
+
+    The recurring "stale bulk get_statuses" finding is a MISDIAGNOSIS of benign
+    capture-time-vs-live read-skew in the reconciliation harness: the cycle-start
+    UNSCOPED status census is captured once and frozen for the whole multi-minute
+    cycle, then compared against LIVE reads (a live ``get_task`` / scoped
+    ``get_statuses``) minutes later.  A task that transitions ``pending -> done``
+    after cycle-start capture but during the cycle therefore appears one way in
+    the frozen census and another in a live read — a capture-time artifact that
+    cannot persist.  The SQLite backend read path has no cache/TTL/materialized
+    view, and scoped and unscoped ``get_statuses`` run the identical unpinnable
+    autocommit-connection path, so within one process they cannot persistently
+    disagree (verified: tasks 2455/2651/2694 already hardened the connection
+    layer, and existing tests prove bulk+scoped reads observe committed writes).
+
+    For each flag whose ``flag_type`` FAMILY (:func:`canonical_flag_type_family`)
+    is in :data:`STALE_BULK_GET_STATUSES_FLAG_TYPES` and that carries a
+    ``task_id``, this filter re-runs the flag's OWN A/B claim LIVE — a fresh
+    unscoped ``taskmaster.get_statuses(project_root)`` and a fresh scoped
+    ``taskmaster.get_statuses(project_root, ids=[tid])`` — and DROPS the flag iff
+    the two now AGREE on the cited task (both report the same non-None status),
+    proving the alleged divergence was a benign capture-time artifact that does
+    not reproduce.
+
+    **Fail-safe direction is KEEP**: this filter drops ONLY on positively-confirmed
+    live agreement.  A live-reproduced divergence, a cited status absent/None on
+    either read, a read error, a missing ``task_id``, or a falsy
+    ``taskmaster``/``project_root`` all KEEP the flag — so a hypothetical genuine
+    backend regression is surfaced, never silenced.  A transient read failure
+    costs at most one extra dedup cycle and self-heals next cycle.
+
+    Non-matching flag types, and matching flags without a ``task_id``, are passed
+    through unchanged without any ``get_statuses`` call.  Degrades to a no-op
+    pass-through when ``taskmaster`` or ``project_root`` is falsy (mirrors
+    :func:`filter_terminal_metadata_flags` / :func:`filter_false_absence_flags`).
+
+    Args:
+        taskmaster: Object with an async ``get_statuses(project_root, ids=None)``
+            method, typically ``self.taskmaster`` in MemoryConsolidator (a raw
+            ``SqliteTaskBackend``).
+        project_root: Project root path passed through to ``get_statuses``.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        Filtered list with non-reproducing stale-bulk-get_statuses flags removed.
+    """
+    if not taskmaster or not project_root:
+        return list(flags)
+
+    # Positions whose flag_type FAMILY matches STALE_BULK_GET_STATUSES_FLAG_TYPES
+    # and that carry a task_id — only these are re-verified.
+    check_positions: list[int] = []
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if (
+            isinstance(flag_type, str)
+            and canonical_flag_type_family(flag_type) in _STALE_BULK_GET_STATUSES_FAMILIES
+            and flag.get('task_id') is not None
+        ):
+            check_positions.append(i)
+
+    # Detect potential LLM naming drift: flag_type strings that mention 'statuses'
+    # but whose family is not in STALE_BULK_GET_STATUSES_FLAG_TYPES.  When the
+    # model emits an unrecognised spelling the filter silently becomes a no-op;
+    # this log makes that observable (mirrors filter_terminal_metadata_flags).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if (ft := flag.get('flag_type')) is not None
+        and isinstance(ft, str)
+        and 'statuses' in ft.lower()
+        and canonical_flag_type_family(ft) not in _STALE_BULK_GET_STATUSES_FAMILIES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update STALE_BULK_GET_STATUSES_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(STALE_BULK_GET_STATUSES_FLAG_TYPES),
+        )
+
+    if not check_positions:
+        return list(flags)
+
+    # The UNSCOPED bulk census is identical for every flag within one filter
+    # invocation, so fetch it ONCE and share it across all per-task scoped
+    # re-checks — otherwise each matching flag would re-read the entire project
+    # census (N full-census reads for N flags).  Fail-safe: any error fetching
+    # the shared census KEEPS every flag (mirrors the per-flag KEEP-on-error).
+    try:
+        bulk = await taskmaster.get_statuses(project_root)
+    except Exception as exc:
+        logger.debug(
+            'reconciliation.stale_bulk_get_statuses_filter_bulk_read_error error=%s',
+            exc,
+        )
+        return list(flags)  # KEEP all flags on bulk-census read error (fail-safe)
+    bulk_map: dict[Any, Any] = bulk if isinstance(bulk, dict) else {}
+
+    async def _safe_ab_check(task_id: Any) -> tuple[bool, str | None]:
+        """Re-run the flag's own bulk-vs-scoped A/B check LIVE.
+
+        Returns ``(should_drop, agreed_status)``.  Compares the cited task's
+        status in the shared unscoped ``bulk_map`` against a fresh per-task
+        scoped read.  DROP only when both report a non-None status for the cited
+        task AND those statuses are equal.  Any exception on the scoped read, a
+        missing/None cited status on either read, or a live divergence => KEEP
+        (fail-closed).
+        """
+        tid = str(task_id)
+        try:
+            scoped = await taskmaster.get_statuses(project_root, ids=[tid])
+        except Exception as exc:
+            logger.debug(
+                'reconciliation.stale_bulk_get_statuses_filter_read_error task_id=%s error=%s',
+                tid, exc,
+            )
+            return False, None  # KEEP flag on error (fail-safe)
+        bulk_status = bulk_map.get(tid)
+        scoped_status = scoped.get(tid) if isinstance(scoped, dict) else None
+        if bulk_status is not None and bulk_status == scoped_status:
+            return True, bulk_status  # live reads AGREE → benign artifact → DROP
+        return False, None  # divergence / missing status → KEEP
+
+    check_task_ids = [flags[i].get('task_id') for i in check_positions]
+    lookup_results: list[tuple[bool, str | None]] = await asyncio.gather(
+        *[_safe_ab_check(tid) for tid in check_task_ids]
+    )
+    results_by_pos: dict[int, tuple[bool, str | None]] = dict(
+        zip(check_positions, lookup_results, strict=True)
+    )
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        decision = results_by_pos.get(i)
+        if decision is not None and decision[0]:
+            logger.info(
+                'reconciliation.stale_bulk_get_statuses_flag_dropped task_id=%s status=%s',
+                flag.get('task_id'), decision[1],
+            )
+            continue  # DROP: alleged divergence did not reproduce live
+        kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
 # Absence guard helpers
 # --------------------------------------------------------------------------- #
 
