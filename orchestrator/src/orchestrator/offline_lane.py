@@ -61,10 +61,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Protocol
 
+from shared.verify_admission import nice_prefix
+
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
-    from orchestrator.config import OrchestratorConfig
+    from orchestrator.config import LaneCommand, OrchestratorConfig
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger(__name__)
@@ -166,6 +168,17 @@ SuiteRunner = Callable[[Path, str, int], Awaitable[tuple[int, str]]]
 #: original failure did not reproduce in isolation (flake, B6).
 ConfirmationRunner = Callable[[Path, str], Awaitable[list[str]]]
 
+#: Signature of the injectable GENERIC per-project command seam (task 2789):
+#: (LaneCommand, worktree path, head SHA) -> (return code, output tail). Takes
+#: the LaneCommand (unlike the fixed reify seams above) because the generic
+#: path runs a different command per config entry.
+CommandRunner = Callable[['LaneCommand', Path, str], Awaitable[tuple[int, str]]]
+
+#: Signature of the injectable GENERIC per-project confirmation seam (task
+#: 2789): (LaneCommand, worktree path, head SHA) -> confirmed-still-failing
+#: test IDs (empty == flake, same contract as ConfirmationRunner).
+CommandConfirmationRunner = Callable[['LaneCommand', Path, str], Awaitable[list[str]]]
+
 
 class OfflineLaneTaskClient(Protocol):
     """Pluggable interface for filing/updating the offline-lane fix task (β3).
@@ -230,6 +243,19 @@ class OfflineLaneWorker:
             its optional ``confirmation_runner`` kwarg) to confirm an infra
             sub-run red result.  Defaults to
             :meth:`_default_infra_confirmation_run` when not supplied.
+        command_runner: Optional injectable async seam (task 2789),
+            ``(LaneCommand, wt_path, head) -> (rc, tail)``, for the generic
+            per-project command sub-runs iterated from
+            ``config.git.offline_lane_commands``.  Defaults to
+            :meth:`_default_run_command` (an idle-niced ``sh -c`` subprocess)
+            when not supplied.
+        command_confirmation_runner: Optional injectable async seam (task
+            2789), ``(LaneCommand, wt_path, head) -> confirmed_still_failing_ids``,
+            bound per-command by :meth:`_run_once` into :meth:`_handle_red_run`'s
+            ``confirmation_runner`` contract for a generic command's red path.
+            Defaults to :meth:`_default_confirm_command` (serial re-run via
+            ``_serial_pytest_str`` + ``_extract_failing_test_ids``) when not
+            supplied.
         task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
             file/update the dedup'd fix task for a confirmed red run.
             Defaults to ``None`` — the red path degrades to a log-only no-op
@@ -250,6 +276,8 @@ class OfflineLaneWorker:
         confirmation_runner: ConfirmationRunner | None = None,
         infra_runner: SuiteRunner | None = None,
         infra_confirmation_runner: ConfirmationRunner | None = None,
+        command_runner: CommandRunner | None = None,
+        command_confirmation_runner: CommandConfirmationRunner | None = None,
         task_client: OfflineLaneTaskClient | None = None,
         escalation_queue: EscalationQueue | None = None,
     ) -> None:
@@ -271,6 +299,14 @@ class OfflineLaneWorker:
             infra_confirmation_runner
             if infra_confirmation_runner is not None
             else self._default_infra_confirmation_run
+        )
+        self.command_runner: CommandRunner = (
+            command_runner if command_runner is not None else self._default_run_command
+        )
+        self.command_confirmation_runner: CommandConfirmationRunner = (
+            command_confirmation_runner
+            if command_confirmation_runner is not None
+            else self._default_confirm_command
         )
         self.task_client = task_client
         self.escalation_queue = escalation_queue
@@ -412,11 +448,17 @@ class OfflineLaneWorker:
         (fine) or re-sets ``_dirty`` for a coalesced re-run (fine).
         Clearing AFTER the snapshot would open a lost-update window.
 
-        Two sub-runs per coalesced cadence, both at this ONE snapshot head
-        and in the SAME ``_offline-deep`` worktree (task 1959, IE1):
+        Up to three kinds of sub-run per coalesced cadence, all at this ONE
+        snapshot head and in the SAME ``_offline-deep`` worktree (task 1959,
+        IE1; task 2789, D1):
 
         1. NUMERIC — the existing ``scripts/run-offline-deep.sh`` suite via
-           :attr:`suite_runner`. Unchanged: on red it calls
+           :attr:`suite_runner`, gated on
+           ``config.git.offline_lane_legacy_numeric_enabled`` (default True =
+           byte-identical to prior behaviour; task 2789, D2). A project with
+           no ``run-offline-deep.sh`` sets it False, in which case the numeric
+           leg is skipped and treated as vacuously green (so it never blocks
+           the all-green ``_last_green_head`` advance). On red it calls
            :meth:`_handle_red_run` BARE (``_handle_red_run(wt, head)``),
            preserving back-compat with the numeric-only red path.
         2. INFRA — reify's ``run_all --scope host-infra`` (H9 = reify:4929)
@@ -431,14 +473,26 @@ class OfflineLaneWorker:
            is taken here. IE-D4: infra ``.sh``/cargo tests never touch
            ``_offline-deep/target/``, so reusing δ's worktree does not
            violate C5's single-consumer-of-target invariant.
+        3. GENERIC per-project commands (task 2789, D1) — every ENABLED entry
+           in ``config.git.offline_lane_commands`` (empty by default, so this
+           leg is a no-op for reify), each run once via :attr:`command_runner`
+           and, on red, handled by the SAME :meth:`_handle_red_run` engine as
+           the numeric/infra legs (INV-5: no new mechanism). Its per-command
+           confirm seam (:attr:`command_confirmation_runner`) is bound into
+           :meth:`_handle_red_run`'s ``confirmation_runner`` contract, and the
+           filed fix task's priority is ``LaneCommand.fix_task_priority`` (via
+           the ``priority`` kwarg). Disabled entries are skipped.
 
-        Both sub-runs are logged (the run record). ``_last_green_head``
+        All executed sub-runs are logged (the run record). ``_last_green_head``
         advances only when ALL EXECUTED sub-runs passed at this head — the
-        last-both-green head is a sound (if sometimes wider) lower bound for
-        either sub-run's suspect range (see :meth:`_suspect_range`). When
-        infra is disabled, the infra leg is vacuously green, so numeric-only
-        semantics are unchanged. Never a gate (C7): a red infra result files
-        a normal queued fix task — it never blocks the merge queue.
+        last-all-green head is a sound (if sometimes wider) lower bound for any
+        sub-run's suspect range (see :meth:`_suspect_range`). A disabled leg
+        (infra off, numeric off, or a disabled/absent generic command) is
+        vacuously green, so numeric-only semantics are unchanged. Never a gate
+        (C7): a red result — numeric, infra, or generic — files a normal queued
+        fix task, never blocking the merge queue. A raising red-handling leg
+        (any kind) propagates before ``_last_run_head`` advances, so run()'s
+        poll backstop retries the still-outstanding head (fail-open, unchanged).
         """
         self._dirty = False
         head = await self.git_ops.get_main_sha()
@@ -448,16 +502,18 @@ class OfflineLaneWorker:
         wt = await self.git_ops.reset_persistent_offline_deep_worktree(head)
         threads = self.config.git.offline_lane_test_threads
 
-        start = time.monotonic()
-        rc, _tail = await self.suite_runner(wt, head, threads)
-        duration = time.monotonic() - start
-        logger.info(
-            'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
-            head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
-        )
-        numeric_green = rc == 0
-        if not numeric_green:
-            await self._handle_red_run(wt, head)
+        numeric_green = True
+        if self.config.git.offline_lane_legacy_numeric_enabled:
+            start = time.monotonic()
+            rc, _tail = await self.suite_runner(wt, head, threads)
+            duration = time.monotonic() - start
+            logger.info(
+                'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
+                head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+            )
+            numeric_green = rc == 0
+            if not numeric_green:
+                await self._handle_red_run(wt, head)
 
         infra_green = True
         if self.config.git.offline_lane_infra_enabled:
@@ -474,14 +530,46 @@ class OfflineLaneWorker:
                     wt, head, confirmation_runner=self.infra_confirmation_runner,
                 )
 
-        # Advance ONLY after both red-handling legs and the infra sub-run have
-        # completed without raising (task 2016, Bug #2 fix). A raise from any
-        # leg propagates out of _run_once BEFORE this line runs, so
-        # _last_run_head stays at its prior value and run()'s poll backstop
-        # (head != self._last_run_head) re-flags this head for retry on the
-        # next poll tick — see run()'s docstring "Fail-open" section.
+        # 3. GENERIC per-project command sub-runs (task 2789, D1): every
+        # ENABLED entry in config.git.offline_lane_commands, each run once at
+        # this same snapshot head in the same worktree via command_runner. On
+        # red, the entire β3 confirm→fingerprint→file/update→escalate engine is
+        # reused via _handle_red_run — the per-command confirm seam is bound
+        # into its (wt, head) confirmation_runner contract, and the filed fix
+        # task's priority comes from LaneCommand.fix_task_priority (INV-5: no
+        # new mechanism). cmd is bound per-iteration into the confirm closure
+        # (the IIFE) to avoid the late-binding-closure bug.
+        generic_green = True
+        for cmd in self.config.git.offline_lane_commands:
+            if not cmd.enabled:
+                continue
+            start = time.monotonic()
+            rc, _tail = await self.command_runner(cmd, wt, head)
+            duration = time.monotonic() - start
+            logger.info(
+                'offline-lane: %s sub-run head=%s status=%s duration=%.1fs',
+                cmd.name, head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+            )
+            if rc != 0:
+                generic_green = False
+                await self._handle_red_run(
+                    wt, head,
+                    confirmation_runner=(
+                        lambda c: (lambda w, h: self.command_confirmation_runner(c, w, h))
+                    )(cmd),
+                    priority=cmd.fix_task_priority,
+                )
+
+        # Advance ONLY after every red-handling leg (numeric, infra, and each
+        # generic command) and every sub-run have completed without raising
+        # (task 2016, Bug #2 fix). A raise from any leg — including a generic
+        # command's red-handling leg — propagates out of _run_once BEFORE this
+        # line runs, so _last_run_head stays at its prior value and run()'s poll
+        # backstop (head != self._last_run_head) re-flags this head for retry on
+        # the next poll tick — see run()'s docstring "Fail-open" section (the
+        # fail-open contract is unchanged for the generic legs).
         self._last_run_head = head
-        if numeric_green and infra_green:
+        if numeric_green and infra_green and generic_green:
             self._last_green_head = head
 
     # ------------------------------------------------------------------
@@ -490,7 +578,9 @@ class OfflineLaneWorker:
     # ------------------------------------------------------------------
 
     async def _handle_red_run(
-        self, wt: Path, head: str, *, confirmation_runner: ConfirmationRunner | None = None,
+        self, wt: Path, head: str, *,
+        confirmation_runner: ConfirmationRunner | None = None,
+        priority: str = 'high',
     ) -> None:
         """Handle a confirmed-red ``_run_once`` pass: confirm, fingerprint, file/update.
 
@@ -516,6 +606,14 @@ class OfflineLaneWorker:
         escalation — is content-agnostic and unchanged, so infra
         test-file-names dedup exactly like numeric test IDs (IE-D1/§6): no
         new dedup mechanism.
+
+        The optional *priority* kwarg (task 2789, D3) is threaded to
+        :meth:`_file_new_fix_task` so a generic per-project command red path
+        files its fix task at ``LaneCommand.fix_task_priority``; it defaults
+        to ``'high'`` so the legacy numeric/infra call sites stay
+        byte-identical. It applies only when a NEW fingerprint is filed — an
+        already-open fingerprint appends a suspect range and its priority was
+        fixed at file time (:meth:`_update_existing_fix_task` unchanged).
         """
         runner = confirmation_runner if confirmation_runner is not None else self.confirmation_runner
         confirmed = await runner(wt, head)
@@ -534,7 +632,7 @@ class OfflineLaneWorker:
         if fp in self.open_fix_tasks:
             await self._update_existing_fix_task(fp, head)
         else:
-            await self._file_new_fix_task(fp, confirmed, head)
+            await self._file_new_fix_task(fp, confirmed, head, priority)
 
     def _suspect_range(self, head: str) -> str:
         """Cheapest sound over-approximation of the commits that could have
@@ -545,7 +643,9 @@ class OfflineLaneWorker:
             return f'{self._last_green_head}..{head}'
         return head
 
-    async def _file_new_fix_task(self, fp: str, confirmed: list[str], head: str) -> None:
+    async def _file_new_fix_task(
+        self, fp: str, confirmed: list[str], head: str, priority: str = 'high',
+    ) -> None:
         """File a NEW dedup'd fix task for a confirmed-red failing-test set (B4).
 
         Builds the ``submit_task`` argument block via
@@ -567,12 +667,16 @@ class OfflineLaneWorker:
         meaningless INFO escalation with ``task_id=''``. So an empty id is
         logged and treated the same as the unwired-client degrade: no state
         recorded, no escalation, safe to retry on the next red advance.
+
+        *priority* (task 2789, D3) is the filed task's priority, defaulting to
+        ``'high'`` so the legacy numeric/infra call sites stay byte-identical;
+        a generic per-project command passes its ``LaneCommand.fix_task_priority``.
         """
         from orchestrator.workflow import build_offline_lane_fix_task_arguments
 
         suspect = self._suspect_range(head)
         arguments = build_offline_lane_fix_task_arguments(
-            confirmed, suspect, fp, self.config.project_root, head,
+            confirmed, suspect, fp, self.config.project_root, head, priority,
         )
         if self.task_client is None:
             logger.info(
@@ -951,3 +1055,98 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         text = (stdout or b'').decode(errors='replace')
         return _parse_infra_failures(text)
+
+    async def _default_run_command(
+        self, cmd: LaneCommand, wt_path: Path, head: str,
+    ) -> tuple[int, str]:
+        """Default ``command_runner`` seam — runs a generic per-project command (task 2789).
+
+        Launches ``cmd.command`` (a shell string) via ``sh -c`` at idle
+        nice/ionice (``nice_prefix('background')`` = ``nice -n 19 ionice -c3``)
+        in ``<wt_path>/<cmd.cwd>``, with ``DF_VERIFY_ROLE=offline`` overlaid
+        onto a full ``os.environ`` copy — mirroring :meth:`_default_run_suite`.
+
+        D4: a bare ``pytest`` does not self-nice (unlike the reify scripts, for
+        which ``nice_prefix('offline')`` returns ``[]``), so the generic runner
+        applies the idle-class prefix itself. ``sh -c`` is needed because
+        ``command`` is a shell string. ``head`` is accepted for seam-signature
+        symmetry with injected runners; the worktree is already checked out to
+        it by :meth:`_run_once`. Returns the return code and the decoded,
+        2000-char output tail (stdout+stderr interleaved).
+        """
+        run_cwd = wt_path / cmd.cwd
+        argv = [*nice_prefix('background'), 'sh', '-c', cmd.command]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(run_cwd),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        return proc.returncode or 0, tail
+
+    async def _default_confirm_command(
+        self, cmd: LaneCommand, wt_path: Path, head: str,
+    ) -> list[str]:
+        """Default ``command_confirmation_runner`` seam — serial confirm re-run (task 2789).
+
+        Reuses the reify-side confirm primitives named by the PRD (sec 5):
+        :func:`~orchestrator.verify._serial_pytest_str` rewrites ``cmd.command``
+        to run serial (appends ``-p no:xdist -o addopts=``), falling back to
+        the raw command when it is not a pytest invocation; the command is
+        launched exactly like :meth:`_default_run_command` (idle nice/ionice
+        ``sh -c`` in ``<wt_path>/<cmd.cwd>``, ``DF_VERIFY_ROLE=offline``); and
+        :func:`~orchestrator.verify._extract_failing_test_ids` extracts the
+        still-failing pytest node-ids from the FULL captured stdout (not the
+        2000-char tail — so no failure line is truncated before extraction).
+
+        This default path is PYTEST-ORIENTED: node-id extraction only
+        recognizes pytest ``FAILED``/``ERROR`` lines. When no node-ids parse,
+        the exit code disambiguates (loud-over-silent / no-silent-fail-soft
+        norm): rc == 0 means the command reproduced GREEN — a real flake (B6),
+        so an empty list is returned and :meth:`_handle_red_run` files no task;
+        rc != 0 means the command reproduced RED but emitted no parseable
+        node-id (a non-pytest command like ``make check``/``cargo test``, or a
+        pytest crash), so a stable ``<cmd.name>::nonzero-exit`` sentinel is
+        returned instead of ``[]`` — the red is filed/escalated rather than
+        silently swallowed as a flake. A project wanting richer per-failure
+        dedup for a non-pytest command injects its own
+        ``command_confirmation_runner``. Both helpers are imported lazily to
+        avoid an ``offline_lane`` <-> ``verify`` import cycle (mirrors the
+        existing lazy ``workflow`` import in :meth:`_handle_red_run`).
+        """
+        from orchestrator.verify import _extract_failing_test_ids, _serial_pytest_str
+
+        run_cwd = wt_path / cmd.cwd
+        serial_command = _serial_pytest_str(cmd.command) or cmd.command
+        argv = [*nice_prefix('background'), 'sh', '-c', serial_command]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(run_cwd),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        text = (stdout or b'').decode(errors='replace')
+        ids = _extract_failing_test_ids(text)
+        if ids:
+            return ids
+        # No pytest node-ids parsed from the serial re-run. Disambiguate a
+        # genuine flake from a genuinely-red-but-unparseable command by the
+        # exit code (loud-over-silent / no-silent-fail-soft norm):
+        #   rc == 0 -> reproduced GREEN -> a real flake -> [] (no task filed).
+        #   rc != 0 -> reproduced RED but emitted no FAILED/ERROR node-id (a
+        #     non-pytest command like `make check`/`cargo test`, or a pytest
+        #     crash) -> DO NOT swallow it as a flake. Return a stable,
+        #     cmd.name-keyed sentinel so _handle_red_run still fingerprints,
+        #     files a dedup'd fix task, and stages to L2. Keyed on cmd.name
+        #     alone (not rc or an output hash) so repeated reds of the same
+        #     command dedup to one open fix task and stall->L2 cleanly.
+        if (proc.returncode or 0) != 0:
+            return [f'{cmd.name}::nonzero-exit']
+        return []

@@ -1297,6 +1297,64 @@ class CpuGovernConfig(BaseModel):
 TASK_META_DIRNAME: str = '.task-meta'
 
 
+class LaneCommand(BaseModel):
+    """A single per-project offline-lane generic command entry (task 2789).
+
+    Drives one generic offline-lane sub-run: the runner launches ``command``
+    (a shell string, via ``sh -c``) at idle nice/ionice in ``<worktree>/<cwd>``
+    with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
+    current ``main`` head. A red result routes through the existing
+    ``OfflineLaneWorker`` red path (confirm → fingerprint → dedup'd fix task →
+    staged L2), filing the fix task at ``fix_task_priority`` — no new mechanism
+    (INV-5). This generalizes the previously reify-hard-coded run seams to
+    per-project config (PRD plans/integration-test-lane-prd.md, task alpha).
+    """
+
+    name: str = Field(
+        description=(
+            'Short, stable identifier for this sub-run, used in the '
+            "``offline-lane: <name> sub-run ...`` log line. Required."
+        ),
+    )
+    command: str = Field(
+        description=(
+            'Shell command string launched via ``sh -c`` for this sub-run '
+            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
+            'confirm/dedup path is pytest-oriented — it serializes via '
+            '``_serial_pytest_str`` and extracts still-failing pytest '
+            'node-ids. A non-pytest command that reproduces red (non-zero '
+            'exit, no parseable node-ids) is filed under a stable '
+            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
+            'a flake; inject a custom ``command_confirmation_runner`` for '
+            'richer per-failure dedup.'
+        ),
+    )
+    cwd: str = Field(
+        default='.',
+        description=(
+            "Working directory for the command, relative to the reset "
+            "``_offline-deep`` worktree root. Defaults to '.' (the worktree "
+            'root == project_root inside the worktree); a static string, since '
+            'a pydantic default cannot reference the runtime project_root.'
+        ),
+    )
+    fix_task_priority: Literal['low', 'medium', 'high'] = Field(
+        default='medium',
+        description=(
+            'Priority for the fix task auto-filed when this sub-run is '
+            "confirmed red. Defaults to 'medium' (the generic per-project "
+            "default; the legacy reify numeric/infra seams stay 'high')."
+        ),
+    )
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'When False this command is skipped by the offline-lane runner '
+            '(a config-only off switch that leaves the entry in place).'
+        ),
+    )
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -1510,6 +1568,28 @@ class GitConfig(BaseModel):
             '§11.3 / C4) tolerates before promoting its filed fix task to a '
             'born-at-L2 escalate_blocker. Not frozen — retunable via '
             'orchestrator.yaml without a code change.'
+        ),
+    )
+    offline_lane_commands: list[LaneCommand] = Field(
+        default_factory=list,
+        description=(
+            'Per-project generic offline-lane commands (task 2789). Each '
+            'entry drives one additional offline-lane sub-run — launched at '
+            'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
+            '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
+            'head — that reuses the existing red path (confirm → dedup fix '
+            'task → staged L2). Generic commands run IN ADDITION to whichever '
+            'legacy seams (numeric / infra) are enabled. Defaults to [] '
+            '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
+            'shared mutable default across model instances.'
+        ),
+    )
+    offline_lane_legacy_numeric_enabled: bool = Field(
+        default=True,
+        description=(
+            'D2 gate: when True the legacy unconditional numeric '
+            'run-offline-deep.sh sub-run fires; projects without that script '
+            'set False; default True keeps reify byte-identical.'
         ),
     )
     persistent_merge_worktree_safety_valve_every_n: int = Field(
@@ -4234,6 +4314,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # Generic per-project offline-lane commands + legacy-numeric gate (task
+        # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
+        # so the command list, per-command priorities, and the legacy-numeric
+        # toggle hot-reload cleanly. offline_lane_commands is a whole
+        # list[LaneCommand] leaf compared by equality (like routing.rules).
+        # The offline_lane_enabled START gate stays restart-only (unchanged).
+        'git.offline_lane_commands',
+        'git.offline_lane_legacy_numeric_enabled',
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate
