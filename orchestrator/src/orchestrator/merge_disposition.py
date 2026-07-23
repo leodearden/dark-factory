@@ -45,6 +45,9 @@ Invariants (see the task-2381 plan / merge-skew-attribution-prd.md):
        classification after a fleet redeploy. Reading across runs keeps the
        durable prior-run green visible (any-prior-green semantics unchanged;
        result set bounded by the task_id filter).
+  I7 — INTEGRATION_SKEW additionally requires evidence.failing_tests
+       non-empty; a guard/ratchet failure parsing zero failing-test ids
+       degrades to INDETERMINATE (task 2871).
 
 This module is intentionally self-contained (task 2381 α scope): it defines
 the classifier, its data types, and private helpers only. Wiring into the
@@ -439,6 +442,9 @@ async def classify_merge_failure_disposition(
            reference frame (see ``_implicated_landings``). *main_sha* stays the
            frozen dispatch-time input (2357 untouched); *real_main_head_sha* is
            a distinct, additional input used only for the ancestor filter.
+      I7 — INTEGRATION_SKEW additionally requires evidence.failing_tests
+           non-empty; a guard/ratchet failure parsing zero failing-test ids
+           degrades to INDETERMINATE (task 2871).
 
     Args:
         verify_result: the failing VerifyResult from the branch's merge-time verify.
@@ -509,7 +515,23 @@ async def classify_merge_failure_disposition(
         # Absent green (None, e.g. a first-attempt skew or a non-orchestrator
         # submit path) or a failed green (False) degrades to the honest
         # INDETERMINATE — never a fabricated skew.
-        if _branch_pre_merge_verify_green(event_store, task_id) is True:
+        #
+        # I7 (task 2871, reify esc-5053-13 & esc-5056-11): additionally
+        # require a parsed failing-test id. A harness-ratchet / shell-guard
+        # failure (kLOC cap, baseline-manifest grandfathering, other
+        # tests/infra/*.sh guards) emits guard text that matches neither
+        # _PYTEST_FAILED_ID_RE nor _RUST_FAILED_ID_RE, so its only "evidence"
+        # is a spurious file-token overlap on the runner (run_all.sh /
+        # verify.sh) or the guard's own artifact — causally irrelevant even
+        # when the implicated landing is a genuine real-main ancestor (2869's
+        # I6 filter therefore cannot prune it). An empty failing_tests here
+        # degrades to the honest INDETERMINATE (never a fabricated skew
+        # steering the debugger off its own diff); NOT BRANCH_BUG, because
+        # the class's true cause is heterogeneous across the census (own-diff
+        # for 5053/5056 vs main-red for 5288/5266) and BRANCH_BUG would both
+        # mislabel the main-red instances and emit a misleading merge_attempt
+        # disposition row.
+        if failing_tests and _branch_pre_merge_verify_green(event_store, task_id) is True:
             return (
                 MergeFailureDisposition.INTEGRATION_SKEW,
                 SkewEvidence(
