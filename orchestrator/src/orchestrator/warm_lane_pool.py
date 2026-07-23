@@ -204,7 +204,13 @@ class WarmLanePool:
             for br in to_drop:
                 del self._assignments[br]
 
-    async def acquire_for(self, branch_name: str) -> tuple[Path, bool] | None:
+    async def acquire_for(
+        self,
+        branch_name: str,
+        *,
+        title: str | None = None,
+        branch: str | None = None,
+    ) -> tuple[Path, bool] | None:
         """Acquire a lane for *branch_name*, reusing the existing one if mapped.
 
         Returns:
@@ -213,20 +219,40 @@ class WarmLanePool:
             or False for a fresh allocation.  Returns ``None`` if *branch_name*
             has no existing mapping AND no FREE lane is available (exhaustion).
 
-        Thread/coroutine-safe: runs under the pool lock.
+        On a FRESH allocation (``reused is False``) and when a ``LaneLifecycle``
+        is wired, the durable ASSIGNED record is written through at the SAME
+        moment the in-memory state flips (single-writer coherence, PRD
+        warm-lane-exhaustion-hardening W2b I1 / boundary row 1). The REUSE
+        branch does NOT re-write: the record is already ``ASSIGNED:branch_name``
+        (``note_assigned`` would no-op anyway). ``title``/``branch`` are
+        carry-forward hints threaded from GitOps so the durable record keeps
+        its task_id/title/branch (used by the GitOps acquire consolidation).
+
+        Thread/coroutine-safe: the in-memory mutation runs under the pool lock;
+        the durable write-through is issued AFTER the lock is released. There is
+        NO ``await`` between the in-memory flip and the synchronous durable
+        write, so on the single asyncio loop no other coroutine can interleave
+        (same coherence rationale as ``note_assignment``/``restore_assignment``),
+        and the blocking file I/O never runs inside the lock.
         """
         async with self._lock:
             # Reuse: if this branch is already mapped, return the same lane.
             if branch_name in self._assignments:
                 return self._assignments[branch_name], True
             # Fresh: find the first FREE lane.
+            fresh_lane: Path | None = None
             for lane, state in self._lanes.items():
                 if state == LaneState.FREE:
                     self._lanes[lane] = LaneState.ASSIGNED
                     self._assignments[branch_name] = lane
-                    return lane, False
-            # Exhausted
-            return None
+                    fresh_lane = lane
+                    break
+            if fresh_lane is None:
+                # Exhausted
+                return None
+        # Durable write-through for the FRESH allocation, outside the lock.
+        self._note_assigned_durable(branch_name, fresh_lane, title=title, branch=branch)
+        return fresh_lane, False
 
     async def reclaim_victim(
         self,
@@ -447,43 +473,59 @@ class WarmLanePool:
         self._assignments[task_id] = matched
         self._note_assigned_durable(task_id, matched)
 
-    def _note_assigned_durable(self, task_id: str, lane: Path) -> None:
-        """Best-effort durable-record mirror for ``restore_assignment``/
-        ``note_assignment`` (PRD dec.3, I1: record ↔ cache never drift).
+    def _note_assigned_durable(
+        self,
+        task_id: str,
+        lane: Path,
+        *,
+        title: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        """Best-effort durable-record mirror for the single-writer ASSIGNED
+        write (PRD dec.3, I1: record ↔ cache never drift).
+
+        Called from ``acquire_for`` (fresh alloc), ``reclaim_victim`` (thief),
+        ``restore_assignment`` and ``note_assignment`` — the pool is the SOLE
+        writer of the durable ASSIGNED record (PRD warm-lane-exhaustion-
+        hardening W2b I2).
 
         No-op when no ``LaneLifecycle`` is wired (``self._lane_lifecycle is
         None``) — the pool then stays a pure in-memory cache, byte-identical
         to its pre-record-routing behavior.
 
         *task_id* is forwarded to ``LaneLifecycle.note_assigned`` as
-        ``task_id`` unchanged.  Every current caller — GitOps's disk-backstop
-        reuse in ``acquire_warm_lane`` and Harness's crash-recovery restore —
-        passes a bare task id (e.g. ``'42'``, matched against plan.json's
-        ``task_id`` field), never a real ``task/<id>`` branch string.
-        ``branch`` is deliberately omitted (left at ``note_assigned``'s
-        default ``None``) so any real branch already on the durable record is
-        carried forward untouched. A future caller must NOT pass a real
+        ``task_id`` unchanged.  Callers that only have a bare task id on hand
+        (e.g. GitOps's disk-backstop reuse and Harness's crash-recovery
+        restore) pass a bare task id (e.g. ``'42'``, matched against
+        plan.json's ``task_id`` field), never a real ``task/<id>`` branch
+        string.  ``title``/``branch`` are optional carry-forward hints: when
+        supplied (GitOps threads ``expected_title``/``full_branch`` from its
+        acquire so the durable record keeps its title/branch) they overwrite
+        the corresponding record field; when left ``None`` any value already on
+        the durable record is carried forward untouched (``note_assigned``'s
+        carry-forward-not-clobber contract). A caller must NOT pass a real
         branch string as *task_id* — it would land in and corrupt the durable
         record's ``task_id`` field.
 
-        Both failure modes below are best-effort: the caller already decided
-        to pin *task_id* in the in-memory cache (crash recovery /
-        reconciliation), and this mirror must never crash or block that
-        decision.
+        Both failure modes below are best-effort: the caller already flipped
+        the in-memory cache (acquire/reclaim/crash-recovery), and this mirror
+        must never crash or block that decision (I3: acquire/release always
+        succeed).
         - ``IllegalLaneTransition``: the durable record conflicts (e.g. the
           lane is durably ``ASSIGNED``/``IN_USE`` for a DIFFERENT task, or
           ``QUARANTINED``) — logged and swallowed rather than stealing the
           record (mirrors ``note_assigned``'s own never-steal contract).
         - ``OSError``: the durable write itself failed (disk full, EACCES,
-          read-only mount) — logged and swallowed so a transient I/O error
-          degrades to cache-only instead of propagating out of
-          ``restore_assignment``/``note_assignment`` and aborting an entire
-          crash-recovery pass over every remaining lane.
+          read-only mount, ``.lane-state`` unwritable) — logged and swallowed
+          so a transient I/O error degrades to cache-only instead of
+          propagating out of the caller.
         """
         if self._lane_lifecycle is None:
             return
         try:
-            self._lane_lifecycle.note_assigned(lane, task_id=task_id)
+            self._lane_lifecycle.note_assigned(
+                lane, task_id=task_id, title=title, branch=branch,
+            )
         except (IllegalLaneTransition, OSError):
             logger.warning(
                 'warm_lane_pool: durable record mirror for lane %s failed '
