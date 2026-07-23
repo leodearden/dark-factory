@@ -14698,15 +14698,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # (task ο).
                 not item.speculative
                 and not isinstance(req, GroupMergeRequest)
-            ):
                 # Mechanism 2: check staleness at pickup for non-speculative items.
                 # Reuse the INV-3 dead-base re-check's already-fetched main SHA
                 # (_dispatch_main, step-8) — one get_main_sha per dispatch, not
                 # two.  A fail-open empty read (a git error at that fetch) SKIPS
                 # this staleness check and dispatches as-is, rather than spuriously
                 # remerging against '' (base_sha != '' is always True).
-                if _dispatch_main and item.base_sha != _dispatch_main:
-                    remerge_reason = 'main_advanced'
+                and _dispatch_main
+                and item.base_sha != _dispatch_main
+            ):
+                remerge_reason = 'main_advanced'
 
             if remerge_reason is not None:
                 iteration_did_remerge = True

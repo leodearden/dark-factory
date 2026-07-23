@@ -28,18 +28,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.event_store import EventType
-from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
-from orchestrator.merge_queue import (
-    DecidedItem,
-    InflightEntry,
-    InflightVerifyResult,
-    MergeOutcome,
-    RealMergeItem,
-)
-from orchestrator.verify_runner import HostLease
-
 # Bare sibling-import of the pure builders (no tests/__init__.py — tests dir is
 # on sys.path; mirrors test_concurrent_verify_boundary importing from
 # test_merge_queue_concurrent_verify).
@@ -51,6 +39,18 @@ from test_merge_queue_two_layer_integration import (
 )
 from test_merge_queue_verify_base_invariant import _fake_local_allocator
 from test_merge_speculation import _LateArrivalFakeEventStore
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
+from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
+from orchestrator.merge_queue import (
+    DecidedItem,
+    InflightEntry,
+    InflightVerifyResult,
+    MergeOutcome,
+    RealMergeItem,
+)
+from orchestrator.verify_runner import HostLease
 
 # ── Fixtures (mirrored from test_merge_queue_verify_base_invariant.py) ────────
 
@@ -329,7 +329,7 @@ class TestAdoptionPassVoid:
         # CAS loop; MAX_CAS_RETRIES=0 makes that exit immediately (no real advance
         # — advance_main is mocked to cas_failed) so the RED assertions below fail
         # cleanly rather than looping.
-        worker.MAX_CAS_RETRIES = 0
+        worker.MAX_CAS_RETRIES = 0  # type: ignore[assignment]
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
         worker._event_store = _LateArrivalFakeEventStore()
@@ -372,10 +372,10 @@ class TestAdoptionPassVoid:
         # and after the PASS-branch void is wired (a non-regression guard).
         _, item = await _make_merged_item(git_ops, config, 'task/deep-pass', 'dp.py', 'd=3\n')
         item = dataclasses.replace(item, base_sha=_LIVE_DEEP)
-        req = item.request
 
         worker = _make_worker(git_ops)
-        worker.MAX_CAS_RETRIES = 0  # exit the CAS fast; we only assert the void branch is SKIPPED
+        # Exit the CAS fast; we only assert the void branch is SKIPPED.
+        worker.MAX_CAS_RETRIES = 0  # type: ignore[assignment]
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
         worker._event_store = _LateArrivalFakeEventStore()
