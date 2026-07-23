@@ -111,6 +111,8 @@ class _Scaffold:
     plan_target: Path
     uv_cache: Path
     uv_data: Path
+    claude_fleet: Path
+    settings_json: Path
 
 
 def _run_sandboxed(
@@ -182,9 +184,16 @@ def landlock_matrix_scaffold():
     ``<worktree>/.task/plan.json`` symlink into ``<base>/.task-meta/<name>/
     plan.json`` (the target itself is left ABSENT — row 7's child write is
     what creates it, mirroring ``TaskArtifacts.ensure_lane_plan_symlink``'s
-    real production symlink shape); and ``~/.local/share/uv/`` pre-created
+    real production symlink shape); ``~/.local/share/uv/`` pre-created
     as an empty, non-writable-by-contract sibling of the (writable)
-    ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT.
+    ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT;
+    ``~/.claude/fleet/`` pre-created so the ``claude_fleet`` carve-out is
+    grantable at wrap time (row 10 — an absent fleet/ dir would make
+    landlock_exec's ``_add_path`` skip the grant and wrongly deny); and
+    ``~/.claude/settings.json`` seeded with known JSON content (row 9 — a
+    file directly under ``~/.claude/`` rather than under the ``fleet/``
+    carve-out, so the write is denied and the seed content lets the test
+    assert it stayed byte-unchanged).
 
     Built under ``/var/tmp`` (never ``/tmp`` — see module docstring) via
     ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
@@ -233,6 +242,18 @@ def landlock_matrix_scaffold():
         uv_data = home / '.local' / 'share' / 'uv'
         uv_data.mkdir(parents=True)
 
+        # Row 10: ~/.claude/fleet/ must already EXIST at wrap time — landlock_
+        # exec's _add_path skips granting a non-existent writable dir, which
+        # would silently turn this happy-path row into a wrongful denial.
+        claude_fleet = home / '.claude' / 'fleet'
+        claude_fleet.mkdir(parents=True)
+        # Row 9: ~/.claude/settings.json is a file directly under ~/.claude/
+        # (NOT under the fleet/ carve-out), so it is outside the write set —
+        # seeded with known content so the test can assert it stays
+        # byte-unchanged after the denied write.
+        settings_json = home / '.claude' / 'settings.json'
+        settings_json.write_text(json.dumps({'orig': True}))
+
         # One staged change so a row's `git commit` has something to
         # commit (rows 2/12 — each test gets its own fresh scaffold
         # instance, function-scoped, so there is no cross-row contention
@@ -256,6 +277,7 @@ def landlock_matrix_scaffold():
             sibling_worktree=sibling_worktree, other_task_meta=other_task_meta,
             plan_symlink=plan_symlink, plan_target=plan_target,
             uv_cache=uv_cache, uv_data=uv_data,
+            claude_fleet=claude_fleet, settings_json=settings_json,
         )
     finally:
         shutil.rmtree(base, ignore_errors=True)
