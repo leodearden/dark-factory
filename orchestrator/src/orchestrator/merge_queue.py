@@ -2940,6 +2940,80 @@ async def resolve_attach_action(
     return decide_attach_action(relation, verifying=verifying)
 
 
+# Structured reject code surfaced by the merge_request MCP tool when a NEWER
+# SHA is submitted for a branch whose EARLIER SHA is already in verify
+# (PRD merge-worktree-lifecycle-integrity §5 D3).  Consumed by the escalation
+# server's merge_request handler to build the {error, code, …} envelope.
+_C3_DUPLICATE_IN_VERIFY_CODE = 'duplicate_in_verify'
+
+
+class C3SubmitAction(Enum):
+    """Action for the SHA-sensitive merge_request submit gate (PRD §4 C3 / §5 D1-D3).
+
+    Computed by the pure :func:`decide_c3_submit_action` from a *resolved*
+    :class:`TipRelation` (DIVERGENT already folded to SUBSET/SUPERSET via
+    :func:`resolve_divergent`) and the current ``verifying`` signal.
+
+    Values:
+    - COALESCE: same SHA (SAME) or the new tip is contained in the in-flight
+      snapshot (SUBSET — stale retry or patch-id-equivalent rebased twin) —
+      attach to the existing work item; never a second dispatch (D1).
+    - REPLACE: new tip is a strict superset of a QUEUED (verify-not-started)
+      in-flight snapshot — drop the old entry, clean its scratch, dispatch
+      fresh (D2).
+    - REJECT: new tip is a strict superset of an IN-VERIFY in-flight snapshot —
+      structured ``duplicate_in_verify`` reject; the caller must merge_cancel
+      then resubmit (D3).
+    """
+
+    COALESCE = 'coalesce'
+    REPLACE = 'replace'
+    REJECT = 'reject'
+
+
+def decide_c3_submit_action(
+    relation: TipRelation,
+    *,
+    verifying: bool,
+) -> C3SubmitAction:
+    """Return the C3 submit-gate action for *relation* given the *verifying* flag.
+
+    Pure function (no git I/O) — maps the PRD §4 C3 / §5 D1-D3 table exactly:
+
+    +------------------+------------------+------------------+
+    | relation         | verifying=False  | verifying=True   |
+    +==================+==================+==================+
+    | SAME             | COALESCE         | COALESCE         |
+    +------------------+------------------+------------------+
+    | SUBSET           | COALESCE         | COALESCE         |
+    +------------------+------------------+------------------+
+    | SUPERSET         | REPLACE          | REJECT           |
+    +------------------+------------------+------------------+
+    | DIVERGENT        | ValueError       | ValueError       |
+    +------------------+------------------+------------------+
+
+    SAME/SUBSET always COALESCE (D1: same SHA never rejects/replaces even mid-
+    verify; SUBSET covers stale retries and patch-id-equivalent rebased twins).
+    SUPERSET REPLACEs when the in-flight merge is still QUEUED and REJECTs when
+    it is already IN VERIFY (mid-verify teardown is the exact failure C3 fixes).
+
+    DIVERGENT must be resolved via :func:`resolve_divergent` before calling this
+    function; it raises :class:`ValueError` otherwise to enforce the "patch-id
+    compare first" contract (mirrors :func:`decide_attach_action`).
+    """
+    if relation is TipRelation.SAME:
+        return C3SubmitAction.COALESCE
+    if relation is TipRelation.SUBSET:
+        return C3SubmitAction.COALESCE
+    if relation is TipRelation.SUPERSET:
+        return C3SubmitAction.REJECT if verifying else C3SubmitAction.REPLACE
+    # TipRelation.DIVERGENT
+    raise ValueError(
+        'DIVERGENT must be resolved via resolve_divergent() first before '
+        'decide_c3_submit_action() can map it to a C3SubmitAction.'
+    )
+
+
 async def _resolve_commit_tree(git_ops: GitOps, commit: str) -> str | None:
     """Return the tree SHA for *commit* (``git rev-parse <commit>^{tree}``).
 
@@ -3696,6 +3770,7 @@ class _FindInflightWorktreeP(Protocol):
 
     async def find_inflight_merge_worktree(self, branch: str) -> Path | None: ...
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None: ...
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str: ...
 
 
 def _inflight_entry_is_stale(
