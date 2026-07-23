@@ -39,6 +39,7 @@ from orchestrator.scheduler import (
     SchedulerCallbacks,
     TickContext,
     _build_delivered_check_escalation,
+    _delivered_checks_descriptor_digest,
 )
 
 # ---------------------------------------------------------------------------
@@ -1184,6 +1185,114 @@ class TestNoteDeliveredHold:
         # The event, unlike the log, is unaffected — still fires every tick.
         assert scheduler._streak_delivered_hold.value('T') == 3
         assert len(self._held_events(scheduler)) == 3
+
+
+# ---------------------------------------------------------------------------
+# TestDeliveredChecksDescriptorDigest (task 2975 — step-1 RED / step-2 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveredChecksDescriptorDigest:
+    """``_delivered_checks_descriptor_digest`` — the pure canonical-JSON
+    sha256 helper that lets :meth:`Scheduler._compute_delivered_check_cache`
+    fold a descriptor digest into its cache key (task 2975), so correcting a
+    dep's ``metadata.delivered_checks`` at a FIXED main SHA is a cache MISS
+    (re-evaluate) instead of continuing to serve a stale cached verdict.
+    Pure function: no scheduler state, no side effects.
+    """
+
+    _ONE_CHECK = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+    # --- (a) determinism: identical input -> identical, stable digest ------
+
+    def test_identical_lists_produce_same_digest_deterministically(self):
+        checks = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        other = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+
+        digest1 = _delivered_checks_descriptor_digest(checks)
+        digest2 = _delivered_checks_descriptor_digest(other)
+        digest3 = _delivered_checks_descriptor_digest(checks)
+
+        assert isinstance(digest1, str)
+        assert len(digest1) == 64, 'expected a sha256 hex digest (64 hex chars)'
+        assert all(c in '0123456789abcdef' for c in digest1)
+        assert digest1 == digest2 == digest3, 'same descriptor content must hash identically'
+
+    # --- (b) any descriptor field change -> a DIFFERENT digest -------------
+
+    def test_changed_grep_pattern_produces_different_digest(self):
+        original = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}]
+        changed = [{'name': 'cap-one', 'kind': 'grep', 'pattern': 'bar', 'expect': 'present'}]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_paths_produces_different_digest(self):
+        original = [{
+            'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo',
+            'paths': ['src/'], 'expect': 'present',
+        }]
+        changed = [{
+            'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo',
+            'paths': ['src/', 'lib/'], 'expect': 'present',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_script_args_produces_different_digest(self):
+        original = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'bar'], 'expect': 'exit_zero',
+        }]
+        changed = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': ['--foo', 'baz'], 'expect': 'exit_zero',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    def test_changed_script_name_produces_different_digest(self):
+        original = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_thing.sh',
+            'args': [], 'expect': 'exit_zero',
+        }]
+        changed = [{
+            'name': 'cap-two', 'kind': 'script', 'script': 'scripts/check_other.sh',
+            'args': [], 'expect': 'exit_zero',
+        }]
+
+        assert _delivered_checks_descriptor_digest(original) != (
+            _delivered_checks_descriptor_digest(changed)
+        )
+
+    # --- (c) key reordering within a check dict -> the SAME digest ---------
+
+    def test_key_reorder_within_check_dict_produces_same_digest(self):
+        forward = [{'name': 'cap-one', 'pattern': 'foo', 'expect': 'present'}]
+        reordered = [{'expect': 'present', 'pattern': 'foo', 'name': 'cap-one'}]
+
+        assert _delivered_checks_descriptor_digest(forward) == (
+            _delivered_checks_descriptor_digest(reordered)
+        )
+
+    # --- (d) empty list and None both hash the same, distinct from 1 check -
+
+    def test_empty_list_and_none_produce_same_stable_digest_distinct_from_one_check(self):
+        empty_digest1 = _delivered_checks_descriptor_digest([])
+        empty_digest2 = _delivered_checks_descriptor_digest([])
+        none_digest1 = _delivered_checks_descriptor_digest(None)
+        none_digest2 = _delivered_checks_descriptor_digest(None)
+        one_check_digest = _delivered_checks_descriptor_digest(self._ONE_CHECK)
+
+        assert empty_digest1 == empty_digest2, 'empty-list digest must be stable'
+        assert none_digest1 == none_digest2, 'None digest must be stable'
+        assert empty_digest1 == none_digest1, '[] and None must normalize to the same digest'
+        assert empty_digest1 != one_check_digest
 
 
 # ---------------------------------------------------------------------------
