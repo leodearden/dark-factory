@@ -3409,6 +3409,92 @@ class TestLaneLifecycleRouting:
 
 
 # ===========================================================================
+# Task 2986 (W2b) step-1 RED: single-writer — acquire_for (fresh) writes the
+# durable ASSIGNED record through the SAME moment it flips the in-memory state
+# (PRD warm-lane-exhaustion-hardening boundary row 1). Today acquire_for only
+# mutates the in-memory _lanes/_assignments, so the durable record is left on
+# its stale (RELEASED) value — these fail until step-2.
+# ===========================================================================
+
+
+class TestAcquireForWritesThroughDurable:
+    def test_fresh_acquire_writes_assigned_record(self, tmp_path: Path):
+        """boundary row 1: acquire_for(fresh) brings the durable record to
+        ASSIGNED:branch_name at the moment it flips the in-memory state."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        # Seed the record to RELEASED (prior task 7 released the lane).
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/7')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='7')
+        lifecycle.transition(lane, DurableLaneState.RELEASED)
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Fresh acquire for a NEW task (not in the in-memory map).
+        result = asyncio.run(pool.acquire_for('42'))
+
+        assert result is not None
+        acquired, reused = result
+        assert acquired == lane
+        assert reused is False
+        # (a) in-memory map + state flipped
+        assert pool.assignment_for('42') == lane
+        assert pool.state(lane) == LaneState.ASSIGNED
+        # (b) durable record mirrored through to ASSIGNED:42
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+
+    def test_fresh_acquire_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): acquire_for writes NO durable
+        record — byte-identical to the pre-record-routing behavior."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+
+        result = asyncio.run(pool.acquire_for('42'))
+
+        assert result is not None
+        assert pool.assignment_for('42') == base / '_lane-0'
+        assert pool.state(base / '_lane-0') == LaneState.ASSIGNED
+        assert not (base / '.lane-state').exists()
+
+    def test_reuse_acquire_does_not_rewrite_record(self, tmp_path: Path):
+        """The reuse branch (branch already mapped) leaves the ASSIGNED record
+        untouched — note_assigned would no-op, and no fresh write is issued."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        first = asyncio.run(pool.acquire_for('42'))
+        assert first is not None
+        record1 = lifecycle.read(lane)
+        assert record1 is not None
+        assert record1.state == DurableLaneState.ASSIGNED
+        assert record1.task_id == '42'
+
+        # Reuse: same branch, already mapped → (same_lane, True), no re-write.
+        second = asyncio.run(pool.acquire_for('42'))
+        assert second is not None
+        lane2, reused2 = second
+        assert lane2 == lane
+        assert reused2 is True
+        record2 = lifecycle.read(lane)
+        assert record2 is not None
+        assert record2.state == DurableLaneState.ASSIGNED
+        assert record2.task_id == '42'
+        assert record2.updated_at == record1.updated_at  # no re-write
+
+
+# ===========================================================================
 # Step-6: RED — GitOps.refresh_warm_base unit + inv.9 promote-provenance
 # ===========================================================================
 
