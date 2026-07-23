@@ -775,3 +775,70 @@ async def test_b8_offline_deep_worktree_isolated_from_merge_lane(git_ops, repo):
         'the offline-deep worktree must remain a registered git worktree '
         'after a cleanup_merge_worktree no-op'
     )
+
+
+# ---------------------------------------------------------------------------
+# Incident reproduction (task 5308) — a verify.sh usage dump files NOTHING
+# ---------------------------------------------------------------------------
+
+
+# A faithful reproduction of reify scripts/verify.sh's error+usage() dump
+# (reify:5308 incident; twin of the fixture in test_offline_lane.py): an
+# em-dash ``verify.sh: ERROR — <msg>`` banner followed by the full usage()
+# block (bare ``Usage:``/``Options:`` section headers + invocation/option
+# lines). run-offline-deep.sh merges stderr into stdout, so this whole blob
+# reaches the numeric confirmation seam's parser.
+_VERIFY_USAGE_DUMP = (
+    "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
+    "\n"
+    "scripts/verify.sh — unified verification entrypoint for Reify.\n"
+    "\n"
+    "Usage:\n"
+    "  verify.sh <test|lint|typecheck|all> [options]\n"
+    "\n"
+    "Options:\n"
+    "  --scope <all|rust|gui|infra>  Restrict verification to a subsystem.\n"
+    "  --profile <fast|full|both>    Select the verification profile.\n"
+    "  -h|--help  Show usage.\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_verify_usage_dump_confirmation_files_no_task_or_escalation(git_ops, tmp_path):
+    """Incident reproduction (task 5308; reify:5264) — when the DEFAULT numeric
+    confirmation seam ingests a reify verify.sh usage/help/error dump (stderr
+    merged into stdout), the full red path files ZERO fix tasks and ZERO
+    escalations, never one fake fix task built from usage lines.
+
+    Unlike B4 (which injects a fake confirmation_runner), this leaves the
+    numeric confirmation seam at its DEFAULT so the REAL
+    ``_default_confirmation_run`` parser runs end-to-end — the reify-subprocess
+    boundary is faked one level deeper, at ``create_subprocess_exec``, which is
+    patched to emit the usage dump with returncode 64. Everything downstream of
+    the parse (the empty-``confirmed`` guard, fingerprinting, fix-task filing,
+    escalation staging) is the real ``_handle_red_run`` chain, driven directly
+    (the confirmed-list → ``_handle_red_run`` corruption flow's entry point).
+
+    RED pre-fix: the seam's inline comprehension turns every non-blank usage
+    line into a confirmed test ID, filing a fix task + an L0 info escalation.
+    """
+    worker = _build_worker(git_ops, tmp_path)  # DEFAULT confirmation seam, real queue + spy client
+    head = await git_ops.get_main_sha()
+    wt_path = git_ops.persistent_offline_deep_worktree_path
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
+    mock_proc.returncode = 64
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        await worker._handle_red_run(wt_path, head)
+
+    # Zero fix tasks filed, zero fingerprints opened.
+    cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
+    assert worker.open_fix_tasks == {}
+    # Zero escalations of ANY kind reached the real queue (no
+    # orchestrator-offline-lane info escalation either).
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []

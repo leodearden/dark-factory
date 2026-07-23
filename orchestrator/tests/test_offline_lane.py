@@ -25,7 +25,7 @@ from _orch_helpers import pydantic_spec
 from pydantic import ValidationError
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.offline_lane import OfflineLaneWorker
+from orchestrator.offline_lane import OfflineLaneWorker, _parse_confirmed_failures
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -74,6 +74,28 @@ def _make_worker(
         task_client=task_client,
         escalation_queue=escalation_queue,
     )
+
+
+# A faithful reproduction of reify scripts/verify.sh's error+usage() dump
+# (reify:5308 incident, verified against task 5264's corrupted fields): an
+# em-dash ``verify.sh: ERROR — <msg>`` banner on stderr followed by the full
+# usage() block (bare ``Usage:``/``Options:`` section headers + invocation and
+# option lines).  run-offline-deep.sh merges stderr into stdout, so this whole
+# blob reaches the numeric confirmation seam's parser.  Shared by the
+# _parse_confirmed_failures unit tests and the seam-level rejection test.
+_VERIFY_USAGE_DUMP = (
+    "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
+    "\n"
+    "scripts/verify.sh — unified verification entrypoint for Reify.\n"
+    "\n"
+    "Usage:\n"
+    "  verify.sh <test|lint|typecheck|all> [options]\n"
+    "\n"
+    "Options:\n"
+    "  --scope <all|rust|gui|infra>  Restrict verification to a subsystem.\n"
+    "  --profile <fast|full|both>    Select the verification profile.\n"
+    "  -h|--help  Show usage.\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1058,78 @@ async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
     assert confirmed == []
+
+
+@pytest.mark.asyncio
+async def test_default_confirmation_run_rejects_verify_usage_dump(tmp_path: Path):
+    """The default numeric confirmation seam rejects a reify verify.sh
+    usage/help/error dump instead of turning every usage line into a bogus
+    confirmed test ID (task 5308; reify:5264 incident).
+
+    No confirmation_runner is injected, so the real ``_default_confirmation_run``
+    seam runs; ``run-offline-deep.sh`` merges stderr into stdout, so a malformed
+    verify.sh invocation floods this seam with usage() text.
+    ``create_subprocess_exec`` is mocked to emit that dump with returncode 64
+    (verify.sh's arg-error exit).
+
+    RED: pre-fix the seam's inline comprehension yields the non-blank usage
+    lines rather than ``[]``.
+    """
+    worker = _make_worker(tmp_path)  # no confirmation_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(_VERIFY_USAGE_DUMP.encode(), b''))
+    mock_proc.returncode = 64
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_confirmed_failures helper — numeric-seam usage/help guard (task 5308)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_confirmed_failures_passes_normal_ids_through():
+    """Normal newline-separated test IDs parse through unchanged (prior behaviour)."""
+    assert _parse_confirmed_failures('tests::test_a\ntests::test_b\n') == [
+        'tests::test_a',
+        'tests::test_b',
+    ]
+
+
+def test_parse_confirmed_failures_rejects_verify_usage_dump():
+    """A faithful verify.sh ERROR+usage() dump is not a set of failing tests -> []."""
+    assert _parse_confirmed_failures(_VERIFY_USAGE_DUMP) == []
+
+
+def test_parse_confirmed_failures_rejects_bare_error_line():
+    """A lone ``verify.sh: ERROR — …`` banner (no usage block) -> []."""
+    assert _parse_confirmed_failures(
+        "verify.sh: ERROR — unknown argument '--test-threads=1'\n"
+    ) == []
+
+
+def test_parse_confirmed_failures_rejects_embedded_usage_header():
+    """A bare ``Usage:``/``Options:`` header among otherwise-plausible lines -> []."""
+    assert _parse_confirmed_failures(
+        'tests::test_a\nOptions:\ntests::test_b\n'
+    ) == []
+    assert _parse_confirmed_failures(
+        'tests::test_a\nUsage:\ntests::test_b\n'
+    ) == []
+
+
+def test_parse_confirmed_failures_empty_on_blank_input():
+    """Blank/whitespace-only input confirms nothing -> []."""
+    assert _parse_confirmed_failures('') == []
+    assert _parse_confirmed_failures('\n  \n') == []
 
 
 # ---------------------------------------------------------------------------
