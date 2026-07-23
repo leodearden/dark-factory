@@ -78,7 +78,9 @@ unlike the flag-marker sweep). It reuses only the PRODUCER's naming FACTS.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -203,3 +205,96 @@ def select_reclaimable(
         else:
             keep.append(record)
     return ReclaimDecision(keep=keep, reclaim=reclaim)
+
+
+def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
+    """Run ``git <args>`` in *cwd*, returning ``(returncode, stdout, stderr)``.
+
+    The single subprocess chokepoint used by EVERY git call in this module.
+    Forces ``LC_ALL=C`` so porcelain output is locale-stable. Best-effort +
+    never-raise: an ``OSError`` (git binary missing, *cwd* vanished, etc.) is
+    mapped to a non-zero ``(1, '', <message>)`` rather than propagated, so
+    callers can treat a failed git call fail-safe without a ``try/except``.
+    """
+    env = dict(os.environ, LC_ALL='C')
+    try:
+        proc = subprocess.run(
+            ['git', *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+    except OSError as err:
+        return 1, '', str(err)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    """Whether *path* is *root* itself or a descendant of it (band guard)."""
+    try:
+        return path == root or path.is_relative_to(root)
+    except (OSError, ValueError):
+        return False
+
+
+def list_parked_worktrees(repo: Path, parking_root: Path) -> list[ParkedWorktree]:
+    """Scan ``git worktree list --porcelain`` for parkings under *parking_root*.
+
+    Parses each porcelain record's ``worktree <path>`` and ``branch
+    refs/heads/<name>`` (``detached`` / ``bare`` records leave ``branch=None``),
+    keeps only those whose RESOLVED path is under *parking_root* (the band guard
+    — nothing outside the quarantine base is ever considered), and derives each
+    parking's ``parked_at`` from its dir basename via
+    :func:`parse_parking_dir_name`.
+
+    A parking whose basename lacks a valid trailing stamp is SKIPPED with a LOUD
+    WARNING (never guess an age). Best-effort + never-raise: a failed
+    ``git worktree list`` (or absent parking root — no worktrees under it) yields
+    ``[]`` LOUDLY rather than raising.
+    """
+    repo = Path(repo)
+    parking_root = Path(parking_root)
+
+    rc, out, err = _run_git(['worktree', 'list', '--porcelain'], cwd=repo)
+    if rc != 0:
+        logger.warning(
+            '%s `git worktree list` failed in %s (rc=%s): %s — treating as no '
+            'parkings',
+            _LOG_PREFIX,
+            repo,
+            rc,
+            err.strip(),
+        )
+        return []
+
+    try:
+        root_resolved = parking_root.resolve()
+    except OSError:
+        root_resolved = parking_root
+
+    records: list[ParkedWorktree] = []
+    for block in out.split('\n\n'):
+        path: Path | None = None
+        branch: str | None = None
+        for line in block.splitlines():
+            if line.startswith('worktree '):
+                path = Path(line[len('worktree ') :]).resolve()
+            elif line.startswith('branch '):
+                ref = line[len('branch ') :].strip()
+                head = 'refs/heads/'
+                branch = ref[len(head) :] if ref.startswith(head) else ref
+        if path is None or not _is_under(path, root_resolved):
+            continue
+        parked_at = parse_parking_dir_name(path.name)
+        if parked_at is None:
+            logger.warning(
+                '%s skipping parking with unparseable basename %s (no trailing '
+                '-<YYYYMMDDTHHMMSSZ> stamp) — never guess an age',
+                _LOG_PREFIX,
+                path,
+            )
+            continue
+        records.append(ParkedWorktree(path=path, branch=branch, parked_at=parked_at))
+    return records
