@@ -24,6 +24,7 @@ never fires — only the behaviour under test is exercised.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -162,3 +163,39 @@ class TestColdPreprovisionCore:
             f'no provision on a warm worktree: {invoked!r}'
         )
         assert result.passed is True
+
+
+class TestColdPreprovisionFailOpen:
+    """A non-zero provision rc must fail-open (never raise, always proceed to the
+    gather) and be loud (WARNING naming the failure)."""
+
+    @pytest.mark.asyncio
+    async def test_provision_failure_is_fail_open_and_loud(
+        self, tmp_path: Path, caplog
+    ):
+        """Provision returns rc=1 while the checks return rc=0 ⇒ run_verification
+        (1) does NOT raise, (2) STILL runs the test/lint/type gather and returns a
+        verdict reflecting the CHECK outcomes (passed=True — the provision failure
+        does not itself fail the verify), and (3) emits a WARNING naming the
+        provision failure.  RED today: step-2 silently ignores rc and logs no
+        warning."""
+        config = _make_config(tmp_path, preprovision=PROVISION_CMD)
+        invoked: list[tuple[str, Path]] = []
+        spy = _spy(invoked, provision_rc=1, provision_out='error: Failed to spawn: ruff')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            with patch('orchestrator.verify._run_cmd', side_effect=spy):
+                # (1) does not raise — reaching the asserts below is the proof.
+                result = await verify.run_verification(tmp_path, config, is_merge_verify=True)
+
+        # Provision was attempted (and failed rc=1) ...
+        assert [c for (c, _) in invoked if _is_provision(c)], f'provision must run: {invoked!r}'
+        # (2) ... yet all three checks still ran afterward and the verdict is theirs.
+        assert len([c for (c, _) in invoked if _is_check(c)]) == 3, invoked
+        assert result.passed is True, 'provision failure must not fail the verify (fail-open)'
+        # (3) a WARNING record names the pre-provision failure (loud-over-silent).
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            'pre-provision' in m.lower() and 'uv sync' in m for m in warnings
+        ), f'a WARNING must name the pre-provision failure: {warnings!r}'
