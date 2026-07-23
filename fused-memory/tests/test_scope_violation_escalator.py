@@ -138,6 +138,96 @@ class TestEscalationEnabled:
         payload = json.loads(files[0].read_text())
         assert 'llm_adjudicator_reason' not in payload['detail']
 
+    def test_report_rejection_folds_repeated_identical_misroutes(self, tmp_path):
+        """Recurring identical misroutes fold into ONE pending parent.
+
+        Reproduces the esc-task-path-guard-8/-9 incident shape (task 2946):
+        a daily reconciliation consolidation round re-proposes the same
+        "Human gate: ..." candidate citing a foreign path (corpus/ owned by
+        know_live) under project reify.  Without dedup, each identical
+        re-proposal files a fresh escalation — this test asserts they
+        instead fold into the first.
+        """
+        esc = ScopeViolationEscalator()
+        project_root = str(tmp_path)
+        project_id = 'reify'
+        candidate_title = 'Human gate: consolidate tree-sitter cluster'
+        matched_paths = ('corpus/',)
+        suggested_project = 'know_live'
+
+        first = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+        second = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+        third = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+
+        assert first is not None
+        assert second == first, 'second identical misroute must fold into the first'
+        assert third == first, 'third identical misroute must fold into the first'
+
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one surviving escalation file, found: {files}'
+
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == first
+        assert payload['dedupe_count'] == 2
+        assert len(payload['dedupe_children']) == 2
+
+    def test_report_rejection_dedup_kill_switch_reproduces_legacy_behavior(self, tmp_path):
+        """scope_violation_dedupe_enabled=False disables folding (escape hatch).
+
+        Mirrors budget_misconfig_dedup_window_secs as an operator-facing
+        constructor knob: with dedup disabled, identical repeated misroutes
+        must each file their own distinct escalation, exactly like the
+        pre-task-2946 behavior.
+        """
+        esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
+        project_root = str(tmp_path)
+        project_id = 'reify'
+        candidate_title = 'Human gate: consolidate tree-sitter cluster'
+        matched_paths = ('corpus/',)
+        suggested_project = 'know_live'
+
+        first = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+        second = esc.report_rejection(
+            project_root=project_root,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+
+        assert first is not None
+        assert second is not None
+        assert second != first, 'dedup disabled: each call must file a distinct escalation'
+
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 2, f'expected two distinct escalation files, found: {files}'
+
 
 @pytest.mark.skipif(
     not sve_mod.HAS_ESCALATION,
