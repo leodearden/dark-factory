@@ -17,17 +17,17 @@ step-1: the pure ``parse_parking_dir_name(name)`` parser — trailing
 """
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-
 import reclaim_orphaned_worktrees as row
 from reclaim_orphaned_worktrees import parse_parking_dir_name
 
 LOG_PREFIX = "reclaim_orphaned_worktrees:"
+SCRIPT = Path(__file__).parent.parent / "reclaim_orphaned_worktrees.py"
 
 NOW = 1_000_000_000.0
 HOUR = 3600.0
@@ -35,8 +35,13 @@ HOUR = 3600.0
 # Deterministic parking stamps used by the real-git-repo fixtures below.
 TS_OLD = "20260722T153045Z"
 TS_LANE = "20260706T000000Z"
+TS_YOUNG = "20260724T120000Z"
 PARKED_AT_OLD = datetime(2026, 7, 22, 15, 30, 45, tzinfo=UTC)
 PARKED_AT_LANE = datetime(2026, 7, 6, 0, 0, 0, tzinfo=UTC)
+
+# CLI reference clock: 2026-07-25 00:00 UTC. Against a 48h floor, TS_OLD
+# (~2.35d) and TS_LANE (~19d) are reclaimable; TS_YOUNG (12h) is kept.
+CLI_NOW = datetime(2026, 7, 25, 0, 0, 0, tzinfo=UTC).timestamp()
 
 
 # ---------------------------------------------------------------------------
@@ -558,3 +563,90 @@ def test_reclaim_remove_failure_counted_siblings_continue(tmp_path, monkeypatch)
     assert bad.resolve() in _resolved(outcome.failed)
     assert not good.exists()  # sibling still reclaimed
     assert bad.exists()  # the failed one is left in place
+
+
+# ---------------------------------------------------------------------------
+# step-15: end-to-end CLI via subprocess (JSON on stdout / LOUD logs on stderr)
+# ---------------------------------------------------------------------------
+
+def _run_cli(*args: str) -> subprocess.CompletedProcess:
+    """Drive the reclaim CLI as a real subprocess. stdout carries the JSON
+    report; stderr carries the LOUD human log lines."""
+    return subprocess.run(
+        ["python3", str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def _cli_repo_with_three_parkings(tmp_path):
+    """A repo with a CLEAN+OLD, a DIRTY+OLD, and a YOUNG parking."""
+    repo = _init_repo(tmp_path)
+    clean_old = _add_parking(repo, f"2920-{TS_OLD}")
+    dirty_old = _add_parking(repo, f"_lane-0-{TS_LANE}", dirty=True)
+    young = _add_parking(repo, f"3050-{TS_YOUNG}")
+    return repo, clean_old, dirty_old, young
+
+
+def test_cli_reclaims_old_park_commits_dirty_keeps_young(tmp_path):
+    """Old-clean removed; old-dirty park-committed then removed (content on the
+    branch); young untouched; prune ran (no stale admin entries); JSON report on
+    stdout with correct counts + check=false; exit 0; LOUD prefix on stderr."""
+    repo, clean_old, dirty_old, young = _cli_repo_with_three_parkings(tmp_path)
+
+    result = _run_cli("--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48")
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert not clean_old.exists()
+    assert not dirty_old.exists()
+    assert young.exists()
+    # Dirty content provably preserved on the parking branch.
+    assert _git(repo, "show", f"task/_lane-0-{TS_LANE}:wip.txt").stdout == "uncommitted work\n"
+    # Prune ran: no stale/prunable admin entries; only main + young remain.
+    porcelain = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert "prunable" not in porcelain
+    assert _worktree_paths(repo) == {repo.resolve(), young.resolve()}
+
+    report = json.loads(result.stdout)
+    assert report["scanned"] == 3
+    assert report["kept"] == 1
+    assert report["reclaimed"] == 2
+    assert report["park_committed"] == 1
+    assert report["skipped"] == 0
+    assert report["failed"] == 0
+    assert report["check"] is False
+    assert LOG_PREFIX in result.stderr
+
+
+def test_cli_check_is_dry_run(tmp_path):
+    """--check removes/commits NOTHING, reports check=true & reclaimed=0, logs
+    'would reclaim', exits 0."""
+    repo, clean_old, dirty_old, young = _cli_repo_with_three_parkings(tmp_path)
+    head_before = _git(dirty_old, "rev-parse", "HEAD").stdout.strip()
+
+    result = _run_cli(
+        "--repo", str(repo), "--now", str(CLI_NOW), "--min-age-hours", "48", "--check"
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert clean_old.exists()
+    assert dirty_old.exists()
+    assert young.exists()
+    assert _git(dirty_old, "rev-parse", "HEAD").stdout.strip() == head_before  # nothing committed
+    report = json.loads(result.stdout)
+    assert report["check"] is True
+    assert report["reclaimed"] == 0
+    assert report["park_committed"] == 0
+    assert "would reclaim" in result.stderr
+
+
+def test_cli_default_parking_root_derived_from_repo(tmp_path):
+    """--parking-root omitted resolves to <repo>/.worktrees-orphaned."""
+    repo = _init_repo(tmp_path)
+
+    result = _run_cli("--repo", str(repo), "--now", str(CLI_NOW), "--check")
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    report = json.loads(result.stdout)
+    assert report["root"] == str(repo / ".worktrees-orphaned")
