@@ -15,6 +15,8 @@ test so a not-yet-defined symbol never breaks collection during RED.
 from __future__ import annotations
 
 import asyncio
+import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +159,77 @@ def _queued_snapshot(request_id: str, branch: str):
             'verify_age_secs': None,
         }]}
     return _snap
+
+
+class _ScratchSpy:
+    """Spy ``_FindInflightWorktreeP``: returns a planted scratch path and records
+    each guarded-removal call (actually deleting the dir), so a REPLACE test can
+    assert the gate cleaned the dropped queued entry's scratch via the C1
+    primitive without depending on find_inflight_merge_worktree's subject-match
+    internals (those have their own coverage in
+    test_remove_merge_worktree_guarded.py).  Ancestry classification is driven
+    by a REAL GitOps passed as ``classifier_git_ops`` — this spy is only the
+    disk-scan/removal surface.
+    """
+
+    def __init__(self, scratch: Path | None) -> None:
+        self._scratch = scratch
+        self.removed: list[tuple[Path, str]] = []
+        self.find_calls = 0
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+        self.find_calls += 1
+        return self._scratch
+
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str:
+        self.removed.append((path, reason))
+        if path.exists():
+            shutil.rmtree(path)
+        return 'removed'
+
+    async def cleanup_merge_worktree(self, merge_wt: Path) -> None:  # noqa: ARG002
+        return None
+
+
+async def _make_patch_equivalent_twin(repo: Path) -> tuple[str, str]:
+    """Return ``(tip_old, tip_new)`` that are topologically DIVERGENT but
+    patch-id EQUIVALENT (a rebased twin — same diff, different commit).
+
+    ``tip_old`` (on main) and ``tip_new`` (on a sibling branch off the same
+    base) apply the SAME diff with DIFFERENT commit messages, so their SHAs
+    differ (guaranteeing divergence, not SAME) while ``git patch-id`` — which
+    ignores the message — matches, so resolve_divergent folds them to SUBSET.
+    """
+    base = await _head_sha(repo)
+    (repo / 'feat.txt').write_text('hello\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'feat old'], cwd=repo)
+    tip_old = await _head_sha(repo)
+    await _run(['git', 'checkout', '-b', 'twin', base], cwd=repo)
+    (repo / 'feat.txt').write_text('hello\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'feat new (rebased)'], cwd=repo)
+    tip_new = await _head_sha(repo)
+    await _run(['git', 'checkout', 'main'], cwd=repo)
+    return tip_old, tip_new
+
+
+async def _make_divergent_forcepush(repo: Path) -> tuple[str, str]:
+    """Return ``(tip_old, tip_new)`` that are DIVERGENT with genuinely NEW
+    content (a real force-push, not a rebased twin) — different diff, so
+    resolve_divergent classifies them SUPERSET (patch NOT contained)."""
+    base = await _head_sha(repo)
+    (repo / 'feat.txt').write_text('hello\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'feat old'], cwd=repo)
+    tip_old = await _head_sha(repo)
+    await _run(['git', 'checkout', '-b', 'forcepush', base], cwd=repo)
+    (repo / 'feat.txt').write_text('DIFFERENT content\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'feat forcepush'], cwd=repo)
+    tip_new = await _head_sha(repo)
+    await _run(['git', 'checkout', 'main'], cwd=repo)
+    return tip_old, tip_new
 
 
 # ---------------------------------------------------------------------------
@@ -334,3 +407,202 @@ class TestC3SubmitGateInVerify:
         assert queue.qsize() == 0
         entry = registry.entry('901')
         assert entry is not None and entry.request_id == 'mr-old'
+
+
+# ---------------------------------------------------------------------------
+# TestC3SubmitGateQueued — step-5 RED: coalesce_or_enqueue queued replace/coalesce
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestC3SubmitGateQueued:
+    """step-5 RED: the QUEUED (verify-not-started) C3 arms with real commits —
+    REPLACE (D2), SUBSET stale-retry coalesce, patch-id-equivalent-twin
+    coalesce (amendment), and genuine-force-push REPLACE + divergence WARNING.
+
+    Ancestry runs against real git (classifier_git_ops); the dropped queued
+    entry's scratch is a planted dir returned by a spy _FindInflightWorktreeP.
+
+    RED until step-6 swaps the interim independent-enqueue for the atomic
+    drop-and-reacquire + C1 scratch clean: (a) the slot still holds the OLD
+    request and the scratch is not cleaned, and (d) no divergence WARNING is
+    logged.  (b)/(c) already coalesce (pinned here).
+    """
+
+    async def test_queued_newer_sha_replaces_and_cleans_scratch(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """(a) REPLACE: NEW descendant SHA while QUEUED → drop old entry, dispatch
+        fresh, clean the dropped scratch via the C1 guarded primitive (D2)."""
+        from orchestrator.merge_queue import coalesce_or_enqueue_merge_request
+
+        sha1 = await _commit(git_repo, 'c1')
+        sha2 = await _commit(git_repo, 'c2')  # strict descendant → SUPERSET
+
+        scratch = tmp_path / '_merge-scratch'
+        scratch.mkdir()
+        spy = _ScratchSpy(scratch)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = _make_event_store(tmp_path)
+
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '910', 'task-old', old_fut, request_id='mr-old', snapshot_tip=sha1,
+        )
+
+        req = _make_request('task-new', '910', tmp_path, config, request_id='mr-new', snapshot_tip=sha2)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=spy,
+            live_snapshot=_queued_snapshot('mr-old', '910'),  # verify NOT started
+            classifier_git_ops=git_ops,
+        )
+
+        assert result.dispatched is True, (
+            f'SUPERSET while queued must REPLACE-dispatch; got {result}'
+        )
+        assert result.in_flight is False
+        assert result.rejected is False
+        # Old entry DROPPED: the slot now holds the NEW request (one item/branch).
+        entry = registry.entry('910')
+        assert entry is not None and entry.request_id == 'mr-new', (
+            f'REPLACE must drop the old entry and hold mr-new; got '
+            f'{entry.request_id if entry else None}'
+        )
+        # Dropped scratch cleaned via the C1 guarded primitive.
+        assert spy.removed == [(scratch, 'c3_replace_drop_queued')], (
+            f'REPLACE must clean the dropped queued scratch; got {spy.removed}'
+        )
+        assert not scratch.exists()
+        assert queue.qsize() == 1
+
+    async def test_queued_older_sha_coalesces_no_scratch_clean(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """(b) SUBSET stale retry: an ancestor SHA → coalesce, old entry retained,
+        scratch NOT cleaned."""
+        from orchestrator.merge_queue import coalesce_or_enqueue_merge_request
+
+        sha1 = await _commit(git_repo, 'c1')
+        sha2 = await _commit(git_repo, 'c2')  # sha1 is ancestor of sha2
+
+        scratch = tmp_path / '_merge-scratch'
+        scratch.mkdir()
+        spy = _ScratchSpy(scratch)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = _make_event_store(tmp_path)
+
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '911', 'task-old', old_fut, request_id='mr-old', snapshot_tip=sha2,
+        )
+
+        # Submit the OLDER SHA1 (ancestor of in-flight sha2) → SUBSET.
+        req = _make_request('task-new', '911', tmp_path, config, request_id='mr-new', snapshot_tip=sha1)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=spy,
+            live_snapshot=_queued_snapshot('mr-old', '911'),
+            classifier_git_ops=git_ops,
+        )
+
+        assert result.in_flight is True, f'SUBSET must coalesce; got {result}'
+        assert result.rejected is False
+        entry = registry.entry('911')
+        assert entry is not None and entry.request_id == 'mr-old', 'old entry retained'
+        assert spy.removed == [], 'coalesce must NOT clean scratch'
+        assert scratch.exists()
+        assert queue.qsize() == 0
+
+    async def test_queued_patch_equivalent_twin_coalesces(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """(c) Patch-id-equivalent DIVERGENT (rebased twin) → coalesce (amendment):
+        resolve_divergent folds it to SUBSET, so genuine content is never lost."""
+        from orchestrator.merge_queue import coalesce_or_enqueue_merge_request
+
+        tip_old, tip_new = await _make_patch_equivalent_twin(git_repo)
+
+        scratch = tmp_path / '_merge-scratch'
+        scratch.mkdir()
+        spy = _ScratchSpy(scratch)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = _make_event_store(tmp_path)
+
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '912', 'task-old', old_fut, request_id='mr-old', snapshot_tip=tip_old,
+        )
+
+        req = _make_request('task-new', '912', tmp_path, config, request_id='mr-new', snapshot_tip=tip_new)
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, event_store, registry,
+            git_ops=spy,
+            live_snapshot=_queued_snapshot('mr-old', '912'),
+            classifier_git_ops=git_ops,
+        )
+
+        assert result.in_flight is True, (
+            f'patch-id-equivalent rebased twin must coalesce, not replace; got {result}'
+        )
+        assert result.rejected is False
+        entry = registry.entry('912')
+        assert entry is not None and entry.request_id == 'mr-old', 'old entry retained'
+        assert spy.removed == [], 'coalesce must NOT clean scratch'
+        assert queue.qsize() == 0
+
+    async def test_queued_genuine_divergent_replaces_and_warns(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+        caplog,
+    ) -> None:
+        """(d) Genuine force-push DIVERGENT (new content) while QUEUED → REPLACE
+        and log a divergence WARNING (D2)."""
+        from orchestrator.merge_queue import coalesce_or_enqueue_merge_request
+
+        tip_old, tip_new = await _make_divergent_forcepush(git_repo)
+
+        scratch = tmp_path / '_merge-scratch'
+        scratch.mkdir()
+        spy = _ScratchSpy(scratch)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = _make_event_store(tmp_path)
+
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '913', 'task-old', old_fut, request_id='mr-old', snapshot_tip=tip_old,
+        )
+
+        req = _make_request('task-new', '913', tmp_path, config, request_id='mr-new', snapshot_tip=tip_new)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=spy,
+                live_snapshot=_queued_snapshot('mr-old', '913'),
+                classifier_git_ops=git_ops,
+            )
+
+        assert result.dispatched is True, (
+            f'genuine divergence while queued must REPLACE-dispatch; got {result}'
+        )
+        assert result.rejected is False
+        entry = registry.entry('913')
+        assert entry is not None and entry.request_id == 'mr-new', 'REPLACE holds mr-new'
+        # A divergence (force-push) WARNING must be emitted (D2).
+        assert any(
+            'diverg' in r.message.lower()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ), f'expected a divergence WARNING; got {[r.message for r in caplog.records]}'
+        assert spy.removed == [(scratch, 'c3_replace_drop_queued')]
