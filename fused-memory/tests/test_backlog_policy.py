@@ -18,6 +18,7 @@ from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
+    orchestrator_started_at,
 )
 
 if TYPE_CHECKING:
@@ -325,6 +326,66 @@ def test_orchestrator_detector_unparseable_lock(tmp_path):
     lock_dir.mkdir(parents=True)
     lock_dir.joinpath('orchestrator.lock').write_text('not a pid\n', encoding='utf-8')
     assert is_orchestrator_live_for(project_root) is False
+
+
+# ── orchestrator_started_at (task 2963) ───────────────────────────────────
+
+
+def _write_orchestrator_lock(project_root, first_line: str):
+    """Write ``<project_root>/data/orchestrator/orchestrator.lock`` with *first_line*.
+
+    Mirrors the ``PID <N> started <ISO>`` lock-write fixture pattern used by
+    the ``is_orchestrator_live_for`` tests above.
+    """
+    lock_dir = project_root / 'data' / 'orchestrator'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir.joinpath('orchestrator.lock').write_text(first_line + '\n', encoding='utf-8')
+
+
+def test_orchestrator_started_at_parses_z_suffix_utc_aware(tmp_path):
+    """First line ``PID 123 started 2026-04-13T00:00:00Z`` → tz-aware UTC datetime."""
+    from datetime import UTC, datetime, timedelta
+
+    project_root = tmp_path / 'proj_root'
+    _write_orchestrator_lock(project_root, 'PID 123 started 2026-04-13T00:00:00Z')
+
+    started = orchestrator_started_at(project_root)
+    assert started == datetime(2026, 4, 13, 0, 0, 0, tzinfo=UTC)
+    # Verify the `Z` suffix parsed and the result is tz-aware.
+    assert started is not None
+    assert started.tzinfo is not None
+    assert started.utcoffset() == timedelta(0)
+
+
+def test_orchestrator_started_at_missing_lock_file(tmp_path):
+    """No orchestrator.lock file → None (fail-safe, no raise)."""
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+    assert orchestrator_started_at(project_root) is None
+
+
+def test_orchestrator_started_at_no_started_token(tmp_path):
+    """First line has no ``started`` token (e.g. ``PID 123``) → None."""
+    project_root = tmp_path / 'proj_root'
+    _write_orchestrator_lock(project_root, 'PID 123')
+    assert orchestrator_started_at(project_root) is None
+
+
+def test_orchestrator_started_at_unparseable_timestamp(tmp_path):
+    """``started`` followed by a non-timestamp token → None."""
+    project_root = tmp_path / 'proj_root'
+    _write_orchestrator_lock(project_root, 'PID 123 started not-a-time')
+    assert orchestrator_started_at(project_root) is None
+
+
+def test_orchestrator_started_at_oserror_returns_none(tmp_path):
+    """OSError on read (lock path is a directory) → None (no raise)."""
+    project_root = tmp_path / 'proj_root'
+    lock_dir = project_root / 'data' / 'orchestrator'
+    lock_dir.mkdir(parents=True)
+    # Make orchestrator.lock a DIRECTORY so read_text raises OSError (IsADirectoryError).
+    lock_dir.joinpath('orchestrator.lock').mkdir()
+    assert orchestrator_started_at(project_root) is None
 
 
 # ── TaskInterceptor integration ───────────────────────────────────────────
