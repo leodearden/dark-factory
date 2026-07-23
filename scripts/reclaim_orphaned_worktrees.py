@@ -394,3 +394,29 @@ def park_commit(worktree: Path, reason: str) -> str | None:
         '%s park-committed %s (reason=%s) -> %s', _LOG_PREFIX, worktree, reason, sha
     )
     return sha
+
+
+def remove_worktree(repo: Path, path: Path) -> bool:
+    """Remove a registered parking via ``git worktree remove --force <path>``.
+
+    Returns ``True`` on success, ``False`` on any failure (logged LOUDLY); never
+    raises. Passes NO branch-deleting flag — ``git worktree remove`` deletes only
+    the working tree + the ``.git/worktrees`` admin entry and NEVER the branch
+    ref, so a parking's content (already on its branch) survives the removal.
+    The only destructive verb in this module, and it only ever runs on paths
+    :func:`list_parked_worktrees` vetted as registered under the parking root.
+    """
+    rc, _out, err = _run_git(
+        ['worktree', 'remove', '--force', str(path)], cwd=repo
+    )
+    if rc != 0:
+        logger.warning(
+            '%s `git worktree remove --force %s` failed (rc=%s): %s',
+            _LOG_PREFIX,
+            path,
+            rc,
+            err.strip(),
+        )
+        return False
+    logger.info('%s removed worktree %s (branch intact)', _LOG_PREFIX, path)
+    return True
