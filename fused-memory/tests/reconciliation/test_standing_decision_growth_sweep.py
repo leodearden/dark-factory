@@ -8,6 +8,7 @@ that wires them into the Stage-2 tail.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,6 +23,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STATE_EXPIRED,
 )
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY,
+    _compute_growth_sweep_failure_streak,
+    _evaluate_growth_sweep_escalation,
+    _extract_growth_sweep_failed,
     _sweep_entity_standing_decision_growth,
 )
 
@@ -183,3 +188,67 @@ class TestGrowthSweep:
         active, expired = await _states(ledger)
         assert active == []
         assert len(expired) == 1
+
+
+class TestGrowthSweepStreakPure:
+    """The pure streak helpers (streak-on-FAILURE, mirroring the snapshot cadence
+    inverted: the counted flag is True=failed, not False=miss)."""
+
+    def test_extract_failed_flag_true(self):
+        report = SimpleNamespace(
+            stats={ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY: 1}
+        )
+        assert _extract_growth_sweep_failed(report) is True
+
+    def test_extract_failed_flag_false(self):
+        report = SimpleNamespace(
+            stats={ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY: 0}
+        )
+        assert _extract_growth_sweep_failed(report) is False
+
+    def test_extract_accepts_dict_shape(self):
+        report = {'stats': {ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY: 1}}
+        assert _extract_growth_sweep_failed(report) is True
+
+    def test_extract_absent_key_is_none(self):
+        assert _extract_growth_sweep_failed(SimpleNamespace(stats={})) is None
+
+    def test_extract_none_report_is_none(self):
+        assert _extract_growth_sweep_failed(None) is None
+
+    def test_compute_streak_stops_at_reset(self):
+        # Leading run of True (failures), stops at the first False (a success
+        # cycle resets the streak).
+        assert _compute_growth_sweep_failure_streak([True, True, False]) == 2
+
+    def test_compute_streak_stops_at_unknown(self):
+        # None (inconclusive/fail-safe) also stops the run — never counted.
+        assert _compute_growth_sweep_failure_streak([True, None, True]) == 1
+
+    def test_compute_streak_leading_false_is_zero(self):
+        assert _compute_growth_sweep_failure_streak([False, True]) == 0
+
+    def test_compute_streak_empty_is_zero(self):
+        assert _compute_growth_sweep_failure_streak([]) == 0
+
+    def test_evaluate_current_not_failed_short_circuits(self):
+        # current_failed False or None ⇒ never escalate (only a CONFIRMED
+        # current failure can trigger).
+        assert _evaluate_growth_sweep_escalation(False, [True, True]) == {
+            'streak': 0, 'escalate': False,
+        }
+        assert _evaluate_growth_sweep_escalation(None, [True, True]) == {
+            'streak': 0, 'escalate': False,
+        }
+
+    def test_evaluate_reaches_threshold(self):
+        # current failure + two prior failures ⇒ streak 3 ⇒ escalate.
+        assert _evaluate_growth_sweep_escalation(True, [True, True]) == {
+            'streak': 3, 'escalate': True,
+        }
+
+    def test_evaluate_below_threshold(self):
+        # current failure + one prior failure ⇒ streak 2 ⇒ no escalation yet.
+        assert _evaluate_growth_sweep_escalation(True, [True]) == {
+            'streak': 2, 'escalate': False,
+        }
