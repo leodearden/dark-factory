@@ -1241,13 +1241,19 @@ class TestProceduralTopicGuardClustersDefault:
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 2
+        assert len(clusters) >= 3
 
-    def test_default_seeds_both_known_topic_ids(self):
+    def test_default_seeds_all_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         topic_ids = {c.topic_id for c in clusters}
         assert 'eval-worktree-plan-tools-missing' in topic_ids
         assert 'eval-worktree-venv-shadowing' in topic_ids
+        assert 'pytest-xdist-serial-override' in topic_ids
+
+    def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(c for c in clusters if c.topic_id == 'pytest-xdist-serial-override')
+        assert '8bb3eb15-1133-4e7b-ac1f-5bac10329b51' in cluster.hint
 
     def test_every_seeded_cluster_is_well_formed(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters

@@ -413,12 +413,15 @@ class ProceduralTopicCluster(BaseModel):
 
 
 def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
-    """Seed the two known-contradictory eval-worktree topic clusters (task 2845).
+    """Seed the known-contradictory/recurring procedural_knowledge topic clusters.
 
-    Both are recurring procedural_knowledge topics that grew several
-    contradictory, paraphrased entries each because every restatement scored
-    BELOW the cosine near-dup threshold. Seeding both means one fix closes this
-    task (2845, gate 2841) AND the sibling venv-shadowing cluster (gate 2844).
+    All three are recurring procedural_knowledge topics that grew several
+    contradictory or paraphrased entries each because every restatement scored
+    BELOW the cosine near-dup threshold. Seeding the two eval-worktree clusters
+    closes task 2845 (gate 2841) AND the sibling venv-shadowing cluster (gate
+    2844); the pytest-xdist cluster closes task 2974 -- it is the topic that
+    originally motivated the guard (9 duplicates consolidated into canonical
+    memory 8bb3eb15) but was never itself seeded.
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
@@ -466,6 +469,30 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'eval worktree) gated to human task 2844. Do NOT add another entry '
                 '-- update/consolidate the existing entries, or add context to gate '
                 'task 2844.'
+            ),
+        ),
+        ProceduralTopicCluster(
+            topic_id='pytest-xdist-serial-override',
+            # This is the topic that ORIGINALLY MOTIVATED this guard (task 2845):
+            # 9 paraphrased entries consolidated into canonical memory 8bb3eb15,
+            # yet the cluster itself was never seeded. Phrases are literal
+            # substrings drawn from 8bb3eb15's actual wording (addopts hardcodes
+            # `-n auto --dist loadgroup --max-worker-restart=0`; `-n0` is the one
+            # reliable serial-override workaround; `-p no:xdist` fails with
+            # "unrecognized arguments").
+            phrases=[
+                'pytest-xdist',
+                '-n0',
+                '--dist loadgroup',
+                'max-worker-restart',
+                '-p no:xdist',
+            ],
+            min_phrase_hits=2,
+            hint=(
+                'Known-recurring topic (pytest-xdist -n0 serial-override workaround '
+                'for the hardcoded -n auto addopts in orchestrator/fused-memory '
+                'pyproject.toml). Do NOT add another entry -- update/consolidate '
+                'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
             ),
         ),
     ]
