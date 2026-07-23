@@ -392,6 +392,93 @@ class TestCheckFilesForScope:
 
 
 # ---------------------------------------------------------------------------
+# all_files_foreign_owner — cross-repo (all-foreign) classifier (task 3004)
+# ---------------------------------------------------------------------------
+
+
+class TestAllFilesForeignOwner:
+    """Unit tests for all_files_foreign_owner — the cross-repo classifier.
+
+    Distinct from check_files_for_scope (which rejects on ANY foreign file):
+    this returns the single foreign owner ONLY when a submission is ENTIRELY
+    foreign under one owner with NO locally-owned file — the reify-task 5308
+    cross-repo deliverable shape (task 3004).  Files with no registered owner
+    stay neutral (conservative, matching _aggregate_owner_mismatches).
+    """
+
+    def test_all_files_single_foreign_owner_returns_owner(self, tmp_path):
+        # (a) every file under dark_factory (orchestrator/), filed under reify.
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        owner = all_files_foreign_owner(
+            ['orchestrator/src/x.py', 'orchestrator/tests/y.py'],
+            'reify', registry,
+        )
+        assert owner == 'dark_factory'
+
+    def test_mixed_local_and_foreign_returns_none(self, tmp_path):
+        # (b) one reify-owned + one dark_factory file → NOT all-foreign;
+        # existing check_files_for_scope rejection semantics are preserved.
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        owner = all_files_foreign_owner(
+            ['crates/foo.rs', 'orchestrator/x.py'],
+            'reify', registry,
+        )
+        assert owner is None
+
+    def test_all_unowned_returns_none(self, tmp_path):
+        # (c) files with no registered owner stay neutral → None.
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        owner = all_files_foreign_owner(
+            ['random/thing.py', 'other/local.py'],
+            'reify', registry,
+        )
+        assert owner is None
+
+    def test_all_local_to_submitting_project_returns_none(self, tmp_path):
+        # (c') files owned by the submitting project → None.
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        owner = all_files_foreign_owner(
+            ['crates/foo.rs', 'gui/app.rs'],
+            'reify', registry,
+        )
+        assert owner is None
+
+    def test_empty_files_or_registry_returns_none(self, tmp_path):
+        # (d) empty files or empty registry → None.
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        assert all_files_foreign_owner([], 'reify', registry) is None
+        assert all_files_foreign_owner(None, 'reify', registry) is None
+        empty = ProjectPrefixRegistry.from_roots([])
+        assert all_files_foreign_owner(['orchestrator/x.py'], 'reify', empty) is None
+
+    def test_files_span_two_foreign_owners_returns_none(self, tmp_path):
+        # (e) foreign files split across TWO owners → None (single-owner req).
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        c_root = _mkproj(tmp_path, 'cthird', ['cthird_dir'])
+        registry = ProjectPrefixRegistry.from_roots([
+            str(_mkproj(tmp_path, 'reify', ['crates'])),
+            str(_mkproj(tmp_path, 'dark-factory', ['fused-memory'])),
+            str(c_root),
+        ])
+        owner = all_files_foreign_owner(
+            ['fused-memory/x.py', 'cthird_dir/y.py'],
+            'reify', registry,
+        )
+        assert owner is None
+
+
+# ---------------------------------------------------------------------------
 # Verdict.to_error_dict
 # ---------------------------------------------------------------------------
 
