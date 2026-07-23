@@ -266,3 +266,64 @@ class TestGitdirParsingRobustness:
 
         assert ws.git_worktree_admin == admin.resolve()
         assert ws.git_objects == (main_git / 'objects').resolve()
+
+
+# ---------------------------------------------------------------------------
+# OS-sandbox β2 (task 2909): WriteSet.digest()
+# ---------------------------------------------------------------------------
+
+
+def _make_write_set(**overrides: Path) -> WriteSet:
+    """Construct a WriteSet from dummy Paths (hermetic — digest() depends
+    ONLY on writable_paths(), which needs no filesystem)."""
+    fields: dict[str, Path] = dict(
+        worktree=Path('/wt'),
+        task_meta=Path('/base/.task-meta/wt'),
+        git_objects=Path('/main/.git/objects'),
+        git_task_refs=Path('/main/.git/refs/heads/task'),
+        git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
+        git_worktree_admin=Path('/main/.git/worktrees/wt'),
+        uv_cache=Path('/home/.cache/uv'),
+        claude_fleet=Path('/home/.claude/fleet'),
+        tmp=Path('/tmp'),
+        dev=Path('/dev'),
+    )
+    fields.update(overrides)
+    return WriteSet(**fields)
+
+
+class TestWriteSetDigest:
+    """Pins WriteSet.digest() — the single owner (INV-5) of the stable
+    writable-set hash the β2 ``sandbox_applied`` event carries so an operator
+    can diff exactly what a given invocation could touch (INV-2). It is a
+    sha256 over the contract-ordered ``writable_paths()`` strings.
+    """
+
+    def test_digest_is_deterministic_across_calls(self):
+        # (a) Same WriteSet → identical hex string across two calls.
+        ws = _make_write_set()
+        assert ws.digest() == ws.digest()
+
+    def test_equal_writable_paths_produce_equal_digest(self):
+        # (b) Two independently-built WriteSets with identical writable_paths()
+        # produce the same digest.
+        a = _make_write_set()
+        b = _make_write_set()
+        assert a.writable_paths() == b.writable_paths()
+        assert a.digest() == b.digest()
+
+    def test_one_differing_path_changes_digest(self):
+        # (c) A WriteSet differing in exactly one writable path yields a
+        # different digest.
+        base = _make_write_set()
+        changed = _make_write_set(worktree=Path('/other-wt'))
+        assert base.writable_paths() != changed.writable_paths()
+        assert base.digest() != changed.digest()
+
+    def test_digest_is_64_char_lowercase_sha256_hex(self):
+        # (d) Shape: a 64-char lowercase sha256 hex string.
+        digest = _make_write_set().digest()
+        assert isinstance(digest, str)
+        assert len(digest) == 64
+        assert digest == digest.lower()
+        assert all(c in '0123456789abcdef' for c in digest)

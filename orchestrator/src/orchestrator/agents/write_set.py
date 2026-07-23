@@ -24,6 +24,7 @@ backend's job.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +73,22 @@ class WriteSet:
                 seen.add(path)
                 deduped.append(path)
         return deduped
+
+    def digest(self) -> str:
+        """Stable sha256 hex digest of this writable-set — the SINGLE owner
+        of the digest definition (INV-5 no-lockstep-duplication).
+
+        Hashes the newline-joined, contract-ordered ``writable_paths()``
+        strings. Because ``writable_paths()`` is deterministic (contract order
+        + order-preserving dedupe) and resolves to absolute paths, the digest
+        is reproducible across processes (pure ``hashlib``) yet per-worktree
+        DISTINCT — exactly the "diff exactly what a given invocation could
+        touch" property the OS-sandbox ``sandbox_applied`` event needs for
+        operator diffing (β2, PRD §Goal 3 / INV-2). The emit site reads this;
+        it never recomputes the hash.
+        """
+        joined = '\n'.join(str(p) for p in self.writable_paths())
+        return hashlib.sha256(joined.encode('utf-8')).hexdigest()
 
 
 _GITDIR_PREFIX = 'gitdir:'

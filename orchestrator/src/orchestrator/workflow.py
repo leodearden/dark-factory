@@ -57,7 +57,7 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
-from orchestrator.agents.write_set import compute_write_set
+from orchestrator.agents.write_set import WriteSet, compute_write_set
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
@@ -9917,8 +9917,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # running unconfined. backend=none is the explicit operator escape
             # hatch (runs UNSANDBOXED with a WARN, no refusal); a
             # required-yet-unavailable backend raises SandboxUnavailable, which
-            # propagates out of _invoke to refuse the invocation.
-            self._guard_sandbox(role.name)
+            # propagates out of _invoke to refuse the invocation. On the
+            # non-refusing path _guard_sandbox returns the resolved backend,
+            # which we record here via the per-invocation sandbox_applied event
+            # (task 2909 β2, PRD §Goal 3 / INV-2): real backend AND the
+            # none-escape hatch both emit sandbox_applied, while a refusal
+            # instead emits sandbox_unavailable inside the guard — so every
+            # sandboxed invocation emits exactly one of the two.
+            resolved_backend = self._guard_sandbox(role.name)
+            self._emit_sandbox_applied(role.name, resolved_backend, write_set)
 
         # Warn once per workflow instance when an escalation-capable role is
         # dispatched without an escalation queue wired up.
@@ -11121,18 +11128,74 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                       'severity': esc.severity, 'summary': summary[:200]},
             )
 
-    def _guard_sandbox(self, role_name: str) -> None:
+    def _emit_sandbox_unavailable(self, role_name: str, backend_state: str) -> None:
+        """Emit one ``sandbox_unavailable`` event on a fail-closed refusal (β2).
+
+        Fires from :meth:`_guard_sandbox`'s ``except SandboxUnavailable`` branch
+        on EVERY refusal — the per-invocation structured record γ1's soak
+        predicate queries — BEFORE the (deduped) escalation, so the event and
+        the escalation deliberately have different cardinalities (PRD
+        plans/os-sandbox-worktree-containment-prd.md β2 §Goal 3 / INV-4).
+        ``role``/``task_id`` are first-class emit columns; ``data`` carries the
+        configured backend that failed to resolve. A silent no-op when no event
+        store is wired up (fire-and-forget, mirroring the sibling
+        escalation-emit guard).
+        """
+        if not self.event_store:
+            return
+        self.event_store.emit(
+            EventType.sandbox_unavailable,
+            task_id=self.task_id,
+            phase=self.state.value,
+            role=role_name,
+            data={'backend': backend_state},
+        )
+
+    def _emit_sandbox_applied(
+        self, role_name: str, backend: str, write_set: WriteSet,
+    ) -> None:
+        """Emit one ``sandbox_applied`` event per sandboxed invocation (β2).
+
+        Fired from :meth:`_invoke` on the NON-refusing guard path — a real
+        backend (landlock/bwrap) OR the explicit ``backend=none`` operator
+        escape hatch (still emitted; ``data.backend`` lets γ1 distinguish
+        deliberately-unsandboxed from real containment). ``role``/``task_id``
+        are first-class emit columns; ``data`` carries the resolved ``backend``
+        and ``write_set.digest()`` — the stable writable-set hash an operator
+        diffs to see exactly what this invocation could touch (PRD
+        plans/os-sandbox-worktree-containment-prd.md β2 §Goal 3 / INV-2). The
+        digest is read from ``WriteSet.digest()`` (its single owner, INV-5), not
+        recomputed here. A silent no-op when no event store is wired up
+        (fire-and-forget, mirroring the sibling escalation-emit guard).
+        """
+        if not self.event_store:
+            return
+        self.event_store.emit(
+            EventType.sandbox_applied,
+            task_id=self.task_id,
+            phase=self.state.value,
+            role=role_name,
+            data={'backend': backend, 'digest': write_set.digest()},
+        )
+
+    def _guard_sandbox(self, role_name: str) -> str:
         """Fail-CLOSED sandbox check for the sandboxed-dispatch call-site (task 2908).
 
         Called from :meth:`_invoke` inside the ``config.sandbox.enabled +
         role.sandboxed`` block. Delegates backend resolution to
-        ``sandbox_dispatch.resolve_backend_or_refuse``: a healthy backend and the
-        operator ``backend=none`` escape hatch both return without raising, but a
-        required-yet-unavailable backend raises ``SandboxUnavailable`` — at which
-        point we file a DEDUPED escalation (only when ``exc.should_escalate``, the
-        process-global dedup decision — INV-4) and re-raise to REFUSE the agent
-        invocation rather than run it unconfined (PRD D4). The re-raised exception
-        propagates out of ``_invoke`` to ``_drive``'s generic failure handler.
+        ``sandbox_dispatch.resolve_backend_or_refuse`` and RETURNS the resolved
+        backend string (``'none'``/``'landlock'``/``'bwrap'``) on the
+        non-refusing path — the single authoritative value :meth:`_invoke`
+        carries into the ``sandbox_applied`` event (β2), avoiding a redundant
+        second resolution and any TOCTOU skew. A healthy backend and the
+        operator ``backend=none`` escape hatch both return without raising, but
+        a required-yet-unavailable backend raises ``SandboxUnavailable`` — at
+        which point we emit a per-refusal ``sandbox_unavailable`` event (β2, NOT
+        deduped) and then file a DEDUPED escalation (only when
+        ``exc.should_escalate``, the process-global dedup decision — INV-4) and
+        re-raise to REFUSE the agent invocation rather than run it unconfined
+        (PRD D4). The re-raised exception propagates out of ``_invoke`` to
+        ``_drive``'s generic failure handler.
         """
         from orchestrator.agents.sandbox_dispatch import (
             SandboxUnavailable,
@@ -11140,8 +11203,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         try:
-            resolve_backend_or_refuse()
+            return resolve_backend_or_refuse()
         except SandboxUnavailable as exc:
+            self._emit_sandbox_unavailable(role_name, exc.backend_state)
             if exc.should_escalate:
                 self._escalate_sandbox_unavailable(
                     role_name, exc.backend_state, str(exc),
