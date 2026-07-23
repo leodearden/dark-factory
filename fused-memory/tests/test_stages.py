@@ -4751,6 +4751,137 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
 
 # ---------------------------------------------------------------------------
+# Task 3007 — filter_stale_bulk_get_statuses_flags wired before dedup_flags
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
+    """filter_stale_bulk_get_statuses_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 3007).
+
+    A stale_bulk_get_statuses_recurrence flag whose live bulk and scoped
+    get_statuses now AGREE on the cited task is dropped before dedup_flags, the
+    stale_bulk_get_statuses_flags_dropped stat is recorded via the same
+    before/after length-diff idiom as stale_count_snapshot_corrections_dropped,
+    and the dropped flag is reclaimed via acknowledge_resolved_flags (no
+    surviving stage1_flag_marker for it).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_agreeing_flag_dropped_stat_set_and_reclaimed(self, mock_deps):
+        """A stale_bulk_get_statuses_recurrence flag whose live bulk/scoped reads
+        agree is dropped before dedup_flags, counted in
+        report.stats['stale_bulk_get_statuses_flags_dropped'], and forwarded to
+        acknowledge_resolved_flags(mode='delete') for marker reclaim.
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', stage.scope.project_root)
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.scope = _scope(stage.scope.project_id, '/proj')
+
+        stale_flag = {'task_id': '2992', 'flag_type': 'stale_bulk_get_statuses_recurrence'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[stale_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        # Live bulk (ids=None) and scoped (ids=[tid]) get_statuses AGREE on 2992,
+        # so the alleged capture-time divergence does not reproduce → DROP.
+        def _statuses(project_root_arg, ids=None, tag=None):
+            return {'2992': 'done'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_statuses = AsyncMock(side_effect=_statuses)
+        # active_flag is stale_metadata; keep its task non-terminal so it survives
+        # filter_terminal_metadata_flags cleanly and is the sole survivor.
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        dedup_call_args: list = []
+
+        async def _dedup_spy(**kwargs):
+            dedup_call_args.append(kwargs.get('flags', []))
+            return kwargs.get('flags', [])
+
+        ack_mock = AsyncMock(return_value=1)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=_dedup_spy,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        # (a) the stale flag must be dropped from the final items_flagged
+        assert stale_flag not in (report.items_flagged or []), (
+            'stale_bulk_get_statuses_recurrence flag must be dropped when the live '
+            'bulk and scoped get_statuses agree on the cited task'
+        )
+        assert active_flag in (report.items_flagged or []), (
+            'the unrelated survivor flag must remain in items_flagged'
+        )
+
+        # (b) the drop must be counted in report.stats (before/after length diff)
+        assert report.stats.get('stale_bulk_get_statuses_flags_dropped') == 1, (
+            'exactly one stale_bulk_get_statuses flag must be counted as dropped'
+        )
+
+        # (c) it must be dropped BEFORE dedup_flags (no marker write/delete churn)
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert stale_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags — dropping it before dedup '
+            'stops the phantom-investigation marker churn'
+        )
+        assert active_flag in dedup_call_args[0], (
+            'the survivor flag must still reach dedup_flags'
+        )
+
+        # (d) the dropped flag must be reclaimed via acknowledge_resolved_flags
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [stale_flag], (
+            'exactly the dropped stale flag (and only it) must be forwarded to '
+            'acknowledge_resolved_flags so its stage1_flag_marker is reclaimed; got '
+            f'{call_kwargs.get("resolved_flags")!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2029 scenario (a) — MemoryConsolidator acknowledges flags dropped by
 # the Stage-1 filter chain via acknowledge_resolved_flags(mode='delete').
 #
