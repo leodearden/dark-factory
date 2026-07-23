@@ -49,7 +49,10 @@ from orchestrator.delivered_checks import (
     verify_delivered_checks_on_main,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
-from orchestrator.deterministic_runner import DeterministicRunner
+from orchestrator.deterministic_runner import (
+    DETERMINISTIC_AGENT_ROLE,
+    DeterministicRunner,
+)
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps
@@ -10016,6 +10019,81 @@ class Harness:
             'Deterministic-recon-sweep: task %s stranded (verdict=%s) — filed '
             'L1 %s (category=%s, suggested_action=%s, no status change)',
             tid, verdict, esc.id, category, suggested_action,
+        )
+
+    async def _recover_stranded_deterministic_gate(
+        self, tid: str, task: dict, metadata: dict,
+    ) -> None:
+        """Recover a stranded deterministic pure-gate / always_escalates GATE (Source A).
+
+        Task 2954: the GATE-strand sibling of
+        ``_recover_stranded_deterministic_task``.  A ``task_kind=='deterministic'``
+        task stamped ``gate_escalated_at`` (proof a born-at-L2 ``milestone_gate``
+        was supposed to be filed by
+        ``DeterministicRunner._file_milestone_gate_and_block``) but its
+        escalation record never landed — lost across a merge-triggered restart
+        or a queue_dir storage/scoping divergence (the failure mode named in
+        ``EscalationQueue.submit``'s docstring).  RE-FILES the born-at-L2 gate
+        mirroring what the runner itself would have filed (same agent_role,
+        level, severity, category, summary/detail/options shape) so the runner's
+        section-1 resume quiescence/resolve-to-done machinery — which scopes its
+        scans on ``DETERMINISTIC_AGENT_ROLE`` — integrates cleanly: a human
+        resolving the re-filed gate drives the task to done exactly as designed.
+
+        Unlike ``_recover_stranded_deterministic_task`` this is a HUMAN-decision
+        gate: there is no target unit, no live systemd health check, and — like
+        that method — it NEVER calls ``set_task_status`` (RE-FILE-NEVER-FLIP;
+        the subject task is already blocked).  The archive-inclusive
+        role-scoped emptiness check that discriminates a genuine strand from a
+        filed+resolved gate is the caller's job
+        (``_run_deterministic_recon_sweep`` Source A), which also self-dedupes
+        across passes.
+        """
+        if self._escalation_queue is None:
+            return
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        title = (task or {}).get('title', '')
+        description = (task or {}).get('description', '')
+        deps = (task or {}).get('dependencies', []) or []
+        dep_ids = [
+            str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
+        ]
+        detail_parts = [description]
+        if dep_ids:
+            detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
+        detail = '\n'.join(detail_parts)
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='milestone_gate',
+            summary=title[:200],
+            detail=detail,
+            options=list(metadata.get('gate_options') or []),
+            level=2,
+        )
+        self._escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=tid,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'milestone_gate',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': 'deterministic-recon-sweep-gate-strand-recovery',
+                },
+            )
+        logger.warning(
+            'Deterministic-recon-sweep: task %s pure-gate strand '
+            '(gate_escalated_at stamped, no escalation record) — re-filed L2 '
+            'milestone_gate %s (agent_role=%s, no status change)',
+            tid, esc.id, DETERMINISTIC_AGENT_ROLE,
         )
 
     async def _revalidate_open_deterministic_escalation(
