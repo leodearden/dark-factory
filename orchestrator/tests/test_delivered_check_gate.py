@@ -1375,6 +1375,12 @@ class TestComputeDeliveredCheckCache:
             if evt == str(EventType.delivered_check_gate_held)
         ]
 
+    def _dcc_key(self, dep_id: str, sha: str, checks: list | None) -> tuple[str, str, str]:
+        """Build the 3-tuple ``_delivered_check_cache`` key (task 2975),
+        using the same digest helper the scheduler uses, for assertions
+        that need to name a specific cache entry below."""
+        return (dep_id, sha, _delivered_checks_descriptor_digest(checks))
+
     # --- (a) no checked deps -> {} and the SHA resolver is NEVER called ----
 
     @pytest.mark.asyncio
@@ -1457,7 +1463,9 @@ class TestComputeDeliveredCheckCache:
         result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert result == {}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'ERRORED must not leave ANY digest-variant cache entry for this dep/sha'
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert self._held_events(scheduler) == []
 
@@ -1499,8 +1507,9 @@ class TestComputeDeliveredCheckCache:
             'the first (and only) dep this sweep must fully resolve despite exceeding budget'
         )
         assert calls == ['cap-a', 'cap-b'], 'both checks must run — forward progress is guaranteed'
-        assert ('20', 'sha1') in scheduler._delivered_check_cache
-        assert scheduler._delivered_check_cache[('20', 'sha1')] is True
+        key = self._dcc_key('20', 'sha1', self._TWO_CHECKS)
+        assert key in scheduler._delivered_check_cache
+        assert scheduler._delivered_check_cache[key] is True
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             'exceeding the per-tick budget for the guaranteed-progress dep must log a WARNING'
         )
@@ -1538,7 +1547,9 @@ class TestComputeDeliveredCheckCache:
 
         assert result == {'20': True}
         assert calls == ['cap-a'], 'the second dep must NOT be evaluated once the budget is spent'
-        assert ('21', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '21' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'the deferred dep must not leave ANY digest-variant cache entry'
 
     # --- (f) cache hit: same-sha re-sweep does NOT re-invoke the runner ----
 
@@ -1593,8 +1604,10 @@ class TestComputeDeliveredCheckCache:
         assert second == {'20': True}
         assert calls2 == ['cap-one'], 'stale-sha cache entry must be pruned, forcing re-invoke'
         assert scheduler._streak_delivered_hold.value('10') == 0
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
-        assert ('20', 'sha2') in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'every sha1-keyed digest variant must be pruned once main advances'
+        assert self._dcc_key('20', 'sha2', self._ONE_CHECK) in scheduler._delivered_check_cache
 
     # --- (h) cached-False dep still holds + emits detail on every sweep ----
 
@@ -1720,9 +1733,9 @@ class TestComputeDeliveredCheckCache:
 
         first = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
         assert first == {'20': False}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache, (
-            'a FAILED result must NOT be cached sticky'
-        )
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'a FAILED result must NOT be cached sticky (any digest variant)'
 
         second = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
@@ -1732,7 +1745,8 @@ class TestComputeDeliveredCheckCache:
         assert calls == ['cap-one', 'cap-one'], (
             'the check must re-run on sweep 2 — it must NOT be served from a sticky-False cache'
         )
-        assert scheduler._delivered_check_cache[('20', 'sha1')] is True, (
+        key = self._dcc_key('20', 'sha1', self._ONE_CHECK)
+        assert scheduler._delivered_check_cache[key] is True, (
             'the monotone-safe DELIVERED result IS now cached'
         )
         assert scheduler._streak_delivered_hold.value('10') == 0, (
@@ -1814,7 +1828,9 @@ class TestComputeDeliveredCheckCache:
         result = await scheduler._compute_delivered_check_cache([task], status_map, tasks_by_id)
 
         assert result == {}
-        assert ('20', 'sha1') not in scheduler._delivered_check_cache
+        assert not any(
+            k[0] == '20' and k[1] == 'sha1' for k in scheduler._delivered_check_cache
+        ), 'a timed-out (ERRORED) check must not leave ANY digest-variant cache entry'
         assert self._held_events(scheduler) == []
         assert scheduler._streak_delivered_hold.value('10') == 0
         assert scheduler._streak_delivered_fail.value(('10', '20')) == 0

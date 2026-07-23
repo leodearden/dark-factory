@@ -1586,22 +1586,31 @@ class Scheduler:
         # failure re-escalate after a resolve), or (b) on an all-DELIVERED
         # tick for that dependent (streak-reset-on-pass).
         self._streak_delivered_fail = StreakCounter(key_fn=lambda k: k[0])
-        # Persistent per-(dep_task_id, main_sha) delivered-check result cache
-        # (task 2580, delta). Keyed by the SHA the check was evaluated
-        # against so a new commit on main naturally self-heals: stale
-        # entries for the previous SHA are pruned by
+        # Persistent per-(dep_task_id, main_sha, descriptor_digest)
+        # delivered-check result cache (task 2580, delta; descriptor-digest
+        # dimension added task 2975). Keyed by the SHA the check was
+        # evaluated against so a new commit on main naturally self-heals:
+        # stale entries for the previous SHA are pruned by
         # _compute_delivered_check_cache once it observes main has moved,
         # forcing a fresh re-evaluation rather than trusting a result that
-        # predates the capability landing. Process-local — an orchestrator
-        # restart is an acceptable implicit reset (mirrors every other
-        # process-local cache above). Only ever holds DELIVERED=True
-        # entries (REFILE of task 2782/2783): True is monotone-safe at a
-        # fixed tree (a capability present at a SHA stays present), but
-        # FAILED is not monotone-safe against the OBSERVATION — a transient
-        # git-grep miss at the same SHA must not wedge the gate — so FAILED
-        # is deliberately never written here and is re-run every sweep (see
+        # predates the capability landing. ALSO keyed by
+        # _delivered_checks_descriptor_digest(checks) — a canonical-JSON
+        # sha256 of the dep's whole metadata.delivered_checks list — so an
+        # operator correcting a check descriptor (pattern/paths/script) at
+        # a FIXED main SHA lands on a different key than a prior sweep's
+        # cached entry: the edit is a cache MISS, forcing re-evaluation on
+        # the very next sweep instead of continuing to serve a verdict
+        # computed against the old descriptor until main happens to advance
+        # (esc-2911-1/2). Process-local — an orchestrator restart is an
+        # acceptable implicit reset (mirrors every other process-local
+        # cache above). Only ever holds DELIVERED=True entries (REFILE of
+        # task 2782/2783): True is monotone-safe at a fixed tree (a
+        # capability present at a SHA stays present), but FAILED is not
+        # monotone-safe against the OBSERVATION — a transient git-grep miss
+        # at the same SHA must not wedge the gate — so FAILED is
+        # deliberately never written here and is re-run every sweep (see
         # the FAILED branch below).
-        self._delivered_check_cache: dict[tuple[str, str], bool] = {}
+        self._delivered_check_cache: dict[tuple[str, str, str], bool] = {}
         # The main SHA the cache above was last pruned/keyed against. None
         # before the first sweep that finds at least one checked dep.
         self._delivered_check_sha: str | None = None
@@ -3107,7 +3116,15 @@ class Scheduler:
         fail_detail_by_dep: dict[str, dict | None] = {}
 
         for dep_id, dep_task in checked_deps.items():
-            cache_key = (dep_id, main_sha)
+            # Read the descriptor and fold its digest into the cache key
+            # BEFORE the cache-hit check (task 2975): an operator editing
+            # metadata.delivered_checks at a fixed main SHA must land on a
+            # DIFFERENT key than the one a prior sweep cached against, so
+            # the edit is a cache MISS (re-evaluate) rather than continuing
+            # to serve a verdict computed against the old descriptor.
+            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+            descriptor_digest = _delivered_checks_descriptor_digest(checks)
+            cache_key = (dep_id, main_sha, descriptor_digest)
             if cache_key in self._delivered_check_cache:
                 # Only the monotone-safe DELIVERED=True result is ever
                 # cached (see the FAILED branch below) — a cache hit is
@@ -3122,7 +3139,6 @@ class Scheduler:
                 self._delivered_check_error_streak.pop(dep_id, None)
                 continue
 
-            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
             # Only the first dep this sweep actually evaluates gets the
