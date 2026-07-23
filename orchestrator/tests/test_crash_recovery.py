@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,13 @@ from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
+    lane_lock_path,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
+)
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 
 
@@ -2128,3 +2136,98 @@ class TestCrashRecoveryPromptNote:
         )
         assert seen['prompt'] == real
         assert seen['prompt'] != CRASH_RECOVERY_RESUME_PROMPT
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksC2Namespace:
+    """C2 namespace invariant in _recover_crashed_tasks (task 2925, beta).
+
+    PRD: docs/prds/merge-worktree-lifecycle-integrity.md §4 Contract C2.
+
+    The crash-recovery sweep must classify each non-lane worktree_base entry
+    by the positive-match namespace rule (classify_worktree_entry) BEFORE the
+    no-plan cleanup heuristic: `_merge-*` is REPORTED to the merge reaper
+    (never removed by the sweep — the 2026-07-22 task/5326 incident, where a
+    persistent `_merge-verify` with a LIVE verify lease was force-removed 21s
+    after a verify was dispatched into it), every other `_`/`.`-prefixed
+    entry is left to its owner, and only a task-id-shaped entry is subject to
+    the existing plan.json/cleanup logic.
+    """
+
+    async def test_infra_and_merge_survive_sweep_only_task_shaped_cleaned(
+        self, harness: Harness, caplog,
+    ):
+        base = harness.git_ops.worktree_base
+
+        # ── Merge band: plant `_merge-verify` (persistent) + `_merge-<uuid>`
+        # each with a LIVE merge-verify lease, faithfully replaying the 5326
+        # timing (a verify holds the lease while the sweep runs). C2 skips
+        # them by NAME, but the live lease future-proofs against any impl
+        # that also consults the lease.
+        merge_verify = base / '_merge-verify'
+        merge_verify.mkdir()
+        merge_uuid = base / '_merge-ba97f10a'
+        merge_uuid.mkdir()
+
+        # ── Infra band: plain infra dirs the sweep must leave to their owner.
+        # `.lane-state`/`.task-meta` are the durable-state dirs whose former
+        # dedicated per-name skip is now SUBSUMED by C2's `.`-prefix rule —
+        # planted here as the regression guard for that removal.
+        infra_dirs = {
+            name: (base / name)
+            for name in (
+                '.reseed-trash', '_mainprobe-x', '.lane-state',
+                '.task-meta', '_offline-deep',
+            )
+        }
+        for d in infra_dirs.values():
+            d.mkdir()
+
+        # ── Task band (positive control): a task-id-shaped PLANLESS dir must
+        # still be cleaned. An inert sweep that skips everything fails HERE.
+        wt_task = base / '999'
+        wt_task.mkdir()
+
+        fd_verify = acquire_merge_verify_flock(lane_lock_path(merge_verify), 5.0)
+        fd_uuid = acquire_merge_verify_flock(lane_lock_path(merge_uuid), 5.0)
+        assert fd_verify is not None and fd_uuid is not None, (
+            'test setup: must be able to acquire both merge-verify leases'
+        )
+        write_lock_holder_pgid(base, os.getpgrp())
+        try:
+            with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+                await harness._recover_crashed_tasks()
+        finally:
+            release_merge_verify_flock(fd_verify)
+            release_merge_verify_flock(fd_uuid)
+            remove_lock_holder_pgid(base)
+
+        # Positive control: the task-shaped planless dir WAS cleaned — and it
+        # is the ONLY cleanup_worktree call (any infra/merge cleanup would
+        # push the count past one, the 5326 "Cleaned up worktree _merge-verify"
+        # regression).
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt_task, '999')  # type: ignore[attr-defined]
+
+        # Explicit regression guard on the cleaned set: no merge/infra path.
+        cleaned_paths = {
+            c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+        }
+        protected = {merge_verify, merge_uuid, *infra_dirs.values()}
+        assert cleaned_paths.isdisjoint(protected), (
+            f'C2 violated — sweep cleaned protected entries: '
+            f'{cleaned_paths & protected}'
+        )
+        # All merge/infra dirs still on disk.
+        for d in protected:
+            assert d.exists(), f'{d.name} must survive the recovery sweep'
+
+        # Skip disposition OBSERVED (not silence): explicit merge-vs-infra
+        # journal lines, per PRD §1 (operators must see an explicit skip/
+        # report line instead of the 5326 "Cleaned up ..." signature).
+        messages = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'reporting to the merge reaper' in messages, messages
+        assert '_merge-verify' in messages and '_merge-ba97f10a' in messages
+        assert 'infra-owned' in messages, messages
+        for name in ('_mainprobe-x', '_offline-deep', '.reseed-trash',
+                     '.lane-state', '.task-meta'):
+            assert name in messages, f'missing explicit skip line for {name}'
