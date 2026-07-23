@@ -375,6 +375,114 @@ class TestWarmLanePoolCensus:
             census.size = 99  # type: ignore[misc]
 
 
+class TestWarmLanePoolCensusClassification:
+    """WarmLanePool.census(is_dispatched, n_quarantined) — pure classification.
+
+    Runs against a bare WarmLanePool (no git).  Per-lane rule:
+      FREE                                   -> n_free
+      ASSIGNED, is_dispatched is None        -> n_unknown_dispatch
+      ASSIGNED, no branch mapping             -> n_unknown_dispatch
+      ASSIGNED, is_dispatched(branch) True   -> n_assigned_dispatched
+      ASSIGNED, is_dispatched(branch) False  -> n_pinned_non_dispatched
+    """
+
+    @staticmethod
+    def _invariant_holds(c: WarmLanePoolCensus) -> bool:
+        return c.size == (
+            c.n_free
+            + c.n_assigned_dispatched
+            + c.n_pinned_non_dispatched
+            + c.n_unknown_dispatch
+        )
+
+    def test_all_free_pool_counts_as_n_free(self, tmp_path: Path):
+        """(a) A pristine pool: n_free == size, every other pool bucket 0."""
+        pool = _make_pool(tmp_path, size=3)
+        census = pool.census(is_dispatched=lambda b: True)
+        assert census.size == 3
+        assert census.n_free == 3
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert census.n_unknown_dispatch == 0
+        assert census.n_quarantined == 0
+        assert self._invariant_holds(census)
+
+    def test_predicate_wired_splits_dispatched_and_pinned(self, tmp_path: Path):
+        """(b) With a wired predicate, dispatched -> n_assigned_dispatched,
+        non-dispatched -> n_pinned_non_dispatched."""
+        pool = _make_pool(tmp_path, size=4)
+        asyncio.run(pool.acquire_for('dispatched-1'))
+        asyncio.run(pool.acquire_for('dispatched-2'))
+        asyncio.run(pool.acquire_for('pinned-1'))
+        # one lane stays FREE
+        dispatched = {'dispatched-1', 'dispatched-2'}
+        census = pool.census(is_dispatched=lambda b: b in dispatched)
+        assert census.size == 4
+        assert census.n_free == 1
+        assert census.n_assigned_dispatched == 2
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 0
+        assert self._invariant_holds(census)
+
+    def test_predicate_none_degrades_all_assigned_to_unknown(self, tmp_path: Path):
+        """(c) predicate None (unwired): every ASSIGNED lane -> n_unknown_dispatch,
+        n_assigned_dispatched == n_pinned_non_dispatched == 0."""
+        pool = _make_pool(tmp_path, size=3)
+        asyncio.run(pool.acquire_for('a'))
+        asyncio.run(pool.acquire_for('b'))
+        census = pool.census(is_dispatched=None)
+        assert census.size == 3
+        assert census.n_free == 1
+        assert census.n_unknown_dispatch == 2
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert self._invariant_holds(census)
+
+    def test_assigned_lane_without_branch_mapping_is_unknown(self, tmp_path: Path):
+        """(d) An ASSIGNED lane with no _assignments entry (try_acquire) has no
+        branch to test -> n_unknown_dispatch, even with a wired predicate."""
+        pool = _make_pool(tmp_path, size=2)
+        lane = asyncio.run(pool.try_acquire())
+        assert lane is not None
+        census = pool.census(is_dispatched=lambda b: True)
+        assert census.size == 2
+        assert census.n_free == 1
+        assert census.n_unknown_dispatch == 1
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert self._invariant_holds(census)
+
+    def test_n_quarantined_passed_through_unchanged(self, tmp_path: Path):
+        """(e) n_quarantined is a pass-through, standing OUTSIDE the size sum."""
+        pool = _make_pool(tmp_path, size=1)
+        census = pool.census(is_dispatched=lambda b: True, n_quarantined=7)
+        assert census.n_quarantined == 7
+        assert self._invariant_holds(census)
+
+    def test_n_quarantined_defaults_to_zero(self, tmp_path: Path):
+        """(e') n_quarantined defaults to 0 when the caller omits it."""
+        pool = _make_pool(tmp_path, size=1)
+        census = pool.census(is_dispatched=lambda b: True)
+        assert census.n_quarantined == 0
+
+    def test_invariant_holds_with_all_four_buckets_populated(self, tmp_path: Path):
+        """(f) The size decomposition holds with free/dispatched/pinned/unknown
+        all populated in one pool."""
+        pool = _make_pool(tmp_path, size=5)
+        asyncio.run(pool.acquire_for('disp'))   # dispatched
+        asyncio.run(pool.acquire_for('pin'))    # pinned (non-dispatched)
+        asyncio.run(pool.try_acquire())         # unknown (no branch mapping)
+        # two lanes remain FREE
+        census = pool.census(is_dispatched=lambda b: b == 'disp', n_quarantined=3)
+        assert census.size == 5
+        assert census.n_free == 2
+        assert census.n_assigned_dispatched == 1
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 1
+        assert census.n_quarantined == 3
+        assert self._invariant_holds(census)
+
+
 # ===========================================================================
 # Step-3: RED — GitOps pool-wiring + warm_lane_base_target_path property
 # ===========================================================================
