@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -79,8 +80,14 @@ from fused_memory.reconciliation.task_filter import (
     render_active_section,
     select_done_since_boundary,
 )
-from fused_memory.services.live_workflow_detector import detect_live_workflow
-from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.services.live_workflow_detector import (
+    corroboration_for_task,
+    detect_live_workflow,
+)
+from fused_memory.services.orchestrator_detector import (
+    is_orchestrator_live_for,
+    orchestrator_started_at,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 try:
@@ -2199,12 +2206,34 @@ def _render_live_workflow_section(
     orchestrator lock also has the signal dropped (task 2409 — closes the
     repeated re-deferral loop this caused for tasks 2335/2196).
 
+    **In-progress corroboration gate (task 2963).** For an ``in-progress`` task
+    whose only live signals are a lingering registered worktree and/or the
+    project-wide orchestrator lock (no ``recent_commit``), a fleet redeploy that
+    KILLED the workflow leaves both those signals falsely asserting liveness.
+    This renderer therefore computes an explicit per-task corroboration verdict
+    (:func:`corroboration_for_task`) for every in-progress task and passes it to
+    the detector as ``corroborated``.  Corroboration requires at least one FRESH
+    per-task signal, ANY sufficient: (1) a live claimant/heartbeat, (2) the
+    task_id present in the scheduler's ``current_holders``/``parks`` snapshot, or
+    (3) a ``routing.latest.decided_at`` newer than the orchestrator's start time
+    (parsed from the lock).  When none corroborates, the detector downgrades the
+    task to ``indeterminate`` (``is_live=False``) and the
+    ``if not liveness.is_live: continue`` below drops it from the section — so a
+    stranded post-redeploy task is no longer reported live, unblocking recon's
+    stranded-remediation path.  The scheduler-state snapshot and the
+    orchestrator start-time are hoisted once per render (like the orchestrator
+    hoist); both are fail-safe → ``None``.  Non-in-progress tasks pass
+    ``corroborated=None`` so the gate stays inert (behavior unchanged).
+
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks
             with a parseable ``id`` are inspected (non-int ids are skipped).
         project_root: Absolute path to the project root, forwarded to the
-            detector.
-        now: Injectable reference time for deterministic tests.
+            detector and used to read the orchestrator lock + scheduler-state
+            snapshot for the in-progress corroboration gate.
+        now: Injectable reference time for deterministic tests.  Also the
+            reference used for the claimant-heartbeat freshness check in the
+            in-progress corroboration gate.
 
     Returns:
         A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
@@ -2225,6 +2254,24 @@ def _render_live_workflow_section(
     kwargs: dict = {} if now is None else {'now': now}
     if project_orch_live is not None:
         kwargs['_orchestrator_live'] = project_orch_live
+
+    # Hoist the per-render corroboration inputs (task 2963), mirroring the
+    # orchestrator hoist above: both the scheduler-state snapshot and the
+    # orchestrator restart-boundary timestamp are constant for this
+    # project_root, so read each once. Both are wrapped fail-safe → None on any
+    # error (corroboration_for_task tolerates None inputs; a None simply means
+    # that corroboration signal cannot fire — never a raise). now_eff is the
+    # reference time threaded into the claimant-freshness check.
+    now_eff = now or datetime.now(UTC)
+    try:
+        scheduler_state: dict | None = read_scheduler_state(Path(project_root))
+    except Exception:
+        scheduler_state = None
+    try:
+        orch_started: datetime | None = orchestrator_started_at(project_root)
+    except Exception:
+        orch_started = None
+
     live_lines: list[str] = []
 
     for task in tasks:
@@ -2235,10 +2282,34 @@ def _render_live_workflow_section(
         raw_metadata = task.get('metadata')
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         task_kind = metadata.get('task_kind')
+
+        # Per-task corroboration gate (task 2963). For an IN-PROGRESS task,
+        # compute an explicit corroboration verdict so the detector can downgrade
+        # a killed-but-lingering task — whose only live signals are a stale
+        # registered worktree and/or the project-wide orchestrator lock (no
+        # recent_commit) — to indeterminate (is_live=False), which the
+        # `if not liveness.is_live: continue` below then drops from the section.
+        # A fresh per-task signal (live claimant/heartbeat, scheduler
+        # holder/park, or a post-restart routing decision) keeps corroborated
+        # True and the task listed. Non-in-progress tasks pass corroborated=None
+        # so the gate stays inert (behavior unchanged). Fail-safe TOWARD live:
+        # any assembler error leaves corroborated=None.
+        corroborated: bool | None = None
+        if task.get('status') == 'in-progress':
+            try:
+                corroborated = corroboration_for_task(
+                    task, task_id, now=now_eff,
+                    scheduler_state=scheduler_state,
+                    orchestrator_started_at=orch_started,
+                )
+            except Exception:
+                corroborated = None
+
         try:
             liveness = detect_live_workflow(
                 task_id, project_root,
-                status=task.get('status'), task_kind=task_kind, **kwargs
+                status=task.get('status'), task_kind=task_kind,
+                corroborated=corroborated, **kwargs
             )
         except Exception:
             logger.warning(
