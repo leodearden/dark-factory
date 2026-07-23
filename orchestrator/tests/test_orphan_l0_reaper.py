@@ -12,7 +12,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import Harness, _has_fresh_dispatch
 from orchestrator.review_checkpoint import ReviewCheckpoint
 
 
@@ -796,6 +796,56 @@ class TestOrphanL0Reaper:
         assert refreshed.status == 'dismissed'
         assert refreshed.resolution is not None
         assert 'Auto-promoted to level 1' in refreshed.resolution
+
+
+class TestHasFreshDispatch:
+    """Task 2931: direct unit coverage of ``_has_fresh_dispatch``'s
+    ``except (ValueError, TypeError)`` fail-open branch.
+
+    The reaper tests (``test_live_lockfree_dispatch_divergence_not_promoted``
+    and ``test_stranded_divergence_still_promoted``) already exercise the
+    fresh / stale / get-task-None / no-routing-key paths indirectly. The
+    unparseable / tz-naive ``decided_at`` branch is NOT covered by them, yet
+    it is exactly the branch that would silently flip the gate from 'defer'
+    to 'promote' — defeating the divergence-FP suppression without any test
+    catching it — if the routing writer's timestamp format ever drifted
+    (a non-ISO string, or a tz-naive stamp on an older Python). Pin the
+    documented fail-safe directly: both malformed inputs must return False
+    (fail open -> the caller promotes).
+    """
+
+    def test_garbage_decided_at_fails_open(self):
+        """A non-ISO / garbage ``decided_at`` raises ValueError inside
+        ``datetime.fromisoformat`` -> caught -> False (fail open)."""
+        task = {
+            'status': 'in-progress',
+            'metadata': {
+                'routing': {'latest': {'decided_at': 'not-a-timestamp'}},
+            },
+        }
+        assert _has_fresh_dispatch(task, datetime.now(UTC), 120.0) is False
+
+    def test_tz_naive_decided_at_fails_open(self):
+        """A tz-naive ``decided_at`` subtracted from a tz-aware ``now`` raises
+        TypeError -> caught -> False (fail open).
+
+        The stamp is deliberately FRESH (5s old, well within the 120s grace),
+        so the ONLY reason for False is the tz mismatch, not staleness — this
+        pins the fail-open branch specifically, not the stale-decision path.
+        """
+        naive_fresh = (
+            (datetime.now(UTC) - timedelta(seconds=5.0))
+            .replace(tzinfo=None)
+            .isoformat()
+        )
+        task = {
+            'status': 'in-progress',
+            'metadata': {
+                'routing': {'latest': {'decided_at': naive_fresh}},
+            },
+        }
+        now = datetime.now(UTC)  # tz-aware
+        assert _has_fresh_dispatch(task, now, 120.0) is False
 
 
 class TestReviewerEscalationPromotion:
