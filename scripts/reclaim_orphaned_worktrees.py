@@ -77,10 +77,14 @@ unlike the flag-marker sweep). It reuses only the PRODUCER's naming FACTS.
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
 import re
 import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,6 +97,15 @@ _LOG_PREFIX = 'reclaim_orphaned_worktrees:'
 # The hardcoded absolute project-root default (drain_check.py / gc_agent_
 # transcripts.py set the precedent). Overridable via --repo.
 DEFAULT_PROJECT_ROOT = '/home/leo/src/dark-factory'
+
+# The quarantine base is a direct sibling of the worktree dir (mirrors
+# GitOps.quarantine_base: ``<worktree_dir>-orphaned``). Derived per-repo in
+# main() as ``<repo>/.worktrees-orphaned`` unless --parking-root overrides it.
+PARKING_ROOT_NAME = '.worktrees-orphaned'
+
+# Default age floor. 48h sits in the task's suggested 48-72h band and clears the
+# ~1h triage-reference window. A NON-POSITIVE floor reclaims NOTHING.
+DEFAULT_MIN_AGE_HOURS = 48.0
 
 # Trailing parking stamp: quarantine_worktree names each parking dir
 # ``<branch>-<%Y%m%dT%H%M%SZ>``; anchor at END so a lane id embedding its own
@@ -524,3 +537,172 @@ def reclaim_worktrees(
             )
             outcome.failed.append(path)
     return outcome
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI arg parser (unit-testable in isolation).
+
+    ``--repo`` defaults to :data:`DEFAULT_PROJECT_ROOT`; ``--parking-root``
+    defaults to ``None`` (derived as ``<repo>/.worktrees-orphaned`` in
+    :func:`main`); ``--min-age-hours`` is the age floor (non-positive => reclaim
+    nothing); ``--check`` is a dry-run flag; ``--now`` overrides the age
+    reference clock (epoch seconds) for deterministic runs.
+    """
+    parser = argparse.ArgumentParser(
+        prog='reclaim_orphaned_worktrees.py',
+        description=(
+            'Periodic verified reclaim of .worktrees-orphaned/ parkings '
+            '(age-floored, safety-preserving, best-effort, LOUD).'
+        ),
+    )
+    parser.add_argument(
+        '--repo',
+        default=DEFAULT_PROJECT_ROOT,
+        help='Repository whose quarantine base is swept (default: %(default)s).',
+    )
+    parser.add_argument(
+        '--parking-root',
+        default=None,
+        help=(
+            'Quarantine base to sweep (default: <repo>/%s).' % PARKING_ROOT_NAME
+        ),
+    )
+    parser.add_argument(
+        '--min-age-hours',
+        type=float,
+        default=DEFAULT_MIN_AGE_HOURS,
+        help=(
+            'Reclaim parkings STRICTLY older than this many hours; a '
+            'NON-POSITIVE value reclaims NOTHING (fail-safe, protecting fresh '
+            'parkings) (default: %(default)s).'
+        ),
+    )
+    parser.add_argument(
+        '--check',
+        action='store_true',
+        help=(
+            'Dry-run: scan + classify + log would-reclaim lines, remove/commit '
+            'nothing, exit 0.'
+        ),
+    )
+    parser.add_argument(
+        '--now',
+        type=float,
+        default=time.time(),
+        help=(
+            'Age reference clock in epoch seconds (default: the current time). '
+            'Pin it for deterministic age-based reclaim in tests.'
+        ),
+    )
+    return parser
+
+
+def build_report(
+    root: Path,
+    now: float,
+    check: bool,
+    min_age_hours: float,
+    scanned: list[ParkedWorktree],
+    decision: ReclaimDecision,
+    outcome: ReclaimOutcome,
+) -> dict:
+    """Assemble the machine-readable JSON report (pure — no I/O).
+
+    ``reclaimed`` is the count actually removed (0 in a dry-run); ``kept`` is the
+    count classified as too-young by the age floor. ``skipped`` / ``failed``
+    carry the best-effort data-loss-guard skips and per-worktree failures — the
+    machine-readable signal (INV-4) a cron/watchdog wrapper reads without
+    alarming on the always-0 exit code.
+    """
+    return {
+        'root': str(root),
+        'now': now,
+        'check': check,
+        'min_age_hours': min_age_hours,
+        'scanned': len(scanned),
+        'kept': len(decision.keep),
+        'reclaimed': len(outcome.reclaimed),
+        'reclaimed_paths': [str(p) for p in outcome.reclaimed],
+        'park_committed': len(outcome.park_committed),
+        'park_committed_paths': [str(p) for p in outcome.park_committed],
+        'skipped': len(outcome.skipped),
+        'skipped_paths': [str(p) for p in outcome.skipped],
+        'failed': len(outcome.failed),
+        'failed_paths': [str(p) for p in outcome.failed],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the sweep: scan → classify → reclaim (or dry-run) → prune, report.
+
+    Best-effort and never-raising by design — the JSON report on stdout and the
+    LOUD summary on stderr carry the signal (including any skips/failures); the
+    process always exits 0 so a nightly timer does not alarm on a routine
+    per-worktree hiccup. ``--check`` never removes/commits. A ``git worktree
+    prune`` runs after real (non-check) removals to clear any stale admin
+    entries.
+    """
+    logging.basicConfig(level=logging.INFO)
+    args = build_parser().parse_args(argv)
+
+    repo = Path(args.repo)
+    parking_root = (
+        Path(args.parking_root)
+        if args.parking_root is not None
+        else repo / PARKING_ROOT_NAME
+    )
+
+    if args.min_age_hours <= 0:
+        logger.warning(
+            '%s --min-age-hours=%s is non-positive; reclaiming NOTHING '
+            '(fail-safe: the age floor is the only protection for fresh '
+            'parkings)',
+            _LOG_PREFIX,
+            args.min_age_hours,
+        )
+
+    scanned = list_parked_worktrees(repo, parking_root)
+    decision = select_reclaimable(scanned, args.now, args.min_age_hours)
+    reclaim_records = [record for record, _reason in decision.reclaim]
+    outcome = reclaim_worktrees(repo, reclaim_records, dry_run=args.check)
+
+    if not args.check:
+        rc, _out, err = _run_git(['worktree', 'prune'], cwd=repo)
+        if rc != 0:
+            logger.warning(
+                '%s `git worktree prune` failed in %s (rc=%s): %s',
+                _LOG_PREFIX,
+                repo,
+                rc,
+                err.strip(),
+            )
+
+    report = build_report(
+        root=parking_root,
+        now=args.now,
+        check=args.check,
+        min_age_hours=args.min_age_hours,
+        scanned=scanned,
+        decision=decision,
+        outcome=outcome,
+    )
+    print(json.dumps(report))
+
+    logger.info(
+        '%s sweep complete — root=%s scanned=%d kept=%d reclaimed=%d '
+        'park_committed=%d skipped=%d failed=%d check=%s',
+        _LOG_PREFIX,
+        parking_root,
+        report['scanned'],
+        report['kept'],
+        report['reclaimed'],
+        report['park_committed'],
+        report['skipped'],
+        report['failed'],
+        args.check,
+    )
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
