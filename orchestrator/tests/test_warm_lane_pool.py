@@ -8,6 +8,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 """
 
 import asyncio
+import dataclasses
 import logging
 from pathlib import Path
 from typing import Any
@@ -372,7 +373,7 @@ class TestWarmLanePoolCensus:
     def test_is_frozen(self):
         """The dataclass is frozen (immutable value object)."""
         census = self._census(size=1, n_free=1)
-        with pytest.raises((AttributeError, Exception)):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             census.size = 99  # type: ignore[misc]
 
 
@@ -3869,6 +3870,60 @@ class TestAssembleWarmLaneCensus:
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
         census = git_ops._assemble_warm_lane_census()
         assert census.n_quarantined == 0
+
+    async def test_pool_disabled_returns_all_zero_census(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(d) Defensive branch: with the pool disabled (warm_lane_pool is None),
+        the assembler returns an all-zero census rather than raising.  The α call
+        sites only reach here with the pool enabled, but the assembler stays
+        total so β/ε can reuse it unconditionally."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=0)
+        assert git_ops.warm_lane_pool is None
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.size == 0
+        assert census.n_free == 0
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert census.n_unknown_dispatch == 0
+        assert census.n_quarantined == 0
+
+    async def test_durable_scan_oserror_reports_zero_and_warns(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, caplog,
+    ):
+        """(e) Defensive branch: an OSError from the durable-record scan is
+        caught — the census reports n_quarantined=0, logs a WARNING, and is
+        still returned.  A disk hiccup must never crash the census and mask the
+        EXHAUSTED signal it decorates (loud-over-silent, but never mis-loud)."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.acquire_for('task-a')
+
+        with (
+            patch.object(
+                git_ops._lane_lifecycle,
+                'all_records',
+                side_effect=OSError('durable store unreadable'),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+        ):
+            census = git_ops._assemble_warm_lane_census()
+
+        # The census is still returned (never raises) with n_quarantined degraded
+        # to 0, while the rest of the pool classification is intact.
+        assert census is not None
+        assert census.n_quarantined == 0
+        assert census.size == 3
+        # Exactly one WARNING names the degraded durable-record scan.
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'could not scan durable lane' in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly one census OSError WARNING, got {warnings}'
+        )
 
 
 # ===========================================================================
