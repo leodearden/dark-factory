@@ -29,6 +29,7 @@ matching rationale at its ``TestLandlockEnforcement`` docstring).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -379,3 +380,26 @@ class TestSandboxEnforcementMatrix:
         assert cache_marker.exists()
         assert 'data_denied' in result.stdout, result.stdout
         assert not data_marker.exists()
+
+    # -- Group 5: ~/.claude narrowing (rows 9/10) -------------------------
+
+    def test_row09_claude_settings_denied(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        original = json.loads(scaffold.settings_json.read_text())
+        poisoned = json.dumps({'pwned': True})
+        result = _run_sandboxed(
+            scaffold,
+            ['/bin/sh', '-c', f"printf '%s' '{poisoned}' > {scaffold.settings_json}"],
+        )
+        assert json.loads(scaffold.settings_json.read_text()) == original
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row10_claude_fleet_allowed(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        target = scaffold.claude_fleet / 'sessions' / 'x'
+        result = _run_sandboxed(
+            scaffold,
+            ['/bin/sh', '-c', f'mkdir -p {target.parent} && printf X > {target}'],
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == 'X'
