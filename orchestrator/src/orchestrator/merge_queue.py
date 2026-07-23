@@ -3969,9 +3969,9 @@ async def coalesce_or_enqueue_merge_request(
             #   • SAME / SUBSET   → COALESCE (fall through to coalesce below;
             #     SUBSET folds stale retries AND patch-id-equivalent rebased
             #     twins, so genuine content is never lost — amendment).
-            #   • SUPERSET queued → REPLACE (drop old, dispatch fresh — the
-            #     atomic release+acquire + C1 scratch clean lands in step-6;
-            #     interim keeps the existing re_snapshot + independent-enqueue).
+            #   • SUPERSET queued → REPLACE (atomic drop-and-reacquire of the
+            #     registry slot + C1 lease-guarded scratch clean, dispatch fresh;
+            #     one live work item per branch — D2).
             #   • SUPERSET verify → REJECT (structured duplicate_in_verify, D3).
             #
             # Atomicity (PRD C3): the ancestry classification (the only await)
@@ -3989,9 +3989,12 @@ async def coalesce_or_enqueue_merge_request(
                 relation = await classify_tip_relation(
                     req.snapshot_tip, entry.snapshot_tip, classifier_git_ops,
                 )
-                if relation is TipRelation.DIVERGENT:
+                original_was_divergent = relation is TipRelation.DIVERGENT
+                if original_was_divergent:
                     # Patch-id containment BEFORE genuine-divergence classification:
-                    # a rebased twin folds to SUBSET → COALESCE (amendment).
+                    # a rebased twin folds to SUBSET → COALESCE (amendment). A
+                    # tip that survives as SUPERSET here is a genuine force-push
+                    # (D2) — logged as a divergence WARNING on the REPLACE arm.
                     relation = await resolve_divergent(
                         req.snapshot_tip, entry.snapshot_tip, classifier_git_ops,
                     )
@@ -4029,21 +4032,80 @@ async def coalesce_or_enqueue_merge_request(
                             verify_age_secs=verify_age,
                         )
                     if action is C3SubmitAction.REPLACE:
-                        # SUPERSET + queued (verify not started).  Interim: keep
-                        # the existing re_snapshot + independent-enqueue dispatch;
-                        # step-6 swaps this for the atomic drop-and-reacquire +
-                        # C1 scratch clean (the true "one work item per branch"
-                        # REPLACE).
-                        registry.re_snapshot(branch, req.snapshot_tip)
-                        logger.info(
-                            'coalesce_or_enqueue_merge_request: SUPERSET (queued) '
-                            'new tip %s ahead of in-flight %s for branch %r; '
-                            'dispatching.',
-                            req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                        # D2: SUPERSET while QUEUED (verify not started) — drop the
+                        # old queued entry and dispatch the new tip, so the branch
+                        # keeps exactly ONE live work item (retires the γ2
+                        # independent-enqueue that kept two).
+                        #
+                        # ATOMIC: no await between the verifying read above and
+                        # this release+acquire, so the worker cannot transition the
+                        # old entry to verifying inside the window.
+                        # release(detach_waiters=True) cancels the old
+                        # primary_future — the worker drops the still-queued item at
+                        # its next _request_abandoned checkpoint (detach() docstring,
+                        # zero worker code change) — and acquire() reclaims the freed
+                        # slot for the new request back-to-back so no concurrent
+                        # merge_request double-dispatches across a free slot.
+                        old_request_id = entry.request_id
+                        old_snapshot_tip = entry.snapshot_tip
+                        registry.release(branch, detach_waiters=True)
+                        registry.acquire(
+                            branch, req.task_id, req.result,
+                            request_id=req.request_id,
+                            source='mcp',
+                            submitted_tip=req.snapshot_tip,
+                            snapshot_tip=req.snapshot_tip,
                         )
-                        await register_and_enqueue_merge_request(
-                            queue, req, event_store, registry, retention=retention,
-                        )
+                        if original_was_divergent:
+                            logger.warning(
+                                'coalesce_or_enqueue_merge_request: REPLACE across '
+                                'DIVERGENT force-push — new tip %s diverges from the '
+                                'dropped queued %s (request_id=%r) for branch %r; '
+                                'replacing (D2).',
+                                req.snapshot_tip[:12],
+                                (old_snapshot_tip or '?')[:12], old_request_id, branch,
+                            )
+                        else:
+                            logger.info(
+                                'coalesce_or_enqueue_merge_request: REPLACE — new tip '
+                                '%s supersedes the dropped queued %s for branch %r; '
+                                'dispatching fresh (D2).',
+                                req.snapshot_tip[:12],
+                                (old_snapshot_tip or '?')[:12], branch,
+                            )
+                        # Slot now held by the new request → the following awaits
+                        # are safe (no free-slot window).  C1: clean the dropped
+                        # queued entry's scratch worktree via the lease-guarded
+                        # primitive (skips rather than yanks a live tree if a verify
+                        # somehow holds the lease).
+                        if git_ops is not None:
+                            wt = await git_ops.find_inflight_merge_worktree(branch)
+                            if wt is not None:
+                                outcome = await git_ops.remove_merge_worktree_guarded(
+                                    wt, reason='c3_replace_drop_queued',
+                                )
+                                if event_store is not None:
+                                    event_store.emit(
+                                        EventType.worktree_reaped,
+                                        task_id=req.task_id,
+                                        phase='merge',
+                                        data={
+                                            'branch': branch,
+                                            'path': str(wt),
+                                            'reason': 'c3_replace_drop_queued',
+                                            'outcome': outcome,
+                                        },
+                                    )
+                        try:
+                            await enqueue_merge_request(
+                                queue, req, event_store, retention=retention,
+                            )
+                        except BaseException:
+                            # Slot-leak guard (mirrors the acquire-and-enqueue tail):
+                            # release the freshly-claimed slot if the enqueue fails
+                            # before the worker can ever resolve req.result.
+                            registry.release(branch)
+                            raise
                         return MergeDispatchResult(
                             dispatched=True, in_flight=False, branch=branch,
                         )
