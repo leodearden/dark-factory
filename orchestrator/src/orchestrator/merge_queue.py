@@ -3813,6 +3813,50 @@ def _inflight_entry_is_stale(
         return not any(e.get('branch') == branch for e in entries)
 
 
+def _snapshot_verify_state(
+    live_snapshot: Callable[[], dict] | None,
+    request_id: str | None,
+) -> tuple[bool, int | None]:
+    """Read the in-verify signal for *request_id* from the live worker snapshot.
+
+    Returns ``(verifying, verify_age_secs)``:
+
+    - *verifying* is True iff the snapshot entry matching *request_id* by
+      ``request_id`` carries a non-None ``verify_started_at`` — i.e. the worker
+      has begun verifying that slot (``SpeculativeMergeWorker.snapshot()`` sets
+      ``verify_started_at`` only on ``_inflight`` entries).
+    - *verify_age_secs* is the integer age of that verify (from the snapshot
+      entry's ``verify_age_secs``), or None when unknown.
+
+    This is the in-scope, in-production "in verify" signal consumed by the C3
+    submit gate (the registry is not yet threaded into the worker to flip
+    ``entry.verifying`` — γ3/task 1641); the gate ORs the returned *verifying*
+    with ``entry.verifying`` so a unit test can drive the flag directly and a
+    future worker-side wiring composes.
+
+    Fail-safe to ``(False, None)`` — no provider wired, a raising or malformed
+    snapshot, or an unmatched request_id all read as NOT verifying (mirrors
+    :func:`_inflight_entry_is_stale`'s trust-the-registry-on-doubt philosophy;
+    ``entry.verifying`` remains the fallback signal).  Synchronous (no await)
+    so the caller can read it inside the atomic decision block.
+    """
+    if live_snapshot is None or request_id is None:
+        return (False, None)
+    try:
+        snap = live_snapshot()
+    except Exception:
+        return (False, None)
+    if not isinstance(snap, dict) or 'entries' not in snap:
+        return (False, None)
+    for e in snap['entries']:
+        if e.get('request_id') == request_id:
+            if e.get('verify_started_at') is None:
+                return (False, None)
+            age = e.get('verify_age_secs')
+            return (True, int(age) if age is not None else None)
+    return (False, None)
+
+
 async def coalesce_or_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
@@ -3874,14 +3918,28 @@ async def coalesce_or_enqueue_merge_request(
 
     *classifier_git_ops* (keyword-only, default None): when provided AND both
     ``entry.snapshot_tip`` and ``req.snapshot_tip`` are set, the registry
-    fast-path classifies the tip relation via :func:`resolve_attach_action`
-    before coalescing.  On SUPERSET (the new submission is strictly ahead of
-    the in-flight snapshot), the request is independent-enqueued via
-    :func:`register_and_enqueue_merge_request` (which enqueues even when the
-    slot is held) and ``dispatched=True`` is returned — mirroring workflow.py's
-    ATTACH_AND_CHAIN path.  On RESNAPSHOT, :meth:`InFlightMergeRegistry.re_snapshot`
-    is also called before enqueueing.  SAME/SUBSET fall through to the existing
-    unconditional coalesce.  When absent or either snapshot_tip is None, the
+    fast-path runs the SHA-sensitive **C3 submit-identity gate** (PRD
+    merge-worktree-lifecycle-integrity §4 C3 / §5 D1-D3) before coalescing.
+    The tip relation is classified via :func:`classify_tip_relation` (then
+    :func:`resolve_divergent` for a DIVERGENT tip, folding patch-id-equivalent
+    rebased twins to SUBSET) and mapped by :func:`decide_c3_submit_action`
+    against the "in verify" signal (``entry.verifying`` OR the live-snapshot
+    ``verify_started_at`` — see :func:`_snapshot_verify_state`):
+
+      • SAME / SUBSET → COALESCE (fall through to the unconditional coalesce;
+        never a second work item, incl. same-SHA-while-verifying — D1).
+      • SUPERSET while QUEUED (verify not started) → REPLACE: dispatch the new
+        tip (``dispatched=True``).  The atomic drop-and-reacquire + C1 scratch
+        clean lands in step-6; the interim keeps the pre-C3 re_snapshot +
+        independent-enqueue.
+      • SUPERSET while IN VERIFY → REJECT: return a rejected
+        :class:`MergeDispatchResult` (``rejected=True``,
+        ``reject_code='duplicate_in_verify'``, ``existing_sha`` / ``verify_age_secs``
+        from the in-flight entry) leaving the live entry UNDISTURBED (D3).
+
+    The verify-started read and the replace/reject decision are ATOMIC with the
+    registry mutation — the only await (ancestry classification) precedes them
+    and performs no mutation.  When absent or either snapshot_tip is None, the
     gate is a no-op and the path preserves current behaviour (back-compat).
     The disk-scan cross-process coalesce branch is intentionally left untouched.
     """
@@ -3902,84 +3960,119 @@ async def coalesce_or_enqueue_merge_request(
             registry.release(branch, detach_waiters=True)
             # Fall through to the acquire-and-enqueue block below.
         else:
-            # ── Tip-recency check (γ2/γ3 consumer wiring) ─────────────────
+            # ── C3 submit-identity gate (PRD §4 C3 / §5 D1-D3) ────────────
             # When classifier_git_ops is wired AND both snapshot tips are
-            # known, classify the relation using the shared resolve_attach_action
-            # helper (same classification decision as workflow.py — the two
-            # paths cannot diverge on *which* action class is returned).
+            # known, classify the tip relation and route the submission
+            # SHA-sensitively (retires the γ2 RESNAPSHOT/ATTACH_AND_CHAIN
+            # independent-enqueue disposition, which kept TWO work items per
+            # branch — the exact double-dispatch C3 fixes):
+            #   • SAME / SUBSET   → COALESCE (fall through to coalesce below;
+            #     SUBSET folds stale retries AND patch-id-equivalent rebased
+            #     twins, so genuine content is never lost — amendment).
+            #   • SUPERSET queued → REPLACE (drop old, dispatch fresh — the
+            #     atomic release+acquire + C1 scratch clean lands in step-6;
+            #     interim keeps the existing re_snapshot + independent-enqueue).
+            #   • SUPERSET verify → REJECT (structured duplicate_in_verify, D3).
             #
-            # Action handling is intentionally different from the workflow path:
-            #   • RESNAPSHOT: re_snapshot + independent-enqueue via
-            #     register_and_enqueue_merge_request (dispatched=True, no alias).
-            #     The old in-flight is NOT cancelled or replaced; it continues
-            #     and typically lands first.  The second item (the new tip) will
-            #     then resolve to already_merged — a redundant but benign extra
-            #     merge+verify pass.  The non-blocking MCP path cannot attach the
-            #     new request as a peer waiter (as the workflow path does) because
-            #     that requires a live Future reference not available in the MCP
-            #     call stack.
-            #   • ATTACH_AND_CHAIN: independent-enqueue (same as workflow path).
-            #   • COALESCE / ATTACH_CONTAINMENT (SAME/SUBSET): fall through to
-            #     the unconditional coalesce below (back-compat).
+            # Atomicity (PRD C3): the ancestry classification (the only await)
+            # runs first and is pure/no-mutation; the verifying read + decision
+            # then run in ONE synchronous block with no await between the read
+            # and any registry mutation, so the worker cannot transition the
+            # entry to verifying inside the decision window.
             if (
                 classifier_git_ops is not None
                 and entry is not None
                 and entry.snapshot_tip is not None
                 and req.snapshot_tip is not None
             ):
-                attach_action = await resolve_attach_action(
-                    req.snapshot_tip, entry.snapshot_tip,
-                    verifying=entry.verifying,
-                    git_ops=classifier_git_ops,
+                # (1) Ancestry classification — the ONLY await; pure, no mutation.
+                relation = await classify_tip_relation(
+                    req.snapshot_tip, entry.snapshot_tip, classifier_git_ops,
                 )
-                if attach_action is AttachAction.RESNAPSHOT:
-                    registry.re_snapshot(branch, req.snapshot_tip)
-                    logger.info(
-                        'coalesce_or_enqueue_merge_request: RESNAPSHOT — '
-                        'new tip %s is SUPERSET of in-flight %s for branch %r; '
-                        'independent-enqueue with snapshot update.',
-                        req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                if relation is TipRelation.DIVERGENT:
+                    # Patch-id containment BEFORE genuine-divergence classification:
+                    # a rebased twin folds to SUBSET → COALESCE (amendment).
+                    relation = await resolve_divergent(
+                        req.snapshot_tip, entry.snapshot_tip, classifier_git_ops,
                     )
-                    await register_and_enqueue_merge_request(
-                        queue, req, event_store, registry, retention=retention,
+                # (2) Atomic decision block — NO await between the verifying read
+                #     and any registry mutation.  The slot may have released
+                #     during the await above; re-fetch and fall through to a
+                #     fresh dispatch (section 2/3) when it did.
+                entry = registry.entry(branch)
+                if entry is not None:
+                    snap_verifying, verify_age = _snapshot_verify_state(
+                        live_snapshot, entry.request_id,
                     )
-                    return MergeDispatchResult(
-                        dispatched=True, in_flight=False, branch=branch,
-                    )
-                elif attach_action is AttachAction.ATTACH_AND_CHAIN:
-                    logger.info(
-                        'coalesce_or_enqueue_merge_request: ATTACH_AND_CHAIN — '
-                        'new tip %s is SUPERSET of verifying in-flight %s for branch %r; '
-                        'independent-enqueue for own merge+verify.',
-                        req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
-                    )
-                    await register_and_enqueue_merge_request(
-                        queue, req, event_store, registry, retention=retention,
-                    )
-                    return MergeDispatchResult(
-                        dispatched=True, in_flight=False, branch=branch,
-                    )
-                # COALESCE or ATTACH_CONTAINMENT → fall through to coalesce.
+                    verifying = snap_verifying or entry.verifying
+                    action = decide_c3_submit_action(relation, verifying=verifying)
+                    if action is C3SubmitAction.REJECT:
+                        # D3: a newer SHA cannot supersede an IN-VERIFY twin —
+                        # reject structurally, leaving the live entry UNDISTURBED.
+                        logger.warning(
+                            'coalesce_or_enqueue_merge_request: REJECT '
+                            'duplicate_in_verify — new tip %s is ahead of the '
+                            'IN-VERIFY in-flight %s (request_id=%r) for branch %r; '
+                            'merge_cancel then resubmit.',
+                            req.snapshot_tip[:12], entry.snapshot_tip[:12],
+                            entry.request_id, branch,
+                        )
+                        return MergeDispatchResult(
+                            dispatched=False,
+                            in_flight=False,
+                            branch=branch,
+                            rejected=True,
+                            reject_code=_C3_DUPLICATE_IN_VERIFY_CODE,
+                            inflight_task_id=entry.task_id,
+                            inflight_request_id=entry.request_id,
+                            existing_sha=entry.snapshot_tip,
+                            verify_age_secs=verify_age,
+                        )
+                    if action is C3SubmitAction.REPLACE:
+                        # SUPERSET + queued (verify not started).  Interim: keep
+                        # the existing re_snapshot + independent-enqueue dispatch;
+                        # step-6 swaps this for the atomic drop-and-reacquire +
+                        # C1 scratch clean (the true "one work item per branch"
+                        # REPLACE).
+                        registry.re_snapshot(branch, req.snapshot_tip)
+                        logger.info(
+                            'coalesce_or_enqueue_merge_request: SUPERSET (queued) '
+                            'new tip %s ahead of in-flight %s for branch %r; '
+                            'dispatching.',
+                            req.snapshot_tip[:12], entry.snapshot_tip[:12], branch,
+                        )
+                        await register_and_enqueue_merge_request(
+                            queue, req, event_store, registry, retention=retention,
+                        )
+                        return MergeDispatchResult(
+                            dispatched=True, in_flight=False, branch=branch,
+                        )
+                    # C3SubmitAction.COALESCE → fall through to coalesce below.
 
-            eta = registry.eta_seconds(branch)
-            # Coalescing onto a LIVE in-flight entry: register the caller's
-            # request_id as an alias onto the primary entry's request_id, so a
-            # poll on the coalesced id resolves to the primary terminal outcome
-            # (the coalesced request never gets its own terminal record).  Only
-            # in this branch — the stale path above reaps the slot and dispatches
-            # a fresh request that gets its own terminal record.
-            if retention is not None and entry is not None and entry.request_id is not None:
-                retention.record_alias(req.request_id, entry.request_id)
-            _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
-            return MergeDispatchResult(
-                dispatched=False,
-                in_flight=True,
-                branch=branch,
-                inflight_task_id=entry.task_id if entry else None,
-                eta_seconds=eta,
-                source='registry',
-                inflight_request_id=entry.request_id if entry else None,
-            )
+            # Coalesce (SAME/SUBSET, back-compat no-classifier, or gate skipped).
+            # Guarded on `entry is not None`: if the slot released during the
+            # classification await above, fall through to section 2/3 for a
+            # fresh dispatch rather than coalescing onto a gone entry.
+            if entry is not None:
+                eta = registry.eta_seconds(branch)
+                # Coalescing onto a LIVE in-flight entry: register the caller's
+                # request_id as an alias onto the primary entry's request_id, so a
+                # poll on the coalesced id resolves to the primary terminal outcome
+                # (the coalesced request never gets its own terminal record).  Only
+                # in this branch — the stale path above reaps the slot and dispatches
+                # a fresh request that gets its own terminal record.
+                if retention is not None and entry.request_id is not None:
+                    retention.record_alias(req.request_id, entry.request_id)
+                _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
+                return MergeDispatchResult(
+                    dispatched=False,
+                    in_flight=True,
+                    branch=branch,
+                    inflight_task_id=entry.task_id,
+                    eta_seconds=eta,
+                    source='registry',
+                    inflight_request_id=entry.request_id,
+                )
 
     # ── 2. On-disk worktree scan (crash-safety / cross-actor) ──────────
     if git_ops is not None:
