@@ -2,7 +2,7 @@
 
 Task 2165: ``OutcomeKind(StrEnum)`` is the enumerated contract for the
 ``data['outcome']`` values emitted by ``_emit_merge_attempt`` (merge_queue.py).
-These tests pin: the exact 21-member vocabulary, str-compatibility (existing
+These tests pin: the exact 22-member vocabulary, str-compatibility (existing
 ``==``/``in``/json comparisons must keep working unchanged), the
 ``is_terminal`` classification, byte-identical payloads through the real
 ``EventStore`` emit chokepoint, and the non-terminal set as a frozen contract
@@ -22,7 +22,7 @@ from orchestrator.event_store import EventStore
 from orchestrator.merge_queue import _emit_merge_attempt
 from orchestrator.merge_types import OutcomeKind
 
-# The exact 21-member vocabulary emitted through _emit_merge_attempt (see its
+# The exact 22-member vocabulary emitted through _emit_merge_attempt (see its
 # docstring at merge_queue.py:1363 and plans/dashboard-alignment-prd.md).
 # 'blocked' is intentionally excluded: bare-infrastructure 'blocked' outcomes
 # are documented as NOT emitted by _emit_merge_attempt.
@@ -32,8 +32,8 @@ _EXPECTED_VALUES = {
     'abandoned_verify_timeouts', 'train_incomplete', 'train_rebase_conflict',
     'train_partial_flip', 'cas_exhausted', 'main_health_red',
     'post_merge_equivalence_failed', 'post_merge_pyright_broken',
-    'plan_files_not_touched', 'plan_files_narrowed', 'cas_retry',
-    'gate_retry', 'post_merge_generation_chained',
+    'plan_files_not_touched', 'plan_files_narrowed', 'plan_files_cross_repo',
+    'cas_retry', 'gate_retry', 'post_merge_generation_chained',
 }
 
 # Attempt continues / merge is still live for these four — see design
@@ -44,7 +44,7 @@ _NON_TERMINAL_VALUES = {
 
 
 class TestOutcomeKindVocabulary:
-    """The enum's value set is exactly the 21-member _emit_merge_attempt vocabulary."""
+    """The enum's value set is exactly the 22-member _emit_merge_attempt vocabulary."""
 
     def test_value_set_is_exact(self) -> None:
         assert {m.value for m in OutcomeKind} == _EXPECTED_VALUES
@@ -80,10 +80,18 @@ class TestOutcomeKindIsTerminal:
 
     def test_terminal_members_are_terminal(self) -> None:
         terminal_values = _EXPECTED_VALUES - _NON_TERMINAL_VALUES
-        assert len(terminal_values) == 17
+        assert len(terminal_values) == 18
         for value in terminal_values:
             member = OutcomeKind(value)
             assert member.is_terminal is True, f'{member!r} should be terminal'
+
+    def test_plan_files_cross_repo_is_terminal(self) -> None:
+        """The new cross-repo outcome is TERMINAL (ends the merge attempt) and
+        stays OUT of the non-terminal frozen set, so the dashboard
+        ``_ACTIVE_ONLY`` mirror + ``TestOutcomeKindFrozenContract`` are
+        unaffected."""
+        assert OutcomeKind('plan_files_cross_repo').is_terminal is True
+        assert 'plan_files_cross_repo' not in _NON_TERMINAL_VALUES
 
 
 class TestOutcomeKindPayloadIdentity:
