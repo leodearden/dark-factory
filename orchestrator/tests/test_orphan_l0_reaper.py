@@ -25,6 +25,9 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     mock_orch_config.orphan_l0_reaper_enabled = True
     mock_orch_config.orphan_l0_timeout_secs = 60.0
     mock_orch_config.orphan_l0_check_interval_secs = 1.0
+    # Task 2931: crisp test grace for the divergence-class routing.latest
+    # freshness gate, decoupled from the 300.0 source default.
+    mock_orch_config.orphan_l0_dispatch_freshness_secs = 120.0
 
     with (
         patch('orchestrator.harness.McpLifecycle'),
@@ -39,6 +42,16 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # semantics are preserved for every test in this file; tests exercising
     # the live-recheck gate override this explicitly.
     h.scheduler.is_actively_held = MagicMock(return_value=False)
+
+    # Task 2931: once the reaper consults get_task for the divergence class
+    # (step-2), divergence tests that don't stub get_task (notably
+    # test_genuine_orphan_with_divergence_still_promoted) would otherwise hit
+    # an un-awaitable MagicMock. Default to a benign no-routing.latest return
+    # (never fresh -> promote), mirroring task 2878's is_actively_held default.
+    # Tests exercising fresh/stale dispatch override this explicitly.
+    h.scheduler.get_task = AsyncMock(
+        return_value={'status': 'in-progress', 'metadata': {}},
+    )
 
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     return h
