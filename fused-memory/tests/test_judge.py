@@ -918,6 +918,42 @@ async def test_initialize_rehydrates_halt_state(mock_journal):
     assert judge.unhalt_grace_remaining('grace-proj') == 2
 
 
+class TestJudgeCooldownExpired:
+    """Judge.cooldown_expired(project_id) — the harness uses this to decide
+    auto-resume-after-cooldown when auto_unhalt_after_cooldown is enabled
+    (task 2920 deliverable c). True iff the project is halted AND a
+    cooldown_until is recorded AND it is now in the past."""
+
+    def test_true_when_halted_and_cooldown_in_past(self, mock_journal):
+        from datetime import timedelta
+
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+        judge._halted_projects.add('proj')
+        judge._halt_cooldown_until['proj'] = datetime.now(UTC) - timedelta(hours=1)
+        assert judge.cooldown_expired('proj') is True
+
+    def test_false_when_halted_but_cooldown_in_future(self, mock_journal):
+        from datetime import timedelta
+
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+        judge._halted_projects.add('proj')
+        judge._halt_cooldown_until['proj'] = datetime.now(UTC) + timedelta(hours=1)
+        assert judge.cooldown_expired('proj') is False
+
+    def test_false_when_not_halted_even_with_stale_cooldown(self, mock_journal):
+        from datetime import timedelta
+
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+        # A stale cooldown row exists but the project is NOT halted.
+        judge._halt_cooldown_until['proj'] = datetime.now(UTC) - timedelta(hours=1)
+        assert judge.cooldown_expired('proj') is False
+
+    def test_false_when_halted_but_no_cooldown_recorded(self, mock_journal):
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+        judge._halted_projects.add('proj')  # no _halt_cooldown_until entry
+        assert judge.cooldown_expired('proj') is False
+
+
 # ---------------------------------------------------------------------------
 # Delegation to invoke_with_cap_retry
 # ---------------------------------------------------------------------------
