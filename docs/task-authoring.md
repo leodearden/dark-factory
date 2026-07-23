@@ -130,6 +130,41 @@ callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
 
+### Terminal-task write freeze (recon-stage boundary)
+
+Reconciliation-stage agents (`agent_id` prefixed `recon-stage-`) may **not**
+write to a terminal (`done`/`cancelled`) task via `update_task`. The
+server-side guard (`fused_memory.middleware.recon_write_policy`) rejects such a
+write with `ReconTerminalWriteRejected`. Only three narrow, sanctioned
+exemptions exist:
+
+- **The same-status `done_provenance` repair seam** — `set_task_status(id,
+  'done', done_provenance={...})` on an already-`done` task, routed to
+  `TaskInterceptor._repair_done_provenance_same_status`. It writes
+  `done_provenance` **only**, and validates it (`kind` enum + `git merge-base
+  --is-ancestor`); it cannot touch any other field.
+- **`CLEARABLE_ANNOTATION_KEYS` clears** — a merge-mode clear of a
+  non-load-bearing advisory annotation (e.g. `possible_scope_mismatch`).
+- **`x_`-prefixed annotation adds** — a merge-mode add of forward-compat
+  `x_`-namespaced annotation keys.
+
+There is intentionally **no** recon-stage corrective path for load-bearing
+string content fields (`details`, `description`, `title`, `prompt`,
+`priority`, `dependencies`). This is a permanent, intentional **human-gate
+boundary, not a bug**: unlike `done_provenance` — a structured, schema- and
+git-ancestor-validated evidence field with a mechanical ground truth (the
+commit SHA) whose same-status repair seam can therefore be safely
+auto-authorized even for a recon-stage caller — these fields are free-form
+prose whose "correct" replacement is a human judgment call, exactly what the
+terminal-write human gate protects. A recon stage must never self-authorize
+such a correction.
+
+When a terminal task's `details` (or another content field) is stale or wrong,
+**file a human-gated workaround task** to correct it rather than re-diagnosing
+the `ReconTerminalWriteRejected` rejection. Both prior recurrences were
+resolved this way: `autopilot_video` 544 was documented-as-artifact, and the
+644/650 pair went through a human-gated workaround task.
+
 ---
 
 ## 3. Dependencies
