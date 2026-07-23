@@ -270,3 +270,34 @@ class TestSandboxEnforcementMatrix:
         result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
         assert not target.exists()
         _assert_denied(result, side_effect_verified=True)
+
+    # -- Group 3: git operations (rows 2/6/12) ----------------------------
+
+    def test_row02_worktree_commit_allowed(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        result = _run_sandboxed(scaffold, ['git', 'commit', '-m', 'row2 test commit'])
+        assert result.returncode == 0, result.stderr
+        new_head = _git(['rev-parse', 'HEAD'], scaffold.worktree)
+        assert new_head != scaffold.main_sha
+        branch_ref = _git(['rev-parse', f'refs/heads/task/{scaffold.name}'], scaffold.main)
+        assert branch_ref == new_head
+
+    def test_row06_update_ref_main_denied(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        result = _run_sandboxed(
+            scaffold, ['git', 'update-ref', 'refs/heads/main', scaffold.main_sha],
+        )
+        after = _git(['rev-parse', 'refs/heads/main'], scaffold.main)
+        assert after == scaffold.main_sha
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row12_commit_clean_with_gc_disabled(self, landlock_matrix_scaffold):
+        scaffold = landlock_matrix_scaffold
+        result = _run_sandboxed(scaffold, ['git', 'commit', '-m', 'row12 test commit'])
+        assert result.returncode == 0, result.stderr
+        noise_tokens = (
+            'maintenance', 'gc.log', 'Permission denied',
+            'Read-only file system', 'Operation not permitted',
+        )
+        for token in noise_tokens:
+            assert token not in result.stderr, result.stderr
