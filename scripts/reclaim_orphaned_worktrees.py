@@ -79,7 +79,9 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 logger = logging.getLogger('reclaim_orphaned_worktrees')
 
@@ -120,3 +122,84 @@ def parse_parking_dir_name(name: str) -> datetime | None:
         )
     except ValueError:
         return None
+
+
+@dataclass
+class ParkedWorktree:
+    """One registered worktree under the quarantine base (a parking).
+
+    ``path`` is its resolved on-disk location; ``branch`` is the local branch it
+    has checked out (``None`` if detached / unresolvable in
+    ``git worktree list --porcelain``); ``parked_at`` is the tz-aware UTC parking
+    time parsed from the dir basename's trailing stamp. Pure value object.
+    """
+
+    path: Path
+    branch: str | None
+    parked_at: datetime
+
+
+@dataclass
+class ReclaimDecision:
+    """Classification of scanned parkings into keep / reclaim sets.
+
+    ``keep`` is the list of retained :class:`ParkedWorktree` records. ``reclaim``
+    pairs each eligible record with its reason (currently always ``age``). Pure
+    value object — no I/O.
+    """
+
+    keep: list[ParkedWorktree] = field(default_factory=list)
+    reclaim: list[tuple[ParkedWorktree, str]] = field(default_factory=list)
+
+    @property
+    def keep_paths(self) -> set[Path]:
+        """Set of retained parking paths."""
+        return {record.path for record in self.keep}
+
+    @property
+    def reclaim_paths(self) -> set[Path]:
+        """Set of reclaimable parking paths."""
+        return {record.path for record, _reason in self.reclaim}
+
+    @property
+    def reasons(self) -> dict[Path, str]:
+        """Map each reclaimable parking path to its reason."""
+        return {record.path: reason for record, reason in self.reclaim}
+
+
+def select_reclaimable(
+    records: list[ParkedWorktree],
+    now: float,
+    min_age_hours: float,
+) -> ReclaimDecision:
+    """Classify parkings into keep / reclaim by the age FLOOR (pure).
+
+    A parking is reclaimed when its age (``now - parked_at``, both in epoch
+    seconds) is STRICTLY greater than ``min_age_hours * 3600`` — a parking
+    sitting exactly on the floor is KEPT (strict ``>``, not ``>=``), and one
+    second older is reclaimed. The reclaim reason is always ``age``.
+
+    A NON-POSITIVE ``min_age_hours`` reclaims NOTHING (every record kept): here
+    the age floor is the ONLY protection against reclaiming an in-flight
+    parking, so a mis-set ``0``/negative floor must be a safe no-op — the
+    OPPOSITE of gc_agent_transcripts' "non-positive disables the axis". The
+    accompanying LOUD warning is emitted by :func:`main` (the single
+    argument-resolution site), keeping this classifier pure.
+
+    Output ordering is deterministic (oldest parking first, path as tiebreak)
+    regardless of input order.
+    """
+    ordered = sorted(records, key=lambda r: (r.parked_at.timestamp(), str(r.path)))
+    if min_age_hours <= 0:
+        return ReclaimDecision(keep=list(ordered), reclaim=[])
+
+    floor_seconds = min_age_hours * 3600
+    keep: list[ParkedWorktree] = []
+    reclaim: list[tuple[ParkedWorktree, str]] = []
+    for record in ordered:
+        age_seconds = now - record.parked_at.timestamp()
+        if age_seconds > floor_seconds:
+            reclaim.append((record, 'age'))
+        else:
+            keep.append(record)
+    return ReclaimDecision(keep=keep, reclaim=reclaim)
