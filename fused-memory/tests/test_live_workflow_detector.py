@@ -1249,3 +1249,159 @@ class TestCorroborationForTask:
             task, _CORROB_TASK_ID, now=_CORROB_NOW,
             scheduler_state=None, orchestrator_started_at=None,
         ) is False
+
+
+class TestCorroborationGate:
+    """detect_live_workflow's in-progress corroboration gate + the new
+    WorkflowLiveness.indeterminate field (task 2963)."""
+
+    _NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)
+
+    def _side_effect(
+        self,
+        *,
+        worktree_branch: bool = True,
+        log_rc: int = 1,
+        log_stdout: str = '',
+        revlist_stdout: str = '1',
+        revlist_rc: int = 0,
+    ):
+        """Drive the three git subprocess signals independently.
+
+        ``worktree_branch``: whether the porcelain output lists ``task/<id>``
+        (a LIVE, non-prunable worktree). ``log_rc``/``log_stdout``: the git-log
+        recent-commit probe. ``revlist_stdout``: the branch's own-commit count
+        (``'1'`` = non-bare, keeps rule-4 inert so the orchestrator signal is
+        reported honestly).
+        """
+        worktree_stdout = (
+            _worktree_porcelain_with_branch(_BRANCH)
+            if worktree_branch
+            else _worktree_porcelain_no_branch()
+        )
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=worktree_stdout, stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=log_rc, stdout=log_stdout, stderr='',
+            )
+
+        return side_effect
+
+    def test_gate_fires_worktree_only_uncorroborated(self, tmp_path):
+        """in-progress, worktree-only (recent_commit False), corroborated=False
+        → is_live False, indeterminate True, raw signals preserved."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert result.worktree_registered is True  # raw detection preserved
+        assert result.recent_commit is False
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_gate_fires_orchestrator_only_uncorroborated(self, tmp_path):
+        """in-progress, orchestrator-lock-only (no worktree, non-bare branch),
+        corroborated=False → is_live False, indeterminate True, orchestrator
+        signal still reported honestly."""
+        side = self._side_effect(worktree_branch=False, log_rc=1, revlist_stdout='1')
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', _orchestrator_live=True, corroborated=False,
+            )
+        assert result.worktree_registered is False
+        assert result.orchestrator_live is True  # raw detection preserved
+        assert result.recent_commit is False
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_gate_inert_when_corroborated_true(self, tmp_path):
+        """corroborated=True keeps the task live (indeterminate False)."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=True,
+            )
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_gate_inert_when_corroborated_none_default(self, tmp_path):
+        """corroborated=None (default) is backward-compatible — existing behavior."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, status='in-progress',
+            )
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_recent_commit_exempt_from_gate(self, tmp_path):
+        """A recent commit is genuine per-task evidence — gate does not fire."""
+        recent_ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side = self._side_effect(
+            worktree_branch=False, log_rc=0, log_stdout=recent_ts, revlist_stdout='1',
+        )
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert result.recent_commit is True
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    @pytest.mark.parametrize('status', ['pending', 'review', 'merge-deferred'])
+    def test_gate_is_in_progress_only(self, tmp_path, status):
+        """Non-in-progress statuses are never gated, even worktree-only + corroborated=False."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status=status, corroborated=False,
+            )
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
+        """All signals False (nothing to downgrade) → is_live False AND indeterminate
+        False — distinct from the gated indeterminate case."""
+        side = self._side_effect(worktree_branch=False, log_rc=1, revlist_stdout='1')
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+        assert result.indeterminate is False
+
+    def test_is_workflow_live_for_task_forwards_corroborated(self, tmp_path):
+        """The convenience wrapper threads corroborated through **kwargs."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+        assert live is False
+
+    def test_indeterminate_defaults_false_on_normal_live(self, tmp_path):
+        """A normal live result (no status/corroborated) has indeterminate False."""
+        side = self._side_effect(worktree_branch=True, log_rc=1)
+        with patch('subprocess.run', side_effect=side):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+        assert result.is_live is True
+        assert result.indeterminate is False
