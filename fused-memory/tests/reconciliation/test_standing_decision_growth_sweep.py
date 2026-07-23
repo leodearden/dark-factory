@@ -8,6 +8,7 @@ that wires them into the Stage-2 tail.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,10 +24,12 @@ from fused_memory.reconciliation.standing_decision_constants import (
     STATE_EXPIRED,
 )
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY,
     ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY,
     _compute_growth_sweep_failure_streak,
     _evaluate_growth_sweep_escalation,
     _extract_growth_sweep_failed,
+    _maybe_escalate_growth_sweep_failures,
     _sweep_entity_standing_decision_growth,
 )
 
@@ -252,3 +255,118 @@ class TestGrowthSweepStreakPure:
         assert _evaluate_growth_sweep_escalation(True, [True]) == {
             'streak': 2, 'escalate': False,
         }
+
+
+# ---------------------------------------------------------------------------
+# _maybe_escalate_growth_sweep_failures — journal-recomputed streak + filing
+# ---------------------------------------------------------------------------
+
+_ESC_KEY = f'recon-esd-growth-sweep:{_PROJECT_ID}'
+
+
+def _run(*, run_id, started, failed=True, run_type='full', status='completed'):
+    """A ReconciliationRun-like double (duck-typed, attribute-access shape)."""
+    stats = {ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY: (1 if failed else 0)}
+    return SimpleNamespace(
+        id=run_id,
+        run_type=run_type,
+        status=status,
+        started_at=started,
+        stage_reports={'task_knowledge_sync': SimpleNamespace(stats=stats)},
+    )
+
+
+class _FakeJournal:
+    def __init__(self, runs):
+        self._runs = runs
+        self.calls: list = []
+
+    async def get_recent_runs(self, project_id, limit=None):
+        self.calls.append((project_id, limit))
+        return list(self._runs)
+
+
+def _queue(*, has_open=False):
+    q = MagicMock()
+    q.has_open_l1 = MagicMock(return_value=has_open)
+    q.make_id = MagicMock(return_value='esc-generated-id')
+    q.submit = MagicMock()
+    return q
+
+
+class TestGrowthSweepEscalationFiler:
+    """The module-level filer: streak recomputed from journalled full+completed
+    prior runs (excluding the current run + running/remediation runs), deduped
+    on a stable per-project synthetic key."""
+
+    @pytest.mark.asyncio
+    async def test_confirmed_streak_files_one_escalation(self):
+        """Two prior failed full+completed runs + a confirmed current failure ⇒
+        streak 3 ⇒ exactly one level-1 Escalation with the ζ category. Noise runs
+        (the current run_id, a remediation run, a running run) — all more recent
+        and 'failed' — are EXCLUDED, so the streak is exactly 3."""
+        runs = [
+            # Noise that must be excluded — all more recent than the genuine priors.
+            _run(run_id='run-current', started=datetime(2026, 7, 10, tzinfo=UTC)),
+            _run(run_id='run-rem', started=datetime(2026, 7, 9, tzinfo=UTC),
+                 run_type='remediation'),
+            _run(run_id='run-running', started=datetime(2026, 7, 8, tzinfo=UTC),
+                 status='running'),
+            # Genuine prior failures (most-recent-first when filtered).
+            _run(run_id='run-p1', started=datetime(2026, 7, 3, tzinfo=UTC)),
+            _run(run_id='run-p2', started=datetime(2026, 7, 2, tzinfo=UTC)),
+        ]
+        journal = _FakeJournal(runs)
+        queue = _queue(has_open=False)
+
+        filed = await _maybe_escalate_growth_sweep_failures(
+            queue, journal, _PROJECT_ID, 'run-current', True,
+        )
+        assert filed is True
+        queue.has_open_l1.assert_called_once_with(_ESC_KEY)
+        queue.make_id.assert_called_once_with(_ESC_KEY)
+        queue.submit.assert_called_once()
+        esc = queue.submit.call_args.args[0]
+        assert esc.task_id == _ESC_KEY
+        assert esc.category == ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY
+        assert esc.level == 1
+        assert esc.agent_role == 'reconciliation-stage2'
+        # Streak is exactly 3 (the two genuine priors + current) — proves the
+        # noise runs were excluded.
+        assert '3' in esc.summary
+
+    @pytest.mark.asyncio
+    async def test_open_l1_dedup_suppresses_submit(self):
+        """An already-open level-1 escalation on the key ⇒ no new submit."""
+        runs = [
+            _run(run_id='run-p1', started=datetime(2026, 7, 3, tzinfo=UTC)),
+            _run(run_id='run-p2', started=datetime(2026, 7, 2, tzinfo=UTC)),
+        ]
+        queue = _queue(has_open=True)
+        filed = await _maybe_escalate_growth_sweep_failures(
+            queue, _FakeJournal(runs), _PROJECT_ID, 'run-current', True,
+        )
+        assert filed is False
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_current_not_failed_no_submit(self):
+        """current_failed=False ⇒ no escalation regardless of prior history."""
+        runs = [
+            _run(run_id='run-p1', started=datetime(2026, 7, 3, tzinfo=UTC)),
+            _run(run_id='run-p2', started=datetime(2026, 7, 2, tzinfo=UTC)),
+        ]
+        queue = _queue()
+        filed = await _maybe_escalate_growth_sweep_failures(
+            queue, _FakeJournal(runs), _PROJECT_ID, 'run-current', False,
+        )
+        assert filed is False
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_queue_is_noop(self):
+        """A None escalation_queue ⇒ no-op, returns False, never raises."""
+        filed = await _maybe_escalate_growth_sweep_failures(
+            None, _FakeJournal([]), _PROJECT_ID, 'run-current', True,
+        )
+        assert filed is False
