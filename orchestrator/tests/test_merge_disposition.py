@@ -1064,3 +1064,165 @@ class TestClassifyOrphanSpeculativeNotSkew:
         ))
         assert disposition == MergeFailureDisposition.INTEGRATION_SKEW
         assert evidence is not None
+
+
+# ---------------------------------------------------------------------------
+# step-1 (task 2871) — harness-ratchet / shell-guard failures require a
+# parsed failing-test id to be INTEGRATION_SKEW
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyHarnessRatchetNotSkew:
+    """Reify esc-5053-13/esc-5056-11: a harness-ratchet / shell-guard
+    merge-verify failure (kLOC cap, baseline-manifest grandfathering, other
+    ``tests/infra/*.sh`` guards) implicates a genuine real-main-ancestor
+    landing (2869's I6 filter keeps it, since it IS a real ancestor) yet
+    parses ZERO failing-test ids, because guard output matches neither
+    ``_PYTEST_FAILED_ID_RE`` nor ``_RUST_FAILED_ID_RE``. Task 2871 requires
+    ``failing_tests`` non-empty for INTEGRATION_SKEW, so these cases degrade
+    to the honest INDETERMINATE instead. The minimal-pair control at the end
+    pins that ``failing_tests`` is the SOLE discriminant (same merge_base ->
+    genuine-landing -> advanced-real-main shape, only the VerifyResult's
+    parseability differs)."""
+
+    def test_kloc_cap_guard_with_genuine_landing_is_indeterminate_not_skew(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base = _commit_file(
+            repo, 'scripts/run_all.sh', 'v1', 'init run_all.sh (merge-base)',
+        )
+        landing = _commit_file(
+            repo, 'scripts/run_all.sh', 'v2', 'genuine landing on main (kloc cap bump)',
+        )
+        # Real main advances past the dispatch base; the landing is an ancestor.
+        real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'later unrelated main tip')
+
+        store = _make_event_store(tmp_path)
+        _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
+
+        kloc_cap_failure = VerifyResult(
+            passed=False,
+            test_output=(
+                'HARNESS_KLOC_CAP FAIL crate=foo file=crates/foo/tests/big_migration.rs\n'
+                '(cap enforced by scripts/run_all.sh)'
+            ),
+            lint_output='',
+            type_output='',
+            summary='1 failed',
+            cause_hint='',
+            category='test_failure',
+        )
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=kloc_cap_failure,
+            branch='task/2381',
+            merge_base_sha=merge_base,
+            main_sha=landing,
+            real_main_head_sha=real_main_head,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store,
+        ))
+        # The run_all.sh overlap + branch green would be a false
+        # INTEGRATION_SKEW today; zero parsed failing-test ids (I7) degrades
+        # it to the honest INDETERMINATE instead.
+        assert disposition == MergeFailureDisposition.INDETERMINATE
+        assert evidence is None
+
+    def test_baseline_manifest_grandfathering_with_genuine_landing_is_indeterminate_not_skew(
+        self, tmp_path: Path,
+    ):
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base = _commit_file(repo, 'src/foo.py', 'v1', 'init foo (merge-base)')
+        landing = _commit_file(
+            repo, 'src/foo.py', 'v2', 'genuine landing on main (baseline guard trip)',
+        )
+        real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'later unrelated main tip')
+
+        store = _make_event_store(tmp_path)
+        _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
+
+        baseline_failure = VerifyResult(
+            passed=False,
+            test_output=(
+                'HARNESS_LAYOUT_BASELINE FAIL: src/foo.py not in '
+                'harness-layout-baseline.manifest'
+            ),
+            lint_output='',
+            type_output='',
+            summary='1 failed',
+            cause_hint='',
+            category='test_failure',
+        )
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=baseline_failure,
+            branch='task/2381',
+            merge_base_sha=merge_base,
+            main_sha=landing,
+            real_main_head_sha=real_main_head,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store,
+        ))
+        # Same shape as the kLOC-cap case, over a SOURCE-file overlap: the
+        # fix covers the whole guard/ratchet class, not just one guard.
+        assert disposition == MergeFailureDisposition.INDETERMINATE
+        assert evidence is None
+
+    def test_minimal_pair_genuine_failing_test_id_still_integration_skew(
+        self, tmp_path: Path,
+    ):
+        """Boundary control (GREEN today and after the fix): same
+        merge_base -> genuine-landing -> advanced-real-main shape as the two
+        guard cases above, but the VerifyResult carries a genuine parsed
+        failing-test id over the overlapping file. Pins that ``failing_tests``
+        is the sole discriminant introduced by task 2871 — the fix must not
+        over-correct and suppress a true INTEGRATION_SKEW."""
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            SkewEvidence,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base = _commit_file(repo, 'src/x.py', 'v1', 'init x (merge-base)')
+        landing = _commit_file(repo, 'src/x.py', 'v2', 'genuine landing on main')
+        real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'later unrelated main tip')
+
+        store = _make_event_store(tmp_path)
+        _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
+
+        disposition, evidence = asyncio.run(classify_merge_failure_disposition(
+            verify_result=_XPY_FAILURE,
+            branch='task/2381',
+            merge_base_sha=merge_base,
+            main_sha=landing,
+            real_main_head_sha=real_main_head,
+            preexisting=False,
+            task_id='2381',
+            repo_root=repo,
+            event_store=store,
+        ))
+        assert disposition == MergeFailureDisposition.INTEGRATION_SKEW
+        assert isinstance(evidence, SkewEvidence)
+        assert landing in evidence.implicated_commits
