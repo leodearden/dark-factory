@@ -312,6 +312,14 @@ class TestSandboxEnforcementMatrix:
         result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
         assert not target.exists()
         _assert_denied(result, side_effect_verified=True)
+        # Representative denial row: additionally pin an actual
+        # permission-class token in stderr, so the suite proves landlock
+        # itself — not an unrelated wrapper crash — produced the denial.
+        # (_assert_denied's stderr branch is otherwise never the deciding
+        # signal, since every denial caller passes side_effect_verified=True.)
+        assert any(tok in result.stderr for tok in _PERMISSION_SIGNALS), (
+            f'expected a permission-error-class token in stderr; stderr={result.stderr!r}'
+        )
 
     def test_row11_tmp_scratch_allowed(self, landlock_matrix_scaffold):
         scaffold = landlock_matrix_scaffold
@@ -335,6 +343,16 @@ class TestSandboxEnforcementMatrix:
     def test_row05_other_task_meta_denied(self, landlock_matrix_scaffold):
         scaffold = landlock_matrix_scaffold
         target = scaffold.other_task_meta / 'x'
+        # Pin the carve-out boundary independently of kernel enforcement: the
+        # sibling task's meta dir must never appear in the computed write
+        # set. Without this, a future regression that widened the task_meta
+        # carve-out to the whole `.task-meta/` parent (rather than just
+        # `.task-meta/<name>/`) would stay green here purely because of the
+        # kernel-level side-effect check below.
+        write_set = compute_write_set(scaffold.worktree, home=scaffold.home)
+        assert str(scaffold.other_task_meta) not in [
+            str(p) for p in write_set.writable_paths()
+        ]
         result = _run_sandboxed(scaffold, ['/bin/sh', '-c', f'printf X > {target}'])
         assert not target.exists()
         _assert_denied(result, side_effect_verified=True)
