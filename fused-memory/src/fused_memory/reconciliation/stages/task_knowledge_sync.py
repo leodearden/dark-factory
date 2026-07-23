@@ -709,6 +709,12 @@ ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
     'entity_standing_decision_growth_expired'
 )
 
+# Consecutive-failure streak (in full+completed cycles) at which the growth
+# sweep files a recon escalation (INV-4). Mirrors the task-count-snapshot
+# miss-streak threshold; recomputed from the journal each cycle (no stored
+# counter), so any successful sweep resets it.
+GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD: int = 3
+
 
 async def _resolve_terminal_task_ids(
     taskmaster,
@@ -1271,6 +1277,82 @@ async def _sweep_entity_standing_decision_growth(
                 )
 
     return {'checked': checked, 'expired': expired, 'failed': failed}
+
+
+# ── Growth-sweep failure-streak escalation (task 2899 ζ, INV-4) ──────────────
+# Pure helpers mirroring task_count_snapshot_cadence's streak-on-miss shape,
+# INVERTED to streak-on-failure: the counted flag is True=sweep-failed (a
+# Graphiti error left >=1 active row unverified this cycle), not False=miss. The
+# streak is recomputed from journalled prior-run stats each cycle (no persisted
+# counter), so any successful sweep resets it and it survives a restart.
+
+
+def _extract_growth_sweep_failed(stage_report: object) -> bool | None:
+    """Read the growth-sweep failed flag off a Stage-2 report.
+
+    Accepts a real ``StageReport`` (attribute access), a raw dict shape (a
+    journal-reconstructed report or test double), or ``None``.
+
+    Returns ``True`` when
+    ``stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 1``,
+    ``False`` when ``== 0``, and ``None`` when the report is ``None``, its
+    ``stats`` is absent, or the key itself is absent — "unknown", never
+    miscounted as a confirmed failure or a confirmed success.
+    """
+    if stage_report is None:
+        return None
+    if isinstance(stage_report, dict):
+        stats = stage_report.get('stats') or {}
+    else:
+        stats = getattr(stage_report, 'stats', None) or {}
+    value = stats.get(ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY)
+    if value == 1:
+        return True
+    if value == 0:
+        return False
+    return None
+
+
+def _compute_growth_sweep_failure_streak(recent_flags: list[bool | None]) -> int:
+    """Count the leading run of consecutive failures in *recent_flags*.
+
+    *recent_flags* is most-recent-first. Counts consecutive ``True`` entries
+    from the start, stopping at the first ``False`` (a successful sweep resets
+    the streak) or ``None`` (unknown — stop, fail-safe: an inconclusive cycle
+    must never be counted as either a failure or a reset).
+    """
+    streak = 0
+    for flag in recent_flags:
+        if flag is True:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _evaluate_growth_sweep_escalation(
+    current_failed: bool | None,
+    prior_flags: list[bool | None],
+    *,
+    threshold: int = GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD,
+) -> dict:
+    """Decide whether the current cycle's sweep failure should escalate.
+
+    Fail-safe short-circuit (checked before the streak is computed): when
+    *current_failed* is not ``True`` (i.e. ``False`` — the sweep succeeded this
+    cycle — or ``None`` — it did not run / was inconclusive) the streak is ``0``
+    and there is no escalation. Only a CONFIRMED current failure can trigger.
+
+    Otherwise the streak is ``_compute_growth_sweep_failure_streak(prior_flags)
+    + 1`` (the "+1" is the current confirmed failure) and ``escalate`` is
+    ``streak >= threshold``.
+
+    Returns ``{'streak': int, 'escalate': bool}``.
+    """
+    if current_failed is not True:
+        return {'streak': 0, 'escalate': False}
+    streak = _compute_growth_sweep_failure_streak(prior_flags) + 1
+    return {'streak': streak, 'escalate': streak >= threshold}
 
 
 async def _verify_task_count_snapshot_written(
