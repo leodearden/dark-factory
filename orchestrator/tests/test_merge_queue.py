@@ -18069,6 +18069,111 @@ class TestPatchContentContained:
 
 
 # ---------------------------------------------------------------------------
+# TestSelectRecoveryWinner — task 2926 (C3 γ) step-1 RED
+# ---------------------------------------------------------------------------
+
+
+def _make_ancestry_git_ops(edges: set[tuple[str, str]]) -> MagicMock:
+    """Fake git_ops whose ``is_ancestor(ancestor, descendant)`` returns True
+    iff ``(ancestor, descendant)`` is in *edges*.
+
+    ``select_recovery_winner`` only calls ``is_ancestor`` (through
+    ``classify_tip_relation``); ``project_root`` is stubbed for the
+    ``patch_content_contained`` path (monkeypatched in the divergent tests, so
+    the real ``git cherry`` never runs).
+    """
+    git_ops = MagicMock()
+    git_ops.project_root = '/fake/root'
+
+    async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+        return (ancestor, descendant) in edges
+
+    git_ops.is_ancestor = _is_ancestor
+    return git_ops
+
+
+@pytest.mark.asyncio
+class TestSelectRecoveryWinner:
+    """task 2926 (C3 γ) step-1 RED: select_recovery_winner pure helper.
+
+    RED until step-2 adds ``select_recovery_winner`` to ``merge_queue``.
+    Asserts the observable contract — ``(winner_idx, divergence_seen)`` — routed
+    through the SHARED ``decide_c3_submit_action(verifying=False)`` disposition
+    table so recovery (γ) and submit (δ) cannot diverge on the ancestry
+    disposition (REPLACE ⇒ descendant candidate wins, COALESCE ⇒ keep winner).
+    """
+
+    async def test_single_tip_is_winner(self) -> None:
+        """One tip → index 0, no divergence (the pairwise loop never runs)."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops(set())
+        assert await select_recovery_winner(['A'], git_ops) == (0, False)
+
+    async def test_identical_tips_keep_earliest(self) -> None:
+        """Two identical tips → SAME → COALESCE → earliest (index 0) wins."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops(set())
+        assert await select_recovery_winner(['A', 'A'], git_ops) == (0, False)
+
+    async def test_ancestor_then_descendant_descendant_wins(self) -> None:
+        """[ancestor, descendant] → SUPERSET → REPLACE → descendant (index 1) wins."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops({('anc', 'desc')})
+        assert await select_recovery_winner(['anc', 'desc'], git_ops) == (1, False)
+
+    async def test_descendant_then_ancestor_order_independent(self) -> None:
+        """[descendant, ancestor] → SUBSET → COALESCE → descendant (index 0) kept.
+
+        Order-independence: the descendant-most tip wins regardless of the
+        journal order the records were persisted in.
+        """
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops({('anc', 'desc')})
+        assert await select_recovery_winner(['desc', 'anc'], git_ops) == (0, False)
+
+    async def test_divergent_superset_replaces_and_flags(self, monkeypatch) -> None:
+        """Divergent pair, patch NOT contained → resolve_divergent SUPERSET →
+        REPLACE → candidate (index 1) wins AND divergence_seen True (D2)."""
+        from orchestrator.merge_queue import select_recovery_winner
+
+        async def _pcc(head: str, upstream: str, git_ops: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.patch_content_contained', _pcc,
+        )
+        git_ops = _make_ancestry_git_ops(set())  # is_ancestor False both ways
+        assert await select_recovery_winner(['X', 'Y'], git_ops) == (1, True)
+
+    async def test_divergent_subset_keeps_and_flags(self, monkeypatch) -> None:
+        """Divergent pair, patch contained → resolve_divergent SUBSET →
+        COALESCE → earliest (index 0) kept AND divergence_seen True (D2)."""
+        from orchestrator.merge_queue import select_recovery_winner
+
+        async def _pcc(head: str, upstream: str, git_ops: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.patch_content_contained', _pcc,
+        )
+        git_ops = _make_ancestry_git_ops(set())
+        assert await select_recovery_winner(['X', 'Y'], git_ops) == (0, True)
+
+    async def test_none_candidate_tip_skipped(self) -> None:
+        """A None candidate tip is skipped (no crash), current winner kept."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops(set())
+        assert await select_recovery_winner(['A', None], git_ops) == (0, False)
+
+    async def test_none_winner_tip_skipped(self) -> None:
+        """A None winner tip cannot be classified against → later tip skipped,
+        current winner (index 0) kept."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops(set())
+        assert await select_recovery_winner([None, 'A'], git_ops) == (0, False)
+
+
+# ---------------------------------------------------------------------------
 # TestDecideAttachAction — γ1 step-13 RED
 # ---------------------------------------------------------------------------
 
