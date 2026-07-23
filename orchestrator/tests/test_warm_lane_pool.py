@@ -3722,6 +3722,84 @@ class TestCreateWorktreeWarmLaneRouting:
 
 
 # ===========================================================================
+# Task 2984 step-05/06: GitOps._assemble_warm_lane_census() — single assembler
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAssembleWarmLaneCensus:
+    """GitOps._assemble_warm_lane_census() — the one INV-5 assembler.
+
+    Reads self.warm_lane_pool + self.warm_lane_dispatched_predicate, counts
+    QUARANTINED durable records via self._lane_lifecycle.all_records(), and
+    returns pool.census(...).  Both α consumers (the EXHAUSTED-return WARNING
+    and the WarmLanePoolExhausted message) call it.
+    """
+
+    async def test_predicate_wired_splits_dispatched_and_pinned(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(a) A wired predicate splits assigned lanes into dispatched vs pinned."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.acquire_for('task-disp')
+        await git_ops.warm_lane_pool.acquire_for('task-pin')
+        git_ops.warm_lane_dispatched_predicate = lambda b: b == 'task-disp'
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.size == 3
+        assert census.n_free == 1
+        assert census.n_assigned_dispatched == 1
+        assert census.n_pinned_non_dispatched == 1
+        assert census.n_unknown_dispatch == 0
+        assert census.n_quarantined == 0
+
+    async def test_predicate_none_degrades_assigned_to_unknown(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(b) With the predicate left None (default, unwired), every assigned
+        lane degrades to n_unknown_dispatch."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        # Default construction leaves the predicate unwired.
+        assert git_ops.warm_lane_dispatched_predicate is None
+        await git_ops.warm_lane_pool.acquire_for('task-a')
+        await git_ops.warm_lane_pool.acquire_for('task-b')
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.size == 3
+        assert census.n_free == 1
+        assert census.n_unknown_dispatch == 2
+        assert census.n_assigned_dispatched == 0
+        assert census.n_pinned_non_dispatched == 0
+        assert census.n_quarantined == 0
+
+    async def test_n_quarantined_counts_only_quarantined_records(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(c) n_quarantined counts exactly the QUARANTINED durable records;
+        non-quarantined records are excluded."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None
+        lanes = git_ops.warm_lane_pool.lane_paths()
+        # One QUARANTINED durable record ((None, QUARANTINED) is a legal edge)...
+        git_ops._lane_lifecycle.transition(lanes[0], DurableLaneState.QUARANTINED)
+        # ...and one NON-quarantined record that must be excluded from the count.
+        git_ops._lane_lifecycle.transition(lanes[1], DurableLaneState.SEED)
+
+        census = git_ops._assemble_warm_lane_census()
+        assert census.n_quarantined == 1
+
+    async def test_no_quarantined_records_counts_zero(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """(c') With no durable records at all, n_quarantined is 0."""
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        census = git_ops._assemble_warm_lane_census()
+        assert census.n_quarantined == 0
+
+
+# ===========================================================================
 # Step-3: RED — GitOps.release_lane_for_terminal_task (shared primitive)
 # ===========================================================================
 
