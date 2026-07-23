@@ -196,26 +196,42 @@ Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 su
 written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \
 for them — Path 1 semantic search remains their fallback. New summaries have both paths.
 
-## Stage-2-Only Remediation Run Exception (task 2652)
+## Remediation Run Exception (task 2652, task 2995)
 
-A Stage-2-only targeted remediation pass runs a focused Stage 1 → Stage 2 → Stage 3 \
-cycle under a fresh `run_id`. In that pass, Stage 1 (`memory_consolidator`) legitimately \
-early-returns and never writes its per-cycle summary — by design, not a bug — while \
-Stage 2 (`task_knowledge_sync`) still writes its own cycle_summary row unconditionally. \
-Checking Stage 1 (`memory_consolidator`) cycle_summary presence alone therefore produces \
-a recurring false positive: Stage 2 present, Stage 1 absent, misread as a genuine Stage 1 \
-write failure (recurring false positive: runs 43c5399e and fb4a7caa; tasks 2436/2437/2625).
+A remediation pass runs a FOCUSED Stage 1 → Stage 2 → Stage 3 cycle under a fresh \
+`run_id` (a new `uuid4()` minted per pass — NOT the parent full cycle's `run_id`; see \
+`harness.py`'s `_maybe_remediate`). Stage 1 (`memory_consolidator`) DOES execute in \
+that pass — it runs a real focused LLM turn against the specific findings it was handed \
+and MAY legitimately emit its own flagged items (its remediation payload instructions \
+explicitly permit flagging an unresolved finding for Stage 2). It is NOT "Stage-2-only" \
+and Stage 1 does NOT "never execute" — what Stage 1 skips, by design, is only its own \
+per-cycle summary write: right after that focused turn, Stage 1 early-returns before \
+reaching its `write_cycle_summary` call. Stage 2 (`task_knowledge_sync`) still writes \
+its own cycle_summary row unconditionally. Checking Stage 1 (`memory_consolidator`) \
+cycle_summary presence alone therefore produces a recurring false positive: Stage 2 \
+present, Stage 1 absent, misread as a genuine Stage 1 write failure (recurring false \
+positive: runs 43c5399e and fb4a7caa; tasks 2436/2437/2625) — or, when that pass's \
+Stage 1 legitimately did emit a finding, misread as an inconsistency between "Stage 1 \
+evidently did work" and "Stage 1 left no summary" (recurring false positive: run \
+b2d19592, finding 2c73785f; task 2995 / esc-2993-1). Do NOT treat "Stage 1 ran and may \
+have emitted findings, yet has no cycle_summary" as contradictory or as a systemic \
+doc/control-flow defect when Stage 2's summary for the SAME run_id shows \
+`remediation: true` — that pairing (Stage 2 present + `remediation: true`, Stage 1 \
+absent) is the CANONICAL designed signature of a remediation pass, not a symptom.
 
-Before filing a missing Stage 1 (`memory_consolidator`) cycle_summary as a genuine absence:
+Before filing a missing Stage 1 (`memory_consolidator`) cycle_summary — or any \
+"Stage 1 did work but left no summary" pattern — as a genuine defect:
 
 1. Check the Stage 2 summary for the SAME run_id via \
 `mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
 stage='task_knowledge_sync')`.
-2. If it returns `present: true` AND `remediation: true`, the run was a Stage-2-only \
-targeted remediation pass in which Stage 1 legitimately never executed. SKIP the \
-missing-Stage-1-summary finding entirely — do not file it. (If you mention it at all \
-for context, mark it `actionable=false` and `severity='minor'`, never \
-`category='missing_knowledge'` with `actionable=true`.)
+2. If it returns `present: true` AND `remediation: true`, the run was a remediation \
+pass: Stage 1 ran a focused turn — possibly emitting real findings — but legitimately \
+never wrote its own cycle_summary. SKIP the missing-Stage-1-summary finding entirely — \
+do not file it, and do not file a `systemic_pattern` / inconsistency finding about \
+Stage 1 "having done work" without a summary either. (If you mention it at all for \
+context, mark it `actionable=false` and `severity='minor'`, never \
+`category='missing_knowledge'` or `category='systemic_pattern'` with `actionable=true`.)
 3. Only flag a missing Stage 1 summary when the Stage 2 summary indicates a full, \
 non-remediation cycle (`present: true`, `remediation: false`) or when remediation status \
 is unknown (`remediation: null` — a legacy row predating this field, or the ledger row \
