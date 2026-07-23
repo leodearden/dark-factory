@@ -16,10 +16,12 @@ records — never transcript-grep (INV-2). See the module design in the task
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -296,3 +298,75 @@ def _report_present_on_main(repo_root, ref: str = "main", path: str = PROBE_REPO
         )
     # 2) The ref is valid — presence of the path in its tree IS the verdict.
     return _run(["cat-file", "-e", f"{ref}:{path}"]).returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point — the before_done.kind='predicate' exit-code contract:
+#   0 = green (all three conditions met)     -> task done
+#   1 = measured-but-not-yet-green           -> the legitimate pre-soak state
+#   2 = usage/infra error (SoakInputError, argparse error)
+# Every non-zero exit prints ONE reason line: the 0/1 verdict to stdout, the 2
+# error to stderr.
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="orchestrator.sandbox_soak",
+        description=(
+            "OS-sandbox rollout soak predicate (PRD γ1/γ5). Exit 0 iff >=N "
+            "distinct sandboxed tasks are done, the containment probe report is "
+            "tracked on main, and there are 0 sandbox-attributable blocks."
+        ),
+    )
+    parser.add_argument("--repo-root", default=None, help="repo root (default: cwd)")
+    parser.add_argument("--events-db", default=None,
+                        help="event store (default: <repo-root>/data/orchestrator/runs.db)")
+    parser.add_argument("--tasks-db", default=None,
+                        help="task records (default: <repo-root>/.taskmaster/tasks/tasks.db)")
+    parser.add_argument("--report-ref", default="main",
+                        help="git ref the probe report must be tracked on (default: main)")
+    parser.add_argument("--report-path", default=PROBE_REPORT_PATH,
+                        help=f"probe report path (default: {PROBE_REPORT_PATH})")
+    parser.add_argument("--tag", default="master", help="tasks.db tag (default: master)")
+    parser.add_argument("--min-done", type=int, default=MIN_DONE_DEFAULT,
+                        help=f"min distinct done sandboxed tasks (default: {MIN_DONE_DEFAULT})")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # argparse already printed a usage error to stderr and raised
+        # SystemExit(2) (or 0 for --help). Preserve the code as a usage error
+        # (2) without killing an in-process caller.
+        return exc.code if isinstance(exc.code, int) else 2
+
+    repo_root = Path(args.repo_root) if args.repo_root else Path.cwd()
+    events_db = (
+        Path(args.events_db) if args.events_db
+        else repo_root / "data" / "orchestrator" / "runs.db"
+    )
+    tasks_db = (
+        Path(args.tasks_db) if args.tasks_db
+        else repo_root / ".taskmaster" / "tasks" / "tasks.db"
+    )
+
+    try:
+        applied = read_sandbox_applied_task_ids(events_db)
+        unavailable = read_sandbox_unavailable_task_ids(events_db)
+        escalations = read_escalations(events_db)
+        task_status = read_task_status(tasks_db, tag=args.tag)
+        report_present = _report_present_on_main(
+            repo_root, ref=args.report_ref, path=args.report_path
+        )
+    except SoakInputError as exc:
+        print(f"check_sandbox_soak: ERROR — {exc}", file=sys.stderr)
+        return 2
+
+    verdict = evaluate_soak(
+        applied, task_status, unavailable, escalations, report_present,
+        min_done=args.min_done,
+    )
+    print(verdict.reason)
+    return 0 if verdict.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
