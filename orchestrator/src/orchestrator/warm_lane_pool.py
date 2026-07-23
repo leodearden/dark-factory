@@ -106,6 +106,7 @@ class WarmLanePool:
         size: int,
         name_prefix: str = '_lane-',
         lane_lifecycle: LaneLifecycle | None = None,
+        drift_l2_threshold: int = 3,
     ) -> None:
         self._base = worktree_base
         self._name_prefix = name_prefix
@@ -124,6 +125,18 @@ class WarmLanePool:
         # (GitOps constructs both its LaneLifecycle and this pool, so the
         # shared instance cannot be injected at __init__ time).
         self._lane_lifecycle = lane_lifecycle
+        # Loud-drift bookkeeping (PRD warm-lane-exhaustion-hardening W2b
+        # I3/I4). A durable-write failure NEVER fails acquire/release (I3);
+        # instead it increments this counter and, once the counter reaches
+        # drift_l2_threshold, fires the opaque _on_lane_record_drift callback
+        # (bounded loudness + dedup, I4). A SUCCESSFUL durable write resets the
+        # counter to 0 (re-arm). The callback defaults None → the pool stays a
+        # pure escalation-free state machine (byte-identical to unwired),
+        # mirroring git_ops _on_pool_storage_absent; the Harness installs the
+        # born-at-L2 lane_record_drift filer here (install-in-harness).
+        self.drift_l2_threshold = drift_l2_threshold
+        self._drift_count = 0
+        self._on_lane_record_drift: Callable[[int], None] | None = None
 
     # ── Public properties ──────────────────────────────────────────────────
 
@@ -143,6 +156,23 @@ class WarmLanePool:
         was added.
         """
         self._lane_lifecycle = lane_lifecycle
+
+    def set_on_lane_record_drift(
+        self, callback: Callable[[int], None] | None,
+    ) -> None:
+        """Install the opaque loud-drift callback (install-in-harness pattern).
+
+        Called by the Harness with its born-at-L2 ``lane_record_drift`` filer.
+        The pool holds this as an OPAQUE ``Callable[[drift_count], None]`` — it
+        never imports escalation, keeping this module a git/escalation-free
+        state machine (mirrors ``git_ops._on_pool_storage_absent``). ``None``
+        (the default) keeps the pool byte-identical to unwired: a
+        durable-write failure still counts and logs, just never fires a
+        callback. The callback is invoked at most once per failing write past
+        the threshold, and any exception it raises is swallowed (I3: never
+        breaks acquire/release).
+        """
+        self._on_lane_record_drift = callback
 
     # ── Mutating operations ────────────────────────────────────────────────
 
@@ -560,16 +590,17 @@ class WarmLanePool:
         """
         if self._lane_lifecycle is None:
             return
-        try:
-            self._lane_lifecycle.note_assigned(
+        lifecycle = self._lane_lifecycle
+        self._run_guarded_durable_write(
+            lambda: lifecycle.note_assigned(
                 lane, task_id=task_id, title=title, branch=branch,
-            )
-        except (IllegalLaneTransition, OSError):
-            logger.warning(
+            ),
+            on_fail_log=lambda: logger.warning(
                 'warm_lane_pool: durable record mirror for lane %s failed '
                 'for task %r — cache updated, durable record left as-is',
                 lane.name, task_id, exc_info=True,
-            )
+            ),
+        )
 
     def _note_released_durable(self, lane: Path) -> None:
         """Best-effort durable-record mirror for the single-writer RELEASED
@@ -600,16 +631,67 @@ class WarmLanePool:
         """
         if self._lane_lifecycle is None:
             return
-        try:
-            record = self._lane_lifecycle.read(lane)
+        lifecycle = self._lane_lifecycle
+
+        def _release_write() -> None:
+            record = lifecycle.read(lane)
             if record is not None and record.state in (
                 DurableLaneState.ASSIGNED,
                 DurableLaneState.IN_USE,
             ):
-                self._lane_lifecycle.transition(lane, DurableLaneState.RELEASED)
-        except (IllegalLaneTransition, OSError):
-            logger.warning(
+                lifecycle.transition(lane, DurableLaneState.RELEASED)
+
+        self._run_guarded_durable_write(
+            _release_write,
+            on_fail_log=lambda: logger.warning(
                 'warm_lane_pool: durable record RELEASED mirror for lane %s '
                 'failed — cache updated (FREE), durable record left as-is',
                 lane.name, exc_info=True,
-            )
+            ),
+        )
+
+    def _run_guarded_durable_write(
+        self,
+        write: Callable[[], object],
+        *,
+        on_fail_log: Callable[[], None],
+    ) -> None:
+        """Shared guarded durable-write path (PRD W2b I1/I3/I4).
+
+        Runs *write* (the actual ``note_assigned``/``read``+``transition``
+        call). Outcomes:
+
+        * SUCCESS (no exception) → reset ``_drift_count`` to 0 (re-arm, I4).
+          A legitimately-skipped RELEASED mirror (record not ASSIGNED/IN_USE)
+          also counts as success — the durable layer answered without error.
+        * ``IllegalLaneTransition`` / ``OSError`` → call *on_fail_log* (the
+          caller's WARNING), increment ``_drift_count``, and — once the counter
+          reaches ``drift_l2_threshold`` and a callback is installed — fire the
+          opaque ``_on_lane_record_drift`` callback with the current count
+          (bounded loudness, I4). Any exception the callback itself raises is
+          swallowed (I3: the durable-write failure must never break
+          acquire/release, and neither may the loudness path).
+
+        NEVER re-raises: acquire/release/reclaim always succeed regardless of
+        the durable-write outcome (I3). The module stays escalation-free — the
+        callback is opaque, installed by the Harness.
+        """
+        try:
+            write()
+        except (IllegalLaneTransition, OSError):
+            on_fail_log()
+            self._drift_count += 1
+            if (
+                self._drift_count >= self.drift_l2_threshold
+                and self._on_lane_record_drift is not None
+            ):
+                try:
+                    self._on_lane_record_drift(self._drift_count)
+                except Exception:
+                    logger.warning(
+                        'warm_lane_pool: _on_lane_record_drift callback raised '
+                        '(drift_count=%d) — swallowed (fail-open, I3)',
+                        self._drift_count, exc_info=True,
+                    )
+        else:
+            self._drift_count = 0
