@@ -10244,7 +10244,14 @@ class Harness:
         """Single testable pass of the deterministic-strand reconciliation sweep.
 
         Source A: enumerate blocked tasks and recover any absent-escalation
-        strand (task-2059 shape) via ``_recover_stranded_deterministic_task``.
+        strand via one of two DISJOINT detectors (task 2954): a deploy
+        RAN-strand (task-2059 shape) via
+        ``_recover_stranded_deterministic_task``, or a pure-gate /
+        ``always_escalates`` GATE-strand (``gate_escalated_at`` stamped but no
+        escalation record) via ``_recover_stranded_deterministic_gate``.  The
+        gate branch's strand-vs-resolved discriminator is an archive-inclusive
+        role-scoped emptiness check (a pending OR resolved record ⇒ not a
+        strand), which also self-dedupes across passes.
 
         Source B: enumerate all pending escalations and re-validate any open
         deterministic-deploy ``infra_issue`` escalation via
@@ -10303,13 +10310,41 @@ class Harness:
             if task.get('status') != 'blocked':
                 continue
             metadata = task.get('metadata') or {}
-            if not _deterministic_deploy_stranded(metadata):
+            # Two DISJOINT Source-A strand detectors (task 2954): a deploy
+            # RAN-strand and a pure-gate / always_escalates GATE-strand. They
+            # never both match one task — _deterministic_deploy_stranded requires
+            # deploy_state.phase==RAN and EXCLUDES gate_escalated_at, while
+            # _deterministic_gate_stranded REQUIRES gate_escalated_at — so no
+            # task is ever handled by both.  Both share the per-task fail-soft
+            # try/except and recovered_this_pass bookkeeping below.
+            _is_deploy = _deterministic_deploy_stranded(metadata)
+            _is_gate = _deterministic_gate_stranded(metadata)
+            if not (_is_deploy or _is_gate):
                 continue
             try:
-                if self._escalation_queue.get_by_task(tid, status='pending'):
-                    continue
-                await self._recover_stranded_deterministic_task(tid, task, metadata)
-                recovered_this_pass.add(tid)
+                if _is_deploy:
+                    # Deploy strand: dedup on the pending queue, then re-file an
+                    # L1 whose category depends on live systemd unit health.
+                    if self._escalation_queue.get_by_task(tid, status='pending'):
+                        continue
+                    await self._recover_stranded_deterministic_task(tid, task, metadata)
+                    recovered_this_pass.add(tid)
+                elif _is_gate:
+                    # Gate strand: the discriminator is an archive-INCLUSIVE,
+                    # role-scoped emptiness check (status=None scans queue root +
+                    # archive).  A PENDING record means the gate is still open
+                    # (not a strand); a RESOLVED/archived record means a human
+                    # already acted (genuinely-resolved, not a strand) — in
+                    # either case leave it alone.  Only a TOTAL absence (never
+                    # landed / lost across a restart) re-fires.  This also
+                    # self-dedupes across passes: once re-filed, the next pass
+                    # sees the pending record and skips.
+                    if self._escalation_queue.get_by_task(
+                        tid, agent_role=DETERMINISTIC_AGENT_ROLE,
+                    ):
+                        continue
+                    await self._recover_stranded_deterministic_gate(tid, task, metadata)
+                    recovered_this_pass.add(tid)
             except Exception as exc:
                 logger.error(
                     'Deterministic-recon-sweep: Source-A recovery failed for '
