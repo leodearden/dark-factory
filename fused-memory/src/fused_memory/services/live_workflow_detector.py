@@ -101,9 +101,13 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from shared.task_claimant import has_live_claimant
+from shared.task_metadata import RoutingState
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 
@@ -147,6 +151,17 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
+
+# Heartbeat staleness threshold for the fresh-claimant corroboration signal
+# (task 2963). A killed workflow keeps its durable ``claimant_run_id`` but stops
+# advancing ``heartbeat_at``, so FRESHNESS (not presence) is the discriminator:
+# `has_live_claimant(task, now, ttl)` reports live only while the heartbeat is
+# newer than ``now - ttl``. Mirrors the orchestrator's validated
+# ``_RECONCILE_HEARTBEAT_TTL`` (harness.py:189) / ``_DEFAULT_HEARTBEAT_TTL``
+# (task_ground_truth.py:146) constant — the coordination point with sibling
+# task 2931's orphan-reaper liveness predicate (reuse this shared TTL, do not
+# invent a parallel heartbeat check).
+DEFAULT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
@@ -322,8 +337,133 @@ def is_workflow_live_for_task(
 
 
 # ---------------------------------------------------------------------------
+# Per-task corroboration (task 2963)
+# ---------------------------------------------------------------------------
+#
+# For an IN-PROGRESS task whose liveness rests SOLELY on the project-wide
+# ``orchestrator_live`` and/or the (lingering) ``worktree_registered`` signal —
+# i.e. no ``recent_commit`` — a fleet redeploy that KILLED the workflow leaves
+# both those signals asserting stale liveness. These helpers require at least
+# one FRESH per-task corroborating signal before the caller treats such a task
+# as live; when none is present the caller downgrades ``is_live`` to False and
+# marks the result ``indeterminate`` (see the gate in :func:`detect_live_workflow`).
+#
+# Three corroborating signals, ANY sufficient:
+#   1. Fresh claimant/heartbeat — ``has_live_claimant(task, now, ttl)``.
+#   2. Scheduler holder/park — task_id in ``parks`` keys OR ``current_holders``
+#      values (both reset by an orchestrator restart).
+#   3. routing.latest.decided_at newer than the orchestrator's start time (a
+#      dispatch predating the last restart cannot have a live workflow).
+
+
+def has_live_workflow_corroboration(
+    task_id: str | int,
+    *,
+    claimant_live: bool,
+    scheduler_state: Mapping | None,
+    routing_latest_decided_at: str | None,
+    orchestrator_started_at: datetime | None,
+) -> bool:
+    """Return True when at least one fresh per-task corroborating signal exists.
+
+    ORs the three corroboration signals (see module section above). A True
+    ``claimant_live`` short-circuits before the scheduler/routing checks are
+    consulted. All inputs are pre-extracted so this predicate stays pure and
+    unit-testable; :func:`corroboration_for_task` is the assembler that derives
+    them from a task dict.
+    """
+    if claimant_live:
+        return True
+    if _task_in_scheduler_holders_or_parks(task_id, scheduler_state):
+        return True
+    return _routing_decided_after_restart(routing_latest_decided_at, orchestrator_started_at)
+
+
+def corroboration_for_task(
+    task: Mapping,
+    task_id: str | int,
+    *,
+    now: datetime,
+    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
+    scheduler_state: Mapping | None = None,
+    orchestrator_started_at: datetime | None = None,
+) -> bool:
+    """Assemble the three corroboration signals from a *task* dict.
+
+    Derives:
+      - ``claimant_live`` via ``has_live_claimant(task, now, heartbeat_ttl)``
+        (freshness-checking — a killed workflow's stale heartbeat reports NOT
+        live even though its durable ``claimant_run_id`` persists);
+      - ``routing_latest_decided_at`` via
+        ``RoutingState.from_metadata(task['metadata']).latest.decided_at``
+        (degrades to ``None`` on missing/invalid metadata — never raises);
+
+    then delegates to :func:`has_live_workflow_corroboration`. The *scheduler_state*
+    and *orchestrator_started_at* inputs are hoisted once per render by the
+    caller (see :func:`_render_live_workflow_section`) and threaded through.
+
+    Returns True when any signal corroborates a live workflow for *task_id*.
+    """
+    claimant_live = has_live_claimant(task, now, heartbeat_ttl)
+    latest = RoutingState.from_metadata(task.get('metadata')).latest
+    routing_latest_decided_at = latest.decided_at if latest is not None else None
+    return has_live_workflow_corroboration(
+        task_id,
+        claimant_live=claimant_live,
+        scheduler_state=scheduler_state,
+        routing_latest_decided_at=routing_latest_decided_at,
+        orchestrator_started_at=orchestrator_started_at,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _task_in_scheduler_holders_or_parks(
+    task_id: str | int, scheduler_state: Mapping | None
+) -> bool:
+    """Return True when *task_id* is a scheduler park key or a current-holder value.
+
+    ``scheduler_state`` is the ``read_scheduler_state`` snapshot: ``parks`` is
+    keyed by task_id, ``current_holders`` is ``{module: task_id}`` (so the task
+    appears as a VALUE there). Both are reset by an orchestrator restart, so a
+    stranded post-redeploy task is absent from both. Coerces to ``str`` for the
+    comparison since the on-disk JSON stores task_ids as strings. Tolerates a
+    ``None`` state or missing/ non-dict ``parks``/``current_holders`` keys
+    (returns False, never raises).
+    """
+    if not isinstance(scheduler_state, Mapping):
+        return False
+    tid = str(task_id)
+    parks = scheduler_state.get('parks')
+    if isinstance(parks, Mapping) and tid in {str(k) for k in parks}:
+        return True
+    holders = scheduler_state.get('current_holders')
+    if isinstance(holders, Mapping) and tid in {str(v) for v in holders.values()}:
+        return True
+    return False
+
+
+def _routing_decided_after_restart(
+    decided_at: str | None, orchestrator_started_at: datetime | None
+) -> bool:
+    """Return True when *decided_at* is strictly newer than *orchestrator_started_at*.
+
+    A routing decision stamped after the current orchestrator's start time is
+    evidence of a post-restart dispatch (a live workflow); one predating the
+    last restart cannot correspond to a live workflow. Returns False when
+    either side is ``None`` (no restart boundary → cannot prove post-restart)
+    or ``decided_at`` is unparseable (fail-safe: absence of positive evidence
+    is not corroboration). Both operands are UTC-aware for the comparison.
+    """
+    if decided_at is None or orchestrator_started_at is None:
+        return False
+    parsed = _parse_iso_timestamp(decided_at)
+    if parsed is None:
+        return False
+    return parsed > orchestrator_started_at
 
 
 def _orchestrator_signal_ineligible(
