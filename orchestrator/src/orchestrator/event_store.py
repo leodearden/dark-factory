@@ -427,6 +427,16 @@ class EventType(StrEnum):
     #   columns. Payload: {backend} — the configured backend that failed to
     #   resolve (SandboxUnavailable.backend_state).
     sandbox_unavailable = 'sandbox_unavailable'
+    # sandbox_applied — emitted once per sandboxed invocation by
+    #   TaskWorkflow._invoke on the NON-refusing guard path: a real backend
+    #   (landlock/bwrap) OR the explicit ``backend=none`` operator escape hatch
+    #   (still emitted — data.backend lets γ1 distinguish deliberately-
+    #   unsandboxed from real containment without a third event type).
+    #   role/task_id are first-class columns. Payload: {backend, digest} —
+    #   ``digest`` is WriteSet.digest(), the STABLE sha256 of the resolved
+    #   writable set so an operator can diff exactly what a given invocation
+    #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
+    sandbox_applied = 'sandbox_applied'
 
 
 class EventStore:

@@ -57,7 +57,7 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
-from orchestrator.agents.write_set import compute_write_set
+from orchestrator.agents.write_set import WriteSet, compute_write_set
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
@@ -9917,8 +9917,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # running unconfined. backend=none is the explicit operator escape
             # hatch (runs UNSANDBOXED with a WARN, no refusal); a
             # required-yet-unavailable backend raises SandboxUnavailable, which
-            # propagates out of _invoke to refuse the invocation.
-            self._guard_sandbox(role.name)
+            # propagates out of _invoke to refuse the invocation. On the
+            # non-refusing path _guard_sandbox returns the resolved backend,
+            # which we record here via the per-invocation sandbox_applied event
+            # (task 2909 β2, PRD §Goal 3 / INV-2): real backend AND the
+            # none-escape hatch both emit sandbox_applied, while a refusal
+            # instead emits sandbox_unavailable inside the guard — so every
+            # sandboxed invocation emits exactly one of the two.
+            resolved_backend = self._guard_sandbox(role.name)
+            self._emit_sandbox_applied(role.name, resolved_backend, write_set)
 
         # Warn once per workflow instance when an escalation-capable role is
         # dispatched without an escalation queue wired up.
@@ -11142,6 +11149,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             phase=self.state.value,
             role=role_name,
             data={'backend': backend_state},
+        )
+
+    def _emit_sandbox_applied(
+        self, role_name: str, backend: str, write_set: WriteSet,
+    ) -> None:
+        """Emit one ``sandbox_applied`` event per sandboxed invocation (β2).
+
+        Fired from :meth:`_invoke` on the NON-refusing guard path — a real
+        backend (landlock/bwrap) OR the explicit ``backend=none`` operator
+        escape hatch (still emitted; ``data.backend`` lets γ1 distinguish
+        deliberately-unsandboxed from real containment). ``role``/``task_id``
+        are first-class emit columns; ``data`` carries the resolved ``backend``
+        and ``write_set.digest()`` — the stable writable-set hash an operator
+        diffs to see exactly what this invocation could touch (PRD
+        plans/os-sandbox-worktree-containment-prd.md β2 §Goal 3 / INV-2). The
+        digest is read from ``WriteSet.digest()`` (its single owner, INV-5), not
+        recomputed here. A silent no-op when no event store is wired up
+        (fire-and-forget, mirroring the sibling escalation-emit guard).
+        """
+        if not self.event_store:
+            return
+        self.event_store.emit(
+            EventType.sandbox_applied,
+            task_id=self.task_id,
+            phase=self.state.value,
+            role=role_name,
+            data={'backend': backend, 'digest': write_set.digest()},
         )
 
     def _guard_sandbox(self, role_name: str) -> str:
