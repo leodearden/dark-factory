@@ -1239,15 +1239,16 @@ class TestProceduralTopicClusterModel:
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
-    Mix of known-contradictory (plan-tools, venv-shadowing) and
-    known-recurring (pytest-xdist) topics -- see the >=3 count and the
-    per-topic-id assertions below.
+    Mix of known-contradictory (plan-tools, venv-shadowing, architect
+    report_task_already_done main-reachability) and known-recurring
+    (pytest-xdist, architect plan-revalidation after requeue/lock) topics --
+    see the >=5 count and the per-topic-id assertions below.
     """
 
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 3
+        assert len(clusters) >= 5
 
     def test_default_seeds_all_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1255,6 +1256,8 @@ class TestProceduralTopicGuardClustersDefault:
         assert 'eval-worktree-plan-tools-missing' in topic_ids
         assert 'eval-worktree-venv-shadowing' in topic_ids
         assert 'pytest-xdist-serial-override' in topic_ids
+        assert 'architect-report-task-already-done-main-reachability' in topic_ids
+        assert 'architect-plan-revalidation-requeue-lock' in topic_ids
 
     def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
@@ -1323,5 +1326,58 @@ class TestReportTaskAlreadyDoneMainReachabilityCluster:
         unrelated_note = (
             'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
             'commit is an ancestor of a branch tip before cherry-picking.'
+        )
+        assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
+
+
+class TestArchitectPlanRevalidationRequeueLockCluster:
+    """Topic-guard cluster for the architect plan-revalidation after
+    requeue/lock family (gate task 2973, already adjudicated). Phrases are
+    drawn verbatim from the resulting canonical Mem0 entries 6a96a020
+    (subcase plan_json_gitignore_wipe) and 974b0adb (subcase
+    lost_plan_reconstruction).
+    """
+
+    def test_cluster_present_with_expected_phrases_and_hint(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(
+            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
+        )
+        assert cluster.phrases == [
+            '.task/plan.json',
+            'plan-revalidation',
+            'requeue rebase',
+            'lost-plan reconstruction',
+            'committed TDD steps',
+        ]
+        assert cluster.min_phrase_hits == 2
+        assert '2973' in cluster.hint
+        assert 'Do NOT add another entry' in cluster.hint
+
+    def test_matches_representative_near_duplicate_note(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(
+            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
+        )
+        note = (
+            'During architect plan-revalidation after a requeue rebase, check '
+            'whether .task/plan.json still exists before choosing confirm vs '
+            'recreate.'
+        )
+        result = find_matching_topic_cluster(note, [cluster])
+        assert result is not None
+        assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+
+    def test_does_not_match_unrelated_plan_tools_note(self):
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        cluster = next(
+            c for c in clusters if c.topic_id == 'architect-plan-revalidation-requeue-lock'
+        )
+        # A generic plan-tools note (not about revalidation-after-requeue)
+        # only hits '.task/plan.json' (1 distinct hit) -- must NOT reach
+        # min_phrase_hits and mis-route to gate 2973.
+        unrelated_note = (
+            'Use create_plan and add_plan_step to build the plan; the '
+            'plan-tools state persists in .task/plan.json.'
         )
         assert find_matching_topic_cluster(unrelated_note, [cluster]) is None
