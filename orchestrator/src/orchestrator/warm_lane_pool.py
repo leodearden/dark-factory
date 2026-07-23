@@ -270,6 +270,9 @@ class WarmLanePool:
         branch_name: str,
         candidates: set[str],
         is_dispatched: Callable[[str], bool],
+        *,
+        title: str | None = None,
+        branch: str | None = None,
     ) -> tuple[str, Path] | None:
         """Steal the oldest eligible ASSIGNED lane for *branch_name*.
 
@@ -292,8 +295,24 @@ class WarmLanePool:
         ``_assignments[branch_name] = lane``, leaves lane ``ASSIGNED``, and
         returns ``(victim, lane)``.  On failure (no eligible victim): ``None``.
 
-        Mirrors ``acquire_for``'s atomic ASSIGNED + map idiom.
+        When a ``LaneLifecycle`` is wired, the durable record is re-keyed
+        victim -> thief at the moment the in-memory map is re-keyed
+        (single-writer coherence, PRD warm-lane-exhaustion-hardening W2b I1 /
+        boundary row 3). Because ``LaneLifecycle.note_assigned`` never STEALS
+        (a different-task ``ASSIGNED -> ASSIGNED`` edge raises), the durable
+        re-key is release-then-assign: ``_note_released_durable`` clears the
+        victim's ``task_id`` (ASSIGNED/IN_USE -> RELEASED), then
+        ``_note_assigned_durable`` sets the thief (RELEASED -> ASSIGNED) — the
+        same order ``GitOps._note_assigned_via_route`` used on its steal path.
+        ``title``/``branch`` are carry-forward hints threaded from GitOps.
+
+        Mirrors ``acquire_for``'s atomic ASSIGNED + map idiom. The durable
+        write-through is issued AFTER the lock is released (no ``await`` between
+        the in-memory re-key and the synchronous durable writes, so the TOCTOU
+        ``is_dispatched`` re-check under the lock is preserved and no coroutine
+        interleaves on the single asyncio loop).
         """
+        stolen: tuple[str, Path] | None = None
         async with self._lock:
             for victim, lane in list(self._assignments.items()):
                 if victim == branch_name:
@@ -309,8 +328,16 @@ class WarmLanePool:
                 del self._assignments[victim]
                 self._assignments[branch_name] = lane
                 self._lanes[lane] = LaneState.ASSIGNED  # explicit, mirrors acquire_for
-                return (victim, lane)
+                stolen = (victim, lane)
+                break
+        if stolen is None:
             return None
+        # Durable re-key outside the lock: release victim's record (clears its
+        # task_id), then assign the thief onto the freed record.
+        _victim, stolen_lane = stolen
+        self._note_released_durable(stolen_lane)
+        self._note_assigned_durable(branch_name, stolen_lane, title=title, branch=branch)
+        return stolen
 
     # ── Read-only helpers ──────────────────────────────────────────────────
 
