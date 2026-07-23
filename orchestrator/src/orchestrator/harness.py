@@ -536,6 +536,41 @@ def _deterministic_deploy_stranded(metadata: dict | None) -> bool:
     )
 
 
+def _deterministic_gate_stranded(metadata: dict | None) -> bool:
+    """Return True iff *metadata* represents a stranded deterministic GATE.
+
+    Task 2954: the sibling of ``_deterministic_deploy_stranded`` for pure-gate
+    / ``always_escalates=true`` strands — a ``task_kind=='deterministic'`` task
+    that stamped ``gate_escalated_at`` (proof a born-at-L2 ``milestone_gate``
+    was supposed to be filed) but whose escalation record never landed or was
+    lost across a restart.  ``gate_escalated_at`` is written ONLY by the
+    gate-filing paths (``DeterministicRunner._file_milestone_gate_and_block`` /
+    ``_file_milestone_check_failed_and_block`` / the predicate leg), so it is
+    the sole reliable "a gate was supposed to be filed" signal.
+
+    Metadata-only predicate — the archive-inclusive empty-escalation-queue
+    I/O check (the strand-vs-resolved discriminator) is performed by the
+    caller (``_run_deterministic_recon_sweep`` Source A), mirroring
+    ``_deterministic_deploy_stranded``'s "the I/O check is the caller's job"
+    contract.
+
+    DISJOINT from ``_deterministic_deploy_stranded`` by construction: that
+    predicate requires ``deploy_state.phase == RAN`` (or the pre-ζ legacy
+    shim) and EXPLICITLY EXCLUDES ``gate_escalated_at`` being set (see the
+    exclusion above), whereas this one REQUIRES ``gate_escalated_at`` — so no
+    task is ever matched by both, and a gate strand and a deploy strand are
+    handled by separate recovery paths with no double-handling.
+
+    None/non-dict *metadata* is treated as non-matching rather than raising.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        metadata.get('task_kind') == 'deterministic'
+        and bool(metadata.get('gate_escalated_at'))
+    )
+
+
 def _is_done_step_commit_orphan(esc: Escalation) -> bool:
     """Return True iff *esc* is the done-step-commit orphan class filed by
     ``TaskWorkflow._escalate_unreconciled_done_step`` (workflow.py:5488).
