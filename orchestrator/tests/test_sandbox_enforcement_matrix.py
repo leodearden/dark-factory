@@ -102,6 +102,7 @@ class _Scaffold:
     worktree: Path
     name: str
     home: Path
+    main_sha: str
     task_meta: Path
     sibling_worktree: Path
     other_task_meta: Path
@@ -167,9 +168,12 @@ def landlock_matrix_scaffold():
     owns); a SIBLING linked worktree + its own (non-writable-by-contract)
     ``.task-meta/`` dir, standing in for a second in-flight task on the
     same host (rows 4/5's denial targets — pre-created so their parent
-    exists and the denial is a true landlock EACCES, not ENOENT); and a
+    exists and the denial is a true landlock EACCES, not ENOENT); a
     hermetic fake ``HOME`` with ``~/.cache/uv/`` seeded so the uv-cache
-    carve-out is grantable at wrap time.
+    carve-out is grantable at wrap time; and the git-row setup — auto-gc/
+    maintenance disabled on the shared main repo (PRD α5 corollary, mirrors
+    ``GitOps.disable_shared_repo_auto_maintenance``) plus one staged
+    change in the worktree, ready for a row's own ``git commit``.
 
     Built under ``/var/tmp`` (never ``/tmp`` — see module docstring) via
     ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
@@ -182,9 +186,18 @@ def landlock_matrix_scaffold():
         _git(['init', '-b', 'main'], main)
         _git(['config', 'user.email', 'landlock-matrix@test.local'], main)
         _git(['config', 'user.name', 'Landlock Matrix Test'], main)
+        # PRD α5 corollary (D2): background auto-gc/maintenance under the
+        # narrow shared-.git write-set would fail benignly but noisily, so
+        # orchestrator-managed shared repos disable it repo-locally. Applied
+        # unconditionally here — harmless for every row (none of them come
+        # close to gc.auto's loose-object threshold) and is exactly what row
+        # 12 pins the absence-of-noise property against.
+        _git(['config', 'gc.auto', '0'], main)
+        _git(['config', 'maintenance.auto', 'false'], main)
         (main / 'README.md').write_text('seed\n')
         _git(['add', '-A'], main)
         _git(['commit', '-m', 'seed commit'], main)
+        main_sha = _git(['rev-parse', 'HEAD'], main)
 
         name = 'wt-a'
         worktree = base / name
@@ -206,10 +219,17 @@ def landlock_matrix_scaffold():
         home.mkdir()
         (home / '.cache' / 'uv').mkdir(parents=True)
 
+        # One staged change so a row's `git commit` has something to
+        # commit (rows 2/12 — each test gets its own fresh scaffold
+        # instance, function-scoped, so there is no cross-row contention
+        # over this single staged file).
+        (worktree / 'staged.txt').write_text('staged content\n')
+        _git(['add', 'staged.txt'], worktree)
+
         yield _Scaffold(
             base=base, main=main, worktree=worktree, name=name, home=home,
-            task_meta=task_meta, sibling_worktree=sibling_worktree,
-            other_task_meta=other_task_meta,
+            main_sha=main_sha, task_meta=task_meta,
+            sibling_worktree=sibling_worktree, other_task_meta=other_task_meta,
         )
     finally:
         shutil.rmtree(base, ignore_errors=True)
