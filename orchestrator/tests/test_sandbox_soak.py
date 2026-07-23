@@ -12,7 +12,14 @@ records — never transcript-grep (INV-2).
 """
 from __future__ import annotations
 
+import json
+import sqlite3
+
+import pytest
+
+from orchestrator import event_store as _event_store
 from orchestrator import sandbox_soak
+from orchestrator.event_store import EventType
 
 PROBE_REPORT_PATH = "docs/sandbox-containment-probe-report.md"
 
@@ -182,3 +189,119 @@ def test_attributable_blocks_helper_arms_and_exclusions():
         task_status, unavailable, escalations
     )
     assert blocks == ["b1", "b2"]
+
+
+# ---------------------------------------------------------------------------
+# Read-only DB readers against constructed fixture SQLite stores.
+# ---------------------------------------------------------------------------
+
+def _build_events_db(path):
+    """Fixture events store — the real event_store `_SCHEMA`, rows spread across
+    TWO run_ids so the run-agnostic aggregation is exercised. Plain
+    DELETE-journal connection (no WAL) so the mode=ro readers open cleanly."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(_event_store._SCHEMA)
+        rows = [
+            # (run_id, task_id, event_type, data)
+            ("run-A", "1", EventType.sandbox_applied.value, {"backend": "bwrap", "digest": "d1"}),
+            ("run-A", "2", EventType.sandbox_applied.value, {"backend": "bwrap"}),
+            ("run-A", "9", EventType.sandbox_unavailable.value, {"reason": "no backend"}),
+            ("run-A", "9", EventType.escalation_created.value,
+             {"category": "sandbox_denial", "summary": "write denied: EACCES on /etc/x"}),
+            # run-B: a distinct run_id — union must aggregate across both.
+            ("run-B", "2", EventType.sandbox_applied.value, {"backend": "bwrap"}),  # dup task across runs
+            ("run-B", "3", EventType.sandbox_applied.value, {"backend": "bwrap"}),
+            ("run-B", None, EventType.sandbox_applied.value, {"note": "no task"}),  # NULL task_id -> excluded
+            ("run-B", "10", EventType.sandbox_unavailable.value, {"reason": "policy"}),
+            ("run-B", "7", EventType.escalation_created.value,
+             {"category": "milestone_gate", "summary": "milestone check failed"}),
+        ]
+        conn.executemany(
+            "INSERT INTO events (timestamp, run_id, task_id, event_type, data) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [("2026-07-23T00:00:00+00:00", r, t, et, json.dumps(d)) for (r, t, et, d) in rows],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_tasks_db(path, rows, tag="master"):
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE tasks (tag TEXT NOT NULL, id INTEGER NOT NULL, "
+            "status TEXT NOT NULL, PRIMARY KEY (tag, id))"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (tag, id, status) VALUES (?, ?, ?)",
+            [(tag, i, s) for i, s in rows],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_read_sandbox_event_task_ids_are_distinct_and_run_agnostic(tmp_path):
+    db = tmp_path / "runs.db"
+    _build_events_db(db)
+    # task "2" appears under both run_ids -> distinct; NULL-task row excluded.
+    assert sandbox_soak.read_sandbox_applied_task_ids(db) == {"1", "2", "3"}
+    assert sandbox_soak.read_sandbox_unavailable_task_ids(db) == {"9", "10"}
+
+
+def test_read_escalations_decodes_summary_and_category(tmp_path):
+    db = tmp_path / "runs.db"
+    _build_events_db(db)
+    escs = sandbox_soak.read_escalations(db)
+    by_task = {e["task_id"]: e for e in escs}
+    assert by_task["9"]["summary"] == "write denied: EACCES on /etc/x"
+    assert by_task["9"]["category"] == "sandbox_denial"
+    assert by_task["7"]["category"] == "milestone_gate"
+    for e in escs:
+        assert set(e.keys()) == {"task_id", "summary", "category"}
+
+
+def test_read_task_status_maps_id_str_to_status(tmp_path):
+    db = tmp_path / "tasks.db"
+    _build_tasks_db(db, [(1, "done"), (2, "blocked"), (3, "in_progress")])
+    assert sandbox_soak.read_task_status(db, tag="master") == {
+        "1": "done", "2": "blocked", "3": "in_progress",
+    }
+
+
+def test_read_task_status_scopes_by_tag(tmp_path):
+    db = tmp_path / "tasks.db"
+    _build_tasks_db(db, [(1, "done")], tag="master")
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO tasks (tag, id, status) VALUES (?, ?, ?)", ("feature", 1, "pending"))
+    conn.commit()
+    conn.close()
+    assert sandbox_soak.read_task_status(db, tag="master") == {"1": "done"}
+
+
+def test_missing_db_raises_soak_input_error_not_silent_empty(tmp_path):
+    missing = tmp_path / "nope.db"
+    with pytest.raises(sandbox_soak.SoakInputError):
+        sandbox_soak.read_sandbox_applied_task_ids(missing)
+    with pytest.raises(sandbox_soak.SoakInputError):
+        sandbox_soak.read_sandbox_unavailable_task_ids(missing)
+    with pytest.raises(sandbox_soak.SoakInputError):
+        sandbox_soak.read_escalations(missing)
+    with pytest.raises(sandbox_soak.SoakInputError):
+        sandbox_soak.read_task_status(missing)
+
+
+def test_readers_do_not_mutate_the_store(tmp_path):
+    db = tmp_path / "runs.db"
+    _build_events_db(db)
+    before = db.stat().st_size
+    sandbox_soak.read_sandbox_applied_task_ids(db)
+    sandbox_soak.read_sandbox_unavailable_task_ids(db)
+    sandbox_soak.read_escalations(db)
+    after = db.stat().st_size
+    assert after == before
+    # No rollback-journal / WAL side files created by a mode=ro reader.
+    assert not (tmp_path / "runs.db-wal").exists()
+    assert not (tmp_path / "runs.db-journal").exists()
