@@ -908,6 +908,19 @@ class ReconciliationConfig(BaseModel):
     # do not re-halt within this window. Belt-and-braces on top of grace_cycles
     # in case the operator intervenes mid-cycle.
     halt_cooldown_seconds: float = Field(default=1800.0)
+    # Auto-resume-after-cooldown (task 2920 deliverable c). When True, a project
+    # the judge has halted is automatically unhalted once its `cooldown_until`
+    # has passed (seeding the normal post-unhalt grace) and reconciliation
+    # resumes; the judge re-halts immediately on the next serious verdict or
+    # infra-failure threshold if the project is still sick, so a genuinely-broken
+    # pipeline re-latches (and re-fires a distinct, now-loud halt escalation)
+    # rather than resuming silently. False (default) keeps the legacy semantics:
+    # a halt persists until an operator calls unhalt_reconciliation. Motivated by
+    # the 2026-07-20 incident where a judge halt of dark_factory sat unhalted for
+    # 2 days because cooldown_until expired and nothing acted on the expiry.
+    # Restart-tier: read from config each cycle; deliberately NOT in
+    # RELOADABLE_FIELDS.
+    auto_unhalt_after_cooldown: bool = Field(default=False)
     # Judge transport/infra-failure tolerance (task 2947 ask a). Bounds the
     # number of CONSECUTIVE judge CLI transport/infra failures (api_error,
     # timeout, cap-wait exhaustion, etc. — NOT genuinely-malformed reachable
