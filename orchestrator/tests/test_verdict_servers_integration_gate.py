@@ -570,6 +570,7 @@ class TestJudgeBoundary:
 
         verdict = await workflow._run_completion_judge([])
 
+        assert verdict is not None
         assert verdict['complete'] is True
         assert verdict['substantive_work'] is False
 
@@ -742,6 +743,7 @@ class TestFreshnessGuards:
         None, not the stale complete verdict.
         """
         workflow = _setup_judge_workflow(config, git_ops, task_assignment, tmp_path)
+        assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
         _artifacts_for(workflow.worktree).write_verdict(
             'judge',
             _envelope('judge', 'stale-sid', {
@@ -767,6 +769,7 @@ class TestFreshnessGuards:
         blocked=False that would have let it proceed.
         """
         workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
+        assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
         _artifacts_for(workflow.worktree).write_verdict(
             'merger', _envelope('merger', 'stale-sid', {'blocked': False, 'reason': ''}),
         )
@@ -779,8 +782,8 @@ class TestFreshnessGuards:
             'task/42', 'conflict in lib.py', merge_phase=True,
         )
 
-        workflow._mark_blocked.assert_awaited_once()
-        workflow._submit_to_merge_queue.assert_not_awaited()
+        workflow._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        workflow._submit_to_merge_queue.assert_not_awaited()  # type: ignore[attr-defined]
         assert outcome == WorkflowOutcome.BLOCKED
 
 
