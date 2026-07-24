@@ -838,7 +838,6 @@ class TestMergeRequestRequestId:
         verify on a no-op merge.
         """
         import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
-
         from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
 
         FAKE_TIP = 'deadbeef12345678'
@@ -3435,7 +3434,6 @@ class TestMergeRequestTipRecency:
         always coalesces → returns 'attached' instead of 'queued'.
         """
         import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
-
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
         )
@@ -3555,7 +3553,6 @@ class TestMergeRequestDuplicateInVerify:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
-
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
         )
