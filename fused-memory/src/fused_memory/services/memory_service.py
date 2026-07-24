@@ -3691,6 +3691,93 @@ class MemoryService:
 
         return result
 
+    async def reassign_edge(
+        self,
+        edge_uuid: str,
+        new_endpoint_uuid: str,
+        which_end: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Re-point one Graphiti edge's endpoint to a different Entity node, losslessly.
+
+        Delegates to GraphitiBackend.reassign_edge(), which moves ONE end
+        (``which_end='source'`` or ``'target'``) of the edge onto
+        ``new_endpoint_uuid`` via an atomic uuid-preserving CREATE-new +
+        DELETE-old, preserving the fact, fact_embedding, valid_at/invalid_at/
+        expired_at, created_at, group_id, episodes, and the edge uuid, then
+        refreshes the two affected endpoint summaries. Journals the operation
+        and emits a memory_updated event (mirroring update_edge).
+
+        Args:
+            edge_uuid: UUID of the RELATES_TO edge to reassign.
+            new_endpoint_uuid: UUID of the Entity node the endpoint moves onto.
+            which_end: Which end to move — ``'source'`` or ``'target'``.
+            project_id: Project scope (graph key + journal logging).
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for the journal entry.
+
+        Returns:
+            ``{'status': 'reassigned', 'store': 'graphiti', **audit}`` where
+            audit is the backend's dict (uuid, which_end, old/new/unchanged
+            endpoint uuids, moved, refreshed_nodes).
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        try:
+            result = await self.graphiti.reassign_edge(
+                edge_uuid, new_endpoint_uuid, which_end=which_end, group_id=project_id,
+            )
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='reassign_edge',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params={
+                            'edge_uuid': edge_uuid,
+                            'new_endpoint_uuid': new_endpoint_uuid,
+                            'which_end': which_end,
+                        },
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'reassign_edge: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        # Reached only on a SUCCESSFUL reassign (a backend failure re-raises
+        # through the finally above, never landing here).
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.memory_updated,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(UTC),
+            payload={'edge_uuid': edge_uuid, 'store': 'graphiti'},
+        ))
+
+        return {'status': 'reassigned', 'store': 'graphiti', **result}
+
     async def delete_episode(
         self,
         episode_id: str,
