@@ -113,15 +113,201 @@ symbols BY NAME (grep/search), never trust a line offset.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from orchestrator.git_ops import GitOps
-from orchestrator.verify_cancel import release_merge_verify_flock, remove_lock_holder_pgid
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
+from orchestrator.harness import Harness
+from orchestrator.lane_lifecycle import LaneLifecycle
+from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
+    lane_lock_path,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
+)
+
+#: A pgid guaranteed to be dead: os.killpg on this must raise
+#: ProcessLookupError (Linux pid_max is nowhere near 2**31-1). Mirrors
+#: test_merge_verify_lease_guard.py's _DEAD_PGID (per-file duplication
+#: convention).
+_DEAD_PGID = 2**31 - 1
+
+
+# ---------------------------------------------------------------------------
+# Real-git fixtures (adapted from test_remove_merge_worktree_guarded.py /
+# test_crash_recovery.py's harness fixture, per-file duplication convention)
+# ---------------------------------------------------------------------------
+
+
+async def _setup_repo(repo: Path) -> None:
+    """Initialise a git repo with a single commit (README.md) on main."""
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _head_sha(repo: Path) -> str:
+    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0
+    return out.strip()
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def git_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+
+
+@pytest.fixture
+def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(git_config, git_repo)
+
+
+@pytest.fixture
+def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
+    """Build a real ephemeral ``_merge-<uuid>`` worktree at the repo's HEAD.
+
+    Ported from test_remove_merge_worktree_guarded.py -- remove_merge_worktree_
+    guarded's 'removed'/'failed' outcome split is only meaningful against a
+    REAL registered git worktree (a plain ``mkdir()``'d directory always
+    yields 'failed' -- see that module's test_non_worktree_directory_returns_failed).
+    """
+    return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+
+
+# ---------------------------------------------------------------------------
+# Recovery-harness factory (ported from test_crash_recovery.py's ``harness``
+# fixture, lines 29-88) -- a plain factory function (not a fixture) so the
+# capstone can attach additional real components (merge store/registry/
+# worker) after construction without a second fixture indirection layer.
+# ---------------------------------------------------------------------------
+
+
+def _build_recovery_harness(mock_orch_config: MagicMock, git_repo: Path) -> Harness:
+    """Build a Harness wired for crash-recovery / merge-reap composition tests.
+
+    McpLifecycle/Scheduler/BriefingAssembler are patched at construction so
+    no fused-memory/live-scheduler machinery starts. ``harness.git_ops`` is
+    then REBOUND to a REAL GitOps over *git_repo* (a real git-initialized
+    repo, decoupled from ``mock_orch_config.project_root``) so real git
+    worktree/lease operations succeed; the scheduler is replaced with a bare
+    MagicMock exposing exactly the async surface ``_recover_crashed_tasks``
+    consults.
+    """
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        h = Harness(mock_orch_config)
+
+    h.scheduler = MagicMock()
+    h.scheduler.get_tasks = AsyncMock(return_value=[])
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.get_task = AsyncMock(return_value={})
+    h.scheduler.get_status = AsyncMock(return_value=None)
+    h.scheduler._dispatched = set()
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
+
+    recovery_git_config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    h.git_ops = GitOps(recovery_git_config, git_repo)
+    h.git_ops.worktree_base = (git_repo / '.worktrees').resolve()
+    h.git_ops.mark_pool_storage_present()
+    h.git_ops.cleanup_worktree = AsyncMock()
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    # GitOps.__init__ built _lane_lifecycle against the ORIGINAL
+    # worktree_base (before the reassignment above) -- rebind it so the
+    # record-driven recovery path reads/writes the same .lane-state dir the
+    # rest of this harness targets (mirrors test_crash_recovery.py's W11 fix).
+    h.git_ops._lane_lifecycle = LaneLifecycle(
+        h.git_ops.worktree_base, quarantine_worktree=h.git_ops.quarantine_worktree,
+    )
+    h.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+    h.event_store = MagicMock()
+
+    return h
+
+
+# ---------------------------------------------------------------------------
+# Planting helpers -- build worktree_base entries in the various dispositions
+# the deleter face must classify (leased / dead-holder / infra / task-shaped).
+# ---------------------------------------------------------------------------
+
+
+def _plant_leased_tree(base: Path, path: Path) -> int:
+    """Ensure *path* exists and hold a LIVE merge-verify lease on it.
+
+    Records the live holder pgid at the fixed rendezvous key so a
+    remove_merge_worktree_guarded skip WARNING can name it. Returns the
+    held fd -- release via ``release_merge_verify_flock(fd)`` (and
+    ``remove_lock_holder_pgid(base)`` once no other lease is live) when done.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    fd = acquire_merge_verify_flock(lane_lock_path(path), 5.0)
+    assert fd is not None, f'test setup: must be able to acquire the {path.name} lease'
+    write_lock_holder_pgid(base, os.getpgrp())
+    return fd
+
+
+def _plant_dead_holder_tree(base: Path, path: Path) -> None:
+    """Ensure *path* exists with a STALE lease: acquire then immediately
+    release its own flock (leaving a stale ``<path>.lock`` file with no
+    live holder -- the kernel already auto-released the advisory lock) and
+    record a guaranteed-dead pgid (``_DEAD_PGID``) at the fixed rendezvous
+    key -- the fail-open positive control proving removal gates on the
+    flock itself, never on the best-effort pgid rendezvous file.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    fd = acquire_merge_verify_flock(lane_lock_path(path), 5.0)
+    assert fd is not None, f'test setup: must be able to acquire the {path.name} lease'
+    release_merge_verify_flock(fd)
+    write_lock_holder_pgid(base, _DEAD_PGID)
+
+
+def _plant_infra_dir(base: Path, name: str) -> Path:
+    """Create a plain (unleased) infra-band directory under *base*."""
+    path = base / name
+    path.mkdir(parents=True)
+    return path
+
+
+def _plant_task_dir(base: Path, task_id: str) -> Path:
+    """Create a plain task-id-shaped, planless directory under *base*."""
+    path = base / task_id
+    path.mkdir(parents=True)
+    return path
+
 
 # ---------------------------------------------------------------------------
 # TestDeleterFace -- PRD Sec.9 rows 1-4
