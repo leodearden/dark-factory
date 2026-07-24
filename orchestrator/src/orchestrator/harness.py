@@ -11799,6 +11799,22 @@ class Harness:
           - Carries the α census counts (size / n_free / n_assigned_dispatched /
             n_pinned_non_dispatched / n_unknown_dispatch / n_quarantined) as
             structured fields so an operator sees WHY the pool is full (INV-2).
+
+        SIZING ASSUMPTION (review amendment — robustness): this L2 is a reliable
+        ABNORMALITY signal only when the warm-lane pool is sized to
+        ``max_concurrent_tasks`` — then a sustained run of EXHAUSTED genuinely
+        means a leak or a mismatch, not honest saturation.  When the pool is
+        deliberately sized SMALLER than max_concurrent_tasks, a legitimately
+        saturated pool (every lane held by a live dispatched task, no leak) can
+        accumulate consecutive EXHAUSTED from queued acquires and trip this
+        human-routed 'urgent' L2.  That case is left to the operator to
+        distinguish via the census carried below (n_assigned_dispatched == size
+        with n_pinned_non_dispatched == 0 ⇒ pure saturation, not a leak), and the
+        threshold (``warm_lane_structural_exhaustion_l2_threshold``) plus this
+        severity are a CONSCIOUS, green-tier/hot-reloadable tuning choice — raise
+        the threshold or run a size==max_concurrent_tasks pool to keep EXHAUSTED
+        an abnormality signal.  Census-shape severity gating (saturation ⇒ lower
+        tier) was considered and deliberately deferred as out of scope here.
         """
         queue = getattr(self, '_escalation_queue', None)
         if not queue:        # bare-Harness unit tests / lifecycle tests stay green
