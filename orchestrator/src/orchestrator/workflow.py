@@ -58,7 +58,11 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
-from orchestrator.agents.write_set import WriteSet, compute_write_set
+from orchestrator.agents.write_set import (
+    WriteSet,
+    compute_write_set,
+    ensure_claude_fleet_dir,
+)
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
@@ -10027,6 +10031,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         sandbox_extras = None
         if self.config.sandbox.enabled and role.sandboxed:
             write_set = compute_write_set(cwd)
+            # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
+            # sandbox at this single INV-5/D11 write-set consumption point, so it
+            # exists before sandbox_extras (below) is built (task 2996) — see
+            # ensure_claude_fleet_dir for the full backend rationale.
+            self._ensure_sandbox_dirs(write_set)
             sandbox_modules = []
             sandbox_extras = [str(p) for p in write_set.writable_paths()]
             # Fail-CLOSED (task 2908, PRD D4 / INV-4): refuse to dispatch this
@@ -11294,6 +11303,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             role=role_name,
             data={'backend': backend, 'digest': write_set.digest()},
         )
+
+    def _ensure_sandbox_dirs(self, write_set: WriteSet) -> None:
+        """Pre-create the load-bearing ``claude_fleet`` carve-out OUTSIDE the
+        sandbox before dispatch (task 2996) — see
+        ``orchestrator.agents.write_set.ensure_claude_fleet_dir`` for the full
+        backend rationale (why neither the pure ``compute_write_set`` nor either
+        backend can materialize this carve-out from inside the sandbox).
+
+        This wrapper owns the operator-facing failure posture: best-effort, so
+        on failure it WARNs LOUDLY (loud-over-silent) with the task_id + path
+        and CONTINUES — a missing fleet dir degrades only fleet session-registry
+        recording, not the agent's task, so aborting the whole dispatch would be
+        a disproportionate fail-closed.
+        """
+        if not ensure_claude_fleet_dir(write_set):
+            logger.warning(
+                'task %s: could not pre-create %s outside the sandbox — both '
+                'backends will skip the claude_fleet carve-out and in-sandbox '
+                'session-registry writes may fail',
+                self.task_id,
+                write_set.claude_fleet,
+            )
 
     def _guard_sandbox(self, role_name: str) -> str:
         """Fail-CLOSED sandbox check for the sandboxed-dispatch call-site (task 2908).

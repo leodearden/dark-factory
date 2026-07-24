@@ -26,7 +26,11 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.agents.write_set import WriteSet, compute_write_set
+from orchestrator.agents.write_set import (
+    WriteSet,
+    compute_write_set,
+    ensure_claude_fleet_dir,
+)
 from orchestrator.artifacts import TaskArtifacts
 
 
@@ -327,3 +331,57 @@ class TestWriteSetDigest:
         assert len(digest) == 64
         assert digest == digest.lower()
         assert all(c in '0123456789abcdef' for c in digest)
+
+
+# ---------------------------------------------------------------------------
+# task 2996: ensure_claude_fleet_dir() — side-effecting pre-creation helper
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureClaudeFleetDir:
+    """Pins ``ensure_claude_fleet_dir(write_set) -> bool`` — the SEPARATE,
+    explicitly side-effecting helper that materializes ~/.claude/fleet OUTSIDE
+    the sandbox before dispatch (task 2996).
+
+    ``compute_write_set`` stays PURE (``test_purity_no_makedirs_side_effect``);
+    this helper is the one place the load-bearing ``claude_fleet`` carve-out is
+    created so BOTH backends can grant it (neither can --bind / add a
+    nonexistent path with parent ~/.claude read-only). Hermetic: ``claude_fleet``
+    always points under ``tmp_path`` — never the real ~/.claude.
+    """
+
+    def test_creates_dir_and_missing_parents_when_absent(self, tmp_path: Path):
+        # (a) parents=True: a claude_fleet whose parent does not yet exist is
+        # created in full, and the call reports success.
+        claude_fleet = tmp_path / 'nonexistent-home' / '.claude' / 'fleet'
+        ws = _make_write_set(claude_fleet=claude_fleet)
+        assert not claude_fleet.exists()
+        assert not claude_fleet.parent.exists()  # missing parent chain
+
+        assert ensure_claude_fleet_dir(ws) is True
+
+        assert claude_fleet.is_dir()
+        assert claude_fleet.parent.is_dir()  # parents=True built the chain
+
+    def test_idempotent_when_dir_already_exists(self, tmp_path: Path):
+        # (b) exist_ok=True: a second call on an already-present dir returns
+        # True and does not raise.
+        claude_fleet = tmp_path / '.claude' / 'fleet'
+        ws = _make_write_set(claude_fleet=claude_fleet)
+        assert ensure_claude_fleet_dir(ws) is True
+        assert claude_fleet.is_dir()
+
+        assert ensure_claude_fleet_dir(ws) is True
+        assert claude_fleet.is_dir()
+
+    def test_returns_false_when_mkdir_raises_oserror(self, tmp_path: Path):
+        # (c) failure path: a regular FILE cannot be a parent dir, so
+        # mkdir(parents=True) raises NotADirectoryError (an OSError subclass),
+        # which the helper catches -> returns False, and nothing is created.
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('i am a regular file, not a directory\n')
+        claude_fleet = blocker / 'fleet'
+        ws = _make_write_set(claude_fleet=claude_fleet)
+
+        assert ensure_claude_fleet_dir(ws) is False
+        assert not claude_fleet.exists()

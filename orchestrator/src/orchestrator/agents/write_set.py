@@ -159,3 +159,32 @@ def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
         tmp=Path('/tmp'),
         dev=Path('/dev'),
     )
+
+
+def ensure_claude_fleet_dir(write_set: WriteSet) -> bool:
+    """Best-effort, side-effecting pre-creation of ``write_set.claude_fleet``.
+
+    ``compute_write_set`` is intentionally PURE (no makedirs — pinned by
+    ``test_purity_no_makedirs_side_effect``), yet the ``~/.claude/fleet``
+    carve-out is load-bearing and must EXIST on disk before the sandbox is
+    built: neither backend can grant a nonexistent writable path from INSIDE
+    the sandbox — bwrap ``build_bwrap_command`` binds a writable extra only
+    ``if os.path.isdir(extra)`` (sandbox.py) and landlock ``_add_path`` skips a
+    path that ``not os.path.isdir(path)`` (landlock_exec.py) — and the agent
+    cannot create it itself because the parent ``~/.claude`` is read-only under
+    both backends. So the orchestrator must materialize it OUTSIDE the sandbox,
+    once, before dispatch (task 2996). This helper is co-located with the
+    single-source ``WriteSet`` (PRD D11) but kept SEPARATE from the pure
+    derivation.
+
+    Returns ``True`` when the directory exists after the call (created or
+    already present — ``exist_ok=True``), ``False`` when ``mkdir`` raises
+    ``OSError``. Does no logging: the caller
+    (``TaskWorkflow._ensure_sandbox_dirs``) owns the operator-facing warning
+    and the ``task_id`` triage context.
+    """
+    try:
+        write_set.claude_fleet.mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError:
+        return False
