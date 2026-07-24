@@ -35,6 +35,16 @@ async def verify_cited_memories(
     Mirrors ``standing_decision_writer.resolve_evidence_refs``'s found/None
     branching. Returns ``stage1_*`` stats for ``report.stats``.
     """
+    # Why re-verify at all, at report-assembly time? Two root causes this pass
+    # closes that a cite-time check cannot:
+    #   (1) The LLM stage hallucinating/typo-ing an id: the structured-output
+    #       JSON fallback (BaseStage.run builds items_flagged straight from the
+    #       model's flagged_items) bypasses recon_report.cite_memory's existence
+    #       check entirely, so a fabricated id reaches cited_memories unchecked.
+    #   (2) Citing an id whose queued add_memory write later FAILED: a TOCTOU
+    #       the cite-time-only check structurally cannot catch (it validates at
+    #       cite-time, not at report-assembly-time). This run()-time
+    #       re-verification is the only check that closes it.
     stats = {
         'stage1_phantom_citations_dropped': 0,
         'stage1_citations_verified': 0,
@@ -46,7 +56,25 @@ async def verify_cited_memories(
         for entry in cited:
             memory_id = entry.get('memory_id')
             store = entry.get('store')
-            record = await memory_service.get_memory_by_id(project_id, memory_id)
+            try:
+                record = await memory_service.get_memory_by_id(project_id, memory_id)
+            except Exception as exc:
+                # A raised backend error is 'unknown', not 'absent': dropping the
+                # citation here would itself be a silent-fail (the exact
+                # anti-pattern this fix forbids). KEEP it, surface the
+                # uncertainty via a marker, and never propagate — the stage must
+                # not crash on a check error.
+                kept.append(entry)
+                finding.setdefault('citation_failures', []).append(
+                    {
+                        'memory_id': memory_id,
+                        'store': store,
+                        'reason': 'verification_error',
+                        'error_type': type(exc).__name__,
+                    },
+                )
+                stats['stage1_citation_verification_errors'] += 1
+                continue
             if record:
                 kept.append(entry)
                 stats['stage1_citations_verified'] += 1
