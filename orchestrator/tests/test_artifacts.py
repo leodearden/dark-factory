@@ -152,6 +152,120 @@ class TestPlan:
         assert len(completed) == 2  # pre-1 + step-1
 
 
+class TestMarkStepCommitted:
+    """TaskArtifacts.mark_step_committed(step_id, sha) — pre-satisfy a plan
+    step at AUTHORING time (status→'done', commit=full sha, prepend a
+    '[COMMITTED <sha[:12]>]' description tag). Pure persistence, NO git — the
+    git corroborate-before-acting guard lives in plan_tools._sha_exists_on_branch.
+    See task 3030 / PRD plans/architect-already-complete-exits.md Contract A1.
+    """
+
+    SHA = 'a' * 40
+
+    @staticmethod
+    def _plan() -> dict:
+        return {
+            'task_id': 'task-1',
+            'files': ['backend/app.py'],
+            'prerequisites': [
+                {'id': 'pre-1', 'type': 'test', 'description': 'Setup fixture',
+                 'status': 'pending', 'commit': None},
+            ],
+            'steps': [
+                {'id': 'step-1', 'type': 'test', 'description': 'Write test',
+                 'status': 'pending', 'commit': None},
+                {'id': 'step-2', 'type': 'impl', 'description': 'Implement',
+                 'status': 'pending', 'commit': None},
+            ],
+        }
+
+    def test_marks_step_done_full_sha_in_commit_truncated_in_tag(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_plan(self._plan())
+
+        assert artifacts.mark_step_committed('step-1', self.SHA) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['id'] == 'step-1'
+        assert step['status'] == 'done'
+        # FULL sha persisted to commit; only sha[:12] appears in the tag.
+        assert step['commit'] == self.SHA
+        assert step['description'].startswith(f'[COMMITTED {self.SHA[:12]}]')
+        assert step['description'].endswith('Write test')
+        # The untruncated 40-char sha must NOT leak into the tag text.
+        assert self.SHA not in step['description']
+
+    def test_marks_prerequisite(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(self._plan())
+
+        assert artifacts.mark_step_committed('pre-1', self.SHA) is True
+
+        prereq = artifacts.read_plan()['prerequisites'][0]
+        assert prereq['status'] == 'done'
+        assert prereq['commit'] == self.SHA
+        assert prereq['description'].startswith(f'[COMMITTED {self.SHA[:12]}]')
+
+    def test_unknown_id_returns_false_and_mutates_nothing(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_plan(self._plan())
+        # Stabilize any one-time normalization rewrite before capturing bytes.
+        artifacts.read_plan()
+        before = (artifacts.root / 'plan.json').read_text()
+
+        assert artifacts.mark_step_committed('nope', self.SHA) is False
+
+        after = (artifacts.root / 'plan.json').read_text()
+        assert after == before
+
+    def test_idempotent_per_step_and_sha(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(self._plan())
+
+        assert artifacts.mark_step_committed('step-1', self.SHA) is True
+        assert artifacts.mark_step_committed('step-1', self.SHA) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        # No double-prepend on a repeated (step_id, sha) call.
+        assert step['description'].count('[COMMITTED ') == 1
+
+    def test_remark_different_sha_replaces_tag_no_stacking(
+        self, artifacts: TaskArtifacts
+    ):
+        # A re-mark against a DIFFERENT sha (e.g. an amended/squashed commit
+        # during re-planning) must REPLACE the stale [COMMITTED ...] tag, not
+        # stack a second one in front of it.
+        artifacts.write_plan(self._plan())
+        sha_a = 'a' * 40
+        sha_b = 'b' * 40
+
+        assert artifacts.mark_step_committed('step-1', sha_a) is True
+        assert artifacts.mark_step_committed('step-1', sha_b) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        # commit tracks the LATEST sha; description carries exactly the current
+        # tag — the stale sha_a tag is gone, not stacked.
+        assert step['commit'] == sha_b
+        assert step['description'].count('[COMMITTED ') == 1
+        assert step['description'].startswith(f'[COMMITTED {sha_b[:12]}]')
+        assert sha_a[:12] not in step['description']
+        assert step['description'].endswith('Write test')
+
+    def test_affects_pending_and_completed_filters(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_plan(self._plan())
+
+        artifacts.mark_step_committed('step-1', self.SHA)
+
+        pending_ids = [s['id'] for s in artifacts.get_pending_steps()]
+        completed_ids = [s['id'] for s in artifacts.get_completed_steps()]
+        assert 'step-1' not in pending_ids
+        assert 'step-1' in completed_ids
+
+
 class TestIterationLog:
     def test_append_and_read(self, artifacts: TaskArtifacts):
         artifacts.append_iteration_log({

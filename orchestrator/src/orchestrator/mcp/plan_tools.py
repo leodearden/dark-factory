@@ -491,6 +491,85 @@ def _resolve_main_sha(worktree: Path) -> str:
         return ''
 
 
+def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
+    """Return True iff *sha* is reachable from HEAD in the repo at *worktree*.
+
+    A real ``git merge-base --is-ancestor <sha> HEAD`` reachability check
+    (returncode 0 == *sha* is an ancestor of — or equal to — HEAD), run in the
+    worktree cwd. This is the machine-checked corroborate-before-acting guard
+    for ``mark_step_committed`` (INV-1/INV-3): the architect must be UNABLE to
+    pre-satisfy a plan step against a commit that does not resolve on the
+    current branch.
+
+    Note we check reachability (``--is-ancestor``), NOT mere object existence
+    (``git cat-file -e``): in this repo's shared/multi-worktree object store a
+    commit from another task's branch — or a dangling/unreachable object —
+    exists in the object DB yet is NOT on this branch. ``--is-ancestor`` returns
+    non-zero (exit 1 for a real-but-unreachable commit, 128 for a bad object)
+    for both, so the guard matches its advertised on-branch contract. It
+    deliberately does NOT prove the step's semantics — VERIFY remains the gate.
+    Mirrors :func:`_resolve_main_sha`'s subprocess shape (cwd=worktree,
+    timeout=10, OSError/SubprocessError -> safe ``False``).
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', sha, 'HEAD'],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning(
+            'Failed git merge-base --is-ancestor for sha %r: %s', sha, exc
+        )
+        return False
+
+
+def _mark_step_committed(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    sha: str,
+) -> dict[str, Any]:
+    """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+    Guards on a real on-branch reachability check for *sha* (corroborate-before-
+    acting) before delegating the status/commit/description-tag mutation to
+    :meth:`TaskArtifacts.mark_step_committed`. Returns the Contract A1 shapes:
+    ``{'ok': True, 'step_id', 'status': 'done'}`` on success (``status`` is the
+    step's NEW status), and ``{'ok': False, 'status': 'error', 'message': ...}``
+    on a non-resolving sha or an unknown ``step_id``.
+
+    NOTE: this envelope (``ok`` + ``status`` = the step's new status) is the
+    Contract A1 shape and DELIBERATELY differs from the sibling
+    :func:`_mark_step_done` (``status: 'ok'|'error'`` + ``new_status``). A1
+    fixes ``{ok, step_id, status}`` for the re-invoked architect's all-committed
+    path; don't "align" the two — the divergence is contractual, not an
+    oversight. On error we keep the repo-wide ``{'status':'error','message'}``
+    convention (so ``status=='error'``/substring assertions hold) and add
+    ``ok:False`` so callers can branch uniformly on ``ok``.
+    """
+    if not _sha_exists_on_branch(artifacts.worktree, sha):
+        return {
+            'ok': False,
+            'status': 'error',
+            'message': (
+                f'sha {sha!r} does not resolve on the current branch '
+                '(not reachable from HEAD — git merge-base --is-ancestor '
+                'failed) — cannot pre-satisfy a step against a commit that '
+                'is not on this branch'
+            ),
+        }
+    if not artifacts.mark_step_committed(step_id, sha):
+        return {
+            'ok': False,
+            'status': 'error',
+            'message': f'Step {step_id!r} not found in plan.',
+        }
+    return {'ok': True, 'step_id': step_id, 'status': 'done'}
+
+
 # ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
@@ -599,6 +678,35 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             commit_sha: The git commit SHA for this step's changes.
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
+
+    @mcp.tool()
+    def mark_step_committed(
+        step_id: str,
+        sha: str,
+    ) -> dict[str, Any]:
+        """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+        Marks the step ``done`` (and prepends a ``[COMMITTED <sha[:12]>]`` tag
+        to its description) WITHOUT an implementer turn. Use this ONLY when the
+        branch you are (re-)planning ALREADY carries the complete, committed,
+        green implementation of this step: a re-invoked architect can then emit
+        an all-satisfied plan so the EXECUTE loop becomes a total no-op and the
+        branch flows PLAN → VERIFY → REVIEW → MERGE with zero implementer turns.
+
+        The *sha* MUST resolve on the current branch — a real ``git merge-base
+        --is-ancestor <sha> HEAD`` reachability guard refuses a commit that is
+        not on this branch (corroborate-before-acting; mere existence in a
+        shared object store is not enough). This does NOT prove the step's
+        semantics: VERIFY remains the gate, and a falsely pre-satisfied step
+        surfaces as a VERIFY failure, never a silent skip. Idempotent per
+        ``(step_id, sha)``.
+
+        Args:
+            step_id: The step or prerequisite ID (e.g. "step-1", "pre-1").
+            sha: The git commit SHA that already carries this step's work.
+                Must resolve on the current branch.
+        """
+        return _mark_step_committed(artifacts, step_id, sha)
 
     # --- Revalidation tools ---
 

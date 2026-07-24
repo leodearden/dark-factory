@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 
+# Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
+# trailing whitespace) at the START of a step description.  Used by
+# :meth:`TaskArtifacts.mark_step_committed` to strip a stale tag before
+# prepending the current one, so re-marking a step against a DIFFERENT sha
+# (e.g. an amended/squashed commit during re-planning) REPLACES the tag rather
+# than stacking provenance.  The ``+`` also cleans up any tags that a prior
+# (pre-strip) implementation may have already stacked.
+_COMMITTED_TAG_RE = re.compile(r'^(?:\[COMMITTED [0-9a-fA-F]+\]\s*)+')
+
 # Sidecar schema for ``agent_session.json`` (task 2771).  v1 carried only
 # session_id/role/started_at/owner_pid; v2 adds the durable task_id binding,
 # resume_count, and this discriminator.  Every write emits the current version.
@@ -702,6 +711,49 @@ class TaskArtifacts:
                     return
 
         logger.warning(f'Step {step_id} not found in plan')
+
+    def mark_step_committed(self, step_id: str, sha: str) -> bool:
+        """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+        Flips the matching item's ``status`` to ``'done'``, records the FULL
+        *sha* in its ``commit`` field, and prepends a ``[COMMITTED <sha[:12]>]``
+        provenance tag to its ``description``. Returns ``True`` on a match,
+        ``False`` (with a warning mirroring :meth:`update_step_status`) when no
+        step/prerequisite has ``id == step_id``.
+
+        Unlike :meth:`update_step_status` — contractually "status and commit
+        fields ONLY" — this DELIBERATELY mutates the description, which is why it
+        is a dedicated method rather than an extension of that one. Idempotent
+        per ``(step_id, sha)``: a repeated call keeps the item ``'done'`` and
+        does NOT double-prepend the tag. A re-mark with a DIFFERENT sha REPLACES
+        the tag (any stale leading ``[COMMITTED ...]`` tag is stripped first)
+        rather than stacking provenance, so the description carries exactly the
+        current commit's tag. Pure persistence, NO git — the
+        corroborate-before-acting guard that *sha* actually resolves on-branch
+        lives in ``plan_tools._sha_exists_on_branch``; this method does NOT
+        prove the step's semantics (VERIFY remains the gate).
+        """
+        plan = self.read_plan()
+        tag = f'[COMMITTED {sha[:12]}]'
+
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get('id') == step_id:
+                    item['status'] = 'done'
+                    item['commit'] = sha
+                    # Strip any existing leading [COMMITTED <sha>] tag(s) before
+                    # prepending the current one: idempotent for a repeat of the
+                    # same sha, and a clean replace (no stacking) for a re-mark
+                    # with a different sha.
+                    description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
+                    item['description'] = f'{tag} {description}'
+                    self.write_plan(plan)
+                    return True
+
+        logger.warning(f'Step {step_id} not found in plan')
+        return False
 
     def get_pending_steps(self) -> list[dict]:
         """Return all steps with status 'pending', in order."""
