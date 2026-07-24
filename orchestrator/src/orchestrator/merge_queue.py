@@ -3079,16 +3079,32 @@ async def select_recovery_winner(
     γ/δ invariant "the two paths cannot diverge on which action class" hold by
     construction rather than by two hand-rolled ancestry checks.
 
-    A None tip (candidate or current winner) cannot be classified, so that pair
-    is skipped and the current winner is kept — never a crash.
+    None-tip handling (never crashes, never silently degrades to journal order):
+
+    * A None *candidate* has no resolvable SHA and can never be a strict
+      descendant, so it is skipped and the current winner kept.
+    * A None *current winner* is shadowed by the first later candidate that has
+      a real tip: that candidate is PROMOTED to winner.  Without this a
+      tip-less earliest record (e.g. a legacy journal entry persisted before
+      snapshot_tip existed) would win the whole reduce — every comparison
+      against a None current is skipped — so "descendant-most wins" would
+      silently collapse to first-seen order for the whole group.
     """
     winner_idx = 0
     divergence_seen = False
     for i in range(1, len(tips)):
         candidate = tips[i]
         current = tips[winner_idx]
-        if candidate is None or current is None:
-            # Can't classify against a missing tip — keep the current winner.
+        if candidate is None:
+            # A tip-less candidate can never be a strict descendant — keep the
+            # current winner.
+            continue
+        if current is None:
+            # The current winner has no resolvable tip but this candidate does.
+            # Prefer the record with a real tip so a mixed None/real-tip group
+            # does not silently fall back to journal order (the None winner would
+            # otherwise survive the whole reduce by skipping every comparison).
+            winner_idx = i
             continue
         relation = await classify_tip_relation(candidate, current, git_ops)
         if relation is TipRelation.DIVERGENT:

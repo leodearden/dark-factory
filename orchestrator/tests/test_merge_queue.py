@@ -18165,12 +18165,33 @@ class TestSelectRecoveryWinner:
         git_ops = _make_ancestry_git_ops(set())
         assert await select_recovery_winner(['A', None], git_ops) == (0, False)
 
-    async def test_none_winner_tip_skipped(self) -> None:
-        """A None winner tip cannot be classified against → later tip skipped,
-        current winner (index 0) kept."""
+    async def test_none_winner_tip_promotes_real_candidate(self) -> None:
+        """A None current-winner tip is shadowed by a later REAL tip.
+
+        The tip-less record can never be a strict descendant, and leaving it as
+        the winner would make tip-based dedup silently degrade to journal order
+        (every comparison against a None current is skipped).  So a later
+        candidate with a resolvable tip is PROMOTED to winner (index 1)."""
         from orchestrator.merge_queue import select_recovery_winner
         git_ops = _make_ancestry_git_ops(set())
-        assert await select_recovery_winner([None, 'A'], git_ops) == (0, False)
+        assert await select_recovery_winner([None, 'A'], git_ops) == (1, False)
+
+    async def test_none_winner_then_descendant_most_still_wins(self) -> None:
+        """[None, ancestor, descendant] → the None is shadowed by the first real
+        tip (promoted at index 1), then the descendant SUPERSEDES it (index 2).
+
+        Confirms the promotion does not short-circuit the descendant-most
+        contract for the remaining real tips."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops({('anc', 'desc')})
+        assert await select_recovery_winner([None, 'anc', 'desc'], git_ops) == (2, False)
+
+    async def test_all_none_until_last_promotes_last(self) -> None:
+        """[None, None, 'A'] → the only resolvable tip wins (index 2); the
+        leading tip-less records never shadow it."""
+        from orchestrator.merge_queue import select_recovery_winner
+        git_ops = _make_ancestry_git_ops(set())
+        assert await select_recovery_winner([None, None, 'A'], git_ops) == (2, False)
 
 
 # ---------------------------------------------------------------------------
