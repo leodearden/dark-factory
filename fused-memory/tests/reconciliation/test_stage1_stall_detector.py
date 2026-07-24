@@ -29,6 +29,7 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD,
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
+    extract_stalled_gate_backlog_task_ids,
     gate_escalated_age_secs,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
@@ -599,3 +600,88 @@ class TestGateEscalatedAgeSecs:
         age = gate_escalated_age_secs(meta, now=_GATE_NOW)
         assert age is not None
         assert age == pytest.approx(-2 * 3600, abs=1.0)
+
+
+# ---------------------------------------------------------------------------
+# extract_stalled_gate_backlog_task_ids (task 3017)
+# ---------------------------------------------------------------------------
+
+
+def _gate_task(
+    tid,
+    *,
+    hours_ago: float = 49,
+    status: str = 'blocked',
+    operational_mode: str | None = 'gate',
+    with_stamp: bool = True,
+) -> dict:
+    """Build a task dict shaped like a blocked human-decision gate."""
+    meta: dict = {}
+    if operational_mode is not None:
+        meta['operational_mode'] = operational_mode
+    if with_stamp:
+        meta['gate_escalated_at'] = (_GATE_NOW - timedelta(hours=hours_ago)).isoformat()
+    return {'id': tid, 'status': status, 'metadata': meta}
+
+
+class TestExtractStalledGateBacklogTaskIds:
+    """extract_stalled_gate_backlog_task_ids selects blocked, aged gate tasks."""
+
+    def test_empty_list_returns_empty(self):
+        """(a) empty list → []."""
+        assert extract_stalled_gate_backlog_task_ids([], now=_GATE_NOW) == []
+
+    def test_blocked_stale_gate_included_id_coerced_to_str(self):
+        """(b) blocked gate aged 49h (> 48h) → ['645'] (int id coerced to str)."""
+        tasks = [_gate_task(645, hours_ago=49)]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['645']
+
+    def test_blocked_fresh_gate_excluded(self):
+        """(c) blocked gate aged 47h (< 48h) → excluded."""
+        tasks = [_gate_task(645, hours_ago=47)]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_non_blocked_status_excluded(self):
+        """(d) stale gate stamp but status != 'blocked' → excluded."""
+        tasks = [
+            _gate_task(1, hours_ago=49, status='in-progress'),
+            _gate_task(2, hours_ago=49, status='pending'),
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_operational_mode_llm_excluded(self):
+        """(e) operational_mode='llm' with stale stamp → excluded."""
+        tasks = [_gate_task(3, hours_ago=49, operational_mode='llm')]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_no_gate_escalated_at_excluded(self):
+        """(f) blocked task without a gate_escalated_at stamp → excluded."""
+        tasks = [_gate_task(4, with_stamp=False)]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_missing_or_none_id_skipped(self):
+        """(g) blocked, stale gate tasks with missing/None id → skipped (no raise)."""
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+        tasks = [
+            {'status': 'blocked', 'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp}},
+            {'id': None, 'status': 'blocked',
+             'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp}},
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_multiple_stalled_sorted_and_deduped(self):
+        """(h) two stalled tasks → sorted; the same id twice collapses to once."""
+        tasks = [
+            _gate_task(650, hours_ago=50),
+            _gate_task(648, hours_ago=60),
+            _gate_task(650, hours_ago=70),  # duplicate id
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['648', '650']
+
+    def test_custom_threshold_secs_respected(self):
+        """(i) custom threshold_secs overrides the 48h default."""
+        tasks = [_gate_task(5, hours_ago=10)]  # 10h old
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+        assert extract_stalled_gate_backlog_task_ids(
+            tasks, now=_GATE_NOW, threshold_secs=5 * 3600
+        ) == ['5']
