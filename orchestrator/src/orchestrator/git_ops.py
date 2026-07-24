@@ -2152,6 +2152,50 @@ class GitOps:
             return False  # any other signal failure — fail-open, not held
         return True
 
+    @staticmethod
+    async def _acquire_lane_flock_off_thread(
+        lock_path: Path, wait_secs: float,
+    ) -> int | None:
+        """Bounded-wait acquire of a lane's ``<lane_dir>.lock`` flock, OFF the
+        event loop.
+
+        Shared acquire skeleton of :meth:`merge_verify_lease` and
+        :meth:`task_verify_lease` (task 3027): the acquire itself is identical
+        in both leases — they diverge only in their timeout constant, their
+        fail-mode on a ``None`` return, and (merge only) the holder-pgid write.
+        Factored out so the two leases cannot drift on the off-thread acquire.
+
+        Runs via :func:`asyncio.to_thread` because
+        :func:`acquire_merge_verify_flock` is a synchronous ``time.sleep`` poll
+        whose bounded wait is now minutes, so an inline call would freeze the
+        whole orchestrator (mirrors :meth:`reset_persistent_merge_worktree`'s
+        off-thread acquire).
+
+        Returns the held fd, or ``None`` if the bounded wait timed out
+        (contended). Each lease encodes its OWN policy on that ``None``:
+        :meth:`merge_verify_lease` RAISES :class:`MergeVerifyLeaseContended`;
+        :meth:`task_verify_lease` fails OPEN (WARNING + proceed).
+        """
+        return await asyncio.to_thread(
+            acquire_merge_verify_flock, lock_path, wait_secs,
+        )
+
+    @staticmethod
+    def _release_lane_flock(fd: int | None) -> None:
+        """Release a lane flock from :meth:`_acquire_lane_flock_off_thread`,
+        guarding the fail-open ``None`` case (task 3027).
+
+        A ``None`` fd means the acquire timed out and the lease proceeded
+        WITHOUT the hold (:meth:`task_verify_lease`'s fail-open path); calling
+        :func:`release_merge_verify_flock` on it would raise an unsuppressed
+        ``TypeError`` (``fcntl.flock(None, ...)``). :meth:`merge_verify_lease`
+        never reaches its finally with a ``None`` fd (it raises on contention
+        first), so the guard is a harmless no-op there — a shared release that
+        is safe for both leases.
+        """
+        if fd is not None:
+            release_merge_verify_flock(fd)
+
     @contextlib.asynccontextmanager
     async def merge_verify_lease(self, lane_dir: Path | None = None):
         """Async context manager recording the merge-verify lease for the
@@ -2217,13 +2261,11 @@ class GitOps:
         lock_path = lane_lock_path(
             lane_dir if lane_dir is not None else self.persistent_merge_worktree_path
         )
-        # Acquire OFF the event loop: the bounded wait is now minutes
-        # (_MERGE_VERIFY_LEASE_WAIT_SECS) and acquire_merge_verify_flock is a
-        # synchronous time.sleep poll, so an inline call would freeze the whole
-        # orchestrator. Mirrors reset_persistent_merge_worktree's
-        # asyncio.to_thread(acquire_merge_verify_flock, ...) precedent.
-        fd = await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS,
+        # Off-thread bounded-wait acquire (shared skeleton, task 3027):
+        # _acquire_lane_flock_off_thread wraps the asyncio.to_thread(
+        # acquire_merge_verify_flock, ...) that both leases use identically.
+        fd = await self._acquire_lane_flock_off_thread(
+            lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS,
         )
         if fd is None:
             # Contended past the bounded wait: RAISE so the dispatch is
@@ -2236,7 +2278,7 @@ class GitOps:
             yield
         finally:
             remove_lock_holder_pgid(self.worktree_base)
-            release_merge_verify_flock(fd)
+            self._release_lane_flock(fd)
 
     @contextlib.asynccontextmanager
     async def task_verify_lease(self, lane_dir: Path):
@@ -2283,12 +2325,11 @@ class GitOps:
         the per-lane ``flock -n`` check itself.
         """
         lock_path = lane_lock_path(lane_dir)
-        # Acquire OFF the event loop: the bounded wait is minutes
-        # (_TASK_VERIFY_LEASE_WAIT_SECS) and acquire_merge_verify_flock is a
-        # synchronous time.sleep poll, so an inline call would freeze the whole
-        # orchestrator (mirrors merge_verify_lease's off-thread acquire).
-        fd = await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, _TASK_VERIFY_LEASE_WAIT_SECS,
+        # Off-thread bounded-wait acquire (shared skeleton with
+        # merge_verify_lease, task 3027): _acquire_lane_flock_off_thread wraps
+        # the asyncio.to_thread(acquire_merge_verify_flock, ...) both leases use.
+        fd = await self._acquire_lane_flock_off_thread(
+            lock_path, _TASK_VERIFY_LEASE_WAIT_SECS,
         )
         if fd is None:
             # Contended past the bounded wait: FAIL OPEN. Proceed WITHOUT the
@@ -2305,10 +2346,10 @@ class GitOps:
         try:
             yield
         finally:
-            # Guard against the fail-open path: never release on a None fd
-            # (fcntl.flock(None, ...) raises an unsuppressed TypeError).
-            if fd is not None:
-                release_merge_verify_flock(fd)
+            # Shared None-guarded release (task 3027): on the fail-open path
+            # fd is None and _release_lane_flock skips the release, avoiding the
+            # unsuppressed TypeError from fcntl.flock(None, ...).
+            self._release_lane_flock(fd)
 
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
