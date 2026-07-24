@@ -21,13 +21,18 @@ Deliberately DIFFERENT from :meth:`GitOps.merge_verify_lease` in two ways:
 This module builds the CM up from the bottom:
   step-1/2 — the happy-path flock hold + release (flock-only)
   step-3/4 — fail-open on a contended flock
-  step-5/6 — the two workflow.py task-lane verify sites hold the lease
+  step-5/6 — the two workflow.py task-lane verify sites hold the lease. Both
+    structurally-independent sites get their OWN held-flock call-site spy: the
+    implement-phase _run_scoped_verification_with_infra_retry
+    (TestTaskLaneVerifyHoldsLease) and the merge-phase post-rebase re-verify in
+    _run_merge_phase (TestMergePhaseReverifyHoldsLease), so unwrapping either
+    one fails a test.
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -249,5 +254,86 @@ class TestTaskLaneVerifyHoldsLease:
         assert result is not None and result.passed, (
             'the wrapped verify must return the passing VerifyResult (proving '
             'the in-mock held-flock assertion passed)'
+        )
+        assert verify_mock.await_count == 1
+
+
+class _StopMergePhase(Exception):
+    """Sentinel raised by the merge-phase spy the instant it has asserted the
+    held flock, to unwind out of _run_merge_phase without driving the whole
+    downstream merge-queue submit path."""
+
+
+@pytest.mark.asyncio
+class TestMergePhaseReverifyHoldsLease:
+    """The merge-phase post-rebase re-verify ALSO runs INSIDE task_verify_lease
+    (step-6; workflow.py _run_merge_phase, the ``async with
+    self.git_ops.task_verify_lease(self.worktree)`` around the pre-merge
+    re-verify).
+
+    This site is STRUCTURALLY INDEPENDENT of the implement-phase site covered by
+    TestTaskLaneVerifyHoldsLease — a future edit could unwrap this one without
+    failing that test — so it gets its OWN held-flock call-site spy (the exact
+    warm-lane-gc race the change targets). The _run_merge_phase preamble is
+    mocked out just far enough to reach the pre-merge re-verify; the spy asserts
+    the lane flock is HELD, then raises _StopMergePhase to unwind cleanly before
+    the merge-queue submit path (which is irrelevant to the flock hold).
+    """
+
+    async def test_pre_merge_reverify_holds_task_lane_flock(self, tmp_path: Path):
+        workflow = _build_task_workflow(tmp_path)
+        assert workflow.worktree is not None  # narrow Path | None for the spy
+        lock_path = lane_lock_path(workflow.worktree)
+
+        # Mock the _run_merge_phase preamble so control reaches the pre-merge
+        # re-verify without any real git / state-machine work. Only the REAL
+        # task_verify_lease flock and the patched run_scoped_verification matter
+        # here. (_check_escalations is already MagicMock->[] via _make_workflow.)
+        workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        workflow._enter_phase = MagicMock()  # type: ignore[method-assign]  # skip the real state-machine transition
+        workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        workflow._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
+        workflow.git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        held_asserted = False
+
+        def _assert_flock_held_then_bail(*_args, **_kwargs) -> VerifyResult:
+            nonlocal held_asserted
+            # The task lane flock must be HELD (task_verify_lease) for the
+            # duration of the merge-phase re-verify — a fresh bounded-wait-0.0
+            # acquire from this same process must contend (separate open file
+            # description → None).
+            fd = acquire_merge_verify_flock(lock_path, 0.0)
+            try:
+                assert fd is None, (
+                    'the task lane flock must be HELD (task_verify_lease) while '
+                    'the merge-phase post-rebase re-verify runs — a fresh 0.0s '
+                    'acquire must contend, but it succeeded (this verify call is '
+                    'not wrapped in the lease)'
+                )
+            finally:
+                if fd is not None:
+                    release_merge_verify_flock(fd)
+            held_asserted = True
+            # Unwind out of _run_merge_phase now: we only assert the hold across
+            # THIS call, not the downstream merge submit.
+            raise _StopMergePhase()
+
+        verify_mock = AsyncMock(side_effect=_assert_flock_held_then_bail)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr('orchestrator.workflow.run_scoped_verification', verify_mock)
+            # git rev-parse HEAD in the preamble — return a stub head SHA.
+            mp.setattr(
+                'orchestrator.workflow._run',
+                AsyncMock(return_value=(0, 'headsha\n', '')),
+            )
+            with pytest.raises(_StopMergePhase):
+                await workflow._run_merge_phase('task/42')
+
+        assert held_asserted, (
+            'the merge-phase re-verify spy must have run and asserted the held '
+            'flock — the re-verify call must be wrapped in task_verify_lease'
         )
         assert verify_mock.await_count == 1

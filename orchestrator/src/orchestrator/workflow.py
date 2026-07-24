@@ -3333,10 +3333,13 @@ class TaskWorkflow:
                         task_files=self._task_files,
                         # role='task' is explicit for γ's explicit-is-correct
                         # invariant (mirrors merge_queue.py role='merge').
-                        # 'task' is already the default so this is documentary;
-                        # no call-site spy exists for this path — the
-                        # _verify_debugfix_loop spy in
-                        # test_workflow_verify_retry.py covers the primary site.
+                        # 'task' is already the default so this is documentary.
+                        # This site's task_verify_lease wrap has its OWN
+                        # held-flock call-site spy: test_task_verify_lease.py::
+                        # TestMergePhaseReverifyHoldsLease drives _run_merge_phase
+                        # to here and asserts the lane flock is HELD during the
+                        # re-verify (the implement-phase site is covered
+                        # separately by TestTaskLaneVerifyHoldsLease).
                         role='task',
                     )
                 if not verify.passed:
