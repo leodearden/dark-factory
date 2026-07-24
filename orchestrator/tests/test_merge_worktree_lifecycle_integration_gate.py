@@ -117,6 +117,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -128,9 +129,19 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
-from orchestrator.merge_queue import SpeculativeMergeWorker, coalesce_or_enqueue_merge_request
+from orchestrator.merge_queue import (
+    SpeculativeMergeWorker,
+    coalesce_or_enqueue_merge_request,
+    retire_cancelled_merge_request,
+)
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_types import InFlightMergeRegistry, MergeRequest, QueuedBranch
+from orchestrator.merge_types import (
+    InFlightMergeRegistry,
+    MergeRequest,
+    QueuedBranch,
+    TerminalOutcomeRecord,
+    TerminalOutcomeRetention,
+)
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -1009,6 +1020,40 @@ class TestIdentityFaceInVerifyReject:
         assert entry is not None and entry.request_id == 'mr-old'
         assert not old_fut.cancelled()
         assert queue.qsize() == 0
+
+
+# ---------------------------------------------------------------------------
+# Retire+resubmit fixture (row 9) -- ported from
+# test_merge_cancel_retire.py:43-69.
+# ---------------------------------------------------------------------------
+
+
+class _RetireSpy:
+    """git_ops spy for retirement tests.
+
+    ``find_inflight_merge_worktree`` returns the planted scratch path only
+    WHILE it still exists on disk, so a post-removal re-scan finds nothing.
+    ``remove_merge_worktree_guarded`` records ``(path, reason)`` and deletes
+    the dir, returning the ``'removed'`` outcome -- mirrors the disk-scan/
+    removal surface of test_merge_queue_c3_submit_identity.py's _ScratchSpy.
+    """
+
+    def __init__(self, scratch: Path | None) -> None:
+        self._scratch = scratch
+        self.removed: list[tuple[Path, str]] = []
+        self.find_calls = 0
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+        self.find_calls += 1
+        if self._scratch is not None and self._scratch.exists():
+            return self._scratch
+        return None
+
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str:
+        self.removed.append((path, reason))
+        if path.exists():
+            shutil.rmtree(path)
+        return 'removed'
 
 
 # ---------------------------------------------------------------------------
