@@ -7641,6 +7641,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _shutdown_timeout override precedent.
         self._heartbeat_interval_s: float = 300.0
+        # Periodic orphaned-_merge-* reap (task 3018 — closes the
+        # observe-but-never-reclaim gap: reap_orphaned_merge_worktrees was
+        # previously wired only at worker construction/recovery time, so a
+        # leak crossing grace mid-run sat unreaped until the next restart).
+        # Same clock-injected rate-limit idiom as _last_heartbeat_at: init
+        # 0.0 so the first heartbeat poll reaps immediately.
+        self._last_reap_at: float = 0.0
+        # Default interval ~5 min; override in tests for deterministic rate-limit checks.
+        # Mirrors the _heartbeat_interval_s / _shutdown_timeout override precedent.
+        self._reap_interval_s: float = 300.0
         # Per-lane FIFO buffers — items are drained from _queue into these so
         # pick-order can prefer high over normal.  Each deque preserves FIFO
         # within a lane.  Accessed only from the merger coroutine.
@@ -9708,6 +9718,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
 
         return {'readopted': readopted, 'reaped': reaped}
+
+    async def _maybe_reap_orphaned_merge_worktrees(self, now: float) -> None:
+        """Periodic/steady-state counterpart to the startup-only reap sweep
+        (task 3018 — closes the observe-but-never-reclaim gap).
+
+        :meth:`reap_orphaned_merge_worktrees` is lease-safe and already
+        reaps aged unregistered ``_merge-*`` worktrees while preserving
+        owned/lease-held ones, but it was previously invoked only once at
+        worker construction/recovery time (see
+        ``Harness._reap_orphaned_merge_worktrees``). A leak that first
+        crosses :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` mid-run therefore
+        sat unreaped until the next orchestrator restart — up to the fleet's
+        8h redeploy window — even though the observation-only resource audit
+        (:meth:`_check_resource_audit` / :meth:`worktree_ledger_violations`)
+        reported it on every heartbeat. This helper is invoked from
+        :meth:`_heartbeat_loop` so the sweep also runs periodically in
+        steady state, bounding a leak's on-disk lifetime instead of leaving
+        it until the next restart.
+
+        Deliberately calls :meth:`reap_orphaned_merge_worktrees` with NO
+        ``recovered_branches``: re-adoption from the durable journal is a
+        startup-only concern (recovery), and in steady state a live merge's
+        worktree is already registered in :attr:`_owned_merge_worktrees`
+        (and therefore skipped by the reap scan) well before it could ever
+        approach the grace window.
+
+        Leaves :meth:`_check_resource_audit` / :meth:`worktree_ledger_violations`
+        untouched — they remain observation + escalation only (PRD design
+        decision 4); this is a deliberately SEPARATE remediation pass, not a
+        change to the audit's mutation-free contract.
+        """
+        self._last_reap_at = now
+        await self.reap_orphaned_merge_worktrees(now=now)
 
     def _warn_if_verify_base_not_frozen_tip(
         self,
