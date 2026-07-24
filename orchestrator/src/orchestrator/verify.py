@@ -3752,6 +3752,134 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
                 cm.__exit__(None, None, None)
 
 
+# Cold-verify shared-venv pre-provision coalescing guard (task 2997).
+# run_verification is invoked N times concurrently in fan-outs (run_scoped_
+# verification's per-module gather; the post-merge type-only pyright gather in
+# merge_queue.py).  Without coalescing, each call would spawn its own `uv sync`
+# on the same cold `.venv` — itself the concurrent-uv-on-cold-venv operation
+# this task exists to eliminate.  A per-worktree lock + a TTL'd completed-path
+# map (both keyed by the RESOLVED worktree path) make overlapping callers await a
+# single in-flight provision and later callers skip.  Follows the module-level
+# cache + TTL precedent (_PROBE_CACHE / _PROBE_CACHE_TTL).
+#
+# No separate guard lock protects the dict: the get-or-create below runs with no
+# `await` between the read and the write, so under asyncio's cooperative
+# scheduling it is atomic (two coroutines cannot interleave within it).  A
+# module-level `asyncio.Lock()` created at import would instead bind to the first
+# event loop that touched it and raise cross-loop under pytest's per-test loops.
+#
+# The completed-path map records a monotonic completion time (not a bare set) so
+# entries EXPIRE.  Two failure modes a permanent set would have:
+#   * LEAK — a fresh-per-merge `.worktrees/_merge-<uuid>` path is never revisited,
+#     so an unbounded map/set would pin one entry per merge forever.
+#   * STALE SKIP — a warm-lane path later reset IN PLACE to a cold state (its
+#     `.venv` wiped and the `verify_warmed` marker cleared, so `_is_verify_cold`
+#     reclassifies it cold) would be SKIPPED on its retained "done" key and never
+#     re-provision, reintroducing the very concurrent-uv-on-empty-venv race this
+#     guard exists to prevent.
+# TTL-expiring the entry on read + opportunistically pruning on each completion
+# (`_prune_preprovision_guard`) handles both.
+_PREPROVISION_LOCKS: dict[str, asyncio.Lock] = {}
+_PREPROVISION_DONE: dict[str, float] = {}
+_PREPROVISION_DONE_TTL: float = 300.0  # 5 min; >> any single verify fan-out's coalescing window
+
+
+def _prune_preprovision_guard() -> None:
+    """Evict TTL-expired entries from the pre-provision coalescing guard.
+
+    Called opportunistically after each completion so the guard stays bounded:
+    a fresh-per-merge ``.worktrees/_merge-<uuid>`` path is never revisited, so
+    without a sweep its DONE + LOCKS entries would leak forever.  A DONE entry
+    older than :data:`_PREPROVISION_DONE_TTL` is dropped (its worktree either no
+    longer exists or, if reset in-place to a cold state, SHOULD re-provision
+    rather than skip on the stale key); the companion lock is dropped only when
+    uncontended, so an active provision/fan-out still coalescing on it is never
+    disturbed.
+    """
+    now = time.monotonic()
+    for key, done_at in list(_PREPROVISION_DONE.items()):
+        if now - done_at >= _PREPROVISION_DONE_TTL:
+            del _PREPROVISION_DONE[key]
+            lock = _PREPROVISION_LOCKS.get(key)
+            if lock is not None and not lock.locked():
+                del _PREPROVISION_LOCKS[key]
+
+
+async def _preprovision_shared_venv(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    verify_env: dict[str, str],
+    timeout: float,
+) -> None:
+    """Synchronously populate the shared ``.venv`` before the test/lint/type gather.
+
+    On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
+    EFFECT of the TEST leg's ``cd <module> && uv run pytest``.  The full-repo-
+    scope root LINT (``uv run ruff check …``) and TYPE (``… npx pyright``)
+    commands race that sync in the concurrent gather and fail spuriously
+    (``Failed to spawn: ruff``; ``Import "pytest" could not be resolved``).
+    Running ``config.verify_cold_preprovision_command`` here, synchronously,
+    before the gather closes that race by populating the venv first.
+
+    No-op when the knob is empty (the project-agnostic default — the deployed
+    uv-workspace value lives only in dark-factory-orchestrator.yaml).  Runs
+    through ``_run_cmd`` so it inherits the ghost-venv isolation scrub from
+    ``_target_subprocess_env`` (the TARGET's ``uv`` resolves the TARGET's
+    ``.venv``) with no new isolation code.
+    """
+    cmd = config.verify_cold_preprovision_command
+    if not cmd:
+        return
+    key = str(worktree.resolve())
+    # Fast path: recently provisioned for this worktree — skip without taking the
+    # lock (the common case once a worktree's first cold verify has run).  TTL'd
+    # so a path later reset in-place to a cold state re-provisions instead of
+    # skipping on a stale "done" key.
+    done_at = _PREPROVISION_DONE.get(key)
+    if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
+        return
+    # Get-or-create the per-worktree lock.  Synchronous (no await between the get
+    # and the set) → atomic under asyncio, so no separate guard lock is needed.
+    lock = _PREPROVISION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PREPROVISION_LOCKS[key] = lock
+    async with lock:
+        # Double-checked: a concurrent caller may have completed the provision
+        # while we awaited the lock — coalesce onto its single sync and skip
+        # (freshness re-checked against the TTL, as in the fast path).
+        done_at = _PREPROVISION_DONE.get(key)
+        if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
+            return
+        logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
+        rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        if rc != 0:
+            # Fail-open + loud (honours the loud-over-silent-degradation norm;
+            # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL
+            # sync is what closes the race; a FAILED sync is a real infra problem
+            # the gather's own tool spawn + existing failure classification will
+            # surface, so the pre-provision must NEVER become a NEW failure
+            # source — warn and return normally, always proceeding to the gather,
+            # never raising.
+            tail = out[-500:] if out else ''
+            logger.warning(
+                'Cold-verify shared-venv pre-provision failed (rc=%d), proceeding '
+                'to the verify gather anyway: %r\noutput tail: %s',
+                rc, cmd, tail,
+            )
+        # Mark done on completion (success OR fail-open failure) so overlapping
+        # callers coalesce onto this single in-flight sync and later callers skip.
+        # A failed sync is deliberately not retried per-caller (fail-open; the
+        # gather surfaces any real breakage) — retrying N times on a cold
+        # throwaway worktree would not help and reintroduces the concurrent-uv
+        # race this guard exists to prevent.  Record the completion TIME (not a
+        # bare membership marker) so the entry TTL-expires, then opportunistically
+        # prune stale entries so the guard stays bounded across many worktrees.
+        _PREPROVISION_DONE[key] = time.monotonic()
+        _prune_preprovision_guard()
+
+
 async def run_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -4021,6 +4149,19 @@ async def run_verification(
             timed_out=timed_out_flag,
             started_at=started_at,
             duration_secs=time.monotonic() - t0,
+        )
+
+    # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
+    # the shared .venv ONCE, synchronously, before the concurrent test/lint/type
+    # gather below, so the full-repo-scope root LINT/TYPE commands don't race the
+    # TEST-driven `uv run pytest` sync and fail spuriously on an empty venv.
+    # Gated on is_cold — the race's defining condition (a cold/possibly-empty
+    # venv) — so it is a no-op on warm lanes and also covers the post-merge
+    # type-only pyright path (test/lint=None → no TEST leg to populate the venv).
+    # No-op when the knob is unset (project-agnostic empty default).
+    if is_cold:
+        await _preprovision_shared_venv(
+            worktree, config, verify_env=verify_env, timeout=timeout,
         )
 
     retries = 0
