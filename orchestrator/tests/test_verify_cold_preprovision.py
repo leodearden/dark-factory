@@ -34,7 +34,10 @@ from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
 
 # Distinct tokens so the spy can attribute each _run_cmd invocation to a leg.
-PROVISION_CMD = 'uv sync --project shared --extra dev'
+# Mirror the ACTUAL deployed command (dark-factory-orchestrator.yaml) so the test
+# doubles as living documentation; ``_is_provision`` matches the 'uv sync'
+# substring, so the exact flags are immaterial to the spy.
+PROVISION_CMD = 'uv sync --all-packages'
 TEST_CMD = 'echo TESTLEG'
 LINT_CMD = 'echo LINTLEG'
 TYPE_CMD = 'echo TYPELEG'

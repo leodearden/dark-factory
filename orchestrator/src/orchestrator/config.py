@@ -2686,9 +2686,11 @@ class OrchestratorConfig(BaseSettings):
     # OrchestratorConfig (all ``_run_cmd`` test doubles) AND every unconfigured
     # target (reify=cargo, autopilot-video) is a byte-identical no-op — the
     # gate short-circuits on the empty command.  The deployed value
-    # (``uv sync --project shared --extra dev``) lives ONLY in
-    # dark-factory-orchestrator.yaml: the orchestrator is project-agnostic, so
-    # the ``shared`` uv-workspace assumption must NOT be hardcoded in verify.py.
+    # (``uv sync --all-packages`` — see that file for why ``--extra dev`` is
+    # WRONG here: the dev deps live in each member's dependency-groups, not an
+    # optional ``dev`` extra) lives ONLY in dark-factory-orchestrator.yaml: the
+    # orchestrator is project-agnostic, so the uv-workspace assumption must NOT
+    # be hardcoded in verify.py.
     # Mirrors the concurrent_verify / verify_cold_command_timeout_secs split-
     # default convention.  Green-tier hot-reloadable (RELOADABLE_FIELDS, beside
     # verify_env): read fresh each verify with no in-flight-split risk.
