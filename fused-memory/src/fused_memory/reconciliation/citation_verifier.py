@@ -32,6 +32,13 @@ async def verify_cited_memories(
       finding's ``citation_failures`` list, so the phantom claim is surfaced
       rather than silently retained.
 
+    Only ``store == 'mem0'`` entries carrying a truthy ``memory_id`` are
+    resolved. ``store == 'graphiti'`` citations (and any malformed/id-less
+    entries) are left UNTOUCHED and never looked up: ``get_memory_by_id`` is a
+    Mem0/Qdrant-only point read, so graphiti-store verification is intentionally
+    out of scope (it would need a different graph primitive and would otherwise
+    false-flag every graphiti citation as a phantom).
+
     Mirrors ``standing_decision_writer.resolve_evidence_refs``'s found/None
     branching. Returns ``stage1_*`` stats for ``report.stats``.
     """
@@ -54,6 +61,21 @@ async def verify_cited_memories(
         cited = finding.get('cited_memories') or []
         kept: list[Any] = []
         for entry in cited:
+            # Skip anything we cannot — or must not — resolve, preserving it
+            # verbatim and never counting it verified/dropped/errored:
+            #   * a non-dict entry (malformed);
+            #   * a dict with no truthy memory_id (nothing to look up);
+            #   * a non-mem0-store citation. get_memory_by_id is Mem0/Qdrant-only
+            #     (a raw point-id read), so resolving a graphiti edge uuid through
+            #     it would return not-found for EVERY graphiti citation and
+            #     false-flag legitimate graph evidence as a phantom.
+            if (
+                not isinstance(entry, dict)
+                or entry.get('store') != 'mem0'
+                or not entry.get('memory_id')
+            ):
+                kept.append(entry)
+                continue
             memory_id = entry.get('memory_id')
             store = entry.get('store')
             try:
