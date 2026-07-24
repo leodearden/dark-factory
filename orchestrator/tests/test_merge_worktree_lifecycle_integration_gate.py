@@ -120,13 +120,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_types import InFlightMergeRegistry
+from orchestrator.merge_types import InFlightMergeRegistry, MergeRequest, QueuedBranch
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -441,6 +442,81 @@ class TestDeleterFace:
         finally:
             release_merge_verify_flock(fd_live)
             remove_lock_holder_pgid(base)
+
+
+# ---------------------------------------------------------------------------
+# Recovery-dedupe seed builders (rows 6-7) -- ported from
+# test_merge_queue_store.py::TestRecoverPendingMergesRegistryDedup
+# (_make_req / _make_git_ops).
+# ---------------------------------------------------------------------------
+
+
+def _seed_dup_journal(
+    store: MergeQueueStore,
+    branch: str,
+    tips: list[str],
+    config: OrchestratorConfig,
+    worktree: Path,
+) -> list[MergeRequest]:
+    """Record ``len(tips)`` PersistedMergeRequest rows for *branch* on
+    *store*, one per tip in *tips* (distinct auto-generated request_ids;
+    journal insertion order == *tips* order).
+
+    Returns the seed MergeRequest objects built along the way -- their
+    ``make_placeholder_future()`` ``.result`` futures are throwaway:
+    recover_pending_merges' Phase 2 reconstructs fresh live MergeRequests
+    via ``reconstruct_merge_request`` bound to the REAL running loop, so
+    only each seed's ``.request_id`` is meaningful after seeding (safe
+    despite these async test bodies -- see make_placeholder_future's
+    docstring caveat, which applies to a future that is itself awaited/
+    resolved, not to one that is merely a throwaway identity carrier).
+    """
+    reqs = []
+    for tip in tips:
+        req = MergeRequest(
+            task_id=branch,
+            branch=QueuedBranch.parse(branch, config.git.branch_prefix),
+            worktree=worktree,
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=make_placeholder_future(),
+            snapshot_tip=tip,
+        )
+        store.record(req)
+        reqs.append(req)
+    return reqs
+
+
+def _make_git_ops(
+    *,
+    full_branch: str,
+    branch_sha: str = 'sha-live',
+    ancestor_pairs: set[tuple[str, str]] | None = None,
+) -> MagicMock:
+    """Fake git_ops for the recovery-dedupe tests (rows 6-7).
+
+    * ``resolve_branch_sha(full_branch)`` -> *branch_sha* (survives Phase 1
+      of recover_pending_merges), None for any other ref.
+    * ``is_ancestor(a, b)`` -> True iff ``(a, b)`` in *ancestor_pairs*. The
+      survival check ``is_ancestor(full_branch, 'main')`` is therefore
+      False (branch not yet landed) unless that exact pair is supplied,
+      and the Phase-2 tip classification is driven entirely by the
+      snapshot-tip pairs the caller supplies.
+    """
+    pairs = ancestor_pairs if ancestor_pairs is not None else set()
+
+    async def fake_resolve(branch: str) -> str | None:
+        return branch_sha if branch == full_branch else None
+
+    async def fake_is_ancestor(ancestor: str, descendant: str) -> bool:
+        return (ancestor, descendant) in pairs
+
+    git_ops = MagicMock()
+    git_ops.resolve_branch_sha = fake_resolve
+    git_ops.is_ancestor = fake_is_ancestor
+    return git_ops
 
 
 # ---------------------------------------------------------------------------
