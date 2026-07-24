@@ -15,6 +15,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.reconciliation.citation_verifier import verify_cited_memories
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
@@ -188,6 +189,23 @@ class MemoryConsolidator(BaseStage):
             events, watermark, prior_reports, run_id, model=model,
             resume_session_id=resume_session_id,
         )
+
+        # ── Phantom-citation verification (task 2978) ─────────────────────────
+        # Re-resolve every flagged finding's cited Mem0 memories against the
+        # live store and strip any that no longer exist, so a finding is never
+        # silently backed by an id that never existed (or whose queued
+        # add_memory write later failed).  Placed HERE — right after
+        # super().run() assembles items_flagged (converging BOTH the
+        # RRS-assembled and the structured-output JSON-fallback citation lists,
+        # the latter of which bypasses cite_memory's existence check) and BEFORE
+        # the remediation early-return below — so full AND remediation passes are
+        # both verified and the stage1_* citation stats are always present on
+        # report.stats.
+        _cite_stats = await verify_cited_memories(
+            report.items_flagged or [], self.memory, self.project_id,
+        )
+        report.stats.update(_cite_stats)
+
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
         )

@@ -169,14 +169,18 @@ async def test_malformed_entries_skipped_without_error():
 
 @pytest.mark.asyncio
 async def test_finding_without_cited_memories_is_noop():
-    """A finding with no 'cited_memories' key adds no citation_failures and
-    triggers no lookup."""
+    """A finding with no 'cited_memories' key is left ENTIRELY untouched — no
+    lookup, no citation_failures, and (critically) no empty cited_memories key
+    is added (else the pass would mutate every citation-less finding it walks)."""
     finding = {'description': 'a finding with no citations'}
     memory_service = AsyncMock()
     memory_service.get_memory_by_id = AsyncMock()
 
     stats = await verify_cited_memories([finding], memory_service, 'test_project')
 
+    # The finding dict is unchanged — no cited_memories, no citation_failures.
+    assert finding == {'description': 'a finding with no citations'}
+    assert 'cited_memories' not in finding
     assert 'citation_failures' not in finding
     memory_service.get_memory_by_id.assert_not_awaited()
     assert stats == {

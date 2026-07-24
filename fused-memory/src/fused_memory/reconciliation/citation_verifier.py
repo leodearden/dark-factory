@@ -59,6 +59,13 @@ async def verify_cited_memories(
     }
     for finding in findings:
         cited = finding.get('cited_memories') or []
+        if not cited:
+            # Nothing to verify — leave the finding ENTIRELY untouched. In
+            # particular, do NOT add an empty ``cited_memories`` key to a finding
+            # that never carried one: this pass runs over every flagged finding,
+            # and mutating citation-less findings would surprise unrelated
+            # consumers (and their tests).
+            continue
         kept: list[Any] = []
         for entry in cited:
             # Skip anything we cannot — or must not — resolve, preserving it
