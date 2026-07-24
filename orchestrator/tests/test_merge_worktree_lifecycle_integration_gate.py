@@ -652,6 +652,53 @@ class TestIdentityFaceRecoveryDedupe:
 
 
 # ---------------------------------------------------------------------------
+# Gated tree-liveness verify runner (capstone concurrency driver) -- holds a
+# verify LIVE in its own worktree while the test drives the concurrent
+# crash-recovery sweep, mirroring the 2026-07-22 task/5326 incident's actual
+# concurrency (a pre-launched merge-worker background task draining the
+# re-enqueued queue WHILE the sweep scans worktrees -- see the module
+# docstring's "Concurrency model" section).
+# ---------------------------------------------------------------------------
+
+
+def _gated_tree_liveness_verify(
+    entered: asyncio.Event,
+    release: asyncio.Event,
+    observations: list[bool],
+):
+    """Build a ``run_scoped_verification`` stand-in that holds ONE verify
+    live in its own ``_merge-<hash>`` worktree across a concurrent sweep.
+
+    Returns an async callable matching ``run_scoped_verification``'s call
+    shape (``worktree`` first positional; everything else absorbed via
+    ``*args``/``**kwargs`` so it tolerates the production call site's exact
+    kwarg set drifting -- mirrors test_merge_queue_restart_hook.py's
+    ``_mock_verify_pass`` duck-typed-VerifyResult idiom). Each call:
+
+      1. Appends ``worktree.exists()`` to *observations* -- entry liveness.
+      2. Sets *entered* so the test can synchronize past this point.
+      3. Awaits *release* -- holds the verify live while the test drives the
+         concurrent crash-recovery sweep.
+      4. Appends ``worktree.exists()`` again -- exit liveness.  A tree
+         yanked mid-verify by a concurrent sweep would record a ``False``
+         here, directly modelling the 2026-07-22 ENOENT incident.
+
+    Returns a duck-typed passing ``VerifyResult`` (``passed=True``).
+    """
+
+    async def _verify(worktree: Path, *args: object, **kwargs: object) -> object:
+        observations.append(worktree.exists())
+        entered.set()
+        await release.wait()
+        observations.append(worktree.exists())
+        return type(
+            'VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None},
+        )()
+
+    return _verify
+
+
+# ---------------------------------------------------------------------------
 # TestFiveThreeTwoSixReplayGate -- capstone: PRD Sec.9 rows 1, 2, 4, 5, 6, 7
 # end-to-end + 'merge finalizes' + the zero-ENOENT causal-proxy chain
 # ---------------------------------------------------------------------------
