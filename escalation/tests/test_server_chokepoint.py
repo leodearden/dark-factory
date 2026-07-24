@@ -3685,8 +3685,9 @@ class TestBoundary9CancelRetire:
     """
 
     async def test_scenario_9_cancel_then_immediate_resubmit_fresh(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             TerminalOutcomeRecord,
@@ -3711,6 +3712,21 @@ class TestBoundary9CancelRetire:
             event_store=event_store,
             registry=registry,
             git_ops=spy,
+        )
+
+        # Both submits drive is_ancestor->False (spy), so the task-2945 patch-id
+        # backstop runs after that miss.  Branch 'b9' is genuinely fresh content
+        # (cancel-then-resubmit), so patch_content_contained is False — stub it
+        # (the spy's /fake/project has no real repo for `git cherry` to run
+        # against; an unstubbed call raises WorktreeMissing).  Both submits must
+        # still fall through to a fresh dispatch (queued), never already_merged.
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
         )
 
         # (1) First submit dispatches fresh (worktree not on disk yet) and
