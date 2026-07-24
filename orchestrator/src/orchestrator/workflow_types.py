@@ -124,6 +124,15 @@ class TerminalReport:
     detail: str
     category: FailureCategory | None
     blocked_from_phase: WorkflowState | None = None
+    # Task 2988 (PRD ε / W3): whether this terminal outcome's requeue counts
+    # against the per-task requeue cap.  Set from
+    # ``BlockDisposition.counts_against_requeue_cap`` at the REQUEUED
+    # construction site (workflow.py's WarmLaneRequeue clause), mapped onto
+    # ``TaskReport.counts_against_requeue_cap`` in the harness, and finally
+    # consumed by ``Scheduler.record_requeue(counts_against_cap=...)``.
+    # Defaults True so every pre-existing construction site (DONE/CANCELLED
+    # and all non-warm-lane block paths) is unchanged and keeps counting.
+    counts_against_requeue_cap: bool = True
 
 
 class RequeueKind(enum.Enum):

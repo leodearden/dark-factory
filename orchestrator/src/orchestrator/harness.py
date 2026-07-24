@@ -806,6 +806,13 @@ class TaskReport:
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''
+    # Task 2988 (PRD ε / W3): whether a REQUEUED outcome counts against the
+    # per-task requeue cap.  Mapped from ``TerminalReport.counts_against_
+    # requeue_cap`` in _run_slot and passed to
+    # ``scheduler.record_requeue(counts_against_cap=...)`` in _apply_retry_cap.
+    # Defaults True so DONE paths and any report built without it keep the
+    # pre-2988 counting behaviour.
+    counts_against_requeue_cap: bool = True
 
 
 @dataclass
@@ -7245,6 +7252,9 @@ class Harness:
                     if terminal_report.blocked_from_phase is not None
                     else ''
                 ),
+                # Task 2988: carry the disposition's cap-accounting policy
+                # through to _apply_retry_cap's record_requeue call.
+                counts_against_requeue_cap=terminal_report.counts_against_requeue_cap,
             )
 
             if self.event_store:
@@ -8018,6 +8028,11 @@ class Harness:
                 detail=report.block_detail or '',
                 run_id=self._run_id,
                 cost_usd=attempt_cost,
+                # Task 2988 (PRD ε / W3): a non-counting requeue (e.g.
+                # warm_lane_pool_exhausted) is history-only — it never trips
+                # the retry-cap escalation; the pool-level structural-
+                # exhaustion L2 is the loud signal instead.
+                counts_against_cap=report.counts_against_requeue_cap,
             )
             genuine_exhausted = count >= self.config.requeue_cap
             transient_exhausted = (

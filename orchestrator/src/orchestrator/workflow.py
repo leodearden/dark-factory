@@ -2765,17 +2765,18 @@ class TaskWorkflow:
             # through to the broad except below → _mark_blocked → BLOCKED + L1.
             #
             # counts_against_requeue_cap is DECLARED once per warm-lane
-            # subclass in the table (EXHAUSTED=True — genuine backpressure;
-            # DISK_PRESSURE/HARD_DOWN=False — transient infra) — the single
-            # source of truth replacing the buried NOTE formerly here (see
-            # workflow_types._disposition_table()'s warm-lane rows for the
-            # full rationale). This clause still unconditionally returns
-            # REQUEUED for every WarmLaneRequeue subclass — routing that
-            # policy into the scheduler's transient requeue-cap bucket
-            # (record_requeue → is_transient_api_requeue) remains a tracked
-            # follow-up outside this task's module scope (scheduler.py /
-            # harness.py), so counts_against_requeue_cap is surfaced in the
-            # log below for observability only, not yet consumed.
+            # subclass in the table (EXHAUSTED=False as of task 2988;
+            # DISK_PRESSURE/HARD_DOWN/SOFT_PRESSURE=False — transient infra /
+            # capacity signals; RESEED_CONTAMINATED=True — per-task
+            # data-integrity) — the single source of truth replacing the
+            # buried NOTE formerly here (see workflow_types._disposition_
+            # table()'s warm-lane rows for the full rationale). Task 2988
+            # (PRD ε / W3) CONSUMES this flag: it is threaded onto the
+            # TerminalReport below -> TaskReport -> Scheduler.record_requeue
+            # (counts_against_cap=), so a non-counting warm-lane requeue no
+            # longer burns the per-task requeue cap. The previously-deferred
+            # "scheduler.py / harness.py" follow-up this comment named IS
+            # task 2988. This clause still unconditionally returns REQUEUED.
             disp = classify_failure(e)
             block_reason = disp.reason_prefix
             logger.info(
@@ -2792,6 +2793,7 @@ class TaskWorkflow:
                 outcome=WorkflowOutcome.REQUEUED, reason=block_reason,
                 phase=self.machine.state, detail=str(e), category=None,
                 blocked_from_phase=self.machine.state,
+                counts_against_requeue_cap=disp.counts_against_requeue_cap,
             )
             return WorkflowOutcome.REQUEUED
 
