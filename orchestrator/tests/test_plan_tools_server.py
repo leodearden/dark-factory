@@ -1105,6 +1105,8 @@ class TestMarkStepCommitted:
         first = await tool.run({'step_id': 'step-1', 'sha': head})
         second = await tool.run({'step_id': 'step-1', 'sha': head})
 
+        assert first.structured_content is not None
+        assert second.structured_content is not None
         assert first.structured_content['ok'] is True
         assert second.structured_content['ok'] is True
         step = artifacts.read_plan()['steps'][0]
