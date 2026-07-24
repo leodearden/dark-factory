@@ -469,6 +469,9 @@ async def recover_pending_merges(
                     raise
                 recovered_requests.append(winner_req)
                 recovered += 1
+                # The enqueued winner IS the in-flight primary; every loser
+                # aliases onto its request_id (below).
+                primary_request_id: str | None = winner_req.request_id
                 logger.info(
                     'merge_queue_store: recovered %s (branch %s)',
                     winner_record.request_id,
@@ -479,13 +482,30 @@ async def recover_pending_merges(
                 # succeeds; a concurrent live merge_request could theoretically
                 # hold the slot first.  Attach the recovered winner as a peer so
                 # its future still resolves with the in-flight outcome — never a
-                # second work item — and count it as coalesced.
+                # second work item — and count it as coalesced.  Here the winner
+                # is NOT the primary: the pre-existing in-flight entry is.
+                existing = registry.entry(bare_id)
+                primary_request_id = (
+                    existing.request_id if existing is not None else None
+                )
                 registry.attach(bare_id, WaiterRecord(
                     request_id=winner_req.request_id,
                     future=winner_req.result,
                     source='recovery',
                     submitted_tip=winner_record.snapshot_tip,
                 ))
+                # The winner itself coalesced onto the pre-existing primary, so
+                # alias IT onto that primary too (mirrors
+                # coalesce_or_enqueue_merge_request) — otherwise a durable poll
+                # on the winner's id would dangle.  Losers below alias onto the
+                # SAME real primary, never onto the non-primary winner.  In
+                # production retention is None on the recovery path (the harness
+                # does not thread it — see the module docstring), so this is
+                # correct-by-construction rather than currently exercised.
+                if retention is not None and primary_request_id:
+                    retention.record_alias(
+                        winner_req.request_id, primary_request_id,
+                    )
                 store.remove(winner_record.request_id)
                 coalesced += 1
                 logger.warning(
@@ -508,9 +528,13 @@ async def recover_pending_merges(
                     source='recovery',
                     submitted_tip=loser_record.snapshot_tip,
                 ))
-                if retention is not None and winner_req.request_id:
+                # Alias onto the ACTUAL in-flight primary (the enqueued winner
+                # when acquire succeeded, else the pre-existing entry) so a
+                # durable poll on a loser id resolves to the real primary
+                # outcome — matching coalesce_or_enqueue_merge_request.
+                if retention is not None and primary_request_id:
                     retention.record_alias(
-                        loser_req.request_id, winner_req.request_id,
+                        loser_req.request_id, primary_request_id,
                     )
                 store.remove(loser_record.request_id)
                 coalesced += 1

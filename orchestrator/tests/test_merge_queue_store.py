@@ -677,6 +677,91 @@ class TestRecoverPendingMergesRegistryDedup:
         assert report['recovered'] == 2
         assert report['coalesced'] == 0
 
+    async def test_preexisting_inflight_coalesces_winner_as_peer(
+        self, tmp_path: Path
+    ) -> None:
+        """A concurrent live merge_request already holds the branch slot at
+        recovery → acquire returns False → the recovered winner attaches as a
+        PEER (never a second enqueued work item), its journal record is removed,
+        and it is counted as coalesced.
+
+        Also locks suggestion-2 alias correctness: on the acquire-False path
+        BOTH the winner and the loser alias onto the ACTUAL in-flight primary's
+        request_id — not the winner's — matching
+        ``coalesce_or_enqueue_merge_request`` (a durable poll on any coalesced id
+        must resolve to the real primary outcome)."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req1 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        req2 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        store.record(req1)
+        store.record(req2)
+
+        # A concurrent live merge_request holds the slot BEFORE recovery runs.
+        registry = InFlightMergeRegistry()
+        primary_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '5326', '5326', primary_future,
+            request_id='mr-preexisting', source='mcp', snapshot_tip='sha-same',
+        )
+
+        # Capture retention.record_alias(alias_id, primary_request_id) calls.
+        aliases: list[tuple[str, str]] = []
+
+        class _FakeRetention:
+            def record_alias(self, alias_id: str, primary_request_id: str) -> None:
+                aliases.append((alias_id, primary_request_id))
+
+        git_ops = self._make_git_ops(full_branch='task/5326')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/',
+            registry=registry, retention=_FakeRetention(),
+        )
+
+        # Nothing enqueued — both recovered records coalesced onto the entry.
+        assert queue.qsize() == 0
+        assert report['recovered'] == 0
+        assert report['coalesced'] == 2
+        assert report['requests'] == []
+
+        # Pre-existing primary + two attached recovery peers.
+        entry = registry.entry('5326')
+        assert entry is not None
+        assert len(entry.waiters) == 3, (
+            f'Expected primary+2 peers; got {len(entry.waiters)}'
+        )
+
+        # Both recovered journal records were removed (winner + loser).
+        remaining_ids = {r.request_id for r in store.load()}
+        assert req1.request_id not in remaining_ids, 'winner must be store.remove()d'
+        assert req2.request_id not in remaining_ids, 'loser must be store.remove()d'
+
+        # Both recovery peers mirror the pre-existing primary's terminal outcome.
+        peer_futures = [
+            w.future for w in entry.waiters if w.future is not primary_future
+        ]
+        assert len(peer_futures) == 2
+        assert all(not f.done() for f in peer_futures)
+        sentinel = object()
+        primary_future.set_result(sentinel)
+        await asyncio.sleep(0)
+        assert all(f.done() and f.result() is sentinel for f in peer_futures), (
+            'both coalesced requesters must resolve with the primary outcome'
+        )
+
+        # Suggestion-2: winner AND loser alias onto the ACTUAL primary
+        # ('mr-preexisting'), never onto the winner's own request_id.
+        assert set(aliases) == {
+            (req1.request_id, 'mr-preexisting'),
+            (req2.request_id, 'mr-preexisting'),
+        }, f'both recovered ids must alias onto the pre-existing primary; got {aliases}'
+
 
 # ---------------------------------------------------------------------------
 # task-1808 step-1 — MergeQueueStore.journal_corrupt flag
