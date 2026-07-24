@@ -80,10 +80,11 @@ The incident's `Error: ENOENT ... uv_cwd` signature appears only in PRD
 prose -- it is not a FailureCategory, not an EventType, and is not asserted
 anywhere in the tree via string match. It is proved via CAUSAL PROXIES
 instead:
-  (a) every `_merge-*`/infra tree survives the concurrent sweep
-      (`.exists()`), paired with a POSITIVE CONTROL (the task-shaped '999'
-      dir the SAME sweep cleans) so a survives-because-the-sweep-is-inert
-      false pass is impossible;
+  (a) every `_merge-*`/infra tree survives the concurrent sweep, with each
+      survival ATTRIBUTED to the specific mechanism that protects it (see
+      the attribution matrix below) and each leg carrying its own positive
+      control -- survival alone is not evidence, since an inert sweep
+      produces the same `.exists()`;
   (b) the gated verify runner asserts its OWN `_merge-<hash>` cwd worktree
       exists at entry AND at completion -- a tree yanked mid-verify would
       fail this assertion, directly modelling the incident;
@@ -91,6 +92,50 @@ instead:
       branch lands on main ('merge finalizes');
   (d) zero spurious `verify_cross_check_mismatch` L1 escalations are filed
       (the incident's clobbered-worktree false-FAIL signature).
+
+Attribution matrix for proxy (a)
+------------------------------------
+The capstone drives TWO sweeps, and a tree that survives one of them is
+NOT thereby protected by the other's mechanism. Each is asserted through
+the evidence that is actually load-bearing for that leg:
+
+  MERGE-REAPER leg (`_reap_orphaned_merge_worktrees`), evidence = the
+  `(path, reason, outcome)` records of a delegating spy over the C1
+  primitive, plus the filesystem:
+    * `_merge-verify`  -- never reaches C1 at all: excluded by name
+      (PERSISTENT_MERGE_WORKTREE_NAME) inside the reap scan.
+    * the live `_merge-<hash>` verify tree -- protected by the worker's
+      owned-worktree ledger and/or the untouched grace window; only its
+      `.exists()` is asserted (its re-adoption path is NOT asserted --
+      `find_inflight_merge_worktree` on a detached-HEAD merge tree is
+      unverified here).
+    * `_merge-cafe5326` (aged, LEASED) -- the ONLY C1-attributable
+      survival on this leg: OFFERED to C1, which answered
+      `skipped_lease_held`.
+    * `_merge-beefbeef` (aged, UNLEASED) -- POSITIVE CONTROL: offered and
+      REAPED, so the leg is demonstrably capable of removal. Its outcome
+      string is deliberately unpinned ('removed' and 'failed'->rmtree
+      fallback both end with the tree gone -- assert the filesystem, not
+      the branch taken).
+    Both merge-band decoys are BACK-DATED past
+    RESOURCE_AUDIT_WORKTREE_GRACE_SECS first; without that the reap loop
+    `continue`s past them and the whole leg is vacuous.
+
+  CRASH-RECOVERY-SWEEP leg (`_recover_crashed_tasks`), evidence = the SET
+  of paths offered to `cleanup_worktree`, NOT `.exists()`:
+    * every `_merge-*` / infra entry survives by the C2
+      `classify_worktree_entry` skip, proven by
+      `cleaned_paths.isdisjoint(protected)` plus an exact-set pin.
+    * the task-shaped planless '999' dir is the POSITIVE CONTROL the same
+      sweep cleans.
+    DELIBERATE NON-FIX: `cleanup_worktree` stays an AsyncMock spy on this
+    leg -- a real delegate would race the in-flight merge by deleting the
+    live task/5326 worktree mid-verify. That makes `.exists()` INERT here
+    (a full C2 regression would leave every tree on disk), so the
+    cleaned-SET assertions are this leg's only regression detector. They
+    were OBSERVED to fire: neutering the C2 `merge` arm in a scratch,
+    uncommitted edit turned them red, naming `_merge-verify`,
+    `_merge-cafe5326` and the live `_merge-<hash>` tree.
 
 SCOPE -- TEST-ONLY / BEHAVIOUR-FROZEN
 ----------------------------------------
@@ -805,19 +850,32 @@ class TestFiveThreeTwoSixReplayGate:
     GitOps, real MergeQueueStore, real InFlightMergeRegistry, real
     SpeculativeMergeWorker) rather than any single leg in isolation.
 
-    Exercises PRD Sec.9 rows 1, 2, 4 (protected trees survive the
-    concurrent sweep), 6 (dup-journal same-branch collapse; here a
-    descendant-tip variant), 7 (descendant wins), and row 5 (the live
-    verify observes its own worktree intact across the concurrent sweep --
-    this row has NO standalone test; it is only exercised HERE), plus
-    'merge finalizes' (the recovered request reaches a terminal 'done' and
-    its branch lands on main).
+    Exercises PRD Sec.9 rows 1, 2, 4 (protected trees survive BOTH
+    concurrent sweeps -- each survival attributed to the mechanism that
+    actually protects it, per the matrix below), 6 (dup-journal
+    same-branch collapse; here a descendant-tip variant), 7 (descendant
+    wins), and row 5 (the live verify observes its own worktree intact
+    across the concurrent sweep -- this row has NO standalone test; it is
+    only exercised HERE), plus 'merge finalizes' (the recovered request
+    reaches a terminal 'done' and its branch lands on main).
 
-    Zero-ENOENT causal-proxy chain (see the module docstring for the full
-    rationale) is asserted via all four legs in ONE test:
-      (a) every `_merge-*`/infra tree still `.exists()` during the live
-          verify, paired with the '999' positive control the SAME sweep
-          cleans;
+    Zero-ENOENT causal-proxy chain (see the module docstring's
+    "Attribution matrix" for the full per-leg rationale) is asserted via
+    all four legs in ONE test:
+      (a) protected-tree survival, per sweep and per mechanism --
+          MERGE-REAPER leg: `_merge-verify` survives by the
+          PERSISTENT_MERGE_WORKTREE_NAME exclusion, the live
+          `_merge-<hash>` verify tree by the owned-ledger/grace window,
+          and the aged LEASED `_merge-cafe5326` by C1 answering
+          `skipped_lease_held` when the reaper OFFERED it (spy-recorded)
+          -- with the aged UNLEASED `_merge-beefbeef` reaped as that
+          leg's positive control;
+          CRASH-RECOVERY-SWEEP leg: every `_merge-*`/infra entry survives
+          by the C2 classify_worktree_entry skip, proven by the SET of
+          paths offered to `cleanup_worktree` (disjoint-from-protected +
+          exact-set pin), NOT by `.exists()` -- `cleanup_worktree` is
+          deliberately an AsyncMock spy here, so `.exists()` is inert on
+          this leg -- with the '999' planless dir as its positive control;
       (b) the gated verify runner's own worktree-existence observations
           (entry AND exit) are all True;
       (c) the recovered merge reaches `outcome.status == 'done'` and its
