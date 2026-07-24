@@ -7645,9 +7645,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # observe-but-never-reclaim gap: reap_orphaned_merge_worktrees was
         # previously wired only at worker construction/recovery time, so a
         # leak crossing grace mid-run sat unreaped until the next restart).
-        # Same clock-injected rate-limit idiom as _last_heartbeat_at: init
-        # 0.0 so the first heartbeat poll reaps immediately.
-        self._last_reap_at: float = 0.0
+        # Deliberately DIVERGES from the _last_heartbeat_at=0.0 idiom (task
+        # 3018 amendment — reviewer_comprehensive correctness finding):
+        # Harness._start_merge_worker spawns this worker's loops via
+        # lifecycle.start_all() BEFORE the startup recovery sequence runs
+        # (_recover_pending_merges, then the startup
+        # Harness._reap_orphaned_merge_worktrees(recovered_branches) call —
+        # see harness.py ~1844-1893). An init-0.0 first poll (~30s later)
+        # could fire the periodic sweep — which passes no recovered_branches
+        # — before that startup sweep re-adopts a worktree backing a
+        # recovered in-flight merge, reaping it out from under recovery.
+        # Seeding to real construction time instead defers the first
+        # periodic sweep by a full _reap_interval_s, giving startup recovery
+        # time to settle first.
+        self._last_reap_at: float = time.time()
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _heartbeat_interval_s / _shutdown_timeout override precedent.
         self._reap_interval_s: float = 300.0
@@ -9765,12 +9776,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Rate-limited by :attr:`_reap_interval_s` (default 300s), mirroring
         the :attr:`_last_heartbeat_at` / :attr:`_heartbeat_interval_s`
-        clock-injected idiom: :attr:`_last_reap_at` starts at 0.0 so the
-        first poll always fires, and each subsequent call is a no-op until
-        at least ``_reap_interval_s`` seconds have elapsed since the last
-        sweep. This bounds a past-grace leak's on-disk lifetime to roughly
-        ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS + _reap_interval_s`` instead of
-        up to the next restart.
+        clock-injected idiom, with one deliberate divergence (task 3018
+        amendment): :attr:`_last_reap_at` is seeded to real construction
+        time rather than 0.0, so the FIRST periodic sweep fires one full
+        :attr:`_reap_interval_s` after worker construction rather than on
+        the first heartbeat poll — giving the harness startup recovery
+        sequence (which runs after this worker's loops are already spawned;
+        see ``Harness._reap_orphaned_merge_worktrees``) time to re-adopt any
+        worktree backing a recovered in-flight merge before this sweep could
+        otherwise reap it out from under recovery. Each subsequent call is a
+        no-op until at least ``_reap_interval_s`` seconds have elapsed since
+        the last sweep. This bounds a past-grace leak's on-disk lifetime to
+        roughly ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS + _reap_interval_s``
+        after startup settles, instead of up to the next restart.
         """
         if now - self._last_reap_at < self._reap_interval_s:
             return

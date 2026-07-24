@@ -514,15 +514,17 @@ class TestPeriodicReapHelper:
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        # _last_reap_at is seeded to real construction time, not 0.0 (task
+        # 3018 amendment — avoids racing the harness startup recovery
+        # sequence; see test_last_reap_at_seeded_to_construction_time).
+        # Reset it to 0.0 here to simulate "a sweep is due" deterministically
+        # against this test's fake _NOW clock, independent of wall-clock
+        # time at worker construction.
+        worker._last_reap_at = 0.0
 
         orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
         owned_wt, _ = await git_ops._create_merge_worktree()
         worker._register_owned_merge_worktree(owned_wt)
-
-        assert worker._last_reap_at == 0.0, (
-            'clock-injected rate-limit idiom: init 0.0 so the first poll reaps '
-            '(mirrors _last_heartbeat_at)'
-        )
 
         await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
 
@@ -543,6 +545,10 @@ class TestPeriodicReapHelper:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
         worker._reap_interval_s = 50.0
+        # See test_first_call_reaps_orphan_preserves_owned: reset the
+        # construction-time seed to 0.0 so "no prior call" is deterministic
+        # against this test's fake _NOW clock (task 3018 amendment).
+        worker._last_reap_at = 0.0
 
         # First call: nothing to reap yet, but it still runs (no prior call)
         # and advances the clock.
@@ -564,6 +570,34 @@ class TestPeriodicReapHelper:
         await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW + 60)
         assert not orphan.exists(), 'a call past _reap_interval_s must reap'
         assert worker._last_reap_at == _NOW + 60
+
+    async def test_last_reap_at_seeded_to_construction_time(self, git_ops: GitOps) -> None:
+        """_last_reap_at must NOT default to 0.0 (unlike _last_heartbeat_at).
+
+        Harness._start_merge_worker spawns this worker's loops (including
+        _heartbeat_loop) via lifecycle.start_all() BEFORE the startup
+        recovery sequence runs (_recover_pending_merges, then the startup
+        Harness._reap_orphaned_merge_worktrees(recovered_branches) call —
+        see harness.py ~1844-1893). An init-0.0 first poll (~_HEARTBEAT_POLL_S
+        later) could fire the periodic sweep — which passes no
+        recovered_branches — before that startup sweep re-adopts a worktree
+        backing a recovered in-flight merge, reaping it out from under
+        recovery. Seeding to real construction time instead defers the
+        first periodic sweep by a full _reap_interval_s (task 3018
+        amendment).
+        """
+        import time as time_mod
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        before = time_mod.time()
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        after = time_mod.time()
+
+        assert before <= worker._last_reap_at <= after, (
+            f'_last_reap_at must be seeded to real construction time, got '
+            f'{worker._last_reap_at!r} (expected within [{before}, {after}])'
+        )
 
 
 # ---------------------------------------------------------------------------
