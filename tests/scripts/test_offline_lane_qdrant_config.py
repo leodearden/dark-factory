@@ -83,3 +83,10 @@ def test_offline_lane_qdrant_config_round_trips_through_config_model(
         "'medium' from the committed YAML — check for a field rename/typo "
         "in config.py"
     )
+    assert command.enabled is True, (
+        "offline_lane_commands[0].enabled is not True — the offline-lane "
+        "runner skips disabled commands entirely, so a committed "
+        "'enabled: false' would silently drop the qdrant-integration "
+        "coverage this test exists to guard (check the committed YAML and "
+        "for a field rename/typo in config.py)"
+    )
