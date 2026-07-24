@@ -2668,6 +2668,15 @@ class TestMergeRequestWorkflowVerifyEmission:
             '_resolve_dispatch_time_merge_base',
             AsyncMock(return_value=sentinel_base_sha),
         )
+        # is_ancestor is stubbed False to reach the fresh-dispatch path; the
+        # task-2945 patch-id backstop then runs after that miss.  Stub it False
+        # (this SimpleNamespace git_ops has no project_root for a real
+        # `git cherry`, and a genuine fresh dispatch is not patch-id-contained).
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            AsyncMock(return_value=False),
+        )
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -2746,6 +2755,14 @@ class TestMergeRequestWorkflowVerifyEmission:
             '_resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
+        # is_ancestor False → reach the dispatch path; the task-2945 patch-id
+        # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
+        # project_root for `git cherry`; a fresh dispatch is not contained).
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            AsyncMock(return_value=False),
+        )
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -2802,6 +2819,14 @@ class TestMergeRequestWorkflowVerifyEmission:
             orchestrator_merge_queue,
             '_resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
+        )
+        # is_ancestor False → reach the dispatch path; the task-2945 patch-id
+        # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
+        # project_root for `git cherry`; a fresh dispatch is not contained).
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            AsyncMock(return_value=False),
         )
 
         stub_git = types.SimpleNamespace(
@@ -2921,6 +2946,14 @@ class TestMergeRequestWorkflowVerifyEmission:
             orchestrator_merge_queue,
             '_resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
+        )
+        # is_ancestor False → reach the gate path; the task-2945 patch-id
+        # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
+        # project_root for `git cherry`; a fresh dispatch is not contained).
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            AsyncMock(return_value=False),
         )
 
         stub_git = types.SimpleNamespace(
