@@ -125,6 +125,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
+from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_types import InFlightMergeRegistry
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -439,3 +441,132 @@ class TestDeleterFace:
         finally:
             release_merge_verify_flock(fd_live)
             remove_lock_holder_pgid(base)
+
+
+# ---------------------------------------------------------------------------
+# TestIdentityFaceRecoveryDedupe -- PRD Sec.9 rows 6-7
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestIdentityFaceRecoveryDedupe:
+    """PRD Sec.9 rows 6-7: recover_pending_merges' registry-gated per-branch
+    collapse (gamma, task 2926). Ported from
+    test_merge_queue_store.py::TestRecoverPendingMergesRegistryDedup.
+
+    (row 6) Two journal entries for one branch with the SAME snapshot tip
+    collapse to ONE enqueued winner; the loser attaches as a peer whose
+    future MIRRORS the winner's terminal outcome (OBSERVED, not inferred).
+
+    (row 7) Two journal entries with ancestor/descendant tips collapse to
+    the DESCENDANT, order-independently (both journal insertion orders are
+    asserted).
+    """
+
+    async def test_same_sha_coalesces_to_one_with_peer_mirror(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Row 6: same-SHA duplicate journal entries -> ONE winner, peer
+        future mirrors the winner's terminal outcome."""
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        reqs = _seed_dup_journal(store, '5326', ['sha-same', 'sha-same'], config, wt)
+
+        registry = InFlightMergeRegistry()
+        git_ops = _make_git_ops(full_branch='task/5326')
+        queue: asyncio.Queue = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/', registry=registry,
+        )
+
+        assert queue.qsize() == 1
+        assert report['recovered'] == 1
+        assert report['coalesced'] == 1
+
+        entry = registry.entry('5326')
+        assert entry is not None
+        assert len(entry.waiters) == 2, (
+            f'Expected primary+peer waiters; got {len(entry.waiters)}'
+        )
+
+        # First-seen wins the SAME tie -> reqs[0] is the enqueued winner.
+        assert len(report['requests']) == 1
+        winner_req = report['requests'][0]
+        assert winner_req.request_id == reqs[0].request_id
+
+        # Grab the PEER future BEFORE resolving the winner.
+        peer_futures = [
+            w.future for w in entry.waiters if w.future is not winner_req.result
+        ]
+        assert len(peer_futures) == 1
+        peer = peer_futures[0]
+        assert not peer.done()
+
+        # Resolving the winner mirrors the terminal outcome onto the peer:
+        # both requesters resolve -- the coalesce attach is OBSERVED.
+        sentinel = object()
+        winner_req.result.set_result(sentinel)
+        await asyncio.sleep(0)
+        assert peer.done()
+        assert peer.result() is sentinel
+
+        # The loser's journal entry is removed; the winner stays journaled.
+        remaining_ids = {r.request_id for r in store.load()}
+        assert reqs[1].request_id not in remaining_ids, 'loser must be store.remove()d'
+        assert reqs[0].request_id in remaining_ids, 'winner stays journaled'
+
+    async def test_descendant_wins_ancestor_first(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Row 7: journal order [ancestor, descendant] -> the DESCENDANT is
+        the single enqueued winner (REPLACE)."""
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        reqs = _seed_dup_journal(store, '5326', ['anc', 'desc'], config, wt)
+
+        registry = InFlightMergeRegistry()
+        git_ops = _make_git_ops(full_branch='task/5326', ancestor_pairs={('anc', 'desc')})
+        queue: asyncio.Queue = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/', registry=registry,
+        )
+
+        assert queue.qsize() == 1
+        assert report['coalesced'] == 1
+        enqueued = queue.get_nowait()
+        assert enqueued.request_id == reqs[1].request_id, (
+            'the DESCENDANT record must be the single enqueued winner'
+        )
+
+    async def test_descendant_wins_descendant_first(
+        self, tmp_path: Path, config: OrchestratorConfig,
+    ) -> None:
+        """Row 7: journal order [descendant, ancestor] -> still the
+        DESCENDANT is enqueued (order-independence: the pre-grouping picks
+        the descendant-most tip regardless of journal insertion order)."""
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        reqs = _seed_dup_journal(store, '5326', ['desc', 'anc'], config, wt)
+
+        registry = InFlightMergeRegistry()
+        git_ops = _make_git_ops(full_branch='task/5326', ancestor_pairs={('anc', 'desc')})
+        queue: asyncio.Queue = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store, queue, git_ops, config, event_store=None,
+            main_branch='main', branch_prefix='task/', registry=registry,
+        )
+
+        assert queue.qsize() == 1
+        assert report['coalesced'] == 1
+        enqueued = queue.get_nowait()
+        assert enqueued.request_id == reqs[0].request_id, (
+            'order-independent: the descendant wins regardless of journal order'
+        )
