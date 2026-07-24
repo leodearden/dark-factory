@@ -184,3 +184,58 @@ class TestStampHelper:
 
         # (d) In-memory metadata is still updated (persist is the last step).
         assert f.wf.task['metadata']['merge_phase_liveness']['entered_at']
+
+
+# ---------------------------------------------------------------------------
+# step-5: _clear_merge_phase_entered helper
+# ---------------------------------------------------------------------------
+
+
+_STAMP = {'entered_at': '2026-07-24T05:00:00+00:00'}
+
+
+class TestClearHelper:
+    @pytest.mark.asyncio
+    async def test_clear_removes_key_from_persisted_and_in_memory(self):
+        f = _make(
+            metadata={
+                'merge_phase_liveness': dict(_STAMP),
+                'retry_ledger': {'x': 1},
+            },
+        )
+
+        await f.wf._clear_merge_phase_entered()
+
+        meta = _persisted_metadata(f.update_task)
+        # (a) key removed from the persisted full-dict write.
+        assert 'merge_phase_liveness' not in meta
+        # (b) clearing one key leaves siblings intact.
+        assert meta['retry_ledger'] == {'x': 1}
+        # (a) key also removed from in-memory task metadata.
+        assert 'merge_phase_liveness' not in f.wf.task['metadata']
+
+    @pytest.mark.asyncio
+    async def test_clear_is_best_effort_and_does_not_raise_on_persist_failure(self):
+        f = _make(
+            metadata={'merge_phase_liveness': dict(_STAMP)},
+            update_task_raises=True,
+        )
+        # (c) must not propagate the update_task failure, and still clears
+        # in-memory.
+        await f.wf._clear_merge_phase_entered()
+        assert 'merge_phase_liveness' not in f.wf.task['metadata']
+
+    @pytest.mark.asyncio
+    async def test_clear_is_noop_when_no_stamp_present(self):
+        # (d) cheap idempotent no-op — no fresh-metadata read, no backend write
+        # — when nothing was ever stamped, so it is safe to call
+        # unconditionally on every enqueue / merge success (the common case
+        # never stamped).
+        f = _make(metadata={'retry_ledger': {'x': 1}})
+
+        await f.wf._clear_merge_phase_entered()
+
+        f.update_task.assert_not_awaited()
+        f.scheduler.get_task.assert_not_awaited()
+        # Metadata is left untouched.
+        assert f.wf.task['metadata'] == {'retry_ledger': {'x': 1}}
