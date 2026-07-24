@@ -124,6 +124,7 @@ if TYPE_CHECKING:
         SpeculativeMergeWorker,
         TrainCallbackFactory,
     )
+    from orchestrator.warm_lane_pool import WarmLanePoolCensus
 
 try:
     from escalation.queue import EscalationQueue
@@ -1254,6 +1255,17 @@ class Harness:
         if self.git_ops.warm_lane_pool is not None:
             self.git_ops.warm_lane_pool.set_on_lane_record_drift(
                 self._file_lane_record_drift_l2
+            )
+            # Wire the structural-exhaustion callback (task 2988, PRD ε pole-2):
+            # GitOps fires this once warm_lane_structural_exhaustion_l2_threshold
+            # consecutive acquires return EXHAUSTED — the loud signal that the
+            # pool is stuck emitting backpressure forever (silent-infinite-
+            # requeue).  Same declare-on-callee (default None) / install-in-
+            # harness pattern as _on_pool_storage_absent / _on_lane_record_drift;
+            # installed only when a pool exists so pool-less hosts stay
+            # byte-identical.
+            self.git_ops._on_structural_exhaustion = (
+                self._file_structural_exhaustion_l2
             )
         # In-memory hint gating the orphan-reaper's per-tick resolve scan
         # (task 2099 review-fix, efficiency). MUST default True ("maybe
@@ -11750,6 +11762,117 @@ class Harness:
         except Exception:
             logger.warning(
                 'lane-record-drift: failed to file L2 escalation',
+                exc_info=True,
+            )
+
+    _STRUCTURAL_EXHAUSTION_SENTINEL: str = '__warm_lane_structural_exhaustion__'
+    _STRUCTURAL_EXHAUSTION_ROOT_CAUSE: str = 'warm_lane_pool_structurally_exhausted'
+    _STRUCTURAL_EXHAUSTION_ROLE: str = 'orchestrator-warm-lane-structural-exhaustion'
+
+    def _file_structural_exhaustion_l2(
+        self, count: int, census: 'WarmLanePoolCensus',
+    ) -> None:
+        """File a born-at-L2 human escalation when the warm-lane pool is
+        STRUCTURALLY exhausted — PRD ε pole-2 (the silent-infinite-requeue pole).
+
+        Installed on ``GitOps._on_structural_exhaustion`` (declare-on-callee
+        default None, install-in-harness), fired by GitOps once
+        ``warm_lane_structural_exhaustion_l2_threshold`` consecutive
+        ``acquire_warm_lane`` calls return EXHAUSTED with no fresh lane and no
+        reclaimable capacity.  A warm-lane EXHAUSTED requeue no longer counts
+        against the per-task requeue cap (task 2988 pole-1), so WITHOUT this
+        filer a genuinely stuck pool (a lane leak, every lane pinned, or a pool
+        sized too small) would requeue every task forever with NO loud signal.
+        This born-at-L2 is that sole loud signal.
+
+        Mirrors :meth:`_file_lane_record_drift_l2`:
+          - No-op when _escalation_queue is None (bare-Harness unit tests).
+          - Deduped via find_pending_l2_by_root_cause(
+            'warm_lane_pool_structurally_exhausted') — a bare fixed literal (not
+            a per-task f-string) so repeated threshold trips file exactly one
+            pending L2.
+          - Best-effort: every exception is swallowed so filing can never break
+            the pool's acquire path (I3 fail-open).
+          - agent_role is an orchestrator sentinel + severity='urgent' → the L2
+            is exempt from the agent-role downgrade gate and routes straight to
+            a human.
+          - Carries the α census counts (size / n_free / n_assigned_dispatched /
+            n_pinned_non_dispatched / n_unknown_dispatch / n_quarantined) as
+            structured fields so an operator sees WHY the pool is full (INV-2).
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
+            return
+        try:
+            if queue.find_pending_l2_by_root_cause(
+                self._STRUCTURAL_EXHAUSTION_ROOT_CAUSE
+            ) is not None:
+                return                         # dedup: one open L2 at a time
+            from escalation.models import Escalation
+            census_line = census.render()
+            summary = (
+                f'warm-lane pool structurally exhausted: {count} consecutive '
+                f'EXHAUSTED acquires — {census_line}'
+            )[:200]
+            detail = (
+                f'acquire_warm_lane has returned EXHAUSTED {count} consecutive '
+                'time(s), reaching warm_lane_structural_exhaustion_l2_threshold — '
+                'no FREE lane and no reclaimable capacity across that many '
+                'attempts.\n\n'
+                f'Pool census at exhaustion:\n  {census_line}\n\n'
+                'A warm-lane EXHAUSTED requeue no longer burns the per-task '
+                'requeue cap (task 2988 pole-1: a transient capacity crunch must '
+                'not escalate the wrong task), so a pool that is STRUCTURALLY '
+                'stuck would otherwise requeue every task forever with no loud '
+                'signal.  This born-at-L2 is that signal.\n\n'
+                'Investigate the census above: n_pinned_non_dispatched > 0 points '
+                'to lanes held by stuck non-dispatched tasks (a leak); '
+                'n_assigned_dispatched == size means genuine saturation (raise '
+                'max_concurrent_tasks / pool size or shed load); '
+                'n_quarantined > 0 means durably quarantined lanes need recovery.'
+            )
+            esc = Escalation(
+                id=queue.make_id(self._STRUCTURAL_EXHAUSTION_SENTINEL),
+                task_id=self._STRUCTURAL_EXHAUSTION_SENTINEL,
+                agent_role=self._STRUCTURAL_EXHAUSTION_ROLE,
+                severity='urgent',
+                category='infra_issue',
+                level=2,
+                root_cause=self._STRUCTURAL_EXHAUSTION_ROOT_CAUSE,
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_warm_lane_structural_exhaustion',
+            )
+            queue.submit(esc)
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=self._STRUCTURAL_EXHAUSTION_SENTINEL,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': esc.category,
+                            'severity': esc.severity,
+                            'level': esc.level,
+                            'reason': 'warm-lane-structural-exhaustion-threshold',
+                        },
+                    )
+            except Exception:
+                # Isolated from the outer handler: the L2 is already filed, so a
+                # failure here is an observability-only miss, never a "failed to
+                # file L2" condition.
+                logger.warning(
+                    'warm-lane-structural-exhaustion: L2 %s filed but '
+                    'escalation_created emit failed', esc.id, exc_info=True,
+                )
+            logger.warning(
+                'warm-lane-structural-exhaustion: pool structurally exhausted '
+                '(consecutive EXHAUSTED=%d); L2 filed %s — %s',
+                count, esc.id, census_line,
+            )
+        except Exception:
+            logger.warning(
+                'warm-lane-structural-exhaustion: failed to file L2 escalation',
                 exc_info=True,
             )
 
