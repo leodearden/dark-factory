@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
@@ -43,6 +43,8 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.reconciliation.stage1_stall_detector import (
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
+    extract_stalled_gate_backlog_task_ids,
+    maybe_escalate_stalled_gate_backlog,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
@@ -499,6 +501,40 @@ class MemoryConsolidator(BaseStage):
                     report.stats['stage1_human_operator_escalated'] = len(escalated)
                 else:
                     report.stats['stage1_human_operator_escalated'] = 0
+
+        # ── Stale gate-backlog age check (task 3017) ──────────────────────────
+        # Deterministic, stateless age check: a blocked human-decision gate task
+        # whose metadata.gate_escalated_at (the born-at-L2 idempotency stamp) has
+        # aged past 48h files an independent level-1
+        # reconciliation_stale_gate_backlog escalation.  Unlike the HOR path above
+        # this needs NO Mem0 marker accumulation and NO LLM finding — it reads the
+        # durable stamp straight off the Stage-1 task tree.  Guarded on both the
+        # escalation queue AND filtered_task_tree (active_tasks is the input, and
+        # restricting to it excludes resolved-and-done gates for free); full-cycle
+        # only (below the remediation early-return).
+        if self._escalation_queue is not None and self.filtered_task_tree is not None:
+            now = datetime.now(UTC)
+            gate_stalled = extract_stalled_gate_backlog_task_ids(
+                self.filtered_task_tree.active_tasks, now=now,
+            )
+            report.stats['stage1_gate_backlog_stalled'] = len(gate_stalled)
+            if gate_stalled:
+                task_by_id = {
+                    str(t.get('id')): t
+                    for t in self.filtered_task_tree.active_tasks
+                    if t.get('id') is not None
+                }
+                gate_escalated = await maybe_escalate_stalled_gate_backlog(
+                    escalation_queue=self._escalation_queue,
+                    project_id=self.project_id,
+                    run_id=run_id,
+                    stalled_task_ids=gate_stalled,
+                    task_by_id=task_by_id,
+                    now=now,
+                )
+                report.stats['stage1_gate_backlog_escalated'] = len(gate_escalated)
+            else:
+                report.stats['stage1_gate_backlog_escalated'] = 0
 
         # ── Degenerate task-node sweep (task 2107) ─────────────────────────────
         # Delete degenerate ("tasks {id}", edge_count == 0) placeholder Graphiti
