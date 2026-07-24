@@ -11770,7 +11770,7 @@ class Harness:
     _STRUCTURAL_EXHAUSTION_ROLE: str = 'orchestrator-warm-lane-structural-exhaustion'
 
     def _file_structural_exhaustion_l2(
-        self, count: int, census: 'WarmLanePoolCensus',
+        self, count: int, census: WarmLanePoolCensus,
     ) -> None:
         """File a born-at-L2 human escalation when the warm-lane pool is
         STRUCTURALLY exhausted — PRD ε pole-2 (the silent-infinite-requeue pole).

@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # step-03: GitConfig.warm_lane_structural_exhaustion_l2_threshold knob
 # ---------------------------------------------------------------------------
