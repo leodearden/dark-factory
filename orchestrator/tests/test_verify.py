@@ -4440,6 +4440,45 @@ class TestScopeFallbackToolToSubproject:
             '&& uv run --project cockpit npx pyright cockpit/tests/test_c3.py'
         )
 
+    def test_multi_clause_chain_rescopes_every_pyright_clause(self):
+        """Every `&&`-clause carrying the tool keyword is rescoped, not just the first (task 3022).
+
+        Regression guard for the fleet-wide ``type_check_command`` chain
+        (task 3000): the has_structural widening path passes the FULL
+        unscoped multi-subproject chain into this helper, so all three
+        ``npx pyright`` clauses — not just the first — must gain ``uv run
+        --project <sub>``. Leaving the later clauses bare means they run
+        with no uv/venv context and hit a reportMissingImports wall
+        unrelated to the diff.
+        """
+        cmd = (
+            'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
+            '&& cd ../dashboard && npx pyright'
+        )
+        result = _scope_fallback_tool_to_subproject(cmd, 'pyright', 'orchestrator')
+        assert result == (
+            'cd fused-memory && uv run --project orchestrator npx pyright '
+            '&& cd ../orchestrator && uv run --project orchestrator npx pyright '
+            '&& cd ../dashboard && uv run --project orchestrator npx pyright'
+        )
+
+    def test_multi_clause_chain_scopes_bare_clause_after_already_scoped_clause(self):
+        """An already-scoped first clause must not suppress scoping a later bare clause.
+
+        Regression guard: the old single-match implementation rescoped only
+        the FIRST clause containing the keyword. When that first clause
+        already carried ``--project``, the "already scoped" no-op guard
+        fired on it and the whole command was returned unchanged — leaving
+        a later bare clause unscoped and still racing the cold-verify
+        dev-dep sync.
+        """
+        cmd = 'uv run --project fused-memory pyright && npx pyright'
+        result = _scope_fallback_tool_to_subproject(cmd, 'pyright', 'orchestrator')
+        assert result == (
+            'uv run --project fused-memory pyright '
+            '&& uv run --project orchestrator npx pyright'
+        )
+
     def test_none_command_returns_none(self):
         """`None` is returned unchanged (propagates absent commands)."""
         assert _scope_fallback_tool_to_subproject(None, 'pyright', 'cockpit') is None
@@ -4954,6 +4993,35 @@ class TestBuildFallbackConfigSubprojectScoped:
         assert 'fused-memory' not in result.type_check_command
         assert 'orchestrator' not in result.type_check_command
         assert 'dashboard' not in result.type_check_command
+
+    def test_type_command_multi_clause_chain_scoped_to_cockpit_on_structural_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """The full fleet type_check_command chain has EVERY clause rescoped, not just the first.
+
+        Regression guard (task 3022): the has_structural widening path
+        passes the FULL unscoped fleet chain (every fleet subproject's own
+        ``npx pyright`` clause) into `_scope_fallback_tool_to_subproject`.
+        All three clauses must land in cockpit's own uv context — leaving
+        clause 2/3 bare (no uv/venv context) hits a reportMissingImports
+        wall unrelated to the diff (task 3000).
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cockpit_src = tmp_path / 'cockpit' / 'src' / 'cockpit'
+        cockpit_src.mkdir(parents=True)
+        (cockpit_src / 'c3.py').write_text('class Foo(Protocol):\n    def m(self) -> None: ...\n')
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.type_check_command == (
+            'cd fused-memory && uv run --project cockpit npx pyright '
+            '&& cd ../orchestrator && uv run --project cockpit npx pyright '
+            '&& cd ../dashboard && uv run --project cockpit npx pyright'
+        )
 
     def test_source_only_change_yields_no_test_command(self, tmp_path: Path) -> None:
         """A cockpit source-only diff (no test files touched) → test_command is None.
