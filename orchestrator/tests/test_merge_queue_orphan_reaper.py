@@ -657,3 +657,53 @@ class TestHeartbeatLoopReapWiring:
             'a raising periodic reap must not kill/propagate out of '
             '_heartbeat_loop (fail-open, mirrors the touch/heartbeat guard)'
         )
+
+    async def test_heartbeat_loop_bounds_hanging_reap_with_timeout(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A hung periodic reap (e.g. a wedged git subprocess — GitOps._run
+        has no internal timeout) must not block _heartbeat_loop forever: the
+        call is bounded by _reap_sweep_timeout_s via asyncio.wait_for, so the
+        loop keeps polling — and keeps touching owned worktrees — instead of
+        stalling on the first hung sweep indefinitely (task 3018 amendment;
+        reviewer_comprehensive robustness finding at merge_queue.py:10440).
+        """
+        import orchestrator.merge_queue as mq_mod
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        monkeypatch.setattr(mq_mod, '_HEARTBEAT_POLL_S', 0.01)
+        worker._reap_sweep_timeout_s = 0.05
+        # Isolate the reap: no-op the touch + log-heartbeat calls the loop
+        # also makes each poll.
+        monkeypatch.setattr(worker, '_touch_owned_merge_worktrees', lambda: 0)
+        monkeypatch.setattr(worker, '_maybe_log_queue_heartbeat', lambda now: False)
+
+        calls = 0
+
+        async def _hanging_reap(now: float) -> None:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(10.0)  # never completes on its own
+
+        monkeypatch.setattr(worker, '_maybe_reap_orphaned_merge_worktrees', _hanging_reap)
+
+        worker._running = True
+        task = asyncio.create_task(worker._heartbeat_loop())
+        try:
+            # Give the loop enough wall time for several timeout-bounded
+            # polls. Without the asyncio.wait_for bound, the very first call
+            # would hang for the full 10s sleep and this window would only
+            # ever observe calls == 1.
+            await asyncio.sleep(0.3)
+            worker._running = False
+            await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+        assert calls >= 2, (
+            f'a hung reap must be cut off by _reap_sweep_timeout_s so the loop '
+            f'keeps polling instead of blocking on the first hung sweep '
+            f'forever; got {calls} call(s) in the observation window'
+        )

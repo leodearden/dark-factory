@@ -7651,6 +7651,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _heartbeat_interval_s / _shutdown_timeout override precedent.
         self._reap_interval_s: float = 300.0
+        # Bounds a single periodic-reap sweep (task 3018 amendment —
+        # reviewer_comprehensive robustness finding). reap_orphaned_merge_worktrees
+        # runs os.scandir plus one `git worktree remove --force` subprocess per
+        # aged orphan via GitOps._run, which has NO internal timeout. A wedged
+        # git (repo lock contention, NFS, many orphans in one sweep) would
+        # otherwise block this loop indefinitely — starving step 1's
+        # owned-worktree touch well past the liveness-margin's touch-miss
+        # floor (_HEARTBEAT_POLL_S x TOUCH_MISS_TOLERANCE = 600s). _run's own
+        # docstring documents asyncio.wait_for(..., timeout=...) wrapping as
+        # cancellation-safe (best-effort kills + reaps the child before
+        # re-raising) — the same pattern delivered_checks.py's
+        # _run_script_check already relies on. Override in tests for
+        # deterministic bounded-hang checks (mirrors the precedents above).
+        self._reap_sweep_timeout_s: float = 120.0
         # Per-lane FIFO buffers — items are drained from _queue into these so
         # pick-order can prefer high over normal.  Each deque preserves FIFO
         # within a lane.  Accessed only from the merger coroutine.
@@ -10524,7 +10538,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              :meth:`_maybe_reap_orphaned_merge_worktrees` (task 3018), the
              steady-state counterpart to the startup-only orphan reap — this
              is what bounds an audit-flagged leak's on-disk lifetime instead
-             of leaving it until the next restart.
+             of leaving it until the next restart.  Bounded by
+             :attr:`_reap_sweep_timeout_s` via ``asyncio.wait_for`` (task
+             3018 amendment) so a hung git subprocess can never block this
+             loop — and therefore step 1's owned-worktree touch — indefinitely;
+             a timed-out sweep is logged and simply retried on a later poll,
+             subject to its own rate limit.
 
         Steps 1-2 and step 3 are wrapped in their OWN, SEPARATE try/except
         (mirroring the swallow-and-log convention used here and in
@@ -10541,7 +10560,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
             try:
-                await self._maybe_reap_orphaned_merge_worktrees(time.time())
+                await asyncio.wait_for(
+                    self._maybe_reap_orphaned_merge_worktrees(time.time()),
+                    timeout=self._reap_sweep_timeout_s,
+                )
             except Exception:
                 logger.exception('merge queue heartbeat: periodic reap failed')
 
