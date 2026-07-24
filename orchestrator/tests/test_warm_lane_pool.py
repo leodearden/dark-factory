@@ -5598,3 +5598,64 @@ class TestDriftCounterFailOpen:
         result = asyncio.run(pool.acquire_for('a'))  # must not raise
         assert result is not None
         assert pool._drift_count == 1
+
+    def test_release_skip_does_not_reset_drift_counter(self, tmp_path: Path):
+        """I4 re-arm is write-scoped: a ``release`` whose durable record is NOT
+        ASSIGNED/IN_USE makes ``_note_released_durable`` SKIP the transition —
+        only a ``read`` happens, no durable write is attempted. A successful
+        read is NOT evidence the ``.lane-state`` is writable (the failure mode
+        this feature targets is writable-fails-but-readable), so a benign skip
+        must NOT reset the drift counter, else it would mask accumulated drift.
+
+        Regression for the reviewer amendment: previously ANY non-raising
+        durable call (including a read-only skip) reset the counter to 0.
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=5)
+        # fail=True → note_assigned/transition raise OSError; read → None, so
+        # _note_released_durable sees a non-ASSIGNED record and skips the write.
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+
+        # Accumulate drift via two failing acquires (each attempts a write).
+        result = asyncio.run(pool.acquire_for('a'))
+        assert result is not None
+        lane_a, _ = result
+        asyncio.run(pool.acquire_for('b'))
+        assert pool._drift_count == 2
+
+        # Release lane_a: the closure reads None → skips the RELEASED
+        # transition (no write). The counter MUST stay at 2, not reset to 0.
+        asyncio.run(pool.release(lane_a))
+        assert pool._drift_count == 2
+
+    def test_acquire_fail_release_skip_cycle_still_reaches_threshold(
+        self, tmp_path: Path,
+    ):
+        """Under SUSTAINED durable-write failure, an acquire-fail / release-skip
+        cycle must still climb to ``drift_l2_threshold`` and fire the callback.
+        Each failing acquire increments; the interleaved release-skip must NOT
+        reset (else the counter oscillates below threshold forever and the
+        born-at-L2 escalation never fires — precisely when it matters most).
+
+        Regression for the reviewer amendment.
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=2)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+        fired: list[int] = []
+        pool._on_lane_record_drift = lambda count: fired.append(count)
+
+        result = asyncio.run(pool.acquire_for('a'))  # write fails → count=1
+        assert result is not None
+        lane_a, _ = result
+        assert pool._drift_count == 1
+        assert fired == []
+
+        asyncio.run(pool.release(lane_a))  # read→None skip → must NOT reset
+        assert pool._drift_count == 1
+
+        asyncio.run(pool.acquire_for('b'))  # write fails → count=2 → fire once
+        assert pool._drift_count == 2
+        assert fired == [2]

@@ -600,10 +600,18 @@ class WarmLanePool:
         if self._lane_lifecycle is None:
             return
         lifecycle = self._lane_lifecycle
+
+        def _assigned_write() -> bool:
+            # note_assigned attempts a durable write on the bring-to-ASSIGNED
+            # ladder; a non-raising call is an attempted-and-succeeded write →
+            # re-arm the drift counter (True). (We return an explicit True
+            # rather than note_assigned's own return value, which some
+            # LaneLifecycle stubs report as None on success.)
+            lifecycle.note_assigned(lane, task_id=task_id, title=title, branch=branch)
+            return True
+
         self._run_guarded_durable_write(
-            lambda: lifecycle.note_assigned(
-                lane, task_id=task_id, title=title, branch=branch,
-            ),
+            _assigned_write,
             on_fail_log=lambda: logger.warning(
                 'warm_lane_pool: durable record mirror for lane %s failed '
                 'for task %r — cache updated, durable record left as-is',
@@ -642,13 +650,20 @@ class WarmLanePool:
             return
         lifecycle = self._lane_lifecycle
 
-        def _release_write() -> None:
+        def _release_write() -> bool:
             record = lifecycle.read(lane)
             if record is not None and record.state in (
                 DurableLaneState.ASSIGNED,
                 DurableLaneState.IN_USE,
             ):
                 lifecycle.transition(lane, DurableLaneState.RELEASED)
+                return True  # a durable write was performed → re-arm
+            # Benign skip: the record is already RELEASED/absent/REGISTERED, so
+            # only a read happened — NOT evidence the durable layer accepts
+            # writes. Returning False leaves _drift_count untouched so a
+            # read-only skip never masks accumulated drift (a REGISTERED record
+            # here can itself be the fossil of an earlier failed ASSIGNED write).
+            return False
 
         self._run_guarded_durable_write(
             _release_write,
@@ -661,18 +676,26 @@ class WarmLanePool:
 
     def _run_guarded_durable_write(
         self,
-        write: Callable[[], object],
+        write: Callable[[], bool],
         *,
         on_fail_log: Callable[[], None],
     ) -> None:
         """Shared guarded durable-write path (PRD W2b I1/I3/I4).
 
         Runs *write* (the actual ``note_assigned``/``read``+``transition``
-        call). Outcomes:
+        call), which returns whether it PERFORMED a durable mutation. Outcomes:
 
-        * SUCCESS (no exception) → reset ``_drift_count`` to 0 (re-arm, I4).
-          A legitimately-skipped RELEASED mirror (record not ASSIGNED/IN_USE)
-          also counts as success — the durable layer answered without error.
+        * WRITE PERFORMED (no exception, ``write()`` returns True) → reset
+          ``_drift_count`` to 0 (re-arm, I4). Only a successful mutating write
+          is evidence the durable layer accepts writes.
+        * BENIGN SKIP (no exception, ``write()`` returns False) → leave
+          ``_drift_count`` UNCHANGED. A read-only skip (e.g. a RELEASED mirror
+          whose record is not ASSIGNED/IN_USE) proves only that the durable
+          layer is READABLE, not writable — the exact failure mode this feature
+          targets is writable-fails-but-readable. Resetting here would let a
+          tight acquire-fail / release-skip cycle oscillate the counter below
+          ``drift_l2_threshold`` forever, so the born-at-L2 never fires despite
+          persistent total write failure. So a skip must NOT re-arm.
         * ``IllegalLaneTransition`` / ``OSError`` → call *on_fail_log* (the
           caller's WARNING), increment ``_drift_count``, and — once the counter
           reaches ``drift_l2_threshold`` and a callback is installed — fire the
@@ -686,7 +709,7 @@ class WarmLanePool:
         callback is opaque, installed by the Harness.
         """
         try:
-            write()
+            wrote = write()
         except (IllegalLaneTransition, OSError):
             on_fail_log()
             self._drift_count += 1
@@ -703,4 +726,5 @@ class WarmLanePool:
                         self._drift_count, exc_info=True,
                     )
         else:
-            self._drift_count = 0
+            if wrote:
+                self._drift_count = 0
