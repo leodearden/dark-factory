@@ -10,6 +10,7 @@ Step test-quarantine: RED — quarantine method absent.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -507,3 +508,64 @@ class TestNoteAssigned:
 
         # Never silent-steal: the record is untouched on conflict.
         assert record_path.read_bytes() == before_bytes
+
+
+# ---------------------------------------------------------------------------
+# note_assigned recycles a durably-QUARANTINED slot (task 3029): a genuine
+# fresh dispatch onto a slot whose bad worktree was relocated to
+# quarantine_base must bring the durable record back to ASSIGNED via the
+# sanctioned QUARANTINED -> RELEASED -> ASSIGNED recycle, LOUDLY (never
+# silent-heal) — rather than raising IllegalLaneTransition and drifting the
+# record (the live esc-__lane_record_drift__-1 incident).
+# ---------------------------------------------------------------------------
+
+
+class TestNoteAssignedRecyclesQuarantined:
+    def _quarantined_lane_with_stale_pin(
+        self, tmp_path: Path, lifecycle: LaneLifecycle,
+    ) -> Path:
+        """Drive a lane to a QUARANTINED record still carrying a stale
+        task_id/title/branch from its prior (now-quarantined) assignment.
+        """
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/old')
+        lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='old', title='old-demo',
+        )
+        lifecycle.transition(lane, LaneState.QUARANTINED)
+        return lane
+
+    def test_quarantined_lane_recycled_to_assigned_without_raising(
+        self, tmp_path: Path, caplog,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = self._quarantined_lane_with_stale_pin(tmp_path, lifecycle)
+        assert lifecycle.read(lane).state == LaneState.QUARANTINED
+
+        # Must NOT raise IllegalLaneTransition (the drift bug): it recycles.
+        with caplog.at_level(logging.WARNING, logger='orchestrator.lane_lifecycle'):
+            record = lifecycle.note_assigned(lane, task_id='42', branch='task/42')
+
+        # Recycled to a clean ASSIGNED record for the NEW task.
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '42'
+        assert record.branch == 'task/42'
+        # The stale prior pin does NOT leak: task_id/title were cleared by the
+        # RELEASED hop before the fresh ASSIGNED (task_id above proves the id;
+        # title proves the RELEASED clear happened).
+        assert record.title is None
+        # Durable record == returned record (record <-> cache consistent, no
+        # drift).
+        assert lifecycle.read(lane) == record
+
+        # LOUD, not silent (never-silent-heal): exactly one WARNING on the
+        # lane_lifecycle logger names the lane and the recycle.
+        recycle_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.lane_lifecycle'
+            and lane.name in r.getMessage()
+            and 'recycl' in r.getMessage().lower()
+        ]
+        assert len(recycle_warnings) == 1
