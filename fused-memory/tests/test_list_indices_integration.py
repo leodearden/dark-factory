@@ -60,6 +60,7 @@ def _falkor_available() -> bool:
 pytestmark = [
     pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable'),
     pytest.mark.timeout(15),
+    pytest.mark.integration,
 ]
 
 
