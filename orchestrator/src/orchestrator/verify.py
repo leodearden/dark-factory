@@ -285,31 +285,65 @@ _ROOT_OWNING_TEST_COMMAND = 'uv run --project shared pytest tests/scripts/'
 _AND_CLAUSE_SPLIT_RE = re.compile(r'(\s*&&\s*)')
 
 
-def _rescope_clause_to_subproject(clause: str, sub: str) -> str:
-    """Reproject a single ``&&``-clause into subpackage *sub*'s own uv context.
+def _cd_clause_target(clause: str) -> str | None:
+    """Return *clause*'s target directory when it is a bare ``cd <dir>`` clause.
+
+    Used by :func:`_scope_fallback_tool_to_subproject` (task 3022 amendment)
+    to track the net effect of the ``cd`` clauses interleaved through a
+    chained ``type_check_command`` (e.g. ``cd fused-memory && npx pyright &&
+    cd ../orchestrator && npx pyright && ...``), so a uv ``--project``
+    inserted into a LATER clause can be computed relative to where the
+    chain actually is at that point — uv resolves a relative ``--project``
+    against the shell's current directory, not the worktree root, so
+    inserting the bare touched-subproject name unconditionally would
+    silently resolve inside the wrong fleet member's directory.
+
+    Returns ``None`` (leaving cwd-tracking unchanged) for anything that
+    isn't exactly a two-token ``cd <dir>`` — an unparseable clause
+    (unbalanced quotes), a no-op ``cd`` with no argument, or a clause that
+    contains more than a lone ``cd``. None of these shapes occur in any
+    current config; this mirrors the module's pre-existing `&&`-inside-a-
+    quoted-argument boundary (not a new gap introduced here).
+    """
+    try:
+        tokens = shlex.split(clause)
+    except ValueError:
+        return None
+    if len(tokens) == 2 and tokens[0] == 'cd':
+        return tokens[1]
+    return None
+
+
+def _rescope_clause_to_subproject(clause: str, project: str) -> str:
+    """Reproject a single ``&&``-clause into uv context *project*.
 
     Extracted from :func:`_scope_fallback_tool_to_subproject` (task 3022) so
     the same parse -> reproject -> render pipeline can be applied to every
-    keyword-bearing clause of a chained command, not just one.
+    keyword-bearing clause of a chained command, not just one. *project* is
+    whatever uv ``--project`` value the caller has already computed for
+    THIS clause's position in the chain (task 3022 amendment) — the touched
+    subproject's bare name, or that name's path relative to any ``cd`` the
+    chain has already executed by this clause (see :func:`_cd_clause_target`)
+    — not necessarily the bare subproject name itself.
 
     Returns *clause* verbatim when it does not parse into a single
     structured tool invocation (P1 — an OPAQUE/unparseable clause, or one
     with ``raw`` retained, is left untouched), or when reprojecting it is a
     no-op (it already carries an explicit ``--project``/``--directory`` —
     don't second-guess an already-set uv context). Otherwise returns the
-    clause rendered with its uv context set to *sub*.
+    clause rendered with its uv context set to *project*.
     """
     parsed = parse_config_command(clause)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return clause
-    reprojected = reproject(parsed, sub)
+    reprojected = reproject(parsed, project)
     if reprojected == parsed and parsed.uv_project is None:
         # Not uv-wrapped at all — reproject() deliberately no-ops on this
         # (it only reprojects an ALREADY-bare `uv run <tool>`), but this
         # helper's own job additionally covers "no uv context whatsoever"
         # by prepending one, closing the cold-verify dev-dep race described
         # on :func:`_scope_fallback_tool_to_subproject`.
-        reprojected = replace(parsed, uv_project=sub)
+        reprojected = replace(parsed, uv_project=project)
     if reprojected == parsed:
         return clause
     return render(reprojected)
@@ -343,6 +377,21 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     :func:`_rescope_clause_to_subproject` — not just the first — while every
     other clause and ``&&`` separator is left byte-identical.
 
+    uv resolves a relative ``--project`` against the shell's CURRENT
+    directory at the point that clause runs, not the worktree root — so for
+    a keyword clause that runs after one or more ``cd`` clauses earlier in
+    the SAME chain (e.g. the second/third ``npx pyright`` in ``cd
+    fused-memory && npx pyright && cd ../orchestrator && npx pyright &&
+    ...``), inserting the bare *sub* would resolve inside the wrong fleet
+    member's directory instead of *sub* (task 3022 amendment). This helper
+    therefore tracks the net effect of every ``cd`` clause seen so far via
+    :func:`_cd_clause_target` and passes :func:`_rescope_clause_to_subproject`
+    *sub*'s path relative to that tracked position (e.g. ``--project
+    ../cockpit`` from inside ``fused-memory``) rather than always the bare
+    *sub* — a no-op when no ``cd`` clause precedes the keyword clause (the
+    tracked position is still the worktree root, so *sub* relative to it is
+    *sub* itself).
+
     Returns:
         ``None`` when *cmd* is ``None``.
         *cmd* unchanged when *tool_keyword* is not present anywhere (no-op
@@ -354,10 +403,11 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
         *different* member than *sub*, which is left alone rather than
         re-targeted).
         *cmd* with every keyword-bearing clause reprojected (bare ``uv run
-        <tool_keyword>`` gains ``--project <sub>``, or — when a clause
-        carries no ``uv run`` wrapper at all, e.g. a bare ``npx pyright`` or
-        bare ``pyright`` invocation — with ``uv run --project <sub>``
-        prepended to it) otherwise.
+        <tool_keyword>`` gains ``--project <sub>`` — or *sub*'s path
+        relative to any preceding ``cd`` clause in the same chain — or, when
+        a clause carries no ``uv run`` wrapper at all, e.g. a bare ``npx
+        pyright`` or bare ``pyright`` invocation — with that same ``uv run
+        --project <...>`` prepended to it) otherwise.
     """
     if cmd is None:
         return None
@@ -365,11 +415,20 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
         return cmd
     parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
     changed = False
+    # Tracks, as a path relative to the worktree root, the net effect of
+    # every `cd` clause encountered so far — '.' (the root itself) until the
+    # first one. See the uv-resolves-against-cwd paragraph above.
+    cwd = '.'
     for i in range(0, len(parts), 2):
         clause = parts[i]
+        cd_target = _cd_clause_target(clause)
+        if cd_target is not None:
+            cwd = os.path.normpath(os.path.join(cwd, cd_target))
+            continue
         if tool_keyword not in clause:
             continue
-        rescoped = _rescope_clause_to_subproject(clause, sub)
+        project = os.path.relpath(sub, cwd)
+        rescoped = _rescope_clause_to_subproject(clause, project)
         if rescoped != clause:
             parts[i] = rescoped
             changed = True

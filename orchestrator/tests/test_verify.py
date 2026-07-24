@@ -4446,20 +4446,31 @@ class TestScopeFallbackToolToSubproject:
         Regression guard for the fleet-wide ``type_check_command`` chain
         (task 3000): the has_structural widening path passes the FULL
         unscoped multi-subproject chain into this helper, so all three
-        ``npx pyright`` clauses — not just the first — must gain ``uv run
-        --project <sub>``. Leaving the later clauses bare means they run
+        ``npx pyright`` clauses — not just the first — must gain a uv
+        ``--project`` context. Leaving the later clauses bare means they run
         with no uv/venv context and hit a reportMissingImports wall
         unrelated to the diff.
+
+        Amendment (task 3022 review): *sub* is 'cockpit' here — a fourth
+        member distinct from the three the chain ``cd``s through — because
+        uv resolves a relative ``--project`` against the shell's CURRENT
+        directory, not the worktree root. Each ``npx pyright`` clause runs
+        after a ``cd`` into a different fleet member, so the inserted
+        ``--project`` must be *cockpit*'s path RELATIVE TO that member
+        (``../cockpit`` from inside any of the three, since all four are
+        worktree-root siblings) for the uv context to actually resolve to
+        cockpit — not the bare name, which would silently resolve inside
+        the wrong member's directory instead.
         """
         cmd = (
             'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
             '&& cd ../dashboard && npx pyright'
         )
-        result = _scope_fallback_tool_to_subproject(cmd, 'pyright', 'orchestrator')
+        result = _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit')
         assert result == (
-            'cd fused-memory && uv run --project orchestrator npx pyright '
-            '&& cd ../orchestrator && uv run --project orchestrator npx pyright '
-            '&& cd ../dashboard && uv run --project orchestrator npx pyright'
+            'cd fused-memory && uv run --project ../cockpit npx pyright '
+            '&& cd ../orchestrator && uv run --project ../cockpit npx pyright '
+            '&& cd ../dashboard && uv run --project ../cockpit npx pyright'
         )
 
     def test_multi_clause_chain_scopes_bare_clause_after_already_scoped_clause(self):
@@ -5005,6 +5016,15 @@ class TestBuildFallbackConfigSubprojectScoped:
         All three clauses must land in cockpit's own uv context — leaving
         clause 2/3 bare (no uv/venv context) hits a reportMissingImports
         wall unrelated to the diff (task 3000).
+
+        Amendment (task 3022 review): each ``npx pyright`` clause runs after
+        the chain's own ``cd`` into fused-memory/orchestrator/dashboard, and
+        uv resolves a relative ``--project`` against that shell's CURRENT
+        directory, not the worktree root. The inserted uv context must
+        therefore be cockpit's path RELATIVE TO each of those members
+        (``../cockpit`` — all four are worktree-root siblings) to actually
+        land in cockpit, not the bare name, which would silently resolve
+        inside e.g. ``fused-memory/cockpit`` instead.
         """
         worktree = self._make_cockpit_worktree(tmp_path)
         cockpit_src = tmp_path / 'cockpit' / 'src' / 'cockpit'
@@ -5018,9 +5038,9 @@ class TestBuildFallbackConfigSubprojectScoped:
 
         assert result is not None
         assert result.type_check_command == (
-            'cd fused-memory && uv run --project cockpit npx pyright '
-            '&& cd ../orchestrator && uv run --project cockpit npx pyright '
-            '&& cd ../dashboard && uv run --project cockpit npx pyright'
+            'cd fused-memory && uv run --project ../cockpit npx pyright '
+            '&& cd ../orchestrator && uv run --project ../cockpit npx pyright '
+            '&& cd ../dashboard && uv run --project ../cockpit npx pyright'
         )
 
     def test_source_only_change_yields_no_test_command(self, tmp_path: Path) -> None:
