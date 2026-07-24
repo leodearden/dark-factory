@@ -230,6 +230,29 @@ class TestMarkStepCommitted:
         # No double-prepend on a repeated (step_id, sha) call.
         assert step['description'].count('[COMMITTED ') == 1
 
+    def test_remark_different_sha_replaces_tag_no_stacking(
+        self, artifacts: TaskArtifacts
+    ):
+        # A re-mark against a DIFFERENT sha (e.g. an amended/squashed commit
+        # during re-planning) must REPLACE the stale [COMMITTED ...] tag, not
+        # stack a second one in front of it.
+        artifacts.write_plan(self._plan())
+        sha_a = 'a' * 40
+        sha_b = 'b' * 40
+
+        assert artifacts.mark_step_committed('step-1', sha_a) is True
+        assert artifacts.mark_step_committed('step-1', sha_b) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        # commit tracks the LATEST sha; description carries exactly the current
+        # tag — the stale sha_a tag is gone, not stacked.
+        assert step['commit'] == sha_b
+        assert step['description'].count('[COMMITTED ') == 1
+        assert step['description'].startswith(f'[COMMITTED {sha_b[:12]}]')
+        assert sha_a[:12] not in step['description']
+        assert step['description'].endswith('Write test')
+
     def test_affects_pending_and_completed_filters(
         self, artifacts: TaskArtifacts
     ):
