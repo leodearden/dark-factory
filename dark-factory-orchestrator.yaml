@@ -223,6 +223,35 @@ merge_train_max_members: 3
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
 
+# Config-driven off-hot-path offline lane — dark-factory qdrant-integration
+# instance (plans/integration-test-lane-prd.md, task beta). Restores the
+# qdrant-client/mem0 version-compat coverage that task 2773 removes from the
+# merge-verify hot path: `pytest -m integration` now runs in fused-memory/ on
+# the off-hot-path offline lane at each post-merge advance from the current
+# main head, instead of on every merge-verify.
+#
+# offline_lane_legacy_numeric_enabled: false because dark-factory has no
+# reify-style scripts/run-offline-deep.sh (PRD D2) — the generic
+# offline_lane_commands entry below drives the lane instead of the legacy
+# numeric seam.
+#
+# ACTIVATION NOTE: like the other restart-only flips in this file,
+# offline_lane_enabled is the START gate for the offline-deep lane worker and
+# is NOT in the config hot-reload allowlist (RELOADABLE_FIELDS,
+# orchestrator/src/orchestrator/config.py) — this edit is inert in the
+# running daemon until the next orchestrator restart. Activation is the
+# separate PRD task gamma. offline_lane_commands and
+# offline_lane_legacy_numeric_enabled ARE hot-reloadable.
+git:
+  offline_lane_enabled: true
+  persistent_offline_deep_worktree: true
+  offline_lane_legacy_numeric_enabled: false
+  offline_lane_commands:
+    - name: qdrant-integration
+      command: "pytest -m integration"
+      cwd: "fused-memory"
+      fix_task_priority: "medium"
+
 # Variable-depth speculative verify placement (task 2359) — ACTIVATE the deep
 # probe (operator decision, 2026-07-19). probe_fraction=0.5: half of second-slot
 # dispatch rounds target a deeper already-built speculative stack (probe_depths
