@@ -112,3 +112,31 @@ def test_mem0_client_qdrant_probe_gated() -> None:
         f'expected {live_class} to be collected under -m integration (it must '
         f'remain selectable as an explicit opt-in). Output:\n{override_output}'
     )
+
+
+@pytest.mark.timeout(120)
+def test_list_indices_integration_module_gated() -> None:
+    """The whole live-FalkorDB module must be deselected by default, selectable via marker.
+
+    test_list_indices_integration.py is 100% live FalkorDB (both classes
+    round-trip a real backend), so its module-level pytestmark carries the
+    integration marker. Both classes must be deselected by default and both
+    selectable under `-m integration` (anti-vacuity).
+    """
+    module = TESTS_DIR / 'test_list_indices_integration.py'
+    live_classes = ('TestCallDbIndexesOverRoQuery', 'TestBackendListIndicesLive')
+
+    default_output = _collect(module)
+    for cls in live_classes:
+        assert cls not in default_output, (
+            f'{cls} was collected by default -- the whole live-FalkorDB module '
+            f'must be marked @pytest.mark.integration (task 3020) so the '
+            f"-m 'not integration' addopts deselects it. Output:\n{default_output}"
+        )
+
+    override_output = _collect(module, '-m', 'integration')
+    for cls in live_classes:
+        assert cls in override_output, (
+            f'expected {cls} to be collected under -m integration (the module '
+            f'must remain selectable as an explicit opt-in). Output:\n{override_output}'
+        )
