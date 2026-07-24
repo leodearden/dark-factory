@@ -1963,6 +1963,34 @@ class GitConfig(BaseModel):
             'warm_lane_* knobs; a second source would drift).'
         ),
     )
+    warm_lane_structural_exhaustion_l2_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Number of CONSECUTIVE WarmLanePoolExhausted acquires GitOps '
+            'tolerates before firing its _on_structural_exhaustion callback '
+            '(the Harness installs a born-at-L2 '
+            'warm_lane_pool_structurally_exhausted filer there).  Task 2988 '
+            '(PRD ε / W3) closes the second failure pole of the 2026-07-22 '
+            'incident (silent infinite requeue): with EXHAUSTED no longer '
+            'counting against the per-task requeue cap, a pool that stays '
+            'exhausted would otherwise requeue forever with no loud signal.  '
+            'The counter is pool-GLOBAL instance state on GitOps, incremented '
+            'at the single EXHAUSTED return in _acquire_warm_lane_impl and '
+            'reset to 0 on ANY successful fresh lane allocation (acquire_for '
+            'reused=False) or reclaim — a reuse/live-requeue does NOT reset '
+            'it (not evidence of free capacity).  At this threshold the '
+            'callback fires ONCE (deduped to a single pending L2 via '
+            'find_pending_l2_by_root_cause), carrying the α pool census.  '
+            'Unlike warm_lane_drift_l2_threshold, GitOps reads this straight '
+            'off self.config (the GitConfig) — no pool-constructor plumbing, '
+            'since the counter lives on GitOps itself.  Default 5 per PRD '
+            'Open Q1; green-tier/hot-reloadable.  defaults.yaml deliberately '
+            'does NOT list this knob — the Field default here is the single '
+            'source of truth (matching the other warm_lane_* knobs; a second '
+            'source would drift).'
+        ),
+    )
     max_interactive_worktrees: int = Field(
         default=2,
         ge=1,

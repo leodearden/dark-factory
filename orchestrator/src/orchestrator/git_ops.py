@@ -370,6 +370,23 @@ _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
 # (not a default arg) so tests can monkeypatch it (0.0 disables the memo).
 _WARM_LANE_AUDIT_CACHE_TTL_SECS: float = 30.0
 
+# Re-fire cadence for the structural-exhaustion loudness callback once the
+# pool-GLOBAL consecutive-EXHAUSTED counter is at-or-above threshold (task 2988,
+# review amendment — efficiency).  The callback fires on the EXACT threshold
+# crossing and then only every _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY-th
+# subsequent consecutive EXHAUSTED — NOT on every acquire.  Rationale: the
+# harness filer's dedup scan (find_pending_l2_by_root_cause) is
+# O(pending-escalations) and runs on the acquire chokepoint; unlike the
+# WarmLanePool drift-counter (self-correcting: resets on every successful round)
+# the consecutive-EXHAUSTED counter NEVER resets while the pool stays stuck (a
+# structurally exhausted pool serves no fresh lane), so firing on every trip
+# would run that scan on every acquire until a lane frees.  The periodic re-fire
+# keeps the born-at-L2 recoverable — it re-files if an operator resolves the L2
+# while the pool remains structurally exhausted — without a per-acquire scan.
+# A fixed interval (not `count % threshold`) so a sensitive threshold=1 config
+# still rate-limits instead of firing every trip.
+_STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY: int = 50
+
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
 # <worktree_base>/_offline-deep.  Deliberately NOT prefixed `_merge-`, so it
@@ -1535,6 +1552,23 @@ class GitOps:
         # when pool_storage_present() is False.  None (unwired) is
         # byte-identical to today — e.g. cli/recover/evals call sites.
         self._on_pool_storage_absent: Callable[..., Any] | None = None
+        # Structural-exhaustion (PRD ε pole-2) loudness callback (task 2988).
+        # A pool-GLOBAL consecutive-EXHAUSTED counter: incremented at the single
+        # EXHAUSTED return in _acquire_warm_lane_impl (via
+        # _note_structural_exhaustion), reset to 0 on any successful FRESH lane
+        # allocation (acquire_for reused=False) or safety-valve reclaim.  Once it
+        # reaches config.warm_lane_structural_exhaustion_l2_threshold and the
+        # callback is installed, fires _on_structural_exhaustion(count, census)
+        # best-effort so the Harness files ONE deduped born-at-L2 — the sole loud
+        # signal for a pool stuck emitting EXHAUSTED forever (silent-infinite-
+        # requeue).  Declared here (default None), installed by Harness.__init__
+        # when a pool exists — same declare-on-callee / install-in-harness
+        # pattern as _on_pool_storage_absent above (None = byte-identical when
+        # unwired: cli/recover/evals, knob-off, pool-less).
+        self._consecutive_exhausted: int = 0
+        self._on_structural_exhaustion: (
+            Callable[[int, WarmLanePoolCensus], None] | None
+        ) = None
         # θ soft-floor defer α-audit memo (task 2443, amendment): a
         # (monotonic_deadline, headroom) pair, or None before the first defer.
         # Consulted only by _warm_lane_audit_cached() on the (non-hot) defer
@@ -4341,6 +4375,56 @@ class GitOps:
             n_quarantined=n_quarantined,
         )
 
+    def _note_structural_exhaustion(self, census: 'WarmLanePoolCensus') -> None:
+        """Count consecutive pool EXHAUSTED; fire the loudness callback at
+        threshold (task 2988, PRD ε pole-2 — the silent-infinite-requeue pole).
+
+        Increments the pool-GLOBAL ``_consecutive_exhausted`` counter (reset to 0
+        on any successful FRESH allocation or safety-valve reclaim in
+        :meth:`_acquire_warm_lane_impl`).  Once the counter reaches
+        ``config.warm_lane_structural_exhaustion_l2_threshold`` and a
+        ``_on_structural_exhaustion`` callback is installed (by the Harness when
+        a pool exists), fires it with ``(count, census)`` so the Harness files
+        ONE deduped born-at-L2 — the sole loud signal that the pool is stuck
+        handing out EXHAUSTED forever.
+
+        RATE-LIMITED (review amendment — efficiency): fires on the EXACT
+        threshold crossing and then only every
+        ``_STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY``-th subsequent consecutive
+        EXHAUSTED — NOT on every trip.  Unlike the :class:`WarmLanePool`
+        drift-counter (which resets on every successful round, so its per-trip
+        fire is naturally bounded), this counter never resets while the pool
+        stays stuck, so firing on every trip would run the harness filer's
+        O(pending-escalations) dedup scan (``find_pending_l2_by_root_cause``) on
+        the acquire chokepoint for every attempt.  The periodic re-fire still
+        re-files the born-at-L2 if an operator resolves it while the pool remains
+        structurally exhausted; dedup keeps at most one pending L2 regardless of
+        trip count.  Callback exceptions are swallowed+logged (I3 fail-open) —
+        escalation-filing must never break the acquire path.  Increment + fire
+        run synchronously (no ``await``), so they are atomic under the single
+        asyncio loop despite concurrent acquires — the same property the pool
+        drift-counter relies on.
+        """
+        self._consecutive_exhausted += 1
+        count = self._consecutive_exhausted
+        threshold = self.config.warm_lane_structural_exhaustion_l2_threshold
+        # Fire on the crossing (count == threshold → (count - threshold) == 0)
+        # and every _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY-th trip after it —
+        # never on every acquire (see the constant's rationale).
+        if (
+            count >= threshold
+            and (count - threshold) % _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY == 0
+            and self._on_structural_exhaustion is not None
+        ):
+            try:
+                self._on_structural_exhaustion(count, census)
+            except Exception:
+                logger.warning(
+                    'acquire_warm_lane: _on_structural_exhaustion callback raised '
+                    '(consecutive_exhausted=%d) — swallowed (fail-open, I3)',
+                    count, exc_info=True,
+                )
+
     async def acquire_warm_lane(
         self,
         branch_name: str,
@@ -4785,10 +4869,18 @@ class GitOps:
                 # / quarantined).  Assembled fresh here (cheap on the rare
                 # exhaustion path, race-free) rather than threaded through the
                 # shared WarmLaneUnavailable sentinel.
+                census = self._assemble_warm_lane_census()
                 logger.warning(
                     'acquire_warm_lane: warm-lane pool EXHAUSTED for branch %r — %s',
-                    branch_name, self._assemble_warm_lane_census().render(),
+                    branch_name, census.render(),
                 )
+                # Pole-2 (task 2988, PRD ε): count consecutive structural
+                # exhaustion and, at threshold, fire the harness-installed
+                # born-at-L2 loudness callback — reusing the SAME census just
+                # assembled for the WARNING so the L2 carries identical counts
+                # (INV-5, single assembler).  Best-effort / fail-open: never
+                # breaks the acquire path.
+                self._note_structural_exhaustion(census)
                 return WarmLaneUnavailable.EXHAUSTED  # Pool exhausted → backpressure
             # Stolen lane: registered worktree, reused=False.  Falls through past
             # `if reused:` (False) and `elif not _is_registered_worktree(lane)`
@@ -4796,8 +4888,17 @@ class GitOps:
             # reset path (_reset_and_seed_recycled_lane + shared tail), reusing all
             # existing reset/reseed/provision logic with zero new git plumbing.
             lane, reused = reclaimed, False
+            # Pole-2 (task 2988): a successful safety-valve reclaim proves the
+            # pool served a NEW lane — reset the consecutive-EXHAUSTED counter.
+            self._consecutive_exhausted = 0
         else:
             lane, reused = acq
+            if not reused:
+                # A genuinely FRESH allocation (not a live-requeue reuse) proves
+                # free capacity — reset the consecutive-EXHAUSTED counter.  A
+                # reuse does NOT reset: it is not evidence of a free lane, only
+                # of the same branch being re-handed its existing mapping.
+                self._consecutive_exhausted = 0
 
         # Call-LOCAL route classifier (W11 eta, PRD Mechanism 3) — NOT
         # instance state: acquire_warm_lane runs concurrently for different
