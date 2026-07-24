@@ -7,14 +7,17 @@ discards extras BEFORE validation, so unknown keys must be detected by a SEPARAT
 raw-YAML-vs-model pass.  These tests pin the pure census engine.
 """
 
+import logging
 from pathlib import Path
 
 import yaml
 
 from orchestrator.config import (
     ConfigUnknownKey,
+    OrchestratorConfig,
     census_unknown_config_keys,
     config_unknown_keys_signature,
+    load_config,
 )
 
 
@@ -124,3 +127,59 @@ def test_signature_changes_when_key_set_changes(tmp_path):
     c1 = [ConfigUnknownKey('a', None), ConfigUnknownKey('b', None)]
     c3 = [ConfigUnknownKey('a', None), ConfigUnknownKey('b', None), ConfigUnknownKey('c', None)]
     assert config_unknown_keys_signature(c1) != config_unknown_keys_signature(c3)
+
+
+# --- load_config stash + unknown_key_census property -------------------------
+
+
+def test_load_config_stashes_census_for_dirty_config(tmp_path, monkeypatch):
+    """load_config on a project YAML with a top-level spare_warm_lanes stashes a
+    census carrying that key and its git.spare_warm_lanes shadow hint."""
+    p = _write_yaml(
+        tmp_path,
+        {'project_root': str(tmp_path), 'spare_warm_lanes': 8},
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    config = load_config(p)
+    census = config.unknown_key_census
+    assert census, 'expected a non-empty census for the dirty config'
+    by_path = {uk.path: uk for uk in census}
+    assert 'spare_warm_lanes' in by_path
+    hint = by_path['spare_warm_lanes'].shadow_hint
+    assert hint is not None and 'git.spare_warm_lanes' in hint
+
+
+def test_load_config_clean_config_empty_census(tmp_path, monkeypatch):
+    p = _write_yaml(
+        tmp_path,
+        {'project_root': str(tmp_path), 'max_concurrent_tasks': 3},
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    config = load_config(p)
+    assert config.unknown_key_census == []
+
+
+def test_direct_construction_yields_empty_census(tmp_path, monkeypatch):
+    """A directly-constructed OrchestratorConfig() never ran load_config, so the
+    census sentinel stays None and the property normalizes to []."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    config = OrchestratorConfig()
+    assert config.unknown_key_census == []
+
+
+def test_load_config_logs_warning_naming_unknown_key(tmp_path, monkeypatch, caplog):
+    """load_config emits a WARNING naming the unknown key (loud-over-silent)."""
+    p = _write_yaml(
+        tmp_path,
+        {'project_root': str(tmp_path), 'spare_warm_lanes': 8},
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+        load_config(p)
+    assert any(
+        'spare_warm_lanes' in rec.getMessage() for rec in caplog.records
+    ), 'expected a WARNING naming the unknown key spare_warm_lanes'
