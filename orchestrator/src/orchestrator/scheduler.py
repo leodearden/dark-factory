@@ -7184,23 +7184,46 @@ class Scheduler:
         detail: str,
         run_id: str,
         cost_usd: float,
+        counts_against_cap: bool = True,
     ) -> int:
         """Append a requeue record and return the new *genuine* cumulative count.
 
-        Transient API requeues (HTTP 5xx "agent API error" summaries, classified
-        by ``is_transient_api_requeue``) are routed to ``_transient_requeue_counts``
-        and do NOT increment the genuine ``_requeue_counts`` that feeds
-        ``config.requeue_cap``.  Genuine requeues behave exactly as before.
-        The record is appended to ``_requeue_history`` either way so the
-        cap-exhaust report shows the full attempt timeline.
+        THREE routes, in precedence order:
+
+        1. ``counts_against_cap=False`` (task 2988, PRD ε / W3) — a
+           NON-COUNTING requeue: recorded in ``_requeue_history`` (so the
+           attempt timeline is preserved for a later genuine failure's
+           cap-exhaust report) but increments NEITHER counter, so it can
+           never trip ``config.requeue_cap`` OR ``config.transient_requeue_cap``.
+           This route is table-driven from ``BlockDisposition.counts_against_
+           requeue_cap`` (threaded through TerminalReport -> TaskReport ->
+           here), and it is decided FIRST — a non-counting reason that also
+           happens to look transient (5xx) is still history-only.  The loud
+           signal for the WarmLanePoolExhausted case that drives this route is
+           the pool-level structural-exhaustion L2, NOT a per-task retry-cap
+           escalation.
+        2. Transient API requeue (HTTP 5xx "agent API error" summaries,
+           classified by ``is_transient_api_requeue``) — routed to
+           ``_transient_requeue_counts`` (feeds ``config.transient_requeue_cap``);
+           does NOT increment the genuine ``_requeue_counts``.
+        3. Genuine requeue (the default) — increments ``_requeue_counts``
+           (feeds ``config.requeue_cap``); behaves exactly as before.
+
+        The record is appended to ``_requeue_history`` in ALL three routes so
+        the cap-exhaust report shows the full attempt timeline.
         ``RequeueRecord.attempt`` is the overall chronological index
-        (``len(history) + 1``) across both buckets, so the timeline is
-        monotonic when genuine and transient records interleave.
-        Returns the genuine count (0 for a transient requeue).
+        (``len(history) + 1``) across all buckets, so the timeline is
+        monotonic when the routes interleave.  Returns the genuine count
+        (0 for a transient OR non-counting requeue on a fresh task).
+        Backward-compatible: ``counts_against_cap`` defaults True, so every
+        existing caller is unchanged.
         """
         history = self._requeue_history.setdefault(task_id, [])
         overall_attempt = len(history) + 1
-        if is_transient_api_requeue(reason):
+        if not counts_against_cap:
+            # Route 1: history-only — neither counter moves.
+            pass
+        elif is_transient_api_requeue(reason):
             t_count = self._transient_requeue_counts.get(task_id, 0) + 1
             self._transient_requeue_counts[task_id] = t_count
         else:
