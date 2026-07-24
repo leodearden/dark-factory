@@ -380,6 +380,65 @@ class TestClassifyAndMergeSpeculativeWorker:
         assert result.merge_result.success
         assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
 
+    async def test_rebased_landing_patch_id_contained_returns_already_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """task 2945: a branch whose content landed on main as a REBASED /
+        cherry-picked commit (same patch-id, different SHA) is NOT an ancestor
+        of main, so the is_ancestor guard misses — but the patch-id backstop
+        must still recognise it as already-merged and skip the no-op merge.
+
+        Repro of the rebased-landing blind spot (RCA 2026-07-22): advance_main's
+        rebased_pending_reverify path lands a branch's content as a new commit
+        on main; the branch tip diverges, is_ancestor misses, and a duplicate/
+        late resubmission burns a head-of-line verify on a guaranteed no-op.
+        """
+        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+
+        # Branch with one commit adding reb.py.
+        worktree = await _make_branch_with_file(git_ops, 'rebased-2945', 'reb.py', 'x = 1\n')
+        branch_sha = await git_ops.resolve_branch_sha('task/rebased-2945')
+        assert branch_sha is not None
+
+        # Advance main with an UNRELATED commit first, so the cherry-picked
+        # commit necessarily lands on a different parent than branch_sha (hence
+        # a different SHA) even if wall-clock commit timestamps collide within
+        # the same second — guaranteeing the rebased-landing shape (same
+        # patch-id, different SHA, NOT an ancestor).  Mirrors the stale-ancestor
+        # test's "Unrelated main advance" idiom.
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+
+        # Land the branch's commit on main as a REBASED/cherry-picked commit:
+        # same patch-id, different SHA (the dominant landing mode under long verifies).
+        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
+        main_reb = await git_ops.get_main_sha()
+
+        # Sanity: the branch tip is NOT an ancestor of main (rebased landing),
+        # yet its content IS fully patch-id-contained in main.
+        assert not await git_ops.is_ancestor(branch_sha, main_reb)
+        assert await patch_content_contained(branch_sha, main_reb, git_ops) is True
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('rebased-2945', 'rebased-2945', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        # RED before impl: is_ancestor(effective_tip=branch_head, main_reb) misses
+        # and there is no patch-id backstop, so the guard falls through to a real
+        # --no-ff merge → MergedOk (not already_merged).
+        assert isinstance(result, Decided), (
+            f'expected a terminal already_merged Decided via the patch-id '
+            f'backstop, got {result!r}'
+        )
+        assert result.outcome.status == 'already_merged'
+        assert _merge_attempt_subtypes(es.db_path) == ['already_merged']
+
     async def test_real_conflict_returns_decided_conflict_and_records_drift_sample(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
