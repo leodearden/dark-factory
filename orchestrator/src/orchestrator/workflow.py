@@ -3172,6 +3172,13 @@ class TaskWorkflow:
         # Clearing here keeps the stamp/clear lifecycle symmetric; it is an
         # idempotent no-op when nothing was ever stamped (the common case).
         await self._clear_merge_retry_pending()
+        # Task 2991: likewise discharge the durable merge-phase-liveness stamp.
+        # The enqueue-boundary clear in _submit_to_merge_queue covers the normal
+        # path, but ghost-loop / eval-mode successes reach DONE without passing
+        # through it — so clear here too, keeping a DONE task from carrying a
+        # fresh stamp that would briefly defer an unrelated stranded divergence
+        # orphan in the reaper. Idempotent no-op when unstamped.
+        await self._clear_merge_phase_entered()
 
         # SUCCESS — write completion knowledge (best-effort after merge)
         try:
@@ -8489,6 +8496,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # window. (A defensive clear in the harness _run_slot finally covers
         # abnormal exits before this point.)
         self.scheduler.clear_merge_phase(self.task_id)
+        # Task 2991: discharge the DURABLE merge-phase-liveness stamp at the same
+        # boundary — the pre-enqueue window the orphan reaper's
+        # _has_fresh_merge_phase gate protects is over, so a lingering fresh
+        # stamp would briefly defer an unrelated stranded divergence orphan.
+        # Unlike the in-memory grace stamp above, this one is deliberately NOT
+        # cleared defensively in the harness _run_slot finally: an abnormal exit
+        # before this point must LEAVE the stamp so the reaper keeps deferring
+        # across the crash/restart/redispatch window.
+        await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
         # the future so the primary entry (and any remaining peers) stay alive.
