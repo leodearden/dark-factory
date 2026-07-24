@@ -1274,6 +1274,13 @@ async def _warn_on_flag_for_stage2_type_drift(
             filters=_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS,
         )
     except Exception:
+        logger.warning(
+            'reconciliation._sweep_stale_mem0_flag_for_stage2_markers: '
+            'flag_for_stage2 string-variant type-drift probe raised; skipping '
+            'this diagnostic (fail-safe, does not affect the sweep count).',
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
         return
     if not isinstance(string_variant_count, int) or string_variant_count <= 0:
         return
