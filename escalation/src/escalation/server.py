@@ -1463,6 +1463,10 @@ def create_server(
             future=future,
             source='mcp',
             submitted_tip=merge_req.snapshot_tip,
+            # ε: branch/task_id let merge_cancel drive per-branch retirement
+            # (slot release + worktree reap) from a request_id alone.
+            branch=merge_req.branch.bare_id,
+            task_id=merge_req.task_id,
         )
         future.add_done_callback(
             lambda _f: _waiters.pop(merge_req.request_id, None)
@@ -2255,18 +2259,32 @@ def create_server(
              worker delivered an outcome but the _waiters.pop done-callback hasn't run yet):
              {cancelled: False, state: <coarse terminal via _map_terminal_state>, reason: ...}.
              Excepted futures (abnormal) map to state='blocked'.
-          4. Waiter present, future pending: cancel the future, return
+          4. Waiter present, future pending: cancel the future, then FULLY RETIRE
+             the entry (release the branch slot, reap the in-flight worktree via
+             the C1 primitive, clear the sticky per-task result) BEFORE returning
              {cancelled: True, state: 'abandoned', reason: None}.
 
-        AUTOMATIC CONSEQUENCES of cancelling the future (NOT implemented here — covered by
-        α1/β1 callbacks and tested in test_merge_queue.py:4520/:4601):
-          - MergeWorker._request_abandoned: drops the request without halting the queue
-          - InFlightMergeRegistry: releases the branch slot via the acquire-time done-cb
-          - _on_finalized: records terminal state 'abandoned' to retention/event-store
+        RETIREMENT (task ε): on the pending path, after cancelling the future the
+        entry is fully retired BEFORE returning via retire_cancelled_merge_request:
+          - InFlightMergeRegistry: the branch slot is released synchronously-before-
+            return (identity-guarded — only when it still belongs to this request_id,
+            so a concurrent resubmit that reclaimed the slot is not clobbered).
+          - the in-flight worktree is reaped via the C1 primitive
+            remove_merge_worktree_guarded(reason='merge_cancel_retire').
+          - the sticky per-task retention result is cleared (yield-then-forget: the
+            cancel's _on_finalized records terminal 'abandoned' first, then forget
+            removes it), so an immediate resubmit gets a FRESH entry and never
+            coalesces onto / observes the cancelled corpse.
+        Still async (unchanged): MergeWorker._request_abandoned drops the queued
+        work item at its next checkpoint via the cancel→worker CancelledError seam.
+        Because retirement yields the loop (the C1 removal is awaited), the
+        merge_request _waiters.pop done-callback fires during the first cancel, so an
+        immediate double-cancel finds rec=None and resolves via _durable_terminal_state.
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
-        contains no await, preserving loop-synchronous race-freedom (I10).
+        contains no await, preserving loop-synchronous race-freedom (I10) — the only
+        awaits are AFTER cancel, inside retirement.
         """
         rec = _waiters.get(request_id)
 
@@ -2315,8 +2333,24 @@ def create_server(
                 'reason': 'Request already finalized; cannot cancel.',
             }
 
-        # Pending waiter — cancel the future.
+        # Pending waiter — cancel the future, then FULLY RETIRE the entry (task ε)
+        # BEFORE returning: release the branch slot, reap the in-flight worktree
+        # via the C1 primitive, and clear the sticky retention result, so an
+        # immediate resubmit gets a FRESH entry.  lookup→cancel above stays
+        # await-free (I10); the only awaits are here, after cancel.
         rec.future.cancel()
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            retire_cancelled_merge_request,
+        )
+        await retire_cancelled_merge_request(
+            request_id=request_id,
+            branch=rec.branch,
+            task_id=rec.task_id,
+            registry=_registry,
+            retention=getattr(harness, '_terminal_retention', None),
+            git_ops=getattr(harness, 'git_ops', None),
+            event_store=event_store,
+        )
         return {'cancelled': True, 'state': 'abandoned', 'reason': None}
 
     return mcp

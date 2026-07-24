@@ -1685,10 +1685,19 @@ class TestMergeCancel:
         orch_config = _make_orch_config(tmp_path / 'repo')
         registry = _make_registry()
 
+        # ε: merge_cancel now retires-before-return, which yields the loop so the
+        # _waiters.pop done-callback fires during the FIRST cancel — the second
+        # cancel finds rec=None and must resolve via the durable tier.  Wire a
+        # real EventStore so _on_finalized's merge_finalized emit (fired during
+        # the retire yields) lets _durable_terminal_state Tier-3 report 'abandoned'.
+        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
+        event_store = EventStore(db_path=tmp_path / 'dc-events.db', run_id='dc')
+
         server = create_server(
             esc_queue,
             merge_queue=mq,
             orch_config=orch_config,
+            event_store=event_store,
             merge_inflight_registry=registry,
         )
 
