@@ -748,6 +748,12 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
     'program',
     'program_stream',
     'stream',
+    # Cross-repo deliverable marker (task 3004): set by the fused-memory submit
+    # path when a task's metadata.files are ALL owned by one other registered
+    # project, read by the orchestrator pre-merge narrowing gate (routes to
+    # OutcomeKind.plan_files_cross_repo instead of flagging 'files not touched').
+    'cross_repo',
+    'cross_repo_project',
 })
 
 
