@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -974,3 +976,153 @@ class TestMainSuppressesBanner:
         transport = kwargs.get('transport', args[0] if args else None)
         assert transport == 'stdio'
         assert kwargs.get('show_banner') is False
+
+
+# ---------------------------------------------------------------------------
+# mark_step_committed — pre-satisfy a plan step at AUTHORING time, guarded by a
+# REAL `git cat-file -e <sha>` existence check (task 3030 / PRD Contract A1).
+#
+# Driven against a REAL temp git repo, NOT a monkeypatched _sha_exists_on_branch:
+# a stubbed always-True guard would mask the corroborate-before-acting invariant,
+# so the bogus-sha "plan unchanged" assertion only has teeth when a real repo
+# distinguishes a resolving sha from a non-resolving one.
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo_artifacts(repo_dir: Path) -> tuple[TaskArtifacts, str]:
+    """Build a REAL temp git repo at *repo_dir* (worktree == repo) and return
+    (artifacts, real HEAD sha).  Mirrors the git-subprocess pattern in
+    test_git_ops.py (init/config/add/commit + rev-parse HEAD).
+    """
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ['git', *args], cwd=str(repo_dir),
+            check=True, capture_output=True, text=True,
+        )
+
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    _git('init')
+    _git('config', 'user.email', 'test@example.com')
+    _git('config', 'user.name', 'Test User')
+    _git('config', 'commit.gpgsign', 'false')
+    (repo_dir / 'README.md').write_text('hello\n')
+    _git('add', 'README.md')
+    _git('commit', '-m', 'initial commit')
+    head = _git('rev-parse', 'HEAD').stdout.strip()
+
+    artifacts = TaskArtifacts(repo_dir)
+    artifacts.init('test-1', 'Test task', 'A test')
+    return artifacts, head
+
+
+def _committable_plan() -> dict[str, Any]:
+    return {
+        'task_id': 'test-1',
+        'title': 'Test task',
+        'files': ['README.md'],
+        'prerequisites': [
+            {'id': 'pre-1', 'type': 'test', 'description': 'Setup',
+             'status': 'pending', 'commit': None},
+        ],
+        'steps': [
+            {'id': 'step-1', 'type': 'test', 'description': 'Write test',
+             'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'description': 'Implement',
+             'status': 'pending', 'commit': None},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+class TestMarkStepCommitted:
+    """The _mark_step_committed helper AND the registered mark_step_committed
+    MCP tool: pre-satisfy a plan step at authoring time behind a real git
+    existence guard (task 3030 / Contract A1)."""
+
+    async def test_helper_marks_step_with_real_sha(self, tmp_path):
+        artifacts, head = _init_git_repo_artifacts(tmp_path / 'repo')
+        artifacts.write_plan(_committable_plan())
+
+        result = plan_tools._mark_step_committed(artifacts, 'step-1', head)
+
+        # Exact Contract A1 success shape; status is the step's NEW status.
+        assert result == {'ok': True, 'step_id': 'step-1', 'status': 'done'}
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        assert step['commit'] == head
+        assert step['description'].startswith(f'[COMMITTED {head[:12]}]')
+
+    async def test_bogus_sha_errors_and_leaves_plan_unchanged(self, tmp_path):
+        artifacts, _head = _init_git_repo_artifacts(tmp_path / 'repo')
+        artifacts.write_plan(_committable_plan())
+        artifacts.read_plan()  # stabilize any one-time normalization rewrite
+        before = (artifacts.root / 'plan.json').read_text()
+
+        bogus = 'f' * 40
+        result = plan_tools._mark_step_committed(artifacts, 'step-1', bogus)
+
+        assert result['ok'] is False
+        assert result['status'] == 'error'
+        assert bogus in result['message']
+        # corroborate-before-acting: plan is byte-for-byte unchanged and the
+        # step is still pending (the git cat-file -e guard refused the sha).
+        assert (artifacts.root / 'plan.json').read_text() == before
+        assert artifacts.read_plan()['steps'][0]['status'] == 'pending'
+
+    async def test_unknown_step_id_errors(self, tmp_path):
+        artifacts, head = _init_git_repo_artifacts(tmp_path / 'repo')
+        artifacts.write_plan(_committable_plan())
+
+        result = plan_tools._mark_step_committed(artifacts, 'nope', head)
+
+        assert result['ok'] is False
+        assert result['status'] == 'error'
+        assert 'nope' in result['message']
+
+    async def test_registered_tool_marks_step_via_fn(self, tmp_path):
+        # Pin the FastMCP @mcp.tool() wiring via the registered tool object,
+        # not only the private _mark_step_committed helper.
+        artifacts, head = _init_git_repo_artifacts(tmp_path / 'repo')
+        artifacts.write_plan(_committable_plan())
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('mark_step_committed')
+        assert tool is not None
+
+        result = tool.fn(step_id='step-2', sha=head)  # type: ignore[union-attr]
+
+        assert result == {'ok': True, 'step_id': 'step-2', 'status': 'done'}
+        assert artifacts.read_plan()['steps'][1]['status'] == 'done'
+
+    async def test_registered_tool_idempotent_via_run(self, tmp_path):
+        artifacts, head = _init_git_repo_artifacts(tmp_path / 'repo')
+        artifacts.write_plan(_committable_plan())
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('mark_step_committed')
+        assert tool is not None
+
+        first = await tool.run({'step_id': 'step-1', 'sha': head})
+        second = await tool.run({'step_id': 'step-1', 'sha': head})
+
+        assert first.structured_content['ok'] is True
+        assert second.structured_content['ok'] is True
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        # Idempotent per (step_id, sha): no double [COMMITTED ] tag.
+        assert step['description'].count('[COMMITTED ') == 1
+
+    async def test_all_committed_plan_has_no_pending_and_confirms(self, tmp_path):
+        artifacts, head = _init_git_repo_artifacts(tmp_path / 'repo')
+        artifacts.write_plan(_committable_plan())
+
+        for step_id in ('pre-1', 'step-1', 'step-2'):
+            result = plan_tools._mark_step_committed(artifacts, step_id, head)
+            assert result['ok'] is True
+
+        # Enabling invariant for the downstream EXECUTE no-op (workflow.py):
+        # an all-committed plan yields no pending steps and still confirms.
+        assert artifacts.get_pending_steps() == []
+        confirm = plan_tools._confirm_plan(artifacts)
+        assert confirm['status'] == 'ok'
+        assert confirm['finalized'] is True
