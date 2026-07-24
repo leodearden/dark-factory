@@ -5,24 +5,41 @@ Covers:
 - TestTrackHumanOperatorStalls     (step-3/4)
 - TestComputeStalledTaskIds        (step-5/6)
 - TestMaybeEscalateStalledTasks    (step-7/8)
+
+Gate-backlog age check (task 3017):
+- TestGateBacklogConstants
+- TestGateEscalatedAgeSecs
+- TestExtractStalledGateBacklogTaskIds
+- TestMaybeEscalateStalledGateBacklog
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.reconciliation.stage1_stall_detector import (
+    _GATE_BACKLOG_ESCALATION_CATEGORY,
     _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
     STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD,
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
+    extract_stalled_gate_backlog_task_ids,
+    gate_escalated_age_secs,
+    maybe_escalate_stalled_gate_backlog,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
+
+# A fixed, timezone-aware "now" for the gate-backlog age tests (task 3017).
+# gate_escalated_at values are built relative to this instant so the age
+# assertions are deterministic regardless of wall-clock time.
+_GATE_NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -502,3 +519,368 @@ class TestEscalationBinding:
                 sys.modules.pop('escalation.models', None)
             else:
                 sys.modules['escalation.models'] = esc_models_saved  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Gate-backlog age check — constants (task 3017)
+# ---------------------------------------------------------------------------
+
+
+class TestGateBacklogConstants:
+    """Assert the gate-backlog module-level constants have expected values."""
+
+    def test_threshold_secs_is_48h(self):
+        assert STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS == 48 * 3600
+
+    def test_escalation_category_value(self):
+        assert _GATE_BACKLOG_ESCALATION_CATEGORY == 'reconciliation_stale_gate_backlog'
+
+
+# ---------------------------------------------------------------------------
+# gate_escalated_age_secs (task 3017)
+# ---------------------------------------------------------------------------
+
+
+class TestGateEscalatedAgeSecs:
+    """gate_escalated_age_secs returns the age (secs) of metadata.gate_escalated_at.
+
+    Pure helper — never raises; returns None on any malformed / non-gate input.
+    ``now`` is injected so the age is deterministic.
+    """
+
+    def test_blocked_gate_metadata_returns_age(self):
+        """(a) operational_mode='gate', gate_escalated_at = now-49h → ~49*3600s."""
+        meta = {
+            'operational_mode': 'gate',
+            'gate_escalated_at': (_GATE_NOW - timedelta(hours=49)).isoformat(),
+        }
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age == pytest.approx(49 * 3600, abs=1.0)
+
+    def test_operational_mode_absent_treated_as_gate(self):
+        """(b) operational_mode absent → treated as 'gate' (returns an age)."""
+        meta = {'gate_escalated_at': (_GATE_NOW - timedelta(hours=10)).isoformat()}
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age == pytest.approx(10 * 3600, abs=1.0)
+
+    def test_operational_mode_llm_still_returns_age(self):
+        """(c) operational_mode='llm' → age (llm gates still await a human today).
+
+        Reviewer amendment (task 3017): the age check keys purely on the
+        authoritative ``gate_escalated_at`` stamp, NOT on ``operational_mode``.
+        Per the operational-routing contract a ``decision``/``operational`` +
+        ``llm`` submission is coerced into a pure human gate (the LLM-operational
+        lane is future work), so an ``operational_mode=='llm'`` blocked gate is
+        exactly the population this safety-net must cover.
+        """
+        meta = {
+            'operational_mode': 'llm',
+            'gate_escalated_at': (_GATE_NOW - timedelta(hours=49)).isoformat(),
+        }
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age == pytest.approx(49 * 3600, abs=1.0)
+
+    def test_metadata_not_a_dict_returns_none(self):
+        """(d) metadata not a dict (None / str / int) → None, no raise."""
+        assert gate_escalated_age_secs(None, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs('str', now=_GATE_NOW) is None  # type: ignore[arg-type]
+        assert gate_escalated_age_secs(123, now=_GATE_NOW) is None  # type: ignore[arg-type]
+
+    def test_gate_escalated_at_missing_or_nonstr_returns_none(self):
+        """(e) gate_escalated_at missing / None / '' / non-str → None."""
+        assert gate_escalated_age_secs({'operational_mode': 'gate'}, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs({'gate_escalated_at': None}, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs({'gate_escalated_at': ''}, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs({'gate_escalated_at': 123}, now=_GATE_NOW) is None
+
+    def test_unparseable_gate_escalated_at_returns_none(self):
+        """(f) unparseable ISO-8601 → None (ValueError swallowed)."""
+        assert gate_escalated_age_secs(
+            {'gate_escalated_at': 'not-a-date'}, now=_GATE_NOW
+        ) is None
+
+    def test_naive_gate_escalated_at_returns_none(self):
+        """(g) naive (tz-less) stamp → None (aware-vs-naive TypeError swallowed)."""
+        naive = datetime(2026, 7, 22, 12, 0, 0).isoformat()  # no tzinfo
+        assert gate_escalated_age_secs({'gate_escalated_at': naive}, now=_GATE_NOW) is None
+
+    def test_future_gate_escalated_at_returns_negative_age(self):
+        """(h) future stamp (now+2h) → negative age (helper does not clamp)."""
+        meta = {'gate_escalated_at': (_GATE_NOW + timedelta(hours=2)).isoformat()}
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age is not None
+        assert age == pytest.approx(-2 * 3600, abs=1.0)
+
+
+# ---------------------------------------------------------------------------
+# extract_stalled_gate_backlog_task_ids (task 3017)
+# ---------------------------------------------------------------------------
+
+
+def _gate_task(
+    tid,
+    *,
+    hours_ago: float = 49,
+    status: str = 'blocked',
+    operational_mode: str | None = 'gate',
+    with_stamp: bool = True,
+) -> dict:
+    """Build a task dict shaped like a blocked human-decision gate."""
+    meta: dict = {}
+    if operational_mode is not None:
+        meta['operational_mode'] = operational_mode
+    if with_stamp:
+        meta['gate_escalated_at'] = (_GATE_NOW - timedelta(hours=hours_ago)).isoformat()
+    return {'id': tid, 'status': status, 'metadata': meta}
+
+
+class TestExtractStalledGateBacklogTaskIds:
+    """extract_stalled_gate_backlog_task_ids selects blocked, aged gate tasks."""
+
+    def test_empty_list_returns_empty(self):
+        """(a) empty list → []."""
+        assert extract_stalled_gate_backlog_task_ids([], now=_GATE_NOW) == []
+
+    def test_blocked_stale_gate_included_id_coerced_to_str(self):
+        """(b) blocked gate aged 49h (> 48h) → ['645'] (int id coerced to str)."""
+        tasks = [_gate_task(645, hours_ago=49)]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['645']
+
+    def test_blocked_fresh_gate_excluded(self):
+        """(c) blocked gate aged 47h (< 48h) → excluded."""
+        tasks = [_gate_task(645, hours_ago=47)]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_non_blocked_status_excluded(self):
+        """(d) stale gate stamp but status != 'blocked' → excluded."""
+        tasks = [
+            _gate_task(1, hours_ago=49, status='in-progress'),
+            _gate_task(2, hours_ago=49, status='pending'),
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_operational_mode_llm_included(self):
+        """(e) operational_mode='llm' with stale stamp → included.
+
+        Reviewer amendment (task 3017): a blocked ``operational_mode=='llm'``
+        gate still awaits a human decision today (the LLM-operational lane is
+        future work), so it must be selected — the check keys on the
+        ``gate_escalated_at`` stamp, not ``operational_mode``.
+        """
+        tasks = [_gate_task(3, hours_ago=49, operational_mode='llm')]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['3']
+
+    def test_operational_llm_pure_gate_with_marker_included(self):
+        """operational+llm pure gate (carries x_operational_llm_gate) → included.
+
+        The exact real-world shape the operational-routing guard produces for an
+        execution_class='operational' + operational_mode='llm' submission: a
+        blocked pure gate stamped with gate_escalated_at AND the
+        x_operational_llm_gate marker.  It awaits a human decision today, so the
+        gate-backlog safety-net must select it (task 3017 reviewer amendment).
+        """
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+        tasks = [
+            {
+                'id': 646,
+                'status': 'blocked',
+                'metadata': {
+                    'operational_mode': 'llm',
+                    'x_operational_llm_gate': True,
+                    'gate_escalated_at': stamp,
+                },
+            }
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['646']
+
+    def test_no_gate_escalated_at_excluded(self):
+        """(f) blocked task without a gate_escalated_at stamp → excluded."""
+        tasks = [_gate_task(4, with_stamp=False)]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_missing_or_none_id_skipped(self):
+        """(g) blocked, stale gate tasks with missing/None id → skipped (no raise)."""
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+        tasks = [
+            {'status': 'blocked', 'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp}},
+            {'id': None, 'status': 'blocked',
+             'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp}},
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+
+    def test_multiple_stalled_sorted_and_deduped(self):
+        """(h) two stalled tasks → sorted; the same id twice collapses to once."""
+        tasks = [
+            _gate_task(650, hours_ago=50),
+            _gate_task(648, hours_ago=60),
+            _gate_task(650, hours_ago=70),  # duplicate id
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['648', '650']
+
+    def test_custom_threshold_secs_respected(self):
+        """(i) custom threshold_secs overrides the 48h default."""
+        tasks = [_gate_task(5, hours_ago=10)]  # 10h old
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+        assert extract_stalled_gate_backlog_task_ids(
+            tasks, now=_GATE_NOW, threshold_secs=5 * 3600
+        ) == ['5']
+
+
+# ---------------------------------------------------------------------------
+# maybe_escalate_stalled_gate_backlog (task 3017)
+# ---------------------------------------------------------------------------
+
+
+def _gate_task_record(tid, *, hours_ago: float = 49) -> dict:
+    """A blocked gate task record for task_by_id lookups (aged `hours_ago`)."""
+    stamp = (_GATE_NOW - timedelta(hours=hours_ago)).isoformat()
+    return {
+        'id': tid,
+        'status': 'blocked',
+        'title': f'Gate task {tid}',
+        'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp},
+    }
+
+
+class TestMaybeEscalateStalledGateBacklog:
+    """maybe_escalate_stalled_gate_backlog files per-task level-1 gate-backlog L1s."""
+
+    def _make_queue(self, has_open_l1_return: bool = False) -> MagicMock:
+        q = MagicMock()
+        q.has_open_l1.return_value = has_open_l1_return
+        q.make_id.return_value = 'esc-645-001'
+        q.submit.return_value = 'esc-645-001'
+        return q
+
+    @pytest.mark.asyncio
+    async def test_happy_path_submits_level1_gate_backlog(self):
+        """(a) submits one Escalation with the gate-backlog fields; returns ['645']."""
+        queue = self._make_queue(has_open_l1_return=False)
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+        task_by_id = {'645': _gate_task_record(645, hours_ago=49)}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='autopilot_video',
+            run_id='run-xyz',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == ['645']
+        queue.submit.assert_called_once()
+        submitted = queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert submitted.severity == 'blocking'
+        assert submitted.category == 'reconciliation_stale_gate_backlog'
+        assert submitted.task_id == '645'
+        assert submitted.agent_role == 'reconciliation-stage1'
+
+        combined = f'{submitted.summary}\n{submitted.detail}'
+        assert '645' in combined
+        assert 'run-xyz' in combined
+        assert stamp in combined  # the gate_escalated_at value
+        assert '49' in combined  # age indicator (~49h)
+
+    @pytest.mark.asyncio
+    async def test_skips_when_open_gate_backlog_l1_exists(self):
+        """(b) has_open_l1(tid, category=...) True → no submit; category-scoped dedup."""
+        queue = self._make_queue(has_open_l1_return=True)
+        task_by_id = {'645': _gate_task_record(645)}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+        queue.submit.assert_not_called()
+        queue.has_open_l1.assert_called_once_with(
+            '645', category='reconciliation_stale_gate_backlog'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_already_escalated_and_new(self):
+        """(c) task A already has an open gate-backlog L1, task B new → only B submitted."""
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = lambda tid, *, category=None: tid == 'A'
+        queue.make_id.return_value = 'esc-B-001'
+        queue.submit.return_value = 'esc-B-001'
+        task_by_id = {
+            'A': _gate_task_record('A', hours_ago=50),
+            'B': _gate_task_record('B', hours_ago=50),
+        }
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['A', 'B'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == ['B']
+        queue.submit.assert_called_once()
+        assert queue.submit.call_args[0][0].task_id == 'B'
+
+    @pytest.mark.asyncio
+    async def test_empty_stalled_list_returns_empty(self):
+        """(d) empty stalled_task_ids → no calls, returns []."""
+        queue = self._make_queue()
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=[],
+            task_by_id={},
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+        queue.has_open_l1.assert_not_called()
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_failure_logs_warning_and_excludes(self):
+        """(e) submit raises RuntimeError → no raise; failed tid excluded from return."""
+        queue = self._make_queue(has_open_l1_return=False)
+        queue.submit.side_effect = RuntimeError('queue full')
+        task_by_id = {'645': _gate_task_record(645)}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_escalation_unavailable_returns_empty(self, monkeypatch):
+        """(f) Escalation package unavailable (module Escalation=None) → [] with no submit."""
+        import fused_memory.reconciliation.stage1_stall_detector as mod
+
+        monkeypatch.setattr(mod, 'Escalation', None)
+        queue = self._make_queue()
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['645'],
+            task_by_id={'645': _gate_task_record(645)},
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+        queue.submit.assert_not_called()

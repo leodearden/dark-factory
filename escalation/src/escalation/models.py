@@ -92,7 +92,7 @@ class Escalation:
     severity: str  # "blocking" | "info" | "critical" | "urgent"
     category: str  # scope_violation, design_concern, cleanup_needed,
     # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator
+    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
