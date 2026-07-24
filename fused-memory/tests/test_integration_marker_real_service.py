@@ -212,3 +212,36 @@ def test_merge_entities_live_class_gated() -> None:
         f'expected {live_class} to be collected under -m integration (it must '
         f'remain selectable as an explicit opt-in). Output:\n{override_output}'
     )
+
+
+@pytest.mark.timeout(120)
+def test_refresh_entity_summary_live_class_gated() -> None:
+    """The live-FalkorDB edge-dedup class gated; the module's mock tests stay collected.
+
+    TestEdgeDedupLiveFalkorDB round-trips a real FalkorDB and must be
+    deselected by default, while the module's mock coverage stays collected.
+    The anchor TestRefreshEntitySummary:: (this module's namesake mock class,
+    matched with a trailing '::' delimiter) proves the module is still
+    collected by default. The live class must be selectable under
+    `-m integration`.
+    """
+    module = TESTS_DIR / 'test_refresh_entity_summary.py'
+    live_class = 'TestEdgeDedupLiveFalkorDB'
+    mock_anchor = 'TestRefreshEntitySummary::'
+
+    default_output = _collect(module)
+    assert live_class not in default_output, (
+        f'{live_class} was collected by default -- it must be marked '
+        f"@pytest.mark.integration (task 3020) so the -m 'not integration' "
+        f'addopts deselects the real-FalkorDB round-trip. Output:\n{default_output}'
+    )
+    assert mock_anchor in default_output, (
+        f'expected the mock class {mock_anchor} to remain collected by default '
+        f'(fast unit coverage must not be dropped). Output:\n{default_output}'
+    )
+
+    override_output = _collect(module, '-m', 'integration')
+    assert live_class in override_output, (
+        f'expected {live_class} to be collected under -m integration (it must '
+        f'remain selectable as an explicit opt-in). Output:\n{override_output}'
+    )
