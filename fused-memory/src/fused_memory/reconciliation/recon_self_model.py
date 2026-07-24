@@ -129,6 +129,26 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
             'Stage 1 flag_dedup post-processor, for flagged items carrying '
             'metadata.flag_for_stage2=true'
         ),
+        # Classified DELETER_GC because this record_kind is one of the three
+        # recon_ledger.MARKER_KINDS ReconLedgerStore.gc() is eligible to
+        # match — kept exactly DELETER_GC (not a distinct sentinel) so this
+        # entry keeps cross-checking against recon_ledger.MARKER_KINDS via
+        # test_recon_self_model.py's DELETER_GC-subset assertion. In current
+        # practice, though, gc() never actually collects a flag_for_stage2
+        # row: this kind's only writer (the Stage 1 flag_dedup/LLM
+        # add_memory path above) writes solely to Mem0
+        # (metadata.flag_for_stage2=true) and no code path upserts a
+        # flag_for_stage2 row into the ledger — the identical
+        # declared-vs-actual gap documented on stage2_persistence_marker
+        # below (task 2228 W5-κ, review finding model_drift). The live
+        # collector is the separate Mem0 age-based sweep
+        # task_knowledge_sync._sweep_stale_mem0_flag_for_stage2_markers
+        # (task 2966), which — unlike stage2_persistence_marker's sweep —
+        # enumerates via the boolean payload filter
+        # {'flag_for_stage2': True} rather than a {'source': ...} filter,
+        # since these markers carry no source metadata field. Migrating the
+        # writer onto the ledger — so DELETER_GC becomes true in practice and
+        # not just in eligibility — is a follow-up.
         deleter=DELETER_GC,
     ),
     'stage2_persistence_marker': MarkerLifecycle(
