@@ -277,27 +277,42 @@ _FALLBACK_UV_PROJECT = 'shared'
 _ROOT_OWNING_TEST_COMMAND = 'uv run --project shared pytest tests/scripts/'
 
 
-def _clause_containing(cmd: str, keyword: str) -> tuple[str, str, str] | None:
-    """Split *cmd* into ``(before, clause, after)`` around the segment containing *keyword*.
+# Splits a `&&`-chained command on each `&&` separator while preserving the
+# separator (with its surrounding whitespace) verbatim as its own token: the
+# capturing group makes `re.split` yield ``[clause, sep, clause, sep, ...,
+# clause]``, so untouched clauses/separators round-trip byte-for-byte when
+# rejoined via ``''.join`` (task 3022).
+_AND_CLAUSE_SPLIT_RE = re.compile(r'(\s*&&\s*)')
 
-    *clause* is the ``&&``-delimited segment bounded by the nearest ``&&``
-    on either side of *keyword*'s position (or the start/end of *cmd*),
-    stripped of surrounding whitespace; *before*/*after* are the remaining
-    text verbatim (including the ``&&`` separator itself), so splicing
-    ``before + <rewritten clause> + after`` back together leaves every
-    other clause byte-identical. Returns ``None`` when *keyword* is absent.
+
+def _rescope_clause_to_subproject(clause: str, sub: str) -> str:
+    """Reproject a single ``&&``-clause into subpackage *sub*'s own uv context.
+
+    Extracted from :func:`_scope_fallback_tool_to_subproject` (task 3022) so
+    the same parse -> reproject -> render pipeline can be applied to every
+    keyword-bearing clause of a chained command, not just one.
+
+    Returns *clause* verbatim when it does not parse into a single
+    structured tool invocation (P1 — an OPAQUE/unparseable clause, or one
+    with ``raw`` retained, is left untouched), or when reprojecting it is a
+    no-op (it already carries an explicit ``--project``/``--directory`` —
+    don't second-guess an already-set uv context). Otherwise returns the
+    clause rendered with its uv context set to *sub*.
     """
-    idx = cmd.find(keyword)
-    if idx == -1:
-        return None
-    start = cmd.rfind('&&', 0, idx)
-    start = start + 2 if start != -1 else 0
-    while start < len(cmd) and cmd[start] == ' ':
-        start += 1
-    end = cmd.find('&&', idx)
-    if end == -1:
-        end = len(cmd)
-    return cmd[:start], cmd[start:end].rstrip(), cmd[end:]
+    parsed = parse_config_command(clause)
+    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
+        return clause
+    reprojected = reproject(parsed, sub)
+    if reprojected == parsed and parsed.uv_project is None:
+        # Not uv-wrapped at all — reproject() deliberately no-ops on this
+        # (it only reprojects an ALREADY-bare `uv run <tool>`), but this
+        # helper's own job additionally covers "no uv context whatsoever"
+        # by prepending one, closing the cold-verify dev-dep race described
+        # on :func:`_scope_fallback_tool_to_subproject`.
+        reprojected = replace(parsed, uv_project=sub)
+    if reprojected == parsed:
+        return clause
+    return render(reprojected)
 
 
 def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: str) -> str | None:
@@ -321,50 +336,44 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
 
     *cmd* is expected to already be scoped to the touched files and stripped
     of any leading ``cd`` (i.e. :func:`_scope_to_keyword` has already run) —
-    this helper only adds/adjusts the uv context. In practice that pipeline
-    always yields a single ``&&``-clause; the guard below is nonetheless
-    scoped to the single clause containing *tool_keyword* (via
-    :func:`_clause_containing`) rather than the whole command string, so
-    this helper stays correct if a multi-clause command ever reaches it.
+    this helper only adds/adjusts the uv context. A multi-subproject
+    ``type_check_command`` (``cd X && npx pyright && cd Y && npx pyright &&
+    ...``) DOES reach this helper via the has_structural widening path (task
+    3022), so EVERY ``&&``-clause carrying *tool_keyword* is rescoped via
+    :func:`_rescope_clause_to_subproject` — not just the first — while every
+    other clause and ``&&`` separator is left byte-identical.
 
     Returns:
         ``None`` when *cmd* is ``None``.
-        *cmd* unchanged when *tool_keyword* is not present (no-op ``true``,
-        an unrelated tool like ``mypy``), or when the matched clause does
-        not parse into a single structured tool invocation (P1 — an
-        OPAQUE/unparseable clause is left untouched).
-        *cmd* with the matched clause reprojected (bare ``uv run
-        <tool_keyword>`` gains ``--project <sub>``, or — when the clause
+        *cmd* unchanged when *tool_keyword* is not present anywhere (no-op
+        ``true``, an unrelated tool like ``mypy``), or when rescoping every
+        keyword-bearing clause was a no-op for each of them (each such
+        clause is OPAQUE/unparseable, or already carries an explicit
+        ``--project``/``--directory`` — don't second-guess it; this
+        deliberately also covers a clause explicitly pre-scoped to a
+        *different* member than *sub*, which is left alone rather than
+        re-targeted).
+        *cmd* with every keyword-bearing clause reprojected (bare ``uv run
+        <tool_keyword>`` gains ``--project <sub>``, or — when a clause
         carries no ``uv run`` wrapper at all, e.g. a bare ``npx pyright`` or
         bare ``pyright`` invocation — with ``uv run --project <sub>``
-        prepended to it) when the clause carries no explicit
-        ``--project``/``--directory`` already.
-        *cmd* unchanged when the clause already carries ``--project`` or
-        ``--directory`` (an explicit uv context is already set for that
-        clause; don't second-guess it — this deliberately also covers a
-        command explicitly pre-scoped to a *different* member than *sub*,
-        which is left alone rather than re-targeted).
+        prepended to it) otherwise.
     """
     if cmd is None:
         return None
     if tool_keyword not in cmd:
         return cmd
-    split = _clause_containing(cmd, tool_keyword)
-    assert split is not None  # tool_keyword in cmd guarantees a match
-    before, clause, after = split
-    parsed = parse_config_command(clause)
-    if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
-        return cmd
-    reprojected = reproject(parsed, sub)
-    if reprojected == parsed and parsed.uv_project is None:
-        # Not uv-wrapped at all — reproject() deliberately no-ops on this
-        # (it only reprojects an ALREADY-bare `uv run <tool>`), but this
-        # helper's own job additionally covers "no uv context whatsoever"
-        # by prepending one, closing the cold-verify dev-dep race above.
-        reprojected = replace(parsed, uv_project=sub)
-    if reprojected == parsed:
-        return cmd
-    return before + render(reprojected) + after
+    parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
+    changed = False
+    for i in range(0, len(parts), 2):
+        clause = parts[i]
+        if tool_keyword not in clause:
+            continue
+        rescoped = _rescope_clause_to_subproject(clause, sub)
+        if rescoped != clause:
+            parts[i] = rescoped
+            changed = True
+    return ''.join(parts) if changed else cmd
 
 
 # Non-.rs file extensions that are safe to ignore when deciding whether to scope
