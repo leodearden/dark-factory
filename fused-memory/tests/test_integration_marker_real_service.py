@@ -18,9 +18,16 @@ rerun path.
 Each guard proves the deselection wiring BEHAVIORALLY, not by string-matching
 config: it runs a real `pytest --collect-only` subprocess bound to
 fused-memory's ACTUAL pyproject.toml (via -c), so the real addopts govern
-collection. Collection imports qdrant_client/falkordb but never connects, and
-skipif does not prevent collection, so the guards are hermetic and need no
-running service.
+collection. Collecting these modules evaluates each live target's
+qdrant_skipif() / _falkor_available() predicate, which DOES attempt a bounded
+(~2s timeout) connection probe to Qdrant / FalkorDB at collection time — so the
+"never connects" framing would be wrong. What makes the guards robust is that
+skip status never affects `-m` selection: a skipif-marked test is still
+collected, and only the marker governs deselection. So the assertions hold
+whether or not a backend is reachable, and the guard needs no running service;
+the up-to-~2s-per-module probe (worst case, backend unreachable — the very
+oversubscribed-box scenario this task targets) is why each carries generous
+@pytest.mark.timeout(120) headroom.
 
 This is a NEW module rather than an extension of
 test_integration_marker_config.py: sibling task 3019 edits that file, and 3020
@@ -56,9 +63,10 @@ def _collect(module_path: Path, *extra_args: str) -> str:
     real pyproject.toml means the real `-m 'not integration'` addopts govern
     the default collection.
 
-    Collecting these real modules imports mem0/qdrant_client/falkordb (never
-    connecting), so the caller gets generous timeout headroom via
-    @pytest.mark.timeout(120) over each file's own default budget.
+    Collecting these real modules evaluates each live target's skip predicate
+    (qdrant_skipif() / _falkor_available()), which attempts a bounded ~2s
+    connection probe to the backend — so the caller gets generous timeout
+    headroom via @pytest.mark.timeout(120) over each file's own default budget.
     """
     result = subprocess.run(
         [
@@ -122,11 +130,27 @@ def test_list_indices_integration_module_gated() -> None:
     round-trip a real backend), so its module-level pytestmark carries the
     integration marker. Both classes must be deselected by default and both
     selectable under `-m integration` (anti-vacuity).
+
+    Because the module is 100% integration, the default run leaves NO surviving
+    node id to anchor a positive control on (unlike the mixed-module guards,
+    which anchor on a mock sibling). A collection-time import error would ALSO
+    leave the class names absent, letting the `not in` checks below pass
+    vacuously. To close that gap, assert the default run reached deselection via
+    its "deselected" summary token — a collection error prints "error" /
+    "Interrupted" and never "deselected" (verified: exit 4, no token), so a
+    regression fails loudly instead of silently.
     """
     module = TESTS_DIR / 'test_list_indices_integration.py'
     live_classes = ('TestCallDbIndexesOverRoQuery', 'TestBackendListIndicesLive')
 
     default_output = _collect(module)
+    assert 'deselected' in default_output, (
+        'expected the default collection to report its tests were DESELECTED '
+        '(this module is 100% integration, so every test is deselected under '
+        "-m 'not integration'). Absence of the token means collection errored "
+        'before deselection, which would make the per-class checks below pass '
+        f'vacuously. Output:\n{default_output}'
+    )
     for cls in live_classes:
         assert cls not in default_output, (
             f'{cls} was collected by default -- the whole live-FalkorDB module '
