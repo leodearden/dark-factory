@@ -196,3 +196,134 @@ class TestQueuedBranch:
         qb = QueuedBranch.parse('4778', 'task/')
         with pytest.raises(dataclasses.FrozenInstanceError):
             qb.bare_id = 'x'  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# TestTerminalOutcomeForget — task ε (2928) step-1 RED / step-2 GREEN
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalOutcomeForget:
+    """Unit tests for ``TerminalOutcomeRetention.forget(request_id)``.
+
+    ``forget`` is the "sticky per-task result cleared" primitive used by
+    ``merge_cancel`` retirement (task ε).  It removes a record from
+    ``_index`` and, under an object-identity guard mirroring ``record()``'s
+    eviction guard, from the ``_by_branch`` / ``_by_task`` secondary indexes;
+    it also drops any alias whose key OR value is the forgotten request_id.
+    The deque slot is intentionally left in place (lossy-eviction contract)
+    but becomes unreachable through every lookup.  ``forget`` returns whether
+    a record was removed from ``_index``.
+    """
+
+    @staticmethod
+    def _rec(request_id: str, branch: str, task_id: str, state: str = 'abandoned'):
+        from orchestrator.merge_types import TerminalOutcomeRecord
+
+        return TerminalOutcomeRecord(
+            request_id=request_id,
+            task_id=task_id,
+            branch=branch,
+            state=state,
+        )
+
+    def test_forget_removes_from_all_indexes_and_returns_true(self) -> None:
+        """(a) forget clears _index / _by_branch / _by_task and returns True."""
+        from orchestrator.merge_types import TerminalOutcomeRetention
+
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = self._rec('mr-a', branch='B', task_id='T')
+        ring.record(rec)
+        # Pre-condition: all three lookups resolve to rec.
+        assert ring.get('mr-a') is rec
+        assert ring.get_by_branch('B') is rec
+        assert ring.get_by_task('T') is rec
+
+        assert ring.forget('mr-a') is True
+
+        # Post-condition: every lookup is now a miss.
+        assert ring.get('mr-a') is None
+        assert ring.get_by_branch('B') is None
+        assert ring.get_by_task('T') is None
+
+    def test_forget_identity_guard_preserves_newer_secondary_entry(self) -> None:
+        """(b) forget(old) must NOT drop a secondary entry owned by a newer record."""
+        from orchestrator.merge_types import TerminalOutcomeRetention
+
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec1 = self._rec('mr-old', branch='B', task_id='T', state='blocked')
+        rec2 = self._rec('mr-new', branch='B', task_id='T', state='abandoned')
+        ring.record(rec1)
+        ring.record(rec2)  # newest-wins: _by_branch['B'] and _by_task['T'] are rec2
+        assert ring.get_by_branch('B') is rec2
+        assert ring.get_by_task('T') is rec2
+
+        # Forgetting the OLD record must leave the newer record's secondary
+        # ownership intact (identity guard).
+        assert ring.forget('mr-old') is True
+        assert ring.get('mr-old') is None
+        assert ring.get('mr-new') is rec2
+        assert ring.get_by_branch('B') is rec2
+        assert ring.get_by_task('T') is rec2
+
+    def test_forget_drops_alias_whose_target_is_request_id(self) -> None:
+        """(c) forget(primary) drops an alias whose value points to it."""
+        from orchestrator.merge_types import TerminalOutcomeRetention
+
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = self._rec('mr-a', branch='B', task_id='T')
+        ring.record(rec)
+        ring.record_alias('mr-coalesced', 'mr-a')
+        assert ring.get('mr-coalesced') is rec  # alias resolves pre-forget
+
+        assert ring.forget('mr-a') is True
+        assert ring.get('mr-a') is None
+        assert ring.get('mr-coalesced') is None  # alias dropped (target forgotten)
+
+    def test_forget_drops_alias_whose_key_is_request_id(self) -> None:
+        """(c2) forget(alias_key) drops the alias registered under that key.
+
+        The key has no direct ``_index`` record, so forget returns False, but
+        the alias itself must still be removed.
+        """
+        from orchestrator.merge_types import TerminalOutcomeRetention
+
+        ring = TerminalOutcomeRetention(maxlen=10)
+        primary = self._rec('mr-primary', branch='P', task_id='TP', state='done')
+        ring.record(primary)
+        ring.record_alias('mr-x', 'mr-primary')
+        assert ring.get('mr-x') is primary  # resolves via alias pre-forget
+
+        assert ring.forget('mr-x') is False  # no _index record for mr-x
+        assert ring.get('mr-x') is None  # alias keyed by 'mr-x' is gone
+        assert ring.get('mr-primary') is primary  # primary untouched
+
+    def test_forget_unknown_returns_false_noop(self) -> None:
+        """(d) forget on an unknown request_id returns False and changes nothing."""
+        from orchestrator.merge_types import TerminalOutcomeRetention
+
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec = self._rec('mr-keep', branch='K', task_id='TK', state='done')
+        ring.record(rec)
+
+        assert ring.forget('mr-unknown') is False
+        # Existing record untouched.
+        assert ring.get('mr-keep') is rec
+        assert ring.get_by_branch('K') is rec
+        assert ring.get_by_task('TK') is rec
+
+    def test_forget_then_fresh_record_same_branch_task_resolves_fresh(self) -> None:
+        """(e) After forget, a fresh record for the same branch/task resolves cleanly."""
+        from orchestrator.merge_types import TerminalOutcomeRetention
+
+        ring = TerminalOutcomeRetention(maxlen=10)
+        rec_a = self._rec('mr-a', branch='B', task_id='T', state='abandoned')
+        ring.record(rec_a)
+        assert ring.forget('mr-a') is True
+
+        rec_fresh = self._rec('mr-fresh', branch='B', task_id='T', state='done')
+        ring.record(rec_fresh)
+        assert ring.get('mr-fresh') is rec_fresh
+        assert ring.get_by_branch('B') is rec_fresh
+        assert ring.get_by_task('T') is rec_fresh
+        assert ring.get('mr-a') is None
