@@ -5244,6 +5244,48 @@ class TaskWorkflow:
         # leaves the in-memory stamp for the merge-success clear to retry.
         self.task['metadata'] = fresh
 
+    async def _stamp_merge_phase_entered(self) -> None:
+        """Persist a durable merge-phase-liveness stamp into task metadata.
+
+        Task 2991: the restart-survivable analog of ``routing.latest`` for the
+        orphan-L0 divergence reaper. The pre-enqueue MERGE loop (rebase +
+        scoped verify + queue submit) makes NO LLM calls, so it never refreshes
+        ``metadata.routing.latest.decided_at`` — the reaper's task-2931
+        ``_has_fresh_dispatch`` gate cannot see a legitimately-live merge-stage
+        task and false-promotes its scope-invariant L0 to a human-facing L1
+        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}`` at
+        merge entry; the reaper's ``_has_fresh_merge_phase`` gate defers a
+        divergence L0 whose task carries a fresh stamp. Being durable task
+        metadata it survives an orchestrator restart (unlike the per-process
+        ``Scheduler._merge_phase_at``), covering the exact redispatch window in
+        which the false positive wedged 2789/2885.
+
+        Mirrors :meth:`_stamp_merge_retry_pending`'s durability contract but
+        carries only a timestamp (no worktree HEAD / base SHA): read fresh
+        backend metadata (via :meth:`_merge_fresh_metadata`) so a concurrent
+        write (``retry_ledger``, ``memory_hints``) is not clobbered, update the
+        in-memory task, and persist via ``scheduler.update_task`` inside a
+        logged try/except. A persistence failure must never crash the merge
+        path — a lost stamp is self-healing (re-written on the next merge entry,
+        and at worst the reaper promotes rather than silently suppresses).
+        """
+        metadata = self.task.get('metadata') or {}
+        fresh = await self._merge_fresh_metadata(
+            metadata, log_context='merge_phase_liveness stamp',
+        )
+        fresh['merge_phase_liveness'] = {
+            'entered_at': datetime.now(UTC).isoformat(),
+        }
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(self.task_id, metadata=fresh)
+        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_phase_liveness stamp '
+                '(merge-phase liveness not durable this cycle): %s',
+                self.task_id, exc,
+            )
+
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
 
