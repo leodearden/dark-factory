@@ -826,6 +826,57 @@ class GraphitiBackend:
         }
 
     @_canonicalize_group_args
+    async def reassign_edge(
+        self,
+        edge_uuid: str,
+        new_endpoint_uuid: str,
+        *,
+        which_end: str,
+        group_id: str,
+    ) -> dict[str, Any]:
+        """Re-point one RELATES_TO edge's endpoint to a different Entity node.
+
+        The single-edge, uuid-targeted sibling of ``redirect_node_edges``:
+        moves ONE end (``which_end='source'`` or ``'target'``) of the edge
+        identified by ``edge_uuid`` onto ``new_endpoint_uuid``, LOSSLESSLY.
+
+        Raises:
+            ValueError: if ``which_end`` is not ``'source'`` or ``'target'``.
+            EdgeNotFoundError: if no RELATES_TO edge with ``edge_uuid`` exists.
+            NodeNotFoundError: if no Entity node with ``new_endpoint_uuid`` exists.
+            RuntimeError: if the backend is not initialized.
+        """
+        if which_end not in ('source', 'target'):
+            raise ValueError(
+                f"reassign_edge: which_end must be 'source' or 'target', got {which_end!r}"
+            )
+        graph = self._graph_for(group_id)
+        # Read the edge's TRUE endpoints from TOPOLOGY, not the
+        # e.source_node_uuid/e.target_node_uuid PROPERTIES: redirect_node_edges
+        # sets only the moved side's property and leaves the other absent/NULL,
+        # and graphiti_core itself derives endpoints from topology (project
+        # memory 41edcf81). The directed MATCH resolves source vs target
+        # unambiguously.
+        topo = await graph.ro_query(
+            'MATCH (s:Entity)-[e:RELATES_TO {uuid: $edge_uuid}]->(t:Entity) '
+            'RETURN s.uuid, t.uuid',
+            {'edge_uuid': edge_uuid},
+        )
+        if not topo.result_set:
+            raise EdgeNotFoundError(f'RELATES_TO edge not found: {edge_uuid}')
+        source_uuid, target_uuid = topo.result_set[0][0], topo.result_set[0][1]
+        # Validate the new endpoint Entity node exists before any move.
+        node_check = await graph.ro_query(
+            'MATCH (n:Entity {uuid: $new_endpoint_uuid}) RETURN n.uuid',
+            {'new_endpoint_uuid': new_endpoint_uuid},
+        )
+        if not node_check.result_set:
+            raise NodeNotFoundError(f'Entity node not found: {new_endpoint_uuid}')
+        # Endpoint move + summary refresh: implemented in subsequent steps.
+        del source_uuid, target_uuid  # consumed by the move slice (step-4)
+        return {}
+
+    @_canonicalize_group_args
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
         """Build community summaries.
 
