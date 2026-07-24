@@ -376,6 +376,7 @@ Management:
 - set_entity_summary: Overwrite an entity node's summary with explicit text (empty clears); bypasses edge-derivation — use to force-clear baked-in stale narrative
 - rename_entity: Rename an entity node to an exact new name (accepts entity_uuid or entity_name) — use to correct mis-named nodes (e.g. non-canonical task-entity names)
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
+- reassign_edge: Re-point one edge's endpoint (source/target) onto a different entity node, losslessly (preserves uuid/fact/embedding/temporal/episodes); refreshes both affected summaries — use to un-conflate a fact attached to the wrong node
 - delete_entity: Delete an entity node by UUID (DETACH DELETE; guards on active edges unless force=True; refreshes neighbour summaries)
 - get_status: Health check for all backends
 - get_dead_letters: Inspect dead-lettered items from the durable write queue and event queue
@@ -2411,6 +2412,78 @@ def create_mcp_server(
         return await memory_service.merge_entities(
             deprecated_uuid=deprecated_uuid,
             surviving_uuid=surviving_uuid,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def reassign_edge(
+        edge_uuid: str,
+        new_endpoint_uuid: str,
+        which_end: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Re-point one existing edge's endpoint to a different Entity node, losslessly.
+
+        When a RELATES_TO edge (fact) was attached to the wrong Entity node —
+        e.g. two distinct real-world subjects were conflated onto one node —
+        use this to move ONE end of the edge onto the correct node WITHOUT
+        losing anything. Unlike delete + re-add, this preserves the edge's
+        uuid, fact text, fact_embedding, valid_at/invalid_at/expired_at,
+        created_at, group_id, and episode links exactly; only the chosen
+        endpoint changes. Both affected node summaries are refreshed.
+
+        The move is a single atomic CREATE-new + DELETE-old at the graph level
+        (a relationship's endpoints are structural and cannot be relocated in
+        place). A ``reassigned_from_node_uuid`` audit property records the prior
+        endpoint. Re-running against an already-reassigned edge is a no-op
+        (returns ``moved=False``).
+
+        Args:
+            edge_uuid: UUID of the RELATES_TO edge to reassign (from search results)
+            new_endpoint_uuid: UUID of the Entity node the endpoint moves onto
+            which_end: Which end to move — ``'source'`` or ``'target'``
+            project_id: Project scope (required)
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        if not edge_uuid or not edge_uuid.strip():
+            return {
+                'error': 'edge_uuid must be a non-empty string',
+                'error_type': 'ValidationError',
+            }
+        if not new_endpoint_uuid or not new_endpoint_uuid.strip():
+            return {
+                'error': 'new_endpoint_uuid must be a non-empty string',
+                'error_type': 'ValidationError',
+            }
+        if which_end not in ('source', 'target'):
+            return {
+                'error': "which_end must be 'source' or 'target'",
+                'error_type': 'ValidationError',
+            }
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.reassign_edge(
+            edge_uuid=edge_uuid,
+            new_endpoint_uuid=new_endpoint_uuid,
+            which_end=which_end,
             project_id=project_id,
             agent_id=agent_id,
             session_id=session_id,

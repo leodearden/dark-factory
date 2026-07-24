@@ -826,6 +826,215 @@ class GraphitiBackend:
         }
 
     @_canonicalize_group_args
+    async def reassign_edge(
+        self,
+        edge_uuid: str,
+        new_endpoint_uuid: str,
+        *,
+        which_end: str,
+        group_id: str,
+    ) -> dict[str, Any]:
+        """Re-point one RELATES_TO edge's endpoint to a different Entity node, losslessly.
+
+        The single-edge, uuid-targeted sibling of ``redirect_node_edges`` (the
+        bulk merge-time endpoint mover): moves ONE end
+        (``which_end='source'`` or ``'target'``) of the edge identified by
+        ``edge_uuid`` onto ``new_endpoint_uuid`` via a single atomic direct-Cypher
+        CREATE-new-relationship + DELETE-old. This is required because a
+        relationship's endpoints are structural in FalkorDB — Cypher cannot
+        relocate an endpoint in place, and ``EntityEdge.save()`` MERGEs on the
+        stored endpoint uuids (so mutating one and saving would create a SECOND
+        edge sharing the uuid rather than move the first).
+
+        Losslessly PRESERVED (copied by direct ``old.<prop>`` reference, which
+        also preserves the vecf32 ``fact_embedding`` type): the edge ``uuid``,
+        ``name``, ``fact``, ``fact_embedding``, ``valid_at``, ``invalid_at``,
+        ``expired_at``, ``created_at``, ``group_id``, and ``episodes``. The
+        UNCHANGED endpoint is pinned from the matched TOPOLOGY node (never the
+        unreliable ``old.<end>_node_uuid`` property, which ``redirect_node_edges``
+        can leave absent). ``new.reassigned_from_node_uuid`` records the prior
+        endpoint uuid for audit.
+
+        A no-op guard returns ``moved=False`` without issuing any write when
+        ``new_endpoint_uuid`` already equals the endpoint being moved (making
+        the operation idempotent on re-run). After a real move, the OLD endpoint
+        (lost the edge) and NEW endpoint (gained it) summaries are refreshed
+        best-effort; the unchanged endpoint's fact-set — and thus summary — is
+        identical, so it is not refreshed.
+
+        Args:
+            edge_uuid: UUID of the RELATES_TO edge to reassign.
+            new_endpoint_uuid: UUID of the Entity node the endpoint moves onto.
+            which_end: Which end to move — ``'source'`` or ``'target'``.
+            group_id: Project graph to target.
+
+        Returns:
+            Audit dict with keys: ``uuid``, ``which_end``, ``old_endpoint_uuid``,
+            ``new_endpoint_uuid``, ``unchanged_endpoint_uuid``, ``moved`` (bool),
+            and ``refreshed_nodes`` (uuids whose summary refresh succeeded).
+
+        Raises:
+            ValueError: if ``which_end`` is not ``'source'`` or ``'target'``, or
+                if ``new_endpoint_uuid`` equals the unchanged endpoint (a move
+                that would create a self-referential RELATES_TO edge).
+            EdgeNotFoundError: if no RELATES_TO edge with ``edge_uuid`` exists.
+            NodeNotFoundError: if no Entity node with ``new_endpoint_uuid`` exists.
+            RuntimeError: if the backend is not initialized, or if more than one
+                RELATES_TO edge shares ``edge_uuid`` (a duplicate-uuid anomaly
+                the uuid-keyed move cannot disambiguate).
+        """
+        if which_end not in ('source', 'target'):
+            raise ValueError(
+                f"reassign_edge: which_end must be 'source' or 'target', got {which_end!r}"
+            )
+        graph = self._graph_for(group_id)
+        # Read the edge's TRUE endpoints from TOPOLOGY, not the
+        # e.source_node_uuid/e.target_node_uuid PROPERTIES: redirect_node_edges
+        # sets only the moved side's property and leaves the other absent/NULL,
+        # and graphiti_core itself derives endpoints from topology (project
+        # memory 41edcf81). The directed MATCH resolves source vs target
+        # unambiguously.
+        topo = await graph.ro_query(
+            'MATCH (s:Entity)-[e:RELATES_TO {uuid: $edge_uuid}]->(t:Entity) '
+            'RETURN s.uuid, t.uuid',
+            {'edge_uuid': edge_uuid},
+        )
+        if not topo.result_set:
+            raise EdgeNotFoundError(f'RELATES_TO edge not found: {edge_uuid}')
+        if len(topo.result_set) > 1:
+            # A uuid must identify exactly one RELATES_TO edge (graph-wide
+            # uuid-uniqueness invariant, tasks 2207/2210). More than one row
+            # means a duplicate-uuid edge is present; the uuid-keyed
+            # CREATE/DELETE below would match ALL of them, moving/duplicating
+            # more than intended. Refuse loudly rather than operate on an
+            # arbitrary result_set[0] (repair the duplicate uuids first). Unlike
+            # redirect_node_edges — which enumerates by ID(old) precisely to
+            # disambiguate pre-existing bulk dups — a single uuid-targeted
+            # reassign has no principled way to pick one.
+            raise RuntimeError(
+                f'reassign_edge: {len(topo.result_set)} RELATES_TO edges share '
+                f'uuid {edge_uuid!r}; refusing to reassign an ambiguous '
+                f'duplicate-uuid edge (repair duplicate edge uuids first)'
+            )
+        source_uuid, target_uuid = topo.result_set[0][0], topo.result_set[0][1]
+        # Validate the new endpoint Entity node exists before any move.
+        node_check = await graph.ro_query(
+            'MATCH (n:Entity {uuid: $new_endpoint_uuid}) RETURN n.uuid',
+            {'new_endpoint_uuid': new_endpoint_uuid},
+        )
+        if not node_check.result_set:
+            raise NodeNotFoundError(f'Entity node not found: {new_endpoint_uuid}')
+
+        # Derive the endpoint being moved and the one left in place from the
+        # TOPOLOGY read (never the unreliable e.<end>_node_uuid properties).
+        if which_end == 'source':
+            old_endpoint_uuid, unchanged_endpoint_uuid = source_uuid, target_uuid
+        else:
+            old_endpoint_uuid, unchanged_endpoint_uuid = target_uuid, source_uuid
+
+        # No-op guard: nothing to move (and the operation is idempotent when
+        # re-run against an already-reassigned edge).
+        moved = new_endpoint_uuid != old_endpoint_uuid
+        # Reject a move that would fold the edge into a self-loop — the moved
+        # endpoint landing on the endpoint left in place. This mirrors the
+        # self-loop edges redirect_node_edges explicitly deletes in its
+        # inter-node cleanup: a self-referential RELATES_TO is not a meaningful
+        # fact. Only a real move can form one (a no-op creates no new edge), so
+        # this is gated on `moved` to preserve no-op idempotency even on an
+        # already-self-looping edge.
+        if moved and new_endpoint_uuid == unchanged_endpoint_uuid:
+            other_end = 'target' if which_end == 'source' else 'source'
+            raise ValueError(
+                f'reassign_edge: new_endpoint_uuid {new_endpoint_uuid!r} equals '
+                f'the unchanged {other_end} endpoint; refusing to create a '
+                f'self-referential RELATES_TO edge'
+            )
+        if moved:
+            # Atomic, uuid-PRESERVING CREATE-new-relationship + DELETE-old.
+            # Properties are copied by direct old.<prop> reference (NOT
+            # ``SET new = properties(old)``) to preserve the vecf32
+            # fact_embedding type, exactly as redirect_node_edges does. The
+            # UNCHANGED endpoint property is set from the matched TOPOLOGY node;
+            # the moved endpoint from the new-endpoint param.
+            if which_end == 'source':
+                cypher = (
+                    'MATCH (old_src)-[old:RELATES_TO {uuid: $edge_uuid}]->(target) '
+                    'MATCH (new_src:Entity {uuid: $new_endpoint_uuid}) '
+                    'CREATE (new_src)-[new:RELATES_TO]->(target) '
+                    'SET new.uuid = old.uuid, '
+                    '    new.name = old.name, '
+                    '    new.fact = old.fact, '
+                    '    new.fact_embedding = old.fact_embedding, '
+                    '    new.valid_at = old.valid_at, '
+                    '    new.invalid_at = old.invalid_at, '
+                    '    new.expired_at = old.expired_at, '
+                    '    new.created_at = old.created_at, '
+                    '    new.group_id = old.group_id, '
+                    '    new.episodes = old.episodes, '
+                    '    new.reassigned_from_node_uuid = $old_endpoint_uuid, '
+                    '    new.source_node_uuid = $new_endpoint_uuid, '
+                    '    new.target_node_uuid = target.uuid '
+                    'DELETE old'
+                )
+            else:
+                cypher = (
+                    'MATCH (source)-[old:RELATES_TO {uuid: $edge_uuid}]->(old_tgt) '
+                    'MATCH (new_tgt:Entity {uuid: $new_endpoint_uuid}) '
+                    'CREATE (source)-[new:RELATES_TO]->(new_tgt) '
+                    'SET new.uuid = old.uuid, '
+                    '    new.name = old.name, '
+                    '    new.fact = old.fact, '
+                    '    new.fact_embedding = old.fact_embedding, '
+                    '    new.valid_at = old.valid_at, '
+                    '    new.invalid_at = old.invalid_at, '
+                    '    new.expired_at = old.expired_at, '
+                    '    new.created_at = old.created_at, '
+                    '    new.group_id = old.group_id, '
+                    '    new.episodes = old.episodes, '
+                    '    new.reassigned_from_node_uuid = $old_endpoint_uuid, '
+                    '    new.target_node_uuid = $new_endpoint_uuid, '
+                    '    new.source_node_uuid = source.uuid '
+                    'DELETE old'
+                )
+            await graph.query(
+                cypher,
+                {
+                    'edge_uuid': edge_uuid,
+                    'new_endpoint_uuid': new_endpoint_uuid,
+                    'old_endpoint_uuid': old_endpoint_uuid,
+                },
+            )
+
+        # Best-effort refresh of the two AFFECTED endpoint summaries: the OLD
+        # endpoint (lost the edge) and the NEW endpoint (gained it). The
+        # unchanged endpoint keeps the identical edge (uuid + fact preserved),
+        # so its summary cannot change. Per-node try/except that logs and
+        # swallows (mirroring update_edge / delete_entity), so a summary-refresh
+        # failure never rolls back the already-committed topology move. Skipped
+        # entirely on a no-op (nothing moved -> nothing to refresh).
+        refreshed: list[str] = []
+        if moved:
+            for node_uuid in (old_endpoint_uuid, new_endpoint_uuid):
+                try:
+                    await self.refresh_entity_summary(node_uuid, group_id=group_id)
+                    refreshed.append(node_uuid)
+                except Exception as exc:
+                    logger.warning(
+                        'reassign_edge: failed to refresh summary for node %s: %s',
+                        node_uuid, exc,
+                    )
+
+        return {
+            'uuid': edge_uuid,
+            'which_end': which_end,
+            'old_endpoint_uuid': old_endpoint_uuid,
+            'new_endpoint_uuid': new_endpoint_uuid,
+            'unchanged_endpoint_uuid': unchanged_endpoint_uuid,
+            'moved': moved,
+            'refreshed_nodes': refreshed,
+        }
+
+    @_canonicalize_group_args
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
         """Build community summaries.
 
