@@ -121,6 +121,69 @@ def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) 
 
 
 # ---------------------------------------------------------------------------
+# I2 (contract-literal): the WarmLanePool is the SOLE durable-assignment writer
+# ---------------------------------------------------------------------------
+
+
+_ORCH_SRC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'orchestrator'
+
+
+class TestSingleWriterSourceScan:
+    """Architectural fitness function for I2 (single-writer consolidation).
+
+    The task's contract-literal I2 is "zero LaneLifecycle.note_assigned callers
+    outside warm_lane_pool.py; grep-checkable".  Encoded as two source scans:
+
+      (i)  tree-wide, the ONLY orchestrator/src/orchestrator file containing a
+           ``.note_assigned(`` CALL is warm_lane_pool.py.  (lane_lifecycle.py
+           DEFINES ``def note_assigned`` and its body is
+           ``self.transition(lane, LaneState.ASSIGNED, ...)`` — neither is a
+           ``.note_assigned(`` call, so the primitive is naturally excluded.)
+           Already true for the pool seam; this locks it against regression.
+
+      (ii) git_ops.py contains ZERO ``LaneState.ASSIGNED`` / ``LaneState.RELEASED``
+           references — the real consolidation teeth.  Both GitOps assignment
+           writers (``_note_assigned_via_route``'s ASSIGNED ladder and
+           ``_lifecycle_note_released``'s RELEASED write) are gone after step-12;
+           the only durable LaneState GitOps still touches is
+           ``LaneState.QUARANTINED`` (a NON-assignment read, retained).
+
+    NOT asserted: "no ASSIGNED/RELEASED transition anywhere in the tree" —
+    harness.py's crash-recovery terminal-release finalizer
+    (``_lane_lifecycle.transition(entry, LaneState.RELEASED)``) is a legitimate
+    NON-pool lifecycle write the task does not consolidate, and the
+    lane_lifecycle.py primitive body is the writer of record.  Both are excluded
+    by construction (this scan targets ``.note_assigned(`` callers and git_ops.py
+    only).
+    """
+
+    def test_note_assigned_called_only_from_warm_lane_pool(self):
+        callers = sorted(
+            py.name
+            for py in _ORCH_SRC_DIR.rglob('*.py')
+            if '.note_assigned(' in py.read_text()
+        )
+        assert callers == ['warm_lane_pool.py'], (
+            'LaneLifecycle.note_assigned() must be called ONLY from '
+            'warm_lane_pool.py (the sole durable ASSIGNED writer, I2); '
+            f'found callers in {callers}'
+        )
+
+    def test_git_ops_has_no_assigned_or_released_lane_state_writes(self):
+        text = (_ORCH_SRC_DIR / 'git_ops.py').read_text()
+        assert 'LaneState.ASSIGNED' not in text, (
+            'git_ops.py must not write/normalize the durable ASSIGNED state — '
+            'the WarmLanePool is the sole ASSIGNED writer (I2). The '
+            '_note_assigned_via_route ASSIGNED ladder must be removed.'
+        )
+        assert 'LaneState.RELEASED' not in text, (
+            'git_ops.py must not write the durable RELEASED state — the '
+            'WarmLanePool is the sole RELEASED writer (I2). '
+            '_lifecycle_note_released must be removed.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # acquire_warm_lane -> durable ASSIGNED record
 # ---------------------------------------------------------------------------
 
@@ -129,14 +192,20 @@ def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) 
 class TestAcquireWarmLaneWritesAssignedRecord:
     """acquire_warm_lane must write a durable ASSIGNED LaneLifecycle record."""
 
-    async def test_create_once_acquire_writes_assigned_record(self, git_repo: Path):
+    async def test_create_once_acquire_writes_assigned_record(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
         await _add_warm_lane_scripts(git_repo)
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
         start_ref = await _get_head(git_repo)
 
-        wt = await git_ops.acquire_warm_lane('321', start_ref, expected_title='Fix X')
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            wt = await git_ops.acquire_warm_lane('321', start_ref, expected_title='Fix X')
 
         assert isinstance(wt, WorktreeInfo), f'Expected WorktreeInfo; got {wt!r}'
+        # The durable ASSIGNED record is now written by the WarmLanePool (single
+        # writer, I2) with task_id/title/branch threaded from the GitOps acquire
+        # — NOT by _note_assigned_via_route, which now only classifies the route.
         record = git_ops._lane_lifecycle.read(wt.path)
         assert record is not None, 'expected a durable record after acquire'
         assert record.state is LaneState.ASSIGNED, (
@@ -152,6 +221,10 @@ class TestAcquireWarmLaneWritesAssignedRecord:
         assert record_path.is_file(), (
             f'expected a durable record file to exist at {record_path}'
         )
+        # Observability retained (PRD W11 eta Mechanism 3): the route-
+        # classification INFO log still fires even though the durable ASSIGNED
+        # write moved from _note_assigned_via_route onto the pool.
+        _assert_route_logged(caplog, AcquireRoute.CREATE_ONCE_FRESH)
 
 
 # ---------------------------------------------------------------------------
