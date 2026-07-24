@@ -3757,18 +3757,52 @@ async def _admission_slot(role: str, config: OrchestratorConfig):
 # verification's per-module gather; the post-merge type-only pyright gather in
 # merge_queue.py).  Without coalescing, each call would spawn its own `uv sync`
 # on the same cold `.venv` — itself the concurrent-uv-on-cold-venv operation
-# this task exists to eliminate.  A per-worktree lock + a completed-path set
-# (both keyed by the RESOLVED worktree path) make overlapping callers await a
+# this task exists to eliminate.  A per-worktree lock + a TTL'd completed-path
+# map (both keyed by the RESOLVED worktree path) make overlapping callers await a
 # single in-flight provision and later callers skip.  Follows the module-level
-# cache precedent (_PROBE_CACHE).
+# cache + TTL precedent (_PROBE_CACHE / _PROBE_CACHE_TTL).
 #
 # No separate guard lock protects the dict: the get-or-create below runs with no
 # `await` between the read and the write, so under asyncio's cooperative
 # scheduling it is atomic (two coroutines cannot interleave within it).  A
 # module-level `asyncio.Lock()` created at import would instead bind to the first
 # event loop that touched it and raise cross-loop under pytest's per-test loops.
+#
+# The completed-path map records a monotonic completion time (not a bare set) so
+# entries EXPIRE.  Two failure modes a permanent set would have:
+#   * LEAK — a fresh-per-merge `.worktrees/_merge-<uuid>` path is never revisited,
+#     so an unbounded map/set would pin one entry per merge forever.
+#   * STALE SKIP — a warm-lane path later reset IN PLACE to a cold state (its
+#     `.venv` wiped and the `verify_warmed` marker cleared, so `_is_verify_cold`
+#     reclassifies it cold) would be SKIPPED on its retained "done" key and never
+#     re-provision, reintroducing the very concurrent-uv-on-empty-venv race this
+#     guard exists to prevent.
+# TTL-expiring the entry on read + opportunistically pruning on each completion
+# (`_prune_preprovision_guard`) handles both.
 _PREPROVISION_LOCKS: dict[str, asyncio.Lock] = {}
-_PREPROVISION_DONE: set[str] = set()
+_PREPROVISION_DONE: dict[str, float] = {}
+_PREPROVISION_DONE_TTL: float = 300.0  # 5 min; >> any single verify fan-out's coalescing window
+
+
+def _prune_preprovision_guard() -> None:
+    """Evict TTL-expired entries from the pre-provision coalescing guard.
+
+    Called opportunistically after each completion so the guard stays bounded:
+    a fresh-per-merge ``.worktrees/_merge-<uuid>`` path is never revisited, so
+    without a sweep its DONE + LOCKS entries would leak forever.  A DONE entry
+    older than :data:`_PREPROVISION_DONE_TTL` is dropped (its worktree either no
+    longer exists or, if reset in-place to a cold state, SHOULD re-provision
+    rather than skip on the stale key); the companion lock is dropped only when
+    uncontended, so an active provision/fan-out still coalescing on it is never
+    disturbed.
+    """
+    now = time.monotonic()
+    for key, done_at in list(_PREPROVISION_DONE.items()):
+        if now - done_at >= _PREPROVISION_DONE_TTL:
+            del _PREPROVISION_DONE[key]
+            lock = _PREPROVISION_LOCKS.get(key)
+            if lock is not None and not lock.locked():
+                del _PREPROVISION_LOCKS[key]
 
 
 async def _preprovision_shared_venv(
@@ -3798,9 +3832,12 @@ async def _preprovision_shared_venv(
     if not cmd:
         return
     key = str(worktree.resolve())
-    # Fast path: already provisioned for this worktree — skip without taking the
-    # lock (the common case once a worktree's first cold verify has run).
-    if key in _PREPROVISION_DONE:
+    # Fast path: recently provisioned for this worktree — skip without taking the
+    # lock (the common case once a worktree's first cold verify has run).  TTL'd
+    # so a path later reset in-place to a cold state re-provisions instead of
+    # skipping on a stale "done" key.
+    done_at = _PREPROVISION_DONE.get(key)
+    if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
         return
     # Get-or-create the per-worktree lock.  Synchronous (no await between the get
     # and the set) → atomic under asyncio, so no separate guard lock is needed.
@@ -3810,8 +3847,10 @@ async def _preprovision_shared_venv(
         _PREPROVISION_LOCKS[key] = lock
     async with lock:
         # Double-checked: a concurrent caller may have completed the provision
-        # while we awaited the lock — coalesce onto its single sync and skip.
-        if key in _PREPROVISION_DONE:
+        # while we awaited the lock — coalesce onto its single sync and skip
+        # (freshness re-checked against the TTL, as in the fast path).
+        done_at = _PREPROVISION_DONE.get(key)
+        if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
             return
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
@@ -3834,8 +3873,11 @@ async def _preprovision_shared_venv(
         # A failed sync is deliberately not retried per-caller (fail-open; the
         # gather surfaces any real breakage) — retrying N times on a cold
         # throwaway worktree would not help and reintroduces the concurrent-uv
-        # race this guard exists to prevent.
-        _PREPROVISION_DONE.add(key)
+        # race this guard exists to prevent.  Record the completion TIME (not a
+        # bare membership marker) so the entry TTL-expires, then opportunistically
+        # prune stale entries so the guard stays bounded across many worktrees.
+        _PREPROVISION_DONE[key] = time.monotonic()
+        _prune_preprovision_guard()
 
 
 async def run_verification(
