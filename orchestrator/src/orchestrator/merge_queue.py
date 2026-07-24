@@ -3046,6 +3046,75 @@ def decide_c3_submit_action(
     )
 
 
+async def select_recovery_winner(
+    tips: list[str | None],
+    git_ops: GitOps,
+) -> tuple[int, bool]:
+    """Pick the descendant-most snapshot tip among *tips* for recovery dedup.
+
+    Recovery-path (task 2926, C3 γ) counterpart of the submit-path C3 gate:
+    given the persisted ``snapshot_tip`` of every surviving journal record for
+    ONE branch (in journal order), return ``(winner_idx, divergence_seen)``
+    where ``winner_idx`` indexes the record whose tip should become the single
+    enqueued merge (the descendant-most), and ``divergence_seen`` is True when
+    any pairwise comparison had to be folded through :func:`resolve_divergent`
+    (a force-push, D2 — the recovery caller logs a WARNING naming the branch).
+
+    Pure on *tips* (snapshot-tip SHA strings or None) + *git_ops* — it takes
+    SHA strings, NOT ``PersistedMergeRequest`` / ``MergeRequest`` objects, so it
+    carries no ``merge_queue`` → ``merge_queue_store`` dependency and can be
+    lazy-imported by the recovery entry point without a circular import.
+
+    Reduces *tips* pairwise, folding each candidate against the running winner
+    through the SAME shared disposition table the submit path uses
+    (:func:`classify_tip_relation` → on DIVERGENT :func:`resolve_divergent` →
+    :func:`decide_c3_submit_action` with ``verifying=False``):
+
+    * REPLACE  → the candidate is a strict descendant; it becomes the winner.
+    * COALESCE → SAME / SUBSET; keep the current winner (earliest-seen wins ties).
+    * REJECT   → unreachable at recovery (nothing is verifying, so ``verifying``
+      is always False and SUPERSET always maps to REPLACE, never REJECT).
+
+    Routing recovery through the exact function the submit path uses makes the
+    γ/δ invariant "the two paths cannot diverge on which action class" hold by
+    construction rather than by two hand-rolled ancestry checks.
+
+    None-tip handling (never crashes, never silently degrades to journal order):
+
+    * A None *candidate* has no resolvable SHA and can never be a strict
+      descendant, so it is skipped and the current winner kept.
+    * A None *current winner* is shadowed by the first later candidate that has
+      a real tip: that candidate is PROMOTED to winner.  Without this a
+      tip-less earliest record (e.g. a legacy journal entry persisted before
+      snapshot_tip existed) would win the whole reduce — every comparison
+      against a None current is skipped — so "descendant-most wins" would
+      silently collapse to first-seen order for the whole group.
+    """
+    winner_idx = 0
+    divergence_seen = False
+    for i in range(1, len(tips)):
+        candidate = tips[i]
+        current = tips[winner_idx]
+        if candidate is None:
+            # A tip-less candidate can never be a strict descendant — keep the
+            # current winner.
+            continue
+        if current is None:
+            # The current winner has no resolvable tip but this candidate does.
+            # Prefer the record with a real tip so a mixed None/real-tip group
+            # does not silently fall back to journal order (the None winner would
+            # otherwise survive the whole reduce by skipping every comparison).
+            winner_idx = i
+            continue
+        relation = await classify_tip_relation(candidate, current, git_ops)
+        if relation is TipRelation.DIVERGENT:
+            divergence_seen = True
+            relation = await resolve_divergent(candidate, current, git_ops)
+        if decide_c3_submit_action(relation, verifying=False) is C3SubmitAction.REPLACE:
+            winner_idx = i
+    return (winner_idx, divergence_seen)
+
+
 async def _resolve_commit_tree(git_ops: GitOps, commit: str) -> str | None:
     """Return the tree SHA for *commit* (``git rev-parse <commit>^{tree}``).
 

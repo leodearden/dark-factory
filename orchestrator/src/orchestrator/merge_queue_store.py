@@ -28,7 +28,11 @@ from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import load_json_or_warn
 
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_types import (
+    InFlightMergeRegistry,
+    QueuedBranch,
+    WaiterRecord,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -254,6 +258,7 @@ async def recover_pending_merges(
     main_branch: str,
     branch_prefix: str,
     retention: Any = None,
+    registry: InFlightMergeRegistry | None = None,
 ) -> dict[str, Any]:
     """Re-enqueue surviving merge requests from the durable journal.
 
@@ -271,16 +276,45 @@ async def recover_pending_merges(
         - The persisted worktree path no longer exists on disk
           (pruned by crash cleanup / redeploy — drop so the scheduler can
           rediscover and re-dispatch through normal channels).
-    * Otherwise reconstructs a fresh ``MergeRequest`` and enqueues it via
+    * Otherwise the record SURVIVES (Phase 1).  Surviving records are then
+      reconstructed into live ``MergeRequest``s and enqueued via
       ``enqueue_merge_request`` so ``_on_finalized`` re-arms the durable
-      ``merge_finalized`` event for any polling caller.
+      ``merge_finalized`` event for any polling caller (Phase 2).
 
-    Errors on individual records are logged and skipped (fail-open) so one
-    bad entry never aborts the whole recovery pass.
+    Registry-gated per-branch collapse (task 2926, C3 γ)
+    ----------------------------------------------------
+    When *registry* (the shared :class:`InFlightMergeRegistry`) is supplied,
+    Phase 2 collapses per-branch duplicates through it BEFORE enqueue so a
+    branch with two surviving journal entries (e.g. the 2026-07-22 task/5326
+    double-rehydrate) never dispatches two concurrent verifies of one work
+    item.  Survivors are grouped by ``QueuedBranch.bare_id`` (first-seen order);
+    for each group the descendant-most snapshot tip is chosen as the WINNER via
+    :func:`orchestrator.merge_queue.select_recovery_winner`, which routes the
+    pairwise ancestry decision through δ's shared
+    ``decide_c3_submit_action(verifying=False)`` (SAME/SUBSET keep the winner,
+    SUPERSET replaces it, a DIVERGENT force-push folds through
+    ``resolve_divergent`` and logs a D2 WARNING).  The winner acquires the
+    registry slot (``source='recovery'``) and is enqueued exactly once; every
+    loser is attached as a peer :class:`WaiterRecord` so BOTH requesters resolve
+    via the registry's primary→peer future-mirror (the coalesce attach is
+    observed, not inferred), then dropped from the journal.  Losers are absent
+    from ``report['requests']`` so their worktrees are cleaned by the existing
+    ``_reap_orphaned_merge_worktrees`` pass (γ does not call the C1 primitive).
 
-    Returns a dict with ``recovered`` and ``dropped`` counts.
+    When *registry* is None (default) Phase 2 preserves the pre-γ behaviour
+    exactly — every survivor is reconstructed and enqueued directly — so every
+    existing caller/test is unaffected.
+
+    Errors on individual records / branch groups are logged and skipped
+    (fail-open) so one bad entry never aborts the whole recovery pass.
+
+    Returns a dict with ``recovered``, ``dropped`` and ``coalesced`` counts,
+    the enqueued ``requests``, and the ``journal_corrupt`` flag.
     """
-    from orchestrator.merge_queue import enqueue_merge_request  # avoid circular
+    from orchestrator.merge_queue import (  # avoid circular
+        enqueue_merge_request,
+        select_recovery_winner,
+    )
 
     # Detect and loudly surface a corrupt journal so pending merges are NOT
     # silently dropped — operators must see the distinction between a corrupt
@@ -295,15 +329,22 @@ async def recover_pending_merges(
     records = store.load()
     recovered = 0
     dropped = 0
+    coalesced = 0
     recovered_requests: list[MergeRequest] = []
 
+    # ── Phase 1: per-record survival checks (unchanged drop semantics) ──────
+    # Collect survivors as (record, QueuedBranch) in journal order.  Errors on
+    # a single record are logged and that record skipped (fail-open) so one bad
+    # entry never aborts the whole pass.
+    survivors: list[tuple[PersistedMergeRequest, QueuedBranch]] = []
     for record in records:
         # Shape-tolerant: QueuedBranch.parse prepends branch_prefix unless
         # record.branch is already prefixed (legacy on-disk journals may
         # predate the enqueue normalization).  .full_name is the exact git ref
         # the existence checks resolve against (byte-identical to the old
         # canonical_queued_branch_name result).
-        full_branch = QueuedBranch.parse(record.branch, branch_prefix).full_name
+        qb = QueuedBranch.parse(record.branch, branch_prefix)
+        full_branch = qb.full_name
         try:
             sha = await git_ops.resolve_branch_sha(full_branch)
             if sha is None:
@@ -347,17 +388,8 @@ async def recover_pending_merges(
                 )
                 continue
 
-            # Branch exists, is not yet merged, and worktree is present —
-            # reconstruct and re-enqueue.
-            req = reconstruct_merge_request(record, config)
-            await enqueue_merge_request(queue, req, event_store, retention=retention)
-            recovered_requests.append(req)
-            recovered += 1
-            logger.info(
-                'merge_queue_store: recovered %s (branch %s)',
-                record.request_id,
-                full_branch,
-            )
+            # Branch exists, is not yet merged, and worktree is present.
+            survivors.append((record, qb))
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 'merge_queue_store: error recovering %s: %s',
@@ -366,9 +398,167 @@ async def recover_pending_merges(
                 exc_info=True,
             )
 
+    # ── Phase 2a: no registry → back-compat direct enqueue per survivor ─────
+    # Preserves the pre-γ behaviour exactly so every existing caller/test that
+    # does not pass a registry is unaffected.
+    if registry is None:
+        for record, qb in survivors:
+            try:
+                req = reconstruct_merge_request(record, config)
+                await enqueue_merge_request(
+                    queue, req, event_store, retention=retention,
+                )
+                recovered_requests.append(req)
+                recovered += 1
+                logger.info(
+                    'merge_queue_store: recovered %s (branch %s)',
+                    record.request_id,
+                    qb.full_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'merge_queue_store: error recovering %s: %s',
+                    record.request_id,
+                    exc,
+                    exc_info=True,
+                )
+        return {
+            'recovered': recovered,
+            'dropped': dropped,
+            'coalesced': coalesced,
+            'requests': recovered_requests,
+            'journal_corrupt': store.journal_corrupt,
+        }
+
+    # ── Phase 2b: registry-gated per-branch collapse (task 2926, C3 γ) ──────
+    # Group survivors by bare branch id (dict preserves first-seen order), then
+    # enqueue exactly ONE winner per branch and attach the rest as peers.
+    groups: dict[str, list[tuple[PersistedMergeRequest, QueuedBranch]]] = {}
+    for record, qb in survivors:
+        groups.setdefault(qb.bare_id, []).append((record, qb))
+
+    for bare_id, group in groups.items():
+        try:
+            # Pick the descendant-most snapshot tip as the single enqueued
+            # winner (order-independent) via the SHARED C3 disposition table;
+            # nothing is verifying at recovery so REJECT is unreachable.
+            winner_idx, divergence_seen = await select_recovery_winner(
+                [rec.snapshot_tip for rec, _ in group], git_ops,
+            )
+            winner_record, winner_qb = group[winner_idx]
+            winner_req = reconstruct_merge_request(winner_record, config)
+
+            # Acquire the winner's slot ONCE, then enqueue behind a slot-leak
+            # release-on-fail guard (mirrors coalesce_or_enqueue_merge_request).
+            if registry.acquire(
+                bare_id,
+                winner_req.task_id,
+                winner_req.result,
+                request_id=winner_req.request_id,
+                source='recovery',
+                snapshot_tip=winner_record.snapshot_tip,
+            ):
+                try:
+                    await enqueue_merge_request(
+                        queue, winner_req, event_store, retention=retention,
+                    )
+                except BaseException:
+                    # Slot-leak guard: release the freshly-claimed slot if the
+                    # enqueue fails before the worker can ever resolve the future.
+                    registry.release(bare_id)
+                    raise
+                recovered_requests.append(winner_req)
+                recovered += 1
+                # The enqueued winner IS the in-flight primary; every loser
+                # aliases onto its request_id (below).
+                primary_request_id: str | None = winner_req.request_id
+                logger.info(
+                    'merge_queue_store: recovered %s (branch %s)',
+                    winner_record.request_id,
+                    winner_qb.full_name,
+                )
+            else:
+                # The registry is EMPTY at startup so acquire almost always
+                # succeeds; a concurrent live merge_request could theoretically
+                # hold the slot first.  Attach the recovered winner as a peer so
+                # its future still resolves with the in-flight outcome — never a
+                # second work item — and count it as coalesced.  Here the winner
+                # is NOT the primary: the pre-existing in-flight entry is.
+                existing = registry.entry(bare_id)
+                primary_request_id = (
+                    existing.request_id if existing is not None else None
+                )
+                registry.attach(bare_id, WaiterRecord(
+                    request_id=winner_req.request_id,
+                    future=winner_req.result,
+                    source='recovery',
+                    submitted_tip=winner_record.snapshot_tip,
+                ))
+                # The winner itself coalesced onto the pre-existing primary, so
+                # alias IT onto that primary too (mirrors
+                # coalesce_or_enqueue_merge_request) — otherwise a durable poll
+                # on the winner's id would dangle.  Losers below alias onto the
+                # SAME real primary, never onto the non-primary winner.  In
+                # production retention is None on the recovery path (the harness
+                # does not thread it — see the module docstring), so this is
+                # correct-by-construction rather than currently exercised.
+                if retention is not None and primary_request_id:
+                    retention.record_alias(
+                        winner_req.request_id, primary_request_id,
+                    )
+                store.remove(winner_record.request_id)
+                coalesced += 1
+                logger.warning(
+                    'merge_queue_store: branch %s already in-flight at recovery; '
+                    'coalescing recovered winner %s onto the existing entry',
+                    winner_qb.full_name,
+                    winner_record.request_id,
+                )
+
+            # Attach every loser as a peer waiter so both requesters resolve via
+            # the primary→peer future-mirror; register the durable alias when
+            # retention is supplied, then drop the loser from the journal.
+            for j, (loser_record, _loser_qb) in enumerate(group):
+                if j == winner_idx:
+                    continue
+                loser_req = reconstruct_merge_request(loser_record, config)
+                registry.attach(bare_id, WaiterRecord(
+                    request_id=loser_req.request_id,
+                    future=loser_req.result,
+                    source='recovery',
+                    submitted_tip=loser_record.snapshot_tip,
+                ))
+                # Alias onto the ACTUAL in-flight primary (the enqueued winner
+                # when acquire succeeded, else the pre-existing entry) so a
+                # durable poll on a loser id resolves to the real primary
+                # outcome — matching coalesce_or_enqueue_merge_request.
+                if retention is not None and primary_request_id:
+                    retention.record_alias(
+                        loser_req.request_id, primary_request_id,
+                    )
+                store.remove(loser_record.request_id)
+                coalesced += 1
+
+            if divergence_seen:
+                logger.warning(
+                    'merge_queue_store: recovery collapsed branch %s across a '
+                    'DIVERGENT force-push (D2) — enqueued the descendant-most '
+                    'snapshot as the single winner and coalesced %d duplicate(s)',
+                    winner_qb.full_name,
+                    len(group) - 1,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'merge_queue_store: error collapsing branch group %s: %s',
+                bare_id,
+                exc,
+                exc_info=True,
+            )
+
     return {
         'recovered': recovered,
         'dropped': dropped,
+        'coalesced': coalesced,
         'requests': recovered_requests,
         'journal_corrupt': store.journal_corrupt,
     }
