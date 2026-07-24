@@ -140,3 +140,42 @@ def test_list_indices_integration_module_gated() -> None:
             f'expected {cls} to be collected under -m integration (the module '
             f'must remain selectable as an explicit opt-in). Output:\n{override_output}'
         )
+
+
+@pytest.mark.timeout(120)
+def test_startup_identity_scan_live_classes_gated() -> None:
+    """Both live-FalkorDB scan classes gated; the fast mock scan class stays collected.
+
+    TestScanDuplicateEntityNamesLiveFalkorDB and
+    TestRepairDuplicateEdgeUuidsLiveFalkorDB each round-trip a real FalkorDB
+    and must be deselected by default, while the mock class
+    TestScanDuplicateEntityNames (control) stays collected. The mock anchor is
+    matched with a trailing '::' delimiter so it cannot be satisfied vacuously
+    by the live class name TestScanDuplicateEntityNamesLiveFalkorDB, of which
+    it is a prefix. Both live classes must be selectable under `-m integration`.
+    """
+    module = TESTS_DIR / 'test_startup_identity_scan.py'
+    live_classes = (
+        'TestScanDuplicateEntityNamesLiveFalkorDB',
+        'TestRepairDuplicateEdgeUuidsLiveFalkorDB',
+    )
+    mock_anchor = 'TestScanDuplicateEntityNames::'
+
+    default_output = _collect(module)
+    for cls in live_classes:
+        assert cls not in default_output, (
+            f'{cls} was collected by default -- it must be marked '
+            f"@pytest.mark.integration (task 3020) so the -m 'not integration' "
+            f'addopts deselects the real-FalkorDB round-trip. Output:\n{default_output}'
+        )
+    assert mock_anchor in default_output, (
+        f'expected the mock class {mock_anchor} to remain collected by default '
+        f'(fast unit coverage must not be dropped). Output:\n{default_output}'
+    )
+
+    override_output = _collect(module, '-m', 'integration')
+    for cls in live_classes:
+        assert cls in override_output, (
+            f'expected {cls} to be collected under -m integration (it must '
+            f'remain selectable as an explicit opt-in). Output:\n{override_output}'
+        )
