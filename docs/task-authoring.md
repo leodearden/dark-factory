@@ -238,6 +238,40 @@ dependency — a workaround for an external-dep gate bug since fixed — is
 retired; use a `task_kind='deterministic'` deploy or gate task with normal
 deps instead.
 
+### 3.2.1 Cross-repo deliverables (`metadata.cross_repo`)
+
+A **cross-repo deliverable** is a task filed under one project whose
+declared `metadata.files` are **all** owned by **one other** project — so
+the filing project's own branch is legitimately **empty**, because the
+actual code change lands on the owning project's branch (the reify-task
+5308 shape: a `reify` task declaring only `orchestrator/…` dark_factory
+paths). Left unmarked, the orchestrator's pre-merge Decision-1 gate would
+see every declared file "not touched" on the (empty) local branch and
+false-flag the task as undelivered.
+
+`metadata.cross_repo` (boolean) marks such a task, with the companion
+`metadata.cross_repo_project` naming the owning project. You normally do
+**not** set these by hand: the **fused-memory submit path auto-sets** them
+when it detects the all-foreign shape, i.e. when **every** `metadata.files`
+entry is owned by **one** other **registered** project **and the filing
+project is itself registered**. Both sides of that relationship must be
+registered projects — a cross-repo deliverable is a relationship between two
+**known** projects, not a blanket allowance for any namespace to declare
+another project's files. A submission from an **unregistered** filer, or one
+that **mixes** local and foreign files, is **not** tagged and stays a hard
+path-scope reject (the task-2206 anti-bypass guard is preserved).
+
+When the marker is present, the orchestrator pre-merge narrowing gate treats
+the task as a cross-repo deliverable: instead of flagging "files not
+touched" and forcing a dishonest plan-narrowing pass, it routes the merge
+attempt to the terminal outcome `OutcomeKind.plan_files_cross_repo` and
+blocks it on the **normal** ladder with `category='cross_repo_deliverable'`
+and `suggested_action='verify_external_landing'` — an honest state naming
+the real situation (verify the deliverable landed on the owning project's
+branch) rather than the false "implementation has not delivered". The
+orchestrator additionally honors an explicitly-set `metadata.cross_repo` for
+the absolute-path-foreign shape it can classify without the registry.
+
 ### 3.3 Delivered-check dependency gate (`metadata.delivered_checks`)
 
 A **local** (same-project) dependency can additionally carry
@@ -632,8 +666,15 @@ human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
-spawned_from, program, program_stream, stream
+spawned_from, program, program_stream, stream, cross_repo,
+cross_repo_project
 ```
+
+`cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
+(§3.2.1): auto-set by the fused-memory submit path when a task's
+`metadata.files` are all owned by one other registered project (and the
+filer is itself registered), and read by the orchestrator pre-merge
+narrowing gate.
 
 ### Tier-B: canonical keys, not aliases
 
