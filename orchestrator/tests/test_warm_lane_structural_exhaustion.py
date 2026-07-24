@@ -20,8 +20,9 @@ test lives in test_retry_cap.py, step-5):
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -327,3 +328,259 @@ class TestConsecutiveExhaustedCounter:
         assert git_ops._consecutive_exhausted == 0, (
             'a successful fresh acquire must reset the consecutive-EXHAUSTED counter'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-11: the harness born-at-L2 filer (_file_structural_exhaustion_l2) +
+# the declare-on-callee / install-in-harness wiring, and the end-to-end chain
+# (git_ops counter -> installed filer -> ONE deduped born-at-L2).
+# Mirrors test_harness_lane_record_drift.py.
+# ---------------------------------------------------------------------------
+
+
+STRUCTURAL_EXHAUSTION_ROOT_CAUSE = 'warm_lane_pool_structurally_exhausted'
+
+
+def _census(
+    *,
+    size: int = 4,
+    n_free: int = 0,
+    n_assigned_dispatched: int = 3,
+    n_pinned_non_dispatched: int = 1,
+    n_unknown_dispatch: int = 0,
+    n_quarantined: int = 2,
+):
+    from orchestrator.warm_lane_pool import WarmLanePoolCensus
+
+    return WarmLanePoolCensus(
+        size=size,
+        n_free=n_free,
+        n_assigned_dispatched=n_assigned_dispatched,
+        n_pinned_non_dispatched=n_pinned_non_dispatched,
+        n_unknown_dispatch=n_unknown_dispatch,
+        n_quarantined=n_quarantined,
+    )
+
+
+def _make_mock_queue(*, pending_l2_root_cause: str | None = None):
+    """Minimal mock EscalationQueue (mirrors test_harness_lane_record_drift)."""
+    submitted: list = []
+
+    def make_id(task_id: str) -> str:
+        return f'esc-{task_id}-L2-1'
+
+    def submit(esc):
+        submitted.append(esc)
+
+    def find_pending_l2_by_root_cause(root_cause: str) -> str | None:
+        return pending_l2_root_cause
+
+    q = MagicMock()
+    q.make_id = make_id
+    q.submit = submit
+    q.find_pending_l2_by_root_cause = find_pending_l2_by_root_cause
+    q.get_pending = MagicMock(return_value=[])
+    q._submitted = submitted
+    q.get = MagicMock(return_value=None)
+    return q
+
+
+def _make_dedup_queue():
+    """A mock queue whose find_pending_l2_by_root_cause reflects prior submits —
+    so a second threshold trip with the same root_cause is deduped."""
+    submitted: list = []
+
+    def make_id(task_id: str) -> str:
+        return f'esc-{task_id}-L2-1'
+
+    def submit(esc):
+        submitted.append(esc)
+
+    def find_pending_l2_by_root_cause(root_cause: str) -> str | None:
+        for esc in submitted:
+            if esc.root_cause == root_cause:
+                return esc.id
+        return None
+
+    q = MagicMock()
+    q.make_id = make_id
+    q.submit = submit
+    q.find_pending_l2_by_root_cause = find_pending_l2_by_root_cause
+    q.get_pending = MagicMock(return_value=[])
+    q._submitted = submitted
+    q.get = MagicMock(return_value=None)
+    return q
+
+
+@pytest.fixture
+def harness(mock_orch_config):
+    """Bare Harness with mocked internals (mirrors test_harness_lane_record_drift).
+
+    Pool is disabled by default so the filer tests exercise the escalation path
+    in isolation; the wiring/e2e tests build their own pool-enabled config or a
+    real-repo GitOps.
+    """
+    from orchestrator.harness import Harness
+
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(mock_orch_config)
+    h._escalation_queue = None
+    return h
+
+
+class TestFileStructuralExhaustionL2:
+    """_file_structural_exhaustion_l2 files exactly one deduped born-at-L2
+    carrying the α census (task 2988, PRD ε pole-2)."""
+
+    def test_fresh_queue_files_one_l2_with_contract_fields(self, harness, caplog):
+        from escalation.models import Escalation
+
+        q = _make_mock_queue()
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+        census = _census()
+
+        with caplog.at_level(logging.WARNING):
+            harness._file_structural_exhaustion_l2(5, census)
+
+        assert len(q._submitted) == 1, (
+            f'Expected exactly 1 L2 submitted, got {len(q._submitted)}'
+        )
+        filed = q._submitted[0]
+        assert isinstance(filed, Escalation)
+        assert filed.level == 2
+        assert filed.severity in {'urgent', 'critical'}, (
+            f'severity must be human-routed urgent/critical, got {filed.severity!r}'
+        )
+        assert filed.root_cause == STRUCTURAL_EXHAUSTION_ROOT_CAUSE, (
+            f'root_cause must be the fixed dedup literal, got {filed.root_cause!r}'
+        )
+        assert 'orchestrator' in (filed.agent_role or ''), (
+            f'agent_role must be an orchestrator sentinel, got {filed.agent_role!r}'
+        )
+        assert filed.category == 'infra_issue', (
+            f'category must be infra_issue, got {filed.category!r}'
+        )
+        # The trip count surfaces in the operator-facing text.
+        text = (filed.summary or '') + (filed.detail or '')
+        assert '5' in text, 'the consecutive-exhausted count should appear'
+        # The α census counts (by field name) are carried (INV-2).
+        for field in (
+            'size',
+            'n_free',
+            'n_assigned_dispatched',
+            'n_pinned_non_dispatched',
+            'n_unknown_dispatch',
+            'n_quarantined',
+        ):
+            assert field in text, f'census field {field!r} must be carried in summary/detail'
+
+        # WARNING logged (loudness).
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'Expected a WARNING record when filing the structural-exhaustion L2'
+        )
+
+    def test_dedup_second_call_files_nothing(self, harness):
+        q = _make_mock_queue(pending_l2_root_cause='esc-__struct__-L2-1')
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+
+        harness._file_structural_exhaustion_l2(5, _census())
+
+        assert len(q._submitted) == 0, (
+            f'Expected 0 new submissions (dedup), got {len(q._submitted)}'
+        )
+
+    def test_noop_when_queue_absent(self, harness):
+        harness._escalation_queue = None
+        # Must not raise and must not require a queue.
+        harness._file_structural_exhaustion_l2(5, _census())
+
+
+class TestStructuralExhaustionWiring:
+    """The GitOps _on_structural_exhaustion callback is the harness filer when a
+    pool exists; None when the pool is disabled (declare-on-callee /
+    install-in-harness, mirroring the drift + pool-storage-absent wiring)."""
+
+    def _pool_config(self, mock_orch_config, *, pool: bool):
+        from orchestrator.config import GitConfig
+
+        cfg = mock_orch_config
+        cfg.git = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            warm_lane_pool=pool,
+            warm_lane_structural_exhaustion_l2_threshold=2,
+        )
+        cfg.max_concurrent_tasks = 2
+        return cfg
+
+    def _build(self, config):
+        from orchestrator.harness import Harness
+
+        with (
+            patch('orchestrator.harness.McpLifecycle'),
+            patch('orchestrator.harness.OverrideStore'),
+            patch('orchestrator.harness.Scheduler'),
+            patch('orchestrator.harness.BriefingAssembler'),
+        ):
+            return Harness(config)
+
+    def test_installed_when_pool_exists(self, mock_orch_config):
+        h = self._build(self._pool_config(mock_orch_config, pool=True))
+        assert h.git_ops.warm_lane_pool is not None
+        assert h.git_ops._on_structural_exhaustion is not None, (
+            '_on_structural_exhaustion must be installed when a pool exists'
+        )
+        assert h.git_ops._on_structural_exhaustion == h._file_structural_exhaustion_l2, (
+            'the installed callback must be the harness structural-exhaustion filer'
+        )
+
+    def test_none_when_pool_disabled(self, mock_orch_config):
+        h = self._build(self._pool_config(mock_orch_config, pool=False))
+        assert h.git_ops.warm_lane_pool is None
+        assert h.git_ops._on_structural_exhaustion is None, (
+            'pool-less harness must leave the callback unwired (byte-identical)'
+        )
+
+
+class TestStructuralExhaustionEndToEnd:
+    """The full chain: a real-repo GitOps counter fires the installed harness
+    filer, which dedups to exactly ONE pending born-at-L2 across repeated
+    threshold trips; a subsequent fresh acquire resets the counter."""
+
+    def test_wired_chain_files_one_l2_and_resets(self, wl_git_repo, harness):
+        threshold = 2
+        git_ops = _exhausting_git_ops(wl_git_repo, threshold)
+        q = _make_dedup_queue()
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+        # Wire the REAL harness filer as the git_ops structural-exhaustion callback.
+        git_ops._on_structural_exhaustion = harness._file_structural_exhaustion_l2
+
+        # Drive several trips PAST the threshold.
+        for i in range(threshold + 2):
+            asyncio.run(git_ops.acquire_warm_lane(f'A{i}', 'HEAD'))
+
+        # Dedup: exactly one pending structural L2 despite multiple trips.
+        assert len(q._submitted) == 1, (
+            f'Expected exactly one deduped L2, got {len(q._submitted)}'
+        )
+        filed = q._submitted[0]
+        assert filed.root_cause == STRUCTURAL_EXHAUSTION_ROOT_CAUSE
+        assert filed.level == 2
+
+        # A fresh acquire resets the counter (end-to-end reset).
+        lane = wl_git_repo / '.worktrees' / '_lane-reset'
+        git_ops.warm_lane_pool.acquire_for = AsyncMock(  # type: ignore[method-assign]
+            return_value=(lane, False)
+        )
+        asyncio.run(git_ops.acquire_warm_lane('B', 'HEAD'))
+        assert git_ops._consecutive_exhausted == 0
