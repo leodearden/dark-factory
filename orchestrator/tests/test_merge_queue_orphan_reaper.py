@@ -574,14 +574,19 @@ class TestPeriodicReapHelper:
 @pytest.mark.asyncio
 class TestHeartbeatLoopReapWiring:
     """Unit tests asserting ``_heartbeat_loop`` invokes the periodic reap
-    helper each poll, and (once test_heartbeat_loop_survives_raising_reap
-    lands in step-7) that the loop survives a raising reap (fail-open — a
-    reap bug must never take down the heartbeat loop, mirroring the
+    helper each poll, and that the loop survives a raising reap (fail-open
+    — a reap bug must never take down the heartbeat loop, mirroring the
     existing touch/heartbeat swallow-and-log convention).
 
     test_heartbeat_loop_invokes_periodic_reap: RED until step-6 GREEN wires
     ``await self._maybe_reap_orphaned_merge_worktrees(time.time())`` into
     ``_heartbeat_loop``.
+
+    test_heartbeat_loop_survives_raising_reap: RED until step-8 GREEN wraps
+    that call in its own try/except — step-6 wired it unguarded (outside
+    the existing touch/heartbeat try-block), so a raise from the reap
+    helper currently propagates out of ``_heartbeat_loop`` and kills the
+    task instead of being logged and swallowed.
     """
 
     async def test_heartbeat_loop_invokes_periodic_reap(
@@ -613,4 +618,42 @@ class TestHeartbeatLoopReapWiring:
         assert len(calls) >= 1, '_heartbeat_loop must invoke the periodic reap helper'
         assert isinstance(calls[0], float), (
             f'_heartbeat_loop must pass a float now= to the reap helper, got {calls[0]!r}'
+        )
+
+    async def test_heartbeat_loop_survives_raising_reap(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import orchestrator.merge_queue as mq_mod
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        monkeypatch.setattr(mq_mod, '_HEARTBEAT_POLL_S', 0.01)
+        # Isolate the reap: no-op the touch + log-heartbeat calls the loop
+        # also makes each poll.
+        monkeypatch.setattr(worker, '_touch_owned_merge_worktrees', lambda: 0)
+        monkeypatch.setattr(worker, '_maybe_log_queue_heartbeat', lambda now: False)
+
+        async def _raising_reap(now: float) -> None:
+            raise RuntimeError('boom: periodic reap exploded')
+
+        monkeypatch.setattr(worker, '_maybe_reap_orphaned_merge_worktrees', _raising_reap)
+
+        worker._running = True
+        task = asyncio.create_task(worker._heartbeat_loop())
+        try:
+            # Let several polls occur — each must swallow the raise
+            # (fail-open). If it doesn't, the loop dies on the very first
+            # poll and `task` completes with the RuntimeError long before
+            # we get here.
+            await asyncio.sleep(0.05)
+            worker._running = False
+
+            await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+        assert task.exception() is None, (
+            'a raising periodic reap must not kill/propagate out of '
+            '_heartbeat_loop (fail-open, mirrors the touch/heartbeat guard)'
         )
