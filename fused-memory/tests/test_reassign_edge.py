@@ -499,3 +499,149 @@ class TestReassignEdgeLiveFalkorDB:
             assert dup.result_set[0][0] == 1
         finally:
             await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# step-7: MemoryService.reassign_edge
+# ---------------------------------------------------------------------------
+
+class TestMemoryServiceReassignEdge:
+    """MemoryService.reassign_edge() delegates to the graphiti backend with
+    journaling + a memory_updated event, mirroring update_edge/merge_entities."""
+
+    @pytest.fixture
+    def service(self, mock_config):
+        """MemoryService with a mocked graphiti backend."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.graphiti.reassign_edge = AsyncMock(return_value={
+            'uuid': 'edge-uuid',
+            'which_end': 'source',
+            'old_endpoint_uuid': 'old-uuid',
+            'new_endpoint_uuid': 'new-uuid',
+            'unchanged_endpoint_uuid': 'unchanged-uuid',
+            'moved': True,
+            'refreshed_nodes': ['old-uuid', 'new-uuid'],
+        })
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graphiti_backend(self, service):
+        """Calls graphiti.reassign_edge with edge/new-endpoint/which_end and
+        group_id=project_id, and returns a reassigned/graphiti status dict."""
+        result = await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='new-uuid',
+            which_end='source',
+            project_id='dark_factory',
+        )
+        service.graphiti.reassign_edge.assert_awaited_once_with(
+            'edge-uuid', 'new-uuid', which_end='source', group_id='dark_factory',
+        )
+        assert result['status'] == 'reassigned'
+        assert result['store'] == 'graphiti'
+        # backend audit keys pass through
+        assert result['moved'] is True
+        assert result['old_endpoint_uuid'] == 'old-uuid'
+
+    @pytest.mark.asyncio
+    async def test_logs_via_write_journal_when_present(self, service):
+        """Logs write op via write journal with operation='reassign_edge'."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='new-uuid',
+            which_end='source',
+            project_id='dark_factory',
+            agent_id='test-agent',
+        )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('operation') == 'reassign_edge'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_journal_params_contain_move_args(self, service):
+        """Journal params dict carries edge_uuid, new_endpoint_uuid, which_end."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='new-uuid',
+            which_end='target',
+            project_id='dark_factory',
+        )
+        params = mock_journal.log_write_op.call_args[1].get('params', {})
+        assert params.get('edge_uuid') == 'edge-uuid'
+        assert params.get('new_endpoint_uuid') == 'new-uuid'
+        assert params.get('which_end') == 'target'
+
+    @pytest.mark.asyncio
+    async def test_emits_memory_updated_event(self, service):
+        """A memory_updated ReconciliationEvent is emitted for the edge."""
+        from fused_memory.models.reconciliation import EventType
+        service._emit_event = AsyncMock()
+        await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='new-uuid',
+            which_end='source',
+            project_id='dark_factory',
+        )
+        service._emit_event.assert_awaited_once()
+        event = service._emit_event.call_args[0][0]
+        assert event.type == EventType.memory_updated
+        assert event.payload.get('edge_uuid') == 'edge-uuid'
+        assert event.payload.get('store') == 'graphiti'
+
+    @pytest.mark.asyncio
+    async def test_journal_failure_does_not_mask_success(self, service):
+        """Journal failure does not prevent returning a successful result."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock(side_effect=RuntimeError('journal down'))
+        service.set_write_journal(mock_journal)
+        result = await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='new-uuid',
+            which_end='source',
+            project_id='dark_factory',
+        )
+        assert result['status'] == 'reassigned'
+
+    @pytest.mark.asyncio
+    async def test_backend_failure_is_journaled(self, service):
+        """When the backend raises, the journal is still called with success=False
+        and the error is re-raised."""
+        service.graphiti.reassign_edge = AsyncMock(
+            side_effect=ValueError('edge not found')
+        )
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        with pytest.raises(ValueError, match='edge not found'):
+            await service.reassign_edge(
+                edge_uuid='edge-uuid',
+                new_endpoint_uuid='new-uuid',
+                which_end='source',
+                project_id='dark_factory',
+            )
+        mock_journal.log_write_op.assert_awaited_once()
+        assert mock_journal.log_write_op.call_args[1].get('success') is False
+
+    @pytest.mark.asyncio
+    async def test_works_without_journal(self, service):
+        """Works correctly when no write journal is set."""
+        service._write_journal = None
+        result = await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='new-uuid',
+            which_end='source',
+            project_id='dark_factory',
+        )
+        assert result['status'] == 'reassigned'
