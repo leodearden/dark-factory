@@ -588,10 +588,17 @@ class WarmLanePool:
         the in-memory cache (acquire/reclaim/crash-recovery), and this mirror
         must never crash or block that decision (I3: acquire/release always
         succeed).
-        - ``IllegalLaneTransition``: the durable record conflicts (e.g. the
-          lane is durably ``ASSIGNED``/``IN_USE`` for a DIFFERENT task, or
-          ``QUARANTINED``) — logged and swallowed rather than stealing the
-          record (mirrors ``note_assigned``'s own never-steal contract).
+        - ``IllegalLaneTransition``: the durable record conflicts — the lane is
+          durably ``ASSIGNED``/``IN_USE`` for a DIFFERENT task — logged and
+          swallowed rather than stealing the record (mirrors ``note_assigned``'s
+          own never-steal contract). A durably-``QUARANTINED`` record is NO
+          LONGER a conflict here: ``note_assigned`` RECYCLES it to ``ASSIGNED``
+          (via the sanctioned ``QUARANTINED -> RELEASED -> ASSIGNED`` recycle,
+          loudly), so the mirror write SUCCEEDS and re-arms ``_drift_count`` (0)
+          through the unchanged guarded-write path — task 3029, fixing the
+          esc-__lane_record_drift__-1 drift where a quarantined slot's fresh
+          reassignment left the record stuck QUARANTINED while the cache said
+          ASSIGNED.
         - ``OSError``: the durable write itself failed (disk full, EACCES,
           read-only mount, ``.lane-state`` unwritable) — logged and swallowed
           so a transient I/O error degrades to cache-only instead of
