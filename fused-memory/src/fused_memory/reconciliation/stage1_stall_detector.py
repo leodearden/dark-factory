@@ -175,6 +175,47 @@ def gate_escalated_age_secs(metadata: dict | None, *, now: datetime) -> float | 
         return None
 
 
+def extract_stalled_gate_backlog_task_ids(
+    tasks: list[dict],
+    *,
+    now: datetime,
+    threshold_secs: float = STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+) -> list[str]:
+    """Return sorted, deduped str task_ids of blocked gate tasks aged past threshold.
+
+    A task qualifies when ALL hold (task 3017):
+
+    - ``task['status'] == 'blocked'`` (a human-decision gate blocks while its
+      born-at-L2 escalation is open);
+    - ``gate_escalated_age_secs(task['metadata'], now=now)`` is not ``None``
+      (i.e. it is an ``operational_mode=='gate'`` task carrying a parseable
+      ``gate_escalated_at`` stamp) AND that age is strictly greater than
+      *threshold_secs*;
+    - ``task['id']`` is not ``None`` (coerced to ``str``).
+
+    Pure (no I/O).  Mirrors ``compute_stalled_task_ids``' sorted return and
+    ``extract_human_operator_task_ids``' first-seen dedup + ``str(id)``
+    coercion.  Callers restrict *tasks* to ``filtered_task_tree.active_tasks``
+    so resolved-and-done gates are excluded for free.  Empty input → ``[]``.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for task in tasks:
+        if task.get('status') != 'blocked':
+            continue
+        age = gate_escalated_age_secs(task.get('metadata'), now=now)
+        if age is None or age <= threshold_secs:
+            continue
+        raw_tid = task.get('id')
+        if raw_tid is None:
+            continue
+        tid = str(raw_tid)
+        if tid not in seen:
+            seen.add(tid)
+            result.append(tid)
+    return sorted(result)
+
+
 # ── Async I/O helpers ────────────────────────────────────────────────────────
 
 
