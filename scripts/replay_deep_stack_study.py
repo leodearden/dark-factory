@@ -215,7 +215,8 @@ def build_stack(repo: Path, base: str, tips: list[list[str] | tuple[str, str]]) 
     """
     git(repo, 'merge', '--abort', check=False)
     git(repo, 'reset', '--hard', check=False)
-    git(repo, 'clean', '-fd', '-e', 'target', '-e', 'node_modules', check=False)
+    git(repo, 'clean', '-fd', '-e', 'target', '-e', 'node_modules',
+        '-e', CLONE_MARKER, check=False)
     git(repo, 'checkout', '--detach', base)
     merged = 0
     for tid, tip in tips:
