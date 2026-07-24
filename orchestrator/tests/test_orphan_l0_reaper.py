@@ -12,7 +12,11 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness, _has_fresh_dispatch
+from orchestrator.harness import (
+    Harness,
+    _has_fresh_dispatch,
+    _has_fresh_merge_phase,
+)
 from orchestrator.review_checkpoint import ReviewCheckpoint
 
 
@@ -501,6 +505,248 @@ class TestOrphanL0Reaper:
         assert l1s[0].task_id == 'task-stranded'
 
     @pytest.mark.asyncio
+    async def test_live_merge_phase_divergence_not_promoted(
+        self, harness: Harness,
+    ):
+        """Task 2991: defer a divergence-class L0 while its task is live in
+        the pre-enqueue MERGE phase.
+
+        The MERGE-phase loop (rebase + scoped verify + queue submit) makes NO
+        LLM calls, so it never refreshes
+        ``metadata.routing.latest.decided_at`` — a legitimately-live
+        merge-stage task therefore fails the task-2931 ``_has_fresh_dispatch``
+        gate and (pre-2991) is false-promoted exactly like the pre-2931 bug
+        (cluster esc-2789-22: esc-2789-21, esc-2885-7, both
+        workflow_state='merge'). The durable liveness signal it DOES leave is
+        ``metadata.merge_phase_liveness.entered_at``, stamped at merge entry.
+        Here it is 5s old — within the 120s test grace — and ``routing.latest``
+        is absent, so ONLY the merge-phase gate can defer.
+
+        RED on main: the reaper has no merge-phase-freshness gate, so the
+        aged, not-held orphan is promoted (count == 1, an L1 filed) instead of
+        0.
+        """
+        assert harness._escalation_queue is not None
+        harness.config.orphan_l0_merge_phase_freshness_secs = 120.0
+        # Merge-phase workflow holds no locks and isn't dispatched.
+        harness.scheduler.is_actively_held = MagicMock(return_value=False)
+
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-merge'),
+            task_id='task-merge',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task '
+                'task-merge'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+        # Deliberately NOT in _escalation_events and is_actively_held False —
+        # only the durable merge-phase stamp proves the task is live.
+
+        fresh_entered_at = (
+            datetime.now(UTC) - timedelta(seconds=5.0)
+        ).isoformat()
+        # routing.latest deliberately ABSENT (a merge phase makes no LLM
+        # calls), so _has_fresh_dispatch is False and only the merge-phase
+        # gate can defer.
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'in-progress',
+                'workflow_state': 'merge',
+                'metadata': {
+                    'merge_phase_liveness': {'entered_at': fresh_entered_at},
+                },
+            },
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_phase_deferral_survives_restart_no_inmemory_state(
+        self, harness: Harness,
+    ):
+        """Task 2991 fix-direction (b): the merge-phase deferral relies SOLELY
+        on durable task metadata, not the per-process
+        ``Scheduler._merge_phase_at``.
+
+        Simulate immediately-after-orchestrator-restart: a bare MagicMock
+        scheduler carrying NO in-memory merge-phase state at all (no
+        ``_merge_phase_at`` populated, ``note_merge_phase_entered`` not yet
+        re-run for this process). The only liveness evidence is the durable
+        ``metadata.merge_phase_liveness.entered_at`` stamp persisted before
+        the restart. The reaper must still defer — proving restart-
+        survivability across the exact window in which esc-2789-21 /
+        esc-2885-7 were not re-dispatched.
+        """
+        assert harness._escalation_queue is not None
+        harness.config.orphan_l0_merge_phase_freshness_secs = 120.0
+
+        # Bare, freshly-restarted scheduler: only get_task (durable metadata)
+        # + is_actively_held are configured; nothing merge-phase in-memory.
+        bare_scheduler = MagicMock()
+        bare_scheduler.is_actively_held = MagicMock(return_value=False)
+        fresh_entered_at = (
+            datetime.now(UTC) - timedelta(seconds=5.0)
+        ).isoformat()
+        bare_scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'in-progress',
+                'workflow_state': 'merge',
+                'metadata': {
+                    'merge_phase_liveness': {'entered_at': fresh_entered_at},
+                },
+            },
+        )
+        harness.scheduler = bare_scheduler
+
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-restart'),
+            task_id='task-restart',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task '
+                'task-restart'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 0
+        # The deferral's sole liveness input was durable metadata via
+        # get_task — no in-memory merge-phase accessor was consulted.
+        bare_scheduler.get_task.assert_awaited_once_with('task-restart')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'case',
+        [
+            pytest.param('stale-merge-phase', id='stale-merge-phase'),
+            pytest.param('no-merge-phase', id='no-merge-phase'),
+            pytest.param('get-task-none', id='get-task-none'),
+        ],
+    )
+    async def test_stranded_merge_phase_divergence_still_promoted(
+        self, harness: Harness, case: str,
+    ):
+        """Task 2991 boundary guard: the merge-phase gate defers ONLY fresh
+        stamps and never drops a genuinely stranded orphan (preserves the
+        task 2878/2931 boundary).
+
+        Same aged (300s) divergence-class L0 and ``is_actively_held=False`` as
+        the live case, but here ``routing.latest`` is ALSO stale so
+        ``_has_fresh_dispatch`` is False too — the promotion therefore rests
+        solely on the merge-phase gate ALSO being non-fresh:
+
+        - 'stale-merge-phase': ``entered_at`` 300s old (> the 120s grace) —
+          the task stopped cycling through merge, so it is stranded.
+        - 'no-merge-phase': ``metadata`` has no ``merge_phase_liveness`` key —
+          no signal to confirm — fail open (promote).
+        - 'get-task-none': ``get_task`` returns ``None`` — fail open (promote).
+        """
+        assert harness._escalation_queue is not None
+        harness.config.orphan_l0_dispatch_freshness_secs = 120.0
+        harness.config.orphan_l0_merge_phase_freshness_secs = 120.0
+        harness.scheduler.is_actively_held = MagicMock(return_value=False)
+
+        # routing.latest is stale in every non-None case so the dispatch gate
+        # (task 2931) is also False — isolating the merge-phase gate as the
+        # sole remaining defer opportunity.
+        stale_ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        if case == 'stale-merge-phase':
+            harness.scheduler.get_task = AsyncMock(
+                return_value={
+                    'status': 'in-progress',
+                    'workflow_state': 'merge',
+                    'metadata': {
+                        'routing': {'latest': {'decided_at': stale_ts}},
+                        'merge_phase_liveness': {'entered_at': stale_ts},
+                    },
+                },
+            )
+        elif case == 'no-merge-phase':
+            harness.scheduler.get_task = AsyncMock(
+                return_value={
+                    'status': 'in-progress',
+                    'metadata': {
+                        'routing': {'latest': {'decided_at': stale_ts}},
+                    },
+                },
+            )
+        else:  # 'get-task-none'
+            harness.scheduler.get_task = AsyncMock(return_value=None)
+
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-merge-stranded'),
+            task_id='task-merge-stranded',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task '
+                'task-merge-stranded'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        refreshed = harness._escalation_queue.get(original.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        assert refreshed.resolution is not None
+        assert 'Auto-promoted to level 1' in refreshed.resolution
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-merge-stranded'
+
+    @pytest.mark.asyncio
     async def test_l1_not_touched(self, harness: Harness):
         """Level-1 escalations are never promoted (they're already at the top)."""
         assert harness._escalation_queue is not None
@@ -846,6 +1092,56 @@ class TestHasFreshDispatch:
         }
         now = datetime.now(UTC)  # tz-aware
         assert _has_fresh_dispatch(task, now, 120.0) is False
+
+
+class TestHasFreshMergePhase:
+    """Task 2991: direct unit coverage of ``_has_fresh_merge_phase``'s
+    ``except (ValueError, TypeError)`` fail-open branch.
+
+    The reaper tests (``test_live_merge_phase_divergence_not_promoted`` and
+    ``test_stranded_merge_phase_divergence_still_promoted``) already exercise
+    the fresh / stale / get-task-None / no-merge_phase_liveness-key paths
+    indirectly. The unparseable / tz-naive ``entered_at`` branch is NOT
+    covered by them, yet it is exactly the branch that would silently flip the
+    gate from 'defer' to 'promote' — defeating the merge-phase-FP suppression
+    without any test catching it — if the stamp writer's timestamp format ever
+    drifted (a non-ISO string, or a tz-naive stamp). Pin the documented
+    fail-safe directly: both malformed inputs must return False (fail open ->
+    the caller promotes), mirroring ``TestHasFreshDispatch``.
+    """
+
+    def test_garbage_entered_at_fails_open(self):
+        """A non-ISO / garbage ``entered_at`` raises ValueError inside
+        ``datetime.fromisoformat`` -> caught -> False (fail open)."""
+        task = {
+            'status': 'in-progress',
+            'metadata': {
+                'merge_phase_liveness': {'entered_at': 'not-a-timestamp'},
+            },
+        }
+        assert _has_fresh_merge_phase(task, datetime.now(UTC), 120.0) is False
+
+    def test_tz_naive_entered_at_fails_open(self):
+        """A tz-naive ``entered_at`` subtracted from a tz-aware ``now`` raises
+        TypeError -> caught -> False (fail open).
+
+        The stamp is deliberately FRESH (5s old, well within the 120s grace),
+        so the ONLY reason for False is the tz mismatch, not staleness — this
+        pins the fail-open branch specifically, not the stale-stamp path.
+        """
+        naive_fresh = (
+            (datetime.now(UTC) - timedelta(seconds=5.0))
+            .replace(tzinfo=None)
+            .isoformat()
+        )
+        task = {
+            'status': 'in-progress',
+            'metadata': {
+                'merge_phase_liveness': {'entered_at': naive_fresh},
+            },
+        }
+        now = datetime.now(UTC)  # tz-aware
+        assert _has_fresh_merge_phase(task, now, 120.0) is False
 
 
 class TestReviewerEscalationPromotion:
