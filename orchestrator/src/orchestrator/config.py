@@ -8,7 +8,8 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from types import UnionType
+from typing import Any, Literal, NamedTuple, Union, get_args, get_origin
 
 import yaml
 from pydantic import (
@@ -4188,6 +4189,147 @@ class OrchestratorConfig(BaseSettings):
         config_path = Path(os.environ.get('ORCH_CONFIG_PATH', '') or 'config.yaml')
         yaml_settings = YamlSettingsSource(settings_cls, config_path)
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
+
+
+# ---------------------------------------------------------------------------
+# Unknown-config-key census (plans/warm-lane-exhaustion-hardening-prd.md leaf ζ)
+#
+# Pydantic's ``extra='ignore'`` silently DISCARDS unknown keys before validation
+# on both OrchestratorConfig and every nested BaseModel, so a misplaced key like
+# a top-level ``spare_warm_lanes: 8`` (the field actually lives on GitConfig)
+# vanishes with no error.  These pure helpers detect that class of typo by
+# walking the RAW project YAML against the model schema — a separate pass from
+# pydantic validation, because validation never sees the dropped keys.
+# ---------------------------------------------------------------------------
+
+
+class ConfigUnknownKey(NamedTuple):
+    """A YAML key that has no matching model field.
+
+    ``path`` is the dotted location of the key in the project YAML (e.g.
+    ``spare_warm_lanes`` or ``git.bogus_nested``).  ``shadow_hint`` names the
+    real dotted home when the same field name lives elsewhere in the model tree
+    (e.g. a top-level ``spare_warm_lanes`` → ``git.spare_warm_lanes``), else
+    ``None``.
+    """
+
+    path: str
+    shadow_hint: str | None
+
+
+def _model_from_annotation(annotation: Any) -> type[BaseModel] | None:
+    """Return the single nested ``BaseModel`` subclass an annotation refers to.
+
+    Handles a bare ``SubModel`` and an ``Optional``/``SubModel | None`` wrapper.
+    Returns ``None`` for scalars, ``dict[...]`` and ``list[...]`` (whose value
+    models carry arbitrary operator DATA keys — the walk deliberately stops
+    there) and any other non-single-BaseModel annotation.
+    """
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    # Only unwrap a Union (Optional[X] / X | None); NEVER dict[...]/list[...],
+    # whose get_args would expose a DATA value-model (e.g. dict[str, PriceEntry]).
+    if origin is Union or origin is UnionType:
+        for arg in get_args(annotation):
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                return arg
+    return None
+
+
+def _build_shadow_index(
+    model_cls: type[BaseModel],
+    prefix: str = '',
+    index: dict[str, list[str]] | None = None,
+    _ancestors: frozenset[type[BaseModel]] = frozenset(),
+) -> dict[str, list[str]]:
+    """Map every field NAME (lowercased) in the model tree → its dotted path(s).
+
+    Recurses into single nested ``BaseModel`` fields only (mirroring the walk),
+    so an unknown top-level ``spare_warm_lanes`` can be pointed at its real home
+    ``git.spare_warm_lanes``.  ``_ancestors`` guards against pathological
+    recursion cycles while still allowing the same submodel at sibling paths.
+    """
+    if index is None:
+        index = {}
+    if model_cls in _ancestors:
+        return index
+    child_ancestors = _ancestors | {model_cls}
+    for name, field in model_cls.model_fields.items():
+        dotted = f'{prefix}{name}'
+        index.setdefault(name.lower(), []).append(dotted)
+        sub = _model_from_annotation(field.annotation)
+        if sub is not None:
+            _build_shadow_index(sub, dotted + '.', index, child_ancestors)
+    return index
+
+
+def _walk_unknown_keys(
+    tree: dict[Any, Any],
+    model_cls: type[BaseModel],
+    prefix: str,
+    shadow_index: dict[str, list[str]],
+) -> list[ConfigUnknownKey]:
+    """Recursively collect keys in ``tree`` with no matching field on ``model_cls``.
+
+    Matching is case-insensitive on the field NAME (mirrors
+    ``model_config.case_sensitive=False``; OrchestratorConfig defines no field
+    aliases).  An unknown key is recorded and NOT descended into.  A known key is
+    descended into only when its field is a single nested ``BaseModel`` AND its
+    value is a dict — scalars, ``list`` values, and ``dict`` DATA fields stop the
+    walk so arbitrary operator data keys are never flagged.
+    """
+    fields_lower = {
+        name.lower(): (name, field) for name, field in model_cls.model_fields.items()
+    }
+    unknown: list[ConfigUnknownKey] = []
+    for key, value in tree.items():
+        key_lower = str(key).lower()
+        dotted = f'{prefix}{key}'
+        match = fields_lower.get(key_lower)
+        if match is None:
+            candidates = [c for c in shadow_index.get(key_lower, []) if c != dotted]
+            hint = ' or '.join(candidates) if candidates else None
+            unknown.append(ConfigUnknownKey(dotted, hint))
+            continue
+        _name, field = match
+        sub = _model_from_annotation(field.annotation)
+        if sub is not None and isinstance(value, dict):
+            unknown.extend(_walk_unknown_keys(value, sub, dotted + '.', shadow_index))
+    return unknown
+
+
+def census_unknown_config_keys(config_path: Path) -> list[ConfigUnknownKey]:
+    """Return the unknown-config-key census for the PROJECT YAML at *config_path*.
+
+    Parses the project file directly (NOT the defaults-merged YamlSettingsSource
+    tree — defaults.yaml is version-controlled and trusted; see design decision
+    1) and walks it against ``OrchestratorConfig``'s schema.  A ``None``/non-dict
+    document or an unreadable/malformed file yields ``[]`` (fail-open — the
+    census cannot detect keys it cannot parse; load_config surfaces parse
+    errors loudly on its own path).
+    """
+    try:
+        with open(config_path) as f:
+            tree = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(tree, dict):
+        return []
+    shadow_index = _build_shadow_index(OrchestratorConfig)
+    return _walk_unknown_keys(tree, OrchestratorConfig, '', shadow_index)
+
+
+def config_unknown_keys_signature(census: list[ConfigUnknownKey]) -> str:
+    """Short, order-independent sha256 hex of the census's unknown-key PATHS.
+
+    Paths only (hints are deterministically derived from paths + model, so they
+    are redundant).  Single-sources the escalation dedup discriminator: an
+    identical key-set yields a stable signature (same-set dedup, the storm
+    escape) while any change to the set re-files.
+    """
+    joined = ','.join(sorted(uk.path for uk in census))
+    return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
 
 
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
