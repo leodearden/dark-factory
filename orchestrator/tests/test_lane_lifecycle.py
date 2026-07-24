@@ -541,7 +541,9 @@ class TestNoteAssignedRecyclesQuarantined:
     ):
         lifecycle = _lifecycle(tmp_path)
         lane = self._quarantined_lane_with_stale_pin(tmp_path, lifecycle)
-        assert lifecycle.read(lane).state == LaneState.QUARANTINED
+        seeded = lifecycle.read(lane)
+        assert seeded is not None
+        assert seeded.state == LaneState.QUARANTINED
 
         # Must NOT raise IllegalLaneTransition (the drift bug): it recycles.
         with caplog.at_level(logging.WARNING, logger='orchestrator.lane_lifecycle'):
