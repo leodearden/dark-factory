@@ -9627,12 +9627,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         The remediation counterpart to :meth:`worktree_ledger_violations`:
         that method only DETECTS leaked worktrees; this method REMOVES them.
-        Intended to run once at worker construction/recovery time (see
-        ``Harness._reap_orphaned_merge_worktrees``), backstopping two orphan
-        sources — a caller's ``finally`` cleanup skipped by a mid-run SIGTERM,
-        and an orchestrator restart that wipes :attr:`_owned_merge_worktrees`
-        while the on-disk worktree (and its ``.git/worktrees`` admin entry)
-        survives.
+        Has two callers (task 3018 added the second): the one-shot startup/
+        recovery sweep (see ``Harness._reap_orphaned_merge_worktrees``,
+        which passes *recovered_branches* so a worktree backing a
+        just-recovered in-flight merge is re-adopted rather than reaped),
+        and the periodic steady-state sweep from
+        :meth:`_maybe_reap_orphaned_merge_worktrees` (invoked every
+        ``_reap_interval_s`` from :meth:`_heartbeat_loop`, always with no
+        *recovered_branches* since re-adoption is a startup-only concern).
+        Together they backstop three orphan sources — a caller's ``finally``
+        cleanup skipped by a mid-run SIGTERM, an orchestrator restart that
+        wipes :attr:`_owned_merge_worktrees` while the on-disk worktree (and
+        its ``.git/worktrees`` admin entry) survives, and a leak that first
+        crosses grace mid-run (only ever reclaimed by the periodic sweep,
+        since the one-shot startup sweep has already run by then).
 
         Reuses :meth:`worktree_ledger_violations`'s exact os.scandir discovery
         so remediation stays symmetric with detection: direct children of
