@@ -1012,9 +1012,47 @@ class TestFiveThreeTwoSixReplayGate:
                 )
                 for d in (merge_verify, *infra_dirs.values()):
                     assert d.exists(), f'{d.name} must survive the concurrent sweep'
+
+                # --- CRASH-RECOVERY-SWEEP leg: the cleaned SET is the C2
+                # regression detector, NOT `.exists()` ---------------------
+                # `_build_recovery_harness` spies `cleanup_worktree` as an
+                # AsyncMock (deliberately -- a real delegate would race the
+                # in-flight merge by deleting the live task/5326 worktree
+                # mid-verify), so `.exists()` above is INERT on this leg: a
+                # full C2 regression (the 2026-07-22 "Cleaned up worktree
+                # _merge-verify" force-removal) would leave every tree on
+                # disk and every `.exists()` green. What C2 actually
+                # promises is that the sweep never OFFERS a protected entry
+                # to cleanup_worktree at all -- so pin the offered set.
+                cleaned_paths = {
+                    c.args[0] for c in harness.git_ops.cleanup_worktree.call_args_list  # type: ignore[attr-defined]
+                }
+                protected = {
+                    merge_verify, merge_uuid, live_merge_tree, *infra_dirs.values(),
+                }
+                assert cleaned_paths.isdisjoint(protected), (
+                    f'C2 violated -- the crash-recovery sweep cleaned protected '
+                    f'entries: {cleaned_paths & protected}'
+                )
                 # Positive control: the SAME sweep cleaned the planless dir --
                 # proves the sweep is not inert.
-                harness.git_ops.cleanup_worktree.assert_any_call(wt_task, '999')  # type: ignore[attr-defined]
+                assert wt_task in cleaned_paths, (
+                    f'positive control: the task-shaped planless dir must be '
+                    f'cleaned by this sweep; cleaned={cleaned_paths}'
+                )
+                # EXACT-SET pin (OBSERVED, not inferred): the sweep offers
+                # exactly the two task-id-shaped entries -- the planless
+                # '999' decoy and the real task/5326 branch worktree, which
+                # is itself task-id-shaped and planless under this test's
+                # MagicMock scheduler. Pinning the whole set (rather than
+                # `assert_any_call`) makes ANY extra cleanup call a failure,
+                # which is what turns a C2 regression into a red test.
+                # Nothing is actually deleted here -- cleanup_worktree is an
+                # AsyncMock spy -- so the live merge below is unaffected.
+                assert cleaned_paths == {wt_task, wt}, (
+                    f'unexpected cleanup_worktree call set: '
+                    f'{cleaned_paths ^ {wt_task, wt}}'
+                )
 
                 # (4) Release the gated verify; await the recovered merge.
                 release.set()
