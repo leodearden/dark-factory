@@ -25,6 +25,7 @@ This module builds the CM up from the bottom:
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -104,3 +105,54 @@ class TestTaskVerifyLeaseHoldsLaneLock:
 
         # (c) still no holder-pgid after exit.
         assert read_lock_holder_pgid(git_ops.worktree_base) is None
+
+
+@pytest.mark.asyncio
+class TestTaskVerifyLeaseFailsOpenOnContention:
+    """A contended flock (bounded wait times out → acquire returns None) must
+    FAIL OPEN: log a WARNING and still run the verify body, never raise
+    (step-3/4).
+
+    Contrast merge_verify_lease's fail-CLOSED MergeVerifyLeaseContended raise:
+    a task-lane verify must never be blocked or aborted by its own lane lease,
+    and proceeding-without-the-hold is exactly today's baseline (nothing held
+    it), so fail-open is strictly non-regressive.
+    """
+
+    async def test_contended_flock_warns_and_enters_body_without_raising(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        git_ops = _git_ops(tmp_path)
+        lane_dir = git_ops.worktree_base / '3027'
+        lock_path = lane_lock_path(lane_dir)
+
+        # Simulate acquire_merge_verify_flock's bounded-wait TIMEOUT (→ None):
+        # the racing reseed held the lane lock past _TASK_VERIFY_LEASE_WAIT_SECS.
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock',
+            lambda *a, **k: None,
+        )
+
+        entered = False
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            async with git_ops.task_verify_lease(lane_dir):
+                entered = True  # body MUST run — fail-open, not fail-closed
+
+        assert entered, (
+            'a contended lane flock must fail OPEN — the verify body must still '
+            'run (never blocked/aborted by its own lane lease)'
+        )
+        # A WARNING naming the contended lane lock must have been logged; and no
+        # fd-related TypeError may have propagated (release must not be called
+        # on a None fd).
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and str(lock_path) in r.getMessage()
+        ]
+        assert warnings, (
+            f'expected a WARNING naming the contended lane lock {lock_path}; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
