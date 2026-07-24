@@ -1467,6 +1467,29 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
 
+    def test_cross_repo_metadata_keys_are_blessed(self):
+        """The cross-repo deliverable marker must not census-warn (task 3004).
+
+        cross_repo (+ companion cross_repo_project) is set by the fused-memory
+        submit path when a task's metadata.files are ALL owned by one other
+        registered project (the reify-task 5308 shape) and is read by the
+        orchestrator pre-merge narrowing gate, which routes such tasks to
+        OutcomeKind.plan_files_cross_repo instead of flagging 'files not
+        touched'. As a first-class cross-cutting convention it belongs in
+        _BLESSED_METADATA_KEYS. RED until both keys are blessed.
+        """
+        _, warnings = parse_metadata(
+            {'cross_repo': True, 'cross_repo_project': 'dark_factory'},
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'cross_repo' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for cross_repo; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'cross_repo_project' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for cross_repo_project; got: {sorted(unknown_key_fields)}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
