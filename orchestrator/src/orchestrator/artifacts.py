@@ -703,6 +703,43 @@ class TaskArtifacts:
 
         logger.warning(f'Step {step_id} not found in plan')
 
+    def mark_step_committed(self, step_id: str, sha: str) -> bool:
+        """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+        Flips the matching item's ``status`` to ``'done'``, records the FULL
+        *sha* in its ``commit`` field, and prepends a ``[COMMITTED <sha[:12]>]``
+        provenance tag to its ``description``. Returns ``True`` on a match,
+        ``False`` (with a warning mirroring :meth:`update_step_status`) when no
+        step/prerequisite has ``id == step_id``.
+
+        Unlike :meth:`update_step_status` — contractually "status and commit
+        fields ONLY" — this DELIBERATELY mutates the description, which is why it
+        is a dedicated method rather than an extension of that one. Idempotent
+        per ``(step_id, sha)``: a repeated call keeps the item ``'done'`` and
+        does NOT double-prepend the tag. Pure persistence, NO git — the
+        corroborate-before-acting guard that *sha* actually resolves on-branch
+        lives in ``plan_tools._sha_exists_on_branch``; this method does NOT
+        prove the step's semantics (VERIFY remains the gate).
+        """
+        plan = self.read_plan()
+        tag = f'[COMMITTED {sha[:12]}]'
+
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get('id') == step_id:
+                    item['status'] = 'done'
+                    item['commit'] = sha
+                    description = item.get('description') or ''
+                    if not description.startswith(tag):
+                        item['description'] = f'{tag} {description}'
+                    self.write_plan(plan)
+                    return True
+
+        logger.warning(f'Step {step_id} not found in plan')
+        return False
+
     def get_pending_steps(self) -> list[dict]:
         """Return all steps with status 'pending', in order."""
         plan = self.read_plan()
