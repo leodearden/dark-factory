@@ -57,9 +57,17 @@ VERIFY_TIMEOUT_S = 14400  # generous: SCHED_IDLE stretches wall time
 # stack tip is already an ancestor of clone-time main, so branch scope resolves
 # EMPTY and verify.sh exits 0 having run nothing ("nothing to verify") — this
 # silently no-op'd 41/55 phase-A runs in the v1 (2026-07-23) results.
-VERIFY_CMD = ['./scripts/verify.sh', 'test', '--scope', 'all', '--include-infra']
+# NO --include-infra (v3, deliberate deviation from the production merge
+# verify): tests/infra/run_all.sh runs BEFORE the cargo phases and
+# test_prd_gate_corpus.sh fails deterministically on historical trees in the
+# offline clone (environment-sensitive verdict assertions; 87/88 other infra
+# tests pass), aborting verify before any Rust test executes — all 8 v2 runs
+# were infra-blocked with zero workspace-test signal. The infra suite tests
+# harness plumbing, is invariant to stacked CODE content, and so cannot carry
+# depth signal; excluding it removes a constant false-fail floor from P(pass|d).
+VERIFY_CMD = ['./scripts/verify.sh', 'test', '--scope', 'all']
 VERIFY_ENV = {'DF_VERIFY_ROLE': 'merge'}
-SCRIPT_VERSION = 2
+SCRIPT_VERSION = 3
 NOOP_CPU_FLOOR_S = 60  # a "pass" burning less CPU than this is a suspect no-op
 SCRUB_ENV = [k for k in os.environ if k.startswith('CLAUDE')]
 
