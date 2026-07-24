@@ -233,3 +233,269 @@ class TestReassignEdgeBackendMove:
         )
         graph.query.assert_not_awaited()
         assert result['moved'] is False
+
+
+def _wire_topology_graph(
+    backend, make_graph_mock, *, source_uuid, target_uuid, node_exists=True,
+):
+    """ro_query router: RELATES_TO topology read -> [source, target]; the
+    new-endpoint node existence read -> one row (or empty when node_exists is
+    False). graph.query stays the default AsyncMock."""
+    async def ro_router(cypher, params=None):
+        result = MagicMock()
+        if 'RELATES_TO' in cypher:
+            result.result_set = [[source_uuid, target_uuid]]
+        else:
+            result.result_set = [['node']] if node_exists else []
+        return result
+
+    graph = make_graph_mock([])
+    graph.ro_query = AsyncMock(side_effect=ro_router)
+    backend._driver._get_graph = MagicMock(return_value=graph)
+    return graph
+
+
+# ---------------------------------------------------------------------------
+# step-5: GraphitiBackend.reassign_edge — post-move refresh + audit dict
+# ---------------------------------------------------------------------------
+
+class TestReassignEdgePostMove:
+    """After a move, exactly the OLD (lost the edge) and NEW (gained it)
+    endpoint summaries are refreshed — best-effort — and a full audit dict is
+    returned. The UNCHANGED endpoint keeps the identical edge, so it is not
+    refreshed."""
+
+    @pytest.mark.asyncio
+    async def test_refreshes_old_and_new_endpoints_only(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """refresh_entity_summary is awaited for the OLD and NEW endpoints, and
+        NOT for the unchanged endpoint."""
+        backend = make_backend(mock_config)
+        _wire_topology_graph(
+            backend, make_graph_mock, source_uuid='src-uuid', target_uuid='tgt-uuid',
+        )
+        backend.refresh_entity_summary = AsyncMock(return_value={})
+        await backend.reassign_edge(
+            'edge-uuid', 'new-src-uuid', which_end='source', group_id='test',
+        )
+        refreshed_uuids = [c.args[0] for c in backend.refresh_entity_summary.call_args_list]
+        assert set(refreshed_uuids) == {'src-uuid', 'new-src-uuid'}
+        assert 'tgt-uuid' not in refreshed_uuids  # unchanged endpoint untouched
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_has_expected_keys(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The returned audit dict has exactly the documented keys and values."""
+        backend = make_backend(mock_config)
+        _wire_topology_graph(
+            backend, make_graph_mock, source_uuid='src-uuid', target_uuid='tgt-uuid',
+        )
+        backend.refresh_entity_summary = AsyncMock(return_value={})
+        result = await backend.reassign_edge(
+            'edge-uuid', 'new-src-uuid', which_end='source', group_id='test',
+        )
+        assert set(result.keys()) == {
+            'uuid', 'which_end', 'old_endpoint_uuid', 'new_endpoint_uuid',
+            'unchanged_endpoint_uuid', 'moved', 'refreshed_nodes',
+        }
+        assert result['uuid'] == 'edge-uuid'
+        assert result['which_end'] == 'source'
+        assert result['old_endpoint_uuid'] == 'src-uuid'
+        assert result['new_endpoint_uuid'] == 'new-src-uuid'
+        assert result['unchanged_endpoint_uuid'] == 'tgt-uuid'
+        assert result['moved'] is True
+        assert result['refreshed_nodes'] == ['src-uuid', 'new-src-uuid']
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_is_swallowed(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A refresh raising for one node is logged and swallowed (best-effort):
+        reassign still returns and that node is absent from refreshed_nodes."""
+        backend = make_backend(mock_config)
+        _wire_topology_graph(
+            backend, make_graph_mock, source_uuid='src-uuid', target_uuid='tgt-uuid',
+        )
+
+        async def refresh_side_effect(node_uuid, *args, **kwargs):
+            if node_uuid == 'src-uuid':
+                raise RuntimeError('refresh boom')
+            return {}
+
+        backend.refresh_entity_summary = AsyncMock(side_effect=refresh_side_effect)
+        result = await backend.reassign_edge(
+            'edge-uuid', 'new-src-uuid', which_end='source', group_id='test',
+        )
+        assert result['moved'] is True
+        assert 'src-uuid' not in result['refreshed_nodes']  # the failed node
+        assert 'new-src-uuid' in result['refreshed_nodes']
+
+
+# ---------------------------------------------------------------------------
+# Live-FalkorDB integration harness (mirrors test_merge_entities.py:980-1132)
+# ---------------------------------------------------------------------------
+#
+# Pins the REAL topology move + lossless preservation + uuid-uniqueness that
+# the mock tests above cannot: mocks can only assert the Cypher string/params
+# shape, not FalkorDB's actual relationship relocation, per-uuid count(*), or
+# byte-for-byte vecf32/temporal/episode preservation. Skipped automatically
+# when FalkorDB is unreachable (the mock tests guarantee coverage then) and
+# deselected by the default `-m 'not integration'`; runs only under an explicit
+# `-m integration` with FalkorDB reachable. Duplicated (not shared via
+# conftest) per the established per-module convention that sidesteps the
+# sys.modules['conftest'] collision documented in _fm_helpers.py.
+# ---------------------------------------------------------------------------
+
+FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
+FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
+
+
+def _falkor_available() -> bool:
+    """FalkorDB-native reachability probe (mirrors test_merge_entities.py)."""
+    try:
+        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
+        try:
+            client.select_graph('_probe').query('RETURN 1')
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        return True
+    except Exception:
+        return False
+
+
+@pytest_asyncio.fixture
+async def reassign_edge_live_graph():
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, clean up."""
+    graph_name = f'_test_3009_reassign_edge_{uuid.uuid4().hex[:8]}'
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    with contextlib.suppress(Exception):
+        stale = client.select_graph(graph_name)
+        await stale.delete()
+    graph = client.select_graph(graph_name)
+    try:
+        yield graph_name, graph
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestReassignEdgeLiveFalkorDB:
+    """Pin the real-DB topology move + losslessness against a REAL FalkorDB
+    server: the edge uuid is preserved (count(*)==1, no dup), the endpoint is
+    genuinely relocated, and fact/valid_at/invalid_at/episodes/fact_embedding
+    survive byte-for-byte — for both which_end='source' and which_end='target'.
+    """
+
+    @staticmethod
+    async def _seed_nodes(graph, uuids):
+        parts = ', '.join(f"(:Entity {{uuid: '{u}', name: '{u}', summary: ''}})" for u in uuids)
+        await graph.query(f'CREATE {parts}')
+
+    @staticmethod
+    async def _seed_edge(graph, src, dst, edge_uuid):
+        await graph.query(
+            'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+            'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact, '
+            'valid_at: $valid_at, invalid_at: $invalid_at, episodes: $episodes}]->(b) '
+            'SET e.fact_embedding = vecf32($embedding)',
+            {
+                'src': src, 'dst': dst, 'edge_uuid': edge_uuid, 'name': 'rel',
+                'fact': 'A relates to B', 'valid_at': '2026-01-01T00:00:00Z',
+                'invalid_at': '2026-06-01T00:00:00Z', 'episodes': ['ep1', 'ep2'],
+                'embedding': [1.0, 2.0, 3.0],
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_source_move_preserves_edge_losslessly(
+        self, mock_config, reassign_edge_live_graph,
+    ):
+        graph_name, graph = reassign_edge_live_graph
+        await self._seed_nodes(graph, ['A', 'B', 'C'])
+        await self._seed_edge(graph, 'A', 'B', 'e1')
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend.reassign_edge('e1', 'C', which_end='source', group_id=graph_name)
+            assert result['moved'] is True
+
+            # Topology moved: C-[e1]->B exists, carrying every preserved property.
+            moved = await graph.query(
+                "MATCH (c:Entity {uuid: 'C'})-[e:RELATES_TO {uuid: 'e1'}]->(b:Entity {uuid: 'B'}) "
+                'RETURN e.fact, e.valid_at, e.invalid_at, e.episodes, e.fact_embedding, '
+                'e.reassigned_from_node_uuid'
+            )
+            assert len(moved.result_set) == 1
+            fact, valid_at, invalid_at, episodes, embedding, reassigned_from = moved.result_set[0]
+            assert fact == 'A relates to B'
+            assert valid_at == '2026-01-01T00:00:00Z'
+            assert invalid_at == '2026-06-01T00:00:00Z'
+            assert list(episodes) == ['ep1', 'ep2']
+            assert list(embedding) == pytest.approx([1.0, 2.0, 3.0])
+            assert reassigned_from == 'A'  # audit trail
+
+            # A no longer connected via e1.
+            a_gone = await graph.query(
+                "MATCH (a:Entity {uuid: 'A'})-[e:RELATES_TO {uuid: 'e1'}]->() RETURN count(e)"
+            )
+            assert a_gone.result_set[0][0] == 0
+
+            # uuid PRESERVED and unique: exactly one RELATES_TO edge with uuid 'e1'.
+            dup = await graph.query(
+                "MATCH ()-[e:RELATES_TO {uuid: 'e1'}]->() RETURN count(e)"
+            )
+            assert dup.result_set[0][0] == 1
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_target_move_preserves_edge_losslessly(
+        self, mock_config, reassign_edge_live_graph,
+    ):
+        graph_name, graph = reassign_edge_live_graph
+        await self._seed_nodes(graph, ['A', 'B', 'C'])
+        await self._seed_edge(graph, 'A', 'B', 'e2')
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend.reassign_edge('e2', 'C', which_end='target', group_id=graph_name)
+            assert result['moved'] is True
+
+            # Topology moved: A-[e2]->C exists, carrying every preserved property.
+            moved = await graph.query(
+                "MATCH (a:Entity {uuid: 'A'})-[e:RELATES_TO {uuid: 'e2'}]->(c:Entity {uuid: 'C'}) "
+                'RETURN e.fact, e.valid_at, e.invalid_at, e.episodes, e.fact_embedding, '
+                'e.reassigned_from_node_uuid'
+            )
+            assert len(moved.result_set) == 1
+            fact, valid_at, invalid_at, episodes, embedding, reassigned_from = moved.result_set[0]
+            assert fact == 'A relates to B'
+            assert valid_at == '2026-01-01T00:00:00Z'
+            assert invalid_at == '2026-06-01T00:00:00Z'
+            assert list(episodes) == ['ep1', 'ep2']
+            assert list(embedding) == pytest.approx([1.0, 2.0, 3.0])
+            assert reassigned_from == 'B'  # audit trail (old target)
+
+            # B no longer the target via e2.
+            b_gone = await graph.query(
+                "MATCH ()-[e:RELATES_TO {uuid: 'e2'}]->(b:Entity {uuid: 'B'}) RETURN count(e)"
+            )
+            assert b_gone.result_set[0][0] == 0
+
+            # uuid preserved and unique.
+            dup = await graph.query(
+                "MATCH ()-[e:RELATES_TO {uuid: 'e2'}]->() RETURN count(e)"
+            )
+            assert dup.result_set[0][0] == 1
+        finally:
+            await backend.close()
