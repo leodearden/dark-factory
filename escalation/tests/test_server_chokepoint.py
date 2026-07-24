@@ -821,6 +821,123 @@ class TestMergeRequestRequestId:
             f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
         )
 
+    async def test_submit_time_already_merged_patch_id_backstop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Rebased landing: branch tip is NOT an ancestor of main, but its
+        content is fully patch-id-contained in main (rebased / cherry-picked
+        landing).  merge_request must return {status:'already_merged', commit}
+        immediately via the patch_content_contained backstop — no enqueue, no
+        merge_queued event, same shape as the is_ancestor fast-path.
+
+        RED until the submit-guard impl: without the patch-id backstop the
+        non-ancestor tip falls through to coalesce/enqueue and blocks on the
+        future → asyncio.wait_for raises TimeoutError.  Covers the rebased-
+        landing blind spot (task 2945): is_ancestor misses a rebased landing,
+        so a duplicate/late resubmission would otherwise burn a head-of-line
+        verify on a no-op merge.
+        """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        FAKE_TIP = 'deadbeef12345678'
+
+        # Recording event_store stub
+        class _RecordingEventStore:
+            def __init__(self):
+                self.events: list = []
+
+            def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+                self.events.append(event_type)
+
+        recording_event_store = _RecordingEventStore()
+
+        # git_ops stub: tip resolves, but is_ancestor MISSES (rebased landing).
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple] = []
+
+        async def _resolve_branch_sha(name: str) -> str:
+            resolve_calls.append(name)
+            return FAKE_TIP
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return False  # rebased landing: branch tip is NOT an ancestor of main
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        git_ops_stub = types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        # Spy the PUBLIC module-level patch_content_contained: record its
+        # (head, upstream, git_ops) args and return True (content fully
+        # contained via a rebased landing).  Monkeypatching the public helper
+        # is permitted — only `_`-private reach-backs are frozen.
+        patch_calls: list[tuple] = []
+
+        async def _patch_content_contained(head, upstream, git_ops):
+            patch_calls.append((head, upstream, git_ops))
+            return True
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            event_store=recording_event_store,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Same already_merged shape as the is_ancestor fast-path.
+        assert result == {
+            'status': 'already_merged',
+            'commit': FAKE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, (
+            f"Expected already_merged via patch-id backstop, got: {result}"
+        )
+        assert mq.empty(), (
+            f"Expected empty queue (no enqueue on already_merged), qsize={mq.qsize()}"
+        )
+        assert EventType.merge_queued not in recording_event_store.events, (
+            f"Expected no merge_queued event, got: {recording_event_store.events}"
+        )
+        # is_ancestor missed (returned False), then the patch-id backstop fired
+        # exactly once with (resolved_tip, main_branch, git_ops_for_scan).
+        assert patch_calls == [(FAKE_TIP, 'main', git_ops_stub)], (
+            f"Expected patch_content_contained(FAKE_TIP, 'main', git_ops_stub) "
+            f"called once, got: {patch_calls}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Fast-path fall-through tests (suggestion 2 — test_coverage)
@@ -923,21 +1040,45 @@ class TestMergeRequestFastPathFallThrough:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
-    async def test_non_ancestor_tip_falls_through_to_enqueue(self, tmp_path: Path):
-        """resolve_branch_sha returns a SHA but is_ancestor returns False → enqueues.
+    async def test_non_ancestor_tip_falls_through_to_enqueue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """resolve_branch_sha returns a SHA but neither is_ancestor NOR the
+        patch-id backstop matches → enqueues.
 
-        When the branch exists but its tip is NOT yet an ancestor of main
-        (i.e. the branch has not been merged), is_ancestor returns False and
-        the fast-path condition is False, so the request proceeds to the normal
-        coalesce/enqueue path rather than returning already_merged.
+        When the branch exists but its tip is NOT an ancestor of main
+        (is_ancestor False) and its content is NOT patch-id-contained in main
+        (patch_content_contained False — genuinely unmerged), both fast-path
+        arms are False, so the request proceeds to the normal coalesce/enqueue
+        path rather than returning already_merged.
 
         A regression that skipped enqueue on any non-None tip would violate this.
+
+        patch_content_contained is monkeypatched to async False: the real
+        helper runs `git cherry` against git_ops.project_root, which the
+        SimpleNamespace stub lacks (would AttributeError), and False is the
+        semantically-correct value for a genuinely-unmerged branch anyway.
         """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
         FAKE_TIP = 'aabbccdd11223344'
         git_ops_stub, resolve_calls, ancestor_calls = self._make_git_ops_stub(
             tip_sha=FAKE_TIP, is_anc=False
         )
         harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        # Stub the patch-id backstop to False (branch genuinely not merged).
+        patch_calls: list[tuple] = []
+
+        async def _patch_content_contained(head, upstream, git_ops):
+            patch_calls.append((head, upstream, git_ops))
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -965,6 +1106,12 @@ class TestMergeRequestFastPathFallThrough:
             )
             assert ancestor_calls[0] == (FAKE_TIP, 'main'), (
                 f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
+            )
+            # patch-id backstop WAS called once after the is_ancestor miss,
+            # returned False, and the request still enqueued.
+            assert patch_calls == [(FAKE_TIP, 'main', git_ops_stub)], (
+                f"Expected patch_content_contained(FAKE_TIP, 'main', git_ops_stub) "
+                f"called once, got: {patch_calls}"
             )
         finally:
             task.cancel()
@@ -3276,7 +3423,7 @@ class TestMergeRequestTipRecency:
         )
 
     async def test_superset_tip_dispatches_not_coalesces(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """SUPERSET re-submission against in-flight slot → dispatched (not coalesced).
 
@@ -3286,6 +3433,7 @@ class TestMergeRequestTipRecency:
         RED until step-6: without classifier_git_ops wired the MCP path
         always coalesces → returns 'attached' instead of 'queued'.
         """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
         )
@@ -3307,6 +3455,20 @@ class TestMergeRequestTipRecency:
 
         # Build git_ops stub: NEW_TIP is SUPERSET of OLD_TIP
         git_ops = self._make_tip_recency_git_ops(new_tip=NEW_TIP, old_tip=OLD_TIP)
+
+        # is_ancestor(new_tip, main) is stubbed False to reach the coalesce
+        # path; the task-2945 patch-id backstop then runs after that miss.  A
+        # SUPERSET carries genuinely novel content, so patch_content_contained
+        # is False — stub it (this SimpleNamespace git_ops' /fake/project has no
+        # real repo for `git cherry` to run against).
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
 
         # Build server with the stub git_ops
         server, mq, _reg, _, _ = _build_merge_server(
@@ -3388,8 +3550,9 @@ class TestMergeRequestDuplicateInVerify:
         )
 
     async def test_newer_sha_in_verify_returns_structured_reject(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
         )
@@ -3415,6 +3578,20 @@ class TestMergeRequestDuplicateInVerify:
         }])
 
         git_ops = self._make_verify_git_ops(new_tip=NEW_TIP, old_tip=OLD_TIP)
+
+        # is_ancestor(new_tip, main) is stubbed False to reach the coalesce/
+        # dispatch path; the task-2945 patch-id backstop then runs after that
+        # miss.  A newer descendant SHA carries genuinely novel content, so
+        # patch_content_contained is False — stub it (this SimpleNamespace
+        # git_ops' /fake/project has no real repo for `git cherry`).
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
         server, mq, _reg, _, _ = _build_merge_server(
             tmp_path, registry=registry, git_ops=git_ops, worker=worker,
         )
@@ -3508,8 +3685,9 @@ class TestBoundary9CancelRetire:
     """
 
     async def test_scenario_9_cancel_then_immediate_resubmit_fresh(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
         from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             TerminalOutcomeRecord,
@@ -3534,6 +3712,21 @@ class TestBoundary9CancelRetire:
             event_store=event_store,
             registry=registry,
             git_ops=spy,
+        )
+
+        # Both submits drive is_ancestor->False (spy), so the task-2945 patch-id
+        # backstop runs after that miss.  Branch 'b9' is genuinely fresh content
+        # (cancel-then-resubmit), so patch_content_contained is False — stub it
+        # (the spy's /fake/project has no real repo for `git cherry` to run
+        # against; an unstubbed call raises WorktreeMissing).  Both submits must
+        # still fall through to a fresh dispatch (queued), never already_merged.
+        async def _patch_content_contained(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
         )
 
         # (1) First submit dispatches fresh (worktree not on disk yet) and

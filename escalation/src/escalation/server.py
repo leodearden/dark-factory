@@ -1238,6 +1238,7 @@ def create_server(
             QueuedBranch,
             WaiterRecord,
             coalesce_or_enqueue_merge_request,
+            patch_content_contained,
         )
 
         # Single git_ops handle reused for both the already_merged fast-path
@@ -1260,19 +1261,34 @@ def create_server(
         if git_ops_for_scan is not None:
             full_branch = canonical_queued_branch_name(branch, orch_config.git.branch_prefix)
             resolved_tip = await git_ops_for_scan.resolve_branch_sha(full_branch)
+            # Shape converged with worker-path already_merged (suggestion 1).
+            # request_id is absent: the fast-path short-circuits before any
+            # MergeRequest entry is constructed (no entry → no id).  Built once
+            # so the is_ancestor arm and the patch-id backstop arm return a
+            # byte-identical response.
+            already_merged_response = {
+                'status': 'already_merged',
+                'commit': resolved_tip,
+                'reason': '',
+                'conflict_details': '',
+                'push_status': None,
+            }
             if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
                 resolved_tip, orch_config.git.main_branch
             ):
-                # Shape converged with worker-path already_merged (suggestion 1).
-                # request_id is absent: the fast-path short-circuits before any
-                # MergeRequest entry is constructed (no entry → no id).
-                return {
-                    'status': 'already_merged',
-                    'commit': resolved_tip,
-                    'reason': '',
-                    'conflict_details': '',
-                    'push_status': None,
-                }
+                return already_merged_response
+            # Rebased-landing backstop (task 2945): a branch whose content
+            # landed on main as a rebased/cherry-picked commit is NOT a literal
+            # ancestor of main (is_ancestor misses above), yet its work is
+            # fully present by patch-id.  patch_content_contained (`git cherry`)
+            # catches this dominant landing mode and kills the guaranteed-no-op
+            # resubmission at the door — NO enqueue, NO merge_queued event, same
+            # already_merged shape as the ancestor arm.  Fail-open: any git
+            # error → False → falls through to the normal coalesce/enqueue path.
+            if resolved_tip is not None and await patch_content_contained(
+                resolved_tip, orch_config.git.main_branch, git_ops_for_scan
+            ):
+                return already_merged_response
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
         # instantiation configs never call load_config, so _module_configs stays None).

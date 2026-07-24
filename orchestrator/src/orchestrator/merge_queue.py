@@ -4855,6 +4855,55 @@ async def classify_and_merge(
                 duration_ms=_elapsed_ms(started_monotonic),
             )
             return Decided(MergeOutcome('already_merged'))
+    elif not await git_ops.has_uncommitted_work(req.worktree):
+        # 2b. Rebased-landing backstop (task 2945).  effective_tip is NOT an
+        # ancestor of main (the is_ancestor block above missed), but a branch
+        # whose content landed on main as a rebased/cherry-picked commit
+        # (advance_main's rebased_pending_reverify path — the dominant landing
+        # mode under hour-long verifies) has a tip that is NOT a literal
+        # ancestor even though its work is fully present by patch-id.  Catch it
+        # here so a duplicate/late resubmission does not burn a head-of-line
+        # verify on a guaranteed no-op merge (RCA 2026-07-22).
+        #
+        # has_uncommitted_work is in the CONDITION so it short-circuits BEFORE
+        # the `git cherry` subprocess: a dirty worktree (an agent may have
+        # committed/staged new work since the content landed) vetoes the skip,
+        # exactly as on the is_ancestor path above.
+        #
+        # Consult the LIVE branch tip (resolve_branch_sha on the canonical
+        # full_name, worktree-HEAD fallback), NOT the possibly-stale
+        # effective_tip — mirrors _already_merged_is_genuine's task-5026 choice
+        # at the semantic level (live ref, not the snapshot).  A single
+        # resolve_branch_sha(req.branch.full_name) is used rather than
+        # _already_merged_is_genuine's resolve_queued_branch_ref ->
+        # resolve_branch_sha pair: req.branch.full_name is always the canonical
+        # prefixed ref (canonical_queued_branch_name guarantees it starts with
+        # branch_prefix), so resolve_queued_branch_ref could only ever return
+        # that same full_name (its double-prefixed rule-1 probe cannot resolve)
+        # or None — the resolver's None maps to the same worktree-HEAD fallback
+        # below, making the direct resolve exactly equivalent while saving 2 of
+        # 3 `git rev-parse` subprocesses.  This branch runs on the COMMON merge
+        # path (non-ancestor clean branch = the majority case), so that saving
+        # is worth taking here (review 2945).
+        # patch_content_contained requires ALL of the live tip's commits to be
+        # patch-id-present in main, so a branch that gained a novel commit after
+        # snapshotting shows a `+` line -> False -> falls through and merges
+        # (never a partial-containment skip).  Fail-open: any git error -> False
+        # -> control leaves this branch without a return and falls through to
+        # the normal merge in step 3.
+        branch_sha = await git_ops.resolve_branch_sha(req.branch.full_name)
+        candidate_tip = branch_sha or branch_head
+        if await patch_content_contained(candidate_tip, actual_main, git_ops):
+            logger.info(
+                'Task %s: branch content already on main via a rebased/'
+                'cherry-picked landing (patch-id contained) — skipping merge',
+                req.task_id,
+            )
+            _emit_merge_attempt(
+                event_store, req.task_id, OutcomeKind.already_merged,
+                duration_ms=_elapsed_ms(started_monotonic),
+            )
+            return Decided(MergeOutcome('already_merged'))
 
     # 3. Merge (speculative or normal).  speculative=True is only ever passed
     # for a SpeculativeMergeWorker caller; the isinstance check is a static-

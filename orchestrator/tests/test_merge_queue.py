@@ -18632,6 +18632,12 @@ class TestMergeWorkerGenerationChain:
         git_ops.get_main_sha = AsyncMock(return_value='main-sha')
         git_ops.is_ancestor = AsyncMock(return_value=False)  # not already on main
         git_ops.has_uncommitted_work = AsyncMock(return_value=False)
+        # task 2945 dispatch-guard: the non-ancestor + clean-worktree path now
+        # resolves the live branch tip and runs the patch-id backstop before
+        # falling through to a real merge.  Stub resolve_branch_sha (awaitable)
+        # and patch_content_contained -> False (branch content is genuinely
+        # novel here) so this test still exercises the 'advanced' merge path.
+        git_ops.resolve_branch_sha = AsyncMock(return_value=branch_head_sha)
         git_ops.merge_to_main = AsyncMock(return_value=MagicMock(
             success=True,
             conflicts=False,
@@ -18665,6 +18671,7 @@ class TestMergeWorkerGenerationChain:
             patch('orchestrator.merge_queue._run',
                   AsyncMock(return_value=(0, branch_head_sha + '\n', ''))),
             patch('orchestrator.merge_queue._classify_branch_presence', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_queue.patch_content_contained', AsyncMock(return_value=False)),
             patch('orchestrator.merge_queue._check_plan_targets_in_tree',
                   AsyncMock(return_value=MagicMock(dropped=[]))),
             # _run_post_merge_verify/_finalize_advanced_merge are called as
