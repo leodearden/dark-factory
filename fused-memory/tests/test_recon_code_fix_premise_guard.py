@@ -618,9 +618,14 @@ class TestSeedRegistryRealSource:
     - ../escalation/src/escalation/queue.py contains "def get_by_task" and
       "_iter_archive_paths" — the archive-inclusive scan that refutes the
       "escalation record was never written" premise.
+    - src/fused_memory/reconciliation/prompts/__init__.py contains
+      "_GATE_CLOSURE_ARCHIVE_GUIDANCE" and "get_task_escalations" — the shared
+      guidance prose naming the disconfirming tool. The literal tool name lives
+      HERE, not in the stage modules, because the guidance is a constant
+      interpolated into each stage's f-string.
     - src/fused_memory/reconciliation/prompts/stage2.py contains
-      "get_task_escalations" — the disconfirming tool the stage guidance points
-      auditors at.
+      "_GATE_CLOSURE_ARCHIVE_GUIDANCE" — the guidance is wired into the stage
+      that files remediation tasks.
     """
 
     # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/

@@ -100,3 +100,63 @@
     - file: src/fused_memory/server/recon_report.py
       must_not_contain:
         - "max_length"
+
+- name: deterministic_gate_escalation_record_archived_not_missing
+  reason: >
+    Task 3023. Recon Stage 1/2 have repeatedly asserted that a done
+    task_kind='deterministic' gate task stamped metadata.gate_escalated_at has
+    "no escalation record" — filed 16 times across dark_factory (2841, 2842,
+    2844, 2846, 2919, 2954, 2955, 2958, 2999, 3005, 3006) and reify (5330,
+    5341, 5349, 5352, 5353). Empirically refuted: the record IS written for
+    every deterministic-gate instance. Once a human resolves a born-at-L2
+    gate, EscalationQueue.resolve() MOVES the file to
+    data/escalations/archive/<date>/, so the root-only
+    get_pending_escalations(task_id) probe the auditor used correctly returns
+    [] — an archive-inclusive fact read through a pending-only lens. Verified
+    on disk: esc-2999-1 and esc-3005-1 are resolved and archived; esc-3011-1
+    is pending in the queue root. The orchestrator side is already
+    archive-inclusive (deterministic_runner.py calls get_by_task with no
+    status filter — task 2954, commit 403c978) and is NOT the defect.
+    Task 3023 additionally exposed get_task_escalations on the escalation MCP
+    surface and pointed both stages at it, so an auditor can now disconfirm
+    this hypothesis directly. Any recurrence should be dropped without an LLM
+    call while the archive-inclusive scan and that guidance remain in place.
+    Anchored on assertion-of-absence phrasings only (NOT a bare
+    "gate_escalated_at" token), so a legitimate proposal to improve this area
+    still reaches the architect — pinned by
+    tests/test_recon_code_fix_premise_guard.py::TestSeedRegistryRealSource::
+    test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped.
+  title_substrings:
+    - "deterministic"
+    - "escalation"
+  description_substrings:
+    - "no escalation record exists"
+    - "gate_escalated_at but no escalation record"
+    - "escalation record was never written"
+    - "never wrote an escalation record"
+  source_assertions:
+    # The archive-inclusive two-tier scan that refutes the premise. Path is
+    # relative to the fused-memory/ server cwd; _assertion_holds fails OPEN on
+    # an unreadable file, so a fused-memory-only deployment without the sibling
+    # escalation package simply leaves this entry inert (the safe direction).
+    - file: ../escalation/src/escalation/queue.py
+      must_contain:
+        - "def get_by_task"
+        - "_iter_archive_paths"
+    # The disconfirming tool the Stage 1/2 guidance points auditors at. The
+    # guidance prose is a shared constant in prompts/__init__.py (it is
+    # interpolated into the stage f-strings, so the literal tool name appears
+    # HERE, not in stage1.py/stage2.py). If get_task_escalations is ever
+    # retired, this assertion stops holding and the guard self-corrects,
+    # letting the candidate through to a human.
+    - file: src/fused_memory/reconciliation/prompts/__init__.py
+      must_contain:
+        - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
+        - "get_task_escalations"
+    # ...and the guidance is actually WIRED INTO the stage that files
+    # remediation tasks. Unwiring it also self-corrects the guard, so the
+    # candidate is only dropped while an auditor genuinely had the
+    # disconfirming instruction in front of it.
+    - file: src/fused_memory/reconciliation/prompts/stage2.py
+      must_contain:
+        - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
