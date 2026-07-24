@@ -393,6 +393,52 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     click.echo(f'Wrote model availability artifact to {out_path}')
 
 
+@main.command('check-config')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to the project orchestrator config YAML to lint (REQUIRED '
+                   'unless ORCH_CONFIG_PATH is set).')
+def check_config(config_path: Path | None):
+    """Lint a project config YAML for unknown keys that pydantic silently drops.
+
+    OrchestratorConfig uses ``extra='ignore'``, so any key with no matching model
+    field is DISCARDED before validation with no error — the 2026-07-22 incident
+    where a top-level ``spare_warm_lanes: 8`` (the field lives on ``git.``) was
+    dropped for weeks.  This offline gate walks the RAW project YAML against the
+    schema via ``census_unknown_config_keys`` DIRECTLY (not a full validated
+    load), so it still reports phantom keys even when the config has an unrelated
+    value-level validation error.  Exits 1 if any unknown key is found, else 0.
+    """
+    from orchestrator.config import census_unknown_config_keys
+
+    # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
+    # constructing a validated config — census only needs the raw YAML path.
+    if config_path is None:
+        env_path = os.environ.get('ORCH_CONFIG_PATH')
+        if not env_path:
+            click.echo(
+                'Error: --config is required (or set ORCH_CONFIG_PATH).', err=True
+            )
+            sys.exit(1)
+        config_path = Path(env_path)
+        if not config_path.exists():
+            click.echo(f'Error: Config file not found: {config_path}', err=True)
+            sys.exit(1)
+
+    census = census_unknown_config_keys(config_path)
+    if not census:
+        click.echo(f'OK: {config_path} has no unknown config keys.')
+        sys.exit(0)
+
+    click.echo(f'Found {len(census)} unknown config key(s) in {config_path}:')
+    for uk in census:
+        if uk.shadow_hint:
+            click.echo(f'  {uk.path}  → did you mean {uk.shadow_hint}?')
+        else:
+            click.echo(f'  {uk.path}')
+    sys.exit(1)
+
+
 @main.command('verify-merge')
 @click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
 @click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')
