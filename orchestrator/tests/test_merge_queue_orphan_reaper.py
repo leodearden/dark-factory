@@ -564,3 +564,53 @@ class TestPeriodicReapHelper:
         await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW + 60)
         assert not orphan.exists(), 'a call past _reap_interval_s must reap'
         assert worker._last_reap_at == _NOW + 60
+
+
+# ---------------------------------------------------------------------------
+# task 3018 step-5..step-8: _heartbeat_loop wiring for the periodic reap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHeartbeatLoopReapWiring:
+    """Unit tests asserting ``_heartbeat_loop`` invokes the periodic reap
+    helper each poll, and (once test_heartbeat_loop_survives_raising_reap
+    lands in step-7) that the loop survives a raising reap (fail-open — a
+    reap bug must never take down the heartbeat loop, mirroring the
+    existing touch/heartbeat swallow-and-log convention).
+
+    test_heartbeat_loop_invokes_periodic_reap: RED until step-6 GREEN wires
+    ``await self._maybe_reap_orphaned_merge_worktrees(time.time())`` into
+    ``_heartbeat_loop``.
+    """
+
+    async def test_heartbeat_loop_invokes_periodic_reap(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import orchestrator.merge_queue as mq_mod
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        monkeypatch.setattr(mq_mod, '_HEARTBEAT_POLL_S', 0.0)
+        # Isolate the reap: no-op the touch + log-heartbeat calls the loop
+        # also makes each poll.
+        monkeypatch.setattr(worker, '_touch_owned_merge_worktrees', lambda: 0)
+        monkeypatch.setattr(worker, '_maybe_log_queue_heartbeat', lambda now: False)
+
+        calls: list[float] = []
+
+        async def _fake_reap(now: float) -> None:
+            calls.append(now)
+            # Stop the loop deterministically after the first reap so
+            # awaiting the coroutine below returns instead of spinning.
+            worker._running = False
+
+        monkeypatch.setattr(worker, '_maybe_reap_orphaned_merge_worktrees', _fake_reap)
+
+        worker._running = True
+        await asyncio.wait_for(worker._heartbeat_loop(), timeout=2.0)
+
+        assert len(calls) >= 1, '_heartbeat_loop must invoke the periodic reap helper'
+        assert isinstance(calls[0], float), (
+            f'_heartbeat_loop must pass a float now= to the reap helper, got {calls[0]!r}'
+        )
