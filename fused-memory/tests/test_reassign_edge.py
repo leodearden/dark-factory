@@ -104,6 +104,34 @@ class TestReassignEdgeBackendValidation:
                 'edge-uuid', 'new-endpoint-uuid', which_end='source', group_id='test',
             )
 
+    @pytest.mark.asyncio
+    async def test_duplicate_uuid_edge_raises_and_issues_no_write(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """When the topology read returns MORE THAN ONE row for the uuid (a
+        duplicate-uuid RELATES_TO edge), reassign refuses loudly rather than
+        operating on an arbitrary result_set[0] — and issues no CREATE/DELETE."""
+        backend = make_backend(mock_config)
+
+        async def router(cypher, params=None):
+            result = MagicMock()
+            if 'RELATES_TO' in cypher:
+                # Two edges share the uuid — a data-integrity anomaly the
+                # uuid-keyed move below could not disambiguate.
+                result.result_set = [['s1', 't1'], ['s2', 't2']]
+            else:
+                result.result_set = [['node']]
+            return result
+
+        graph = make_graph_mock([])
+        graph.ro_query = AsyncMock(side_effect=router)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        with pytest.raises(RuntimeError, match='duplicate-uuid'):
+            await backend.reassign_edge(
+                'dup-edge', 'new-endpoint-uuid', which_end='source', group_id='test',
+            )
+        graph.query.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.reassign_edge — endpoint-move Cypher
@@ -232,6 +260,23 @@ class TestReassignEdgeBackendMove:
         )
         graph.query.assert_not_awaited()
         assert result['moved'] is False
+
+    @pytest.mark.asyncio
+    async def test_self_loop_rejected_and_issues_no_write(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Moving an endpoint onto the UNCHANGED endpoint would form a
+        self-referential edge (e.g. src->tgt, which_end='source', new=tgt =>
+        tgt->tgt). This is rejected with ValueError and issues no write."""
+        backend = make_backend(mock_config)
+        graph = self._wire_graph(
+            backend, make_graph_mock, source_uuid='src-uuid', target_uuid='tgt-uuid',
+        )
+        with pytest.raises(ValueError, match='self-referential'):
+            await backend.reassign_edge(
+                'edge-uuid', 'tgt-uuid', which_end='source', group_id='test',
+            )
+        graph.query.assert_not_awaited()
 
 
 def _wire_topology_graph(
@@ -598,6 +643,32 @@ class TestMemoryServiceReassignEdge:
         assert event.type == EventType.memory_updated
         assert event.payload.get('edge_uuid') == 'edge-uuid'
         assert event.payload.get('store') == 'graphiti'
+
+    @pytest.mark.asyncio
+    async def test_noop_reassign_does_not_emit_event(self, service):
+        """A no-op reassign (backend returns moved=False — the new endpoint
+        already equals the current one) changed nothing in the graph, so it must
+        NOT emit a memory_updated event (which would trigger spurious downstream
+        reconciliation). The call still succeeds and returns the no-op audit."""
+        service.graphiti.reassign_edge = AsyncMock(return_value={
+            'uuid': 'edge-uuid',
+            'which_end': 'source',
+            'old_endpoint_uuid': 'same-uuid',
+            'new_endpoint_uuid': 'same-uuid',
+            'unchanged_endpoint_uuid': 'other-uuid',
+            'moved': False,
+            'refreshed_nodes': [],
+        })
+        service._emit_event = AsyncMock()
+        result = await service.reassign_edge(
+            edge_uuid='edge-uuid',
+            new_endpoint_uuid='same-uuid',
+            which_end='source',
+            project_id='dark_factory',
+        )
+        service._emit_event.assert_not_awaited()
+        assert result['status'] == 'reassigned'
+        assert result['moved'] is False
 
     @pytest.mark.asyncio
     async def test_journal_failure_does_not_mask_success(self, service):

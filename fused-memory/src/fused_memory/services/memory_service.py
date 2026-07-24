@@ -3766,15 +3766,21 @@ class MemoryService:
                     )
 
         # Reached only on a SUCCESSFUL reassign (a backend failure re-raises
-        # through the finally above, never landing here).
-        await self._emit_event(ReconciliationEvent(
-            id=str(uuid_mod.uuid4()),
-            type=EventType.memory_updated,
-            source=EventSource.agent,
-            project_id=project_id,
-            timestamp=datetime.now(UTC),
-            payload={'edge_uuid': edge_uuid, 'store': 'graphiti'},
-        ))
+        # through the finally above, never landing here). Emit the
+        # memory_updated event ONLY when the edge actually moved: a no-op
+        # reassign (moved=False — the new endpoint already equals the current
+        # one) changed nothing in the graph, so emitting would trigger spurious
+        # downstream reconciliation for an edge that did not change. The journal
+        # still records the (successful) no-op call as an accurate audit trail.
+        if result.get('moved'):
+            await self._emit_event(ReconciliationEvent(
+                id=str(uuid_mod.uuid4()),
+                type=EventType.memory_updated,
+                source=EventSource.agent,
+                project_id=project_id,
+                timestamp=datetime.now(UTC),
+                payload={'edge_uuid': edge_uuid, 'store': 'graphiti'},
+            ))
 
         return {'status': 'reassigned', 'store': 'graphiti', **result}
 

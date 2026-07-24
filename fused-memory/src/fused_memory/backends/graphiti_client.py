@@ -874,10 +874,14 @@ class GraphitiBackend:
             and ``refreshed_nodes`` (uuids whose summary refresh succeeded).
 
         Raises:
-            ValueError: if ``which_end`` is not ``'source'`` or ``'target'``.
+            ValueError: if ``which_end`` is not ``'source'`` or ``'target'``, or
+                if ``new_endpoint_uuid`` equals the unchanged endpoint (a move
+                that would create a self-referential RELATES_TO edge).
             EdgeNotFoundError: if no RELATES_TO edge with ``edge_uuid`` exists.
             NodeNotFoundError: if no Entity node with ``new_endpoint_uuid`` exists.
-            RuntimeError: if the backend is not initialized.
+            RuntimeError: if the backend is not initialized, or if more than one
+                RELATES_TO edge shares ``edge_uuid`` (a duplicate-uuid anomaly
+                the uuid-keyed move cannot disambiguate).
         """
         if which_end not in ('source', 'target'):
             raise ValueError(
@@ -897,6 +901,21 @@ class GraphitiBackend:
         )
         if not topo.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {edge_uuid}')
+        if len(topo.result_set) > 1:
+            # A uuid must identify exactly one RELATES_TO edge (graph-wide
+            # uuid-uniqueness invariant, tasks 2207/2210). More than one row
+            # means a duplicate-uuid edge is present; the uuid-keyed
+            # CREATE/DELETE below would match ALL of them, moving/duplicating
+            # more than intended. Refuse loudly rather than operate on an
+            # arbitrary result_set[0] (repair the duplicate uuids first). Unlike
+            # redirect_node_edges — which enumerates by ID(old) precisely to
+            # disambiguate pre-existing bulk dups — a single uuid-targeted
+            # reassign has no principled way to pick one.
+            raise RuntimeError(
+                f'reassign_edge: {len(topo.result_set)} RELATES_TO edges share '
+                f'uuid {edge_uuid!r}; refusing to reassign an ambiguous '
+                f'duplicate-uuid edge (repair duplicate edge uuids first)'
+            )
         source_uuid, target_uuid = topo.result_set[0][0], topo.result_set[0][1]
         # Validate the new endpoint Entity node exists before any move.
         node_check = await graph.ro_query(
@@ -916,6 +935,20 @@ class GraphitiBackend:
         # No-op guard: nothing to move (and the operation is idempotent when
         # re-run against an already-reassigned edge).
         moved = new_endpoint_uuid != old_endpoint_uuid
+        # Reject a move that would fold the edge into a self-loop — the moved
+        # endpoint landing on the endpoint left in place. This mirrors the
+        # self-loop edges redirect_node_edges explicitly deletes in its
+        # inter-node cleanup: a self-referential RELATES_TO is not a meaningful
+        # fact. Only a real move can form one (a no-op creates no new edge), so
+        # this is gated on `moved` to preserve no-op idempotency even on an
+        # already-self-looping edge.
+        if moved and new_endpoint_uuid == unchanged_endpoint_uuid:
+            other_end = 'target' if which_end == 'source' else 'source'
+            raise ValueError(
+                f'reassign_edge: new_endpoint_uuid {new_endpoint_uuid!r} equals '
+                f'the unchanged {other_end} endpoint; refusing to create a '
+                f'self-referential RELATES_TO edge'
+            )
         if moved:
             # Atomic, uuid-PRESERVING CREATE-new-relationship + DELETE-old.
             # Properties are copied by direct old.<prop> reference (NOT
