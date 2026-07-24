@@ -563,13 +563,22 @@ class TestGateEscalatedAgeSecs:
         age = gate_escalated_age_secs(meta, now=_GATE_NOW)
         assert age == pytest.approx(10 * 3600, abs=1.0)
 
-    def test_operational_mode_llm_returns_none(self):
-        """(c) operational_mode='llm' → None (routes to an agent, not a human)."""
+    def test_operational_mode_llm_still_returns_age(self):
+        """(c) operational_mode='llm' → age (llm gates still await a human today).
+
+        Reviewer amendment (task 3017): the age check keys purely on the
+        authoritative ``gate_escalated_at`` stamp, NOT on ``operational_mode``.
+        Per the operational-routing contract a ``decision``/``operational`` +
+        ``llm`` submission is coerced into a pure human gate (the LLM-operational
+        lane is future work), so an ``operational_mode=='llm'`` blocked gate is
+        exactly the population this safety-net must cover.
+        """
         meta = {
             'operational_mode': 'llm',
             'gate_escalated_at': (_GATE_NOW - timedelta(hours=49)).isoformat(),
         }
-        assert gate_escalated_age_secs(meta, now=_GATE_NOW) is None
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age == pytest.approx(49 * 3600, abs=1.0)
 
     def test_metadata_not_a_dict_returns_none(self):
         """(d) metadata not a dict (None / str / int) → None, no raise."""
@@ -650,10 +659,39 @@ class TestExtractStalledGateBacklogTaskIds:
         ]
         assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
 
-    def test_operational_mode_llm_excluded(self):
-        """(e) operational_mode='llm' with stale stamp → excluded."""
+    def test_operational_mode_llm_included(self):
+        """(e) operational_mode='llm' with stale stamp → included.
+
+        Reviewer amendment (task 3017): a blocked ``operational_mode=='llm'``
+        gate still awaits a human decision today (the LLM-operational lane is
+        future work), so it must be selected — the check keys on the
+        ``gate_escalated_at`` stamp, not ``operational_mode``.
+        """
         tasks = [_gate_task(3, hours_ago=49, operational_mode='llm')]
-        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == []
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['3']
+
+    def test_operational_llm_pure_gate_with_marker_included(self):
+        """operational+llm pure gate (carries x_operational_llm_gate) → included.
+
+        The exact real-world shape the operational-routing guard produces for an
+        execution_class='operational' + operational_mode='llm' submission: a
+        blocked pure gate stamped with gate_escalated_at AND the
+        x_operational_llm_gate marker.  It awaits a human decision today, so the
+        gate-backlog safety-net must select it (task 3017 reviewer amendment).
+        """
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+        tasks = [
+            {
+                'id': 646,
+                'status': 'blocked',
+                'metadata': {
+                    'operational_mode': 'llm',
+                    'x_operational_llm_gate': True,
+                    'gate_escalated_at': stamp,
+                },
+            }
+        ]
+        assert extract_stalled_gate_backlog_task_ids(tasks, now=_GATE_NOW) == ['646']
 
     def test_no_gate_escalated_at_excluded(self):
         """(f) blocked task without a gate_escalated_at stamp → excluded."""

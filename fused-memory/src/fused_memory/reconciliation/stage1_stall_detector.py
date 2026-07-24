@@ -142,15 +142,30 @@ def gate_escalated_age_secs(metadata: dict | None, *, now: datetime) -> float | 
     """Age (in seconds) of ``metadata['gate_escalated_at']``, or ``None``.
 
     ``gate_escalated_at`` is a DeterministicRunner idempotency stamp written
-    whenever a born-at-L2 human-decision gate is filed (blessed key
-    ``shared/src/shared/task_metadata.py``).  Its age is the unambiguous
-    "a human decision has been pending this long" signal (task 3017).
+    ONLY by ``_file_milestone_gate_and_block`` whenever a born-at-L2
+    human-decision gate is filed (blessed key
+    ``shared/src/shared/task_metadata.py``).  Its presence is therefore the
+    unambiguous, authoritative "a human decision has been pending since this
+    instant" signal (task 3017), so the age check keys purely on a parseable
+    stamp — it deliberately does NOT filter on ``operational_mode``.
+
+    Rationale for ignoring ``operational_mode`` (reviewer amendment): the
+    operational-routing contract
+    (``fused_memory/middleware/operational_routing_guard.py``) coerces a
+    ``decision`` task (ANY mode) and an ``operational`` + ``llm`` task into a
+    *pure gate* that ``_file_milestone_gate_and_block`` blocks and stamps —
+    while leaving ``operational_mode='llm'`` on the metadata.  The
+    LLM-operational lane that would route such a gate to an agent instead of a
+    human is explicit future work (``deterministic_runner.py``
+    ``operational_llm_needs_lane``), so today an ``operational_mode=='llm'``
+    gate STILL awaits a human decision.  An ``operational_mode``-based filter
+    would silently exclude exactly that population and defeat the feature; the
+    ``gate_escalated_at`` stamp already captures the "human gate filed" fact
+    precisely.
 
     Returns ``None`` — never raises — when:
 
     - *metadata* is not a ``dict``;
-    - ``metadata['operational_mode']`` (default ``'gate'`` when absent) is not
-      ``'gate'`` (e.g. ``'llm'`` routes to an agent, not a human gate);
     - ``gate_escalated_at`` is missing, ``None``, empty, or not a ``str``;
     - ``gate_escalated_at`` is not a parseable ISO-8601 timestamp
       (``ValueError`` swallowed);
@@ -162,8 +177,6 @@ def gate_escalated_age_secs(metadata: dict | None, *, now: datetime) -> float | 
     fail-soft contract so one malformed stamp never aborts the Stage 1 pass.
     """
     if not isinstance(metadata, dict):
-        return None
-    if metadata.get('operational_mode', 'gate') != 'gate':
         return None
     raw = metadata.get('gate_escalated_at')
     if not isinstance(raw, str) or not raw:
@@ -188,8 +201,9 @@ def extract_stalled_gate_backlog_task_ids(
     - ``task['status'] == 'blocked'`` (a human-decision gate blocks while its
       born-at-L2 escalation is open);
     - ``gate_escalated_age_secs(task['metadata'], now=now)`` is not ``None``
-      (i.e. it is an ``operational_mode=='gate'`` task carrying a parseable
-      ``gate_escalated_at`` stamp) AND that age is strictly greater than
+      (i.e. it carries a parseable ``gate_escalated_at`` stamp — the
+      authoritative born-at-L2 human-gate signal, regardless of
+      ``operational_mode``) AND that age is strictly greater than
       *threshold_secs*;
     - ``task['id']`` is not ``None`` (coerced to ``str``).
 
