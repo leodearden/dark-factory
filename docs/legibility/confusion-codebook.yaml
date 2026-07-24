@@ -315,6 +315,13 @@ entries:
     manifested_phase: recon
     invariant_violated: Flag marker acknowledgment lifecycle — zero acknowledgments across both stage-1 and stage-2 despite flag generation and marker sweeps
     note: 'Recon run shows memory_consolidator generating 1 escalation (findings_filed: 1.0) and adding 2 memories, but downstream stages exhibit zero flag-marker acknowledgments (stage1_flag_markers_acknowledged: 0, stage2_flag_markers_acknowledged: 0). Task_knowledge_sync then performs recon_markers_gc_swept: 1, suggesting markers are being garbage-collected without proper lifecycle state acknowledgment — textbook flag-drop silencing described in the entry.'
+  - date: '2026-07-23'
+    project: dark_factory
+    session: 2ba6c7cd-6557-4e95-a7e9-7fa027df15e9
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: Stage 1 relays 2 flags to stage 2, but stage 2 only reports 1 item flagged; flag count mismatch suggests silent drop
+    note: 'Memories added by stage 1 (f704c52e, d043c079) are relayed (flags_relayed_to_stage2=2.0) but stage 2 processes only 1 item (items_flagged=1). Same memory UUIDs appear in delete operations shortly after (7 min later), indicating invisible state loss in flag handoff. Matches: ''flags silently dropped'' and ''lifecycle is leaky and invisible''.'
 - id: fused-memory-api-traps
   title: 'fused-memory tool contracts lie or under-inform: destructive-by-default writes, envelope asymmetry, silent filters, unusable oversized outputs'
   severity: medium
