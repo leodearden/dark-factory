@@ -498,10 +498,15 @@ class TestReapShape1InterruptedTeardown:
 @pytest.mark.asyncio
 class TestPeriodicReapHelper:
     """Unit tests for SpeculativeMergeWorker._maybe_reap_orphaned_merge_worktrees
-    (task 3018 step-1/step-2).
+    (task 3018 step-1..step-4).
 
-    RED until step-2 GREEN adds _maybe_reap_orphaned_merge_worktrees and the
-    _last_reap_at/_reap_interval_s fields to merge_queue.py.
+    test_first_call_reaps_orphan_preserves_owned: RED until step-2 GREEN adds
+    _maybe_reap_orphaned_merge_worktrees and the _last_reap_at/_reap_interval_s
+    fields to merge_queue.py.
+
+    test_reap_is_rate_limited_by_interval: RED until step-4 GREEN adds the
+    interval gate — step-2 always reaps unconditionally, so a call within
+    _reap_interval_s of the previous one would still reap.
     """
 
     async def test_first_call_reaps_orphan_preserves_owned(self, git_ops: GitOps) -> None:
@@ -531,3 +536,31 @@ class TestPeriodicReapHelper:
             'the audit must read clean after the periodic reap reclaims the orphan'
         )
         assert worker._last_reap_at == _NOW, 'the reap ran and advanced the clock'
+
+    async def test_reap_is_rate_limited_by_interval(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        worker._reap_interval_s = 50.0
+
+        # First call: nothing to reap yet, but it still runs (no prior call)
+        # and advances the clock.
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
+        assert worker._last_reap_at == _NOW
+
+        # A new aged orphan appears after the first call.
+        orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        # WITHIN the interval (10s < 50s) — must be rate-limited: no reap,
+        # no clock advance.
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW + 10)
+        assert orphan.exists(), 'a call within _reap_interval_s must be rate-limited'
+        assert worker._last_reap_at == _NOW, (
+            'a rate-limited call must not advance _last_reap_at'
+        )
+
+        # PAST the interval (60s > 50s) — must fire and reap.
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW + 60)
+        assert not orphan.exists(), 'a call past _reap_interval_s must reap'
+        assert worker._last_reap_at == _NOW + 60
