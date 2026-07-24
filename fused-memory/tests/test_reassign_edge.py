@@ -34,7 +34,6 @@ from fused_memory.backends.graphiti_client import (
     _MultiTenantFalkorDriver,
 )
 
-
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.reassign_edge — validation slice
 # ---------------------------------------------------------------------------
