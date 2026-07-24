@@ -376,6 +376,7 @@ Management:
 - set_entity_summary: Overwrite an entity node's summary with explicit text (empty clears); bypasses edge-derivation — use to force-clear baked-in stale narrative
 - rename_entity: Rename an entity node to an exact new name (accepts entity_uuid or entity_name) — use to correct mis-named nodes (e.g. non-canonical task-entity names)
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
+- reassign_edge: Re-point one edge's endpoint (source/target) onto a different entity node, losslessly (preserves uuid/fact/embedding/temporal/episodes); refreshes both affected summaries — use to un-conflate a fact attached to the wrong node
 - delete_entity: Delete an entity node by UUID (DETACH DELETE; guards on active edges unless force=True; refreshes neighbour summaries)
 - get_status: Health check for all backends
 - get_dead_letters: Inspect dead-lettered items from the durable write queue and event queue
