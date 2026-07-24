@@ -757,3 +757,31 @@ class TestReassignEdgeMcpTool:
         parsed = _parse_tool_result(result)
         assert 'error' in parsed
         assert 'FalkorDB connection failed' in parsed['error']
+
+
+# ---------------------------------------------------------------------------
+# step-11: reassign_edge disallow-list stage membership
+# ---------------------------------------------------------------------------
+
+
+class TestDisallowListForReassignEdge:
+    """reassign_edge is a memory write: it must be in DISALLOW_MEMORY_WRITES
+    (blocked in Stage 3 read-only) but NOT in STAGE1_DISALLOWED (Stage 1 may
+    call it)."""
+
+    def test_reassign_edge_in_disallow_memory_writes(self):
+        """'mcp__fused-memory__reassign_edge' must be in DISALLOW_MEMORY_WRITES
+        so Stage 3 (read-only) cannot call it."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert 'mcp__fused-memory__reassign_edge' in DISALLOW_MEMORY_WRITES
+
+    def test_reassign_edge_not_in_stage1_disallowed(self):
+        """Stage 1 must be able to call reassign_edge (not in STAGE1_DISALLOWED)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__reassign_edge' not in STAGE1_DISALLOWED
+
+    def test_reassign_edge_in_stage3_disallowed(self):
+        """Stage 3 must NOT be able to call reassign_edge (in STAGE3_DISALLOWED
+        via DISALLOW_MEMORY_WRITES)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert 'mcp__fused-memory__reassign_edge' in STAGE3_DISALLOWED
