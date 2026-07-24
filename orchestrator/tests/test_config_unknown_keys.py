@@ -11,7 +11,9 @@ import logging
 from pathlib import Path
 
 import yaml
+from click.testing import CliRunner
 
+from orchestrator.cli import main
 from orchestrator.config import (
     ConfigUnknownKey,
     OrchestratorConfig,
@@ -183,3 +185,34 @@ def test_load_config_logs_warning_naming_unknown_key(tmp_path, monkeypatch, capl
     assert any(
         'spare_warm_lanes' in rec.getMessage() for rec in caplog.records
     ), 'expected a WARNING naming the unknown key spare_warm_lanes'
+
+
+# --- check-config CLI subcommand ---------------------------------------------
+
+
+def test_check_config_clean_exits_zero(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'max_concurrent_tasks': 3, 'git': {'remote': 'origin'}},
+        name='config.yaml',
+    )
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+    assert result.exit_code == 0, result.output
+    # A clean/OK line is printed, and no unknown-key rows appear.
+    assert result.output.strip(), 'expected a clean/OK line'
+    assert 'spare_warm_lanes' not in result.output
+    assert 'bogus_key' not in result.output
+
+
+def test_check_config_reports_unknown_keys_and_exits_one(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'bogus_key': 1, 'spare_warm_lanes': 8},
+        name='config.yaml',
+    )
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+    assert result.exit_code == 1, result.output
+    assert 'bogus_key' in result.output
+    assert 'spare_warm_lanes' in result.output
+    # The placement hint points at the real home of the incident key.
+    assert 'git.spare_warm_lanes' in result.output
