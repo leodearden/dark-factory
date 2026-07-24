@@ -3409,6 +3409,182 @@ class TestLaneLifecycleRouting:
 
 
 # ===========================================================================
+# Task 2986 (W2b) step-1 RED: single-writer — acquire_for (fresh) writes the
+# durable ASSIGNED record through the SAME moment it flips the in-memory state
+# (PRD warm-lane-exhaustion-hardening boundary row 1). Today acquire_for only
+# mutates the in-memory _lanes/_assignments, so the durable record is left on
+# its stale (RELEASED) value — these fail until step-2.
+# ===========================================================================
+
+
+class TestAcquireForWritesThroughDurable:
+    def test_fresh_acquire_writes_assigned_record(self, tmp_path: Path):
+        """boundary row 1: acquire_for(fresh) brings the durable record to
+        ASSIGNED:branch_name at the moment it flips the in-memory state."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        # Seed the record to RELEASED (prior task 7 released the lane).
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/7')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='7')
+        lifecycle.transition(lane, DurableLaneState.RELEASED)
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Fresh acquire for a NEW task (not in the in-memory map).
+        result = asyncio.run(pool.acquire_for('42'))
+
+        assert result is not None
+        acquired, reused = result
+        assert acquired == lane
+        assert reused is False
+        # (a) in-memory map + state flipped
+        assert pool.assignment_for('42') == lane
+        assert pool.state(lane) == LaneState.ASSIGNED
+        # (b) durable record mirrored through to ASSIGNED:42
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+
+    def test_fresh_acquire_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): acquire_for writes NO durable
+        record — byte-identical to the pre-record-routing behavior."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+
+        result = asyncio.run(pool.acquire_for('42'))
+
+        assert result is not None
+        assert pool.assignment_for('42') == base / '_lane-0'
+        assert pool.state(base / '_lane-0') == LaneState.ASSIGNED
+        assert not (base / '.lane-state').exists()
+
+    def test_reuse_acquire_does_not_rewrite_record(self, tmp_path: Path):
+        """The reuse branch (branch already mapped) leaves the ASSIGNED record
+        untouched — note_assigned would no-op, and no fresh write is issued."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        first = asyncio.run(pool.acquire_for('42'))
+        assert first is not None
+        record1 = lifecycle.read(lane)
+        assert record1 is not None
+        assert record1.state == DurableLaneState.ASSIGNED
+        assert record1.task_id == '42'
+
+        # Reuse: same branch, already mapped → (same_lane, True), no re-write.
+        second = asyncio.run(pool.acquire_for('42'))
+        assert second is not None
+        lane2, reused2 = second
+        assert lane2 == lane
+        assert reused2 is True
+        record2 = lifecycle.read(lane)
+        assert record2 is not None
+        assert record2.state == DurableLaneState.ASSIGNED
+        assert record2.task_id == '42'
+        assert record2.updated_at == record1.updated_at  # no re-write
+
+
+# ===========================================================================
+# Task 2986 (W2b) step-3 RED: single-writer — release writes the durable
+# RELEASED record through the moment it flips the in-memory state to FREE
+# (PRD warm-lane-exhaustion-hardening boundary row 2). Today release only
+# mutates the in-memory _lanes/_assignments — these fail until step-4.
+# ===========================================================================
+
+
+class TestReleaseWritesThroughDurable:
+    def test_release_writes_released_record(self, tmp_path: Path):
+        """boundary row 2: release brings the durable record ASSIGNED->RELEASED
+        with task_id cleared, at the moment it flips in-memory state to FREE."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Bring the lane to durable ASSIGNED:42 + in-memory ASSIGNED+mapped.
+        asyncio.run(pool.acquire_for('42'))
+        assigned_rec = lifecycle.read(lane)
+        assert assigned_rec is not None
+        assert assigned_rec.state == DurableLaneState.ASSIGNED
+
+        asyncio.run(pool.release(lane))
+
+        # (a) in-memory: FREE + assignment dropped
+        assert pool.state(lane) == LaneState.FREE
+        assert pool.assignment_for('42') is None
+        # (b) durable record mirrored through to RELEASED, task_id cleared
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.RELEASED
+        assert record.task_id is None
+
+    def test_release_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): release writes NO durable record."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+
+        asyncio.run(pool.acquire_for('42'))
+        asyncio.run(pool.release(base / '_lane-0'))
+
+        assert pool.state(base / '_lane-0') == LaneState.FREE
+        assert not (base / '.lane-state').exists()
+
+    def test_release_already_released_record_is_noop(self, tmp_path: Path):
+        """Releasing a lane whose record is already RELEASED (or absent) is a
+        no-op — never raises, never writes an illegal RELEASED->RELEASED edge."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        # Seed the record to RELEASED directly.
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/7')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='7')
+        lifecycle.transition(lane, DurableLaneState.RELEASED)
+        released_rec = lifecycle.read(lane)
+        assert released_rec is not None
+        released_at = released_rec.updated_at
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Lane is FREE in-memory + RELEASED on disk → release must be a no-op.
+        asyncio.run(pool.release(lane))  # must not raise
+
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.RELEASED
+        assert record.updated_at == released_at  # untouched, no RELEASED->RELEASED
+
+    def test_release_absent_record_is_noop(self, tmp_path: Path):
+        """Releasing a known lane with NO durable record is a no-op (no write)."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        asyncio.run(pool.release(lane))  # must not raise
+
+        assert lifecycle.read(lane) is None
+
+
+# ===========================================================================
 # Step-6: RED — GitOps.refresh_warm_base unit + inv.9 promote-provenance
 # ===========================================================================
 
@@ -5191,3 +5367,295 @@ class TestReclaimVictim:
         victim, lane = result
         assert victim == 'A', f'self skipped, must pick A, got {victim!r}'
         assert lane == lane_a
+
+
+# ===========================================================================
+# Task 2986 (W2b) step-5 RED: single-writer — reclaim_victim (steal) re-keys
+# the durable record victim -> thief at the moment it re-keys the in-memory
+# map (PRD warm-lane-exhaustion-hardening boundary row 3). Because
+# LaneLifecycle.note_assigned never STEALS (a different-task ASSIGNED->ASSIGNED
+# raises), the durable re-key is release-then-assign: victim ASSIGNED->RELEASED,
+# then thief RELEASED->ASSIGNED. Fails today (reclaim_victim is cache-only).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestReclaimVictimWritesThroughDurable:
+    async def test_steal_rekeys_durable_record_to_thief(self, tmp_path: Path):
+        """boundary row 3: after the steal the durable record is ASSIGNED:thief
+        (victim released, thief assigned) on the SAME lane."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+
+        pool = _make_pool(tmp_path, size=1)
+        pool.set_lane_lifecycle(lifecycle)
+
+        # Assign the victim (durable ASSIGNED:victim via write-through acquire).
+        acq_v = await pool.acquire_for('victim')
+        assert acq_v is not None
+        lane_v, _ = acq_v
+        rec_v = lifecycle.read(lane_v)
+        assert rec_v is not None
+        assert rec_v.state == DurableLaneState.ASSIGNED
+        assert rec_v.task_id == 'victim'
+
+        # Steal victim's lane for thief (victim non-dispatched).
+        result = await pool.reclaim_victim('thief', {'victim'}, lambda b: False)
+
+        assert result is not None
+        victim, lane = result
+        assert victim == 'victim'
+        assert lane == lane_v
+        # (a) in-memory map re-keyed victim -> thief; lane stays ASSIGNED
+        assert pool.assignment_for('victim') is None
+        assert pool.assignment_for('thief') == lane_v
+        assert pool.state(lane_v) == LaneState.ASSIGNED
+        # (b) durable record: ASSIGNED with task_id == thief
+        record = lifecycle.read(lane_v)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == 'thief'
+
+    async def test_steal_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): reclaim_victim writes no record."""
+        pool = _make_pool(tmp_path, size=1)
+        base = tmp_path / 'worktrees'
+
+        acq_v = await pool.acquire_for('victim')
+        assert acq_v is not None
+        lane_v, _ = acq_v
+
+        result = await pool.reclaim_victim('thief', {'victim'}, lambda b: False)
+
+        assert result is not None
+        assert pool.assignment_for('thief') == lane_v
+        assert pool.state(lane_v) == LaneState.ASSIGNED
+        assert not (base / '.lane-state').exists()
+
+
+# ===========================================================================
+# Task 2986 (W2b) step-7 RED: loud, fail-open drift (boundary row 4 + I3/I4/I5).
+# A durable-write failure (OSError — .lane-state unwritable — or
+# IllegalLaneTransition) must NEVER fail acquire/release (I3), logs a WARNING,
+# increments a bounded drift counter, and fires an opaque _on_lane_record_drift
+# callback ONCE the counter reaches drift_l2_threshold (I4). A subsequent
+# SUCCESSFUL durable write resets the counter to 0 (re-arm, I4). restore_
+# assignment shares the same guarded seam (I5). Fails today: no counter,
+# no threshold constructor param, no callback.
+# ===========================================================================
+
+
+class _DriftStubLifecycle(LaneLifecycle):
+    """LaneLifecycle stand-in for the pool drift-counter tests.
+
+    ``fail=True`` → every durable write raises ``OSError`` (simulating an
+    unwritable ``.lane-state``; deterministic under any test UID, no chmod —
+    chmod is ignored under root and would make the boundary-row-4 test flaky).
+    ``fail=False`` → the write 'succeeds' (a no-op), so the pool resets its
+    drift counter. Records every ``note_assigned`` call for assertion.
+    """
+
+    def __init__(self, *, fail: bool = True) -> None:
+        # Throwaway base: every LaneLifecycle method the pool touches
+        # (note_assigned / read / transition) is overridden below, so the
+        # real record-directory machinery is never exercised.
+        super().__init__(worktree_base=Path('/nonexistent-drift-stub-base'))
+        self.fail = fail
+        self.note_assigned_calls: list[tuple[str, str]] = []
+
+    def note_assigned(self, lane, *, task_id, title=None, branch=None):
+        self.note_assigned_calls.append((Path(lane).name, str(task_id)))
+        if self.fail:
+            raise OSError('simulated unwritable .lane-state')
+        return None
+
+    def read(self, lane):
+        return None
+
+    def transition(self, lane, to, **fields):
+        if self.fail:
+            raise OSError('simulated unwritable .lane-state')
+        return None
+
+
+class TestDriftCounterFailOpen:
+    def test_acquire_survives_failing_durable_write(self, tmp_path: Path):
+        """I3: acquire_for still returns a lane and flips in-memory ASSIGNED
+        even when the durable write raises — never propagates the OSError."""
+        pool = _make_pool(tmp_path, size=2)
+        stub = _DriftStubLifecycle(fail=True)
+        pool.set_lane_lifecycle(stub)
+
+        result = asyncio.run(pool.acquire_for('42'))  # must not raise
+
+        assert result is not None
+        lane, reused = result
+        assert reused is False
+        assert pool.state(lane) == LaneState.ASSIGNED
+        assert pool.assignment_for('42') == lane
+        assert stub.note_assigned_calls  # a durable write was attempted
+
+    def test_failing_durable_write_logs_warning(self, tmp_path: Path, caplog):
+        """A durable-write failure logs a WARNING on the pool logger."""
+        pool = _make_pool(tmp_path, size=1)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.warm_lane_pool'):
+            asyncio.run(pool.acquire_for('42'))
+
+        assert 'durable record mirror' in caplog.text
+
+    def test_drift_counter_increments_per_failed_write(self, tmp_path: Path):
+        """The drift counter increments once per failed durable write."""
+        pool = _make_pool(tmp_path, size=3)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+
+        assert pool._drift_count == 0
+        asyncio.run(pool.acquire_for('a'))
+        assert pool._drift_count == 1
+        asyncio.run(pool.acquire_for('b'))
+        assert pool._drift_count == 2
+
+    def test_callback_fires_at_threshold_exactly_once(self, tmp_path: Path):
+        """I4: with threshold=2 the callback fires EXACTLY once — at the 2nd
+        failed write, not on the first."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=2)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+        fired: list[int] = []
+        pool._on_lane_record_drift = lambda count: fired.append(count)
+
+        asyncio.run(pool.acquire_for('a'))  # count=1 < 2 → no fire
+        assert fired == []
+        asyncio.run(pool.acquire_for('b'))  # count=2 >= 2 → fire once
+        assert fired == [2]
+
+    def test_successful_write_resets_drift_counter(self, tmp_path: Path):
+        """I4 re-arm: a subsequent SUCCESSFUL durable write resets the counter."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=2)
+        stub = _DriftStubLifecycle(fail=True)
+        pool.set_lane_lifecycle(stub)
+
+        asyncio.run(pool.acquire_for('a'))
+        asyncio.run(pool.acquire_for('b'))
+        assert pool._drift_count == 2
+
+        stub.fail = False  # .lane-state becomes writable again
+        asyncio.run(pool.acquire_for('c'))  # healthy write resets
+        assert pool._drift_count == 0
+
+    def test_callback_default_none_is_noop(self, tmp_path: Path):
+        """Default _on_lane_record_drift is None → failing writes never raise
+        even past the threshold (byte-identical to an unwired pool)."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=1)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+
+        assert pool._on_lane_record_drift is None
+        asyncio.run(pool.acquire_for('a'))  # count=1 >= 1 but callback None
+        asyncio.run(pool.acquire_for('b'))
+        assert pool._drift_count == 2  # still counts, just no callback
+
+    def test_restore_assignment_shares_guarded_seam(self, tmp_path: Path):
+        """I5: restore_assignment routes through the SAME guarded seam — a
+        failing lifecycle increments the counter and stays fail-open; a healthy
+        one writes ASSIGNED and resets the counter."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=2, drift_l2_threshold=5)
+        stub = _DriftStubLifecycle(fail=True)
+        pool.set_lane_lifecycle(stub)
+        lane0 = base / '_lane-0'
+
+        pool.restore_assignment('42', lane0)  # fail-open, must not raise
+
+        assert pool.state(lane0) == LaneState.ASSIGNED  # cache still updated
+        assert pool.assignment_for('42') == lane0
+        assert pool._drift_count == 1
+
+        stub.fail = False
+        pool.restore_assignment('99', base / '_lane-1')  # healthy → reset
+        assert pool._drift_count == 0
+
+    def test_callback_failure_never_breaks_acquire(self, tmp_path: Path):
+        """I3: a callback that itself raises is swallowed — acquire still
+        succeeds and never propagates the callback's exception."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=2, drift_l2_threshold=1)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+
+        def _boom(count: int) -> None:
+            raise RuntimeError('callback blew up')
+
+        pool._on_lane_record_drift = _boom
+
+        result = asyncio.run(pool.acquire_for('a'))  # must not raise
+        assert result is not None
+        assert pool._drift_count == 1
+
+    def test_release_skip_does_not_reset_drift_counter(self, tmp_path: Path):
+        """I4 re-arm is write-scoped: a ``release`` whose durable record is NOT
+        ASSIGNED/IN_USE makes ``_note_released_durable`` SKIP the transition —
+        only a ``read`` happens, no durable write is attempted. A successful
+        read is NOT evidence the ``.lane-state`` is writable (the failure mode
+        this feature targets is writable-fails-but-readable), so a benign skip
+        must NOT reset the drift counter, else it would mask accumulated drift.
+
+        Regression for the reviewer amendment: previously ANY non-raising
+        durable call (including a read-only skip) reset the counter to 0.
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=5)
+        # fail=True → note_assigned/transition raise OSError; read → None, so
+        # _note_released_durable sees a non-ASSIGNED record and skips the write.
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+
+        # Accumulate drift via two failing acquires (each attempts a write).
+        result = asyncio.run(pool.acquire_for('a'))
+        assert result is not None
+        lane_a, _ = result
+        asyncio.run(pool.acquire_for('b'))
+        assert pool._drift_count == 2
+
+        # Release lane_a: the closure reads None → skips the RELEASED
+        # transition (no write). The counter MUST stay at 2, not reset to 0.
+        asyncio.run(pool.release(lane_a))
+        assert pool._drift_count == 2
+
+    def test_acquire_fail_release_skip_cycle_still_reaches_threshold(
+        self, tmp_path: Path,
+    ):
+        """Under SUSTAINED durable-write failure, an acquire-fail / release-skip
+        cycle must still climb to ``drift_l2_threshold`` and fire the callback.
+        Each failing acquire increments; the interleaved release-skip must NOT
+        reset (else the counter oscillates below threshold forever and the
+        born-at-L2 escalation never fires — precisely when it matters most).
+
+        Regression for the reviewer amendment.
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        pool = WarmLanePool(worktree_base=base, size=3, drift_l2_threshold=2)
+        pool.set_lane_lifecycle(_DriftStubLifecycle(fail=True))
+        fired: list[int] = []
+        pool._on_lane_record_drift = lambda count: fired.append(count)
+
+        result = asyncio.run(pool.acquire_for('a'))  # write fails → count=1
+        assert result is not None
+        lane_a, _ = result
+        assert pool._drift_count == 1
+        assert fired == []
+
+        asyncio.run(pool.release(lane_a))  # read→None skip → must NOT reset
+        assert pool._drift_count == 1
+
+        asyncio.run(pool.acquire_for('b'))  # write fails → count=2 → fire once
+        assert pool._drift_count == 2
+        assert fired == [2]

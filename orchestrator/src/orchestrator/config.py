@@ -1942,6 +1942,27 @@ class GitConfig(BaseModel):
             'WARNING-logged per steal (ops signal, not silently absorbed).'
         ),
     )
+    warm_lane_drift_l2_threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Number of consecutive durable-record mirror failures the '
+            'WarmLanePool tolerates before firing its _on_lane_record_drift '
+            'callback (the Harness installs a born-at-L2 lane_record_drift '
+            'filer there).  A durable-write failure (OSError — .lane-state '
+            'unwritable — or IllegalLaneTransition) increments a drift counter '
+            'and logs a WARNING but NEVER fails acquire/release (fail-open, '
+            'PRD warm-lane-exhaustion-hardening W2b I3); at this threshold the '
+            'callback fires ONCE (deduped to a single pending L2 via '
+            'find_pending_l2_by_root_cause), and any subsequent SUCCESSFUL '
+            'durable write resets the counter to 0 (re-arm, I4).  GitOps plumbs '
+            'this straight into the pool constructor (self.config IS the '
+            'GitConfig).  Default 3 per PRD Open Q2; green-tier/hot-reloadable.  '
+            'defaults.yaml deliberately does NOT list this knob — the Field '
+            'default here is the single source of truth (matching the other '
+            'warm_lane_* knobs; a second source would drift).'
+        ),
+    )
     max_interactive_worktrees: int = Field(
         default=2,
         ge=1,

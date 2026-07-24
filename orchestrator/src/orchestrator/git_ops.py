@@ -1474,7 +1474,17 @@ class GitOps:
             self.warm_lane_pool: WarmLanePool | None = WarmLanePool(
                 worktree_base=self.worktree_base,
                 size=warm_lane_pool_size,
+                drift_l2_threshold=config.warm_lane_drift_l2_threshold,
             )
+            # Wire the shared durable-record writer so the pool is the SOLE
+            # writer of ASSIGNED/RELEASED .lane-state records at the moment the
+            # in-memory state flips (task 2986, W2b I1: record ≡ map after every
+            # mutation).  Previously only harness crash-recovery wired this;
+            # doing it here makes write-through + fail-open hold UNCONDITIONALLY,
+            # including GitOps-level unit tests.  The harness crash-recovery
+            # set_lane_lifecycle call is now a redundant idempotent no-op (same
+            # LaneLifecycle instance).
+            self.warm_lane_pool.set_lane_lifecycle(self._lane_lifecycle)
         else:
             self.warm_lane_pool = None
         # Merge-speculation warm-lane pool — None when knob off or size=0.
@@ -4197,13 +4207,23 @@ class GitOps:
                 lane, warm, exc_info=True,
             )
 
-    async def _try_reclaim_lane_for(self, branch_name: str) -> Path | None:
+    async def _try_reclaim_lane_for(
+        self,
+        branch_name: str,
+        *,
+        title: str | None = None,
+        branch: str | None = None,
+    ) -> Path | None:
         """Attempt to steal a non-dispatched non-terminal lane for *branch_name*.
 
         Called from :meth:`acquire_warm_lane` when :meth:`acquire_for` returns
         None (pool exhausted).  Returns the reclaimed lane Path on success, or
         None if either callback is not wired, the candidate set is empty, or
         no eligible victim exists.
+
+        *title*/*branch* are threaded into :meth:`WarmLanePool.reclaim_victim`'s
+        durable write-through (task 2986, single writer) so the re-keyed
+        ASSIGNED record keeps the thief's task_id/title/branch.
 
         Victim eligibility (checked by :meth:`WarmLanePool.reclaim_victim`):
         - ``victim != branch_name`` — never steal from self.
@@ -4243,6 +4263,7 @@ class GitOps:
 
         victim_result = await pool.reclaim_victim(
             branch_name, eligible, self.warm_lane_dispatched_predicate,
+            title=title, branch=branch,
         )
         if victim_result is None:
             return None
@@ -4742,11 +4763,21 @@ class GitOps:
         ):
             return WarmLaneUnavailable.SOFT_PRESSURE
 
-        acq = await self.warm_lane_pool.acquire_for(branch_name)
+        # Computed BEFORE acquire_for so it can be threaded into the pool's
+        # durable write-through (task 2986, single writer): the pool writes the
+        # ASSIGNED record with task_id/title/branch at the moment it flips the
+        # in-memory slot, so GitOps must supply the branch (and title) up front.
+        full_branch = f'{self.config.branch_prefix}{branch_name}'
+
+        acq = await self.warm_lane_pool.acquire_for(
+            branch_name, title=expected_title, branch=full_branch,
+        )
         if acq is None:
             # Pool exhausted — try to reclaim a non-dispatched non-terminal lane
             # before falling back to EXHAUSTED (task 1933 safety valve).
-            reclaimed = await self._try_reclaim_lane_for(branch_name)
+            reclaimed = await self._try_reclaim_lane_for(
+                branch_name, title=expected_title, branch=full_branch,
+            )
             if reclaimed is None:
                 # Task 2984 (PRD α): carry the typed census on the exhaustion
                 # path so an operator sees WHY the pool is full (free / held by
@@ -4767,8 +4798,6 @@ class GitOps:
             lane, reused = reclaimed, False
         else:
             lane, reused = acq
-
-        full_branch = f'{self.config.branch_prefix}{branch_name}'
 
         # Call-LOCAL route classifier (W11 eta, PRD Mechanism 3) — NOT
         # instance state: acquire_warm_lane runs concurrently for different
@@ -5129,8 +5158,14 @@ class GitOps:
                                 )
                             )
                             if _disk_ident_ok:
-                                # Record the mapping and route to reuse
-                                self.warm_lane_pool.note_assignment(branch_name, lane)
+                                # Record the mapping and route to reuse. Thread
+                                # title/branch so the pool's durable write-through
+                                # (task 2986, single writer) keeps the record's
+                                # task_id/title/branch on the disk-backstop path.
+                                self.warm_lane_pool.note_assignment(
+                                    branch_name, lane,
+                                    title=expected_title, branch=full_branch,
+                                )
                                 disk_reuse = True
                             else:
                                 logger.warning(
@@ -5316,81 +5351,41 @@ class GitOps:
     def _note_assigned_via_route(
         self, lane: Path, route: AcquireRoute, task_id: str, title: str | None, branch: str,
     ) -> None:
-        """Route-named durable ASSIGNED write for :meth:`_acquire_warm_lane_impl`.
+        """Route-classification INFO log for :meth:`_acquire_warm_lane_impl`.
 
-        Normalizes whatever state the lane's durable record is CURRENTLY in
-        onto a legal edge ending at ASSIGNED, rather than calling
-        ``transition(lane, ASSIGNED)`` directly — ``LEGAL_TRANSITIONS``
-        forbids ``(None, ASSIGNED)`` and ``(ASSIGNED, ASSIGNED)``, and the
-        pool's 2-value FREE/ASSIGNED cache does not map 1:1 onto the 6-state
-        durable model:
+        The durable ASSIGNED record is now written by the :class:`WarmLanePool`
+        SINGLE writer (task 2986, PRD warm-lane-exhaustion-hardening W2b I2) at
+        the moment the in-memory state flips — ``acquire_for`` (fresh alloc),
+        ``reclaim_victim`` (steal) and ``note_assignment`` (disk-backstop) each
+        thread ``task_id``/``title``/``branch`` into the pool's durable
+        write-through. This method NO LONGER writes or normalizes the durable
+        record; it retains ONLY the route-classification INFO log line (PRD W11
+        eta Mechanism 3 observability), naming which acquire route the lane took
+        and the route's canonical durable edge (read from
+        ``ACQUIRE_ROUTE_TRANSITIONS[route]``, keeping the route table
+        load-bearing for observability).
 
-        * Same-task reuse (already at the route's target state for this
-          task_id): no-op — idempotent.
-        * Currently ASSIGNED (to a DIFFERENT task) or IN_USE (steal/recycle):
-          released first, so RELEASED -> target is the edge actually taken.
-        * No record yet (``None``): bootstrapped ``SEED -> REGISTERED``
-          before the write.
-        * SEED (should not normally occur post-gamma, but handled for
-          completeness): registered before the write.
-        * REGISTERED or RELEASED: written directly (both are legal
-          predecessors of ASSIGNED).
-
-        The terminal target is read from ``ACQUIRE_ROUTE_TRANSITIONS[route][1]``
-        — always ``LaneState.ASSIGNED`` by construction (validated at
-        :mod:`orchestrator.lane_lifecycle` import time) — making the route
-        table load-bearing, and an INFO log line records which named route
-        (PRD W11 eta Mechanism 3) the acquire took.
+        ``task_id``/``title``/``branch`` are retained on the signature (the 5
+        call sites pass them) to keep the log line and future observability
+        self-describing; they no longer drive any durable write.
 
         Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`):
-        any exception (including a genuine ``IllegalLaneTransition``, e.g. a
-        QUARANTINED lane) is logged and swallowed so a durable-record hiccup
-        never regresses ``acquire_warm_lane`` itself.
+        any exception is logged and swallowed so a logging hiccup never
+        regresses ``acquire_warm_lane`` itself.
         """
-        target = None
         try:
-            target = ACQUIRE_ROUTE_TRANSITIONS[route][1]
-            rec = self._lane_lifecycle.read(lane)
-            original_state = rec.state if rec is not None else None
-            if (
-                rec is not None
-                and rec.state is target
-                and rec.task_id == str(task_id)
-            ):
-                logger.info(
-                    'acquire_warm_lane: route=%s edge=%s->%s(noop) lane=%s task=%s',
-                    route.value,
-                    original_state.value if original_state is not None else 'none',
-                    target.value, lane, task_id,
-                )
-                return  # idempotent same-task reuse
-            state = original_state
-            if state in (LaneState.ASSIGNED, LaneState.IN_USE):
-                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
-                state = LaneState.RELEASED
-            if state is None:
-                self._lane_lifecycle.transition(lane, LaneState.SEED)
-                self._lane_lifecycle.transition(
-                    lane, LaneState.REGISTERED, branch=branch,
-                )
-            elif state is LaneState.SEED:
-                self._lane_lifecycle.transition(
-                    lane, LaneState.REGISTERED, branch=branch,
-                )
-            self._lane_lifecycle.transition(
-                lane, target, task_id=str(task_id), title=title, branch=branch,
-            )
+            src, dst = ACQUIRE_ROUTE_TRANSITIONS[route]
             logger.info(
                 'acquire_warm_lane: route=%s edge=%s->%s lane=%s task=%s',
                 route.value,
-                original_state.value if original_state is not None else 'none',
-                target.value, lane, task_id,
+                src.value if src is not None else 'none',
+                dst.value, lane, task_id,
             )
         except Exception:
             logger.warning(
-                '_note_assigned_via_route: failed to record %s for lane %s '
-                '(task %s, route %s) — durable record may be stale/inconsistent',
-                target, lane, task_id, getattr(route, 'value', route), exc_info=True,
+                '_note_assigned_via_route: route-classification log failed for '
+                'lane %s (task %s, route %s)',
+                lane, task_id, getattr(route, 'value', route), exc_info=True,
             )
 
     async def _reuse_warm_lane(
@@ -5776,38 +5771,17 @@ class GitOps:
 
         await self._delete_branch_if_on_main(full_branch, context='release_warm_lane')
 
+        # The pool's release() writes the durable RELEASED record (task 2986,
+        # single writer): _note_released_durable transitions an ASSIGNED/IN_USE
+        # lane -> RELEASED at the moment the in-memory slot flips to FREE, so
+        # GitOps no longer issues a separate durable RELEASED write here.
         await self.warm_lane_pool.release(lane_dir)
-        self._lifecycle_note_released(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
 
         # §9.5 η (task 2442): eager free-first release-thin — LAST step, so a
         # thin hiccup can never strand the pool release above (inv.11).
         if self.config.warm_lane_release_thin:
             await self._run_thin_warm_lane(lane_dir)
-
-    def _lifecycle_note_released(self, lane: Path) -> None:
-        """Best-effort durable RELEASED write for :meth:`release_warm_lane`.
-
-        Only ASSIGNED or IN_USE legally transition to RELEASED — a lane with
-        no record, or already REGISTERED/RELEASED, is left untouched (a
-        REGISTERED -> RELEASED or RELEASED -> RELEASED edge is not legal, so
-        this never attempts either).
-
-        Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`
-        and :meth:`_note_assigned_via_route`): any exception is logged and
-        swallowed so a durable-record hiccup never regresses
-        ``release_warm_lane`` itself (contractually never-raise).
-        """
-        try:
-            rec = self._lane_lifecycle.read(lane)
-            if rec is not None and rec.state in (LaneState.ASSIGNED, LaneState.IN_USE):
-                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
-        except Exception:
-            logger.warning(
-                '_lifecycle_note_released: failed to record RELEASED for lane '
-                '%s — durable record may be stale/inconsistent',
-                lane, exc_info=True,
-            )
 
     async def detach_lane_checkout(self, lane: Path, bare_id: str) -> bool:
         """Commit WIP then detach *lane*'s HEAD, preserving branch and worktree.
