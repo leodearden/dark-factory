@@ -77,6 +77,10 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
         (LaneState.ASSIGNED, LaneState.IN_USE),
         (LaneState.IN_USE, LaneState.RELEASED),
         (LaneState.ASSIGNED, LaneState.RELEASED),
+        # recycle a quarantined slot back into service after its bad worktree
+        # is relocated to quarantine_base — the ONE sanctioned exit from
+        # QUARANTINED; every other QUARANTINED->X stays illegal.
+        (LaneState.QUARANTINED, LaneState.RELEASED),
     }
     | {(origin, LaneState.QUARANTINED) for origin in [*list(LaneState), None]}
 )
@@ -496,12 +500,36 @@ class LaneLifecycle:
           returns the existing record UNCHANGED, with no write at all
           (idempotent).
         * Already ``ASSIGNED``/``IN_USE`` for a DIFFERENT ``task_id`` (or any
-          other state with no legal edge to ``ASSIGNED``, e.g.
-          ``QUARANTINED``): never steals, never mutates — the final
-          ``transition()`` call below raises ``IllegalLaneTransition``
-          (propagated to the caller, NOT swallowed — unlike the best-effort
-          ``GitOps`` writer methods this mirrors) and the durable record is
-          left untouched.
+          other state with no legal edge to ``ASSIGNED``): never steals,
+          never mutates — the final ``transition()`` call below raises
+          ``IllegalLaneTransition`` (propagated to the caller, NOT swallowed
+          — unlike the best-effort ``GitOps`` writer methods this mirrors)
+          and the durable record is left untouched.
+        * Current state ``QUARANTINED``: RECYCLED, not refused. Emits a LOUD
+          ``WARNING`` (never silent-heal, PRD W11 I2), routes the ONE
+          sanctioned ``QUARANTINED -> RELEASED`` recycle edge (which clears the
+          stale ``task_id``/``title``), then falls through to the terminal
+          ``RELEASED -> ASSIGNED`` below. The relocated worktree stays
+          preserved in ``quarantine_base`` for forensics; only the per-slot
+          durable record is recycled. Distinct from the different-task
+          ASSIGNED/IN_USE conflict above, which still raises/never-steals.
+
+          The recycle fires for ANY caller that presents a QUARANTINED record,
+          NOT only the fresh-acquire path: this method cannot itself verify
+          that GitOps has re-prepared a worktree, so it treats the durable
+          record as the subordinate mirror it is (PRD I1) and brings it into
+          line with the authoritative in-memory assignment the caller already
+          committed to. In a coherent pool only the genuine fresh dispatch
+          (``WarmLanePool.acquire_for`` onto a slot whose bad worktree was
+          already relocated to ``quarantine_base``, GitOps having prepared a
+          new worktree) actually presents a QUARANTINED record here — the pool's
+          other assignment callers (``reclaim_victim``, ``note_assignment``)
+          re-key a lane that is already in-memory ASSIGNED, whose durable
+          record was therefore already recycled off QUARANTINED by the acquire
+          that assigned it, while ``restore_assignment`` runs only from crash
+          recovery, which provably SKIPS QUARANTINED lanes before it ever
+          restores one (``Harness._recover_crashed_tasks``). The LOUD warning
+          surfaces every recycle, so an unexpected caller is never silent.
         * Otherwise walks the legal seed-up ladder (mirrors
           ``GitOps._note_assigned_via_route``): ``None -> SEED ->
           REGISTERED(branch=branch) -> ASSIGNED``; ``SEED -> REGISTERED ->
@@ -531,10 +559,28 @@ class LaneLifecycle:
             self.transition(lane, LaneState.REGISTERED, **registered_fields)
         elif state is LaneState.SEED:
             self.transition(lane, LaneState.REGISTERED, **registered_fields)
-        # REGISTERED/RELEASED (and any other, e.g. QUARANTINED or a
-        # different-task ASSIGNED/IN_USE conflict) fall straight through to
-        # the terminal edge below — transition() itself is the single
-        # legality gate, so a conflicting/illegal origin raises there.
+        elif state is LaneState.QUARANTINED:
+            # Recycle a genuinely-reborn slot: its bad worktree was already
+            # relocated to quarantine_base and GitOps has prepared a fresh
+            # worktree for this new task, but the durable record is still
+            # QUARANTINED. Route it back via the ONE sanctioned
+            # QUARANTINED -> RELEASED recycle edge (which clears the stale
+            # task_id/title), then fall through to the terminal
+            # RELEASED -> ASSIGNED below. LOUD, never silent-heal (PRD W11 I2):
+            # the relocated worktree stays preserved in quarantine_base for
+            # forensics — only the per-slot durable record is recycled.
+            logger.warning(
+                'lane_lifecycle: recycling QUARANTINED lane %s for fresh '
+                'assignment task_id=%s — prior quarantine record superseded '
+                '(the relocated worktree remains preserved in quarantine_base)',
+                Path(lane).name, task_id,
+            )
+            self.transition(lane, LaneState.RELEASED)
+            state = LaneState.RELEASED
+        # REGISTERED/RELEASED (and a different-task ASSIGNED/IN_USE conflict)
+        # fall straight through to the terminal edge below — transition()
+        # itself is the single legality gate, so a conflicting/illegal origin
+        # raises there.
 
         assigned_fields: dict[str, object] = {'task_id': task_id}
         if title is not None:
