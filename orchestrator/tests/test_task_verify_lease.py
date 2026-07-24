@@ -31,6 +31,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+# Reused read-only (cross-module helper, mirroring the suite's convention, e.g.
+# test_harness_task_runtime importing from test_task_runtime): the workflow spy
+# factory that builds a TaskWorkflow with all collaborators mocked.
+from test_workflow_verify_retry import _make_workflow
+
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
@@ -41,11 +46,6 @@ from orchestrator.verify_cancel import (
     read_lock_holder_pgid,
     release_merge_verify_flock,
 )
-
-# Reused read-only (cross-module helper, mirroring the suite's convention, e.g.
-# test_harness_task_runtime importing from test_task_runtime): the workflow spy
-# factory that builds a TaskWorkflow with all collaborators mocked.
-from test_workflow_verify_retry import _make_workflow
 
 
 def _git_config(**overrides) -> GitConfig:
@@ -218,6 +218,7 @@ class TestTaskLaneVerifyHoldsLease:
 
     async def test_infra_retry_verify_holds_task_lane_flock(self, tmp_path: Path):
         workflow = _build_task_workflow(tmp_path)
+        assert workflow.worktree is not None  # narrow Path | None for the spy
         lock_path = lane_lock_path(workflow.worktree)
 
         def _assert_flock_held(*_args, **_kwargs) -> VerifyResult:
