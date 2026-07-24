@@ -872,9 +872,82 @@ class GraphitiBackend:
         )
         if not node_check.result_set:
             raise NodeNotFoundError(f'Entity node not found: {new_endpoint_uuid}')
-        # Endpoint move + summary refresh: implemented in subsequent steps.
-        del source_uuid, target_uuid  # consumed by the move slice (step-4)
-        return {}
+
+        # Derive the endpoint being moved and the one left in place from the
+        # TOPOLOGY read (never the unreliable e.<end>_node_uuid properties).
+        if which_end == 'source':
+            old_endpoint_uuid, unchanged_endpoint_uuid = source_uuid, target_uuid
+        else:
+            old_endpoint_uuid, unchanged_endpoint_uuid = target_uuid, source_uuid
+
+        # No-op guard: nothing to move (and the operation is idempotent when
+        # re-run against an already-reassigned edge).
+        moved = new_endpoint_uuid != old_endpoint_uuid
+        if moved:
+            # Atomic, uuid-PRESERVING CREATE-new-relationship + DELETE-old.
+            # Properties are copied by direct old.<prop> reference (NOT
+            # ``SET new = properties(old)``) to preserve the vecf32
+            # fact_embedding type, exactly as redirect_node_edges does. The
+            # UNCHANGED endpoint property is set from the matched TOPOLOGY node;
+            # the moved endpoint from the new-endpoint param.
+            if which_end == 'source':
+                cypher = (
+                    'MATCH (old_src)-[old:RELATES_TO {uuid: $edge_uuid}]->(target) '
+                    'MATCH (new_src:Entity {uuid: $new_endpoint_uuid}) '
+                    'CREATE (new_src)-[new:RELATES_TO]->(target) '
+                    'SET new.uuid = old.uuid, '
+                    '    new.name = old.name, '
+                    '    new.fact = old.fact, '
+                    '    new.fact_embedding = old.fact_embedding, '
+                    '    new.valid_at = old.valid_at, '
+                    '    new.invalid_at = old.invalid_at, '
+                    '    new.expired_at = old.expired_at, '
+                    '    new.created_at = old.created_at, '
+                    '    new.group_id = old.group_id, '
+                    '    new.episodes = old.episodes, '
+                    '    new.reassigned_from_node_uuid = $old_endpoint_uuid, '
+                    '    new.source_node_uuid = $new_endpoint_uuid, '
+                    '    new.target_node_uuid = target.uuid '
+                    'DELETE old'
+                )
+            else:
+                cypher = (
+                    'MATCH (source)-[old:RELATES_TO {uuid: $edge_uuid}]->(old_tgt) '
+                    'MATCH (new_tgt:Entity {uuid: $new_endpoint_uuid}) '
+                    'CREATE (source)-[new:RELATES_TO]->(new_tgt) '
+                    'SET new.uuid = old.uuid, '
+                    '    new.name = old.name, '
+                    '    new.fact = old.fact, '
+                    '    new.fact_embedding = old.fact_embedding, '
+                    '    new.valid_at = old.valid_at, '
+                    '    new.invalid_at = old.invalid_at, '
+                    '    new.expired_at = old.expired_at, '
+                    '    new.created_at = old.created_at, '
+                    '    new.group_id = old.group_id, '
+                    '    new.episodes = old.episodes, '
+                    '    new.reassigned_from_node_uuid = $old_endpoint_uuid, '
+                    '    new.target_node_uuid = $new_endpoint_uuid, '
+                    '    new.source_node_uuid = source.uuid '
+                    'DELETE old'
+                )
+            await graph.query(
+                cypher,
+                {
+                    'edge_uuid': edge_uuid,
+                    'new_endpoint_uuid': new_endpoint_uuid,
+                    'old_endpoint_uuid': old_endpoint_uuid,
+                },
+            )
+
+        # (best-effort endpoint-summary refresh added in step-6)
+        return {
+            'uuid': edge_uuid,
+            'which_end': which_end,
+            'old_endpoint_uuid': old_endpoint_uuid,
+            'new_endpoint_uuid': new_endpoint_uuid,
+            'unchanged_endpoint_uuid': unchanged_endpoint_uuid,
+            'moved': moved,
+        }
 
     @_canonicalize_group_args
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
