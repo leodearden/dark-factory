@@ -3493,6 +3493,69 @@ class TestAcquireForWritesThroughDurable:
         assert record2.task_id == '42'
         assert record2.updated_at == record1.updated_at  # no re-write
 
+    def test_fresh_acquire_recycles_durably_quarantined_lane_no_drift(
+        self, tmp_path: Path, caplog,
+    ):
+        """Regression (live incident esc-__lane_record_drift__-1): a fresh
+        acquire onto a slot whose durable record is stuck QUARANTINED must
+        recycle it to ASSIGNED via the lifecycle layer — NOT drift.
+
+        Before the fix, note_assigned fell through to the illegal
+        QUARANTINED -> ASSIGNED terminal edge, the pool swallowed the
+        IllegalLaneTransition, logged 'durable record mirror ... failed', and
+        left the record QUARANTINED while the in-memory map said ASSIGNED
+        (record <-> cache drift, _drift_count climbing). This is the
+        cross-module end-to-end guard: the fix lives in
+        LaneLifecycle.note_assigned (recycle branch), so this test verifies the
+        pool <-> lifecycle wiring end to end.
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        # A durably-QUARANTINED record still carrying a STALE pin: the lane's
+        # bad worktree was relocated to quarantine_base, but its per-slot
+        # durable record never moved and is stuck QUARANTINED (the live drift
+        # scenario). _lane-0 is the first FREE lane acquire_for hands out.
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/old')
+        lifecycle.transition(
+            lane, DurableLaneState.ASSIGNED, task_id='old', title='old-demo',
+        )
+        lifecycle.transition(lane, DurableLaneState.QUARANTINED)
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.warm_lane_pool'):
+            # Must neither raise nor drift.
+            result = asyncio.run(pool.acquire_for('42'))
+
+        assert result is not None
+        acquired, reused = result
+        assert acquired == lane
+        assert reused is False
+        # (a) in-memory map + state flipped ASSIGNED
+        assert pool.assignment_for('42') == lane
+        assert pool.state(lane) == LaneState.ASSIGNED
+        # (b) durable record RECYCLED to ASSIGNED:42 — record <-> cache
+        # consistent, no drift; the stale 'old' pin is gone.
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+        # (c) the mirror write SUCCEEDED: NO 'durable record mirror ... failed'
+        # WARNING on the pool logger, and the guarded-write drift counter is
+        # re-armed at 0.
+        pool_drift_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.warm_lane_pool'
+            and 'durable record mirror' in r.getMessage()
+            and 'failed' in r.getMessage()
+        ]
+        assert pool_drift_warnings == []
+        assert pool._drift_count == 0
+
 
 # ===========================================================================
 # Task 2986 (W2b) step-3 RED: single-writer — release writes the durable
