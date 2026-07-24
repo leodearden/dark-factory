@@ -128,7 +128,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_queue import SpeculativeMergeWorker, coalesce_or_enqueue_merge_request
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import InFlightMergeRegistry, MergeRequest, QueuedBranch
 from orchestrator.verify_cancel import (
@@ -875,6 +875,74 @@ class TestFiveThreeTwoSixReplayGate:
             release_merge_verify_flock(fd_verify)
             release_merge_verify_flock(fd_uuid)
             remove_lock_holder_pgid(base)
+
+
+# ---------------------------------------------------------------------------
+# In-verify submit-identity reject helpers (row 8) -- ported from
+# test_merge_queue_c3_submit_identity.py (_commit, _make_request,
+# _verify_snapshot).
+# ---------------------------------------------------------------------------
+
+
+async def _commit(repo: Path, name: str) -> str:
+    """Add a commit on the current branch/HEAD and return its SHA.
+
+    Successive calls build a linear history, so an earlier SHA is a strict
+    ancestor of a later one (SUPERSET when the earlier SHA is the in-flight
+    tip and the later SHA is submitted).
+    """
+    (repo / f'{name}.txt').write_text(f'{name}\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', name], cwd=repo)
+    return await _head_sha(repo)
+
+
+def _make_request(
+    task_id: str,
+    branch: str,
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    request_id: str | None = None,
+    snapshot_tip: str | None = None,
+) -> MergeRequest:
+    """Build a MergeRequest with a fresh Future bound to the running loop
+    (ported from test_merge_queue_c3_submit_identity.py's _make_request)."""
+    kwargs: dict[str, object] = {}
+    if request_id is not None:
+        kwargs['request_id'] = request_id
+    if snapshot_tip is not None:
+        kwargs['snapshot_tip'] = snapshot_tip
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+        **kwargs,
+    )
+
+
+def _verify_snapshot(request_id: str, branch: str, *, verify_age_secs: float = 42.0):
+    """Fake ``live_snapshot`` reporting *request_id* as IN VERIFY.
+
+    Matches the SpeculativeMergeWorker.snapshot() entry schema --
+    ``verify_started_at`` non-None means the verify has started (ported from
+    test_merge_queue_c3_submit_identity.py's _verify_snapshot).
+    """
+    def _snap() -> dict:
+        return {'entries': [{
+            'request_id': request_id,
+            'branch': branch,
+            'state': 'verifying',
+            'verify_started_at': 1000.0,
+            'verify_age_secs': verify_age_secs,
+        }]}
+    return _snap
 
 
 # ---------------------------------------------------------------------------
