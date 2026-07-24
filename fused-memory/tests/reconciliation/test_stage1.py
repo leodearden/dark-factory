@@ -3047,3 +3047,75 @@ class TestAlreadyTrackedSystemicPatternWiring:
             'Finding must be KEPT when dark_factory is not in known_projects '
             f'(no-op guard); got items_flagged={report.items_flagged!r}'
         )
+
+
+class TestMemoryConsolidatorCitationVerificationWiring:
+    """MemoryConsolidator.run() must re-verify each flagged finding's cited
+    Mem0 memories (verify_cited_memories) AFTER super().run() and BEFORE the
+    remediation early-return, so a phantom (non-resolving) mem0 citation is
+    stripped + marked, and the stage1_* citation stats are always present on
+    report.stats (task 2978).
+
+    Driven through the remediation path: its early-return fires immediately
+    after the verifier, isolating the verifier wiring from the full-path
+    filter chain AND proving the check runs BEFORE that early-return (so both
+    full and remediation passes are covered). RED until step-8 wires
+    verify_cited_memories into run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_phantom_citation_stripped_and_marked_via_run(self):
+        stage = _make_consolidator(project_root='/tmp/reify')
+        # Remediation mode: run() early-returns right after the verifier, before
+        # the full-path filter chain.
+        stage.remediation_findings = [{'description': 'remediation'}]
+
+        async def _get(project_id, memory_id):
+            # 'good-id' resolves; 'phantom-id' is genuinely not found.
+            if memory_id == 'good-id':
+                return {'id': 'good-id', 'content': 'x', 'metadata': {}}
+            return None
+
+        assert stage.memory is not None  # AsyncMock() from _make_consolidator
+        stage.memory.get_memory_by_id = AsyncMock(side_effect=_get)  # type: ignore[union-attr]
+
+        finding = {
+            'description': 'a stage-1 finding',
+            'severity': 'medium',
+            'cited_memories': [
+                {'memory_id': 'good-id', 'store': 'mem0'},
+                {'memory_id': 'phantom-id', 'store': 'mem0'},
+            ],
+        }
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[finding],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-citation-verify',
+            )
+
+        verified_finding = report.items_flagged[0]
+        # The phantom is stripped; the resolving id remains.
+        assert [c['memory_id'] for c in verified_finding['cited_memories']] == ['good-id'], (
+            'run() must strip the non-resolving mem0 citation via verify_cited_memories; '
+            f'got cited_memories={verified_finding.get("cited_memories")!r}. '
+            'RED: verify_cited_memories is not yet wired into run().'
+        )
+        # The dropped phantom is named on the finding.
+        assert verified_finding.get('citation_failures') == [
+            {'memory_id': 'phantom-id', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+        # Citation stats are merged onto the returned report (present on this
+        # remediation path — and, by construction, on the full path too).
+        assert report.stats['stage1_phantom_citations_dropped'] == 1
+        assert 'stage1_citations_verified' in report.stats
+        assert 'stage1_citation_verification_errors' in report.stats
