@@ -801,6 +801,25 @@ class TestFiveThreeTwoSixReplayGate:
         }
         wt_task = _plant_task_dir(base, '999')
 
+        # --- Merge-reaper leg fixture -------------------------------------
+        # SpeculativeMergeWorker.reap_orphaned_merge_worktrees only reaches
+        # GitOps.cleanup_merge_worktree (and thus the C1 guarded primitive)
+        # for entries whose mtime age EXCEEDS
+        # RESOURCE_AUDIT_WORKTREE_GRACE_SECS (9000.0); a freshly-planted
+        # decoy is `continue`d past, which would make the reaper leg below
+        # VACUOUS (survival by never-being-looked-at, not by the lease
+        # guard). Back-date both merge-band decoys well past the window --
+        # the lane `.lock` is a SIBLING of the tree, so planting the lease
+        # above did not re-touch this directory's mtime.
+        #
+        # `_merge-beefbeef` is the reaper-specific POSITIVE CONTROL: aged
+        # and UNLEASED, so the same sweep that must SKIP the leased decoy
+        # must REMOVE this one.
+        merge_unleased = base / '_merge-beefbeef'
+        _plant_unleased_tree(merge_unleased)
+        _age_tree(merge_uuid, 100_000)
+        _age_tree(merge_unleased, 100_000)
+
         entered = asyncio.Event()
         release = asyncio.Event()
         observations: list[bool] = []
@@ -843,10 +862,74 @@ class TestFiveThreeTwoSixReplayGate:
                 # merge reaper THEN the crash-recovery sweep (mirrors run()'s
                 # step 1b/1c0a -> 2c ordering -- see the module docstring's
                 # "Concurrency model" section).
+                #
+                # The guarded-removal spy DELEGATES to the real bound method
+                # (this instance attribute shadows the class method, so
+                # cleanup_merge_worktree's `self.remove_merge_worktree_
+                # guarded(...)` call is what gets captured) -- it records
+                # what the reaper OFFERED to C1 and what C1 answered, so
+                # tree survival is attributable to the lease guard rather
+                # than to an inert sweep.
+                spy = _GuardedRemovalSpy(harness.git_ops.remove_merge_worktree_guarded)
+                harness.git_ops.remove_merge_worktree_guarded = spy  # type: ignore[method-assign]
                 await harness._reap_orphaned_merge_worktrees(report['requests'])
+                # Snapshot IMMEDIATELY: worker-driven removals later in this
+                # test (the throwaway verify worktree's own teardown) must
+                # not mask what THIS sweep did.
+                reap_records = list(spy.records)
                 await harness._recover_crashed_tasks()
 
-                for d in (merge_verify, merge_uuid, *infra_dirs.values()):
+                # --- MERGE-REAPER leg: attribution, not mere survival -----
+                # The aged LEASED decoy was OFFERED to C1 and survived
+                # BECAUSE C1 refused it ('skipped_lease_held').
+                offered = {p for p, _reason, _outcome in reap_records}
+                assert merge_uuid in offered, (
+                    f'the aged leased decoy was never offered to the C1 '
+                    f'guarded primitive -- the reaper leg is vacuous; '
+                    f'offered={offered}'
+                )
+                uuid_outcomes = spy.outcomes_for(merge_uuid, records=reap_records)
+                assert 'skipped_lease_held' in uuid_outcomes, (
+                    f'C1 must REFUSE removal of a live-leased merge tree; '
+                    f'got outcomes={uuid_outcomes}'
+                )
+                assert merge_uuid.exists(), (
+                    '_merge-cafe5326 must survive the reaper: C1 answered '
+                    'skipped_lease_held'
+                )
+                # REAPER POSITIVE CONTROL: the aged UNLEASED decoy was
+                # offered too, and is GONE -- this leg genuinely removes, so
+                # the leased decoy's survival above is a real refusal. The
+                # outcome string is deliberately NOT pinned ('removed' and
+                # 'failed'->rmtree-fallback both end with the tree gone):
+                # assert the filesystem, not the branch taken.
+                assert merge_unleased in offered, (
+                    f'the aged unleased decoy was never offered to C1 -- the '
+                    f'reaper never reached the removal primitive; '
+                    f'offered={offered}'
+                )
+                assert not merge_unleased.exists(), (
+                    '_merge-beefbeef (aged, unleased, unowned) must be reaped '
+                    '-- otherwise this leg proves nothing about the leased '
+                    'decoy that survived it'
+                )
+
+                # Survivors protected by OTHER mechanisms on this leg (see
+                # the module docstring's attribution matrix): `_merge-verify`
+                # never reaches C1 at all (PERSISTENT_MERGE_WORKTREE_NAME
+                # exclusion in reap_orphaned_merge_worktrees), the live
+                # verify's own `_merge-<hash>` tree is protected by the
+                # owned-ledger/grace window, and the infra bands are outside
+                # the reaper's `_merge-` band entirely.
+                call = gated.call_args
+                live_merge_tree = Path(
+                    call.args[0] if call.args else call.kwargs['worktree'],  # type: ignore[index]
+                )
+                assert live_merge_tree.exists(), (
+                    'the live verify\'s own worktree must survive the sweep '
+                    '(zero-ENOENT proxy (a))'
+                )
+                for d in (merge_verify, *infra_dirs.values()):
                     assert d.exists(), f'{d.name} must survive the concurrent sweep'
                 # Positive control: the SAME sweep cleaned the planless dir --
                 # proves the sweep is not inert.
