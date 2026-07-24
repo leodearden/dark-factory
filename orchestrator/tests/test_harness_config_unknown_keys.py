@@ -14,6 +14,7 @@ one L2 (storm escape) while a changed set re-files a distinct L2.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from escalation.models import BORN_AT_L2_SEVERITIES
@@ -145,3 +146,54 @@ async def test_none_queue_is_noop(tmp_path: Path, monkeypatch):
     )
     # Must not raise even though the census is non-empty.
     await h._file_config_unknown_keys_escalation()
+
+
+# --- reload_config surfaces the census ---------------------------------------
+
+
+def _reload_harness(tmp_path):
+    """Minimal Harness for driving reload_config() (uses self.config + event_store)."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.config = OrchestratorConfig(project_root=tmp_path)
+    h.event_store = None
+    h._run_id = 'run-test'
+    return h
+
+
+@pytest.mark.asyncio
+async def test_reload_config_surfaces_unknown_keys(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    h = _reload_harness(tmp_path)
+
+    fresh = OrchestratorConfig(project_root=tmp_path)
+    fresh._unknown_key_census = [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')]
+
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'orchestrator.yaml'))
+    with patch('orchestrator.harness.load_config', return_value=fresh):
+        report = await h.reload_config()
+
+    assert 'unknown_config_keys' in report
+    uck = report['unknown_config_keys']
+    assert isinstance(uck, list)
+    paths = {d['path'] for d in uck}
+    assert 'spare_warm_lanes' in paths
+    assert any(
+        d.get('shadow_hint') and 'git.spare_warm_lanes' in d['shadow_hint'] for d in uck
+    )
+
+
+@pytest.mark.asyncio
+async def test_reload_config_clean_yields_empty_unknown_keys(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    h = _reload_harness(tmp_path)
+
+    fresh = OrchestratorConfig(project_root=tmp_path)  # census sentinel None → []
+
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'orchestrator.yaml'))
+    with patch('orchestrator.harness.load_config', return_value=fresh):
+        report = await h.reload_config()
+
+    assert report['unknown_config_keys'] == []
