@@ -160,6 +160,12 @@ class TestDefaults:
         with pytest.raises(ValidationError):
             GitConfig(spare_warm_lanes=-1)
 
+    def test_warm_lane_drift_l2_threshold_default_three(self):
+        """GitConfig().warm_lane_drift_l2_threshold defaults to 3 (PRD Open Q2)."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig().warm_lane_drift_l2_threshold == 3
+
     def test_warm_lane_release_thin_field_defaults_false(self):
         """GitConfig.warm_lane_release_thin exists, is typed bool, and
         defaults to False (§9.5 η — mirrors warm_lane_disk_guard's
