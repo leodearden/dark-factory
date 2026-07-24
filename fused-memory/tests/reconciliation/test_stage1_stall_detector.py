@@ -31,6 +31,7 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     extract_human_operator_task_ids,
     extract_stalled_gate_backlog_task_ids,
     gate_escalated_age_secs,
+    maybe_escalate_stalled_gate_backlog,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
@@ -685,3 +686,163 @@ class TestExtractStalledGateBacklogTaskIds:
         assert extract_stalled_gate_backlog_task_ids(
             tasks, now=_GATE_NOW, threshold_secs=5 * 3600
         ) == ['5']
+
+
+# ---------------------------------------------------------------------------
+# maybe_escalate_stalled_gate_backlog (task 3017)
+# ---------------------------------------------------------------------------
+
+
+def _gate_task_record(tid, *, hours_ago: float = 49) -> dict:
+    """A blocked gate task record for task_by_id lookups (aged `hours_ago`)."""
+    stamp = (_GATE_NOW - timedelta(hours=hours_ago)).isoformat()
+    return {
+        'id': tid,
+        'status': 'blocked',
+        'title': f'Gate task {tid}',
+        'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp},
+    }
+
+
+class TestMaybeEscalateStalledGateBacklog:
+    """maybe_escalate_stalled_gate_backlog files per-task level-1 gate-backlog L1s."""
+
+    def _make_queue(self, has_open_l1_return: bool = False) -> MagicMock:
+        q = MagicMock()
+        q.has_open_l1.return_value = has_open_l1_return
+        q.make_id.return_value = 'esc-645-001'
+        q.submit.return_value = 'esc-645-001'
+        return q
+
+    @pytest.mark.asyncio
+    async def test_happy_path_submits_level1_gate_backlog(self):
+        """(a) submits one Escalation with the gate-backlog fields; returns ['645']."""
+        queue = self._make_queue(has_open_l1_return=False)
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+        task_by_id = {'645': _gate_task_record(645, hours_ago=49)}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='autopilot_video',
+            run_id='run-xyz',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == ['645']
+        queue.submit.assert_called_once()
+        submitted = queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert submitted.severity == 'blocking'
+        assert submitted.category == 'reconciliation_stale_gate_backlog'
+        assert submitted.task_id == '645'
+        assert submitted.agent_role == 'reconciliation-stage1'
+
+        combined = f'{submitted.summary}\n{submitted.detail}'
+        assert '645' in combined
+        assert 'run-xyz' in combined
+        assert stamp in combined  # the gate_escalated_at value
+        assert '49' in combined  # age indicator (~49h)
+
+    @pytest.mark.asyncio
+    async def test_skips_when_open_gate_backlog_l1_exists(self):
+        """(b) has_open_l1(tid, category=...) True → no submit; category-scoped dedup."""
+        queue = self._make_queue(has_open_l1_return=True)
+        task_by_id = {'645': _gate_task_record(645)}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+        queue.submit.assert_not_called()
+        queue.has_open_l1.assert_called_once_with(
+            '645', category='reconciliation_stale_gate_backlog'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_already_escalated_and_new(self):
+        """(c) task A already has an open gate-backlog L1, task B new → only B submitted."""
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = lambda tid, *, category=None: tid == 'A'
+        queue.make_id.return_value = 'esc-B-001'
+        queue.submit.return_value = 'esc-B-001'
+        task_by_id = {
+            'A': _gate_task_record('A', hours_ago=50),
+            'B': _gate_task_record('B', hours_ago=50),
+        }
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['A', 'B'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == ['B']
+        queue.submit.assert_called_once()
+        assert queue.submit.call_args[0][0].task_id == 'B'
+
+    @pytest.mark.asyncio
+    async def test_empty_stalled_list_returns_empty(self):
+        """(d) empty stalled_task_ids → no calls, returns []."""
+        queue = self._make_queue()
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=[],
+            task_by_id={},
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+        queue.has_open_l1.assert_not_called()
+        queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_failure_logs_warning_and_excludes(self):
+        """(e) submit raises RuntimeError → no raise; failed tid excluded from return."""
+        queue = self._make_queue(has_open_l1_return=False)
+        queue.submit.side_effect = RuntimeError('queue full')
+        task_by_id = {'645': _gate_task_record(645)}
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_escalation_unavailable_returns_empty(self, monkeypatch):
+        """(f) Escalation package unavailable (module Escalation=None) → [] with no submit."""
+        import fused_memory.reconciliation.stage1_stall_detector as mod
+
+        monkeypatch.setattr(mod, 'Escalation', None)
+        queue = self._make_queue()
+
+        result = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r',
+            stalled_task_ids=['645'],
+            task_by_id={'645': _gate_task_record(645)},
+            now=_GATE_NOW,
+        )
+
+        assert result == []
+        queue.submit.assert_not_called()
