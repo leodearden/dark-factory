@@ -2266,8 +2266,17 @@ class GitOps:
           hold) and would spuriously gate merge-lane resets/GC. The per-lane
           flock alone is the cross-process mechanism reify consults, so the
           rendezvous stays single-purpose to the merge lane.
-        * **fail-OPEN on contention** — added in step-4 (contended-flock
-          handling below is the minimal happy-path form for now).
+        * **fail-OPEN on contention** — on acquire timeout (a racing reseed
+          held the lane lock past ``_TASK_VERIFY_LEASE_WAIT_SECS``) it logs a
+          WARNING and yields WITHOUT the hold, rather than raising. The hold is
+          defense-in-depth over reify's per-lane guard; blocking or aborting the
+          task's OWN verify would be more disruptive than proceeding, and
+          proceeding-without-the-hold is exactly today's baseline (nothing held
+          it), so fail-open is strictly non-regressive. Contrast
+          :meth:`merge_verify_lease`, which RAISES
+          :class:`MergeVerifyLeaseContended` (safe there because the merge
+          worker cleanly requeues the dispatch; a task verify has no such clean
+          requeue and must never be blocked by its own lane lease).
 
         No change is made to :meth:`_run_warm_lane_gc_reclaim`: it honors the
         hold transitively by invoking reify's ``warm-lane-gc.sh``, which does
@@ -2281,10 +2290,25 @@ class GitOps:
         fd = await asyncio.to_thread(
             acquire_merge_verify_flock, lock_path, _TASK_VERIFY_LEASE_WAIT_SECS,
         )
+        if fd is None:
+            # Contended past the bounded wait: FAIL OPEN. Proceed WITHOUT the
+            # hold rather than raise/block — the task verify must never be
+            # aborted by its own lane lease, and running unprotected is exactly
+            # today's baseline (nothing held it). Only the rare racing reseed
+            # holds this lane lock, so this WARNING is the diagnosable signal
+            # that the defense-in-depth hold was skipped for this run.
+            logger.warning(
+                'task_verify_lease: contended lane lock %s (no acquire within '
+                '%.1fs) — proceeding without the hold (fail-open)',
+                lock_path, _TASK_VERIFY_LEASE_WAIT_SECS,
+            )
         try:
             yield
         finally:
-            release_merge_verify_flock(fd)
+            # Guard against the fail-open path: never release on a None fd
+            # (fcntl.flock(None, ...) raises an unsuppressed TypeError).
+            if fd is not None:
+                release_merge_verify_flock(fd)
 
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
