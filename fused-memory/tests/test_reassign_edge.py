@@ -645,3 +645,115 @@ class TestMemoryServiceReassignEdge:
             project_id='dark_factory',
         )
         assert result['status'] == 'reassigned'
+
+
+# ---------------------------------------------------------------------------
+# step-9: MCP tool reassign_edge
+# ---------------------------------------------------------------------------
+
+def _parse_tool_result(result):
+    """Normalize a call_tool result (list of content blocks or a dict) to a dict."""
+    import json
+    if isinstance(result, list):
+        content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+        return json.loads(content)
+    return result
+
+
+class TestReassignEdgeMcpTool:
+    """MCP tool reassign_edge is registered, guards its inputs, and delegates."""
+
+    @pytest.fixture
+    def mock_service(self):
+        svc = AsyncMock()
+        svc.reassign_edge = AsyncMock(return_value={
+            'status': 'reassigned', 'store': 'graphiti', 'uuid': 'edge-uuid',
+            'which_end': 'source', 'moved': True,
+        })
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        from fused_memory.server.tools import create_mcp_server
+        return create_mcp_server(mock_service)
+
+    @pytest.mark.asyncio
+    async def test_tool_is_registered(self, mcp_server):
+        tool_names = [t.name for t in await mcp_server.list_tools()]
+        assert 'reassign_edge' in tool_names
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_memory_service(self, mcp_server, mock_service):
+        await mcp_server._tool_manager.call_tool(
+            'reassign_edge',
+            {
+                'edge_uuid': 'edge-uuid',
+                'new_endpoint_uuid': 'new-uuid',
+                'which_end': 'source',
+                'project_id': 'dark_factory',
+            },
+        )
+        mock_service.reassign_edge.assert_awaited_once()
+        call_kwargs = mock_service.reassign_edge.call_args[1]
+        assert call_kwargs.get('edge_uuid') == 'edge-uuid'
+        assert call_kwargs.get('new_endpoint_uuid') == 'new-uuid'
+        assert call_kwargs.get('which_end') == 'source'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_empty_edge_uuid_returns_error(self, mcp_server, mock_service):
+        result = await mcp_server._tool_manager.call_tool(
+            'reassign_edge',
+            {'edge_uuid': '  ', 'new_endpoint_uuid': 'new-uuid',
+             'which_end': 'source', 'project_id': 'dark_factory'},
+        )
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.reassign_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_new_endpoint_uuid_returns_error(self, mcp_server, mock_service):
+        result = await mcp_server._tool_manager.call_tool(
+            'reassign_edge',
+            {'edge_uuid': 'edge-uuid', 'new_endpoint_uuid': '',
+             'which_end': 'source', 'project_id': 'dark_factory'},
+        )
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.reassign_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_which_end_returns_error(self, mcp_server, mock_service):
+        result = await mcp_server._tool_manager.call_tool(
+            'reassign_edge',
+            {'edge_uuid': 'edge-uuid', 'new_endpoint_uuid': 'new-uuid',
+             'which_end': 'sideways', 'project_id': 'dark_factory'},
+        )
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.reassign_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_error(self, mcp_server, mock_service):
+        result = await mcp_server._tool_manager.call_tool(
+            'reassign_edge',
+            {'edge_uuid': 'edge-uuid', 'new_endpoint_uuid': 'new-uuid',
+             'which_end': 'source', 'project_id': ''},
+        )
+        parsed = _parse_tool_result(result)
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.reassign_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error_dict(self, mcp_server, mock_service):
+        mock_service.reassign_edge = AsyncMock(
+            side_effect=RuntimeError('FalkorDB connection failed')
+        )
+        result = await mcp_server._tool_manager.call_tool(
+            'reassign_edge',
+            {'edge_uuid': 'edge-uuid', 'new_endpoint_uuid': 'new-uuid',
+             'which_end': 'source', 'project_id': 'dark_factory'},
+        )
+        parsed = _parse_tool_result(result)
+        assert 'error' in parsed
+        assert 'FalkorDB connection failed' in parsed['error']
