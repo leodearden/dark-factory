@@ -10032,10 +10032,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.config.sandbox.enabled and role.sandboxed:
             write_set = compute_write_set(cwd)
             # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
-            # sandbox before dispatch (task 2996). compute_write_set is pure and
-            # neither backend can grant a nonexistent path from inside the
-            # sandbox; doing it here at the single INV-5/D11 write-set
-            # consumption point fixes BOTH backends without touching them.
+            # sandbox at this single INV-5/D11 write-set consumption point, so it
+            # exists before sandbox_extras (below) is built (task 2996) — see
+            # ensure_claude_fleet_dir for the full backend rationale.
             self._ensure_sandbox_dirs(write_set)
             sandbox_modules = []
             sandbox_extras = [str(p) for p in write_set.writable_paths()]
@@ -11307,16 +11306,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
     def _ensure_sandbox_dirs(self, write_set: WriteSet) -> None:
         """Pre-create the load-bearing ``claude_fleet`` carve-out OUTSIDE the
-        sandbox before dispatch (task 2996).
+        sandbox before dispatch (task 2996) — see
+        ``orchestrator.agents.write_set.ensure_claude_fleet_dir`` for the full
+        backend rationale (why neither the pure ``compute_write_set`` nor either
+        backend can materialize this carve-out from inside the sandbox).
 
-        ``compute_write_set`` is intentionally PURE, and neither backend can
-        grant a nonexistent writable path from INSIDE the sandbox — bwrap
-        ``build_bwrap_command`` binds a writable extra only ``if
-        os.path.isdir(extra)`` and landlock ``_add_path`` skips a path that is
-        ``not os.path.isdir`` — with the parent ``~/.claude`` read-only, so the
-        agent cannot create it either. Materializing ``~/.claude/fleet`` here,
-        once, at the single INV-5/D11 write-set consumption point fixes BOTH
-        backends without touching sandbox.py / landlock_exec.py. Best-effort:
+        This wrapper owns the operator-facing failure posture: best-effort, so
         on failure it WARNs LOUDLY (loud-over-silent) with the task_id + path
         and CONTINUES — a missing fleet dir degrades only fleet session-registry
         recording, not the agent's task, so aborting the whole dispatch would be
