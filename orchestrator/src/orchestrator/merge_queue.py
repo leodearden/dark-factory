@@ -3787,6 +3787,24 @@ retirement (task ε) — distinguishes a cancel-retirement reap from the C3
 REPLACE ``'c3_replace_drop_queued'`` reap in ``worktree_reaped`` events."""
 
 
+class _RetireWorktreeP(Protocol):
+    """Narrow protocol for the git_ops worktree surface used by retirement.
+
+    Only :meth:`find_inflight_merge_worktree` and
+    :meth:`remove_merge_worktree_guarded` are called on *git_ops* inside
+    :func:`retire_cancelled_merge_request` (it never cleans up, unlike the C3
+    gate).  Declaring the parameter with this Protocol — rather than the
+    concrete :class:`~orchestrator.git_ops.GitOps` — lets test stubs that
+    implement only these two methods satisfy the type-checker without
+    inheriting from the full ``GitOps`` class (mirrors the rationale of the
+    wider :class:`_FindInflightWorktreeP` used by
+    :func:`coalesce_or_enqueue_merge_request`).
+    """
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None: ...
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str: ...
+
+
 async def retire_cancelled_merge_request(
     *,
     request_id: str,
@@ -3794,7 +3812,7 @@ async def retire_cancelled_merge_request(
     task_id: str | None,
     registry: InFlightMergeRegistry | None,
     retention: TerminalOutcomeRetention | None,
-    git_ops: GitOps | None,
+    git_ops: _RetireWorktreeP | None,
     event_store: EventStore | None,
     yields: int = 3,
 ) -> str | None:
