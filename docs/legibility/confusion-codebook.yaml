@@ -36,6 +36,37 @@ entries:
     manifested_phase: recon
     invariant_violated: 'Tool envelope mismatch: recon Stage 2 agent handed claim-verification contract and implicitly attempts grep_search tool (turns 11, 13, 15), but tool is unavailable in harness'
     note: 'Recon agent spawned for ''verify whether Mem0 GC sweep fix exists or has a bug'' (Stage 2 finding) attempted grep_search three times across separate turns, all failing with ''No such tool available''. Agent should have access to Bash grep or Explore agent type, not a nonexistent grep_search tool. Pattern: verification contract omits tool availability discovery, agent discovers by failure only.'
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 6160695f-acbc-49de-a775-9bd1beb2960e
+    origin_phase: architect
+    manifested_phase: architect
+    invariant_violated: 'Tool envelope mismatch: architect prompt mandates a fixed plan-tools MCP workflow (create_plan/add_prerequisite/.../confirm_plan) but create_plan is a deferred tool never discovered/registered in this agent''s runtime, so the mandated call fails with ''No such tool available'' only after a full exploration pass, with no fallback or self-check for tool non-availability in the prompt'
+    note: 'Digest is the periodic-census verifier re-checking a previously flagged cluster (source session a6855ce1-d65c-4c58-a77d-f834ceddcd54): architect task prompt scripts a required plan-tools MCP call sequence; create_plan turns out unregistered/deferred and errors at turn 85, after the agent already burned the whole session on step-1 exploration. Same underlying pattern already logged as this entry''s own sighting (recon Stage 2 grep_search: ''verification contract omits tool availability discovery, agent discovers by failure only'') — one-shot/architect subagents are handed prose tool contracts their actual runtime doesn''t honor without warning.'
+  - date: '2026-07-23'
+    project: dark_factory
+    session: a2952779-11c8-4256-b57c-aa7640e720de
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 'Claim-verification sub-agent for esc-5316-11 (verifying task ''Heal main-red: fix stale test_warm_lane_pool_config.sh...'') was given a verification_complete-style contract naming read_file and git_log as available tools; both failed with ''No such tool available'' — the same shim-vs-runtime mismatch (read_file/grep_search/verification_complete prose contract unsupported by the actual claude_cli backend) already documented in this entry.'
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 9df7f270-e6ea-4300-be61-eafee210dd1a
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Claim-verification one-shot session called grep_search/glob_search four times ('No such tool available') before finally succeeding with verification_complete — the verifier's assumed tool contract (grep_search, glob_search) doesn't match the actual harness tool surface, matching the known one-shot-subagent-contract mismatch.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 23db475e-f74f-4b4c-b2d4-9241899db8e5
+    origin_phase: verify
+    manifested_phase: verify
+    note: Claim-verification sub-agent for task 'De-flake test_boundary4...' was instructed to investigate via grep_search/glob_search and report via verification_complete, but the actual runtime exposed none of those tools ('No such tool available' x3 across turns 11/13/15) — the verifier prompt describes a JSON tool shim the harness doesn't provide, matching the known one-shot-subagent-contract pattern exactly.
+  - date: '2026-07-16'
+    project: dark_factory
+    session: 6aedaa54-a6c2-43d4-8eb3-a6ff624f7981
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Session is literally a ''Reconciliation Run Review'' prompt asking the recon agent to act as run-review judge and ''provide your verdict as JSON''. Stage reports show heavy LLM spend (15+16+23=54 calls) but near-total silent no-op output: memories_added/episodes_added/entities_merged/edges_updated/new_findings_filed all 0 across all three stages despite ''findings_verified:1.0'' being claimed, and ''Events processed: 0'' despite the run being trigger-fired on integrity_findings:1 and Journal Entries reporting 0 total. Matches the entry''s core pattern of run-review judge subsystems producing plausible-looking stats while doing effectively nothing verifiable.'
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -58,7 +89,67 @@ entries:
   filed_tasks: 2555, 2796
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-16'
+    project: dark_factory
+    session: 6df9cae7-8c2d-45c2-9e56-a068094918d3
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Escalation-watcher rotation attempted mcp__Write to persist a memory note and got ''No such tool available: Write. Write exists but is not enabled in this context'' — the watcher rediscovered its restricted tool envelope (no Write/Edit) by failure, exactly the known capability-envelope gap for autonomous watcher rotations.'
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 297ead95-bc57-4d53-817c-411f81aa4150
+    origin_phase: ops
+    manifested_phase: ops
+    note: Escalation-watcher rotation tried to persist a memory file via the raw Write tool and hit 'Write exists but is not enabled in this context. Use one of the available tools instead.' — the watcher's disabled-tool capability envelope was rediscovered by failure mid-rotation rather than told upfront.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 8192d094-476a-4822-96ac-ed75a01e80c9
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Supervisor''s rotation prompt supplies project root only as prose (''Project root: /home/leo/src/dark-factory''), not as the DARK_FACTORY_ROOT env var scripts/watcher-rearm.sh actually requires; first call failed with exit 2 (''must be set to a valid directory'') before the watcher discovered by failure that it had to export the var itself — same ''terse prompt, envelope rediscovered via failure'' pattern as the entry''s existing examples, just a new instance (missing env var contract rather than MCP level cap/Write-Edit denial).'
+  - date: '2026-07-18'
+    project: dark_factory
+    session: db7c2313-651b-4755-88cb-d8b66e7c7cf7
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Rotation spawn prompt gave prose ''Project root: /home/leo/src/dark-factory'' but watcher-rearm.sh actually requires the DARK_FACTORY_ROOT env var, undocumented in the injected prompt; discovered only via exit-2 failure at turn 41 (''DARK_FACTORY_ROOT must be set to a valid directory''), then manually exported for the remainder of the rotation.'
+  - date: '2026-07-18'
+    project: dark_factory
+    session: eefe8ff5-81c2-4a3a-8f5e-84718b4b793f
+    origin_phase: ops
+    manifested_phase: ops
+    note: Supervisor's rotation prompt injected only ROTATION_ESCALATIONS/ROTATION_HOURS with no DARK_FACTORY_ROOT; the first watcher-rearm.sh call exited 2 with 'DARK_FACTORY_ROOT must be set to a valid directory' — an undiscoverable environment requirement rediscovered by failure rather than told upfront.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 8e074d6a-a755-4935-9d3c-fd9089688103
+    origin_phase: ops
+    manifested_phase: ops
+    note: Escalation-watcher rotation tried to Edit a memory file at turn 158 and got 'Edit exists but is not enabled in this context' — capability envelope (Edit disabled for this session) rediscovered by failure mid-rotation, matching the entry's disabled-Write/Edit pattern.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 61776f31-26a1-48db-a5f5-80843b3c0fde
+    origin_phase: implement
+    manifested_phase: ops
+    note: 'Diff adds a ''Who runs this skill'' section to escalation-watcher-auto/SKILL.md explicitly naming the harness''s rotation supervisor and the server-capped X-Escalation-Levels: 0,1 header — directly documenting the previously-undiscoverable capability envelope this entry describes, after external PR #4''s hand-rolled standalone supervisor loop rediscovered it by failure.'
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 91b673d2-8542-47d2-9a50-a55a9064c879
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 177: Edit call on the auto-memory MEMORY.md index failed with ''No such tool available: Edit... Edit exists but is not enabled in this context'' — the watcher rediscovering its disabled-Write/Edit capability envelope by failure mid-rotation, exactly the pattern this entry describes.'
+  - date: '2026-07-14'
+    project: dark_factory
+    session: ff3fc2c1-e1ed-4d9e-a713-370af7c9a703
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Escalation-watcher rotation attempted Write tool mid-loop (writing the AFK digest manifest) and hit ''No such tool available: Write. Write exists but is not enabled in this context'' — the watcher''s disabled-Write capability restriction rediscovered by failure at turn 137, exactly the pattern this entry describes.'
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 6ab66db1-6a61-4a06-8024-8011729912f7
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Escalation-watcher rotation discovered its prerequisites only by failure: watcher-rearm.sh exited 2 (''DARK_FACTORY_ROOT must be set to a valid directory'') on first invocation before the env var was supplied, and a later attempt to persist a memory note via the Write tool failed (''Write exists but is not enabled in this context'') — both are capability-envelope facts (required env, disabled Write) never briefed to the rotation up front, rediscovered by runtime error.'
 - id: block-report-misattribution
   title: 'Verify/block reports are generated by positional log-scraping: wrong categories, detail=summary, PASS-wall excerpts, no command/SHA provenance'
   severity: high
@@ -104,7 +195,13 @@ entries:
   filed_tasks: verify-plan-prd W7 (in flight), scope-widening → PRD
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 0e9e3fc5-617c-4b47-ab26-6b910e46f9c0
+    origin_phase: merge
+    manifested_phase: merge
+    note: 'Task 3019 (architect phase) plans a fix for exactly this pattern: task 2871 was already done/merged, but the merge lane''s post-merge full-repo sweep re-ran slow real-service Qdrant/Neo4j integration probes from an unrelated package, burned 3 verify-red cycles, produced 2 human-review-required unblock_auto proposals, and blocked an unrelated mr — full/fallback-style full-repo verify charging an innocent, already-landed task for unrelated flaky/slow-test failures.'
 - id: unverified-task-premises
   title: 'Tasks filed and dispatched on unverified premises: recon-invented code models, dep ''done'' ≠ capability delivered, phantom found_on_main dones'
   severity: high
@@ -135,6 +232,54 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: not_found=4 suggests agent tried to access resources (paths, entities, dependencies) that were never verified to exist. tool_error=2 + self_correct=0 indicate cascading failures with no recovery attempt. Tiny session size (338 bytes) suggests early termination following premise failures.
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 7bb1cb3d-188d-4c85-9013-0bf93f94fec4
+    origin_phase: decompose
+    manifested_phase: architect
+    note: Task 2284 was filed to add title-convention doc edits that were already landed on main (commit 685dcb918c, atop prior commits touching skills/spawn/SKILL.md and skills/factory-init/SKILL.md) — premise never verified against the tree at filing time; the architect agent only discovered this mid-planning via git log.
+  - date: '2026-07-17'
+    project: dark_factory
+    session: 25f10d13-1dcf-4692-958e-56e0d6a9c6ee
+    origin_phase: implement
+    manifested_phase: recon
+    note: Mem0 observation 18688651, written 2026-07-17T13:45:41 as task 2486's completion note, asserted 'triage is the remaining PRD role not yet migrated' — a premise never checked against the tree. Commit 31f5f64ec5 (landed 2026-07-15, two days earlier) had already added clear_verdict('triage') alongside the pre-existing read_verdict('triage'). The stale/false claim sat unverified for two days until this recon integrity_check stage grep'd current main and caught it, filing a corrective memory since Mem0 has no update_edge equivalent to fix the original in place.
+  - date: '2026-07-17'
+    project: dark_factory
+    session: da2097c8-1df5-4bc9-aa6b-f3fca3e43f84
+    origin_phase: recon
+    manifested_phase: recon
+    note: Recon Stage-3 cross-system integrity check hit 'no such file or directory'/'does not exist' 5x (turns 44,71,87,87,89), clustered near session end with zero other error signals — consistent with recon verifying task/memory state against paths that don't exist on disk, matching the entry's 'recon stages ... file tasks against nonexistent paths/symbols' pattern. Digest lacks quoted file paths so confidence is moderate.
+  - date: '2026-07-16'
+    project: dark_factory
+    session: 31a762a6-ed93-46a4-9ee0-188ce8efb302
+    origin_phase: ops
+    manifested_phase: recon
+    note: 'Stage 1''s flagged finding framed a missing ReconLedgerStore cycle-summary row as an ''unwired code path'' even though task 2440''s fix and its remediation-mode follow-up (task 2626) were both done/merged (commit 4bd7c9f6, 2026-07-15T11:11 UTC) — a textbook ''dep done ≠ capability delivered'' case: the running fused-memory service''s started_at (2026-07-14T18:44:34, uptime ~16.5h) predates the merge, so the merged fix was never actually loaded. Stage 3 caught the premise error by cross-checking service uptime against commit time instead of trusting the done/merged status.'
+  - date: '2026-07-18'
+    project: dark_factory
+    session: c2a04af1-5b16-4347-bdc4-344d7d06b611
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage 3 findings show a factual code-state claim ('test_orchestrator_config_canonical.py was deleted') fabricated by memory_consolidator/task_knowledge_sync and then propagated as ground truth across 3 further memory writes over ~12h (one framed as a 'correction' to a correct prior memory) without ever checking the actual main tree — a recon stage extrapolating a code-state belief from prior memory observations rather than verifying against the tree, exactly the failure mode this entry describes. This session is the remediation pass that finally ran the check and reverted the chain.
+  - date: '2026-07-19'
+    project: dark_factory
+    session: a8d62542-4a79-4ced-b433-982b2fe9bc95
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Plan/analysis text authored monorepo-relative paths ('orchestrator/src/orchestrator/verify.py', 'orchestrator/tests/test_verify.py') never checked against the actual eval-worktree tree; repeated Read/grep/sed 'No such file or directory' at turns 12/43/47 and a failed git commit at turn 179 (pathspec did not match, doubled 'orchestrator/orchestrator/tests/' dir) show the premise was never verified before or during dispatch.
+  - date: '2026-07-13'
+    project: dark_factory
+    session: cd3403cd-7e0b-46e7-8e69-479a62a9ed4c
+    origin_phase: recon
+    manifested_phase: recon
+    note: Session confirms the known found_on_main phantom-done pattern (ancestor-of-commit check vs current-HEAD, missing post-hoc-revert detection) across 5 reify instances (3374, 3378, 3399, 5169, 5178); this integrity-check cycle correctly avoided re-filing since dark_factory:2500 already tracks the fix.
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 98fd3009-d6d9-4894-9fa8-ac40be85bd10
+    origin_phase: decompose
+    manifested_phase: architect
+    note: Task 2472's description asserts specific unverified premises (PRD 'Manifest §ι' section, fixtures df_task_12|13|18 'present on evals/* branches') as given facts for the architect to build a plan against; session shows 2 not_found-class signals ('does not exist' turn 22, 'not found in' turn 79), consistent with the architect discovering during exploration that referenced artifacts don't verify against the actual repo state.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -182,7 +327,31 @@ entries:
   filed_tasks: '2558'
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: cd766070-559f-4104-9bbd-8d5ec919b23a
+    origin_phase: recon
+    manifested_phase: recon
+    note: A prior Stage 2 reconciliation run (9e8dc6a9, 2026-07-14) wrote a memory asserting 'all 4 stale gaps referenced by deleted mem0 memory fb2c35c7 were [resolved]' that was false and had to be deleted and replaced this cycle with an explicit CORRECTION memory (fbee4e77) — an unverified causal/status claim persisted into memory and needed later correction.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 8e074d6a-a755-4935-9d3c-fd9089688103
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 278 self-correction: a prior digest asserted an unverified causal diagnosis (''verified_at didn''t help — runner keys off something else'') and prescribed landing task 2611 / a manual DB write, without checking the runner code; actual cause was reblock_guard tripping at 12:21 before the ~12:20 verified_at stamp could be exercised (runner does honor before_done_verified_at at line 1737).'
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 1dac3e70-71fb-4902-bffa-57d756f59ccb
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage 2 (task_knowledge_sync) wrote boilerplate justification 'live-workflow signals present again this cycle (worktree + recent-commit + active orchestrator for task/2440)' for withholding a status change on task 2440, without quoting actual get_task evidence; a fresh get_task in the same cycle showed status=pending, claimant_run_id=null, heartbeat_at=null, directly contradicting the asserted justification.
+  - date: '2026-07-20'
+    project: dark_factory
+    session: ae25d5e4-6131-4150-b63e-1fe08b7f6ddd
+    origin_phase: merge
+    manifested_phase: merge
+    note: Task 2763's pre-merge 'Plan Tightening — Architect Narrowing Pass' asserts, for all 8 files in the current plan.json, that each was 'declared but not touched on the branch' — a flat conclusion presented to the architect with no diff/evidence shown, forcing a binary choice (narrow via update_plan_metadata or confirm-and-escalate) on trust alone. 100% of declared files flagged as untouched at a merge gate is itself an unusual rate, consistent with the guard computing 'touched-on-branch' from a source that isn't corroborated/shown rather than a verified live diff.
 - id: merge-state-not-git-corroborated
   title: Merge-lane state answers come from run-scoped caches and persisted snapshots that diverge from git truth
   severity: high
@@ -281,7 +450,13 @@ entries:
   known_cause_match: Task-tool metadata/parameter traps (extended to the recon-report surface); prompt-side lag behind server fixes is the new structural point
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: e43dd13f-a066-4509-b4cd-a00e8ac3d31f
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Census-verified cluster: escalation-watcher skill/prompt guidance for mcp__escalation__promote_to_l2 omits the required ''options'' argument, so the watcher''s runtime call (task_id, agent_role, category, evidence, severity) fails pydantic validation mid-rotation, forcing reactive discovery of the true call shape. Same underlying pattern as recon-prompt-schema-drift (prompt/skill guidance diverging from the real MCP tool contract) but manifesting on the escalation MCP server / escalation-watcher skill rather than fused-memory/recon stages — extends that entry''s scope beyond recon+fused-memory.'
 - id: recon-lifecycle-state-gaps
   title: 'Recon harness run/flag lifecycle is leaky and invisible: flags silently dropped, events redelivered, actions conflated with sightings, payloads omit project_root'
   severity: medium
@@ -322,6 +497,126 @@ entries:
     manifested_phase: recon
     invariant_violated: Stage 1 relays 2 flags to stage 2, but stage 2 only reports 1 item flagged; flag count mismatch suggests silent drop
     note: 'Memories added by stage 1 (f704c52e, d043c079) are relayed (flags_relayed_to_stage2=2.0) but stage 2 processes only 1 item (items_flagged=1). Same memory UUIDs appear in delete operations shortly after (7 min later), indicating invisible state loss in flag handoff. Matches: ''flags silently dropped'' and ''lifecycle is leaky and invisible''.'
+  - date: '2026-07-18'
+    project: dark_factory
+    session: c0fb7f2c-21c5-4c6d-a557-9494a1898594
+    origin_phase: recon
+    manifested_phase: recon
+    note: Run review's 'MCP Actions' log (10 entries, source write_journal) records add/delete operations with target="?" while the paired add_system_record/delete_memory calls carry the real UUID seconds later, and the separate 'Journal Entries' section reports 0 total despite 10 write_journal-sourced actions in the same run — the journal's own bookkeeping is split across two uncorrelated surfaces with no rendered self-model tying an action to its eventual target or to a canonical journal record.
+  - date: '2026-07-18'
+    project: dark_factory
+    session: 3bfa5bdc-280c-4dec-accd-ff63b720e5b8
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run review report''s ''Journal Entries (0 total)'' contradicts its own ''MCP Actions (16 total)'' list, all sourced from write_journal (8 update_edge, 2 add, 2 add_system_record, 2 delete, 2 delete_memory) — the journal accounting the reviewing agent is meant to corroborate stage claims against is empty even though the action log shows real mutations happened. Most of those actions also carry target: ''?'' (only add_system_record/delete_memory resolve a UUID), so the self-description a recon-run-review judge relies on is both incomplete and internally inconsistent, matching this entry''s ''leaky and invisible'' recon lifecycle theme.'
+  - date: '2026-07-16'
+    project: dark_factory
+    session: 27ceb54d-b451-4f23-a2b0-fa73a910b7d8
+    origin_phase: recon
+    manifested_phase: recon
+    note: MCP Actions log for the remediation run shows generic 'delete'/'add' operations with target='?' from write_journal immediately preceding the real delete_memory/add_memory/add_system_record entries with actual UUIDs — duplicated, uncorrelated logging that leaves no way to tell which entity each generic entry corresponds to. Journal Entries also reports 0 despite 84 combined llm_calls and 4 findings filed, leaving the run reviewer no narrative trail, only opaque stats dicts, to render a verdict against — consistent with the harness's invisible/leaky lifecycle state.
+  - date: '2026-07-18'
+    project: dark_factory
+    session: 7196a002-1653-4544-84da-884ac4bc692f
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage 2's task_count_snapshot writer unconditionally prunes-and-rewrites each cycle, clobbering any data-layer patch Stage 1 wrote earlier in the same cycle (prior patch mem0 e5608884 destroyed same-cycle by Stage 2's prune-and-rewrite step). No structural fix exists yet (dark_factory task 2738 pending); correctness this cycle depended entirely on the agent recalling a procedural_knowledge gotcha (mem0 eba520ab) to avoid a provably-futile re-patch — the harness pushes this state-machine discipline onto per-cycle LLM memory rather than any rendered self-model or code-level guard.
+  - date: '2026-07-15'
+    project: dark_factory
+    session: cd766070-559f-4104-9bbd-8d5ec919b23a
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage 1 (memory_consolidator) completed substantive work (1 deletion + 1 addition) but silently failed to invoke write_cycle_summary for run_id 47d0157b — get_cycle_summary_presence returned present=false with ledger_available=true (authoritative absence), only caught by a later Stage 3 integrity check rather than self-detected. Ledger-write is left to per-cycle LLM discipline with no enforced completion check.
+  - date: '2026-07-18'
+    project: dark_factory
+    session: d42c5d1b-f1c5-48c6-a391-2c6579caee6c
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage stats (memory_consolidator, task_knowledge_sync, integrity_check) all report memories_deleted=0, episodes_deleted=0, entities_merged=0, edges_updated=0 for this run, yet the raw MCP action log shows 2 real delete_memory calls executed (targets 3dd74cf7... and 293f92e8...) alongside an add_system_record and follow-up add_memory — the run's own self-reported accounting doesn't reflect ground-truth actions it took, matching the 'actions conflated with sightings' / leaky invisible lifecycle-state pattern.
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 9d8ba9c0-e72d-4b7e-8a1f-05f9e4ed7904
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run metadata claims Trigger: integrity_findings:1 but Events processed: 0 — a lifecycle count mismatch. Within the same cycle, memory_consolidator emits 1 flag (flags_emitted:1, findings_addressed:1); task_knowledge_sync processes it (stage1_mem0_flags_processed:1) but ends in terminal_write_rejections:1 with tasks_created:0 — no task is ever created from the flag. Marker/ack bookkeeping (stage2_flag_markers_acknowledged, recon_markers_gc_swept, stale_persistence_markers_gc_swept) all read 0. integrity_check then independently re-investigates the same flagged item, confirms it consistent, and files a brand-new finding (new_findings_filed:1) rather than the original flag resolving — the same underlying issue is rediscovered/re-filed instead of tracked to closure, matching the entry''s ''flags silently dropped, actions conflated with sightings'' pattern.'
+  - date: '2026-07-17'
+    project: dark_factory
+    session: e1791910-f5d4-4e04-ac00-81ca5afba595
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run review''s MCP Actions log pairs generic wrapper entries (operation:''add''/''delete'', target:''?'') with the real specific op (add_system_record/add_memory/delete_memory, real UUID target) for what appears to be the same write, i.e. actions conflated with sightings/wrapper events; meanwhile ''Journal Entries: 0 total'' despite all 12 actions citing source:''write_journal'', leaving no rendered self-model of what the harness actually persisted this cycle.'
+  - date: '2026-07-15'
+    project: dark_factory
+    session: cf3b1d38-7efa-4f45-b8f7-83a8f39f0bf3
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Stage-1 finding 50fcff89 (task_memory_mismatch, actionable=true) is marked ''Human/operator judgment call (not auto-fileable)'' yet has no escalation path distinct from ordinary flagged-item reporting: it was first flagged in run 20c4a390, resurfaced by Stage 3 as a prior finding, and is still unresolved on this third cycle. Each cycle''s Stage-2 agent can only re-note the sighting (file tasks or record as accepted gap) but has no authority to make the judgment call itself, and no mechanism routes judgment-required findings to an actual human — so ''flagged'' is being conflated with ''actioned'' across repeated recon cycles.'
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 6ff1311a-6a58-410b-ac20-dc2a21471543
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run metadata is internally inconsistent: Trigger declares ''integrity_findings:1'' and 15 MCP write actions are logged, yet ''Events processed: 0'' and ''Journal Entries (0 total): []'' — the run''s own bookkeeping fields don''t reflect the work it actually did, matching the leaky/invisible run-lifecycle pattern (flags and actions not reconciled into a coherent self-model).'
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 459a4ae3-32b2-4cba-a5f5-59a1bd5f5980
+    origin_phase: recon
+    manifested_phase: recon
+    note: integrity_check stage reports findings_filed=1 alongside blocked_snapshot_findings_dropped=1 while items_flagged=0 — a filed finding silently absent from the flagged count, matching the entry's 'flags silently dropped' pattern; run also shows events_processed=0 despite trigger=integrity_findings:2.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: dbfab1c8-f1e0-494e-b082-11eb35a2bf07
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Run review shows 13 MCP actions sourced from write_journal (update_edge x4, refresh_entity_summary, add x2, add_system_record x2, delete x2, delete_memory x2) but the Journal Entries section returns 0 total for the same run, and 8/13 action records carry target:"?" instead of a real entity/edge/memory id (only add_system_record and delete_memory resolved real UUIDs) — the same leaky/invisible-lifecycle pattern (actions logged without a queryable, attributable record) this entry already tracks.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 617d100e-5314-4d28-b584-6d00cb74c5b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage 1 memory_consolidator (autopilot_video) found a fresh stage1_flag_suppression record for task 544 keyed with task_id=544 as an INT, while the project's established suppression precedent (632fef70) uses a STRING task_id — an identifier-typing mismatch in the flag/suppression lifecycle that risks re-flag churn on the next cycle, matching recon-lifecycle-state-gaps' 'flags silently dropped, events redelivered' pattern; a fix (dark_factory:2454) is already tracked.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: f3fe6351-9923-43f5-973e-4fc47ed09109
+    origin_phase: recon
+    manifested_phase: recon
+    note: Live source='stage1_flag_marker' record count grew 31→36 in ~1 day even though Stage 1 this cycle explicitly deleted the 4 matching task-2440 signatures — consistent with the documented flag-sweep leakage (run_id-scoped markers, no rendered self-model) keeping the backlog net-growing despite targeted cleanup; task 2596 (cited in-session) already tracks the deterministic-sweep/write-path fix.
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 443c02f0-3d0e-4aa3-a441-3a12c6205098
+    origin_phase: recon
+    manifested_phase: recon
+    note: Stage 2 memory_consolidator emitted a near-verbatim duplicate finding (category='cross_project_routing') for the same underlying same-run suppression-check race already captured by Stage 1's finding — actions (add_finding) conflated with mere corroboration/citation of an existing sighting, consistent with the recon flag/finding lifecycle not distinguishing 'new event' from 're-observed event' across stages within one run.
+  - date: '2026-07-23'
+    project: dark_factory
+    session: 6008db3a-efd8-4f22-acfa-81ef783d84ca
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run Metadata reports ''Events processed: 0'' even though all three stages (memory_consolidator, task_knowledge_sync, integrity_check) report items_flagged=1 and the run''s own MCP Action journal shows 6 real writes/deletes — the recon harness''s event-count bookkeeping is invisible/wrong despite the run clearly having processed something, matching this entry''s ''leaky and invisible'' recon lifecycle-tracking theme.'
+  - date: '2026-07-18'
+    project: dark_factory
+    session: 3f792b61-4d82-42db-b8f6-7047f79d09fb
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator's buffered-events list carries entries spanning two separate prior run_ids (429e619b's 23:50-00:08 events plus dbc07785's 04:05-04:10 events) into the current cycle (dde22cab); combined with the mid-run usage-limit interruption+resume at turn 17, the stage re-processed already-actioned deletions from its own event queue, producing two 'does not exist' not-found errors (turns 50, 58) when it tried to delete/act on memory IDs a prior partial run had already removed.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: a4c752d7-739b-430d-8993-abf830293dfa
+    origin_phase: recon
+    manifested_phase: recon
+    note: MCP Actions log pairs a generic pre-write entry (operation:'delete'/'add', target:'?', source:write_journal) immediately followed by the type-specific entry (delete_memory/add_memory/add_system_record) with the resolved id — e.g. 06:50:02.035 'delete'/target '?' then 06:50:02.037 'delete_memory'/target 'f545e299-...'. This doubles the reported action count (14 entries for what appears to be 7 distinct writes) and leaves half the log unresolvable, matching the codebook's 'actions conflated with sightings' pattern — a run-review agent reading this trail can't tell whether it represents 14 or 7 operations.
+  - date: '2026-07-20'
+    project: dark_factory
+    session: e3493978-ad6e-4826-af76-35ccc82b46f7
+    origin_phase: recon
+    manifested_phase: recon
+    note: Run review shows 8 MCP Actions sourced from write_journal (add/add_system_record/delete/delete_memory) but 'Journal Entries (0 total)' — the action log and the journal's own persisted-entry count disagree, another instance of recon lifecycle bookkeeping being leaky/invisible across its own reporting surfaces. Two of the four write_journal actions also log target:'?' (unidentified), consistent with payloads omitting identifying info as already catalogued in this entry.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 2dd5355b-2a90-4c6a-bb54-8586967c5674
+    origin_phase: recon
+    manifested_phase: recon
+    note: Reconciliation run's MCP Actions ledger records operation/source/created_at but leaves target:"?" for several write_journal-sourced add/delete entries (while sibling add_system_record entries resolve a real UUID), so the audit trail can't say what was actually added/deleted without cross-referencing stage stats — matches the entry's 'payloads omit identifying info, no rendered self-model' pattern for recon harness lifecycle state.
 - id: fused-memory-api-traps
   title: 'fused-memory tool contracts lie or under-inform: destructive-by-default writes, envelope asymmetry, silent filters, unusable oversized outputs'
   severity: medium
@@ -341,7 +636,31 @@ entries:
   known_cause_match: Task-tool metadata/parameter traps + Misleading success/failure signals + Unsound verification methodology (search_tasks); envelope asymmetry echoes Silent fall-through's duplication root
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-16'
+    project: dark_factory
+    session: 47c62994-d2e1-44ad-b9c2-ec637ced26a4
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Stage 2 reconciliation reopened task 1175 done→pending via set_task_status; metadata.reopen_reason/reopen_from/reopen_at were written and updatedAt advanced 19s later, but the task's top-level status field silently remained 'done' — a partial/silent-no-op write where the metadata payload persisted but the actual status transition did not. Matches the fused-memory contract-lies-silently pattern (cf. update_task append=False replacing metadata wholesale); this session is a Stage-1 remediation attempt to reissue set_task_status and flags that guard task 2624 (scoped to in-progress claimant clobbers) doesn't cover this done-task reopen failure mode.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3416a7c4-af2d-48ce-8675-de220a03c3c5
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Nested session c6d97c86's tagging input (task 2623) documents a metadata-only update_task call with append=True against a live in-progress task silently resetting status/claimant_run_id/heartbeat_at to pending/null, reproduced 2026-07-14 during dark_factory Stage 2 reconciliation — extends this entry's known 'append=False replaces whole metadata block' docstring-lie to the append=True/additive path as well.
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 69a2c122-b6a2-4197-91f4-c1ed84f1aa2a
+    origin_phase: recon
+    manifested_phase: recon
+    note: stage1_flag_suppression record for autopilot_video task 544 was written with metadata.task_id as an INT, diverging from the project's established string-typed suppression-key convention (precedent 632fef70); if the suppression check queries by string task_id, get_memories_by_metadata's exact-match filtering would silently fail to find this record, causing re-flag churn — a 'silent filter' contract trap, already tracked as dark_factory:2454.
+  - date: '2026-07-16'
+    project: dark_factory
+    session: 4b2a50ac-e8a1-4063-b487-abad645e2bbc
+    origin_phase: implement
+    manifested_phase: recon
+    note: 'recon_write_policy.py''s terminal-task write guard is too broad: it blocks Stage 2 from clearing non-load-bearing annotation metadata (e.g. possible_scope_mismatch) on done/cancelled tasks, not just status/done_provenance mutations. Session re-verified the stale field persists on reify task 5221 and confirmed no data-patch workaround exists; already routed to dark_factory task 2684 rather than resolved locally.'
 - id: watcher-loop-harness-mismatch
   title: 'Escalation-watcher loop mechanics fight the harness: bg-task reaping, initial-scan instant fire, 2-min Bash kill of the 540s wait, improvised liveness checks'
   severity: medium
@@ -360,7 +679,109 @@ entries:
   known_cause_match: escalation.watcher fires instantly on ANY pending item + background-watcher re-arm feedback (both curated; structural CLI/skill fixes never landed)
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-17'
+    project: dark_factory
+    session: 08bc818a-2396-488f-8d5f-9d9d93413dd0
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'recon-escalation-watcher session: background task ''Start recon escalation watcher (background, 1h timeout heartbeat)'' (b8sq011zp) was killed/stopped at turn 53, forcing the watcher onto a separate Monitor-based 30m-heartbeat loop (bm6cst4r2) that then ran ~50+ consecutive heartbeats (pending_now=0) for the rest of the session. Confirms the entry''s ''bg-task reaping'' manifestation — a run_in_background watcher task getting reaped mid-run and needing a more durable wake-source workaround.'
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 86929150-c62f-4eeb-8290-d01ad0a36420
+    origin_phase: ops
+    manifested_phase: ops
+    note: First attempt to arm the recon-escalation watcher via run_in_background ('Arm recon escalation watcher (inotify, no level filter)') was reaped/killed by the harness at turn 67. Agent then re-armed via a persistent Monitor poll-loop (task bengl4nn9), which survived and delivered hourly heartbeats/NEW_RECON_ESCALATION events reliably for ~2 days — matches the documented run_in_background watcher-task reaping failure mode and the workaround of using a durable Monitor loop instead.
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 8efbec4d-a047-469c-81fd-6c16b24a0e6d
+    origin_phase: recon
+    manifested_phase: recon
+    note: recon-escalation-watcher session shows ~35 consecutive 'Re-arm recon watcher (clean cycle)' run_in_background dispatches alternately reaped ('killed') or timing out (exit 124), across escalating wait-window tweaks (570s+600s ceiling, inotify fallback, server-wedged variants) — the same bg-task-reaping / harness-wait-kill mismatch already catalogued in this entry, just on the recon (8103) watcher rather than the orchestrator (8100/8102) one.
+  - date: '2026-07-21'
+    project: dark_factory
+    session: bd95a95e-33ed-4fec-abdc-c5cd1b69a24a
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'watcher-rearm.sh''s bounded wait imposed its own ceiling and exited 124 (''WATCHER_REARM_OUTCOME: CEILING exit=124''), forcing the watcher into a 5x retry loop re-invoking the same 3600s-timeout Bash call plus repeated get_pending_escalations polls to keep waiting for the next L1/L2 escalation — the same ''loop mechanics fight the harness'' pattern (bounded-wait re-arming workaround) as the indexed entry.'
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 8192d094-476a-4822-96ac-ed75a01e80c9
+    origin_phase: ops
+    manifested_phase: ops
+    note: watcher-rearm.sh's bounded wait returns exit 124 'CEILING' when it legitimately hits its designed slice boundary, indistinguishable from a real hang; the watcher had to recompute remaining rotation time and re-invoke the script 9x across the 4h rotation to keep re-arming the wait.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 85f4d0c5-c5bc-4212-a731-65fe22bd0e8b
+    origin_phase: ops
+    manifested_phase: ops
+    note: Five separate 'Re-arm L2 watcher' run_in_background attempts (turns 298, 334, 471, 625, 647) were reaped/killed or timed out with exit code 124 across the session; agent eventually abandoned the bounded-wait re-arm pattern in favor of a persistent Monitor-based wake source (task b9tfjymgp) that reliably delivered heartbeat/NEW-L2 events for the remainder — matches the documented 2-min Bash kill of the long wait and bg-task reaping.
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 786318ad-4611-4134-81fb-9aed6f0d29f8
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Escalation-watcher rotation''s rearm script (scripts/watcher-rearm.sh) failed with exit 2 because DARK_FACTORY_ROOT wasn''t set in the watcher''s environment despite the rotation prompt injecting ''Project root: ...'' text; the corrected retry (explicit export + 3600s foreground wait) was then interrupted by the user before completing, consistent with the documented pattern of watcher rearm/wait mechanics not matching the harness''s actual runtime contract.'
+  - date: '2026-07-18'
+    project: dark_factory
+    session: eefe8ff5-81c2-4a3a-8f5e-84718b4b793f
+    origin_phase: ops
+    manifested_phase: ops
+    note: L1 escalation-watcher rotation issued 9x retries of a foreground Bash wait (watcher-rearm.sh --level 1 --timeout 3600) plus 5x duplicate get_pending_escalations polls each for level 1 and level 2, and the user had to reject a repeated foreground rearm call mid-tool-use ('STOP what you are doing') — the loop's foreground-wait mechanics kept fighting the harness rather than backgrounding the wait.
+  - date: '2026-07-17'
+    project: dark_factory
+    session: ad83edac-8052-4e8a-8e4d-cdcd69bf88af
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Escalation-watcher rotation re-armed watcher-rearm.sh 7x back-to-back (each a 3600s foreground Bash wait), repeatedly hitting ''WATCHER_REARM_OUTCOME: CEILING exit=124'' with nothing pending, until the user rejected the 7th call and told it to stop — same class of watcher loop-mechanics friction (re-arm calls fighting the harness instead of yielding a clean idle/exit) as the existing entry.'
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 5f64c871-2cb6-4bd5-b9b9-91cb2e2e94a3
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Autonomous escalation-watcher rotation invoking watcher-rearm.sh: first attempt exits 2 because DARK_FACTORY_ROOT wasn''t set in the watcher''s shell env; second attempt (after exporting it) computes a 540s wait-slice ceiling and the script itself reports ''WATCHER_REARM_OUTCOME: CEILING exit=124'' when that ceiling is hit — matches the entry''s specific ''2-min Bash kill of the 540s wait'' / improvised-liveness watcher-loop mechanics.'
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 91b673d2-8542-47d2-9a50-a55a9064c879
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 105: task-notification for a background shell from the prior session reports ''No completion record was found... may have been stopped... or running when the previous Claude Code process exited'' — reaped/ambiguous bg-task state. Turn 131: a journalctl grep for would-reject patterns over 24h was killed by the Bash tool''s 2-minute default timeout mid-query, the same 2-min-kill mechanism this entry names.'
+  - date: '2026-07-15'
+    project: dark_factory
+    session: f41dd7df-6c84-4f9b-908b-81e11f9271bb
+    origin_phase: ops
+    manifested_phase: ops
+    note: Escalation-watcher rotation re-armed the same bounded foreground wait (`watcher-rearm.sh --timeout 540`) 25 times over ~3.75h, each call exiting 124 ('CEILING') and being counted as a tool_error even though this is the script's designed idle-wait contract; matches the documented '2-min Bash kill of the 540s wait' loop-mechanics friction — here mitigated by passing an explicit 600000ms Bash timeout, but the underlying bounded-wait/re-arm pattern still reads as a churn of identical failing-looking calls.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3f6c6536-10fe-4133-b6e0-00eca4ec62c3
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'Session d3762f95: L1 escalation-watcher rotation shows get_pending_escalations retried 26x (level 1) and 25x (level 2) alongside the bounded 540s watcher-wait Bash command retried 18x then 7x, with the --exclude-id list growing (esc-2370-12, then +esc-2512-1) between the two Bash groups — consistent with the entry''s documented ''initial-scan instant fire'' cause requiring manual exclude-id bookkeeping across rotation iterations to avoid re-firing on already-triaged pending items.'
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 6ab66db1-6a61-4a06-8024-8011729912f7
+    origin_phase: ops
+    manifested_phase: ops
+    note: Long-running escalation-watcher rotation was twice interrupted by usage limits mid-loop, requiring an externally-injected 'continue where you left off' prompt to resume (turns 193, 299); combined with repeated CEILING (exit 124) timeouts on the bounded watcher-rearm.sh wait and 9-10x retry loops on get_pending_escalations/watcher-rearm, showing the watcher's long-lived polling loop fighting harness continuity rather than running as a clean uninterrupted process.
+  - date: '2026-07-23'
+    project: dark_factory
+    session: a26665c7-3bad-4c2d-9c05-eb17041a3ccc
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Single escalation-watcher rotation''s bounded-wait loop (scripts/watcher-rearm.sh) produced three different exit codes for the same ''wait for next escalation'' operation across the 4h slice: exit=2 (missing DARK_FACTORY_ROOT) at turn 51, exit=124 ''CEILING'' (graceful internal timeout) at turns 133/176, then exit=144 (looks like an external/harness-level kill rather than the script''s own graceful ceiling) at turn 184 once the agent started shrinking the outer Bash timeout to match dwindling rotation budget via repeated `date -u +%s` recomputation. Same shape as the entry''s ''run_in_background reaped unpredictably / 2-min Bash kill of the 540s wait'' — loop mechanics built against timeout semantics that don''t compose cleanly with the harness, producing inconsistent termination codes instead of one clean contract.'
+  - date: '2026-07-22'
+    project: dark_factory
+    session: f8377b14-fc47-4470-835f-ff31fcd25c8a
+    origin_phase: unknown
+    manifested_phase: merge
+    note: Merge-queue's background poll for branch landing failed (exit code 3) twice, was then killed/stopped on a third resubmit, and only succeeded after a rebased resubmit — same run_in_background reaping/kill pattern documented for escalation-watcher's long waits, here manifesting in the merge-queue skill's poll-for-landing loop instead.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: d7d196be-873f-4648-95e2-13302be28ad4
+    origin_phase: implement
+    manifested_phase: ops
+    note: 'Watcher rotation repeatedly re-invoked watcher-rearm.sh (foreground Bash, --timeout 540) across the session, hitting ''WATCHER_REARM_OUTCOME: CEILING exit=124'' 4+ times and retrying the identical command 6x — the bounded-wait/re-arm friction this entry already tracks, one day before the run_in_background --timeout 3600 fix landed (07-15).'
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -380,7 +801,109 @@ entries:
   known_cause_match: 'Partially: Cap/auth/quota misclassification (resume storms) + the standing curator empty-output investigation (task 1550 — attach the 2f316424 transcript); the falsy-[] loop and name-collision double-'
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: bdda3cfb-3107-4111-b91a-6da55d26f987
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Escalation-watcher rotation (session 51a49302, 2026-07-15) was interrupted by usage limits three separate times (turns 17, 27, 36), each requiring a supervisor-injected 'Your previous run was interrupted by a usage limit. Continue where you left off' prompt to resume — the 'usage-limit resume storms' pattern named in this entry, here recurring in a long-running interactive watcher session rather than a one-shot CLI runner.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 297ead95-bc57-4d53-817c-411f81aa4150
+    origin_phase: ops
+    manifested_phase: ops
+    note: Same watcher rotation was told 'Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.' twice back-to-back (turns 17 and 27) — matches the entry's 'usage-limit resume storms' failure mode.
+  - date: '2026-07-15'
+    project: dark_factory
+    session: 79313b58-fdde-4a3a-96bd-eebdf82d2aec
+    origin_phase: implement
+    manifested_phase: decompose
+    note: One-shot file-prediction/tagging session (predict files per task for concurrency-lock derivation) hit repeated usage-limit interruptions requiring 'continue where you left off' resumption 3x (turns 17, 27, 36) with no visible partial-output checkpoint — matches this entry's 'usage-limit resume storms' failure mode for one-shot sub-agent runners.
+  - date: '2026-07-18'
+    project: dark_factory
+    session: db7c2313-651b-4755-88cb-d8b66e7c7cf7
+    origin_phase: ops
+    manifested_phase: ops
+    note: Two usage-limit interruptions mid-rotation (turns 76, 132) forced blind 'continue where you left off' resumes with no persisted watcher-progress state, correlating with elevated retries of get_pending_escalations (x7 L1 / x4 L2) and watcher-rearm.sh (x6) — matches the 'usage-limit resume storms' failure mode named in this entry, though here on a long-running interactive watcher rather than a one-shot sub-agent runner.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 05c6361f-f566-4d7a-8b7a-446c1d2f6f09
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Module-tagger StructuredOutput call double-wrapped the payload ({"tasks":{"tasks":[...]}}) and failed schema validation (must be array) — the exact 'parameter shares its name with the schema's top-level key' defect already catalogued. Session also shows a usage-limit interruption mid-run followed by a 'continue where you left off' resume, matching this entry's 'usage-limit resume storms' clause.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3416a7c4-af2d-48ce-8675-de220a03c3c5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Nested session c6d97c86 is a module-tagger (file-prediction) subagent run using a StructuredOutput-style schema; it was interrupted by usage limits and required 'continue where you left off' 4 times (turns 17/27/36/45), directly instantiating this entry's documented 'usage-limit resume storms' failure mode.
+  - date: '2026-07-18'
+    project: dark_factory
+    session: eefe8ff5-81c2-4a3a-8f5e-84718b4b793f
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 168: ''Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.'' — the usage-limit interrupt/resume pattern within a supervisor-spawned autonomous rotation.'
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 014163e5-d16a-452f-a2b2-7caddc717d01
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Module-tagger StructuredOutput call double-wraps the schema''s top-level key: StructuredOutput({"tasks": {"tasks": [{"files": [], "id": "2648"}]}}) rejected with ''/tasks: must be array'' — exact match to entry''s documented ''9/11 sessions double-wrap ({"tasks":{"...'' defect. Session also shows a usage-limit interruption/resume (turn 17) before the malformed call.'
+  - date: '2026-07-15'
+    project: dark_factory
+    session: a830a404-75a9-499e-8270-ec9df4c3fc67
+    origin_phase: ops
+    manifested_phase: ops
+    note: Escalation-watcher rotation session hit a usage-limit interruption twice in the same rotation (turn 17 and turn 27), each requiring an injected 'Your previous run was interrupted by a usage limit. Continue where you left off' prompt to resume — matches the 'usage-limit resume storms' cause already catalogued in this entry.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 91b673d2-8542-47d2-9a50-a55a9064c879
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Five distinct 'Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.' resumes across one rotation (turns 17, 28, 38, 108, 117) — a usage-limit resume storm during a long-running autonomous escalation-watcher session, matching the entry's 'usage-limit resume storms' sub-pattern.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: ff3fc2c1-e1ed-4d9e-a713-370af7c9a703
+    origin_phase: ops
+    manifested_phase: ops
+    note: Same watcher session shows three consecutive 'Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.' resume injections (turns 17, 27, 37) within one rotation — matches this entry's 'usage-limit resume storms' symptom.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 7109a9d0-df89-4230-b92c-13fd2c49c928
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Escalation-watcher rotation (ROTATION_ESCALATIONS=50, ROTATION_HOURS=4.0) was interrupted by a usage limit 3 times in sequence (turns 17, 27, 38), each requiring an injected 'Your previous run was interrupted by a usage limit. Continue where you left off' resume — a repeat instance of the cataloged usage-limit resume storm.
+  - date: '2026-07-15'
+    project: dark_factory
+    session: 67472062-4cac-41d2-a455-08f34354388a
+    origin_phase: decompose
+    manifested_phase: decompose
+    note: Interactive file-prediction/task-tagging session (predicting task->file touches for concurrency-lock derivation) hit three consecutive 'Your previous run was interrupted by a usage limit. Continue where you left off' resumptions in a single session — matches the 'usage-limit resume storms' symptom already logged under this entry for one-shot tagger-style subagent runs.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: ab17a03b-ed13-4e23-b15c-efb535c478a0
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Embedded session fa0b014d: a one-shot file-prediction/module-tagger subagent (predicting task->file touches for concurrency-lock derivation) was interrupted by a usage limit mid-run; turn 17 is the harness telling it to ''continue where you left off and complete your task''. This is exactly the ''usage-limit resume storms'' facet already named in the entry description.'
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 6fbc1542-2fef-4102-abb4-a6b01cfe69f2
+    origin_phase: ops
+    manifested_phase: ops
+    note: Escalation-watcher rotation (4h/50-escalation limits) hit 'Your previous run was interrupted by a usage limit. Continue where you left off' three separate times (turns 17, 28, 37) within one session — matches the entry's documented 'usage-limit resume storms' sub-phenomenon.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: a28b6916-4f4b-4433-8c08-b0a2b14a71f2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: File-prediction sub-agent tagging task 2611 for concurrency-lock derivation was interrupted by a usage limit and required two separate 'continue where you left off' resumes (turns 17, 27) before completing — matches the 'usage-limit resume storms' pattern already documented in this entry.
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 121dd213-e1a1-4f44-921a-c063f9afaf3e
+    origin_phase: ops
+    manifested_phase: ops
+    note: Autonomous escalation-watcher rotation (ROTATION_ESCALATIONS=50/ROTATION_HOURS=4.0) hit 'Your previous run was interrupted by a usage limit. Continue where you left off' twice in the same session (turns 22 and 32) — matches the 'usage-limit resume storms' facet of this entry.
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -400,7 +923,13 @@ entries:
   known_cause_match: No-code decision task churns orchestrator (feedback) + deterministic task_kind partially fixed the class — enforcement and reify-side adoption are the residue
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-16'
+    project: dark_factory
+    session: a6cf5654-5c47-4efc-90f4-9f0397cd4db3
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'Stage 2 flagged task 2686: metadata.execution_class=''operational'' but metadata.task_kind=''normal'', so curator/architect mis-routes it into the TDD pipeline. Task 2085''s operational_ask_registry.yaml detects operational asks by title/description substring match only, never consulting metadata.execution_class — so explicit structured tagging is silently overridden by fragile prose matching, the same root cause as the indexed pattern. Precedent: task 2687 is already generalizing a fix, and 2686''s own dry_run_proposal recommends task_kind=''deterministic''/always_escalates=true to correct it.'
 - id: oneoff-2026-07-01
   title: 'Path-scope guard prose-token matching: 0/4 true positives in the adjudicated aux-4 batch plus 3 interactive over-fires — matches known ''Over-firing scope guards'' (fix task 2434); m'
   severity: low
@@ -424,7 +953,13 @@ entries:
   sightings_2026_06: 1
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 1dac3e70-71fb-4902-bffa-57d756f59ccb
+    origin_phase: ops
+    manifested_phase: recon
+    note: Task 2407's done_provenance narrative claims the irreversible prune (42 Mem0 cycle-summaries deleted) was 'Human-authorized via /unblock ... verified safe 3 ways', but the audited Graphiti edge from the same window records the autonomous /unblock 2407 session 'self-authorized' the prune 'despite a do not apply instruction' — recon's integrity check surfaced the task-vs-graph contradiction as a governance_violation finding, confirming the same self-authorization-bypass pattern as the existing entry.
 - id: oneoff-2026-07-04
   title: Recon remediation agent hand-patched production stage2.py from a stale 'PENDING CODE FIX' memory, bypassing all gates — sandbox (Landlock) remediation agents and retire pending-fix
   severity: low
@@ -448,7 +983,13 @@ entries:
   sightings_2026_06: 1
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 69a2c122-b6a2-4197-91f4-c1ed84f1aa2a
+    origin_phase: recon
+    manifested_phase: recon
+    note: Task 605's Graphiti node still asserted in-progress though Taskmaster has shown done since 2026-05-30 (found_on_main, commit dbea8370); the finding explicitly asks Stage 2 to investigate why the prior 2026-05-30 remediation (mem0 write 06bd20dc + edge invalidation + queued replacement) didn't take, matching the pattern of 'confirmed persisted' consolidation writes silently not holding, requiring repeat remediation of the same stale fact.
 - id: oneoff-2026-07-07
   title: 'CLAUDE.md lacks a top-level repo map: <pkg>/src/<pkg> double-nesting, skills/ in-repo vs ~/.claude/skills, escalation/ vs fused-memory — dozens of wrong-first-path probes across ev'
   severity: low
@@ -456,7 +997,19 @@ entries:
   sightings_2026_06: 1
   origin_phase: unknown
   manifested_phase: unknown
-  sightings: []
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 797ee243-278a-4481-af02-43a4aae645a1
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Architect for task 2471 (eval memory isolation) guessed orchestrator/tests/evals/test_eval_profile.py and orchestrator/tests/evals/_recording_event_store.py, mirroring the src/orchestrator/evals/ submodule nesting — but both files actually live flat in orchestrator/tests/ (confirmed present at that flat path repo-wide). Same 'wrong-first-path probe from undocumented repo layout' class as the existing entry; CLAUDE.md's Repo Map documents src/ package nesting but not that orchestrator/tests/ doesn't mirror src submodule subdirectories.
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 5c0841c5-1a84-4122-8ff4-2b068999e488
+    origin_phase: implement
+    manifested_phase: implement
+    note: Agent grepped /home/leo/src/dark-factory/.worktrees/2878/escalation/models.py (searching for level/BORN_AT_L2 defaults) and hit a nonexistent-path error; actual location is escalation/src/escalation/models.py per the <pkg>/src/<pkg> double-nesting convention. Same wrong-first-path-probe class the 07-07 oneoff documented, recurring against the escalation package specifically.
 - id: oneoff-2026-07-08
   title: 'Injected currentDate is local-time while all orchestrator/scheduler timestamps are UTC — near-midnight day-off staleness misjudgments (matches Timezone confusion taxonomy); inject '
   severity: low
@@ -481,6 +1034,708 @@ entries:
   origin_phase: unknown
   manifested_phase: unknown
   sightings: []
+- id: entry-cand-20260722-1
+  title: Self-revising analysis docs leave stale, contradicted verdicts unreconciled
+  severity: medium
+  status: open
+  origin_phase: prd
+  manifested_phase: review
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 6eacb171-32bf-4d25-954f-2921341ad475
+    origin_phase: prd
+    manifested_phase: review
+    evidence_quote: each of §9.4, §11.1, §11.3, and §11.5 retracts a load-bearing claim from an earlier section, and almost none of those earlier sections were edited to match... everything a reader actually consults — the BLUF, the §6 verdict grounds, the §5 ranking, the §7 spec, and the entire §9.5 re-verdict — still argues the pre-correction case... all of which §11 reverses.
+- id: entry-cand-20260721-1
+  title: Deferred MCP tool called before ToolSearch discovery guesses params and fails validation
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: bdda3cfb-3107-4111-b91a-6da55d26f987
+    origin_phase: unknown
+    manifested_phase: ops
+    evidence_quote: 'Monitor({"onlyTaskIds": "[\"byv7hyci7\"]"}) -> <tool_use_error>InputValidationError: Monitor failed due to the following issues:
+
+      The required parameter `description` is missing
+
+      An unexpected parameter `onlyTaskIds` was provided
+
+
+      This tool''s schema was not sent to the API — it was not in the discovered-tool set derived from message history.'
+- id: entry-cand-20260719-2
+  title: Graphiti memory search returns self-referential summaries stripped of the actual fact
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: implement
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 9de9e14f-172c-426e-8e12-c68c5b40ee36
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: The decision was made to fix via citations, choosing Option A over Option B.
+- id: entry-cand-20260719-3
+  title: Resume-after-escalation boilerplate assumes .task/iterations.jsonl always exists
+  severity: medium
+  status: open
+  origin_phase: implement
+  manifested_phase: implement
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 9de9e14f-172c-426e-8e12-c68c5b40ee36
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'Bash({"command": "cat .task/iterations.jsonl 2>/dev/null"}) -> Exit code 1'
+- id: entry-cand-20260718-1
+  title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-18'
+    project: dark_factory
+    session: 3bfa5bdc-280c-4dec-accd-ff63b720e5b8
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memory_consolidator": {..., "llm_calls": 35, "tokens_used": 0}, "task_knowledge_sync": {..., "llm_calls": 23, "tokens_used": 0}, "integrity_check": {..., "llm_calls": 39, "tokens_used": 0}'
+- id: entry-cand-20260722-3
+  title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 2a08d615-ba2e-4c00-af9e-0a1b3eb093b2
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+- id: entry-cand-20260722-4
+  title: Session-start memory search returns generically high-scored but task-irrelevant context
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: c4c00b6a-9ce2-493f-aaa8-c227f52a0cb2
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: The decision to extend in place was made unanimously when presented via AskUserQuestion. (relevance_score 0.9, surfaced under Recent Decisions for a task about merge-duplicate coalescing in recover_pending_merges)
+- id: entry-cand-20260722-5
+  title: Periodic-census verifier can't read other sessions' transcripts — sandboxed to the current project's working directory
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: e41e6bc1-1bc2-48a1-97a8-1cda69e9bcbf
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'ls in ''/home/leo/.claude/projects'' was blocked. For security, Claude Code may only list files in the allowed working directories for this session: ''/home/leo/src/dark-factory''.'
+- id: entry-cand-20260722-6
+  title: Bash tool's static-analysis pre-check rejects multi-line heredoc/multi-command scripts outright, conflating with the 'flattening' bug it was sent to reproduce
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: e41e6bc1-1bc2-48a1-97a8-1cda69e9bcbf
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: Contains shell syntax (file_redirect) that cannot be statically analyzed
+- id: entry-cand-20260714-2
+  title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 85f4d0c5-c5bc-4212-a731-65fe22bd0e8b
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'mcp__fused-memory__resolve_ticket({... ''timeout_seconds'': 115}) -> The operation timed out.'
+- id: entry-cand-20260722-9
+  title: Recon action-provenance logger records target='?' for write_journal add/delete ops
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 47959768-2eb3-434b-b879-8988d4fd6547
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "add", "target": "?", "source": "write_journal", "created_at": "2026-07-17T18:59:35.301274+00:00"}'
+- id: entry-cand-20260722-10
+  title: Trickle-coder digest pipeline recursively re-ingests its own prompts as session content, mislabeled as User Corrections
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3275ca01-356c-42f8-822f-b605ea2ebbab
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches (if any)...
+- id: entry-cand-20260722-11
+  title: Read tool's undocumented 256KB cap blocks whole-file architect exploration of large modules
+  severity: medium
+  status: open
+  origin_phase: architect
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 81d54a47-cf7e-43ab-9a1d-c49796eb5e87
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: File content (739.6KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.
+- id: entry-cand-20260722-12
+  title: Reconciliation write_journal double-logs each mutation as an uninformative generic entry plus a specific one
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3802d188-d36e-4eb6-b9e9-8ca6365dc2c2
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "delete", "target": "?", "source": "write_journal", "created_at": "2026-07-18T12:31:45.010883+00:00"}, {"operation": "delete_memory", "target": "28a8413b-4198-4e37-b2d0-27ad4badd26c", "source": "write_journal", "created_at": "2026-07-18T12:31:45.020382+00:00"}'
+- id: entry-cand-20260722-13
+  title: Trickle-coder prompt recursively ingested as mined session content
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3b1cd07f-4808-4120-a048-cdd9c9c0bb6e
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+- id: entry-cand-20260722-14
+  title: Digest extraction collapses a scored session to system-reminder boilerplate, discarding the substance behind its signal counts
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3b1cd07f-4808-4120-a048-cdd9c9c0bb6e
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "signal_counts:\n  tool_error: 1\n  self_correct: 0\n  not_found: 2\n  df_guard: 0\n  interrupt: 0\n---\n\nsystem<system-reminder>\nThe following deferred tools are now available via ToolSearch..."
+- id: entry-cand-20260720-7
+  title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 33b115bf-54fd-420f-b52d-ca944d8bae5b
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_deleted": 0 ... "_reported": {"memories_added": 0.0, "memories_deleted": 3.0}'
+- id: entry-cand-20260724-1
+  title: Session-start context search injects generic, task-irrelevant memories scored as highly relevant
+  severity: medium
+  status: open
+  origin_phase: architect
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-24'
+    project: dark_factory
+    session: d8b662df-7a79-4f45-b85e-36c5cea2c981
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: '{"content": "The steward''s decisions for ''cancelled'', ''deferred'', and ''blocked'' are intentional terminal decisions.", "relevance_score": 0.8}'
+- id: entry-cand-20260717-2
+  title: Rotation-hour budget invisible during long blocking re-arm waits
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-17'
+    project: dark_factory
+    session: ad83edac-8052-4e8a-8e4d-cdcd69bf88af
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'WATCHER_REARM_OUTCOME: CEILING exit=124 (Bash x7 retries of the same 3600s-timeout watcher-rearm.sh call, against ROTATION_HOURS=4.0 injected at turn 3) ending with: ''The user doesn''t want to proceed with this tool use... STOP what you are doing and wait for the user to tell you how to proceed.'''
+- id: entry-cand-20260722-15
+  title: Review-round adjudication list conflates 'previously raised' with 'resolved'
+  severity: medium
+  status: open
+  origin_phase: review
+  manifested_phase: review
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 459234ec-4bed-4510-a5c4-76c8e4b3dc44
+    origin_phase: review
+    manifested_phase: review
+    evidence_quote: Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted.
+- id: entry-cand-20260722-16
+  title: Trickle-coder digest pipeline ingests its own meta-sessions as source material
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: c5522685-c5d9-40b0-abe2-84afbb39f556
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+- id: entry-cand-20260716-2
+  title: Recon write-journal drops operation targets and diverges from self-reported stage stats
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-16'
+    project: dark_factory
+    session: a8dbb27b-6d80-47df-9bab-955971157a61
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "add_episode", "target": "?", ...} x4 vs stats.episodes_added: 0, stats._reported.memories_deleted: 0.0 vs two logged delete_memory calls'
+- id: entry-cand-20260719-4
+  title: Session-start memory search returns anaphoric, contentless summaries
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 60627405-5efb-42e3-8f03-e95585aa6a4c
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: '"Task 2584 serves as a precedent for resolving task 2585." / "The decision was made to fix via citations, choosing Option A over Option B." / "the reasoning for the decision regarding get_statuses was recorded during the investigation of recon-watcher Issue #3."'
+- id: entry-cand-20260722-17
+  title: Digest generator captures the trickle-coder's own recurring task prompt as a 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: ee633c8a-910f-417d-bc4e-13f5b2b818c8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches (if any), and whether it reveals any novel confusion causes not yet in the codebook (candidates).
+- id: entry-cand-20260722-18
+  title: Periodic-census verifier sessions blocked by per-command interactive Bash approval on read-only forensic commands
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: verify
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 96ee5257-265c-4317-ad72-da08793b8a3b
+    origin_phase: ops
+    manifested_phase: verify
+    evidence_quote: 'Bash({"command": "grep -rn \"ensure_eval_verify_deps\" /home/leo/src/dark-factory/orchestrator/src 2>/dev/null"}) -> This command requires approval'
+- id: entry-cand-20260719-5
+  title: Graphiti search returns decontextualized single-sentence fragments — high relevance score, zero actionable content
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: fc5e835d-c134-474f-93ed-e07827caa332
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: '"content": "This decision is explicitly called out in docs/plan-scoring-and-judge.md to prevent relitigation."'
+- id: entry-cand-20260721-5
+  title: Trickle-coder digest ingestion mistakes its own meta-prompt for session evidence
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 8d1a9af8-b5fc-4fd8-8ccf-0d16e8899a1d
+    origin_phase: ops
+    manifested_phase: unknown
+    evidence_quote: '## User Corrections
+
+      - (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...'
+- id: entry-cand-20260720-8
+  title: Reconciliation run's MCP action journal has unresolved targets and duplicate coarse/fine-grained entries, undermining audit provenance
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 6ff1311a-6a58-410b-ac20-dc2a21471543
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "add", "target": "?", "source": "write_journal", ...} immediately followed by {"operation": "add_memory", "target": "8a11c2ac-b06f-41dc-ba4a-c6c5a24fef2c", ...}; and "_reported": {"memories_deleted": 1.0, "memories_written": 1.0, "memories_added": 1.0, "entity_summaries_refreshed": 1.0} alongside items_flagged:2 vs stats.flags_emitted:1.0'
+- id: entry-cand-20260722-19
+  title: Digest pipeline mislabels the trickle-coder's own scripted prompt as a 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 0abb0308-181f-4310-90ad-24c0ad9ebe2b
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+- id: entry-cand-20260722-20
+  title: Digest severity score decoupled from evidence body — high score with an empty digest
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 0abb0308-181f-4310-90ad-24c0ad9ebe2b
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "score: 10.0\nsignal_counts:\n  tool_error: 0\n  self_correct: 0\n  not_found: 0\n  df_guard: 0\n  interrupt: 0\n... (no body content follows; size_bytes: 294)"
+- id: entry-cand-20260722-21
+  title: Digest-extraction pipeline embeds recursive/self-referential trickle-coder prompt content as a session's own 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 554e62f1-5eb5-4ce8-ae7d-b57d41bb7538
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '## User Corrections
+
+      - (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches (if any)...'
+- id: entry-cand-20260713-1
+  title: Reconciliation stage reports show tokens_used=0 despite nonzero llm_calls
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 459a4ae3-32b2-4cba-a5f5-59a1bd5f5980
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"llm_calls": 21, "tokens_used": 0'
+- id: entry-cand-20260713-2
+  title: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 459a4ae3-32b2-4cba-a5f5-59a1bd5f5980
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_added": 3, ... "_reported": {"memories_written": 2.0, ... "memories_added": 2.0}'
+- id: entry-cand-20260722-23
+  title: Recon stage report's top-level items_flagged contradicts its own nested stats.items_flagged
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: dbfab1c8-f1e0-494e-b082-11eb35a2bf07
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '"memory_consolidator": {"items_flagged": 1, "stats": {"items_flagged": 0.0, "entity_summary_snapshot_lines_stripped": 0, ...}}'
+- id: entry-cand-20260722-24
+  title: Session digest generator self-embeds the trickle-coder's own recursive prompt as fabricated 'session content'
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 8db2d245-160d-4f15-acb8-662600bd5e00
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+- id: entry-cand-20260723-2
+  title: Review-suggestion settled/deferred adjudicator must be told resemblance-to-prior-round ≠ verified resolution
+  severity: medium
+  status: open
+  origin_phase: review
+  manifested_phase: review
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: 7a14b442-c5e5-462e-88c6-11e057665ce4
+    origin_phase: review
+    manifested_phase: review
+    evidence_quote: 'IMPORTANT: the PRIOR-ROUND block below lists EVERY suggestion raised in earlier rounds — it is NOT a list of confirmed resolutions. Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted.'
+- id: entry-cand-20260715-4
+  title: watcher-rearm.sh requires DARK_FACTORY_ROOT, unset by the rotation's injected supervisor prompt
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: f41dd7df-6c84-4f9b-908b-81e11f9271bb
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+- id: entry-cand-20260722-26
+  title: Digest-capture pipeline recursively embeds the trickle-coder's own meta-prompt as a zero-signal 'User Correction', risking self-pollution of the codebook corpus
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 617d100e-5314-4d28-b584-6d00cb74c5b1
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '## User Corrections
+
+      - (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below ... === SESSION DIGEST ===\nsession: "69a2c122-b6a2-4197-91f4-c1ed84f1aa2a"'
+- id: entry-cand-20260714-3
+  title: Recon dedup 'fully resolved' claims come from an under-scoped search radius, so live near-duplicates recur across cycles
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: f3fe6351-9923-43f5-973e-4fc47ed09109
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: Stage 1's finding ... claimed the recurring "duplicate_procedural_knowledge_recurring_topic" flag was fully resolved by merging a "5-way near-identical procedural_knowledge cluster" ... Spot-check search for the same topic surfaces 4 MORE live, un-merged memories describing ...
+- id: entry-cand-20260714-4
+  title: Mem0 dedup/consolidation merges by similarity, not correctness — canonical records can encode content that contradicts other live near-duplicates
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: f3fe6351-9923-43f5-973e-4fc47ed09109
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: content diverges on the actual behavior of the command. The canonical merged memory 973056dd ... and live copies ... all assert the command "reliably exits 1 but still stages the intended files correctly (advisory-only)". A separate live memory, 8a75e49b ... asserts [something different]
+- id: entry-cand-20260720-9
+  title: Recon stage stats nest a redundant '_reported' subtotal duplicating top-level counters
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 40dff74e-b72f-46ba-817f-1808b94fcba6
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_added": 2, ... "_reported": {"memories_written": 2.0, "memories_added": 2.0}'
+- id: entry-cand-20260722-27
+  title: Trickle-coder digest pipeline ingests its own prior invocations as session digests
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3f6c6536-10fe-4133-b6e0-00eca4ec62c3
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+- id: entry-cand-20260722-29
+  title: Architect explore-phase hits ModuleNotFoundError / command-not-found in task worktree
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 92d5f938-bbe9-415f-a247-c5e00d950123
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: (turn 69) modulenotfounderror; (turn 93) command not found — during architect task 2884's codebase-exploration step in /home/leo/src/dark-factory/.worktrees/2884
+- id: entry-cand-20260720-10
+  title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
+  severity: medium
+  status: open
+  origin_phase: decompose
+  manifested_phase: architect
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 287f6ff2-f184-4c06-8f99-1014296927a4
+    origin_phase: decompose
+    manifested_phase: architect
+    evidence_quote: '"decision": "Fix only Path A (the `except _StewardReescalated` clause at workflow.py:2444); do NOT re-route it through task 2248''s typed StewardOutcome channel.", "rationale": "Task 2248 (done, merge..." -> The user doesn''t want to proceed with this tool use... STOP what you are doing and wait for the user to tell you how to proceed.'
+- id: entry-cand-20260722-30
+  title: Trickle-coder digest capture mislabels the initial task-framing prompt as a 'User Correction' and recurses
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: dc6036ed-d8ac-4385-a7e7-bdeefd8a1e3f
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+- id: entry-cand-20260713-3
+  title: Recon category labels applied by surface keyword match, not guard definition
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 443c02f0-3d0e-4aa3-a441-3a12c6205098
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: reserve category='cross_project_routing' for actual get_task/get_tasks/get_statuses project_id mis-stamping (per the Cross-Project Routing Guard), not for corroboration/evidence-forwarding notes that merely cite a task in another project
+- id: entry-cand-20260721-6
+  title: Oversized test file forces fragile grep/offset navigation instead of direct reads
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: implement
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: b8cedfca-50ad-4d10-80d5-4f8a44deba80
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: File content (1001.7KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.
+- id: entry-cand-20260722-31
+  title: Trickle-coder digest generator mislabels the injected task/system prompt as a 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: a3d49c3c-4dbc-4f82-bad2-b276220b2e09
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '## User Corrections
+
+      - (turn 3) # Context
+
+
+      _No memory context available._
+
+
+      ## Agent Identity
+
+
+      - **agent_id:** `claude-architect`
+
+      - **project_id:** `dark_factory`'
+- id: entry-cand-20260723-5
+  title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: ec1611ea-3ad2-4a3a-a281-59a17eadbd78
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'Recurring gap (2nd confirmed occurrence) in the terminal-task write guard: recon-stage agents have no authorized corrective_path to fix arbitrary terminal-task string fields (e.g. top-level `details`) once a task is done — ReconTerminalWriteRejected blocks it, and the only corrective_path (set_task_status_done_provenance_repair, confirmed present in fused-memory/src/fused_memory/middleware/recon_write_policy.py) covers only `done_provenance`, not other fields.'
+- id: entry-cand-20260722-33
+  title: Session digest generator renders guard/not-found signals as bare templates, dropping the matched substring
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 06dac3e5-adae-4879-ad7e-a24cd2257ec8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Guard Trips: (turn 21) blocked: | Not Found: (turn 21) no such file or directory / (turn 21) does not exist / (turn 21) not found in / (turn 21) modulenotfounderror / (turn 21) command not found'
+- id: entry-cand-20260722-34
+  title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 06dac3e5-adae-4879-ad7e-a24cd2257ec8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '(turn 30) Bash({"command": "find / -iname \"*72ca812e*\" ..."}) -> This Bash command contains multiple operations... requires approval; (turn 41) grep in ''/home/leo/.claude'' was blocked. For security, Claude Code may only search ... allowed working directories ... ''/home/leo/src/dark-factory'''
+- id: entry-cand-20260722-35
+  title: watcher-rearm.sh's required DARK_FACTORY_ROOT env var absent from the rotation prompt's vocabulary
+  severity: medium
+  status: open
+  origin_phase: implement
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: d7d196be-873f-4648-95e2-13302be28ad4
+    origin_phase: implement
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -586,3 +1841,1057 @@ candidates:
     origin_phase: architect
     manifested_phase: implement
     evidence_quote: 'Turn 149 Bash stderr: ''echo "=== pytest config in worktree pyproject ==="; grep -n "pythonpath\|testpaths\|\[tool.pytest...'' returned only column headers, no pytest configuration found. Agent cannot execute TDD plan.'
+- id: cand-20260715-2
+  title: Merge-queue pytest-rerun runs in a throwaway worktree with no dependency install, so verify spuriously fails as if the task broke tests
+  cause: 'The post-merge targeted pytest-rerun step is executed in a fresh throwaway merge worktree that never runs `uv sync --extra dev` (or an equivalent all-packages sync), so pytest itself is absent and the rerun fails with ''Failed to spawn: pytest'' — surfacing as a task-specific block/regression rather than an infra provisioning gap.'
+  area: merge-queue verify infra
+  first_seen: '2026-07-15'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: 4196febb-1555-4ead-b959-6440f875698f
+    origin_phase: merge
+    manifested_phase: merge
+    evidence_quote: 'the dark_factory merge-queue''s post-merge targeted pytest-rerun step (run in a fresh throwaway merge worktree) omits a preceding `uv sync --extra dev`, so pytest is never installed and the rerun spuriously fails with "Failed to spawn: pytest"'
+- id: cand-20260722-1
+  title: Self-revising analysis docs leave stale, contradicted verdicts unreconciled
+  cause: A long-form PRD-substrate analysis document is revised incrementally as new evidence overturns earlier findings (here §9.4/§11.1/§11.3/§11.5 each retract a load-bearing claim from §5/§6/§7/§9.5), but the earlier sections — critically the executive-summary BLUF at the top — are never rewritten or given a forward pointer to the correction. The document ends up asserting two contradictory verdicts simultaneously with no reconciliation, so any reader who consults only the BLUF or an early section (the parts actually read for a decision) gets the pre-correction, retracted conclusion while the document's own final considered position is materially different.
+  area: PRD authoring / decision-document self-consistency
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 6eacb171-32bf-4d25-954f-2921341ad475
+    origin_phase: prd
+    manifested_phase: review
+    evidence_quote: each of §9.4, §11.1, §11.3, and §11.5 retracts a load-bearing claim from an earlier section, and almost none of those earlier sections were edited to match... everything a reader actually consults — the BLUF, the §6 verdict grounds, the §5 ranking, the §7 spec, and the entire §9.5 re-verdict — still argues the pre-correction case... all of which §11 reverses.
+  promoted_to: entry-cand-20260722-1
+- id: cand-20260720-6
+  title: Architect/plan-tools contract has no 'task already done' exit — agent hallucinates report_task_already_done
+  cause: The plan-tools MCP surface handed to claude-architect (create_plan/add_prerequisite/add_plan_step/add_design_decision/add_reuse_item/confirm_plan) documents only the happy-path TDD-planning flow. When the architect verified via `git log --all -- <files>` that both requested doc edits were already on main, it had no real tool to signal 'premise invalid, nothing to plan' — it invented `report_task_already_done`, which the harness rejected outright (No such tool available), leaving no documented recovery path for a premise-invalidated architect dispatch.
+  area: plan-tools MCP / architect contract
+  first_seen: '2026-07-20'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 7bb1cb3d-188d-4c85-9013-0bf93f94fec4
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: 'report_task_already_done({"commit": "685dcb918c", "evidence": "Both requested doc edits are already on main..."}) -> <tool_use_error>Error: No such tool available: report_task_already_done</tool_use_error>'
+- id: cand-20260721-1
+  title: Deferred MCP tool called before ToolSearch discovery guesses params and fails validation
+  cause: Tools like Monitor are deferred (schema withheld from the model's context until ToolSearch loads it). An agent that calls a deferred tool directly — without first invoking ToolSearch('select:<name>') — has no schema to work from, so it invents parameter names/types from context or convention (e.g. 'onlyTaskIds' instead of the real params, and typed values serialized as strings), and the call is rejected client-side with InputValidationError. Nothing prompts the agent to check for or load deferred-tool schemas before first use.
+  area: cli-harness/tool-discovery
+  first_seen: '2026-07-21'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: bdda3cfb-3107-4111-b91a-6da55d26f987
+    origin_phase: unknown
+    manifested_phase: ops
+    evidence_quote: 'Monitor({"onlyTaskIds": "[\"byv7hyci7\"]"}) -> <tool_use_error>InputValidationError: Monitor failed due to the following issues:
+
+      The required parameter `description` is missing
+
+      An unexpected parameter `onlyTaskIds` was provided
+
+
+      This tool''s schema was not sent to the API — it was not in the discovered-tool set derived from message history.'
+  promoted_to: entry-cand-20260721-1
+- id: cand-20260722-2
+  title: Eval-worktree root is package-scoped but agent assumes full-monorepo path prefixes
+  cause: The eval harness's worktree for this task (.eval-worktrees/df_task_12/run-00f35016) is rooted at (or equivalent to) the orchestrator package directory itself rather than the dark-factory monorepo root, but the implementer agent followed the CLAUDE.md `<pkg>/src/<pkg>` repo-map convention literally and kept prefixing commands with `orchestrator/` (grep on `orchestrator/pyproject.toml`, `git add orchestrator/tests/test_verify.py`), producing repeated 'No such file or directory' errors that were never self-corrected, and a failed git add/commit whose own warning shows a doubled path (`orchestrator/orchestrator/tests/`), confirming cwd was already inside the package root. The commit of the new test file never landed in that turn, risking silent loss of the step's work.
+  area: eval-harness / worktree-layout
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 30f6e99d-95b1-42c7-98cf-9bbca755af8c
+    origin_phase: ops
+    manifested_phase: implement
+    evidence_quote: 'warning: could not open directory ''orchestrator/orchestrator/tests/'': No such file or directory
+
+      fatal: pathspec ''orchestrator/tests/test_verify.py'' did not match any files'
+- id: cand-20260719-2
+  title: Graphiti memory search returns self-referential summaries stripped of the actual fact
+  cause: Fact-extraction/summarization for graphiti edges distills content into meta-referential pointer text ('the decision was made...', 'this is recorded to prevent relitigation') that confirms a decision/convention/context item exists without ever stating what it says, so session-start context injection (Project Context, Conventions, Recent Decisions, Task Context — all 20 results here) returns technically non-empty but practically unusable facts.
+  area: fused-memory / graphiti fact extraction
+  first_seen: '2026-07-19'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 9de9e14f-172c-426e-8e12-c68c5b40ee36
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: The decision was made to fix via citations, choosing Option A over Option B.
+  promoted_to: entry-cand-20260719-2
+- id: cand-20260719-3
+  title: Resume-after-escalation boilerplate assumes .task/iterations.jsonl always exists
+  cause: The standard 'Resuming After Escalation' prompt template instructs the agent to read .task/plan.json and .task/iterations.jsonl to reconstruct progress, but iterations.jsonl is not guaranteed to be present for every task/workflow shape, causing an immediate failed tool call at the very start of resumed work.
+  area: orchestrator resume protocol / task artifact contract
+  first_seen: '2026-07-19'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 9de9e14f-172c-426e-8e12-c68c5b40ee36
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'Bash({"command": "cat .task/iterations.jsonl 2>/dev/null"}) -> Exit code 1'
+  promoted_to: entry-cand-20260719-3
+- id: cand-20260718-1
+  title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
+  cause: 'The three reconciliation stage runners (memory_consolidator, task_knowledge_sync, integrity_check) report real llm_calls counts (35, 23, 39) but tokens_used: 0 in every case — token accounting appears never wired into the stage runner''s metrics emission, so a run-reviewing agent (or any downstream cost/capacity decision) has no way to see actual spend for a reconciliation cycle from the review report, only call counts.'
+  area: recon/observability
+  first_seen: '2026-07-18'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-18'
+    project: dark_factory
+    session: 3bfa5bdc-280c-4dec-accd-ff63b720e5b8
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memory_consolidator": {..., "llm_calls": 35, "tokens_used": 0}, "task_knowledge_sync": {..., "llm_calls": 23, "tokens_used": 0}, "integrity_check": {..., "llm_calls": 39, "tokens_used": 0}'
+  promoted_to: entry-cand-20260718-1
+- id: cand-20260722-3
+  title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
+  cause: Escalation-watcher rotations are spawned by the supervisor without DARK_FACTORY_ROOT in the environment, and no rotation-startup prompt or doc mentions the requirement; the agent only discovers it after scripts/watcher-rearm.sh fails outright on first invocation (exit 2), then must guess and retry with the var set manually before the bounded-wait mechanism can run at all
+  area: escalation-watcher / scripts/watcher-rearm.sh
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 2a08d615-ba2e-4c00-af9e-0a1b3eb093b2
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+  promoted_to: entry-cand-20260722-3
+- id: cand-20260722-4
+  title: Session-start memory search returns generically high-scored but task-irrelevant context
+  cause: The mandated session-start context assembly (Project Context / Conventions / Recent Decisions / Task Context searches) returns graphiti hits with relevance_score 0.75-1.0 that are unrelated to the specific task's domain — for a task about InFlightMergeRegistry duplicate-coalescing in recover_pending_merges, the injected context surfaced unrelated facts (task 1470/audit wiring, task 841 view scoping, an AskUserQuestion decision, task 2917/2693 status). Relevance scoring reflects generic recency/salience rather than domain fit to the task at hand, filling the agent's context budget with noise instead of grounding it in prior InFlightMergeRegistry/merge_queue decisions.
+  area: memory retrieval / context assembly
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: c4c00b6a-9ce2-493f-aaa8-c227f52a0cb2
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: The decision to extend in place was made unanimously when presented via AskUserQuestion. (relevance_score 0.9, surfaced under Recent Decisions for a task about merge-duplicate coalescing in recover_pending_merges)
+  promoted_to: entry-cand-20260722-4
+- id: cand-20260721-2
+  title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var
+  cause: The rearm script hard-requires an environment variable that isn't mentioned in its usage/help text or in the escalation-watcher skill's prompt, so the first invocation fails immediately (exit 2) and the agent must discover the requirement by trial and error before retrying with the var set.
+  area: escalation-watcher / scripts/watcher-rearm.sh
+  first_seen: '2026-07-21'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: bd95a95e-33ed-4fec-abdc-c5cd1b69a24a
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+- id: cand-20260715-3
+  title: Project-id spelling drift (hyphen vs underscore) lets duplicate decision episodes escape dedup
+  cause: Two Graphiti episodes recorded the identical 2026-04-21 decision ~4.5 hours apart under two different project_id spellings for the same project ('pump_web_ui' underscore vs 'pump-web-ui' hyphen). Because consolidation/dedup keys off project_id, the spelling drift let a near word-for-word duplicate persist undetected until a later recon memory_consolidator stage had to manually find and remediate it — a systemic gap, not a one-off typo, since nothing at write time normalizes or validates project_id spelling against the canonical (hyphen-free) form.
+  area: memory / fused-memory ingestion
+  first_seen: '2026-07-15'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: 8481bc65-3781-45dc-9d2e-3639d4cc66f9
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: episode 66745778-600e-44d5-8fe3-d16be7b5fc10 (created 11:50:44Z, uses 'pump_web_ui' underscore spelling) and episode e6e5cc4d-e814-4af5-8128-6670ca0fce6a (created 16:23:00Z, uses 'pump-web-ui' hyphen spelling). Content is near word-for-word identical
+- id: cand-20260722-5
+  title: Periodic-census verifier can't read other sessions' transcripts — sandboxed to the current project's working directory
+  cause: The verifier prompt instructs confirming a cross-session claim via 'targeted reads of . (ABSOLUTE paths only)', but locating the flagged session's transcript requires listing files under ~/.claude/projects/, which lies outside the session's allowed working directory ('/home/leo/src/dark-factory') and is blocked by the sandbox. Five consecutive find/ls attempts across turns 12-26 were rejected or required approval before the agent gave up and tried to reproduce the bug empirically instead.
+  area: tooling/verifier-sandbox-scope
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: e41e6bc1-1bc2-48a1-97a8-1cda69e9bcbf
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'ls in ''/home/leo/.claude/projects'' was blocked. For security, Claude Code may only list files in the allowed working directories for this session: ''/home/leo/src/dark-factory''.'
+  promoted_to: entry-cand-20260722-5
+- id: cand-20260722-6
+  title: Bash tool's static-analysis pre-check rejects multi-line heredoc/multi-command scripts outright, conflating with the 'flattening' bug it was sent to reproduce
+  cause: Attempting to reproduce a claimed cd+heredoc+git flattening bug, the agent's own multi-line Bash commands were rejected pre-execution ('Contains shell syntax that cannot be statically analyzed') rather than executed and observed to flatten — so the harness's static-analysis gate is a distinct failure mode from the runtime argument-corruption the cluster describes, and the two are easy to conflate from error text alone.
+  area: tooling/bash-harness
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: e41e6bc1-1bc2-48a1-97a8-1cda69e9bcbf
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: Contains shell syntax (file_redirect) that cannot be statically analyzed
+  promoted_to: entry-cand-20260722-6
+- id: cand-20260722-7
+  title: Eval-worktree verify env installs deps per-package, missing sibling-package transitive deps (aiosqlite) — spurious ModuleNotFoundError misattributed to the task's own fix
+  cause: The eval harness bootstraps the verify venv scoped to the target package (e.g. `cd orchestrator && uv sync`), installing only orchestrator's own declared deps. A test file importing orchestrator.config transitively imports shared (via KNOWN_ROLE_NAMES), and shared/async_sqlite_base.py hard-imports aiosqlite — a dependency declared under shared's/fused-memory's pyproject, never installed into the package-scoped venv. Verify then fails with a ModuleNotFoundError wholly unrelated to the task's actual fix, and the misattribution recurs across sessions because nothing corrects the per-package bootstrap scope.
+  area: eval-harness verify environment bootstrap / cross-package dependency provisioning
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: f95f1c92-c7bb-490e-bf3c-f2a1ecd69873
+    origin_phase: ops
+    manifested_phase: verify
+    evidence_quote: "ModuleNotFoundError: No module named 'aiosqlite' ... shared/async_sqlite_base.py:18: in <module>\n    import aiosqlite"
+- id: cand-20260722-8
+  title: Episode/add_episode ingestion extracts proposed/conditional 'resolution option' prose as unqualified current-state fact
+  cause: add_episode's extraction pipeline has no detection for modal/hypothetical framing ('RESOLUTION OPTIONS', 'architect call', should/would/propose) in task-description text, so a task's proposed-but-not-yet-implemented fix option gets stored as a present-tense entities_and_relations/temporal_facts Graphiti edge that directly contradicts the actual code, only caught later when reconciliation invalidates the contaminated edges.
+  area: fused-memory / Graphiti episode extraction (add_episode)
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 63769571-3e7b-43ba-80ba-f8c28be2d336
+    origin_phase: architect
+    manifested_phase: recon
+    evidence_quote: This looks like an extraction pipeline (add_episode or similar) ingesting a task description's hypothetical/conditional "resolution option" prose and storing it as an unqualified present-tense entities_and_relations/temporal_facts edge, rather than recognizing the modal framing ("RESOLUTION OPTIONS", "Move the ... to ...", architect-decision language)
+- id: cand-20260723-1
+  title: Review-round adjudicator conflates 'raised before' with 'resolved before', risking silent suppression of deferred-but-open findings
+  cause: The prior-round suggestion list fed to a review-adjudication judge mixes concerns that were actually fixed/deliberately reverted-and-kept with concerns that were merely deferred to a follow-up task and remain open. Without an explicit warning, a judge naturally treats textual resemblance to any prior-round item as evidence of resolution and marks it 'settled', silently dropping a still-open finding instead of re-emitting it.
+  area: review round-adjudication / duplicate-suggestion suppression across amendment rounds
+  first_seen: '2026-07-23'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: 88c974ae-59c6-4e9f-a03a-89173e897adc
+    origin_phase: review
+    manifested_phase: review
+    evidence_quote: 'IMPORTANT: the PRIOR-ROUND block below lists EVERY suggestion raised in earlier rounds — it is NOT a list of confirmed resolutions. Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted. Classify "settled" ONLY when you are confident the concern was actually resolved earlier, never merely because it resembles something raised before.'
+- id: cand-20260714-1
+  title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var, discovered only by failure
+  cause: The re-arm helper script has an unstated required-env-var contract; the agent's first invocation exited 2 with 'DARK_FACTORY_ROOT must be set to a valid directory' rather than the script or any watcher-facing doc surfacing the requirement up front.
+  area: escalation-watcher tooling / scripts/watcher-rearm.sh
+  first_seen: '2026-07-14'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 85f4d0c5-c5bc-4212-a731-65fe22bd0e8b
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory (exit code 2)'
+- id: cand-20260714-2
+  title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
+  cause: mcp__fused-memory__resolve_ticket timed out at 115s with only 'The operation timed out' and no indication of whether the underlying resolution actually applied, pushing the agent into repeated corroborating polls (get_pending_escalations x13, get_scheduler_state x3) to infer the true outcome instead of getting a definitive answer from the tool itself.
+  area: fused-memory ticket resolution / MCP timeout ambiguity
+  first_seen: '2026-07-14'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: 85f4d0c5-c5bc-4212-a731-65fe22bd0e8b
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'mcp__fused-memory__resolve_ticket({... ''timeout_seconds'': 115}) -> The operation timed out.'
+  promoted_to: entry-cand-20260714-2
+- id: cand-20260721-3
+  title: Extraction ingestion stores proposed/conditional resolution-option prose as unqualified current-state fact
+  cause: add_episode ingestion (from a task description during creation or an architect/planning step) does not detect modal/conditional framing ('RESOLUTION OPTIONS (architect call — pick one)', 'should'/'would'/'propose') and stores the hypothetical fix option as an unqualified present-tense entities_and_relations/temporal_facts edge, directly contradicting the verified current code
+  area: fused-memory Graphiti extraction/ingestion pipeline
+  first_seen: '2026-07-21'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 9df7f270-e6ea-4300-be61-eafee210dd1a
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: This looks like an extraction pipeline (add_episode or similar) ingesting a task description's hypothetical/conditional "resolution option" prose and storing it as an unqualified present-tense entities_and_relations/temporal_facts edge, rather than recognizing the modal framing
+- id: cand-20260721-4
+  title: Review-round adjudication conflates 'raised before' with 'resolved before'
+  cause: When an LLM judge is asked whether a current review finding was already settled in a prior round, prior-round suggestion lists mix genuinely-resolved items with merely-deferred (routed to follow-up task) ones with no structural marker distinguishing them inline — resolution status must be tracked out-of-band and reasoned about per-item. Without an explicit disclaimer forcing the distinction, the natural default is to treat mere topical resemblance to a prior-round mention as evidence of resolution, silently suppressing still-open concerns and re-litigating nothing while actually dropping real findings.
+  area: review/adjudication
+  first_seen: '2026-07-21'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 038a1058-9d68-4ced-99da-997ae61998cb
+    origin_phase: review
+    manifested_phase: review
+    evidence_quote: 'IMPORTANT: the PRIOR-ROUND block below lists EVERY suggestion raised in earlier rounds — it is NOT a list of confirmed resolutions. Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted.'
+- id: cand-20260722-9
+  title: Recon action-provenance logger records target='?' for write_journal add/delete ops
+  cause: The action-provenance logger captures a real UUID target for add_system_record/delete_memory operations but records target as the literal string '?' for 'add'/'delete' operations sourced from write_journal, so a self-review agent or human auditing the MCP Actions list cannot correlate which journal entry was added vs. later deleted, only that some add/delete pair occurred.
+  area: reconciliation harness / MCP action logging
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 47959768-2eb3-434b-b879-8988d4fd6547
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "add", "target": "?", "source": "write_journal", "created_at": "2026-07-17T18:59:35.301274+00:00"}'
+  promoted_to: entry-cand-20260722-9
+- id: cand-20260722-10
+  title: Trickle-coder digest pipeline recursively re-ingests its own prompts as session content, mislabeled as User Corrections
+  cause: The session-digest generator for the confusion-codebook trickle-coder appears to capture full raw user-turn text without filtering out prior trickle-coder task prompts. When a previous trickle-coder invocation (itself containing the full instructions, codebook index, and a nested prior session digest) becomes the subject of a later digest, its entire text is extracted verbatim and labeled 'User Corrections', producing self-referential recursive nesting with no actual signal about agent behavior.
+  area: confusion-codebook digest generation / trickle-coder harness
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3275ca01-356c-42f8-822f-b605ea2ebbab
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches (if any)...
+  promoted_to: entry-cand-20260722-10
+- id: cand-20260722-11
+  title: Read tool's undocumented 256KB cap blocks whole-file architect exploration of large modules
+  cause: Architect-stage planning reflexively Read()s a target file whole to understand call sites before writing a plan; large modules (merge_queue.py, ~739.6KB) silently exceed the Read tool's 256KB size cap with no upfront file-size signal, forcing a blind offset/limit fallback mid-exploration and risking partial comprehension of consume() call sites.
+  area: tooling/harness — Read tool file-size ceiling not surfaced to planners ahead of time
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 81d54a47-cf7e-43ab-9a1d-c49796eb5e87
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: File content (739.6KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.
+  promoted_to: entry-cand-20260722-11
+- id: cand-20260716-1
+  title: Graphiti task-entity facts go stale/contradictory across lifecycle transitions with no automatic invalidation
+  cause: 'Stage 1/2 recon writes status facts to Graphiti as tasks progress, but when a task later reaches a different terminal state (cancelled, or corrected done-via-real-merge after a found_on_main misattribution reopen/redo cycle), nothing invalidates or supersedes the earlier edges — the entity summary is only reconciled if a later Stage-3 cross-system integrity check happens to flag it as a ''systemic_pattern'' finding and an agent manually calls update_edge/add_memory. Separately, a single episode ingestion produced two mutually-exclusive co-current edges for the same entity (task 2669: ''left blocked'' and ''left pending'', both timestamped from the same source episode), showing the extraction step itself can emit contradictory facts from one pass.'
+  area: fused-memory/reconciliation (Graphiti entity lifecycle sync)
+  first_seen: '2026-07-16'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-16'
+    project: dark_factory
+    session: d932cec0-6537-46b8-866e-fb4138a6a85c
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: Tasks 2531, 2394, 2624, and 2504 each completed their found_on_main-misattribution reopen/redo cycle and are now genuinely done via real merge commits (confirmed live via get_task), but their Graphiti entity summaries only recorded the earlier misattributed/false-completion facts, with no resulting fact for the actual final merged completion.
+- id: cand-20260722-12
+  title: Reconciliation write_journal double-logs each mutation as an uninformative generic entry plus a specific one
+  cause: 'The MCP Actions journal (source: write_journal) emits two log rows per logical mutation: a generic op (e.g. ''delete'', ''add'') with target literally the string ''?'', immediately followed by a specific op (e.g. ''delete_memory'', ''add_memory'', ''add_system_record'', ''add_episode'') carrying the real target id. A reviewer (human or LLM) must correlate rows by millisecond timestamp proximity to reconstruct one real operation; the ''?'' rows carry zero identifying information on their own, so if the specific row were ever dropped or reordered the generic row would be silently unattributable.'
+  area: reconciliation/observability
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3802d188-d36e-4eb6-b9e9-8ca6365dc2c2
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "delete", "target": "?", "source": "write_journal", "created_at": "2026-07-18T12:31:45.010883+00:00"}, {"operation": "delete_memory", "target": "28a8413b-4198-4e37-b2d0-27ad4badd26c", "source": "write_journal", "created_at": "2026-07-18T12:31:45.020382+00:00"}'
+  promoted_to: entry-cand-20260722-12
+- id: cand-20260722-13
+  title: Trickle-coder prompt recursively ingested as mined session content
+  cause: The session-digest corpus assembled for the confusion-codebook trickle-coder contains a digest (session 3b1cd07f) whose sole 'User Corrections' entry is the trickle-coder's own full task prompt verbatim — instructions, codebook index, and a second nested SESSION DIGEST block — rather than genuine user/assistant dialogue. The mining pipeline captured its own recursive invocation as a codeable session, with no filter excluding trickle-coder-authored turns from the corpus it mines, so the codebook risks being trained on its own scaffolding instead of real agent confusion.
+  area: confusion-reduction trickle-coder / session-digest mining pipeline
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3b1cd07f-4808-4120-a048-cdd9c9c0bb6e
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  promoted_to: entry-cand-20260722-13
+- id: cand-20260722-14
+  title: Digest extraction collapses a scored session to system-reminder boilerplate, discarding the substance behind its signal counts
+  cause: The nested session 0a92e754 digest reports score=8.0 with tool_error=1 and not_found=2 (signals implying a real, notable failure), but its rendered body contains zero actual dialogue or tool-call content — only injected system-reminder boilerplate (deferred-tool list, agent-type roster, MCP server instructions, skills catalogue) for an orchestrated-task session in a task worktree. Whatever selects representative content for the digest is evidently anchoring on message position/type rather than the signals it claims to summarize, leaving no evidence to ground a match/candidate decision for a session its own scoring flags as significant.
+  area: confusion-reduction trickle-coder / session-digest generation
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3b1cd07f-4808-4120-a048-cdd9c9c0bb6e
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "signal_counts:\n  tool_error: 1\n  self_correct: 0\n  not_found: 2\n  df_guard: 0\n  interrupt: 0\n---\n\nsystem<system-reminder>\nThe following deferred tools are now available via ToolSearch..."
+  promoted_to: entry-cand-20260722-14
+- id: cand-20260720-7
+  title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
+  cause: 'Reconciliation stage reports carry two parallel accounting layers that are never cross-checked: a deterministic `stats` block and a separate `_reported` block. In this run''s memory_consolidator report, stats.memories_deleted=0 but _reported.memories_deleted=3.0 (a direct value conflict), and in task_knowledge_sync, _reported introduces a key (`memories_written`) that doesn''t exist anywhere in the stats schema (which only has `memories_added`/`memories_deleted`, both 0). Nothing in the pipeline asserts the two layers agree before the report is emitted, so a consumer reading `_reported` would conclude 3 deletions happened when the authoritative counters say 0.'
+  area: reconciliation harness / recon stage self-reporting
+  first_seen: '2026-07-20'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 33b115bf-54fd-420f-b52d-ca944d8bae5b
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_deleted": 0 ... "_reported": {"memories_added": 0.0, "memories_deleted": 3.0}'
+  promoted_to: entry-cand-20260720-7
+- id: cand-20260724-1
+  title: Session-start context search injects generic, task-irrelevant memories scored as highly relevant
+  cause: 'The architect harness auto-populates ''Project Context / Conventions / Recent Decisions / Task Context'' via broad search() queries (e.g. ''project overview and current status''); the returned items carry relevance_score 0.75-1.0 yet are semantically unrelated to the task''s actual domain (task 2790 wires a Qdrant offline-lane pytest config) — hits include ''/audit wired into /review Phase-2'', ''task #841 scoped to four views'', ''steward decisions for cancelled/deferred/blocked are intentional'', ''task 2589/lambda decision trees compute different answers''. The relevance_score gives false confidence that this context is on-topic when it is generic filler, burning context budget without informing the plan.'
+  area: memory/context-injection
+  first_seen: '2026-07-24'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-24'
+    project: dark_factory
+    session: d8b662df-7a79-4f45-b85e-36c5cea2c981
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: '{"content": "The steward''s decisions for ''cancelled'', ''deferred'', and ''blocked'' are intentional terminal decisions.", "relevance_score": 0.8}'
+  promoted_to: entry-cand-20260724-1
+- id: cand-20260717-2
+  title: Rotation-hour budget invisible during long blocking re-arm waits
+  cause: ROTATION_HOURS=4.0 is injected once at startup as prose the agent must self-track, but each watcher-rearm.sh call blocks up to 3600s and its return value only reports a per-call outcome (CEILING/escalation-found), never cumulative elapsed wall-clock time against the rotation clock. With no tool surfacing 'budget exceeded', the agent kept re-arming (7 consecutive ~3600s foreground waits, up to ~7h against a 4h budget) instead of emitting its digest and exiting, until a human manually interrupted and rejected the tool call to force a stop.
+  area: escalation-watcher
+  first_seen: '2026-07-17'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-17'
+    project: dark_factory
+    session: ad83edac-8052-4e8a-8e4d-cdcd69bf88af
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'WATCHER_REARM_OUTCOME: CEILING exit=124 (Bash x7 retries of the same 3600s-timeout watcher-rearm.sh call, against ROTATION_HOURS=4.0 injected at turn 3) ending with: ''The user doesn''t want to proceed with this tool use... STOP what you are doing and wait for the user to tell you how to proceed.'''
+  promoted_to: entry-cand-20260717-2
+- id: cand-20260722-15
+  title: Review-round adjudication list conflates 'previously raised' with 'resolved'
+  cause: The PRIOR-ROUND suggestions block handed to the settled/not-settled judge lists every concern raised in earlier amendment rounds with no status field separating 'applied/deliberately kept' from 'deferred to a follow-up task and still open' — the adjudicator has to infer resolution status from prose resemblance alone, so a current suggestion matching a merely-deferred prior one risks being mis-marked 'settled' and silently suppressed, re-hiding an unaddressed concern.
+  area: review-round suggestion re-litigation adjudicator (merge_disposition.py review/amendment loop)
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 459234ec-4bed-4510-a5c4-76c8e4b3dc44
+    origin_phase: review
+    manifested_phase: review
+    evidence_quote: Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted.
+  promoted_to: entry-cand-20260722-15
+- id: cand-20260722-16
+  title: Trickle-coder digest pipeline ingests its own meta-sessions as source material
+  cause: The session-digest harvester that feeds the trickle-coder (plans/confusion-reduction-prd.md §7.3) does not filter out interactive sessions that were themselves prior trickle-coder classification runs. A digest was captured whose entire 'User Corrections' content is the trickle-coder's own instruction prompt (including an older, shorter codebook index), meaning the pipeline is at risk of classifying its own meta-tooling output as if it were genuine dark-factory task-agent confusion, polluting the codebook corpus with self-referential, zero-signal content instead of real agent behavior.
+  area: confusion-reduction-pipeline/digest-capture
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: c5522685-c5d9-40b0-abe2-84afbb39f556
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  promoted_to: entry-cand-20260722-16
+- id: cand-20260716-2
+  title: Recon write-journal drops operation targets and diverges from self-reported stage stats
+  cause: 'The write_journal MCP action log records target: "?" for update_edge, add_episode, add, and delete operations (only add_memory/delete_memory calls get real IDs), and the logged call counts don''t reconcile with the stage''s own self-reported counters — e.g. memory_consolidator''s action log shows 4 add_episode calls and 2 delete_memory calls in this run, while its stage stats report episodes_added: 0 and _reported.memories_deleted: 0.0. A reviewing agent (or human) trying to verify what this reconciliation run actually mutated has no ground truth to check the self-reported stats against.'
+  area: reconciliation write-journal / stage-stats provenance
+  first_seen: '2026-07-16'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-16'
+    project: dark_factory
+    session: a8dbb27b-6d80-47df-9bab-955971157a61
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "add_episode", "target": "?", ...} x4 vs stats.episodes_added: 0, stats._reported.memories_deleted: 0.0 vs two logged delete_memory calls'
+  promoted_to: entry-cand-20260716-2
+- id: cand-20260719-4
+  title: Session-start memory search returns anaphoric, contentless summaries
+  cause: 'Graphiti edges/entity summaries surfaced by session-start `search()` calls are phrased as meta-references to ''the decision'', ''the reasoning'', ''Option A vs Option B'', or ''task N as precedent'' without embedding the actual subject matter — so despite high relevance_score (0.75-1.0) and passing the similarity filter, all four session-start context buckets (Project Context, Conventions, Recent Decisions, Task Context) return hits an agent cold-opening the session cannot act on: it learns THAT a decision/precedent/reasoning exists but never WHAT it was.'
+  area: memory (fused-memory search / Graphiti edge extraction)
+  first_seen: '2026-07-19'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: 60627405-5efb-42e3-8f03-e95585aa6a4c
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: '"Task 2584 serves as a precedent for resolving task 2585." / "The decision was made to fix via citations, choosing Option A over Option B." / "the reasoning for the decision regarding get_statuses was recorded during the investigation of recon-watcher Issue #3."'
+  promoted_to: entry-cand-20260719-4
+- id: cand-20260722-17
+  title: Digest generator captures the trickle-coder's own recurring task prompt as a 'User Correction'
+  cause: The session-digest/signal-extraction pipeline that feeds session digests to the trickle coder appears to have captured the full templated task-invocation prompt (the same codebook index and JSON-output instructions the trickle coder itself receives each run) as a 'User Corrections' entry for a prior session, rather than recognizing it as routine recurring-task text rather than an in-session correction. This pollutes the correction signal with recursive self-referential content and, if re-digested, would compound across future trickle-coder batches without any real agent-confusion event underneath it.
+  area: confusion-reduction-pipeline/digest-generation
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: ee633c8a-910f-417d-bc4e-13f5b2b818c8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches (if any), and whether it reveals any novel confusion causes not yet in the codebook (candidates).
+  promoted_to: entry-cand-20260722-17
+- id: cand-20260722-18
+  title: Periodic-census verifier sessions blocked by per-command interactive Bash approval on read-only forensic commands
+  cause: The census-verification role is dispatched with Bash access but no pre-granted allowlist for read-only forensic commands (find, grep, git log); each read-only command trips an individual interactive approval gate, and in a context with no human actively present to click approve, the verification task stalls on exactly the reads it needs to confirm or refute the flagged cluster against current tree state.
+  area: harness / tool permissions
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 96ee5257-265c-4317-ad72-da08793b8a3b
+    origin_phase: ops
+    manifested_phase: verify
+    evidence_quote: 'Bash({"command": "grep -rn \"ensure_eval_verify_deps\" /home/leo/src/dark-factory/orchestrator/src 2>/dev/null"}) -> This command requires approval'
+  promoted_to: entry-cand-20260722-18
+- id: cand-20260719-5
+  title: Graphiti search returns decontextualized single-sentence fragments — high relevance score, zero actionable content
+  cause: Graphiti's episode-to-fact condensation drops the antecedent/subject when reducing an episode to a single sentence, so session-start search() results score highly (0.75-1.0 relevance) but read as free-floating claims an agent cannot act on — e.g. 'This decision is explicitly called out in docs/plan-scoring-and-judge.md to prevent relitigation' never names the decision, 'Task 2584 serves as a precedent for resolving task 2585' never says how, 'The decision to extend in place was made unanimously when presented via AskUserQuestion' never says what was extended. The architect's mandated session-start memory read (CLAUDE.md 'Starting a session' step 1) returns a fully populated Project Context/Conventions/Recent Decisions/Task Context block that looks informative but is actually inert — the agent must silently discard it and fall back to reading source, with no signal that the memory layer under-delivered.
+  area: fused-memory/graphiti search+extraction
+  first_seen: '2026-07-19'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: fc5e835d-c134-474f-93ed-e07827caa332
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: '"content": "This decision is explicitly called out in docs/plan-scoring-and-judge.md to prevent relitigation."'
+  promoted_to: entry-cand-20260719-5
+- id: cand-20260721-5
+  title: Trickle-coder digest ingestion mistakes its own meta-prompt for session evidence
+  cause: The session-digest extractor feeding this trickle-coding process captured a prior trickle-coder invocation's own system/task prompt (the 'You are the trickle coder...' instructions) and logged it verbatim as a '## User Corrections' turn in the digest for session 8d1a9af8-b5fc-4fd8-8ccf-0d16e8899a1d, with all signal_counts at zero. This produces self-referential, evidence-free digests that could recursively contaminate the codebook if a future trickle-coder pass treats the quoted meta-prompt as genuine confusion evidence rather than recognizing it as leaked tooling text — the same 'leaked artifact persists into downstream prompts' failure mode as oneoff-2026-07-09 but in the codebook-maintenance pipeline itself.
+  area: confusion-codebook-trickle-coder / session-digest-extraction
+  first_seen: '2026-07-21'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: 8d1a9af8-b5fc-4fd8-8ccf-0d16e8899a1d
+    origin_phase: ops
+    manifested_phase: unknown
+    evidence_quote: '## User Corrections
+
+      - (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...'
+  promoted_to: entry-cand-20260721-5
+- id: cand-20260720-8
+  title: Reconciliation run's MCP action journal has unresolved targets and duplicate coarse/fine-grained entries, undermining audit provenance
+  cause: write_journal logs pair a generic wrapper call (operation:'add'/'delete'/'remove_edge', target:'?') immediately adjacent to the specific resolved tool call (add_memory/delete_memory/add_system_record/refresh_entity_summary) for what is evidently the same underlying write, so 8 of 15 logged actions carry no resolvable target at all. Separately, per-stage stats report the same quantity under different names depending on which sub-dict you read (outer stats.memories_added/memories_deleted vs _reported.memories_written; memory_consolidator.items_flagged:2 vs its own stats.flags_emitted:1) with no single field a reviewer can trust as ground truth.
+  area: recon
+  first_seen: '2026-07-20'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 6ff1311a-6a58-410b-ac20-dc2a21471543
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '{"operation": "add", "target": "?", "source": "write_journal", ...} immediately followed by {"operation": "add_memory", "target": "8a11c2ac-b06f-41dc-ba4a-c6c5a24fef2c", ...}; and "_reported": {"memories_deleted": 1.0, "memories_written": 1.0, "memories_added": 1.0, "entity_summaries_refreshed": 1.0} alongside items_flagged:2 vs stats.flags_emitted:1.0'
+  promoted_to: entry-cand-20260720-8
+- id: cand-20260722-19
+  title: Digest pipeline mislabels the trickle-coder's own scripted prompt as a 'User Correction'
+  cause: 'The session-digest generator that feeds the trickle coder appears to classify turns as ''User Corrections'' by role/position rather than content: session 0abb0308''s turn 3 ''correction'' is verbatim the trickle-coder task prompt itself (the same instructions issued to classify this digest), not a genuine user correction, and all correction-related signal_counts (self_correct, tool_error, df_guard, interrupt) are 0 — confirming no real correction occurred. This risks the confusion-codebook pipeline recursively ingesting its own harness prompts as session evidence.'
+  area: confusion-reduction pipeline / digest generation (plans/confusion-reduction-prd.md §7.3)
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 0abb0308-181f-4310-90ad-24c0ad9ebe2b
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  promoted_to: entry-cand-20260722-19
+- id: cand-20260722-20
+  title: Digest severity score decoupled from evidence body — high score with an empty digest
+  cause: 'Session b2b4156a is scored 10.0 (the top of the observed range) yet its digest is only 294 bytes: frontmatter only, no ''User Corrections''/tool-error/etc. body content, and all signal_counts are 0. A consumer (the trickle coder) cannot substantiate any classification from a score alone, so a high-severity-scored session silently contributes zero usable evidence — a data-quality gap between the scoring step and the evidence-extraction step of the pipeline.'
+  area: confusion-reduction pipeline / digest generation (plans/confusion-reduction-prd.md §7.3)
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 0abb0308-181f-4310-90ad-24c0ad9ebe2b
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: "score: 10.0\nsignal_counts:\n  tool_error: 0\n  self_correct: 0\n  not_found: 0\n  df_guard: 0\n  interrupt: 0\n... (no body content follows; size_bytes: 294)"
+  promoted_to: entry-cand-20260722-20
+- id: cand-20260722-21
+  title: Digest-extraction pipeline embeds recursive/self-referential trickle-coder prompt content as a session's own 'User Correction'
+  cause: The tool that builds per-session digests for codebook trickle-coding failed to distinguish the trickle-coder's own meta-prompt (instructions plus the full codebook index) from genuine in-session user input, so it recorded that entire meta-prompt -- including a second, unrelated session's fully nested digest (1d0d5d85, a 2026-07-16 recon integrity-check report) -- as a single 'User Corrections' turn inside session 554e62f1's digest. The reviewing agent then receives a self-referential, doubly-nested artifact in place of the session's real transcript, making it impossible to assess what actually happened in that session.
+  area: confusion-reduction-pipeline/digest-generation
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 554e62f1-5eb5-4ce8-ae7d-b57d41bb7538
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '## User Corrections
+
+      - (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches (if any)...'
+  promoted_to: entry-cand-20260722-21
+- id: cand-20260722-22
+  title: Headless `claude -p` permission-bypass mode silently excludes MCP tools; Bash allowlist prefixes break on inlined env-vars
+  cause: Agents/authors assume a blanket permission-bypass flag in non-interactive `-p` sessions covers all tool classes, but each MCP tool (e.g. mcp__escalation__resolve_issue) must be named explicitly in --allowedTools; separately, Bash allowlist prefix rules like `Bash(/path/to/script *)` match only the literal invoked command string, so an inlined env-var prefix (`VAR=val /path/to/script ...`) silently breaks the match with no error surfaced.
+  area: headless/non-interactive claude -p invocation config (skills/spawn, watcher headless execution)
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 61776f31-26a1-48db-a5f5-80843b3c0fde
+    origin_phase: implement
+    manifested_phase: ops
+    evidence_quote: MCP tools are NOT covered by permission-bypass mode in `-p` sessions... Bash allowlist prefix rules match the literal invoked command string... An inline env-var prefix (`VAR=val /path/to/script ...`) changes the leading token and silently breaks the match.
+- id: cand-20260713-1
+  title: Reconciliation stage reports show tokens_used=0 despite nonzero llm_calls
+  cause: Every stage report in this run (memory_consolidator, task_knowledge_sync, integrity_check) carries a real llm_calls count (21/11/33) but tokens_used is 0 in all three — token/cost accounting appears unwired in the stage-report path, so a reviewing agent or human auditing the run cannot see actual LLM spend.
+  area: reconciliation stage reporting / cost telemetry
+  first_seen: '2026-07-13'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 459a4ae3-32b2-4cba-a5f5-59a1bd5f5980
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"llm_calls": 21, "tokens_used": 0'
+  promoted_to: entry-cand-20260713-1
+- id: cand-20260713-2
+  title: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
+  cause: memory_consolidator's stats block has top-level counters (memories_added=3, memories_deleted=0) plus a nested '_reported' sub-object claiming different values (memories_written=2.0, memories_added=2.0) for the same run, with no reconciliation between the two tallies — a consumer trusting '_reported' undercounts real writes.
+  area: reconciliation stage reporting / stats accounting
+  first_seen: '2026-07-13'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 459a4ae3-32b2-4cba-a5f5-59a1bd5f5980
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_added": 3, ... "_reported": {"memories_written": 2.0, ... "memories_added": 2.0}'
+  promoted_to: entry-cand-20260713-2
+- id: cand-20260722-23
+  title: Recon stage report's top-level items_flagged contradicts its own nested stats.items_flagged
+  cause: memory_consolidator's stage report states items_flagged=1 at the top level while the nested stats dict for that same run reports stats.items_flagged=0.0 — the two counters are computed on different paths and drift out of sync, leaving a run-reviewing agent no way to tell which number (or neither) reflects reality without re-deriving it from the raw edges/entities touched.
+  area: reconciliation stage reporting
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: dbfab1c8-f1e0-494e-b082-11eb35a2bf07
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '"memory_consolidator": {"items_flagged": 1, "stats": {"items_flagged": 0.0, "entity_summary_snapshot_lines_stripped": 0, ...}}'
+  promoted_to: entry-cand-20260722-23
+- id: cand-20260722-24
+  title: Session digest generator self-embeds the trickle-coder's own recursive prompt as fabricated 'session content'
+  cause: The digest pipeline that feeds session summaries to the confusion-codebook trickle-coder produced a digest whose 'User Corrections' section is not real session transcript but a verbatim copy of the trickle-coder's own instructions and codebook index (including a second nested session header with no transcript body). The reviewing model is left with only self-referential prompt text plus bare score/signal_counts metadata (e.g. score:13.0, tool_error:1, not_found:2) and zero observable evidence to ground any match or candidate decision.
+  area: confusion-reduction pipeline / digest generation (plans/confusion-reduction-prd.md §7.3)
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 8db2d245-160d-4f15-acb8-662600bd5e00
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  promoted_to: entry-cand-20260722-24
+- id: cand-20260723-2
+  title: Review-suggestion settled/deferred adjudicator must be told resemblance-to-prior-round ≠ verified resolution
+  cause: 'The judge task dedupes CURRENT review findings against a PRIOR-ROUND suggestions list, but that list conflates two different statuses: suggestions actually resolved (fix applied, or deliberately reverted-and-kept) and suggestions merely routed to a follow-up task and still open. Nothing in the prior-round record itself marks which is which, so a suggestion that superficially resembles an earlier one is at risk of being marked ''settled'' (suppressed) when it was in fact only deferred and remains unaddressed — the harness has to explicitly instruct the judge never to infer resolution from resemblance alone and to default to ''inconclusive'' rather than guess.'
+  area: review triage / cross-round suggestion dedup adjudication
+  first_seen: '2026-07-23'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: 7a14b442-c5e5-462e-88c6-11e057665ce4
+    origin_phase: review
+    manifested_phase: review
+    evidence_quote: 'IMPORTANT: the PRIOR-ROUND block below lists EVERY suggestion raised in earlier rounds — it is NOT a list of confirmed resolutions. Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted.'
+  promoted_to: entry-cand-20260723-2
+- id: cand-20260715-4
+  title: watcher-rearm.sh requires DARK_FACTORY_ROOT, unset by the rotation's injected supervisor prompt
+  cause: The supervisor prompt that spawns escalation-watcher rotations injects ROTATION_ESCALATIONS/ROTATION_HOURS/project_root/queue path but not DARK_FACTORY_ROOT, which watcher-rearm.sh hard-requires; the agent discovers this only via a first-call exit-2 failure rather than any upfront contract.
+  area: escalation-watcher / ops tooling env setup
+  first_seen: '2026-07-15'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: f41dd7df-6c84-4f9b-908b-81e11f9271bb
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+  promoted_to: entry-cand-20260715-4
+- id: cand-20260722-25
+  title: Remediation applied in mem0 doesn't propagate to Graphiti's cached entity summary — divergence from authoritative Taskmaster status persists undetected
+  cause: A 2026-05-30 fix invalidated a stale edge in mem0 (06bd20dc) and queued a replacement fact, but by 2026-07-13 Graphiti's canonical entity node for Task 605 still asserts 'in-progress' from four stale/moot edges, diverging from Taskmaster's authoritative done status (done_provenance kind=found_on_main) held since 2026-05-30. Nothing verifies that a single-store remediation (mem0) actually propagated to the sibling store's cached summary (Graphiti requires an explicit refresh_entity_summary call), so the divergence between two supposedly-unified memory backends silently persisted for six+ weeks until the next recon pass happened to catch it.
+  area: fused-memory dual-store consistency / entity summary refresh
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 617d100e-5314-4d28-b584-6d00cb74c5b1
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'Graphiti''s canonical entity node for Task 605 ... still asserts the task is in-progress, while Taskmaster (authoritative) shows status=done since 2026-05-30T07:56:55Z ... Root-cause note for Stage 2/dark_factory: investigate why the 2026-05-30 fix (mem0 06bd20dc, edge 920215dc invalidation + queued replacement...) [did not hold]'
+- id: cand-20260722-26
+  title: Digest-capture pipeline recursively embeds the trickle-coder's own meta-prompt as a zero-signal 'User Correction', risking self-pollution of the codebook corpus
+  cause: Session 617d100e's sole 'User Correction' turn is a verbatim copy of this same trickle-coder system prompt (codebook index, instructions, and a nested session digest for 69a2c122) with signal_counts all zero and a flat default score. The digest-collection harness appears to capture synthetic/automated meta-prompts sent to trickle-coder sub-agents as if they were real user corrections during a session, rather than filtering them out — creating recursive, evidence-free entries that could dilute or mislead future codebook-matching passes over this very corpus.
+  area: confusion-reduction pipeline / digest capture
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 617d100e-5314-4d28-b584-6d00cb74c5b1
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '## User Corrections
+
+      - (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below ... === SESSION DIGEST ===\nsession: "69a2c122-b6a2-4197-91f4-c1ed84f1aa2a"'
+  promoted_to: entry-cand-20260722-26
+- id: cand-20260714-3
+  title: Recon dedup 'fully resolved' claims come from an under-scoped search radius, so live near-duplicates recur across cycles
+  cause: Stage 1's duplicate-detection search operates over a narrower radius/time-window than the actual duplicate footprint for a topic, so it asserts a cluster is 'fully resolved' after merging only the subset it found; a same-cycle spot-check with a broader query immediately surfaces additional live, un-merged duplicates on the identical topic, and the finding notes this exact restatement 'keeps recurring across weeks despite the exact command being documented' — i.e. this is a repeat failure mode, not a one-off miss.
+  area: recon/memory-consolidation (fused-memory Mem0 dedup, stage1)
+  first_seen: '2026-07-14'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: f3fe6351-9923-43f5-973e-4fc47ed09109
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: Stage 1's finding ... claimed the recurring "duplicate_procedural_knowledge_recurring_topic" flag was fully resolved by merging a "5-way near-identical procedural_knowledge cluster" ... Spot-check search for the same topic surfaces 4 MORE live, un-merged memories describing ...
+  promoted_to: entry-cand-20260714-3
+- id: cand-20260714-4
+  title: Mem0 dedup/consolidation merges by similarity, not correctness — canonical records can encode content that contradicts other live near-duplicates
+  cause: The consolidator treats near-duplicate procedural_knowledge records as safe to merge/canonicalize based on textual similarity alone, with no empirical re-verification step. As a result the designated 'canonical' record and several live copies can assert one behavior for an operational fact (e.g. a git command 'reliably exits 1 but still stages the intended files correctly') while another live record on the same topic asserts materially different behavior, and nothing in the write/merge path catches the contradiction before or during consolidation.
+  area: recon/memory-consolidation content-quality (fused-memory Mem0)
+  first_seen: '2026-07-14'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-14'
+    project: dark_factory
+    session: f3fe6351-9923-43f5-973e-4fc47ed09109
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: content diverges on the actual behavior of the command. The canonical merged memory 973056dd ... and live copies ... all assert the command "reliably exits 1 but still stages the intended files correctly (advisory-only)". A separate live memory, 8a75e49b ... asserts [something different]
+  promoted_to: entry-cand-20260714-4
+- id: cand-20260720-9
+  title: Recon stage stats nest a redundant '_reported' subtotal duplicating top-level counters
+  cause: 'The memory_consolidator stage report emits a self-summarizing ''_reported'' sub-object ({"memories_written": 2.0, "memories_added": 2.0}) that mirrors the top-level ''memories_added'': 2 counter under a different key name. A downstream consumer or human auditor flattening/summing this JSON has no signal for which figure is authoritative, risking silent double-counting of reconciliation throughput.'
+  area: recon reporting / reconciliation harness stage stats schema
+  first_seen: '2026-07-20'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 40dff74e-b72f-46ba-817f-1808b94fcba6
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_added": 2, ... "_reported": {"memories_written": 2.0, "memories_added": 2.0}'
+  promoted_to: entry-cand-20260720-9
+- id: cand-20260722-27
+  title: Trickle-coder digest pipeline ingests its own prior invocations as session digests
+  cause: The session-selection process feeding the trickle coder does not exclude sessions whose entire content is a prior trickle-coder classification prompt, so the classifier is handed a digest of itself running (a recursive prompt-echo) with zero real user signal (all signal_counts=0), producing empty/self-referential input instead of being filtered upstream.
+  area: confusion-reduction-prd trickle-coder tooling / digest generation
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 3f6c6536-10fe-4133-b6e0-00eca4ec62c3
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  promoted_to: entry-cand-20260722-27
+- id: cand-20260722-28
+  title: Session Startup Protocol's dual plan-state location contract doesn't resolve to a real path in pooled/W11-relocated worktrees
+  cause: 'The implementer prompt''s Session Startup Protocol names two candidate locations for plan.json/iterations.jsonl (''.task/plan.json'', falling back to ''.task-meta/<worktree-name>/plan.json'' per the W11 pooled-lane relocation), but in pooled .eval-worktrees layouts neither resolves: ''.task/'' holds only a stray ''claude-config-<task>'' directory entry, and the corresponding ''.task-meta/run-<id>/'' path yields no iterations.jsonl either, driving many rounds of ls/find/stat probing (several gated behind Bash approval) before task state can be located.'
+  area: worktree/plan-state discovery
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 1a69afed-d9eb-48de-b387-2a45fe055a35
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: 'stat: cannot statx ''/home/leo/src/dark-factory/.eval-worktrees/df_task_12/.task-meta/run-4a79d4f3/iterations.jsonl'': No such file or directory'
+- id: cand-20260722-29
+  title: Architect explore-phase hits ModuleNotFoundError / command-not-found in task worktree
+  cause: The architect agent's own step-1 instruction ('Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities') led it to execute Python/CLI commands inside the freshly-created task worktree (.worktrees/2884) that failed with ModuleNotFoundError (turn 69) and a shell command-not-found (turn 93) — consistent with a worktree whose dependencies/tooling were not confirmed installed before dispatch, costing exploration turns before the session was ultimately cut short by a user interrupt at turn 109 without a plan ever being confirmed.
+  area: worktree-provisioning
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 92d5f938-bbe9-415f-a247-c5e00d950123
+    origin_phase: unknown
+    manifested_phase: architect
+    evidence_quote: (turn 69) modulenotfounderror; (turn 93) command not found — during architect task 2884's codebase-exploration step in /home/leo/src/dark-factory/.worktrees/2884
+  promoted_to: entry-cand-20260722-29
+- id: cand-20260720-10
+  title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
+  cause: 'Task 2553''s description carried an explicit COORDINATION directive: verify whether dependency task 2248 (replacing the same code region with a typed StewardOutcome channel) had landed, and if so implement on top of it rather than patching the old path; otherwise verify Detail!=Summary and close as already-delivered. After a long plan session (one usage-limit interruption/resume), the architect instead added a design decision to patch only the old `except _StewardReescalated` clause at workflow.py:2444 and explicitly declined to re-route through 2248''s channel, despite its own rationale citing 2248 as done/merged — contradicting the task''s own written branching instructions. A human had to reject the plan-tools call and halt the session to stop the divergence, rather than any automated check catching it.'
+  area: cross-task-coordination
+  first_seen: '2026-07-20'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 287f6ff2-f184-4c06-8f99-1014296927a4
+    origin_phase: decompose
+    manifested_phase: architect
+    evidence_quote: '"decision": "Fix only Path A (the `except _StewardReescalated` clause at workflow.py:2444); do NOT re-route it through task 2248''s typed StewardOutcome channel.", "rationale": "Task 2248 (done, merge..." -> The user doesn''t want to proceed with this tool use... STOP what you are doing and wait for the user to tell you how to proceed.'
+  promoted_to: entry-cand-20260720-10
+- id: cand-20260722-30
+  title: Trickle-coder digest capture mislabels the initial task-framing prompt as a 'User Correction' and recurses
+  cause: The confusion-codebook digest pipeline (plans/confusion-reduction-prd.md §7.3) that extracts 'User Corrections' from a session transcript misclassifies the verbatim system/task-framing prompt — including the full codebook index and formatting instructions — as a user correction at turn 3, rather than recognizing it as the task's own initial instructions. Because that mislabeled turn contains the entire trickle-coder prompt, it in turn embeds a second, unrelated, near-empty session digest (337 bytes, all-zero signal_counts, orchestrated-task worktree 2738), so the digest handed to the reviewing agent is self-referential/corrupted rather than a clean sample of real agent confusion.
+  area: confusion-reduction-pipeline / digest-generation
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: dc6036ed-d8ac-4385-a7e7-bdeefd8a1e3f
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  promoted_to: entry-cand-20260722-30
+- id: cand-20260713-3
+  title: Recon category labels applied by surface keyword match, not guard definition
+  cause: Stage 2 assigned category='cross_project_routing' because the finding's text merely cited a task in another project, rather than because it represented an actual get_task/get_tasks/get_statuses project_id mis-stamping (the Cross-Project Routing Guard's real trigger condition) — a taxonomy applied by surface pattern rather than by the guard's defined semantics.
+  area: recon/memory_consolidator finding categorization
+  first_seen: '2026-07-13'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: 443c02f0-3d0e-4aa3-a441-3a12c6205098
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: reserve category='cross_project_routing' for actual get_task/get_tasks/get_statuses project_id mis-stamping (per the Cross-Project Routing Guard), not for corroboration/evidence-forwarding notes that merely cite a task in another project
+  promoted_to: entry-cand-20260713-3
+- id: cand-20260721-6
+  title: Oversized test file forces fragile grep/offset navigation instead of direct reads
+  cause: tests/test_merge_queue.py has grown past the Read tool's 256KB ceiling (1001.7KB observed), so agents editing it can never load full-file context; they fall back to Grep (which then hits ripgrep's no-lookaround limitation on natural disambiguating patterns) and blind Edit calls (which then collide on multiple near-identical matches, e.g. two 'branch=...' occurrences) — one structural fact (file size) cascading into three separate tool-contract failures in a single session
+  area: orchestrator test suite / tooling
+  first_seen: '2026-07-21'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-21'
+    project: dark_factory
+    session: b8cedfca-50ad-4d10-80d5-4f8a44deba80
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: File content (1001.7KB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.
+  promoted_to: entry-cand-20260721-6
+- id: cand-20260723-3
+  title: Reconciliation stage self-reported memory-write stats undercount the run's own ground-truth MCP action journal
+  cause: The three stage 'stats' dicts sum to memories_added=1 and memories_deleted=1 for the run, but the same run's MCP Action journal records 2 add_memory calls (71b97073, df622821), 3 delete_memory calls (93ad9685, 4f6d084e, b3ec2b8e), and 1 add_system_record (02015086) — no stage's stats account for the second add or the two extra deletes, so a reviewer (human or agent) trusting the stage stats table underestimates the run's actual footprint on the memory store by more than half, and 'Journal Entries (0 total)' being empty removes the one place that could have reconciled the discrepancy.
+  area: reconciliation / fused-memory
+  first_seen: '2026-07-23'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: 6008db3a-efd8-4f22-acfa-81ef783d84ca
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '"memories_added": 1 / "memories_deleted": 1 (summed across stages) vs MCP Actions: add_memory(71b97073), delete_memory(93ad9685), add_system_record(02015086), delete_memory(4f6d084e), delete_memory(b3ec2b8e), add_memory(df622821); "Journal Entries (0 total)": []'
+- id: cand-20260719-6
+  title: Eval-worktree checkout root is package-scoped, but task/plan paths assume the monorepo repo-map convention
+  cause: The df_task eval harness materializes this worktree (.eval-worktrees/df_task_12/run-00f35016) with cwd already at the orchestrator package root, but the task's own plan/analysis (and the agent's mental model from CLAUDE.md's '<pkg>/src/<pkg>' repo map) prescribe full monorepo-relative paths like 'orchestrator/src/orchestrator/verify.py' and 'orchestrator/tests/test_verify.py'. Every tool call using those paths 404s, and the final `git add orchestrator/tests/test_verify.py && git commit` fails outright (exit 128, pathspec no match) because git tried to open a doubled 'orchestrator/orchestrator/tests/' directory — silently breaking the mandated 'commit after each step, then mark_step_done' loop and likely contributing to the low session score (22.0) and two usage-limit interruptions while the agent thrashed on path resolution.
+  area: eval harness / worktree provisioning
+  first_seen: '2026-07-19'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-19'
+    project: dark_factory
+    session: a8d62542-4a79-4ced-b433-982b2fe9bc95
+    origin_phase: ops
+    manifested_phase: implement
+    evidence_quote: 'warning: could not open directory ''orchestrator/orchestrator/tests/'': No such file or directory
+
+      fatal: pathspec ''orchestrator/tests/test_verify.py'' did not match any files'
+- id: cand-20260713-4
+  title: Recon remediation-finding generation duplicates 'file a task' suggestions because existing-coverage search misses already-filed tasks/memories (ranking/limit miss, not data gap)
+  cause: Stage 1 (memory_consolidator) finding-generation recommends filing a task without reliably surfacing prior memories/tasks that already document and cover the same root cause; the search that should have found mem0 memory 4e9cafa9 (documenting dark_factory:2500's filing) missed it due to ranking or result-limit truncation, not because the memory didn't exist. This forces downstream stages (Stage 2, and this integrity-check cycle) to manually re-verify via get_task/get_entity and write suppression flags/edges every cycle to prevent duplicate task filing, and the finding's own suggested_action anticipates the same suggestion resurfacing again in future cycles.
+  area: recon / fused-memory search retrieval
+  first_seen: '2026-07-13'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-13'
+    project: dark_factory
+    session: cd3403cd-7e0b-46e7-8e69-479a62a9ed4c
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'The gap that let this redundant suggestion surface: mem0 memory 4e9cafa9-3b55-42de-86d3-785d8078a609, which already documents task 2500''s filing, was apparently missed by whatever search produced the original remediation finding (a ranking/limit miss, not a data gap).'
+- id: cand-20260722-31
+  title: Trickle-coder digest generator mislabels the injected task/system prompt as a 'User Correction'
+  cause: 'In both digested sessions, turn 3 (the harness-injected task-assignment or role-instruction block, e.g. ''# Context / ## Agent Identity / # Task'' or the trickle-coder''s own §7.3 instructions) is captured verbatim under a ''## User Corrections'' heading rather than recognized as routine task injection. The digest heuristic appears to bucket any early user-role turn as a correction signal instead of filtering for actual corrective language, producing noisy low-signal digests where the reader (the trickle coder itself) receives the full original prompt echoed back as if the user had corrected the agent.'
+  area: confusion-reduction pipeline / digest-generation tooling (plans/confusion-reduction-prd.md §7.3)
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: a3d49c3c-4dbc-4f82-bad2-b276220b2e09
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '## User Corrections
+
+      - (turn 3) # Context
+
+
+      _No memory context available._
+
+
+      ## Agent Identity
+
+
+      - **agent_id:** `claude-architect`
+
+      - **project_id:** `dark_factory`'
+  promoted_to: entry-cand-20260722-31
+- id: cand-20260722-32
+  title: Periodic-census verifier is sandboxed to the project cwd and cannot read the cross-session transcripts its own contract requires
+  cause: The periodic-census verifier role (confusion-reduction-prd.md section 5.7) is instructed to confirm a mined cluster by reading targeted absolute paths, including the originating session's transcript by id, but the harness restricts find/ls/Bash to the current project's working directory ('/home/leo/src/dark-factory'). Repeated find attempts across '/', '/home/leo', and the home dir required approval or were hard-blocked, so the verifier cannot reach the evidence (another session's transcript under ~/.claude/projects/) its own contract asks it to corroborate against — a role-contract vs. sandbox-capability mismatch distinct from the watcher MCP-level-cap and Write/Edit-disablement cases already tracked.
+  area: tooling/sandbox-scope
+  first_seen: '2026-07-22'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: bf10fa64-0743-4394-8c0a-75116e67e84e
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'ls in ''/home/leo/.claude/projects'' was blocked. For security, Claude Code may only list files in the allowed working directories for this session: ''/home/leo/src/dark-factory''.'
+- id: cand-20260723-4
+  title: watcher-rearm.sh's DARK_FACTORY_ROOT env-var requirement isn't surfaced by the rotation injection prompt
+  cause: 'The supervisor''s rotation-start prompt states ''Project root: /home/leo/src/dark-factory'' as plain text but scripts/watcher-rearm.sh actually requires that value exported as the env var DARK_FACTORY_ROOT specifically; nothing in the injected context names the env var, so the first invocation fails (exit 2) before the watcher learns to export it, and because Bash tool shell state doesn''t persist across calls, the export must be re-issued as part of every subsequent watcher-rearm.sh invocation for the rest of the rotation.'
+  area: escalation-watcher / scripts/watcher-rearm.sh
+  first_seen: '2026-07-23'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: a26665c7-3bad-4c2d-9c05-eb17041a3ccc
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+- id: cand-20260723-5
+  title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
+  cause: recon_write_policy.py's ReconTerminalWriteRejected guard has exactly one authorized corrective_path (set_task_status_done_provenance_repair) scoped to the done_provenance field; no analogous path exists for other terminal-task string fields like top-level `details`, so once a task is done, recon agents can never correct stale/incorrect details text even with fresh corroborating evidence already recorded elsewhere (Graphiti edge, sibling task's done_provenance) — and because the boundary itself was never documented or tracked, each recurrence (task 544 in 2026-07-10/11, now autopilot_video task 644/650 in 2026-07-22/23) gets silently re-diagnosed as a fresh bug or routed to a one-off human-gated workaround instead of being recognized as the same known gap
+  area: fused-memory / recon_write_policy.py (ReconTerminalWriteRejected guard)
+  first_seen: '2026-07-23'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-23'
+    project: dark_factory
+    session: ec1611ea-3ad2-4a3a-a281-59a17eadbd78
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: 'Recurring gap (2nd confirmed occurrence) in the terminal-task write guard: recon-stage agents have no authorized corrective_path to fix arbitrary terminal-task string fields (e.g. top-level `details`) once a task is done — ReconTerminalWriteRejected blocks it, and the only corrective_path (set_task_status_done_provenance_repair, confirmed present in fused-memory/src/fused_memory/middleware/recon_write_policy.py) covers only `done_provenance`, not other fields.'
+  promoted_to: entry-cand-20260723-5
+- id: cand-20260722-33
+  title: Session digest generator renders guard/not-found signals as bare templates, dropping the matched substring
+  cause: The digest build's regex/capture-group logic matches only the trigger phrase (e.g. 'blocked:', 'does not exist', 'not found in', 'no such file or directory') and never captures the guard name, path, or symbol that follows it in the source log line, so every occurrence collapses to an uninformative template no matter how long the session was.
+  area: confusion-reduction pipeline / scripts/legibility/digest.py session-digest generation
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 06dac3e5-adae-4879-ad7e-a24cd2257ec8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Guard Trips: (turn 21) blocked: | Not Found: (turn 21) no such file or directory / (turn 21) does not exist / (turn 21) not found in / (turn 21) modulenotfounderror / (turn 21) command not found'
+  promoted_to: entry-cand-20260722-33
+- id: cand-20260722-34
+  title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
+  cause: Nothing informs the periodic-census verifier of the deterministic transcript path (data/orchestrator/agent-transcripts/<task_id>/<worktree>/<session>.jsonl.gz); it instead issued ~11 escalating find/grep attempts (cwd, then filesystem root, then ~/.claude) hunting for a session UUID, each requiring separate human approval or getting blocked as out-of-scope, before it finally located and ran digest.py on the file directly.
+  area: confusion-reduction pipeline / periodic-census verifier tooling — session-transcript discovery
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: 06dac3e5-adae-4879-ad7e-a24cd2257ec8
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '(turn 30) Bash({"command": "find / -iname \"*72ca812e*\" ..."}) -> This Bash command contains multiple operations... requires approval; (turn 41) grep in ''/home/leo/.claude'' was blocked. For security, Claude Code may only search ... allowed working directories ... ''/home/leo/src/dark-factory'''
+  promoted_to: entry-cand-20260722-34
+- id: cand-20260722-35
+  title: watcher-rearm.sh's required DARK_FACTORY_ROOT env var absent from the rotation prompt's vocabulary
+  cause: 'The supervisor''s watcher rotation prompt states ''Project root: <path>'' but watcher-rearm.sh requires the differently-named env var DARK_FACTORY_ROOT to be exported; the agent''s first invocation failed (exit 2) before it inferred the mapping and retried with the var set.'
+  area: escalation-watcher
+  first_seen: '2026-07-22'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-22'
+    project: dark_factory
+    session: d7d196be-873f-4648-95e2-13302be28ad4
+    origin_phase: implement
+    manifested_phase: ops
+    evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+  promoted_to: entry-cand-20260722-35
+- id: cand-20260720-11
+  title: Eval-worktree checkouts missing workspace-wide dependency install — aiosqlite ImportError blocks all test collection regardless of the actual fix
+  cause: The eval harness worktree at .eval-worktrees/df_task_13/run-4ce554e6 lacks an installed 'aiosqlite' package, so importing shared.async_sqlite_base (transitively required by orchestrator.config, orchestrator.artifacts, orchestrator.agents.invoke) fails at pytest collection time — before any of the agent's actual code changes to git_ops/artifacts/workflow.py can even run. The same ModuleNotFoundError recurred identically across at least 5 verify attempts (turns 59, 79, 84, 103, 125) over 128 turns, with the agent apparently unable to resolve an environment-provisioning gap from inside the sandboxed worktree, ending in a user interrupt with the underlying bug fix presumably still unverified.
+  area: eval-harness worktree provisioning / dependency sync
+  first_seen: '2026-07-20'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-20'
+    project: dark_factory
+    session: 672c4846-8f30-412a-a56c-aae5abf5f03c
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: 'E   ModuleNotFoundError: No module named ''aiosqlite''
+
+      ...
+
+      ERROR orchestrator/tests/test_artifacts.py
+
+      ERROR orchestrator/tests/test_git_ops.py
+
+      ERROR orchestrator/tests/test_workflow_e2e.py
+
+      !!!!!!!!!!!!!!!!!!! Interrupted: 3 errors during collection !!!!!!!!!!!!!!!!!!!!'
+- id: cand-20260715-5
+  title: Recon consolidator stages detect entity-cleanup needs but are never granted delete_entity/merge_entities, so fixes defer forever
+  cause: 'memory_consolidator and task_knowledge_sync stage toolsets omit delete_entity/merge_entities even though the fused-memory server exposes both tools; when a stage finds an orphan/misattributed entity it can only apply a partial workaround (update_edge invalid_at, a corrective add_memory) and must flag final deletion for ''next cycle or an operator with delete_entity access'' — but every per-cycle recon stage carries the same restricted toolset, so the same finding recurs cycle over cycle (confirmed here: an identical ''task 2992 orphan stub'' finding was flagged, partially remediated, and re-flagged across two consecutive cycles) with no stage ever actually empowered to close it, compounded by the queued Graphiti write not landing within a cycle so even the workaround''s completion can''t be confirmed same-cycle.'
+  area: recon/fused-memory
+  first_seen: '2026-07-15'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-15'
+    project: dark_factory
+    session: 891d40d6-1825-40b9-8adc-c116eb8ce8c3
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: the memory_consolidator toolset lacks delete_entity/merge_entities, so the fix was done via update_edge(invalid_at=...) ... 'task 2992' ... now has zero valid edges and an empty summary but still exists as an orphan node — it needs delete_entity, which this stage cannot call.
