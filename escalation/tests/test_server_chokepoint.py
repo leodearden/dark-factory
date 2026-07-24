@@ -821,6 +821,124 @@ class TestMergeRequestRequestId:
             f"Expected is_ancestor('{FAKE_TIP}', 'main'), got: {ancestor_calls[0]}"
         )
 
+    async def test_submit_time_already_merged_patch_id_backstop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Rebased landing: branch tip is NOT an ancestor of main, but its
+        content is fully patch-id-contained in main (rebased / cherry-picked
+        landing).  merge_request must return {status:'already_merged', commit}
+        immediately via the patch_content_contained backstop — no enqueue, no
+        merge_queued event, same shape as the is_ancestor fast-path.
+
+        RED until the submit-guard impl: without the patch-id backstop the
+        non-ancestor tip falls through to coalesce/enqueue and blocks on the
+        future → asyncio.wait_for raises TimeoutError.  Covers the rebased-
+        landing blind spot (task 2945): is_ancestor misses a rebased landing,
+        so a duplicate/late resubmission would otherwise burn a head-of-line
+        verify on a no-op merge.
+        """
+        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        FAKE_TIP = 'deadbeef12345678'
+
+        # Recording event_store stub
+        class _RecordingEventStore:
+            def __init__(self):
+                self.events: list = []
+
+            def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+                self.events.append(event_type)
+
+        recording_event_store = _RecordingEventStore()
+
+        # git_ops stub: tip resolves, but is_ancestor MISSES (rebased landing).
+        resolve_calls: list[str] = []
+        ancestor_calls: list[tuple] = []
+
+        async def _resolve_branch_sha(name: str) -> str:
+            resolve_calls.append(name)
+            return FAKE_TIP
+
+        async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+            ancestor_calls.append((ancestor, descendant))
+            return False  # rebased landing: branch tip is NOT an ancestor of main
+
+        async def _find_inflight_merge_worktree(branch: str):
+            return None
+
+        git_ops_stub = types.SimpleNamespace(
+            resolve_branch_sha=_resolve_branch_sha,
+            is_ancestor=_is_ancestor,
+            find_inflight_merge_worktree=_find_inflight_merge_worktree,
+        )
+        harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+
+        # Spy the PUBLIC module-level patch_content_contained: record its
+        # (head, upstream, git_ops) args and return True (content fully
+        # contained via a rebased landing).  Monkeypatching the public helper
+        # is permitted — only `_`-private reach-backs are frozen.
+        patch_calls: list[tuple] = []
+
+        async def _patch_content_contained(head, upstream, git_ops):
+            patch_calls.append((head, upstream, git_ops))
+            return True
+
+        monkeypatch.setattr(
+            orchestrator_merge_queue,
+            'patch_content_contained',
+            _patch_content_contained,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = _make_orch_config(tmp_path / 'repo')
+        registry = _make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            event_store=recording_event_store,
+            harness=harness_stub,
+            merge_inflight_registry=registry,
+        )
+
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id='591',
+                branch='591',
+                worktree=str(tmp_path / 'wt'),
+                description='',
+            ),
+            timeout=2.0,
+        )
+
+        # Same already_merged shape as the is_ancestor fast-path.
+        assert result == {
+            'status': 'already_merged',
+            'commit': FAKE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, (
+            f"Expected already_merged via patch-id backstop, got: {result}"
+        )
+        assert mq.empty(), (
+            f"Expected empty queue (no enqueue on already_merged), qsize={mq.qsize()}"
+        )
+        assert EventType.merge_queued not in recording_event_store.events, (
+            f"Expected no merge_queued event, got: {recording_event_store.events}"
+        )
+        # is_ancestor missed (returned False), then the patch-id backstop fired
+        # exactly once with (resolved_tip, main_branch, git_ops_for_scan).
+        assert patch_calls == [(FAKE_TIP, 'main', git_ops_stub)], (
+            f"Expected patch_content_contained(FAKE_TIP, 'main', git_ops_stub) "
+            f"called once, got: {patch_calls}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Fast-path fall-through tests (suggestion 2 — test_coverage)
