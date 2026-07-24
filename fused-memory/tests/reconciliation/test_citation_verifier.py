@@ -58,3 +58,40 @@ async def test_mem0_keeps_resolved_drops_phantom():
     assert stats['stage1_citations_verified'] == 1
     assert stats['stage1_phantom_citations_dropped'] == 1
     assert stats['stage1_citation_verification_errors'] == 0
+
+
+@pytest.mark.asyncio
+async def test_backend_error_keeps_citation_and_marks_it():
+    """A backend error (e.g. Qdrant timeout) is 'unknown', not 'absent': the
+    citation is KEPT and marked verification_error — never dropped, never
+    propagated (dropping-on-unknown would itself be a silent-fail)."""
+    finding = {
+        'description': 'a finding',
+        'cited_memories': [{'memory_id': 'A', 'store': 'mem0'}],
+    }
+
+    memory_service = AsyncMock()
+    memory_service.get_memory_by_id = AsyncMock(
+        side_effect=TimeoutError('qdrant timeout'),
+    )
+
+    # The exception must NOT propagate out of the verifier.
+    stats = await verify_cited_memories([finding], memory_service, 'test_project')
+
+    # The citation is kept (unknown != absent).
+    assert [c['memory_id'] for c in finding['cited_memories']] == ['A']
+
+    # The uncertainty is surfaced via a verification_error marker.
+    assert finding['citation_failures'] == [
+        {
+            'memory_id': 'A',
+            'store': 'mem0',
+            'reason': 'verification_error',
+            'error_type': 'TimeoutError',
+        },
+    ]
+
+    # Stats: one error, nothing dropped, nothing verified.
+    assert stats['stage1_citation_verification_errors'] == 1
+    assert stats['stage1_phantom_citations_dropped'] == 0
+    assert stats['stage1_citations_verified'] == 0
