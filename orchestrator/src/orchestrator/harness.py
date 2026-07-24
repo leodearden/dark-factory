@@ -761,6 +761,56 @@ def _has_fresh_dispatch(
     return delta_secs < grace_secs
 
 
+def _has_fresh_merge_phase(
+    task: dict | None, now: datetime, grace_secs: float,
+) -> bool:
+    """Return True iff *task* entered the pre-enqueue MERGE phase within
+    *grace_secs* of *now* — i.e. a live merge-stage workflow.
+
+    Task 2991 (successor to task 2931's :func:`_has_fresh_dispatch`): the
+    pre-enqueue MERGE loop (rebase + scoped verify + queue submit) makes NO
+    LLM calls, so it never refreshes ``metadata.routing.latest.decided_at`` —
+    a legitimately-live merge-stage task therefore fails the
+    ``_has_fresh_dispatch`` gate and is false-promoted exactly like the
+    pre-2931 divergence bug (cluster esc-2789-22: esc-2789-21, esc-2885-7,
+    both ``workflow_state='merge'``). The durable liveness signal a merge
+    phase DOES leave is ``metadata.merge_phase_liveness.entered_at``, stamped
+    at merge entry (``TaskWorkflow._stamp_merge_phase_entered``) before the
+    scope-invariant escalation is filed and refreshed on every merge
+    (re-)entry. This is the restart-survivable analog of ``routing.latest``:
+    read from durable task metadata, it defers a live merge-stage divergence
+    L0 even immediately after an orchestrator restart, when the per-process
+    ``Scheduler._merge_phase_at`` is still empty.
+
+    Fail-safe (mirrors :func:`_has_fresh_dispatch`): a ``None`` *task*, a
+    missing/non-dict ``metadata``/``merge_phase_liveness``, an absent/non-str
+    ``entered_at``, and an unparseable or tz-mismatched timestamp are all
+    treated as "not fresh" (return False) rather than raising — the caller
+    then promotes (surfaces) instead of silently suppressing whenever
+    merge-phase liveness cannot be positively confirmed, preserving task
+    2878's boundary guard and the loud-over-silent-degradation norm. An
+    ``entered_at`` newer than *now* (a stamp written after the sweep
+    snapshot) yields a negative delta ``< grace_secs`` -> True (fresh).
+    """
+    if task is None:
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    liveness = metadata.get('merge_phase_liveness')
+    if not isinstance(liveness, dict):
+        return False
+    entered_at = liveness.get('entered_at')
+    if not isinstance(entered_at, str):
+        return False
+    try:
+        entered_dt = datetime.fromisoformat(entered_at)
+        delta_secs = (now - entered_dt).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return delta_secs < grace_secs
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
@@ -10059,6 +10109,33 @@ class Harness:
                         'stage); next sweep re-checks',
                         esc.task_id,
                         self.config.orphan_l0_dispatch_freshness_secs,
+                    )
+                    continue
+                # Task 2991: also defer — don't promote — a divergence orphan
+                # whose task is live in the pre-enqueue MERGE phase. That loop
+                # (rebase + scoped verify + queue submit) makes NO LLM calls,
+                # so it never refreshes routing.latest and the
+                # _has_fresh_dispatch gate above cannot see it — but it stamps
+                # a durable metadata.merge_phase_liveness.entered_at at merge
+                # entry. A stamp within orphan_l0_merge_phase_freshness_secs of
+                # this sweep's `now` means the task is live mid-merge: defer,
+                # and the next sweep re-checks once it ages out. Reuses the
+                # SAME get_task already fetched above (no extra RPC); durable
+                # metadata makes the gate restart-survivable (unlike the
+                # per-process Scheduler._merge_phase_at). A stranded task has a
+                # stale/absent stamp -> _has_fresh_merge_phase False -> still
+                # promoted (preserves task 2878/2931's boundary guard).
+                if _has_fresh_merge_phase(
+                    task, now,
+                    self.config.orphan_l0_merge_phase_freshness_secs,
+                ):
+                    logger.info(
+                        'Orphan L0 reaper: deferred divergence orphan for '
+                        'task_id=%s — fresh merge_phase_liveness stamp within '
+                        '%.0fs grace (live pre-enqueue merge phase); next '
+                        'sweep re-checks',
+                        esc.task_id,
+                        self.config.orphan_l0_merge_phase_freshness_secs,
                     )
                     continue
 
