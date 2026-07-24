@@ -33,10 +33,17 @@ Escalation category note:
   blocked human-decision gate task's ``metadata.gate_escalated_at`` stamp has
   aged past ``STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`` (48h).  It is a
   deterministic age check — no Mem0 marker accumulation, no LLM finding — and
-  is deduped per-task via ``has_open_l1(task_id, category=...)`` so it neither
-  suppresses nor is suppressed by the ``reconciliation_stale_human_operator``
-  path or the DeterministicRunner's born-at-L2 ``milestone_gate`` escalation
-  (distinct level/category).
+  is deduped per-task via ``has_open_l1(task_id, category=...)``.  Because that
+  lookup is category-scoped, an open gate-backlog L1 is never *suppressed by* an
+  unrelated open L1 — a ``reconciliation_stale_human_operator`` L1 or the
+  DeterministicRunner's born-at-L2 ``milestone_gate`` escalation (distinct
+  level/category).  The independence is only guaranteed in that one direction:
+  the HOR path (``maybe_escalate_stalled_tasks``) dedups with an
+  UN-categorized ``has_open_l1(task_id)`` (its own task-1201 "at most one open
+  L1 per task" contract), so a pre-existing open gate-backlog L1 WOULD *suppress*
+  a same-task HOR escalation.  In practice the two populations (LLM-finding
+  ``human_operator_required`` flags vs. blocked born-at-L2 gates) are disjoint,
+  so this asymmetry does not bite.
 
 Stall marker accumulation:
   ``stage1_human_operator_stall_marker`` memories accumulate indefinitely —
@@ -446,9 +453,13 @@ async def maybe_escalate_stalled_gate_backlog(
     - Skip (log INFO) when
       ``escalation_queue.has_open_l1(task_id, category=_GATE_BACKLOG_ESCALATION_CATEGORY)``
       is truthy.  The category scope (task 2757) guarantees at most one open
-      gate-backlog L1 per task without being suppressed by — or suppressing —
-      an unrelated open L1 or the DeterministicRunner's born-at-L2
-      ``milestone_gate`` escalation (distinct level/category).
+      gate-backlog L1 per task and keeps this path from being *suppressed by* an
+      unrelated open L1 or the DeterministicRunner's born-at-L2
+      ``milestone_gate`` escalation (distinct level/category).  The independence
+      is one-directional: the HOR path (``maybe_escalate_stalled_tasks``) dedups
+      with an UN-categorized ``has_open_l1(task_id)``, so an open gate-backlog L1
+      CAN *suppress* a same-task HOR escalation — harmless because the two
+      populations are disjoint in practice.
     - Otherwise build an ``Escalation`` with ``level=1``, ``severity='blocking'``,
       ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The
       human-readable age is recomputed from ``task_by_id[task_id]['metadata']``
