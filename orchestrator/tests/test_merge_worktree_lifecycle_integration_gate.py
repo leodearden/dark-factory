@@ -875,3 +875,69 @@ class TestFiveThreeTwoSixReplayGate:
             release_merge_verify_flock(fd_verify)
             release_merge_verify_flock(fd_uuid)
             remove_lock_holder_pgid(base)
+
+
+# ---------------------------------------------------------------------------
+# TestIdentityFaceInVerifyReject -- PRD Sec.9 row 8
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestIdentityFaceInVerifyReject:
+    """PRD Sec.9 row 8: coalesce_or_enqueue_merge_request's duplicate_in_verify
+    reject (delta, task 2927). Ported from
+    test_merge_queue_c3_submit_identity.py::TestC3SubmitGateInVerify::
+    test_in_verify_newer_sha_rejects.
+
+    A newer SHA submitted while the branch's earlier SHA is already IN
+    VERIFY is structurally REJECTed -- never coalesced, never replaced --
+    leaving the live in-flight entry UNDISTURBED (D3).
+    """
+
+    async def test_newer_sha_in_verify_rejects_leaves_entry_undisturbed(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """OBSERVED-TO-FIRE negative assertion (the reject must actually
+        fire) paired with an UNDISTURBED positive control (the live
+        in-flight entry survives untouched -- not dropped, not cancelled,
+        nothing enqueued)."""
+        sha1 = await _commit(git_repo, 'c1')
+        sha2 = await _commit(git_repo, 'c2')  # strict descendant of sha1 -> SUPERSET
+
+        queue: asyncio.Queue = asyncio.Queue()
+        registry = InFlightMergeRegistry()
+        event_store = None
+
+        old_fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire(
+            '5326', 'task-old', old_fut, request_id='mr-old', snapshot_tip=sha1,
+        )
+
+        req_new = _make_request(
+            'task-new', '5326', tmp_path, config, request_id='mr-new', snapshot_tip=sha2,
+        )
+
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req_new, event_store, registry,
+            git_ops=None,
+            live_snapshot=_verify_snapshot('mr-old', '5326', verify_age_secs=42.0),
+            classifier_git_ops=git_ops,
+        )
+
+        assert result.rejected is True, (
+            f'a newer SHA submitted while the earlier SHA is in verify must '
+            f'REJECT; got {result}'
+        )
+        assert result.reject_code == 'duplicate_in_verify'
+        assert result.dispatched is False
+        assert result.in_flight is False
+        assert result.existing_sha == sha1
+        assert result.inflight_request_id == 'mr-old'
+        assert result.verify_age_secs is not None
+
+        # UNDISTURBED positive control: the live entry survives untouched.
+        assert registry.is_inflight('5326')
+        entry = registry.entry('5326')
+        assert entry is not None and entry.request_id == 'mr-old'
+        assert not old_fut.cancelled()
+        assert queue.qsize() == 0
