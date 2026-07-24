@@ -314,6 +314,15 @@ def all_files_foreign_owner(
     ``cross_repo_project``) and ALLOW it, instead of hard-rejecting via
     :func:`check_files_for_scope`.
 
+    FILER MUST BE REGISTERED (task 3004 / esc-3004 NARROW decision): the
+    allow-and-tag path fires ONLY when *project_id* is itself a registered
+    project (``registry.is_known(project_id)``).  A cross-repo deliverable is a
+    relationship between two KNOWN projects (e.g. reify → dark_factory), not an
+    open door for any namespace to declare another project's files.  An
+    UNREGISTERED filer whose files are all foreign therefore returns ``None``
+    here and falls through to the :func:`check_files_for_scope` hard reject,
+    preserving task-2206's anti-bypass guard.
+
     Distinct from :func:`check_files_for_scope`, which rejects on ANY foreign
     file: here the submission must be ENTIRELY foreign under a SINGLE owner,
     with NO locally-owned file, before it qualifies.  Reuses
@@ -323,12 +332,18 @@ def all_files_foreign_owner(
     nor establish cross-repo (conservative, matching
     :func:`_aggregate_owner_mismatches`).
 
-    Returns ``None`` when the registry/*files* are empty, when ANY file is
-    owned by *project_id* (a genuine same-repo or mixed scope, left to
+    Returns ``None`` when the registry/*files* are empty, when the FILER
+    (*project_id*) is not a registered project, when ANY file is owned by
+    *project_id* (a genuine same-repo or mixed scope, left to
     ``check_files_for_scope``'s hard-reject), when no file is foreign, or when
     foreign files span more than one owner.
     """
     if not registry or not files:
+        return None
+    if not registry.is_known(project_id):
+        # Unregistered filer → task-2206 anti-bypass preserved; a cross-repo
+        # deliverable is a relationship between two REGISTERED projects, not a
+        # blanket allowance for any namespace to declare foreign files.
         return None
     foreign_owners: set[str] = set()
     first_owner: str | None = None

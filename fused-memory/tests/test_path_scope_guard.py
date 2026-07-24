@@ -477,6 +477,26 @@ class TestAllFilesForeignOwner:
         )
         assert owner is None
 
+    def test_unregistered_filer_all_foreign_returns_none(self, tmp_path):
+        # (f) FILER-REGISTRATION gate (task 3004 / esc-3004 NARROW decision):
+        # an UNREGISTERED filer whose files are ALL foreign under a single
+        # owner does NOT qualify for the cross-repo allow+tag path — it returns
+        # None here and falls through to check_files_for_scope's hard reject,
+        # preserving task-2206's anti-bypass guard. Cross-repo is a
+        # relationship between two REGISTERED projects.
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)  # registers reify + dark_factory
+        assert registry.is_known('reify') is True
+        assert registry.is_known('outsider') is False
+        # Same all-foreign single-owner file set that returns 'dark_factory' for
+        # a REGISTERED filer ('reify') must return None for an UNREGISTERED one.
+        owner = all_files_foreign_owner(
+            ['orchestrator/src/x.py', 'orchestrator/tests/y.py'],
+            'outsider', registry,
+        )
+        assert owner is None
+
 
 # ---------------------------------------------------------------------------
 # Verdict.to_error_dict
