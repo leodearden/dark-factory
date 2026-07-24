@@ -5286,6 +5286,46 @@ class TaskWorkflow:
                 self.task_id, exc,
             )
 
+    async def _clear_merge_phase_entered(self) -> None:
+        """Remove the durable merge-phase-liveness stamp from task metadata.
+
+        Task 2991 symmetric clear (mirrors :meth:`_clear_merge_retry_pending`):
+        called at the durable-enqueue boundary in
+        :meth:`_submit_to_merge_queue` (alongside ``scheduler.clear_merge_phase``)
+        and on merge SUCCESS in :meth:`_merge_and_finalise`, so a just-enqueued
+        / just-merged task does not carry a fresh stamp that would briefly defer
+        an unrelated stranded divergence orphan. Uses the full-dict
+        :meth:`_merge_fresh_metadata` + ``scheduler.update_task(metadata=...)``
+        pattern because only a full-dict write can REMOVE a key.
+
+        Deliberately NOT cleared defensively in the harness ``_run_slot``
+        finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an
+        abnormal exit must LEAVE the durable stamp so the reaper keeps deferring
+        across the crash/restart/redispatch window (fix-direction b). A
+        persistence failure must never crash the merge path; a subsequent merge
+        (re-)entry re-stamps, so a lost clear is self-healing.
+
+        Idempotent no-op when no stamp is present: returns immediately without a
+        fresh-metadata read or backend write, so it is cheap and safe to call
+        unconditionally on every enqueue / merge success (the common case never
+        stamped — the stamp is written only at merge entry).
+        """
+        metadata = self.task.get('metadata') or {}
+        if 'merge_phase_liveness' not in metadata:
+            return
+        fresh = await self._merge_fresh_metadata(
+            metadata, log_context='merge_phase_liveness clear',
+        )
+        fresh.pop('merge_phase_liveness', None)
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(self.task_id, metadata=fresh)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_phase_liveness clear: %s',
+                self.task_id, exc,
+            )
+
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
 
