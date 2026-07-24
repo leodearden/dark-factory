@@ -370,6 +370,23 @@ _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
 # (not a default arg) so tests can monkeypatch it (0.0 disables the memo).
 _WARM_LANE_AUDIT_CACHE_TTL_SECS: float = 30.0
 
+# Re-fire cadence for the structural-exhaustion loudness callback once the
+# pool-GLOBAL consecutive-EXHAUSTED counter is at-or-above threshold (task 2988,
+# review amendment — efficiency).  The callback fires on the EXACT threshold
+# crossing and then only every _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY-th
+# subsequent consecutive EXHAUSTED — NOT on every acquire.  Rationale: the
+# harness filer's dedup scan (find_pending_l2_by_root_cause) is
+# O(pending-escalations) and runs on the acquire chokepoint; unlike the
+# WarmLanePool drift-counter (self-correcting: resets on every successful round)
+# the consecutive-EXHAUSTED counter NEVER resets while the pool stays stuck (a
+# structurally exhausted pool serves no fresh lane), so firing on every trip
+# would run that scan on every acquire until a lane frees.  The periodic re-fire
+# keeps the born-at-L2 recoverable — it re-files if an operator resolves the L2
+# while the pool remains structurally exhausted — without a per-acquire scan.
+# A fixed interval (not `count % threshold`) so a sensitive threshold=1 config
+# still rate-limits instead of firing every trip.
+_STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY: int = 50
+
 # Fixed name for the SECOND persistent warm worktree (task 1952, PRD δ /
 # §5 C5), dedicated to the offline-deep lane worker (β2).  Lives at
 # <worktree_base>/_offline-deep.  Deliberately NOT prefixed `_merge-`, so it
@@ -4371,28 +4388,41 @@ class GitOps:
         ONE deduped born-at-L2 — the sole loud signal that the pool is stuck
         handing out EXHAUSTED forever.
 
-        Mirrors the :class:`WarmLanePool` drift-counter (warm_lane_pool.py):
-        fires on EACH trip at-or-above the threshold; DEDUP to a single pending
-        L2 is the harness filer's job (``find_pending_l2_by_root_cause``), not
-        the counter's.  Callback exceptions are swallowed+logged (I3 fail-open) —
+        RATE-LIMITED (review amendment — efficiency): fires on the EXACT
+        threshold crossing and then only every
+        ``_STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY``-th subsequent consecutive
+        EXHAUSTED — NOT on every trip.  Unlike the :class:`WarmLanePool`
+        drift-counter (which resets on every successful round, so its per-trip
+        fire is naturally bounded), this counter never resets while the pool
+        stays stuck, so firing on every trip would run the harness filer's
+        O(pending-escalations) dedup scan (``find_pending_l2_by_root_cause``) on
+        the acquire chokepoint for every attempt.  The periodic re-fire still
+        re-files the born-at-L2 if an operator resolves it while the pool remains
+        structurally exhausted; dedup keeps at most one pending L2 regardless of
+        trip count.  Callback exceptions are swallowed+logged (I3 fail-open) —
         escalation-filing must never break the acquire path.  Increment + fire
         run synchronously (no ``await``), so they are atomic under the single
         asyncio loop despite concurrent acquires — the same property the pool
         drift-counter relies on.
         """
         self._consecutive_exhausted += 1
+        count = self._consecutive_exhausted
+        threshold = self.config.warm_lane_structural_exhaustion_l2_threshold
+        # Fire on the crossing (count == threshold → (count - threshold) == 0)
+        # and every _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY-th trip after it —
+        # never on every acquire (see the constant's rationale).
         if (
-            self._consecutive_exhausted
-            >= self.config.warm_lane_structural_exhaustion_l2_threshold
+            count >= threshold
+            and (count - threshold) % _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY == 0
             and self._on_structural_exhaustion is not None
         ):
             try:
-                self._on_structural_exhaustion(self._consecutive_exhausted, census)
+                self._on_structural_exhaustion(count, census)
             except Exception:
                 logger.warning(
                     'acquire_warm_lane: _on_structural_exhaustion callback raised '
                     '(consecutive_exhausted=%d) — swallowed (fail-open, I3)',
-                    self._consecutive_exhausted, exc_info=True,
+                    count, exc_info=True,
                 )
 
     async def acquire_warm_lane(

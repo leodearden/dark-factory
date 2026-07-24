@@ -190,9 +190,12 @@ class TestWarmLanePoolExhaustedDoesNotCount:
 # in ``_acquire_warm_lane_impl``; once it reaches the configured threshold and a
 # ``_on_structural_exhaustion`` callback is installed, the callback fires with
 # ``(count, census)``.  A successful FRESH acquire (acquire_for reused=False)
-# resets the counter to 0.  Mirrors the pool drift-counter mechanics
-# (warm_lane_pool.py) — fire-each-at-or-above-threshold; dedup is the harness
-# filer's job (step-11/12), NOT the counter's.
+# resets the counter to 0.  The callback is RATE-LIMITED (review amendment,
+# efficiency): it fires on the exact threshold crossing and then only every
+# _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY-th subsequent trip — NOT on every
+# acquire — because this counter (unlike the self-correcting pool drift-counter)
+# never resets while the pool stays stuck; dedup to a single pending L2 is the
+# harness filer's job (step-11/12), NOT the counter's.
 # ---------------------------------------------------------------------------
 
 
@@ -302,6 +305,40 @@ class TestConsecutiveExhaustedCounter:
         assert isinstance(census, WarmLanePoolCensus), (
             f'callback must carry the α census, got {type(census)!r}'
         )
+
+    def test_callback_rate_limited_past_threshold(self, wl_git_repo: Path):
+        """Review amendment (efficiency): past the threshold the loudness
+        callback is RATE-LIMITED — it fires on the exact crossing and then only
+        every ``_STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY``-th consecutive
+        EXHAUSTED, NOT on every trip.  The counter never resets while the pool
+        stays stuck, so per-trip firing would run the harness filer's O(pending)
+        dedup scan on the acquire chokepoint for every attempt.  Driven directly
+        through ``_note_structural_exhaustion`` (no git acquire path) so the many
+        trips are cheap; also proves the periodic re-fire still recovers a
+        resolved L2 while the pool remains structurally exhausted."""
+        from orchestrator.git_ops import _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY
+
+        threshold = 3
+        git_ops = _exhausting_git_ops(wl_git_repo, threshold)
+        fires: list = []
+        git_ops._on_structural_exhaustion = (
+            lambda count, census: fires.append(count)
+        )
+        census = _census()
+
+        n = threshold + 2 * _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY
+        for _ in range(n):
+            git_ops._note_structural_exhaustion(census)
+
+        # Fires only at the crossing and each subsequent re-fire boundary — not
+        # on every one of the `n` trips at-or-above the threshold.
+        assert fires == [
+            threshold,
+            threshold + _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY,
+            threshold + 2 * _STRUCTURAL_EXHAUSTION_L2_REFIRE_EVERY,
+        ], f'callback must be rate-limited past threshold, got fires={fires}'
+        assert len(fires) < n, 'must NOT fire on every trip past the threshold'
+        assert git_ops._consecutive_exhausted == n
 
     def test_fresh_acquire_resets_counter(self, wl_git_repo: Path):
         """A successful FRESH acquire (acquire_for returns ``(lane, reused=False)``)
