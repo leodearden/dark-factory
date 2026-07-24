@@ -3321,17 +3321,27 @@ class TaskWorkflow:
                 main_before = await self.git_ops.get_main_sha()
                 if not await self.git_ops.rebase_onto_main(self.worktree):
                     break  # true conflict — queue will detect it
-                verify = await run_scoped_verification(
-                    self.worktree, self.config, self._module_configs,
-                    task_files=self._task_files,
-                    # role='task' is explicit for γ's explicit-is-correct
-                    # invariant (mirrors merge_queue.py role='merge').
-                    # 'task' is already the default so this is documentary;
-                    # no call-site spy exists for this path — the
-                    # _verify_debugfix_loop spy in
-                    # test_workflow_verify_retry.py covers the primary site.
-                    role='task',
-                )
+                # Warm-lane consumer-hold (task 3027): same per-lane
+                # <lane_dir>.lock hold as the implement-phase verify — this
+                # post-rebase re-verify also builds/runs test binaries on the
+                # task's warm lane, so it equally races reify's warm-lane-gc.sh
+                # reclaim; the flock is the cross-process guard that script
+                # honors. Fails open on contention.
+                async with self.git_ops.task_verify_lease(self.worktree):
+                    verify = await run_scoped_verification(
+                        self.worktree, self.config, self._module_configs,
+                        task_files=self._task_files,
+                        # role='task' is explicit for γ's explicit-is-correct
+                        # invariant (mirrors merge_queue.py role='merge').
+                        # 'task' is already the default so this is documentary.
+                        # This site's task_verify_lease wrap has its OWN
+                        # held-flock call-site spy: test_task_verify_lease.py::
+                        # TestMergePhaseReverifyHoldsLease drives _run_merge_phase
+                        # to here and asserts the lane flock is HELD during the
+                        # re-verify (the implement-phase site is covered
+                        # separately by TestTaskLaneVerifyHoldsLease).
+                        role='task',
+                    )
                 if not verify.passed:
                     if verify.timed_out:
                         logger.warning(
@@ -7095,15 +7105,25 @@ class TaskWorkflow:
                 # applies independently, in the non-force_workspace
                 # module-config branch, for any train member whose task
                 # verify isn't force_workspace'd.
-                result = await run_scoped_verification(
-                    self.worktree, self.config, self._module_configs,
-                    task_files=self._task_files,
-                    attempt_id=verify_attempt + 1,
-                    task_id=self.task_id,
-                    archive_root=self.config.project_root / 'data' / 'verify-logs',
-                    force_workspace=self._train is not None,
-                    role='task',
-                )
+                # Warm-lane consumer-hold (task 3027): hold the task lane's
+                # <lane_dir>.lock across this nextest run so a concurrent reify
+                # warm-lane-gc.sh reclaim's per-lane `flock -n` refuses/queues
+                # instead of reseeding the lane out from under this live
+                # consumer and deleting its in-flight test binaries (esc-5236-7
+                # / esc-5275-10). The flock is the cross-process guard reify's
+                # warm-lane-gc.sh honors; task_verify_lease fails OPEN on
+                # contention (per-attempt scope keeps the hold off the
+                # infra-retry backoff sleeps below).
+                async with self.git_ops.task_verify_lease(self.worktree):
+                    result = await run_scoped_verification(
+                        self.worktree, self.config, self._module_configs,
+                        task_files=self._task_files,
+                        attempt_id=verify_attempt + 1,
+                        task_id=self.task_id,
+                        archive_root=self.config.project_root / 'data' / 'verify-logs',
+                        force_workspace=self._train is not None,
+                        role='task',
+                    )
             except VerifyInfraError as exc:
                 last_infra_exc = exc
                 last_infra_result = None
