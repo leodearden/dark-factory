@@ -1489,9 +1489,9 @@ class TestRecordDrivenRecovery:
 
         step-16 review-fix regression guard: cleanup_worktree's side_effect
         performs the REAL durable RELEASED write (mirroring what
-        release_warm_lane -> _lifecycle_note_released does for a real warm
-        lane) BEFORE the harness's own explicit transition runs, so an
-        unconditional second RELEASED -> RELEASED transition would raise
+        release_warm_lane -> pool.release -> _note_released_durable does for a
+        real warm lane) BEFORE the harness's own explicit transition runs, so
+        an unconditional second RELEASED -> RELEASED transition would raise
         IllegalLaneTransition uncaught out of the recovery loop.  A second,
         non-terminal lane seeded AFTER this one proves recovery keeps going
         instead of aborting mid-loop.
@@ -1520,7 +1520,9 @@ class TestRecordDrivenRecovery:
 
         harness.scheduler.get_status = AsyncMock(side_effect=_get_status)
         harness.git_ops.cleanup_worktree.side_effect = (  # type: ignore[attr-defined]
-            lambda entry, tid: harness.git_ops._lifecycle_note_released(entry)
+            lambda entry, tid: harness.git_ops._lane_lifecycle.transition(
+                entry, DurableLaneState.RELEASED,
+            )
         )
 
         await harness._recover_crashed_tasks()  # must not raise

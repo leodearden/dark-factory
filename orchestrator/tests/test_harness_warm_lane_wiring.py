@@ -1242,8 +1242,9 @@ class TestRecoveryTerminalTaskLaneRelease:
 
         step-16 review-fix regression guard: exercises the REAL release path
         (side_effect=real_cleanup) rather than a bare mock.  cleanup_worktree
-        on a warm lane routes through release_warm_lane -> _lifecycle_note_released,
-        which already writes the durable ASSIGNED -> RELEASED edge; a bare
+        on a warm lane routes through release_warm_lane -> pool.release ->
+        _note_released_durable, which already writes the durable
+        ASSIGNED -> RELEASED edge; a bare
         AsyncMock decouples cleanup from that durable write and masks the bug
         where the harness's OWN unconditional `transition(entry, RELEASED)`
         afterward then hits an illegal RELEASED -> RELEASED edge and raises

@@ -483,7 +483,14 @@ class WarmLanePool:
             n_quarantined=n_quarantined,
         )
 
-    def note_assignment(self, task_id: str, lane: Path) -> None:
+    def note_assignment(
+        self,
+        task_id: str,
+        lane: Path,
+        *,
+        title: str | None = None,
+        branch: str | None = None,
+    ) -> None:
         """Record *task_id* → *lane* in the assignment map.
 
         Used by the on-disk backstop in ``acquire_warm_lane`` to restore the
@@ -496,10 +503,12 @@ class WarmLanePool:
 
         When a ``LaneLifecycle`` has been wired via ``set_lane_lifecycle``,
         also mirrors this assignment onto the durable record (best-effort;
-        see ``_note_assigned_durable``). No-op when unwired.
+        see ``_note_assigned_durable``). No-op when unwired. ``title``/``branch``
+        are optional carry-forward hints threaded from GitOps's acquire so the
+        durable record keeps its title/branch (task 2986, single writer).
         """
         self._assignments[task_id] = lane
-        self._note_assigned_durable(task_id, lane)
+        self._note_assigned_durable(task_id, lane, title=title, branch=branch)
 
     def drop_assignment(self, branch_name: str) -> None:
         """Remove the *branch_name* assignment without changing lane state.

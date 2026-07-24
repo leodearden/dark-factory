@@ -2887,11 +2887,12 @@ class Harness:
                         await self.git_ops.cleanup_worktree(entry, rec.task_id)
                         # Guarded, not unconditional (step-16 review-fix): for
                         # a warm lane, cleanup_worktree already routed through
-                        # release_warm_lane -> _lifecycle_note_released, which
-                        # records the ASSIGNED/IN_USE -> RELEASED edge itself
-                        # (with the same guard). Re-issuing the transition
-                        # unconditionally would then attempt an illegal
-                        # RELEASED -> RELEASED edge and raise
+                        # release_warm_lane -> pool.release ->
+                        # _note_released_durable (task 2986, single writer),
+                        # which records the ASSIGNED/IN_USE -> RELEASED edge
+                        # itself (with the same guard). Re-issuing the
+                        # transition unconditionally would then attempt an
+                        # illegal RELEASED -> RELEASED edge and raise
                         # IllegalLaneTransition uncaught, aborting recovery
                         # for every remaining lane. Only finalize RELEASED
                         # here when cleanup did NOT already write it (e.g. a
