@@ -12354,6 +12354,9 @@ class Harness:
                 'restart_required': {},
                 'unchanged': 0,
                 'error': error,
+                # Always present so callers can read report['unknown_config_keys']
+                # unconditionally; a failed load has no fresh config to census.
+                'unknown_config_keys': [],
             }
             if self.event_store:
                 self.event_store.emit(EventType.config_reload, data=report)
@@ -12375,6 +12378,12 @@ class Harness:
 
         report = apply_reload(self.config, fresh)
         report['config_path'] = config_path
+        # Surface the freshly-loaded config's unknown-key census (task 2989) so
+        # the reload MCP tool reports phantom keys pydantic silently dropped.
+        # apply_reload itself is left unchanged (it only diffs model_fields).
+        report['unknown_config_keys'] = [
+            uk._asdict() for uk in fresh.unknown_key_census
+        ]
         if self.event_store:
             self.event_store.emit(EventType.config_reload, data=report)
         if report['restart_required'] or not report['reloaded']:
