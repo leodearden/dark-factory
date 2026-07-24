@@ -1020,6 +1020,7 @@ async def merge_entities_live_graph():
 
 @pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
 @pytest.mark.timeout(15)
+@pytest.mark.integration
 class TestRedirectNodeEdgesLiveFalkorDB:
     """Pin the true B4 invariant against a REAL FalkorDB server: after
     redirect_node_edges, no RELATES_TO uuid is shared by more than one edge,

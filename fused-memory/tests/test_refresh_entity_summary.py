@@ -1315,6 +1315,7 @@ async def edge_dedup_live_graph():
 
 @pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
 @pytest.mark.timeout(15)
+@pytest.mark.integration
 class TestEdgeDedupLiveFalkorDB:
     """Pin WITH DISTINCT e / WITH DISTINCT n, e result semantics against real FalkorDB."""
 

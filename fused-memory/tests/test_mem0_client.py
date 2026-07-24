@@ -500,7 +500,7 @@ class TestMem0BackendAddSystemRecordIntegration:
     new dedup-exempt backend.add_system_record method.
     """
 
-    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60)]
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
