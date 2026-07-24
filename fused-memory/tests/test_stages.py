@@ -7348,10 +7348,11 @@ class TestWarnOnFlagForStage2TypeDrift:
         )
 
     @pytest.mark.asyncio
-    async def test_exception_is_swallowed_and_no_warning_logged(self, caplog):
-        """A count_memories_by_metadata failure must never raise or warn —
-        this probe is purely diagnostic and best-effort, fail-open like
-        every other probe in this module."""
+    async def test_exception_is_swallowed_but_logged(self, caplog):
+        """A count_memories_by_metadata failure must never raise (this probe
+        is purely diagnostic and best-effort), but the swallowed exception is
+        logged at WARNING with exc_info so it surfaces loudly rather than
+        silently — required by the repo-wide silent-fallthrough gate."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _warn_on_flag_for_stage2_type_drift,
         )
@@ -7368,11 +7369,18 @@ class TestWarnOnFlagForStage2TypeDrift:
             # Must not raise.
             await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
 
-        assert not any(
-            rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        probe_warnings = [
+            rec
             for rec in caplog.records
-        )
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        # Exactly one fail-safe warning naming the swallowed probe failure;
+        # the string-variant drift warning must NOT fire (the probe never
+        # produced a count).
+        assert len(probe_warnings) == 1
+        assert 'probe raised' in probe_warnings[0].getMessage()
+        assert probe_warnings[0].exc_info is not None
 
     @pytest.mark.asyncio
     async def test_non_int_result_is_treated_as_nothing_to_report(self, caplog):
