@@ -412,3 +412,115 @@ async def maybe_escalate_stalled_tasks(
             )
 
     return escalated
+
+
+async def maybe_escalate_stalled_gate_backlog(
+    escalation_queue,
+    project_id: str,
+    run_id: str,
+    stalled_task_ids: list[str],
+    task_by_id: dict[str, dict],
+    *,
+    now: datetime,
+    threshold_secs: float = STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+) -> list[str]:
+    """Submit level-1 gate-backlog escalations for stalled gate tasks lacking one.
+
+    Mirrors ``maybe_escalate_stalled_tasks`` (task 3017).  For each *task_id* in
+    *stalled_task_ids*:
+
+    - Skip (log INFO) when
+      ``escalation_queue.has_open_l1(task_id, category=_GATE_BACKLOG_ESCALATION_CATEGORY)``
+      is truthy.  The category scope (task 2757) guarantees at most one open
+      gate-backlog L1 per task without being suppressed by — or suppressing —
+      an unrelated open L1 or the DeterministicRunner's born-at-L2
+      ``milestone_gate`` escalation (distinct level/category).
+    - Otherwise build an ``Escalation`` with ``level=1``, ``severity='blocking'``,
+      ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The
+      human-readable age is recomputed from ``task_by_id[task_id]['metadata']``
+      via ``gate_escalated_age_secs`` for the summary/detail.  Any failure
+      (id-gen, construction, or submit) logs WARNING and excludes the task_id
+      from the returned list.
+
+    Returns the list of task_ids that received a new escalation.  Returns
+    ``[]`` immediately when the ``escalation`` package is unavailable.
+
+    *threshold_secs* is accepted for signature symmetry with
+    ``extract_stalled_gate_backlog_task_ids`` (the caller has already applied
+    the age filter) and names the boundary in the fallback summary when a
+    task's age cannot be recomputed.
+    """
+    if Escalation is None:
+        return []
+
+    escalated: list[str] = []
+    for task_id in stalled_task_ids:
+        if escalation_queue.has_open_l1(
+            task_id, category=_GATE_BACKLOG_ESCALATION_CATEGORY
+        ):
+            logger.info(
+                'reconciliation.stage1_gate_backlog_escalation_suppressed: '
+                'task_id=%s already has open level-1 gate-backlog escalation',
+                task_id,
+                extra={'project_id': project_id, 'task_id': task_id},
+            )
+            continue
+
+        task = task_by_id.get(task_id) or {}
+        metadata = task.get('metadata') if isinstance(task, dict) else None
+        age_secs = gate_escalated_age_secs(metadata, now=now)
+        age_hours = round(age_secs / 3600, 1) if age_secs is not None else None
+        gate_escalated_at = (
+            metadata.get('gate_escalated_at') if isinstance(metadata, dict) else None
+        )
+
+        if age_hours is not None:
+            summary = (
+                f'Gate task {task_id} has awaited a human decision for {age_hours}h'
+            )
+        else:
+            summary = (
+                f'Gate task {task_id} has awaited a human decision beyond the '
+                f'{threshold_secs / 3600:.0f}h gate-backlog threshold'
+            )
+
+        detail_parts = [
+            f'project_id: {project_id}',
+            f'run_id: {run_id}',
+            f'task_id: {task_id}',
+            f'gate_escalated_at: {gate_escalated_at}',
+            f'age_hours: {age_hours if age_hours is not None else "unknown"}',
+        ]
+        title = task.get('title') if isinstance(task, dict) else None
+        if title:
+            detail_parts.append(f'title: {title}')
+        description = task.get('description') if isinstance(task, dict) else None
+        if description:
+            detail_parts.append(f'description: {description}')
+        detail = '\n'.join(detail_parts)
+
+        try:
+            # make_id() and Escalation() are inside the try so that id-generation
+            # or constructor failures are caught and logged rather than escaping.
+            esc = Escalation(
+                id=escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='reconciliation-stage1',
+                severity='blocking',
+                category=_GATE_BACKLOG_ESCALATION_CATEGORY,
+                summary=summary,
+                detail=detail,
+                level=1,
+            )
+            escalation_queue.submit(esc)
+            escalated.append(task_id)
+        except Exception as exc:
+            logger.warning(
+                'stage1_stall_detector: failed to escalate gate-backlog task_id=%s '
+                '(id-gen, construction, or submit): %s',
+                task_id,
+                exc,
+                extra={'project_id': project_id, 'task_id': task_id},
+            )
+
+    return escalated
