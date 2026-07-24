@@ -5480,6 +5480,78 @@ class TestReclaimVictimWritesThroughDurable:
         assert record.state == DurableLaneState.ASSIGNED
         assert record.task_id == 'thief'
 
+    async def test_steal_of_recycled_lane_does_not_retrigger_quarantine_recycle(
+        self, tmp_path: Path, caplog,
+    ):
+        """Amendment (reviewer robustness, task 3029): the QUARANTINED ->
+        RELEASED -> ASSIGNED recycle in note_assigned is reachable from any
+        caller, but only the genuine fresh-acquire path ever PRESENTS a
+        QUARANTINED record. reclaim_victim can steal only an in-memory-ASSIGNED
+        lane, whose durable record was ALREADY recycled off QUARANTINED by the
+        acquire that assigned it (and reclaim_victim additionally releases it to
+        RELEASED first), so the thief re-key is a clean ASSIGNED -> RELEASED ->
+        ASSIGNED that never re-enters the recycle branch — no second loud
+        warning, no drift. Confirms reclaim_victim cannot flip a genuinely-bad
+        (never-re-prepared) QUARANTINED worktree's record to ASSIGNED.
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        # Drive _lane-0's durable record to a stale QUARANTINED (the live
+        # esc-__lane_record_drift__-1 scenario) BEFORE any acquire.
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/old')
+        lifecycle.transition(
+            lane, DurableLaneState.ASSIGNED, task_id='old', title='old-demo',
+        )
+        lifecycle.transition(lane, DurableLaneState.QUARANTINED)
+
+        pool = _make_pool(tmp_path, size=1)
+        pool.set_lane_lifecycle(lifecycle)
+
+        def _recycle_warnings():
+            return [
+                r for r in caplog.records
+                if r.name == 'orchestrator.lane_lifecycle'
+                and 'recycling QUARANTINED lane' in r.getMessage()
+            ]
+
+        with caplog.at_level(logging.WARNING):
+            # Fresh acquire recycles _lane-0 off QUARANTINED for 'victim'
+            # (exactly ONE loud recycle warning).
+            acq_v = await pool.acquire_for('victim')
+            assert acq_v is not None
+            assert acq_v[0] == lane
+            assert len(_recycle_warnings()) == 1
+            assert pool._drift_count == 0
+
+            # The record is now durably ASSIGNED:victim, so stealing the lane is
+            # a clean re-key, NOT a QUARANTINED recycle. Isolate the reclaim's
+            # log output.
+            caplog.clear()
+            result = await pool.reclaim_victim('thief', {'victim'}, lambda b: False)
+
+        assert result == ('victim', lane)
+        assert pool.state(lane) == LaneState.ASSIGNED
+        assert pool.assignment_for('thief') == lane
+        # Durable record followed the thief...
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == 'thief'
+        # ...and the reclaim re-key never re-entered the QUARANTINED recycle
+        # branch (no second loud warning) and never drifted.
+        assert _recycle_warnings() == []
+        pool_drift_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.warm_lane_pool'
+            and 'durable record mirror' in r.getMessage()
+            and 'failed' in r.getMessage()
+        ]
+        assert pool_drift_warnings == []
+        assert pool._drift_count == 0
+
     async def test_steal_without_lifecycle_is_cache_only(self, tmp_path: Path):
         """No lifecycle wired (default None): reclaim_victim writes no record."""
         pool = _make_pool(tmp_path, size=1)

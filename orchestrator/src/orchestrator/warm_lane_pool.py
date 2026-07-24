@@ -598,7 +598,17 @@ class WarmLanePool:
           through the unchanged guarded-write path — task 3029, fixing the
           esc-__lane_record_drift__-1 drift where a quarantined slot's fresh
           reassignment left the record stuck QUARANTINED while the cache said
-          ASSIGNED.
+          ASSIGNED. ``note_assigned`` is not gated to the fresh-``acquire_for``
+          caller — it recycles a QUARANTINED record for whichever of the four
+          callers above presents one. In practice only fresh ``acquire_for``
+          does: ``reclaim_victim`` and ``note_assignment`` re-key a lane that is
+          already in-memory ASSIGNED (its record therefore already recycled off
+          QUARANTINED by the acquire that assigned it — and ``reclaim_victim``
+          additionally routes ``_note_released_durable`` first, so the thief
+          write sees RELEASED), while ``restore_assignment`` runs only from
+          crash recovery, which SKIPS QUARANTINED lanes before it ever restores
+          one. The LOUD ``note_assigned`` warning surfaces any recycle, so an
+          unexpected caller is never silent.
         - ``OSError``: the durable write itself failed (disk full, EACCES,
           read-only mount, ``.lane-state`` unwritable) — logged and swallowed
           so a transient I/O error degrades to cache-only instead of
