@@ -482,3 +482,52 @@ class TestReapShape1InterruptedTeardown:
         assert not leaks, f'no _merge-* leak may survive the sweep: {leaks}'
         # The audit reads clean AFTER the sweep — the acceptance criterion.
         assert worker.worktree_ledger_violations(now=_NOW) == []
+
+
+# ---------------------------------------------------------------------------
+# task 3018: periodic (steady-state) reap wired into the heartbeat loop
+#
+# Closes the observe-but-never-reclaim gap: reap_orphaned_merge_worktrees
+# above is wired ONLY at startup/recovery (Harness._reap_orphaned_merge_worktrees),
+# so a leak that first crosses grace mid-run sat unreaped until the next
+# restart. _maybe_reap_orphaned_merge_worktrees is the periodic, rate-limited
+# steady-state counterpart, invoked from _heartbeat_loop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPeriodicReapHelper:
+    """Unit tests for SpeculativeMergeWorker._maybe_reap_orphaned_merge_worktrees
+    (task 3018 step-1/step-2).
+
+    RED until step-2 GREEN adds _maybe_reap_orphaned_merge_worktrees and the
+    _last_reap_at/_reap_interval_s fields to merge_queue.py.
+    """
+
+    async def test_first_call_reaps_orphan_preserves_owned(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+
+        orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+        owned_wt, _ = await git_ops._create_merge_worktree()
+        worker._register_owned_merge_worktree(owned_wt)
+
+        assert worker._last_reap_at == 0.0, (
+            'clock-injected rate-limit idiom: init 0.0 so the first poll reaps '
+            '(mirrors _last_heartbeat_at)'
+        )
+
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert not orphan.exists(), 'aged orphan must be removed from disk'
+        registered = await _registered_worktree_paths(git_ops)
+        assert str(orphan) not in registered, (
+            f'aged orphan must be gone from git worktree list: {registered}'
+        )
+        assert owned_wt.exists(), 'owned/registered worktree must survive the sweep'
+        assert worker.worktree_ledger_violations(now=_NOW) == [], (
+            'the audit must read clean after the periodic reap reclaims the orphan'
+        )
+        assert worker._last_reap_at == _NOW, 'the reap ran and advanced the clock'
