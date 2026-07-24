@@ -69,6 +69,24 @@ class TestStaticContract:
     def test_legal_transitions_excludes_illegal_edge(self):
         assert (LaneState.RELEASED, LaneState.IN_USE) not in LEGAL_TRANSITIONS
 
+    def test_quarantined_has_exactly_one_sanctioned_recycle_edge(self):
+        # The ONE sanctioned exit from QUARANTINED: recycle a quarantined slot
+        # back into service (QUARANTINED -> RELEASED) once its bad worktree was
+        # relocated to quarantine_base, so a genuine fresh dispatch can bring
+        # the durable record back to ASSIGNED via the existing RELEASED edge.
+        assert (LaneState.QUARANTINED, LaneState.RELEASED) in LEGAL_TRANSITIONS
+        # Every OTHER QUARANTINED -> X stays illegal: a divergent quarantine
+        # record must never be silently adopted straight back into service.
+        for illegal_target in (
+            LaneState.ASSIGNED,
+            LaneState.IN_USE,
+            LaneState.SEED,
+            LaneState.REGISTERED,
+        ):
+            assert (
+                LaneState.QUARANTINED, illegal_target,
+            ) not in LEGAL_TRANSITIONS
+
     def test_illegal_lane_transition_is_an_exception(self):
         assert issubclass(IllegalLaneTransition, Exception)
 
