@@ -7082,6 +7082,144 @@ class TestSweepStaleMem0FlagMarkers:
         memory_service.get_memories_by_metadata.assert_awaited_once()
 
 
+class TestSweepStaleMem0FlagForStage2Markers:
+    """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
+    flag_for_stage2 Stage-1 -> Stage-2 relay pool (task 2966).
+
+    flag_for_stage2 markers are written ONLY to Mem0 by the Stage-1
+    flag_dedup/LLM add_memory path (metadata.flag_for_stage2=true); no code
+    path upserts a flag_for_stage2 row into recon_ledger, so
+    ReconLedgerStore.gc()'s record_kind IN (...) clause never matches it —
+    the identical declared-vs-actual gap already documented for
+    stage2_persistence_marker (task 2228 W5-κ). This helper closes that gap
+    by delegating to the shared _sweep_stale_mem0_pool skeleton with a
+    DISTINCT enumeration/count filter: the boolean payload key
+    {'flag_for_stage2': True}, not a {'source': ...} filter (these markers
+    carry no source field) and not the string 'true' (Qdrant payload
+    filters are type-sensitive; live verification found the stored value is
+    boolean True).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_markers_deleted_fresh_marker_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'stale-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't1', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'stale-2',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't2', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'fresh-1',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't3', 'run_id': 'prior-run',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        assert 'fresh-1' not in deleted_ids
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r1'
+            assert kwargs.get('_source') == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters == {'flag_for_stage2': True}
+
+        # Deterministic scroll only — semantic search must never be used for GC.
+        memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_skips_scroll_when_count_is_zero(self):
+        """When count_memories_by_metadata reports an exact 0, the scroll is
+        skipped entirely — mirrors the stage1_flag_marker short circuit
+        (task 2853 review), applied here with the boolean flag_for_stage2
+        filter instead of a source filter."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1',
+        )
+
+        assert result == 0
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        call = memory_service.count_memories_by_metadata.call_args
+        assert call.kwargs.get('filters') == {'flag_for_stage2': True}
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_fails_open_to_scroll_on_error(self):
+        """A count_memories_by_metadata failure must fall through to the
+        normal scroll path unchanged, not skip the sweep — the short circuit
+        may only ever skip work the scroll would itself have found empty."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+
+
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
 
