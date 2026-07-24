@@ -1009,3 +1009,66 @@ class TestIdentityFaceInVerifyReject:
         assert entry is not None and entry.request_id == 'mr-old'
         assert not old_fut.cancelled()
         assert queue.qsize() == 0
+
+
+# ---------------------------------------------------------------------------
+# TestIdentityFaceCancelResubmit -- PRD Sec.9 row 9
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestIdentityFaceCancelResubmit:
+    """PRD Sec.9 row 9: retire_cancelled_merge_request's full retirement
+    (epsilon, task 2928) followed by an immediate resubmit. Ported from
+    test_merge_cancel_retire.py::TestRetireCancelledMergeRequest::
+    test_basic_release_worktree_and_forget +
+    test_identity_guard_does_not_drop_fresh_slot.
+
+    A cancelled merge is FULLY retired (registry slot + worktree via the C1
+    guarded primitive + sticky retention) before an immediate resubmit,
+    which gets a genuinely FRESH entry rather than coalescing onto /
+    mirroring the retired corpse.
+    """
+
+    async def test_full_retirement_then_immediate_resubmit_gets_fresh_slot(
+        self, tmp_path: Path,
+    ) -> None:
+        registry = InFlightMergeRegistry()
+        retention = TerminalOutcomeRetention()
+        fut_old: asyncio.Future = asyncio.get_running_loop().create_future()
+        registry.acquire(
+            '5326', 'T', fut_old, request_id='mr-old', snapshot_tip='sha-old',
+        )
+        retention.record(TerminalOutcomeRecord(
+            request_id='mr-old', branch='5326', task_id='T', state='abandoned',
+        ))
+        wt = tmp_path / 'merge-5326'
+        wt.mkdir()
+        spy = _RetireSpy(wt)
+
+        outcome = await retire_cancelled_merge_request(
+            request_id='mr-old', branch='5326', task_id='T',
+            registry=registry, retention=retention, git_ops=spy, event_store=None,
+        )
+
+        # FULL retirement: slot released, worktree routed through the C1
+        # guarded primitive, sticky cleared across every retention index.
+        assert registry.is_inflight('5326') is False
+        assert spy.removed == [(wt, 'merge_cancel_retire')]
+        assert not wt.exists()
+        assert outcome == 'removed'
+        assert retention.get_by_branch('5326') is None
+        assert retention.get_by_task('T') is None
+        assert retention.get('mr-old') is None
+
+        # IMMEDIATE resubmit: a genuinely FRESH entry, not a coalesce onto /
+        # mirror of the retired corpse -- positive control: a real new work
+        # item, whose future is NOT cancelled.
+        fut_new: asyncio.Future = asyncio.get_running_loop().create_future()
+        claimed = registry.acquire(
+            '5326', 'T2', fut_new, request_id='mr-new', snapshot_tip='sha-new',
+        )
+        assert claimed is True, 'resubmit must claim a FREE slot, not coalesce'
+        entry = registry.entry('5326')
+        assert entry is not None and entry.request_id == 'mr-new'
+        assert not fut_new.cancelled()
