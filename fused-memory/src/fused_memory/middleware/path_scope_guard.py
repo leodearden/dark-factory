@@ -299,6 +299,69 @@ def check_files_for_scope(
     )
 
 
+def all_files_foreign_owner(
+    files: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> str | None:
+    """Return the single foreign owner iff EVERY owned file belongs to ONE other project.
+
+    Recognises the cross-repo deliverable shape (task 3004 / reify-task 5308):
+    a task filed under *project_id* whose ``metadata.files`` are ALL owned by
+    one OTHER registered project, so its own branch is legitimately empty (the
+    deliverable lands on that project's branch).  The interceptor consumes the
+    returned owner to TAG the submission (``metadata.cross_repo`` +
+    ``cross_repo_project``) and ALLOW it, instead of hard-rejecting via
+    :func:`check_files_for_scope`.
+
+    FILER MUST BE REGISTERED (task 3004 / esc-3004 NARROW decision): the
+    allow-and-tag path fires ONLY when *project_id* is itself a registered
+    project (``registry.is_known(project_id)``).  A cross-repo deliverable is a
+    relationship between two KNOWN projects (e.g. reify → dark_factory), not an
+    open door for any namespace to declare another project's files.  An
+    UNREGISTERED filer whose files are all foreign therefore returns ``None``
+    here and falls through to the :func:`check_files_for_scope` hard reject,
+    preserving task-2206's anti-bypass guard.
+
+    Distinct from :func:`check_files_for_scope`, which rejects on ANY foreign
+    file: here the submission must be ENTIRELY foreign under a SINGLE owner,
+    with NO locally-owned file, before it qualifies.  Reuses
+    :meth:`ProjectPrefixRegistry.project_for_path` exactly as
+    ``check_files_for_scope`` does; files with no registered owner
+    (``project_for_path`` returns ``None``) are neutral — they neither block
+    nor establish cross-repo (conservative, matching
+    :func:`_aggregate_owner_mismatches`).
+
+    Returns ``None`` when the registry/*files* are empty, when the FILER
+    (*project_id*) is not a registered project, when ANY file is owned by
+    *project_id* (a genuine same-repo or mixed scope, left to
+    ``check_files_for_scope``'s hard-reject), when no file is foreign, or when
+    foreign files span more than one owner.
+    """
+    if not registry or not files:
+        return None
+    if not registry.is_known(project_id):
+        # Unregistered filer → task-2206 anti-bypass preserved; a cross-repo
+        # deliverable is a relationship between two REGISTERED projects, not a
+        # blanket allowance for any namespace to declare foreign files.
+        return None
+    foreign_owners: set[str] = set()
+    first_owner: str | None = None
+    for f in files:
+        owner = registry.project_for_path(f)
+        if owner is None:
+            continue  # unowned → neutral, never grounds for classification
+        if owner == project_id:
+            return None  # a locally-owned file → not a pure cross-repo deliverable
+        if first_owner is None:
+            first_owner = owner
+        foreign_owners.add(owner)
+    # len 0 (no foreign file) or >1 (spans multiple owners) → not cross-repo.
+    if len(foreign_owners) != 1:
+        return None
+    return first_owner
+
+
 def is_routing_override(routing_override_reason: str | None) -> bool:
     """Return True when *routing_override_reason* constitutes a deliberate bypass.
 

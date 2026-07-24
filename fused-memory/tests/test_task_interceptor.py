@@ -6455,7 +6455,16 @@ class TestSubmitTaskGuardrailMultiProject:
     ):
         """metadata.files point at another project's tree — FILES-certain is
         a hard reject even though the prose is clean: no ticket row is
-        persisted and taskmaster.add_task is never called."""
+        persisted and taskmaster.add_task is never called.
+
+        Repointed (task 3004 / esc-3004 NARROW decision): an ALL-foreign
+        single-owner file set from a REGISTERED filer ('reify') is now an
+        allowed+tagged cross-repo deliverable (see
+        TestSubmitTaskCrossRepoDeliverable), so the reject is driven by a
+        MIXED local+foreign set (a reify-owned 'crates/' file + a foreign
+        dark_factory file), which is NOT all-foreign and stays a hard reject.
+        The offending foreign path is still the only entry in matched_paths.
+        """
         interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
 
         try:
@@ -6463,7 +6472,7 @@ class TestSubmitTaskGuardrailMultiProject:
                 project_root=str(tmp_path / 'reify'),
                 title='Generic title, no prose hit',
                 description='nothing project-specific here',
-                metadata={'files': ['fused-memory/src/x.py']},
+                metadata={'files': ['crates/local_widget.rs', 'fused-memory/src/x.py']},
             )
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
@@ -6483,6 +6492,163 @@ class TestSubmitTaskGuardrailMultiProject:
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
 
+        taskmaster.add_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 3004: cross-repo deliverable — all-foreign files are ALLOWED + TAGGED
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitTaskCrossRepoDeliverable:
+    """End-to-end coverage of the cross-repo deliverable tagging through the
+    real ``submit_task`` persistence path.
+
+    A task filed under one project whose ``metadata.files`` are ALL owned by a
+    single OTHER project (the reify-task 5308 shape) is not a scope error — its
+    own branch is legitimately empty because the deliverable lands on the other
+    project's branch.  The interceptor ALLOWS it and tags the outgoing metadata
+    ``cross_repo=True`` + ``cross_repo_project=<owner>`` so the orchestrator
+    pre-merge gate routes it to ``OutcomeKind.plan_files_cross_repo``.  A
+    partial/mixed foreign submission stays a hard reject (task 2206 preserved).
+    """
+
+    @staticmethod
+    def _reify_df_registry(tmp_path):
+        """Reify (crates/) + dark-factory (orchestrator/) — DF uniquely owns
+        'orchestrator/' (reify lacks it), so no collision."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        return ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_foreign_files_allowed_and_tagged_cross_repo(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A reify-filed task whose metadata.files are ALL dark_factory paths
+        (the 5308 shape) is ALLOWED and TAGGED cross_repo=True +
+        cross_repo_project='dark_factory' on the persisted blob."""
+        interceptor_with_store._prefix_registry = self._reify_df_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Cross-repo deliverable landing in dark_factory',
+                description='Deliverable lands on the DF branch; this branch is empty',
+                metadata={'files': [
+                    'orchestrator/src/orchestrator/offline_lane.py',
+                    'orchestrator/tests/test_offline_lane.py',
+                ]},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, f'Expected no error, got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_ ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        assert meta.get('cross_repo') is True, (
+            f'Expected cross_repo=True in blob metadata: {blob!r}'
+        )
+        assert meta.get('cross_repo_project') == 'dark_factory', (
+            f'Expected cross_repo_project=dark_factory: {blob!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_local_and_foreign_still_rejected_not_tagged(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A task mixing a local reify file with a foreign dark_factory file is
+        STILL a scope error: the existing FILES-certain hard reject fires,
+        nothing is tagged, and no ticket is persisted."""
+        interceptor_with_store._prefix_registry = self._reify_df_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Generic title, no prose hit',
+                description='nothing project-specific here',
+                metadata={'files': [
+                    'crates/widget.rs',
+                    'orchestrator/src/x.py',
+                ]},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+        taskmaster.add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unregistered_filer_all_foreign_still_rejected_not_tagged(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """FILER-REGISTRATION boundary (task 3004 / esc-3004 NARROW decision):
+        an UNREGISTERED filer whose metadata.files are ALL foreign under a
+        single owner is NOT a cross-repo deliverable — it is STILL a hard
+        scope reject (task-2206 anti-bypass preserved), NOT tagged cross_repo,
+        and NOT persisted.
+
+        The registry knows only 'reify' and 'dark_factory'; filing under an
+        'outsider' project (basename → unregistered project_id) with the exact
+        same all-dark_factory file set that IS allowed+tagged for the
+        registered 'reify' filer must be rejected here. This pins the narrow
+        boundary so a future refactor cannot silently drift the allow+tag path
+        to a filer-agnostic (BROAD) classifier.
+        """
+        interceptor_with_store._prefix_registry = self._reify_df_registry(tmp_path)
+        (tmp_path / 'outsider').mkdir()
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'outsider'),
+                title='Unregistered filer declaring all dark_factory files',
+                description='no prose hit',
+                metadata={'files': [
+                    'orchestrator/src/orchestrator/offline_lane.py',
+                    'orchestrator/tests/test_offline_lane.py',
+                ]},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation for unregistered filer, '
+            f'got: {result}'
+        )
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
         taskmaster.add_task.assert_not_called()
 
 
@@ -7008,6 +7174,14 @@ class TestFilesCertainScopeCheck:
         interceptor,
         tmp_path,
     ):
+        # Repointed (task 3004 / esc-3004 NARROW decision): the ALL-foreign
+        # single-owner shape from a REGISTERED filer ('reify') is now a
+        # legitimate cross-repo deliverable that is allowed+tagged (covered by
+        # TestSubmitTaskCrossRepoDeliverable), not a hard reject. This test's
+        # invariant — "a genuine scope error hard-rejects + escalates" — is
+        # preserved by driving it with a MIXED local+foreign file set (one
+        # reify-owned 'crates/' file + one foreign dark_factory file), which is
+        # NOT all-foreign and so still fails check_files_for_scope.
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
@@ -7032,7 +7206,10 @@ class TestFilesCertainScopeCheck:
         result = await interceptor._path_guard_or_skip(
             {
                 'title': 'Generic title, no prose hit',
-                'metadata': {'files': ['fused-memory/src/x.py']},
+                'metadata': {'files': [
+                    'crates/local_widget.rs',
+                    'fused-memory/src/x.py',
+                ]},
             },
             str(tmp_path / 'reify'),
             'reify',
@@ -7251,6 +7428,14 @@ class TestMultiProjectRoutingWiring:
         metadata.files owner-mismatch — prose hits are now a non-rejecting
         advisory, so only a FILES-certain mismatch still triggers a hard
         reject + escalation.
+
+        Re-repointed (task 3004 / esc-3004 NARROW decision): the ALL-foreign
+        single-owner shape from a REGISTERED filer is now an allowed+tagged
+        cross-repo deliverable, so the reject is driven by a MIXED
+        local+foreign file set (one reify-owned 'crates/' file + one foreign
+        dark_factory file). The matched_paths still carry ONLY the foreign
+        entry (the local file is owned by the filer and skipped), so the
+        assertions below are unchanged.
         """
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
@@ -7282,7 +7467,7 @@ class TestMultiProjectRoutingWiring:
         result = await interceptor._path_guard_or_skip(
             {
                 'title': 'Generic title, no prose hit',
-                'metadata': {'files': ['fused-memory/x.py']},
+                'metadata': {'files': ['crates/widget.rs', 'fused-memory/x.py']},
             },
             str(tmp_path / 'reify'),
             'reify',

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import posixpath
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
@@ -89,6 +90,22 @@ the branch's history (``base..HEAD``) doesn't touch them, the implementation
 hasn't actually delivered against the plan — short-circuit straight to L1
 without involving the steward (mutating plan.json to silence the gate
 would defeat its purpose)."""
+
+
+CROSS_REPO_DELIVERABLE_REASON_PREFIX = 'Cross-repo deliverable'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the pre-merge
+Decision-1 gate recognizes a *cross-repo deliverable* — a task whose declared
+plan files ALL belong to a different project.  The reify-task 5308 shape: the
+task's branch is legitimately EMPTY because the deliverable lands on the other
+project's branch, so the ``base..HEAD`` history touches none of the declared
+(foreign) files.  Rather than false-flag this as
+``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX`` (which would force the architect
+through a dishonest narrowing pass — drop = falsify provenance, confirm =
+mislabel complete work — and escalate straight to a human), the workflow
+short-circuits to the honest ``OutcomeKind.plan_files_cross_repo`` terminal
+outcome on the NORMAL ladder (``category='cross_repo_deliverable'``,
+``suggested_action='verify_external_landing'``) so triage can verify the
+external landing instead of re-running the empty branch."""
 
 
 POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX = 'Post-merge content equivalence failed'
@@ -944,6 +961,53 @@ async def _check_plan_targets_in_tree(
             task_id or '<unknown>', merge_commit_sha, task_head, real_drops,
         )
     return DropGuardResult(dropped=real_drops)
+
+
+def is_cross_repo_task(
+    plan_files: list[str],
+    project_root: Path,
+    metadata: dict | None,
+) -> bool:
+    """Return True iff a task's declared files identify a *cross-repo deliverable*.
+
+    A cross-repo deliverable is a task whose plan files ALL belong to a
+    *different* project, so its own branch is legitimately empty (the reify
+    task 5308 shape).  Recognizing it lets the pre-merge Decision-1 gate route
+    to the honest ``OutcomeKind.plan_files_cross_repo`` outcome instead of
+    false-flagging the empty branch as "plan files not touched".
+
+    An orchestrator owns exactly one ``project_root`` and has NO cross-project
+    registry, so it cannot classify a *relative* foreign path on its own.  Two
+    signals are therefore honored:
+
+    * ``metadata['cross_repo']`` truthy — the marker set by the fused-memory
+      submit path when it recognizes (via its ``ProjectPrefixRegistry``) that
+      every declared file is owned by one other project.  This covers the
+      relative-foreign 5308 shape the orchestrator cannot see unaided.
+    * Every declared entry is an ABSOLUTE path resolving OUTSIDE
+      ``project_root`` — the absolute-foreign shape, which the orchestrator can
+      classify by path containment alone (no registry needed).
+
+    Returns False for an empty ``plan_files`` (evaluated first, before the
+    marker), for any mix of foreign + local/relative entries, and when a
+    declared absolute path resolves INSIDE ``project_root``.  Conservative by
+    design: a genuine, still-undelivered NEW local file is a relative in-tree
+    path with no marker, so it is never mistaken for cross-repo.
+    """
+    if not plan_files:
+        return False
+    if metadata and metadata.get('cross_repo'):
+        return True
+    entries = [entry for entry in plan_files if entry]
+    if not entries:
+        return False
+    root = project_root.resolve()
+    for entry in entries:
+        if not os.path.isabs(entry):
+            return False
+        if Path(entry).resolve().is_relative_to(root):
+            return False
+    return True
 
 
 def _normalize_plan_path(entry: str) -> str:

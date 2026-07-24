@@ -330,6 +330,103 @@ class TestSubmitToMergeQueuePlanTightening:
         assert len(invocations) == 1
 
 
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueCrossRepo:
+    """Cross-repo deliverable short-circuit inside ``_submit_to_merge_queue``.
+
+    A task whose declared plan files ALL belong to a *different* project (the
+    reify-task 5308 shape) has a legitimately EMPTY branch.  The gate must NOT
+    false-flag it as ``plan_files_not_touched`` or drag the architect through
+    ``_try_narrow_plan``; it short-circuits to the honest
+    ``plan_files_cross_repo`` terminal outcome on the NORMAL ladder
+    (``category='cross_repo_deliverable'``, no forced ``escalate_to_human``).
+    """
+
+    def _wire(self, wf, monkeypatch):
+        """Shared stubs: capture emits, forbid narrowing, stub _mark_blocked.
+
+        Also stubs the not-touched gate so that WITHOUT the cross-repo
+        short-circuit the flow deterministically reaches the
+        ``plan_files_not_touched`` escalation (the RED behaviour), giving a
+        clean assertion failure rather than an ``await MagicMock`` crash.
+        """
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_head_sha\n', ''
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        async def fake_check(*a, **k):  # noqa: ARG001
+            return PlanFilesTouchedResult(not_touched=['__unreached__'])
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            fake_check,
+        )
+
+        emits: list = []
+
+        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
+            emits.append(outcome)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
+        )
+
+        narrow = AsyncMock(return_value=False)
+        wf._try_narrow_plan = narrow  # type: ignore[method-assign]
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        return emits, narrow, mark_blocked
+
+    def _assert_cross_repo(self, outcome, emits, narrow, mark_blocked):
+        from orchestrator.merge_gates import CROSS_REPO_DELIVERABLE_REASON_PREFIX
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_cross_repo' in emits
+        assert 'plan_files_not_touched' not in emits
+        narrow.assert_not_awaited()
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        reason = args[0] if args else kwargs['reason']
+        assert reason.startswith(CROSS_REPO_DELIVERABLE_REASON_PREFIX)
+        assert kwargs.get('category') == 'cross_repo_deliverable'
+        assert kwargs.get('suggested_action') == 'verify_external_landing'
+        assert kwargs.get('escalate_to_human') is not True
+
+    async def test_marker_relative_foreign_short_circuits(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(a) MARKER: metadata.cross_repo + relative DF paths (5308 shape)."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.task['metadata'] = {
+            'cross_repo': True,
+            'external_deps': ['dark_factory:5308'],
+        }
+        wf.plan = {'files': [
+            'orchestrator/src/orchestrator/offline_lane.py',
+            'orchestrator/tests/test_offline_lane.py',
+        ]}
+        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        self._assert_cross_repo(outcome, emits, narrow, mark_blocked)
+
+    async def test_absolute_foreign_no_marker_short_circuits(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(b) ABSOLUTE-FOREIGN: no marker; every file absolute + OUTSIDE
+        project_root (config.project_root is tmp_path/'proj')."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        foreign = tmp_path / 'other_repo'
+        wf.plan = {'files': [
+            str(foreign / 'src' / 'x.py'),
+            str(foreign / 'tests' / 'test_x.py'),
+        ]}
+        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        self._assert_cross_repo(outcome, emits, narrow, mark_blocked)
+
+
 _PASSING_VERIFY_RESULT = VerifyResult(
     passed=True,
     test_output='',
