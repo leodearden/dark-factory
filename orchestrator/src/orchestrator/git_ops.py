@@ -325,6 +325,25 @@ PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 # _SEED_WARM_LANE_LOCK_WAIT_SECS below.
 _MERGE_VERIFY_LEASE_WAIT_SECS: float = 300.0
 
+# Bounded-wait timeout (seconds) for GitOps.task_verify_lease()'s
+# acquire_merge_verify_flock() call — the warm-lane consumer-hold (task 3027).
+# task_verify_lease holds the SHARED <lane_dir>.lock across a task-lane verify
+# so a concurrent reify warm-lane-gc.sh reclaim's per-lane `flock -n` refuses
+# (reify task 5354, the paired acquire-time guard), preventing an in-flight
+# nextest's test binaries from being reclaimed out from under it (esc-5236-7 /
+# esc-5275-10). A SEPARATE constant from _MERGE_VERIFY_LEASE_WAIT_SECS keeps the
+# task-lane wait independently tunable. Unlike the merge lease this one fails
+# OPEN on timeout (WARNING + proceed unprotected, see task_verify_lease), so
+# this window is only how long a task verify patiently waits for a racing
+# reseed to finish before proceeding anyway — a modest 300s (5 min) comfortably
+# outlasts every SHORT legitimate holder (a reseed/thin/gc — seconds to low
+# minutes) so the common case takes the hold, while never blocking the verify.
+# The acquire runs OFF the event loop via asyncio.to_thread (see
+# task_verify_lease). A plain module constant (no config knob, no env override),
+# monkeypatchable in tests via the module global, mirroring the sibling
+# _MERGE_VERIFY_LEASE_WAIT_SECS above.
+_TASK_VERIFY_LEASE_WAIT_SECS: float = 300.0
+
 # Bounded-wait timeout (seconds) for GitOps._seed_warm_lane()'s outer
 # <lane_dir>.lock flock -x (task 2599 amendment). Seeding runs on the
 # latency-sensitive warm-lane acquisition hot path; a plain unbounded
@@ -2217,6 +2236,54 @@ class GitOps:
             yield
         finally:
             remove_lock_holder_pgid(self.worktree_base)
+            release_merge_verify_flock(fd)
+
+    @contextlib.asynccontextmanager
+    async def task_verify_lease(self, lane_dir: Path):
+        """Async context manager holding the warm-lane consumer-hold across a
+        task-lane verify window (task 3027).
+
+        Holds the SHARED ``<lane_dir>.lock``
+        (:func:`~orchestrator.verify_cancel.lane_lock_path` of *lane_dir*, the
+        task's warm lane) for the duration of the block — the SAME per-lane
+        inode reify's ``seed-warm-lane.sh`` / ``thin-warm-lane.sh`` /
+        ``warm-lane-gc.sh`` and DF's own :meth:`_seed_warm_lane` flock. Holding
+        it across the task-lane verify makes a concurrent reify
+        ``warm-lane-gc.sh reclaim``'s per-lane ``flock -n`` REFUSE/queue (reify
+        task 5354, the paired reify-side acquire-time guard) rather than reseed
+        a lane whose LIVE consumer is mid-nextest and delete its in-flight test
+        binaries out from under it (esc-5236-7 / esc-5275-10, the exit-127
+        vanished-artifact storm this closes).
+
+        Deliberately DIFFERENT from :meth:`merge_verify_lease` in two ways:
+
+        * **flock-ONLY** — it does NOT write the merge-verify holder-pgid
+          rendezvous (:func:`write_lock_holder_pgid`). That single GLOBAL key
+          (keyed to :attr:`worktree_base`) is read fail-CLOSED by
+          :meth:`reset_persistent_merge_worktree` and by
+          :meth:`_run_warm_lane_gc_reclaim`; many concurrent task-lane verifies
+          would stomp it (one lease's finally clearing it while others still
+          hold) and would spuriously gate merge-lane resets/GC. The per-lane
+          flock alone is the cross-process mechanism reify consults, so the
+          rendezvous stays single-purpose to the merge lane.
+        * **fail-OPEN on contention** — added in step-4 (contended-flock
+          handling below is the minimal happy-path form for now).
+
+        No change is made to :meth:`_run_warm_lane_gc_reclaim`: it honors the
+        hold transitively by invoking reify's ``warm-lane-gc.sh``, which does
+        the per-lane ``flock -n`` check itself.
+        """
+        lock_path = lane_lock_path(lane_dir)
+        # Acquire OFF the event loop: the bounded wait is minutes
+        # (_TASK_VERIFY_LEASE_WAIT_SECS) and acquire_merge_verify_flock is a
+        # synchronous time.sleep poll, so an inline call would freeze the whole
+        # orchestrator (mirrors merge_verify_lease's off-thread acquire).
+        fd = await asyncio.to_thread(
+            acquire_merge_verify_flock, lock_path, _TASK_VERIFY_LEASE_WAIT_SECS,
+        )
+        try:
+            yield
+        finally:
             release_merge_verify_flock(fd)
 
     async def _is_registered_worktree(self, path: Path) -> bool:
