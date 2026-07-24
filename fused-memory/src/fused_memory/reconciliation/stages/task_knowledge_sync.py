@@ -2806,6 +2806,20 @@ class TaskKnowledgeSync(BaseStage):
             self.memory, self.project_id, run_id,
         )
 
+        # Mem0-only flag_for_stage2 relay pool (task 2966): its only writer is
+        # the Stage-1 flag_dedup/LLM add_memory path, which writes solely to
+        # Mem0 (metadata.flag_for_stage2=true) — no code path upserts a
+        # flag_for_stage2 row into the recon_ledger, so ReconLedgerStore.gc()
+        # structurally cannot reach this pool (the same declared-vs-actual
+        # gap as stage2_persistence_marker above). Runs unconditionally every
+        # cycle, per-project, alongside the three sibling GC passes; explicit
+        # value so downstream consumers never need a .get(..., 0) fallback.
+        report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                self.memory, self.project_id, run_id,
+            )
+        )
+
         # Entity-standing-decision growth-freshness sweep (task 2899 ζ) — a
         # sibling of the marker sweeps above, run at the Stage-2 TAIL (Stage 3 is
         # read-only by design; PRD decision 9). Corroborates each ACTIVE standing
