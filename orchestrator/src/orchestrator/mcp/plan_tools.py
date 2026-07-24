@@ -492,19 +492,28 @@ def _resolve_main_sha(worktree: Path) -> str:
 
 
 def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
-    """Return True iff *sha* resolves to an object in the repo at *worktree*.
+    """Return True iff *sha* is reachable from HEAD in the repo at *worktree*.
 
-    A real ``git cat-file -e <sha>`` existence check (returncode 0 == exists),
-    run in the worktree cwd. This is the machine-checked corroborate-before-
-    acting guard for ``mark_step_committed`` (INV-1/INV-3): the architect must
-    be UNABLE to pre-satisfy a plan step against a commit that does not resolve
-    on the current branch. It deliberately does NOT prove the step's semantics —
-    VERIFY remains the gate. Mirrors :func:`_resolve_main_sha`'s subprocess shape
-    (cwd=worktree, timeout=10, OSError/SubprocessError -> safe ``False``).
+    A real ``git merge-base --is-ancestor <sha> HEAD`` reachability check
+    (returncode 0 == *sha* is an ancestor of — or equal to — HEAD), run in the
+    worktree cwd. This is the machine-checked corroborate-before-acting guard
+    for ``mark_step_committed`` (INV-1/INV-3): the architect must be UNABLE to
+    pre-satisfy a plan step against a commit that does not resolve on the
+    current branch.
+
+    Note we check reachability (``--is-ancestor``), NOT mere object existence
+    (``git cat-file -e``): in this repo's shared/multi-worktree object store a
+    commit from another task's branch — or a dangling/unreachable object —
+    exists in the object DB yet is NOT on this branch. ``--is-ancestor`` returns
+    non-zero (exit 1 for a real-but-unreachable commit, 128 for a bad object)
+    for both, so the guard matches its advertised on-branch contract. It
+    deliberately does NOT prove the step's semantics — VERIFY remains the gate.
+    Mirrors :func:`_resolve_main_sha`'s subprocess shape (cwd=worktree,
+    timeout=10, OSError/SubprocessError -> safe ``False``).
     """
     try:
         result = subprocess.run(
-            ['git', 'cat-file', '-e', sha],
+            ['git', 'merge-base', '--is-ancestor', sha, 'HEAD'],
             cwd=str(worktree),
             capture_output=True,
             text=True,
@@ -512,7 +521,9 @@ def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
         )
         return result.returncode == 0
     except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning('Failed git cat-file -e for sha %r: %s', sha, exc)
+        logger.warning(
+            'Failed git merge-base --is-ancestor for sha %r: %s', sha, exc
+        )
         return False
 
 
@@ -523,12 +534,21 @@ def _mark_step_committed(
 ) -> dict[str, Any]:
     """Pre-satisfy a plan step/prerequisite at AUTHORING time.
 
-    Guards on a real on-branch existence check for *sha* (corroborate-before-
+    Guards on a real on-branch reachability check for *sha* (corroborate-before-
     acting) before delegating the status/commit/description-tag mutation to
     :meth:`TaskArtifacts.mark_step_committed`. Returns the Contract A1 shapes:
     ``{'ok': True, 'step_id', 'status': 'done'}`` on success (``status`` is the
     step's NEW status), and ``{'ok': False, 'status': 'error', 'message': ...}``
     on a non-resolving sha or an unknown ``step_id``.
+
+    NOTE: this envelope (``ok`` + ``status`` = the step's new status) is the
+    Contract A1 shape and DELIBERATELY differs from the sibling
+    :func:`_mark_step_done` (``status: 'ok'|'error'`` + ``new_status``). A1
+    fixes ``{ok, step_id, status}`` for the re-invoked architect's all-committed
+    path; don't "align" the two — the divergence is contractual, not an
+    oversight. On error we keep the repo-wide ``{'status':'error','message'}``
+    convention (so ``status=='error'``/substring assertions hold) and add
+    ``ok:False`` so callers can branch uniformly on ``ok``.
     """
     if not _sha_exists_on_branch(artifacts.worktree, sha):
         return {
@@ -536,8 +556,9 @@ def _mark_step_committed(
             'status': 'error',
             'message': (
                 f'sha {sha!r} does not resolve on the current branch '
-                '(git cat-file -e failed) — cannot pre-satisfy a step '
-                'against a non-existent commit'
+                '(not reachable from HEAD — git merge-base --is-ancestor '
+                'failed) — cannot pre-satisfy a step against a commit that '
+                'is not on this branch'
             ),
         }
     if not artifacts.mark_step_committed(step_id, sha):
@@ -672,11 +693,13 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         an all-satisfied plan so the EXECUTE loop becomes a total no-op and the
         branch flows PLAN → VERIFY → REVIEW → MERGE with zero implementer turns.
 
-        The *sha* MUST resolve on the current branch — a real ``git cat-file -e``
-        guard refuses a non-existent commit (corroborate-before-acting). This
-        does NOT prove the step's semantics: VERIFY remains the gate, and a
-        falsely pre-satisfied step surfaces as a VERIFY failure, never a silent
-        skip. Idempotent per ``(step_id, sha)``.
+        The *sha* MUST resolve on the current branch — a real ``git merge-base
+        --is-ancestor <sha> HEAD`` reachability guard refuses a commit that is
+        not on this branch (corroborate-before-acting; mere existence in a
+        shared object store is not enough). This does NOT prove the step's
+        semantics: VERIFY remains the gate, and a falsely pre-satisfied step
+        surfaces as a VERIFY failure, never a silent skip. Idempotent per
+        ``(step_id, sha)``.
 
         Args:
             step_id: The step or prerequisite ID (e.g. "step-1", "pre-1").
