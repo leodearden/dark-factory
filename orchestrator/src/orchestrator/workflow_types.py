@@ -276,8 +276,25 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # ── Warm-lane requeue family ─────────────────────────────────────
         # counts_against_requeue_cap is declared ONCE per subclass here —
         # the single source of truth replacing the buried NOTE at
-        # workflow.py ~2278-2300 (EXHAUSTED is genuine backpressure and
-        # counts; DISK_PRESSURE/HARD_DOWN are transient infra and do not).
+        # workflow.py ~2278-2300. EXHAUSTED/DISK_PRESSURE/HARD_DOWN/
+        # SOFT_PRESSURE all count=False: they are shared-resource /
+        # capacity signals, NOT a fault of the requeued task, so burning
+        # its per-task requeue cap punishes the wrong party.
+        #
+        # EXHAUSTED was flipped True->False by task 2988 (PRD ε / W3): the
+        # 2026-07-22 incident showed pool exhaustion can mean a capacity
+        # LEAK (lanes stuck assigned), and treating it as "genuine
+        # backpressure that counts" burned every waiting task's requeue cap
+        # -> retry-cap escalation -> reblock-guard L2 storm. Exhaustion is
+        # now observed pool-GLOBALLY at the GitOps acquire chokepoint: a
+        # deduped, born-at-L2 structural-exhaustion escalation (fired after
+        # N consecutive EXHAUSTED acquires) is the SOLE loud signal, so
+        # EXHAUSTED joins its transient siblings as non-counting.
+        #
+        # WarmLaneReseedContaminated remains count=True — it is a per-task
+        # DATA-INTEGRITY fault (a lane retained a prior occupant's commits),
+        # not a shared-resource signal, so a persistent contamination SHOULD
+        # trip that task's requeue-cap escalation.
         # The WarmLaneRequeue base row exists for BD-2 completeness (it is
         # itself one of git_ops.py's exported types) — MRO resolution means
         # a real subclass instance always matches its OWN row first, so this
@@ -307,7 +324,11 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             category=FailureCategory.NONE,
             escalate_to_human=False,
             requeue_kind=RequeueKind.REQUEUE,
-            counts_against_requeue_cap=True,
+            # Task 2988 (PRD ε / W3): flipped True->False — see the family
+            # comment above. Pool exhaustion no longer burns the per-task
+            # requeue cap; a pool-level structural-exhaustion L2 is the loud
+            # signal instead.
+            counts_against_requeue_cap=False,
             reason_prefix='warm_lane_pool_exhausted',
             block_class=BlockClass.AGENT_FAILURE,
         ),
