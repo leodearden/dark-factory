@@ -77,6 +77,10 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
         (LaneState.ASSIGNED, LaneState.IN_USE),
         (LaneState.IN_USE, LaneState.RELEASED),
         (LaneState.ASSIGNED, LaneState.RELEASED),
+        # recycle a quarantined slot back into service after its bad worktree
+        # is relocated to quarantine_base — the ONE sanctioned exit from
+        # QUARANTINED; every other QUARANTINED->X stays illegal.
+        (LaneState.QUARANTINED, LaneState.RELEASED),
     }
     | {(origin, LaneState.QUARANTINED) for origin in [*list(LaneState), None]}
 )
