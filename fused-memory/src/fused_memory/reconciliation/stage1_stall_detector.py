@@ -28,6 +28,16 @@ Escalation category note:
   ``reconciliation_stale_flag`` category to allow filtering on each
   independently.
 
+  A second, independent Stage 1 category ``reconciliation_stale_gate_backlog``
+  (task 3017) is filed by ``maybe_escalate_stalled_gate_backlog`` when a
+  blocked human-decision gate task's ``metadata.gate_escalated_at`` stamp has
+  aged past ``STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`` (48h).  It is a
+  deterministic age check — no Mem0 marker accumulation, no LLM finding — and
+  is deduped per-task via ``has_open_l1(task_id, category=...)`` so it neither
+  suppresses nor is suppressed by the ``reconciliation_stale_human_operator``
+  path or the DeterministicRunner's born-at-L2 ``milestone_gate`` escalation
+  (distinct level/category).
+
 Stall marker accumulation:
   ``stage1_human_operator_stall_marker`` memories accumulate indefinitely —
   there is no cleanup hook tied to task resolution or escalation resolution.
@@ -58,6 +68,7 @@ Dedup interaction:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from fused_memory.utils.async_utils import gather_collect
 
@@ -79,6 +90,18 @@ a level-1 escalation is submitted."""
 _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE = 'stage1_human_operator_stall_marker'
 """Mem0 metadata ``source`` tag used to accumulate per-task stall-cycle
 markers.  Kept private to this module — callers use the public helpers."""
+
+STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS: float = 48 * 3600
+"""Age (in seconds) a blocked human-decision gate task's
+``metadata.gate_escalated_at`` stamp may reach before a level-1
+``reconciliation_stale_gate_backlog`` escalation is filed (task 3017).  A
+module constant, mirroring ``STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD`` (not
+config)."""
+
+_GATE_BACKLOG_ESCALATION_CATEGORY = 'reconciliation_stale_gate_backlog'
+"""``Escalation.category`` used for the deterministic gate-backlog age check.
+Kept distinct from ``reconciliation_stale_human_operator`` so the two Stage 1
+aging signals dedup and filter independently (task 3017)."""
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -113,6 +136,43 @@ def extract_human_operator_task_ids(flags: list[dict]) -> list[str]:
             seen.add(tid)
             result.append(tid)
     return result
+
+
+def gate_escalated_age_secs(metadata: dict | None, *, now: datetime) -> float | None:
+    """Age (in seconds) of ``metadata['gate_escalated_at']``, or ``None``.
+
+    ``gate_escalated_at`` is a DeterministicRunner idempotency stamp written
+    whenever a born-at-L2 human-decision gate is filed (blessed key
+    ``shared/src/shared/task_metadata.py``).  Its age is the unambiguous
+    "a human decision has been pending this long" signal (task 3017).
+
+    Returns ``None`` — never raises — when:
+
+    - *metadata* is not a ``dict``;
+    - ``metadata['operational_mode']`` (default ``'gate'`` when absent) is not
+      ``'gate'`` (e.g. ``'llm'`` routes to an agent, not a human gate);
+    - ``gate_escalated_at`` is missing, ``None``, empty, or not a ``str``;
+    - ``gate_escalated_at`` is not a parseable ISO-8601 timestamp
+      (``ValueError`` swallowed);
+    - subtracting an aware *now* from a naive parsed stamp raises
+      ``TypeError`` (swallowed) — a naive stamp yields ``None``.
+
+    The helper does NOT clamp: a future ``gate_escalated_at`` returns a
+    negative age.  Swallowing parse/subtraction errors upholds the module's
+    fail-soft contract so one malformed stamp never aborts the Stage 1 pass.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get('operational_mode', 'gate') != 'gate':
+        return None
+    raw = metadata.get('gate_escalated_at')
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+        return (now - parsed).total_seconds()
+    except (ValueError, TypeError):
+        return None
 
 
 # ── Async I/O helpers ────────────────────────────────────────────────────────
