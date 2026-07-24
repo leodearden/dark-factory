@@ -18,6 +18,7 @@ exercised here.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from orchestrator.agents.write_set import WriteSet
@@ -95,3 +96,42 @@ class TestEmitSandboxApplied:
         write_set = _make_write_set()
         # Must not raise when there is no event store wired up.
         wf._emit_sandbox_applied('implementer', 'landlock', write_set)
+
+
+class TestEnsureSandboxDirs:
+    """_ensure_sandbox_dirs pre-creates the load-bearing claude_fleet carve-out
+    OUTSIDE the sandbox before dispatch (task 2996). On success the dir exists
+    for both backends to grant; on failure it WARNs LOUDLY with the task_id +
+    fleet path (loud-over-silent) and continues — best-effort, never raising."""
+
+    def test_creates_claude_fleet_dir(self, tmp_path):
+        # (a) Happy path: the claude_fleet dir is materialized and no exception
+        # escapes.
+        wf = _make_bare_workflow()
+        claude_fleet = tmp_path / '.claude' / 'fleet'
+        write_set = _make_write_set(claude_fleet=claude_fleet)
+        assert not claude_fleet.exists()
+
+        wf._ensure_sandbox_dirs(write_set)
+
+        assert claude_fleet.is_dir()
+
+    def test_failure_warns_loudly_with_task_id_and_path(self, tmp_path, caplog):
+        # (b) Failure path: a regular FILE cannot be a parent dir, so mkdir
+        # raises OSError and the helper returns False. _ensure_sandbox_dirs must
+        # NOT raise (best-effort) and must emit a WARNING naming BOTH the task_id
+        # (_make_bare_workflow's default '2909') and the fleet path.
+        wf = _make_bare_workflow()
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('i am a regular file, not a directory\n')
+        claude_fleet = blocker / 'fleet'
+        write_set = _make_write_set(claude_fleet=claude_fleet)
+
+        with caplog.at_level(logging.WARNING):
+            wf._ensure_sandbox_dirs(write_set)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, 'expected a loud WARNING when pre-creation fails'
+        rendered = ' '.join(r.getMessage() for r in warnings)
+        assert '2909' in rendered
+        assert str(claude_fleet) in rendered
