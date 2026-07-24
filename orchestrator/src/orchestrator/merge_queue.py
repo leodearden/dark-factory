@@ -10520,6 +10520,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              never starve the heartbeat log.
           2. Delegates the fire/rate-limit/format/emit decision to the
              synchronous, clock-injectable :meth:`_maybe_log_queue_heartbeat`.
+          3. Delegates to the rate-limited, clock-injectable
+             :meth:`_maybe_reap_orphaned_merge_worktrees` (task 3018), the
+             steady-state counterpart to the startup-only orphan reap — this
+             is what bounds an audit-flagged leak's on-disk lifetime instead
+             of leaving it until the next restart.
 
         Any unexpected exception from either call is logged and swallowed so a
         heartbeat bug can never crash the worker.
@@ -10531,6 +10536,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._maybe_log_queue_heartbeat(time.time())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
+            await self._maybe_reap_orphaned_merge_worktrees(time.time())
 
     async def _reprobe_loop(self) -> None:
         """Periodically probe quarantined remote hosts and clear on recovery.
