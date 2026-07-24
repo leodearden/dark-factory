@@ -5,24 +5,39 @@ Covers:
 - TestTrackHumanOperatorStalls     (step-3/4)
 - TestComputeStalledTaskIds        (step-5/6)
 - TestMaybeEscalateStalledTasks    (step-7/8)
+
+Gate-backlog age check (task 3017):
+- TestGateBacklogConstants
+- TestGateEscalatedAgeSecs
+- TestExtractStalledGateBacklogTaskIds
+- TestMaybeEscalateStalledGateBacklog
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.reconciliation.stage1_stall_detector import (
+    _GATE_BACKLOG_ESCALATION_CATEGORY,
     _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
     STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD,
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
+    gate_escalated_age_secs,
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
+
+# A fixed, timezone-aware "now" for the gate-backlog age tests (task 3017).
+# gate_escalated_at values are built relative to this instant so the age
+# assertions are deterministic regardless of wall-clock time.
+_GATE_NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -502,3 +517,85 @@ class TestEscalationBinding:
                 sys.modules.pop('escalation.models', None)
             else:
                 sys.modules['escalation.models'] = esc_models_saved  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Gate-backlog age check — constants (task 3017)
+# ---------------------------------------------------------------------------
+
+
+class TestGateBacklogConstants:
+    """Assert the gate-backlog module-level constants have expected values."""
+
+    def test_threshold_secs_is_48h(self):
+        assert STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS == 48 * 3600
+
+    def test_escalation_category_value(self):
+        assert _GATE_BACKLOG_ESCALATION_CATEGORY == 'reconciliation_stale_gate_backlog'
+
+
+# ---------------------------------------------------------------------------
+# gate_escalated_age_secs (task 3017)
+# ---------------------------------------------------------------------------
+
+
+class TestGateEscalatedAgeSecs:
+    """gate_escalated_age_secs returns the age (secs) of metadata.gate_escalated_at.
+
+    Pure helper — never raises; returns None on any malformed / non-gate input.
+    ``now`` is injected so the age is deterministic.
+    """
+
+    def test_blocked_gate_metadata_returns_age(self):
+        """(a) operational_mode='gate', gate_escalated_at = now-49h → ~49*3600s."""
+        meta = {
+            'operational_mode': 'gate',
+            'gate_escalated_at': (_GATE_NOW - timedelta(hours=49)).isoformat(),
+        }
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age == pytest.approx(49 * 3600, abs=1.0)
+
+    def test_operational_mode_absent_treated_as_gate(self):
+        """(b) operational_mode absent → treated as 'gate' (returns an age)."""
+        meta = {'gate_escalated_at': (_GATE_NOW - timedelta(hours=10)).isoformat()}
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age == pytest.approx(10 * 3600, abs=1.0)
+
+    def test_operational_mode_llm_returns_none(self):
+        """(c) operational_mode='llm' → None (routes to an agent, not a human)."""
+        meta = {
+            'operational_mode': 'llm',
+            'gate_escalated_at': (_GATE_NOW - timedelta(hours=49)).isoformat(),
+        }
+        assert gate_escalated_age_secs(meta, now=_GATE_NOW) is None
+
+    def test_metadata_not_a_dict_returns_none(self):
+        """(d) metadata not a dict (None / str / int) → None, no raise."""
+        assert gate_escalated_age_secs(None, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs('str', now=_GATE_NOW) is None  # type: ignore[arg-type]
+        assert gate_escalated_age_secs(123, now=_GATE_NOW) is None  # type: ignore[arg-type]
+
+    def test_gate_escalated_at_missing_or_nonstr_returns_none(self):
+        """(e) gate_escalated_at missing / None / '' / non-str → None."""
+        assert gate_escalated_age_secs({'operational_mode': 'gate'}, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs({'gate_escalated_at': None}, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs({'gate_escalated_at': ''}, now=_GATE_NOW) is None
+        assert gate_escalated_age_secs({'gate_escalated_at': 123}, now=_GATE_NOW) is None
+
+    def test_unparseable_gate_escalated_at_returns_none(self):
+        """(f) unparseable ISO-8601 → None (ValueError swallowed)."""
+        assert gate_escalated_age_secs(
+            {'gate_escalated_at': 'not-a-date'}, now=_GATE_NOW
+        ) is None
+
+    def test_naive_gate_escalated_at_returns_none(self):
+        """(g) naive (tz-less) stamp → None (aware-vs-naive TypeError swallowed)."""
+        naive = datetime(2026, 7, 22, 12, 0, 0).isoformat()  # no tzinfo
+        assert gate_escalated_age_secs({'gate_escalated_at': naive}, now=_GATE_NOW) is None
+
+    def test_future_gate_escalated_at_returns_negative_age(self):
+        """(h) future stamp (now+2h) → negative age (helper does not clamp)."""
+        meta = {'gate_escalated_at': (_GATE_NOW + timedelta(hours=2)).isoformat()}
+        age = gate_escalated_age_secs(meta, now=_GATE_NOW)
+        assert age is not None
+        assert age == pytest.approx(-2 * 3600, abs=1.0)
