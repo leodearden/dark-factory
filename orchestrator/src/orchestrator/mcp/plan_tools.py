@@ -491,6 +491,64 @@ def _resolve_main_sha(worktree: Path) -> str:
         return ''
 
 
+def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
+    """Return True iff *sha* resolves to an object in the repo at *worktree*.
+
+    A real ``git cat-file -e <sha>`` existence check (returncode 0 == exists),
+    run in the worktree cwd. This is the machine-checked corroborate-before-
+    acting guard for ``mark_step_committed`` (INV-1/INV-3): the architect must
+    be UNABLE to pre-satisfy a plan step against a commit that does not resolve
+    on the current branch. It deliberately does NOT prove the step's semantics —
+    VERIFY remains the gate. Mirrors :func:`_resolve_main_sha`'s subprocess shape
+    (cwd=worktree, timeout=10, OSError/SubprocessError -> safe ``False``).
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'cat-file', '-e', sha],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning('Failed git cat-file -e for sha %r: %s', sha, exc)
+        return False
+
+
+def _mark_step_committed(
+    artifacts: TaskArtifacts,
+    step_id: str,
+    sha: str,
+) -> dict[str, Any]:
+    """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+    Guards on a real on-branch existence check for *sha* (corroborate-before-
+    acting) before delegating the status/commit/description-tag mutation to
+    :meth:`TaskArtifacts.mark_step_committed`. Returns the Contract A1 shapes:
+    ``{'ok': True, 'step_id', 'status': 'done'}`` on success (``status`` is the
+    step's NEW status), and ``{'ok': False, 'status': 'error', 'message': ...}``
+    on a non-resolving sha or an unknown ``step_id``.
+    """
+    if not _sha_exists_on_branch(artifacts.worktree, sha):
+        return {
+            'ok': False,
+            'status': 'error',
+            'message': (
+                f'sha {sha!r} does not resolve on the current branch '
+                '(git cat-file -e failed) — cannot pre-satisfy a step '
+                'against a non-existent commit'
+            ),
+        }
+    if not artifacts.mark_step_committed(step_id, sha):
+        return {
+            'ok': False,
+            'status': 'error',
+            'message': f'Step {step_id!r} not found in plan.',
+        }
+    return {'ok': True, 'step_id': step_id, 'status': 'done'}
+
+
 # ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
@@ -599,6 +657,33 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             commit_sha: The git commit SHA for this step's changes.
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
+
+    @mcp.tool()
+    def mark_step_committed(
+        step_id: str,
+        sha: str,
+    ) -> dict[str, Any]:
+        """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+        Marks the step ``done`` (and prepends a ``[COMMITTED <sha[:12]>]`` tag
+        to its description) WITHOUT an implementer turn. Use this ONLY when the
+        branch you are (re-)planning ALREADY carries the complete, committed,
+        green implementation of this step: a re-invoked architect can then emit
+        an all-satisfied plan so the EXECUTE loop becomes a total no-op and the
+        branch flows PLAN → VERIFY → REVIEW → MERGE with zero implementer turns.
+
+        The *sha* MUST resolve on the current branch — a real ``git cat-file -e``
+        guard refuses a non-existent commit (corroborate-before-acting). This
+        does NOT prove the step's semantics: VERIFY remains the gate, and a
+        falsely pre-satisfied step surfaces as a VERIFY failure, never a silent
+        skip. Idempotent per ``(step_id, sha)``.
+
+        Args:
+            step_id: The step or prerequisite ID (e.g. "step-1", "pre-1").
+            sha: The git commit SHA that already carries this step's work.
+                Must resolve on the current branch.
+        """
+        return _mark_step_committed(artifacts, step_id, sha)
 
     # --- Revalidation tools ---
 
