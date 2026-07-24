@@ -1178,7 +1178,7 @@ class TestCorroborationForTask:
     _STARTED = datetime(2026, 7, 23, 10, 0, 0, tzinfo=UTC)
 
     def test_default_heartbeat_ttl_is_ten_minutes(self):
-        assert DEFAULT_HEARTBEAT_TTL == timedelta(minutes=10)
+        assert timedelta(minutes=10) == DEFAULT_HEARTBEAT_TTL
 
     def test_fresh_heartbeat_true(self):
         task = {

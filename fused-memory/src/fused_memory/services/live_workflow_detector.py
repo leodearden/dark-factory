@@ -520,9 +520,7 @@ def _task_in_scheduler_holders_or_parks(
     if isinstance(parks, Mapping) and tid in {str(k) for k in parks}:
         return True
     holders = scheduler_state.get('current_holders')
-    if isinstance(holders, Mapping) and tid in {str(v) for v in holders.values()}:
-        return True
-    return False
+    return isinstance(holders, Mapping) and tid in {str(v) for v in holders.values()}
 
 
 def _routing_decided_after_restart(
