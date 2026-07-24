@@ -114,6 +114,7 @@ symbols BY NAME (grep/search), never trust a line offset.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -121,11 +122,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
+from orchestrator.merge_queue import SpeculativeMergeWorker
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import InFlightMergeRegistry, MergeRequest, QueuedBranch
 from orchestrator.verify_cancel import (
@@ -646,3 +649,182 @@ class TestIdentityFaceRecoveryDedupe:
         assert enqueued.request_id == reqs[0].request_id, (
             'order-independent: the descendant wins regardless of journal order'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestFiveThreeTwoSixReplayGate -- capstone: PRD Sec.9 rows 1, 2, 4, 5, 6, 7
+# end-to-end + 'merge finalizes' + the zero-ENOENT causal-proxy chain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)  # heavy class: real git + real merge worker end-to-end
+class TestFiveThreeTwoSixReplayGate:
+    """The headline done-gate: replays the 2026-07-22 task/5326 restart
+    incident end-to-end, driving the ACTUAL startup substrate (real
+    GitOps, real MergeQueueStore, real InFlightMergeRegistry, real
+    SpeculativeMergeWorker) rather than any single leg in isolation.
+
+    Exercises PRD Sec.9 rows 1, 2, 4 (protected trees survive the
+    concurrent sweep), 6 (dup-journal same-branch collapse; here a
+    descendant-tip variant), 7 (descendant wins), and row 5 (the live
+    verify observes its own worktree intact across the concurrent sweep --
+    this row has NO standalone test; it is only exercised HERE), plus
+    'merge finalizes' (the recovered request reaches a terminal 'done' and
+    its branch lands on main).
+
+    Zero-ENOENT causal-proxy chain (see the module docstring for the full
+    rationale) is asserted via all four legs in ONE test:
+      (a) every `_merge-*`/infra tree still `.exists()` during the live
+          verify, paired with the '999' positive control the SAME sweep
+          cleans;
+      (b) the gated verify runner's own worktree-existence observations
+          (entry AND exit) are all True;
+      (c) the recovered merge reaches `outcome.status == 'done'` and its
+          branch is an ancestor of main;
+      (d) zero `verify_cross_check_mismatch` L1 escalations were filed.
+    """
+
+    async def test_concurrent_startup_sweep_survives_and_merge_finalizes(
+        self,
+        mock_orch_config: MagicMock,
+        git_repo: Path,
+        git_config: GitConfig,
+        tmp_path: Path,
+    ) -> None:
+        harness = _build_recovery_harness(mock_orch_config, git_repo)
+        # Rebind harness.config to a REAL OrchestratorConfig (mirrors the
+        # git_ops rebind above): the merge-verify dispatch path this capstone
+        # actually drives reads several config fields directly off
+        # MergeRequest.config (project_root for git-cwd/archive-root
+        # resolution, merge_verify_min_free_disk_bytes for the pre-verify
+        # disk guard, ...) that mock_orch_config deliberately leaves
+        # unconfigured (it is tuned for the lighter harness-lifecycle-loop
+        # surface TestDeleterFace exercises, not a real verify dispatch) --
+        # an un-set MagicMock field reaching a real `int >= ...` comparison
+        # raises TypeError, not a graceful skip. Harness.__init__ already
+        # consumed mock_orch_config's neutralizing fields (usage_cap.enabled=
+        # False, review.enabled=False, background-loop toggles, ...) by this
+        # point and this test never calls harness.run() (only targeted
+        # internal methods), so those neutralizations are moot post-init --
+        # safe to swap in a fully-real, self-consistent config here.
+        harness.config = OrchestratorConfig(project_root=git_repo, git=git_config)
+        base = harness.git_ops.worktree_base
+
+        # --- Pre-state: a REAL branch task/5326 with a real worktree and a
+        # descendant tip (sha2 descends sha1). -----------------------------
+        wt = (await harness.git_ops.create_worktree('5326')).path
+        (wt / 'capstone_a.py').write_text('a = 1\n')
+        await harness.git_ops.commit(wt, 'Add capstone_a.py')
+        _, sha1_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        sha1 = sha1_raw.strip()
+
+        (wt / 'capstone_b.py').write_text('b = 2\n')
+        await harness.git_ops.commit(wt, 'Add capstone_b.py')
+        _, sha2_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        sha2 = sha2_raw.strip()
+
+        # Durable journal seeded with TWO entries for task/5326 (descendant
+        # variant), both pointing at the same real worktree.
+        reqs = _seed_dup_journal(
+            harness._merge_store, '5326', [sha1, sha2], harness.config, wt,
+        )
+
+        # --- Decoys: leased persistent + ephemeral merge trees, infra bands,
+        # and the task-shaped planless '999' dir (positive control). ------
+        merge_verify = base / '_merge-verify'
+        fd_verify = _plant_leased_tree(base, merge_verify)
+        merge_uuid = base / '_merge-cafe5326'
+        fd_uuid = _plant_leased_tree(base, merge_uuid)
+        infra_dirs = {
+            name: _plant_infra_dir(base, name)
+            for name in ('.reseed-trash', '_mainprobe-x')
+        }
+        wt_task = _plant_task_dir(base, '999')
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        observations: list[bool] = []
+        gated = AsyncMock(
+            side_effect=_gated_tree_liveness_verify(entered, release, observations),
+        )
+
+        harness._escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        worker_task: asyncio.Task | None = None
+
+        try:
+            # (1) Recover the durable journal via the ACTUAL harness entry
+            # point -- exactly ONE winner enqueued for task/5326.
+            report = await harness._recover_pending_merges()
+            assert report['recovered'] == 1, report
+            assert report['coalesced'] == 1, report
+            assert len(report['requests']) == 1, report
+            winner = report['requests'][0]
+            assert winner.branch.bare_id == '5326'
+            assert winner.request_id == reqs[1].request_id, (
+                'the DESCENDANT record must be the recovered winner'
+            )
+            assert harness._merge_queue.qsize() == 1
+
+            # (2) Start the merge-worker task with run_scoped_verification
+            # patched to the gated tree-liveness runner; await entry.
+            harness._merge_worker = SpeculativeMergeWorker(
+                harness.git_ops,
+                harness._merge_queue,
+                merge_store=harness._merge_store,
+                escalation_queue=harness._escalation_queue,
+            )
+            with patch('orchestrator.merge_queue.run_scoped_verification', gated):
+                worker_task = asyncio.create_task(
+                    harness._merge_worker.run(), name='capstone-merge-worker',
+                )
+                await asyncio.wait_for(entered.wait(), timeout=60)
+
+                # (3) WHILE the verify is live, run the concurrent sweep: the
+                # merge reaper THEN the crash-recovery sweep (mirrors run()'s
+                # step 1b/1c0a -> 2c ordering -- see the module docstring's
+                # "Concurrency model" section).
+                await harness._reap_orphaned_merge_worktrees(report['requests'])
+                await harness._recover_crashed_tasks()
+
+                for d in (merge_verify, merge_uuid, *infra_dirs.values()):
+                    assert d.exists(), f'{d.name} must survive the concurrent sweep'
+                # Positive control: the SAME sweep cleaned the planless dir --
+                # proves the sweep is not inert.
+                harness.git_ops.cleanup_worktree.assert_any_call(wt_task, '999')  # type: ignore[attr-defined]
+
+                # (4) Release the gated verify; await the recovered merge.
+                release.set()
+                outcome = await asyncio.wait_for(winner.result, timeout=60)
+
+            assert outcome.status == 'done', f'Expected done, got: {outcome}'
+            full_branch = f'{harness.config.git.branch_prefix}5326'
+            assert await harness.git_ops.is_ancestor(
+                full_branch, harness.config.git.main_branch,
+            ), 'merge finalizes: the branch must land on main'
+
+            # (5) gamma collapse held under the live path (one verify total);
+            # the gated runner never observed a missing worktree (zero-ENOENT
+            # proxy); zero spurious cross-check L1 escalations were filed.
+            assert gated.call_count == 1, (
+                f'expected exactly one verify for task/5326; got {gated.call_count}'
+            )
+            assert observations and all(observations), (
+                f'gated verify observed a missing worktree: {observations}'
+            )
+            cross_check_l1 = [
+                e for e in harness._escalation_queue.get_pending()
+                if e.category == 'verify_cross_check_mismatch' and e.level == 1
+            ]
+            assert cross_check_l1 == [], cross_check_l1
+        finally:
+            release.set()
+            if harness._merge_worker is not None:
+                await harness._merge_worker.stop()
+            if worker_task is not None:
+                worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker_task
+            release_merge_verify_flock(fd_verify)
+            release_merge_verify_flock(fd_uuid)
+            remove_lock_holder_pgid(base)
