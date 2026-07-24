@@ -25,7 +25,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3119,3 +3119,159 @@ class TestMemoryConsolidatorCitationVerificationWiring:
         assert report.stats['stage1_phantom_citations_dropped'] == 1
         assert 'stage1_citations_verified' in report.stats
         assert 'stage1_citation_verification_errors' in report.stats
+
+
+# ---------------------------------------------------------------------------
+# Gate-backlog age-check wiring in MemoryConsolidator.run (task 3017)
+# ---------------------------------------------------------------------------
+
+
+_GATE_FIXED_NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
+
+
+class _FrozenGateDatetime(datetime):
+    """datetime subclass whose .now() returns a fixed instant (task 3017 wiring).
+
+    Patched onto the memory_consolidator module so the gate-backlog block's
+    ``datetime.now(UTC)`` is deterministic; ``gate_escalated_at`` stamps are
+    built relative to ``_GATE_FIXED_NOW``.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return _GATE_FIXED_NOW
+
+
+def _blocked_gate_task(tid, *, hours_ago: float) -> dict:
+    """A blocked human-decision gate task aged ``hours_ago`` relative to fixed-now."""
+    stamp = (_GATE_FIXED_NOW - timedelta(hours=hours_ago)).isoformat()
+    return {
+        'id': tid,
+        'status': 'blocked',
+        'title': f'Gate task {tid}',
+        'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp},
+    }
+
+
+class TestMemoryConsolidatorGateBacklogWiring:
+    """MemoryConsolidator.run() files a level-1 reconciliation_stale_gate_backlog
+    escalation for a blocked gate task whose gate_escalated_at has aged past 48h,
+    and records stage1_gate_backlog_stalled / stage1_gate_backlog_escalated stats.
+
+    Reuses the real-EscalationQueue-on-tmp_path + filtered_task_tree wiring harness
+    and freezes datetime.now(UTC) in the memory_consolidator module so the age is
+    deterministic.  RED until step-8 wires the gate-backlog block into run().
+    """
+
+    def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
+        return FilteredTaskTree(
+            active_tasks=tasks,
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=len(tasks),
+            max_task_id=0,
+        )
+
+    def _base_report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+    async def _run(self, stage, monkeypatch, run_id: str) -> StageReport:
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.stages.memory_consolidator.datetime',
+            _FrozenGateDatetime,
+        )
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_stale_gate_backlog_files_l1_and_sets_stats(self, tmp_path, monkeypatch):
+        """(a) blocked gate aged 49h → one pending L1 gate-backlog + stalled=1, escalated=1."""
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report = await self._run(stage, monkeypatch, 'run-gate-a')
+
+        pending = queue.get_by_task('645', status='pending', level=1)
+        gate_backlog = [
+            e for e in pending if e.category == 'reconciliation_stale_gate_backlog'
+        ]
+        assert len(gate_backlog) == 1, (
+            'run() must file exactly one level-1 reconciliation_stale_gate_backlog '
+            f'escalation for the >48h blocked gate task; got {pending!r}. '
+            'RED: the gate-backlog block is not yet wired into run().'
+        )
+        assert gate_backlog[0].task_id == '645'
+        assert report.stats['stage1_gate_backlog_stalled'] == 1
+        assert report.stats['stage1_gate_backlog_escalated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_fresh_gate_no_escalation_stats_zero(self, tmp_path, monkeypatch):
+        """(b) control: gate aged 1h (< 48h) → no gate-backlog L1; both stats 0."""
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=1)])
+
+        report = await self._run(stage, monkeypatch, 'run-gate-b')
+
+        assert not any(
+            e.category == 'reconciliation_stale_gate_backlog' for e in queue.get_pending()
+        )
+        assert report.stats['stage1_gate_backlog_stalled'] == 0
+        assert report.stats['stage1_gate_backlog_escalated'] == 0
+
+    @pytest.mark.asyncio
+    async def test_none_tree_noops(self, tmp_path, monkeypatch):
+        """(c1) filtered_task_tree is None → block no-ops: no escalation, no raise, no stat."""
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = None
+
+        report = await self._run(stage, monkeypatch, 'run-gate-c1')
+
+        assert not any(
+            e.category == 'reconciliation_stale_gate_backlog' for e in queue.get_pending()
+        )
+        assert 'stage1_gate_backlog_stalled' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_none_queue_noops(self, monkeypatch):
+        """(c2) _escalation_queue is None → block no-ops: no raise, no stat."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage._escalation_queue = None
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report = await self._run(stage, monkeypatch, 'run-gate-c2')
+
+        assert 'stage1_gate_backlog_stalled' not in report.stats
