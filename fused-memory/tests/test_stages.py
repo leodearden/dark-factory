@@ -7168,7 +7168,14 @@ class TestSweepStaleMem0FlagForStage2Markers:
         """When count_memories_by_metadata reports an exact 0, the scroll is
         skipped entirely — mirrors the stage1_flag_marker short circuit
         (task 2853 review), applied here with the boolean flag_for_stage2
-        filter instead of a source filter."""
+        filter instead of a source filter.
+
+        The wrapper also issues a second, supplementary count call — the
+        string-variant type-drift probe (task 2966 amendment, reviewer
+        finding; see TestWarnOnFlagForStage2TypeDrift) — after the primary
+        sweep completes. Both calls return 0 here, so no drift is present
+        and the scroll still never runs.
+        """
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _sweep_stale_mem0_flag_for_stage2_markers,
         )
@@ -7183,9 +7190,13 @@ class TestSweepStaleMem0FlagForStage2Markers:
         )
 
         assert result == 0
-        memory_service.count_memories_by_metadata.assert_awaited_once()
-        call = memory_service.count_memories_by_metadata.call_args
-        assert call.kwargs.get('filters') == {'flag_for_stage2': True}
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        filters_seen = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': True} in filters_seen
+        assert {'flag_for_stage2': 'true'} in filters_seen
         memory_service.get_memories_by_metadata.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -7218,6 +7229,173 @@ class TestSweepStaleMem0FlagForStage2Markers:
 
         assert result == 1
         memory_service.get_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wrapper_surfaces_type_drift_warning(self, caplog):
+        """End-to-end: when the string-'true' variant probe is positive, the
+        wrapper logs a loud WARNING (task 2966 amendment, reviewer finding).
+
+        _query_stage2_flags' consumer-side check is a plain truthy check
+        that accepts both boolean True and the string 'true', but the GC
+        filter above is type-exact (boolean True only) — so a string-typed
+        marker is consumed/rendered normally but invisible to this sweep and
+        would accumulate forever. This is the reviewer's stated minimum
+        floor: surface that drift loudly rather than growing unbounded and
+        silent.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        async def _count_side_effect(*, project_id, filters):
+            if filters == {'flag_for_stage2': 'true'}:
+                return 5
+            return 0  # boolean-filter probe: primary pool short-circuits empty
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_side_effect)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_mem0_flag_for_stage2_markers(
+                memory_service, 'reify', run_id='r1',
+            )
+
+        # Diagnostic-only: the drift warning must never affect the sweep's
+        # own return value (the primary boolean pool was genuinely empty).
+        assert result == 0
+        drift_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'flag_for_stage2' in rec.getMessage()
+            and "'true'" in rec.getMessage()
+        ]
+        assert len(drift_records) == 1, (
+            f'Expected exactly one type-drift WARNING; got: '
+            f'{[(r.levelno, r.message) for r in caplog.records]}'
+        )
+        assert '5' in drift_records[0].getMessage()
+
+
+class TestWarnOnFlagForStage2TypeDrift:
+    """_warn_on_flag_for_stage2_type_drift: best-effort boolean/string
+    type-drift diagnostic for the flag_for_stage2 GC sweep (task 2966
+    amendment, reviewer finding).
+
+    _query_stage2_flags' consumer-side check (``meta.get('flag_for_stage2')``)
+    is a plain truthy check that accepts both the boolean ``True`` and the
+    string ``'true'``, but _sweep_stale_mem0_flag_for_stage2_markers' GC
+    filter is type-exact (boolean ``True`` only, since Qdrant payload
+    filters are type-sensitive). A marker written with the string variant
+    would be consumed/rendered normally by Stage 2 but invisible to the GC
+    filter — an unbounded, silent leak. This helper probes for that
+    condition and must log loudly when found, while never raising or
+    otherwise affecting the caller.
+    """
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_string_variant_present(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=3)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        call = memory_service.count_memories_by_metadata.call_args
+        assert call.kwargs.get('project_id') == 'reify'
+        assert call.kwargs.get('filters') == {'flag_for_stage2': 'true'}
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert '3' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_string_variant_absent(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_exception_is_swallowed_and_no_warning_logged(self, caplog):
+        """A count_memories_by_metadata failure must never raise or warn —
+        this probe is purely diagnostic and best-effort, fail-open like
+        every other probe in this module."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            # Must not raise.
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_int_result_is_treated_as_nothing_to_report(self, caplog):
+        """A non-int return (unexpected backend shape) must not crash log
+        formatting — treated as fail-safe "nothing to report", not a warning."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            for rec in caplog.records
+        )
 
 
 class TestComputeStaleFlags:

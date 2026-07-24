@@ -413,9 +413,16 @@ async def _query_stage2_flags(
       count (task-1381).
 
     Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
-    residue is reaped by the recon_ledger's TTL/terminal-task GC pass
-    (:func:`_gc_recon_markers`, task 2228 W5-κ) rather than an immediate
-    per-cycle delete by the caller.
+    residue is reaped by the in-cycle Mem0 age-GC sweep
+    (:func:`_sweep_stale_mem0_flag_for_stage2_markers`, task 2966) rather
+    than an immediate per-cycle delete by the caller. (Prior to task 2966
+    this docstring pointed at the recon_ledger's TTL/terminal-task GC pass,
+    :func:`_gc_recon_markers` — that pass STRUCTURALLY cannot reach these
+    markers: ``flag_for_stage2`` is written ONLY to Mem0 and is never
+    upserted into the recon_ledger, so ``ReconLedgerStore.gc()``'s
+    ``record_kind IN (...)`` clause never matches it.  See
+    ``recon_self_model.py``'s ``flag_for_stage2`` ``MARKER_LIFECYCLE`` entry
+    for the full declared-vs-actual explanation.)
 
     The *run_window_start* parameter is optional and defaults to ``None``
     (backward-compatible: window guard dormant, pure run_id partition applies).
@@ -713,6 +720,21 @@ _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 14
 _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
 _FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
+
+# Boolean/string type-drift probe (task 2966 amendment, reviewer finding).
+# _query_stage2_flags' consumer-side check (``meta.get('flag_for_stage2')``,
+# ~line 489) is a plain truthy check — it accepts BOTH the boolean True and
+# the string 'true'. The GC filter above is type-EXACT (boolean True only),
+# because Qdrant payload filters are type-sensitive. Nothing at the
+# add_memory write boundary normalizes this key's type (it is an LLM
+# tool-call argument, and only ``_normalize_task_id_metadata`` runs
+# server-side) — so a producer writing the string 'true' instead of the
+# boolean is not structurally prevented. Such a marker would be rendered
+# and consumed normally by _query_stage2_flags but INVISIBLE to the GC
+# filter above, and would accumulate forever, silently. This filter is used
+# by _warn_on_flag_for_stage2_type_drift to probe for that condition and
+# log loudly rather than let it grow unbounded and silent.
+_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS: dict = {'flag_for_stage2': 'true'}
 
 # --- Entity-standing-decision growth-freshness sweep (task 2899 ζ) -----------
 # PRD plans/stage1-entity-standing-decision-prd.md §Staleness: a standing
@@ -1217,6 +1239,57 @@ async def _sweep_stale_mem0_flag_markers(
     )
 
 
+async def _warn_on_flag_for_stage2_type_drift(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> None:
+    """Best-effort probe for the boolean/string type-drift gap (task 2966 review).
+
+    :func:`_sweep_stale_mem0_flag_for_stage2_markers`'s GC filter
+    (``_FLAG_FOR_STAGE2_ENUM_FILTERS`` == ``{'flag_for_stage2': True}``) is a
+    type-exact Qdrant payload match, but ``_query_stage2_flags``' consumer-side
+    check (``meta.get('flag_for_stage2')``) is a plain truthy check that also
+    accepts the string ``'true'``. Nothing at the ``add_memory`` write
+    boundary normalizes this key's type, so a producer writing the string
+    instead of the boolean would create a marker that Stage 2 renders and
+    consumes normally but that the GC filter can never see — an unbounded,
+    silent leak of exactly the shape this sweep exists to prevent.
+
+    Issues one supplementary ``count_memories_by_metadata`` call for the
+    string-typed variant (``_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS``) and
+    logs a WARNING when it is a positive integer, so drift surfaces loudly
+    instead of accumulating quietly (reviewer's stated minimum floor: "at
+    minimum add a log/metric when ... a type drift surfaces loudly rather
+    than growing unbounded and silent").
+
+    Purely diagnostic and fail-safe: any exception, or any non-``int``/
+    non-positive result (e.g. a falsy probe or an unexpected return shape),
+    is treated as "nothing to report" — this must never raise and must never
+    affect the caller's sweep count.
+    """
+    try:
+        string_variant_count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters=_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS,
+        )
+    except Exception:
+        return
+    if not isinstance(string_variant_count, int) or string_variant_count <= 0:
+        return
+    logger.warning(
+        'reconciliation._sweep_stale_mem0_flag_for_stage2_markers: found %d '
+        "flag_for_stage2 marker(s) stored as the string 'true' rather than "
+        'boolean True — _query_stage2_flags renders/consumes these normally '
+        "(truthy check) but this sweep's type-exact GC filter "
+        '(%r) can never match them, so they will accumulate forever; '
+        'investigate the producer (task 2966 review finding).',
+        string_variant_count,
+        _FLAG_FOR_STAGE2_ENUM_FILTERS,
+        extra={'project_id': project_id, 'run_id': run_id},
+    )
+
+
 async def _sweep_stale_mem0_flag_for_stage2_markers(
     memory_service,
     project_id: str,
@@ -1261,6 +1334,14 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     it fails OPEN (see :func:`_sweep_stale_mem0_pool`'s docstring), so this
     can only ever skip a scroll that would itself have found nothing.
 
+    After the primary sweep, also runs
+    :func:`_warn_on_flag_for_stage2_type_drift` (task 2966 amendment,
+    reviewer finding) — a supplementary best-effort probe for markers stored
+    with the string ``'true'`` instead of boolean ``True``, which the
+    type-exact GC filter above can never see even though such markers are
+    consumed normally by ``_query_stage2_flags``'s truthy check. Purely
+    diagnostic: never affects this function's return value.
+
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
             ``delete_memory``, and ``count_memories_by_metadata``.
@@ -1277,7 +1358,7 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
-    return await _sweep_stale_mem0_pool(
+    swept = await _sweep_stale_mem0_pool(
         memory_service,
         project_id,
         run_id,
@@ -1290,6 +1371,10 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         count_short_circuit=True,
         enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
     )
+    # Diagnostic-only; never affects the returned sweep count (task 2966
+    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
+    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
+    return swept
 
 
 async def _sweep_entity_standing_decision_growth(
