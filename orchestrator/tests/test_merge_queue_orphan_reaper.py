@@ -741,3 +741,53 @@ class TestHeartbeatLoopReapWiring:
             f'keeps polling instead of blocking on the first hung sweep '
             f'forever; got {calls} call(s) in the observation window'
         )
+
+    async def test_heartbeat_loop_reap_survives_raising_touch(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The converse of test_heartbeat_loop_survives_raising_reap: a
+        raising _touch_owned_merge_worktrees (caught by the FIRST,
+        touch/heartbeat try/except) must never suppress the periodic reap
+        (run by the SECOND, separate try/except) on that same poll.
+
+        test_heartbeat_loop_survives_raising_reap alone couldn't pin the
+        substantive claim in _heartbeat_loop's docstring — "a fault in the
+        periodic reap can never suppress — or be suppressed by — the
+        touch/heartbeat step" — because the reap runs AFTER the
+        touch/heartbeat block, so a raising reap could never have suppressed
+        it anyway. This test exercises the direction that actually depends
+        on the two try/excepts being separate: before that separation, a
+        raising touch would have short-circuited anything appended to its
+        try-block (task 3018 amendment; reviewer_comprehensive test-coverage
+        finding at test_merge_queue_orphan_reaper.py:592).
+        """
+        import orchestrator.merge_queue as mq_mod
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        monkeypatch.setattr(mq_mod, '_HEARTBEAT_POLL_S', 0.0)
+
+        def _raising_touch() -> None:
+            raise RuntimeError('boom: touch exploded')
+
+        monkeypatch.setattr(worker, '_touch_owned_merge_worktrees', _raising_touch)
+        monkeypatch.setattr(worker, '_maybe_log_queue_heartbeat', lambda now: False)
+
+        calls: list[float] = []
+
+        async def _fake_reap(now: float) -> None:
+            calls.append(now)
+            # Stop the loop deterministically after the first reap so
+            # awaiting the coroutine below returns instead of spinning.
+            worker._running = False
+
+        monkeypatch.setattr(worker, '_maybe_reap_orphaned_merge_worktrees', _fake_reap)
+
+        worker._running = True
+        await asyncio.wait_for(worker._heartbeat_loop(), timeout=2.0)
+
+        assert len(calls) >= 1, (
+            'the periodic reap must still run on a poll where the touch/'
+            'heartbeat step raised — it is a SEPARATE try/except, not '
+            'short-circuited by the touch/heartbeat guard'
+        )
