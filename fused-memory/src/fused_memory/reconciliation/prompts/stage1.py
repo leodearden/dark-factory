@@ -1,6 +1,7 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
 from fused_memory.reconciliation.prompts import (
+    _GATE_CLOSURE_ARCHIVE_GUIDANCE,
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
@@ -626,6 +627,8 @@ directive is intentionally STRICTER: the LLM is asked to additionally surface th
 from its own re-search into the `flagged_items` entry, since the structured-output channel \
 carries the durable delivery guarantee. The asymmetry is deliberate; do not re-align by \
 reverting the Python helper to return `str | None`.
+
+{_GATE_CLOSURE_ARCHIVE_GUIDANCE}
 
 ## Live-Workflow Authority
 The payload may include a `### Live-Workflow Signals` section. When present, it lists \

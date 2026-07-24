@@ -10,6 +10,7 @@ from fused_memory.reconciliation.predicate_contradiction import (
     render_predicate_contradiction_section,
 )
 from fused_memory.reconciliation.prompts import (
+    _GATE_CLOSURE_ARCHIVE_GUIDANCE,
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     get_recon_report_tool_guidance,
@@ -246,6 +247,8 @@ flag a true claim about work that was done and later reverted or removed.
 commits did. It does not apply to your own prospective proposals for new \
 work (e.g. suggesting a new `metadata.foo` field as a next step is not a \
 claim about completed work and needs no verification).
+
+{_GATE_CLOSURE_ARCHIVE_GUIDANCE}
 
 ## Completion-Note Suppression Pre-Check (stage2_suppress guard)
 Before writing ANY completion note or "task marked done, no knowledge captured" memory \

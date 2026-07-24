@@ -150,6 +150,46 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 )
 
 # ---------------------------------------------------------------------------
+# Shared deterministic-gate closure guidance (task 3023)
+# ---------------------------------------------------------------------------
+# Stage 1 emits the flag and Stage 2 files the remediation task, so this
+# suppression policy is only sound if BOTH stages hold the identical rule.
+# Kept as ONE constant interpolated into both stage prompts — hand-duplicated
+# prompt prose in this module has already drifted twice.
+#
+# NOTE: this is a PLAIN (non-f) string, so its literal braces need no doubling.
+# Do NOT inline this prose into the stage f-strings — that would require
+# escaping every `{`/`}` below.  Keep it free of bare recon-report tool call
+# examples (see test_recon_report_guidance_drift.py, which scans the assembled
+# stage prompts and requires every such example to carry `run_id=`).
+_GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
+## Deterministic-Gate Closure: pending-only probes are not proof of absence
+Scope: a `done` task with `task_kind='deterministic'`, `metadata.gate_escalated_at` \
+set, and a `done_provenance.kind` of `deterministic-gate` or `deterministic-milestone`.
+
+`mcp__escalation__get_pending_escalations(task_id=...)` is PENDING/ROOT-ONLY BY \
+DESIGN. When a human resolves a born-at-L2 deterministic gate, that record is MOVED \
+to `data/escalations/archive/<date>/` and correctly disappears from that query. An \
+empty result there is the EXPECTED outcome for a properly-closed gate — it is NOT \
+evidence that the escalation record was never written.
+
+**Before emitting ANY finding, Stage-1 flag, memory, or filed remediation task that \
+asserts a missing / never-written escalation record, you MUST call \
+`mcp__escalation__get_task_escalations(task_id=...)`**, which is archive-inclusive. \
+Only an empty result THERE is evidence of absence.
+
+A resolved/archived record — or the combination of `done` + `metadata.gate_escalated_at` \
++ a deterministic-gate `done_provenance` — is LEGITIMATE closure. Do not flag it, do \
+not file remediation work, and do not write a memory asserting the gap.
+
+Incident lineage, so you recognise this pattern rather than re-deriving it: \
+dark_factory tasks 2841, 2842, 2844, 2846, 2919, 2954, 2955, 2958, 2999, 3005, 3006 \
+and reify tasks 5330, 5341, 5349, 5352, 5353 were all filed on this same false \
+premise. The orchestrator side (`deterministic_runner.py` / `harness.py`) already \
+queries the archive inclusively and is NOT the defect — do not file work against it.\
+"""
+
+# ---------------------------------------------------------------------------
 # Shared recon_report tool-usage guidance (PRD γ §9)
 # ---------------------------------------------------------------------------
 # Extracted to prevent prompt drift across Stage 1 / 2 / 3.  Any UUID-format
