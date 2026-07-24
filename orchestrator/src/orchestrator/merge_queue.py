@@ -10526,8 +10526,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              is what bounds an audit-flagged leak's on-disk lifetime instead
              of leaving it until the next restart.
 
-        Any unexpected exception from either call is logged and swallowed so a
-        heartbeat bug can never crash the worker.
+        Steps 1-2 and step 3 are wrapped in their OWN, SEPARATE try/except
+        (mirroring the swallow-and-log convention used here and in
+        :meth:`_reprobe_loop`) so a fault in the periodic reap can never
+        suppress — or be suppressed by — the touch/heartbeat step, and
+        either kind of bug is logged and swallowed instead of crashing the
+        worker.
         """
         while self._running:
             await asyncio.sleep(_HEARTBEAT_POLL_S)
@@ -10536,7 +10540,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._maybe_log_queue_heartbeat(time.time())
             except Exception:
                 logger.exception('merge queue heartbeat: unexpected error')
-            await self._maybe_reap_orphaned_merge_worktrees(time.time())
+            try:
+                await self._maybe_reap_orphaned_merge_worktrees(time.time())
+            except Exception:
+                logger.exception('merge queue heartbeat: periodic reap failed')
 
     async def _reprobe_loop(self) -> None:
         """Periodically probe quarantined remote hosts and clear on recovery.
