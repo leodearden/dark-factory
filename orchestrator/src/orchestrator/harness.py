@@ -9164,8 +9164,23 @@ class Harness:
 
         Delegates to ``recover_pending_merges`` which:
         - Drops records whose branch is missing or already landed on main.
-        - Re-enqueues surviving records via ``enqueue_merge_request`` so a
+        - Collapses per-branch duplicate journal entries through the SHARED
+          in-flight registry BEFORE enqueue (task 2926, C3 γ): the descendant-
+          most snapshot tip enqueues once and the rest attach as peer waiters,
+          so a branch double-rehydrated by the journal never dispatches two
+          concurrent verifies of one work item (the 2026-07-22 task/5326
+          double-enqueue).
+        - Re-enqueues each surviving winner via ``enqueue_merge_request`` so a
           polling ``merge_request`` caller resolves once the merge finishes.
+
+        Passes ``registry=self._merge_inflight_registry`` — the SAME shared
+        :class:`InFlightMergeRegistry` the live submit path uses — so a
+        concurrent live ``merge_request`` during startup coalesces against the
+        recovered entries too.  ``retention`` is deliberately NOT threaded here:
+        the merge worker (owner of ``TerminalOutcomeRetention``) may not be
+        constructed yet at this startup step, so the recovery alias stays
+        best-effort/None and the observable contract is the in-process attach
+        future-mirror rather than a durable cross-restart poll-alias.
 
         Called once from ``run()`` immediately after ``_rehydrate_merge_halt``
         so a halted queue buffers the re-enqueued items rather than merging
@@ -9173,8 +9188,8 @@ class Harness:
         startup continue rather than blocking the orchestrator.
 
         Returns the ``recover_pending_merges`` report dict (``recovered`` /
-        ``dropped`` / ``requests`` / ``journal_corrupt``) so ``run()`` can
-        thread the recovered requests' branches into
+        ``dropped`` / ``coalesced`` / ``requests`` / ``journal_corrupt``) so
+        ``run()`` can thread the recovered requests' branches into
         :meth:`_reap_orphaned_merge_worktrees` (task 2060) — a recovered
         in-flight worktree is re-adopted rather than reaped.
         """
@@ -9186,11 +9201,14 @@ class Harness:
             event_store=self.event_store,
             main_branch=self.config.git.main_branch,
             branch_prefix=self.config.git.branch_prefix,
+            registry=self._merge_inflight_registry,
         )
         logger.info(
-            '_recover_pending_merges: recovered=%d dropped=%d journal_corrupt=%s',
+            '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
+            'journal_corrupt=%s',
             report.get('recovered', 0),
             report.get('dropped', 0),
+            report.get('coalesced', 0),
             report.get('journal_corrupt', False),
         )
         return report
