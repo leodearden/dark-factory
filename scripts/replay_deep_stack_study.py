@@ -51,7 +51,16 @@ STACK_CAP = 6          # max items in a phase-A stack (queue rarely offers more)
 DUP_CAP = 25           # max phase-C duplicate runs
 SINGLE_EVERY = 2       # phase-S sampling: every Nth episode
 VERIFY_TIMEOUT_S = 14400  # generous: SCHED_IDLE stretches wall time
-VERIFY_CMD = ['./scripts/verify.sh', 'test', '--scope', 'branch', '--include-infra']
+# --scope all + DF_VERIFY_ROLE=merge: replicate the PRODUCTION MERGE verify
+# (hooks/pre-merge-commit uses --scope all; the merge pipeline injects
+# DF_VERIFY_ROLE=merge => profile=both). --scope branch is unusable here: every
+# stack tip is already an ancestor of clone-time main, so branch scope resolves
+# EMPTY and verify.sh exits 0 having run nothing ("nothing to verify") — this
+# silently no-op'd 41/55 phase-A runs in the v1 (2026-07-23) results.
+VERIFY_CMD = ['./scripts/verify.sh', 'test', '--scope', 'all', '--include-infra']
+VERIFY_ENV = {'DF_VERIFY_ROLE': 'merge'}
+SCRIPT_VERSION = 2
+NOOP_CPU_FLOOR_S = 60  # a "pass" burning less CPU than this is a suspect no-op
 SCRUB_ENV = [k for k in os.environ if k.startswith('CLAUDE')]
 
 
@@ -221,6 +230,7 @@ def build_stack(repo: Path, base: str, tips: list[list[str] | tuple[str, str]]) 
 
 def run_verify(repo: Path, log_path: Path) -> dict:
     env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+    env.update(VERIFY_ENV)
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     t0 = time.monotonic()
     timed_out = False
@@ -234,13 +244,19 @@ def run_verify(repo: Path, log_path: Path) -> dict:
             timed_out = True
             exit_code = -1
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_user = after.ru_utime - before.ru_utime
+    cpu_sys = after.ru_stime - before.ru_stime
     return {
         'exit_code': exit_code,
         'passed': exit_code == 0,
         'timed_out': timed_out,
         'wall_s': round(time.monotonic() - t0, 1),
-        'cpu_user_s': round(after.ru_utime - before.ru_utime, 1),
-        'cpu_sys_s': round(after.ru_stime - before.ru_stime, 1),
+        'cpu_user_s': round(cpu_user, 1),
+        'cpu_sys_s': round(cpu_sys, 1),
+        # A "pass" that burned almost no CPU verified nothing (e.g. an empty
+        # scope resolution) — flag it so aggregation can never mistake a
+        # no-op exit 0 for a green verify.
+        'suspect_noop': exit_code == 0 and (cpu_user + cpu_sys) < NOOP_CPU_FLOOR_S,
     }
 
 
@@ -288,7 +304,12 @@ def main() -> int:
             break
         log(f'{j["job_id"]}: building {len(j["tips"])}-item stack on {j["base"][:10]}')
         tree, merged = build_stack(args.repo, j['base'], j['tips'])
+        # Tree OBJECT hash (not commit sha): rebuilt merges get fresh commit
+        # shas from timestamps, but identical content — phase C same-tree
+        # comparison must key on this.
+        tree_obj = git(args.repo, 'rev-parse', 'HEAD^{tree}').stdout.strip()
         rec = {**j, 'tips': [t for t, _ in j['tips']], 'tree': tree,
+               'tree_object': tree_obj, 'script_version': SCRIPT_VERSION,
                'items_merged': merged, 'started_at': dt.datetime.now(dt.timezone.utc).isoformat()}
         if merged == 0:
             rec.update(exit_code=None, passed=None, skipped='no_items_merged')
