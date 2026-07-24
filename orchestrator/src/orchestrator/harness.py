@@ -12384,6 +12384,16 @@ class Harness:
         report['unknown_config_keys'] = [
             uk._asdict() for uk in fresh.unknown_key_census
         ]
+        # Treat reload symmetrically with startup (INV-5, ONE implementation).
+        # apply_reload copies only model_fields, so the _unknown_key_census
+        # PrivateAttr would otherwise keep its stale startup value on the live
+        # config; copy the freshly-loaded census across, then re-run the
+        # born-at-L2 filer so a hot-reload that INTRODUCES a phantom key files an
+        # L2 and a hot-reload that FIXES the config self-heals the pending one —
+        # exactly as startup does.  The filer is None-safe (no-op without an
+        # escalation queue) and fail-open, so it can never break a reload.
+        self.config._unknown_key_census = fresh.unknown_key_census
+        await self._file_config_unknown_keys_escalation()
         if self.event_store:
             self.event_store.emit(EventType.config_reload, data=report)
         if report['restart_required'] or not report['reloaded']:

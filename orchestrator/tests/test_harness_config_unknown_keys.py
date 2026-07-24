@@ -196,3 +196,45 @@ async def test_reload_config_clean_yields_empty_unknown_keys(tmp_path: Path, mon
         report = await h.reload_config()
 
     assert report['unknown_config_keys'] == []
+
+
+@pytest.mark.asyncio
+async def test_reload_config_files_and_self_heals_l2(tmp_path: Path, monkeypatch):
+    """reload_config is symmetric with startup (INV-5, one implementation): a
+    phantom key introduced by a hot-reload files a born-at-L2, the live config's
+    census is refreshed (not left at its stale startup value), and a subsequent
+    clean reload self-heals the pending L2 — the same file/self-heal the startup
+    filer performs."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'orchestrator.yaml'))
+    queue = EscalationQueue(tmp_path / 'esc')
+    h = _reload_harness(tmp_path)
+    h._escalation_queue = queue
+
+    # Hot-reload picks up a config carrying an unknown key → files an L2.
+    dirty = OrchestratorConfig(project_root=tmp_path)
+    dirty._unknown_key_census = [ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')]
+    with patch('orchestrator.harness.load_config', return_value=dirty):
+        report = await h.reload_config()
+
+    assert report['unknown_config_keys']  # surfaced in the report
+    # The live config's census is now in step with the report (no stale data).
+    assert h.config.unknown_key_census == [
+        ConfigUnknownKey('spare_warm_lanes', 'git.spare_warm_lanes')
+    ]
+    l2s = _pending_config_l2s(queue)
+    assert len(l2s) == 1, 'a phantom key introduced via reload must file exactly one L2'
+    assert l2s[0].level == 2
+    assert l2s[0].severity in BORN_AT_L2_SEVERITIES
+    esc_id = l2s[0].id
+
+    # Operator fixes the config and hot-reloads → the pending L2 self-heals.
+    clean = OrchestratorConfig(project_root=tmp_path)
+    with patch('orchestrator.harness.load_config', return_value=clean):
+        report = await h.reload_config()
+
+    assert report['unknown_config_keys'] == []
+    assert _pending_config_l2s(queue) == [], 'a clean reload must self-heal the pending L2'
+    resolved = queue.get(esc_id)
+    assert resolved is not None
+    assert resolved.status == 'resolved'
