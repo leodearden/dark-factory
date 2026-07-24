@@ -4423,6 +4423,15 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     # Stash it beside _module_configs so consumers (startup L2 filer, reload
     # response, check-config) read one computed result, and warn loudly now
     # (loud-over-silent) so the phantom key is never invisible.
+    #
+    # SCOPE (intentional): the census walks the TOP-LEVEL project config only.
+    # The per-module orchestrator.yaml files discovered just above by
+    # _discover_module_configs are deliberately NOT censused, so a typo'd key in
+    # a per-package orchestrator.yaml is still silently dropped by pydantic
+    # extra='ignore'.  This mirrors design decision 1 (project-config-only walk):
+    # the incident key lived in the top-level project YAML.  Extending the census
+    # to module configs (walk each discovered ModuleConfig YAML against
+    # ModuleConfig's schema) is a deferred follow-up, not an oversight.
     census = census_unknown_config_keys(config_path)
     config._unknown_key_census = census
     if census:
