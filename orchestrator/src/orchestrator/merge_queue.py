@@ -3793,6 +3793,159 @@ async def enqueue_merge_request(
     _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
 
 
+_MERGE_CANCEL_RETIRE_REASON = 'merge_cancel_retire'
+"""Reason string for the C1 worktree removal driven by ``merge_cancel``
+retirement (task ε) — distinguishes a cancel-retirement reap from the C3
+REPLACE ``'c3_replace_drop_queued'`` reap in ``worktree_reaped`` events."""
+
+
+class _RetireWorktreeP(Protocol):
+    """Narrow protocol for the git_ops worktree surface used by retirement.
+
+    Only :meth:`find_inflight_merge_worktree` and
+    :meth:`remove_merge_worktree_guarded` are called on *git_ops* inside
+    :func:`retire_cancelled_merge_request` (it never cleans up, unlike the C3
+    gate).  Declaring the parameter with this Protocol — rather than the
+    concrete :class:`~orchestrator.git_ops.GitOps` — lets test stubs that
+    implement only these two methods satisfy the type-checker without
+    inheriting from the full ``GitOps`` class (mirrors the rationale of the
+    wider :class:`_FindInflightWorktreeP` used by
+    :func:`coalesce_or_enqueue_merge_request`).
+    """
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None: ...
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str: ...
+
+
+async def retire_cancelled_merge_request(
+    *,
+    request_id: str,
+    branch: str | None,
+    task_id: str | None,
+    registry: InFlightMergeRegistry | None,
+    retention: TerminalOutcomeRetention | None,
+    git_ops: _RetireWorktreeP | None,
+    event_store: EventStore | None,
+    yields: int = 3,
+) -> str | None:
+    """Fully retire a just-cancelled live merge entry before ``merge_cancel`` returns.
+
+    Called by ``merge_cancel`` immediately AFTER ``rec.future.cancel()`` on the
+    pending-waiter path so an immediate resubmit gets a FRESH entry and never
+    coalesces onto / observes the cancelled corpse (PRD §4 C3 last row / §5 D3,
+    task ε).  Three consequences the cancel would otherwise run LATER via
+    ``call_soon`` done-callbacks are performed here, before returning:
+
+    1. **Slot release (identity-guarded).**  ``registry.release(branch,
+       detach_waiters=True)`` — but ONLY when the branch slot still belongs to
+       *request_id*.  A concurrent/immediate resubmit may have reclaimed the
+       freed slot during the yields (step 3); an unconditional release would
+       drop that fresh entry and cancel its future — the exact double-dispatch
+       the registry exists to prevent.  Mirrors
+       :meth:`InFlightMergeRegistry._release_if_current`'s object-identity guard.
+
+    2. **Worktree release (C1).**  The branch's in-flight worktree is routed
+       through the α/C1 lease-enforced primitive
+       ``remove_merge_worktree_guarded(reason='merge_cancel_retire')`` and a
+       ``worktree_reaped`` event is emitted — mirroring the C3 REPLACE arm.  A
+       live-leased tree is SKIPPED (never yanked); the reaper collects true
+       leaks later (PRD D4).
+
+    3. **Sticky result cleared (yield-then-forget).**  The loop is YIELDED
+       (bounded ``await asyncio.sleep(0)`` loop; the worktree await also
+       yields) so the cancel's ``enqueue_merge_request._on_finalized`` records
+       the terminal ``'abandoned'`` outcome into *retention* FIRST, then
+       ``retention.forget(request_id)`` clears it.  A synchronous forget would
+       be clobbered by the async re-record; the future resolves once, so
+       ``_on_finalized`` cannot re-fire after the forget.
+
+    *registry*, *retention*, and *git_ops* are each None-guarded (degrade to a
+    no-op) so the helper is safe to call with a partially-wired harness.  When
+    *branch* is None (a WaiterRecord predating branch/task_id population) the
+    slot-release and worktree steps are skipped, but the yields + forget still
+    run so the sticky-by-request_id record is cleared.
+
+    Returns the C1 removal outcome (e.g. ``'removed'`` / ``'skipped_lease_held'``)
+    when a worktree was found and reaped, else None.
+    """
+    outcome: str | None = None
+
+    if branch is not None:
+        # (1) Identity-guarded slot release: only release when the slot still
+        # belongs to *request_id* (a resubmit may already have reclaimed it).
+        if registry is not None:
+            entry = registry.entry(branch)
+            if entry is None or entry.request_id == request_id:
+                registry.release(branch, detach_waiters=True)
+
+        # (2) Route the in-flight worktree through the C1 primitive and emit
+        # worktree_reaped (mirrors the C3 REPLACE arm, merge_queue.py:4186-4203).
+        #
+        # GUARDED: a git/IO failure in the find/remove/emit below must NOT
+        # propagate out of merge_cancel.  By this point the future is already
+        # cancelled and the slot released (steps above), so an escaping
+        # exception would (a) skip the yield-then-forget in step (3), leaving
+        # the sticky 'abandoned' record to shadow an immediate resubmit, and
+        # (b) hand the MCP caller an exception instead of the documented
+        # {cancelled: True, state: 'abandoned'} contract — even though the
+        # cancel itself succeeded.  Log loudly (loud-over-silent) and fall
+        # through so step (3) always clears the sticky result; the reaper
+        # collects any worktree left behind by the failed reap later (PRD D4).
+        if git_ops is not None:
+            try:
+                wt = await git_ops.find_inflight_merge_worktree(branch)
+                if wt is not None:
+                    outcome = await git_ops.remove_merge_worktree_guarded(
+                        wt, reason=_MERGE_CANCEL_RETIRE_REASON,
+                    )
+                    if event_store is not None:
+                        event_store.emit(
+                            EventType.worktree_reaped,
+                            task_id=task_id,
+                            phase='merge',
+                            data={
+                                'branch': branch,
+                                'path': str(wt),
+                                'reason': _MERGE_CANCEL_RETIRE_REASON,
+                                'outcome': outcome,
+                            },
+                        )
+            except Exception:
+                # CancelledError (BaseException) is intentionally NOT caught —
+                # a cancellation of the retirement coroutine itself must
+                # propagate.
+                logger.warning(
+                    'retire_cancelled_merge_request: worktree reap failed for '
+                    'branch %r (request_id=%r); degrading to sticky-clear only '
+                    '(fail-safe, I3) — the reaper collects any orphan later',
+                    branch, request_id,
+                    exc_info=True,
+                )
+
+    # (3) Yield-then-forget: let the cancel's _on_finalized record 'abandoned'
+    # FIRST, then clear the sticky per-request_id result permanently.
+    #
+    # ORDERING INVARIANT — this is correct only while
+    # ``enqueue_merge_request._on_finalized`` stays a SYNCHRONOUS done-callback
+    # (it calls ``retention.record`` BEFORE any await).  ``future.cancel()``
+    # schedules that callback via ``call_soon``, so it runs to completion on the
+    # first loop turn — one ``sleep(0)`` already suffices for the record to land.
+    # ``yields`` defaults to 3 (not 1) purely as belt-and-suspenders slack: once
+    # the record has landed each extra ``sleep(0)`` is a harmless no-op turn, and
+    # the margin absorbs a future leading await should ``_on_finalized`` ever
+    # gain one.  If that callback is ever made async such that ``record()`` lands
+    # AFTER an await, ``forget()`` here could win the race and a stale
+    # 'abandoned' record would survive — keep ``record()`` ahead of every await
+    # there, or gate this off the future's done/callback state instead of a fixed
+    # yield count.
+    for _ in range(yields):
+        await asyncio.sleep(0)
+    if retention is not None:
+        retention.forget(request_id)
+
+    return outcome
+
+
 async def register_and_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,

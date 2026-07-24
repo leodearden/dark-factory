@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import types
 from pathlib import Path
 from typing import Any
@@ -1684,10 +1685,19 @@ class TestMergeCancel:
         orch_config = _make_orch_config(tmp_path / 'repo')
         registry = _make_registry()
 
+        # ε: merge_cancel now retires-before-return, which yields the loop so the
+        # _waiters.pop done-callback fires during the FIRST cancel — the second
+        # cancel finds rec=None and must resolve via the durable tier.  Wire a
+        # real EventStore so _on_finalized's merge_finalized emit (fired during
+        # the retire yields) lets _durable_terminal_state Tier-3 report 'abandoned'.
+        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
+        event_store = EventStore(db_path=tmp_path / 'dc-events.db', run_id='dc')
+
         server = create_server(
             esc_queue,
             merge_queue=mq,
             orch_config=orch_config,
+            event_store=event_store,
             merge_inflight_registry=registry,
         )
 
@@ -3439,3 +3449,151 @@ class TestMergeRequestDuplicateInVerify:
         assert mq.empty()
 
         old_fut.cancel()  # cleanup
+
+
+# ---------------------------------------------------------------------------
+# TestBoundary9CancelRetire — PRD §8 boundary #9 (task ε) step-5 RED / step-6 GREEN
+# ---------------------------------------------------------------------------
+
+
+class _B9GitOpsSpy:
+    """git_ops spy for the boundary #9 cancel-retire test.
+
+    Implements only the surface the merge_request dispatch + retirement touch:
+    ``resolve_branch_sha`` (fast-path tip), ``is_ancestor`` (always False so the
+    already_merged fast-path is skipped), ``find_inflight_merge_worktree``
+    (returns the planted path only WHILE it exists on disk, so a post-retire
+    re-scan finds nothing), and ``remove_merge_worktree_guarded`` (records the
+    call + reason and deletes the dir).
+    """
+
+    def __init__(self, branch: str, tip: str, scratch: Path) -> None:
+        self._branch_full = f'task/{branch}'
+        self._tip = tip
+        self._scratch = scratch
+        self.removed: list[tuple[Path, str]] = []
+        self.project_root = '/fake/project'
+
+    async def resolve_branch_sha(self, branch: str) -> str | None:
+        return self._tip if branch == self._branch_full else None
+
+    async def is_ancestor(self, ancestor: str, descendant: str) -> bool:  # noqa: ARG002
+        return False  # never already-merged -> skip the fast-path
+
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+        if self._scratch.exists():
+            return self._scratch
+        return None
+
+    async def remove_merge_worktree_guarded(self, path: Path, *, reason: str) -> str:
+        self.removed.append((path, reason))
+        if path.exists():
+            shutil.rmtree(path)
+        return 'removed'
+
+
+@pytest.mark.asyncio
+class TestBoundary9CancelRetire:
+    """PRD §8 boundary #9 (task ε): merge_cancel FULLY RETIRES before returning.
+
+    A cancel on a live (in-verify) entry must, BEFORE returning, release the
+    branch slot, remove the in-flight worktree via the C1 primitive, and clear
+    the sticky retention result — so an IMMEDIATE resubmit (no intervening
+    awaited yields) gets a FRESH entry and never coalesces onto / observes the
+    cancelled corpse.
+
+    RED until step-6: today's merge_cancel returns before the async
+    done-callbacks release the slot / record 'abandoned', so the immediate
+    resubmit coalesces/attaches onto the still-held slot.
+    """
+
+    async def test_scenario_9_cancel_then_immediate_resubmit_fresh(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.event_store import EventStore  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            TerminalOutcomeRecord,
+            TerminalOutcomeRetention,
+        )
+
+        TIP = 'b9b9b9b9deadbeef'
+        # Planted AFTER the first dispatch (models the verify worktree the worker
+        # would create), so the first submit's disk-scan finds nothing.
+        wt_inflight = tmp_path / 'merge-b9'
+
+        registry = _make_registry()
+        retention = TerminalOutcomeRetention()
+        worker = _FakeMergeWorker()
+        spy = _B9GitOpsSpy('b9', TIP, wt_inflight)
+        event_store = EventStore(db_path=tmp_path / 'b9-events.db', run_id='b9')
+
+        server, mq, _reg, _es, _harness = _build_merge_server(
+            tmp_path,
+            worker=worker,
+            retention=retention,
+            event_store=event_store,
+            registry=registry,
+            git_ops=spy,
+        )
+
+        # (1) First submit dispatches fresh (worktree not on disk yet) and
+        # acquires the 'b9' registry slot as rid_a.
+        result_a = await _call_merge_request(
+            server, task_id='b9', branch='b9',
+            worktree=str(tmp_path / 'wt-a'), wait_secs=0,
+        )
+        assert result_a['status'] == 'queued', f'first submit must be queued: {result_a}'
+        rid_a = result_a['request_id']
+        req_a = mq.get_nowait()  # drain: only the registry slot models in-flight now
+
+        # (2) Model the D3 in-verify precondition: plant the worktree, mark the
+        # slot verifying, report rid_a verifying in the worker snapshot, and seed
+        # the sticky per-task terminal result the retirement must clear.
+        wt_inflight.mkdir()
+        registry.set_verifying('b9')
+        worker.set_entries([{
+            'branch': 'b9', 'request_id': rid_a, 'state': 'verifying',
+            'verify_started_at': 1000.0, 'verify_age_secs': 42.0,
+        }])
+        retention.record(TerminalOutcomeRecord(
+            request_id=rid_a, branch='b9', task_id='b9', state='abandoned',
+        ))
+
+        # (3) Cancel rid_a — retirement must complete BEFORE the call returns.
+        cancel_result = await _call_merge_cancel(server, request_id=rid_a)
+        assert cancel_result.get('cancelled') is True, f'cancel must succeed: {cancel_result}'
+
+        # (i) slot released before return
+        entry = registry.entry('b9')
+        assert entry is None or entry.request_id != rid_a, (
+            f'slot must be released before merge_cancel returns: {entry!r}'
+        )
+        # (ii) sticky result cleared before return
+        assert retention.get_by_branch('b9') is None, 'sticky by-branch must be cleared'
+        assert retention.get_by_task('b9') is None, 'sticky by-task must be cleared'
+        # (iii) worktree reaped via the C1 primitive
+        assert (wt_inflight, 'merge_cancel_retire') in spy.removed, (
+            f'worktree must be reaped via C1 (reason=merge_cancel_retire): {spy.removed}'
+        )
+
+        # The verify was aborted by the cancel->worker seam; model the snapshot
+        # teardown so the immediate resubmit sees no stale in-flight snapshot entry.
+        worker.set_entries([])
+
+        # (4) IMMEDIATE resubmit — must dispatch a FRESH entry, not coalesce/attach.
+        result_b = await _call_merge_request(
+            server, task_id='b9', branch='b9',
+            worktree=str(tmp_path / 'wt-b'), wait_secs=0,
+        )
+        assert result_b['status'] == 'queued', (
+            f'resubmit must dispatch fresh, got: {result_b}'
+        )
+        assert result_b['request_id'] != rid_a, (
+            f'resubmit must get a FRESH request_id, not the cancelled one: {result_b}'
+        )
+
+        # Cleanup enqueued/cancelled futures.
+        req_a.result.cancel()
+        with contextlib.suppress(asyncio.QueueEmpty):
+            while True:
+                mq.get_nowait().result.cancel()

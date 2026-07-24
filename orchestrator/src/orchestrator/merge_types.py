@@ -276,6 +276,47 @@ class TerminalOutcomeRetention:
         """Return the most-recently recorded record for *task_id*, or None if unknown."""
         return self._by_task.get(task_id)
 
+    def forget(self, request_id: str) -> bool:
+        """Remove *request_id* from every lookup; return whether it had a record.
+
+        The "sticky per-task result cleared" retirement primitive (task ε):
+        after a ``merge_cancel`` the retirement path calls this so an immediate
+        resubmit observes a clean ring rather than the cancelled corpse's
+        ``'abandoned'`` record shadowing the branch/task.
+
+        Pops *request_id* from ``_index``; when a record was present, removes
+        it from ``_by_branch`` / ``_by_task`` under the SAME object-identity
+        guard ``record()`` uses for eviction (delete a secondary key only when
+        it still ``is`` that record) so a newer record that already claimed the
+        same branch/task key is never clobbered.  Also drops every alias whose
+        key OR value equals *request_id* (a coalesced id resolving to it, or an
+        alias registered under it).  The deque slot is left untouched — the
+        lossy-eviction contract tolerates a missing ``_index`` entry, so the
+        stale deque record simply becomes unreachable and ages out normally.
+
+        Returns True when a record was removed from ``_index``; False when
+        *request_id* had no direct record (aliases keyed by / pointing at it
+        are dropped regardless of the return value).
+        """
+        rec = self._index.pop(request_id, None)
+        if rec is not None:
+            # Identity-guarded secondary-index removal (mirrors record()'s
+            # eviction guard): only drop the key while it still points to *rec*.
+            if self._by_branch.get(rec.branch) is rec:
+                del self._by_branch[rec.branch]
+            if self._by_task.get(rec.task_id) is rec:
+                del self._by_task[rec.task_id]
+        # Drop aliases where *request_id* is the alias key or its resolution
+        # target — a stale coalesced id must not resolve to a forgotten record.
+        if self._aliases:
+            stale = [
+                k for k, v in self._aliases.items()
+                if k == request_id or v == request_id
+            ]
+            for k in stale:
+                del self._aliases[k]
+        return rec is not None
+
 
 class InFlightMergeRegistry:
     """Per-branch in-flight de-dup registry for the merge-request chokepoint.
@@ -627,6 +668,14 @@ class WaiterRecord:
     """Origin of the waiter: 'mcp' (via merge_request tool) or 'workflow'."""
     submitted_tip: str | None = None
     """Git SHA of the branch tip at submit time (snapshot_tip), or None if unavailable."""
+    branch: str | None = None
+    """Bare branch name (e.g. '591') this waiter's merge targets, populated at
+    dispatch so ``merge_cancel`` can drive per-branch retirement (release the
+    registry slot / find the in-flight worktree) from a request_id alone (task
+    ε).  Back-compat optional (the ``_waiters`` dict is keyed by request_id)."""
+    task_id: str | None = None
+    """Task id of this waiter's merge, the ``_by_task`` retention-index key that
+    retirement clears (task ε).  Back-compat optional."""
 
 
 @dataclass(frozen=True)
