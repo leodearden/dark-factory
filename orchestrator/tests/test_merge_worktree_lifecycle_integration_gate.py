@@ -119,6 +119,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -919,7 +920,7 @@ def _make_request(
 ) -> MergeRequest:
     """Build a MergeRequest with a fresh Future bound to the running loop
     (ported from test_merge_queue_c3_submit_identity.py's _make_request)."""
-    kwargs: dict[str, object] = {}
+    kwargs: dict[str, Any] = {}
     if request_id is not None:
         kwargs['request_id'] = request_id
     if snapshot_tip is not None:
