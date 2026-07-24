@@ -2390,6 +2390,24 @@ def default_price_table() -> dict[str, dict[str, float]]:
     return {model: dict(rates) for model, rates in _DEFAULT_PRICES.items()}
 
 
+class ConfigUnknownKey(NamedTuple):
+    """A project-YAML key that has no matching model field.
+
+    Emitted by the unknown-config-key census (see ``census_unknown_config_keys``
+    below OrchestratorConfig).  ``path`` is the dotted location of the key in the
+    project YAML (e.g. ``spare_warm_lanes`` or ``git.bogus_nested``).
+    ``shadow_hint`` names the real dotted home when the same field name lives
+    elsewhere in the model tree (e.g. a top-level ``spare_warm_lanes`` →
+    ``git.spare_warm_lanes``), else ``None``.
+
+    Defined here (before OrchestratorConfig) so the ``_unknown_key_census``
+    PrivateAttr can reference it eagerly, mirroring the ModuleConfig precedent.
+    """
+
+    path: str
+    shadow_hint: str | None
+
+
 # --- Top-level ---
 
 
@@ -3817,6 +3835,13 @@ class OrchestratorConfig(BaseSettings):
     # guards so new consumers cannot silently omit the normalization.
     _module_configs: dict[str, ModuleConfig] | None = PrivateAttr(default=None)
 
+    # Unknown-config-key census (populated by load_config via
+    # census_unknown_config_keys).  None means "census never ran" (direct
+    # OrchestratorConfig() instantiation in evals/tests); any list (including [])
+    # means "census ran".  Read through the `unknown_key_census` property below,
+    # which normalizes the None sentinel to [] — mirrors _module_configs.
+    _unknown_key_census: list[ConfigUnknownKey] | None = PrivateAttr(default=None)
+
     @field_validator('project_root', mode='after')
     @classmethod
     def _resolve_project_root(cls, v: Path) -> Path:
@@ -4115,6 +4140,17 @@ class OrchestratorConfig(BaseSettings):
         """
         return self._module_configs or {}
 
+    @property
+    def unknown_key_census(self) -> list[ConfigUnknownKey]:
+        """Return the unknown-config-key census, normalizing the None sentinel to [].
+
+        Populated by ``load_config`` (which stashes
+        ``census_unknown_config_keys(config_path)``).  A directly-constructed
+        ``OrchestratorConfig()`` never ran the census, so the sentinel stays None
+        and this returns [] — mirrors ``module_configs_or_empty``.
+        """
+        return self._unknown_key_census or []
+
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return the ModuleConfig whose registered prefix is the longest (deepest) match
         for *module_path*, or None if no registered prefix matches at all.
@@ -4200,21 +4236,11 @@ class OrchestratorConfig(BaseSettings):
 # vanishes with no error.  These pure helpers detect that class of typo by
 # walking the RAW project YAML against the model schema — a separate pass from
 # pydantic validation, because validation never sees the dropped keys.
+#
+# ``ConfigUnknownKey`` itself is defined above OrchestratorConfig (so the
+# ``_unknown_key_census`` PrivateAttr can reference it eagerly); the walk
+# functions live here because they reference OrchestratorConfig's schema.
 # ---------------------------------------------------------------------------
-
-
-class ConfigUnknownKey(NamedTuple):
-    """A YAML key that has no matching model field.
-
-    ``path`` is the dotted location of the key in the project YAML (e.g.
-    ``spare_warm_lanes`` or ``git.bogus_nested``).  ``shadow_hint`` names the
-    real dotted home when the same field name lives elsewhere in the model tree
-    (e.g. a top-level ``spare_warm_lanes`` → ``git.spare_warm_lanes``), else
-    ``None``.
-    """
-
-    path: str
-    shadow_hint: str | None
 
 
 def _model_from_annotation(annotation: Any) -> type[BaseModel] | None:
@@ -4392,6 +4418,24 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 'Move the orchestrator.yaml up or raise lock_depth.',
                 prefix, prefix_depth, config.lock_depth,
             )
+    # Unknown-config-key census: detect project-YAML keys that pydantic's
+    # extra='ignore' silently dropped (the 2026-07-22 spare_warm_lanes incident).
+    # Stash it beside _module_configs so consumers (startup L2 filer, reload
+    # response, check-config) read one computed result, and warn loudly now
+    # (loud-over-silent) so the phantom key is never invisible.
+    census = census_unknown_config_keys(config_path)
+    config._unknown_key_census = census
+    if census:
+        logger.warning(
+            'Config %s has %d unknown key(s) that pydantic silently dropped '
+            '(extra=ignore): %s',
+            config_path,
+            len(census),
+            '; '.join(
+                uk.path + (f' (did you mean {uk.shadow_hint}?)' if uk.shadow_hint else '')
+                for uk in census
+            ),
+        )
     return config
 
 
