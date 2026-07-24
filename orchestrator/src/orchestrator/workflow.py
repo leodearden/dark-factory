@@ -3310,6 +3310,19 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
+        # task 2991: write the durable, restart-survivable merge-phase liveness
+        # stamp immediately on merge entry — BEFORE _check_scope_invariant files
+        # its plan.files/metadata.files divergence L0 and BEFORE the gating bail
+        # below. The orphan-L0 divergence reaper's _has_fresh_merge_phase gate
+        # reads it to DEFER (not promote) a live merge-stage task, which the
+        # pre-enqueue loop (no LLM calls) would otherwise fail the task-2931
+        # routing.latest freshness gate. Placed here so it is refreshed on every
+        # (re-)dispatch into merge phase, including passes that immediately bail
+        # to ESCALATED — exactly the passes a live-but-wedged task cycles
+        # through. (Distinct from the in-memory note_merge_phase_entered at the
+        # retry-loop top, which is the self-redeploy coordinator's signal.)
+        await self._stamp_merge_phase_entered()
+
         # Tripwire (task 2505): plan.files must equal metadata.files by
         # construction (the scope-reconciliation choke point keeps them in
         # lockstep) — a divergence here means some path bypassed it. Purely
