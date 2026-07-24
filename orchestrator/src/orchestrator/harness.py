@@ -1235,6 +1235,19 @@ class Harness:
         # None (byte-identical when unwired) — same declare-in-callee /
         # install-in-harness pattern as warm_lane_reclaim_candidate_provider.
         self.git_ops._on_pool_storage_absent = self._file_pool_storage_absent_escalation
+        # Wire the warm-lane record-drift callback (task 2986, W2b I3/I4): the
+        # pool fires this opaque callback when drift_l2_threshold consecutive
+        # durable .lane-state writes fail — the loud signal that the durable
+        # ASSIGNED/RELEASED records have drifted from the in-memory assignment
+        # map.  The pool NEVER raises on a mirror failure (fail-open, I3), so
+        # this filer is the only path by which the drift becomes visible.  Same
+        # declare-on-callee (default None) / install-in-harness pattern as
+        # _on_pool_storage_absent above; installed only when a pool exists so
+        # pool-less hosts stay byte-identical.
+        if self.git_ops.warm_lane_pool is not None:
+            self.git_ops.warm_lane_pool.set_on_lane_record_drift(
+                self._file_lane_record_drift_l2
+            )
         # In-memory hint gating the orphan-reaper's per-tick resolve scan
         # (task 2099 review-fix, efficiency). MUST default True ("maybe
         # pending") rather than False ("never filed") — a fresh process
@@ -11617,6 +11630,110 @@ class Harness:
         except Exception:
             logger.warning(
                 'reblock-guard: failed to file L2 for task %s', task_id,
+                exc_info=True,
+            )
+
+    # Warm-lane record-drift born-at-L2 filer (task 2986, W2b I3/I4). Constant
+    # (not per-task) dedup key — one open L2 at a time regardless of how many
+    # lanes drift — mirroring _WATCHER_OUTAGE_ROOT_CAUSE's bare-literal style.
+    # The literal 'lane_record_drift' matches the PRD/capability-manifest grep.
+    _LANE_RECORD_DRIFT_SENTINEL: str = '__lane_record_drift__'
+    _LANE_RECORD_DRIFT_ROOT_CAUSE: str = 'lane_record_drift'
+    _LANE_RECORD_DRIFT_ROLE: str = 'orchestrator-lane-record-drift'
+
+    def _file_lane_record_drift_l2(self, count: int) -> None:
+        """File a born-at-L2 human escalation when warm-lane record drift persists.
+
+        Installed on ``WarmLanePool._on_lane_record_drift`` (declare-on-callee
+        default None, install-in-harness), fired by the pool once
+        ``drift_l2_threshold`` consecutive durable ``.lane-state`` mirror writes
+        fail.  The pool NEVER raises on a mirror failure (fail-open, I3) — the
+        in-memory assignment map stays the source of truth and acquire/release
+        keep succeeding — so this filer is the only path by which the drift
+        between the map and the durable records becomes visible to a human.
+
+        Mirrors _file_watcher_outage_l2 / _file_reblock_guard_l2:
+          - No-op when _escalation_queue is None (bare-Harness unit tests).
+          - Deduped via find_pending_l2_by_root_cause('lane_record_drift') — a
+            bare fixed literal (not a per-task f-string) so repeated trips file
+            exactly one pending L2.
+          - Best-effort: every exception is swallowed so this never breaks the
+            pool's acquire/release path (I3).
+          - agent_role is an orchestrator sentinel + severity='urgent' → the L2
+            is exempt from the agent-role downgrade gate and routes straight to
+            a human.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
+            return
+        try:
+            if queue.find_pending_l2_by_root_cause(
+                self._LANE_RECORD_DRIFT_ROOT_CAUSE
+            ) is not None:
+                return                         # dedup: one open L2 at a time
+            from escalation.models import Escalation
+            summary = (
+                f'warm-lane record drift: {count} consecutive durable-write '
+                f'failures (in-memory assignment map diverged from .lane-state)'
+            )[:200]
+            detail = (
+                f'The WarmLanePool durable-record mirror write has failed '
+                f'{count} consecutive time(s), reaching '
+                f'warm_lane_drift_l2_threshold.\n\n'
+                'The in-memory FREE/ASSIGNED assignment map remains the single '
+                'source of truth and acquire/release continue to succeed '
+                '(fail-open), so task dispatch is NOT blocked.  But the durable '
+                '.lane-state/<lane>.json records have drifted from the map (a '
+                'write raised OSError — .lane-state unwritable — or '
+                'IllegalLaneTransition), so a restart would rebuild the map '
+                'from stale records.\n\n'
+                'Investigate why the durable write is failing (disk full, '
+                'permissions, corrupt .lane-state), fix the underlying issue, '
+                'and restart the orchestrator so the pool re-seeds and the '
+                'records reconcile with the map.'
+            )
+            esc = Escalation(
+                id=queue.make_id(self._LANE_RECORD_DRIFT_SENTINEL),
+                task_id=self._LANE_RECORD_DRIFT_SENTINEL,
+                agent_role=self._LANE_RECORD_DRIFT_ROLE,
+                severity='urgent',
+                category='infra_issue',
+                level=2,
+                root_cause=self._LANE_RECORD_DRIFT_ROOT_CAUSE,
+                summary=summary,
+                detail=detail,
+                suggested_action='investigate_lane_record_drift',
+            )
+            queue.submit(esc)
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=self._LANE_RECORD_DRIFT_SENTINEL,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': esc.category,
+                            'severity': esc.severity,
+                            'level': esc.level,
+                            'reason': 'lane-record-drift-threshold',
+                        },
+                    )
+            except Exception:
+                # Isolated from the outer handler: the L2 is already filed, so a
+                # failure here is an observability-only miss, never a "failed to
+                # file L2" condition.
+                logger.warning(
+                    'lane-record-drift: L2 %s filed but escalation_created '
+                    'emit failed', esc.id, exc_info=True,
+                )
+            logger.warning(
+                'lane-record-drift: warm-lane durable record drift hit '
+                'threshold (count=%d); flip fail-open, L2 filed %s',
+                count, esc.id,
+            )
+        except Exception:
+            logger.warning(
+                'lane-record-drift: failed to file L2 escalation',
                 exc_info=True,
             )
 

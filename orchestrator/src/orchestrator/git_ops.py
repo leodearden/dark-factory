@@ -1474,7 +1474,17 @@ class GitOps:
             self.warm_lane_pool: WarmLanePool | None = WarmLanePool(
                 worktree_base=self.worktree_base,
                 size=warm_lane_pool_size,
+                drift_l2_threshold=config.warm_lane_drift_l2_threshold,
             )
+            # Wire the shared durable-record writer so the pool is the SOLE
+            # writer of ASSIGNED/RELEASED .lane-state records at the moment the
+            # in-memory state flips (task 2986, W2b I1: record ≡ map after every
+            # mutation).  Previously only harness crash-recovery wired this;
+            # doing it here makes write-through + fail-open hold UNCONDITIONALLY,
+            # including GitOps-level unit tests.  The harness crash-recovery
+            # set_lane_lifecycle call is now a redundant idempotent no-op (same
+            # LaneLifecycle instance).
+            self.warm_lane_pool.set_lane_lifecycle(self._lane_lifecycle)
         else:
             self.warm_lane_pool = None
         # Merge-speculation warm-lane pool — None when knob off or size=0.
