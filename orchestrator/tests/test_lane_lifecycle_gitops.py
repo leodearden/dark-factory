@@ -28,7 +28,6 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.lane_lifecycle import (
-    ACQUIRE_ROUTE_TRANSITIONS,
     LANE_STATE_DIRNAME,
     AcquireRoute,
     LaneState,

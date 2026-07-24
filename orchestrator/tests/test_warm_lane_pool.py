@@ -3516,7 +3516,9 @@ class TestReleaseWritesThroughDurable:
 
         # Bring the lane to durable ASSIGNED:42 + in-memory ASSIGNED+mapped.
         asyncio.run(pool.acquire_for('42'))
-        assert lifecycle.read(lane).state == DurableLaneState.ASSIGNED
+        assigned_rec = lifecycle.read(lane)
+        assert assigned_rec is not None
+        assert assigned_rec.state == DurableLaneState.ASSIGNED
 
         asyncio.run(pool.release(lane))
 
@@ -3552,7 +3554,9 @@ class TestReleaseWritesThroughDurable:
         lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/7')
         lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='7')
         lifecycle.transition(lane, DurableLaneState.RELEASED)
-        released_at = lifecycle.read(lane).updated_at
+        released_rec = lifecycle.read(lane)
+        assert released_rec is not None
+        released_at = released_rec.updated_at
 
         pool = _make_pool(tmp_path, size=2)
         pool.set_lane_lifecycle(lifecycle)
@@ -5391,8 +5395,10 @@ class TestReclaimVictimWritesThroughDurable:
         acq_v = await pool.acquire_for('victim')
         assert acq_v is not None
         lane_v, _ = acq_v
-        assert lifecycle.read(lane_v).state == DurableLaneState.ASSIGNED
-        assert lifecycle.read(lane_v).task_id == 'victim'
+        rec_v = lifecycle.read(lane_v)
+        assert rec_v is not None
+        assert rec_v.state == DurableLaneState.ASSIGNED
+        assert rec_v.task_id == 'victim'
 
         # Steal victim's lane for thief (victim non-dispatched).
         result = await pool.reclaim_victim('thief', {'victim'}, lambda b: False)
@@ -5440,7 +5446,7 @@ class TestReclaimVictimWritesThroughDurable:
 # ===========================================================================
 
 
-class _DriftStubLifecycle:
+class _DriftStubLifecycle(LaneLifecycle):
     """LaneLifecycle stand-in for the pool drift-counter tests.
 
     ``fail=True`` → every durable write raises ``OSError`` (simulating an
@@ -5451,6 +5457,10 @@ class _DriftStubLifecycle:
     """
 
     def __init__(self, *, fail: bool = True) -> None:
+        # Throwaway base: every LaneLifecycle method the pool touches
+        # (note_assigned / read / transition) is overridden below, so the
+        # real record-directory machinery is never exercised.
+        super().__init__(worktree_base=Path('/nonexistent-drift-stub-base'))
         self.fail = fail
         self.note_assigned_calls: list[tuple[str, str]] = []
 
