@@ -605,7 +605,7 @@ class TestPremiseRefutedEntry:
 
 class TestSeedRegistryRealSource:
     """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
-    and re-verifies its three seed entries against the REAL fused-memory source
+    and re-verifies its four seed entries against the REAL fused-memory source
     root — not a tmp_path fixture.
 
     Confirmed base-branch facts (see task-1972 analysis):
@@ -613,6 +613,14 @@ class TestSeedRegistryRealSource:
     - tests/test_stages.py contains
       "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2".
     - src/fused_memory/server/recon_report.py does NOT contain "max_length".
+
+    Confirmed facts for the fourth entry (task 3023):
+    - ../escalation/src/escalation/queue.py contains "def get_by_task" and
+      "_iter_archive_paths" — the archive-inclusive scan that refutes the
+      "escalation record was never written" premise.
+    - src/fused_memory/reconciliation/prompts/stage2.py contains
+      "get_task_escalations" — the disconfirming tool the stage guidance points
+      auditors at.
     """
 
     # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/
@@ -623,15 +631,16 @@ class TestSeedRegistryRealSource:
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
         return load_premise_registry(self.REGISTRY_PATH)
 
-    def test_shipped_registry_has_three_entries(self):
-        """The seed registry ships exactly the three confirmed incidents."""
+    def test_shipped_registry_has_four_entries(self):
+        """The seed registry ships exactly the four confirmed incidents."""
         entries = self._load_entries()
         names = {e.name for e in entries}
-        assert len(entries) == 3
+        assert len(entries) == 4
         assert names == {
             "entity_summary_rebuild_invalid_at_filter_already_present",
             "stage2_flag_query_stage1_flag_marker_forbidden_regression",
             "add_finding_suggested_action_no_max_length_field",
+            "deterministic_gate_escalation_record_archived_not_missing",
         }
 
     def test_esc_1946_15_entity_summary_rebuild_matches_and_is_refuted(self):
@@ -702,8 +711,73 @@ class TestSeedRegistryRealSource:
         assert entry.name == "add_finding_suggested_action_no_max_length_field"
         assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
 
-    def test_all_three_incidents_via_premise_refuted_entry(self):
-        """premise_refuted_entry composes match + verify for all three incidents
+    def test_deterministic_gate_escalation_absence_claim_matches_and_is_refuted(self):
+        """task 3023: "gate task stamped gate_escalated_at but no escalation record
+        exists" — refuted because the record IS written, then ARCHIVED on human
+        resolve; the claim comes from a root-only get_pending_escalations probe
+        against an archive-inclusive fact.
+
+        This is the recurring false positive filed 16 times across dark_factory
+        (2841/2842/2844/2846/2919/2954/2955/2958/2999/3005/3006) and reify
+        (5330/5341/5349/5352/5353).
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=(
+                "Fix DeterministicRunner escalation-write/closure gap for "
+                "deterministic gate tasks"
+            ),
+            description=(
+                "Task was marked done and stamped metadata.gate_escalated_at but no "
+                "escalation record exists — get_pending_escalations(task_id) returns []."
+            ),
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None
+        assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is not None
+
+    def test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped(self):
+        """Over-broad-anchoring guard: task 3023's OWN framing must still reach
+        the architect.
+
+        Its title carries both "deterministic" and "escalation" and its
+        description mentions gate_escalated_at, so anchoring the entry on those
+        tokens alone would have dropped the very task that fixed the bug. The
+        description anchor is deliberately restricted to assertion-of-absence
+        phrasings; this test pins that separation as executable, not a comment.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import premise_refuted_entry
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=(
+                "Expose a task-scoped archive-inclusive escalation MCP lookup and "
+                "point recon stages at it"
+            ),
+            description=(
+                "Add get_task_escalations to the escalation MCP server so an auditor "
+                "of a deterministic gate task stamped metadata.gate_escalated_at can "
+                "see resolved records that were archived, and point Stage 1 / Stage 2 "
+                "at it."
+            ),
+        )
+
+        assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None, (
+            "A legitimate proposal to ADD the archive-inclusive lookup must not be "
+            "dropped by the guard — only assertion-of-absence claims are refuted."
+        )
+
+    def test_all_four_incidents_via_premise_refuted_entry(self):
+        """premise_refuted_entry composes match + verify for all four incidents
         at once against the real source root — the end-to-end shape the curator
         actually calls.
         """
@@ -742,6 +816,20 @@ class TestSeedRegistryRealSource:
                     ),
                 ),
                 "add_finding_suggested_action_no_max_length_field",
+            ),
+            (
+                CandidateTask(
+                    title=(
+                        "Fix DeterministicRunner escalation-write/closure gap for "
+                        "deterministic gate tasks"
+                    ),
+                    description=(
+                        "Task was marked done and stamped metadata.gate_escalated_at but "
+                        "no escalation record exists — get_pending_escalations(task_id) "
+                        "returns []."
+                    ),
+                ),
+                "deterministic_gate_escalation_record_archived_not_missing",
             ),
         ]
 
