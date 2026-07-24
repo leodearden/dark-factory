@@ -118,6 +118,8 @@ import contextlib
 import logging
 import os
 import shutil
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -325,6 +327,85 @@ def _plant_task_dir(base: Path, task_id: str) -> Path:
     path = base / task_id
     path.mkdir(parents=True)
     return path
+
+
+def _plant_unleased_tree(path: Path) -> Path:
+    """Create *path* with NO lease and NO holder-pgid record.
+
+    The counterpart to :func:`_plant_leased_tree`: nothing holds this
+    tree's merge-verify flock, so ``remove_merge_worktree_guarded``'s
+    non-blocking acquire succeeds and removal proceeds. Used as the merge
+    reaper's POSITIVE CONTROL -- an entry the sweep MUST remove, proving
+    the leased decoy beside it survived by refusal rather than by neglect.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _age_tree(path: Path, age_secs: float) -> None:
+    """Back-date *path*'s mtime by *age_secs* seconds.
+
+    ``SpeculativeMergeWorker.reap_orphaned_merge_worktrees`` only offers a
+    ``_merge-*`` candidate to ``GitOps.cleanup_merge_worktree`` (and thus
+    to the C1 guarded-removal primitive) once
+    ``now - entry.stat().st_mtime`` exceeds
+    :attr:`SpeculativeMergeWorker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS`
+    (9000.0) -- the register-after-create race guard. A freshly-planted
+    decoy is therefore ``continue``d past before any removal machinery
+    runs, which would make a "survives the reaper" assertion VACUOUS.
+    Pushing the mtime past that window makes the reap loop actually reach
+    the primitive, so the outcome it returns is what the assertion pins.
+
+    Only the directory's own mtime matters: the lane ``.lock`` flock file
+    is a SIBLING of the tree (``lane_lock_path``), so planting a lease
+    neither creates nor touches anything inside *path*.
+    """
+    stamp = time.time() - age_secs
+    os.utime(path, (stamp, stamp))
+
+
+class _GuardedRemovalSpy:
+    """Recording DELEGATE over ``GitOps.remove_merge_worktree_guarded``.
+
+    Mirrors the :class:`_RetireSpy` idiom (see
+    test_merge_cancel_retire.py's git_ops spy) but with one deliberate
+    difference: it does NOT fake an outcome -- it awaits the REAL bound
+    method and records what the production primitive actually answered.
+    The point of the merge-reaper leg is attribution ("this tree survived
+    BECAUSE C1 refused it"), which a faked outcome would destroy.
+
+    Installed as an INSTANCE attribute on the live GitOps object, so it
+    shadows the class method and therefore also captures
+    ``cleanup_merge_worktree``'s internal
+    ``self.remove_merge_worktree_guarded(...)`` call -- the only path by
+    which the reaper reaches C1.
+
+    ``records`` accumulates ``(path, reason, outcome)`` per call, with the
+    path resolved so it compares equal to a ``worktree_base / name`` the
+    test built (``worktree_base`` is itself resolved).
+    """
+
+    def __init__(self, inner: Callable[..., Awaitable[str]]) -> None:
+        self._inner = inner
+        self.records: list[tuple[Path, str, str]] = []
+
+    async def __call__(self, path: Path, *, reason: str) -> str:
+        outcome = await self._inner(path, reason=reason)
+        self.records.append((Path(path).resolve(), reason, outcome))
+        return outcome
+
+    def outcomes_for(
+        self, path: Path, *, records: list[tuple[Path, str, str]] | None = None,
+    ) -> list[str]:
+        """Every outcome C1 returned for *path*, in call order.
+
+        *records* accepts a caller-taken SNAPSHOT of :attr:`records` so an
+        assertion about one sweep is not contaminated by removals a
+        concurrently-running merge worker drove afterwards.
+        """
+        source = self.records if records is None else records
+        target = Path(path).resolve()
+        return [outcome for p, _reason, outcome in source if p == target]
 
 
 # ---------------------------------------------------------------------------
