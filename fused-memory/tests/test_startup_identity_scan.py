@@ -447,6 +447,7 @@ class TestInitializeSkipMaintenance:
 
 @pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
 @pytest.mark.timeout(15)
+@pytest.mark.integration
 class TestScanDuplicateEntityNamesLiveFalkorDB:
     """Pin the true B5 dup-node alarm semantics against a REAL FalkorDB
     server: real count(*) grouping by name, and the `n.group_id =
@@ -494,6 +495,7 @@ class TestScanDuplicateEntityNamesLiveFalkorDB:
 
 @pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
 @pytest.mark.timeout(15)
+@pytest.mark.integration
 class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
     """Pin the true B6 dup-uuid-edge repair semantics against a REAL
     FalkorDB server: after repair, no RELATES_TO uuid is shared by more than
