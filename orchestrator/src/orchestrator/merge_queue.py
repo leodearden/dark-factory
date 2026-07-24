@@ -9748,7 +9748,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         untouched — they remain observation + escalation only (PRD design
         decision 4); this is a deliberately SEPARATE remediation pass, not a
         change to the audit's mutation-free contract.
+
+        Rate-limited by :attr:`_reap_interval_s` (default 300s), mirroring
+        the :attr:`_last_heartbeat_at` / :attr:`_heartbeat_interval_s`
+        clock-injected idiom: :attr:`_last_reap_at` starts at 0.0 so the
+        first poll always fires, and each subsequent call is a no-op until
+        at least ``_reap_interval_s`` seconds have elapsed since the last
+        sweep. This bounds a past-grace leak's on-disk lifetime to roughly
+        ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS + _reap_interval_s`` instead of
+        up to the next restart.
         """
+        if now - self._last_reap_at < self._reap_interval_s:
+            return
         self._last_reap_at = now
         await self.reap_orphaned_merge_worktrees(now=now)
 
