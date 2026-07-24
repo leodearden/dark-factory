@@ -413,9 +413,16 @@ async def _query_stage2_flags(
       count (task-1381).
 
     Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
-    residue is reaped by the recon_ledger's TTL/terminal-task GC pass
-    (:func:`_gc_recon_markers`, task 2228 W5-κ) rather than an immediate
-    per-cycle delete by the caller.
+    residue is reaped by the in-cycle Mem0 age-GC sweep
+    (:func:`_sweep_stale_mem0_flag_for_stage2_markers`, task 2966) rather
+    than an immediate per-cycle delete by the caller. (Prior to task 2966
+    this docstring pointed at the recon_ledger's TTL/terminal-task GC pass,
+    :func:`_gc_recon_markers` — that pass STRUCTURALLY cannot reach these
+    markers: ``flag_for_stage2`` is written ONLY to Mem0 and is never
+    upserted into the recon_ledger, so ``ReconLedgerStore.gc()``'s
+    ``record_kind IN (...)`` clause never matches it.  See
+    ``recon_self_model.py``'s ``flag_for_stage2`` ``MARKER_LIFECYCLE`` entry
+    for the full declared-vs-actual explanation.)
 
     The *run_window_start* parameter is optional and defaults to ``None``
     (backward-compatible: window guard dormant, pure run_id partition applies).
@@ -693,6 +700,42 @@ _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
+# Age-based GC for the Mem0-only flag_for_stage2 Stage-1 -> Stage-2 relay pool
+# (task 2966). flag_for_stage2 markers are written ONLY to Mem0 by the
+# Stage-1 flag_dedup/LLM add_memory path (metadata.flag_for_stage2=true); no
+# code path upserts a flag_for_stage2 row into recon_ledger, so
+# ReconLedgerStore.gc()'s record_kind IN (...) clause never matches it — the
+# same declared-vs-actual gap already documented above for
+# stage2_persistence_marker (task 2228 W5-κ). Unlike stage1_flag_marker /
+# stage2_persistence_marker, these markers carry NO ``source`` metadata field
+# at all (live verification, task 2966), so the pool cannot be identified by
+# a {'source': ...} filter — it is enumerated by the boolean payload key
+# {'flag_for_stage2': True} instead (Qdrant payload filters are
+# type-sensitive; the stored value is boolean True, not the string 'true').
+# A marker Stage 2 hasn't consumed in 14+ days can never be "current" per
+# _query_stage2_flags' run_id/run-window semantics (run_ids are per-cycle;
+# Stage 2 runs many times/day) — so it is definitionally unconsumed dead
+# signal past that point; 14 days reuses the task-1944
+# STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS convention for operator consistency.
+_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 14
+_FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
+_FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
+
+# Boolean/string type-drift probe (task 2966 amendment, reviewer finding).
+# _query_stage2_flags' consumer-side check (``meta.get('flag_for_stage2')``,
+# ~line 489) is a plain truthy check — it accepts BOTH the boolean True and
+# the string 'true'. The GC filter above is type-EXACT (boolean True only),
+# because Qdrant payload filters are type-sensitive. Nothing at the
+# add_memory write boundary normalizes this key's type (it is an LLM
+# tool-call argument, and only ``_normalize_task_id_metadata`` runs
+# server-side) — so a producer writing the string 'true' instead of the
+# boolean is not structurally prevented. Such a marker would be rendered
+# and consumed normally by _query_stage2_flags but INVISIBLE to the GC
+# filter above, and would accumulate forever, silently. This filter is used
+# by _warn_on_flag_for_stage2_type_drift to probe for that condition and
+# log loudly rather than let it grow unbounded and silent.
+_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS: dict = {'flag_for_stage2': 'true'}
+
 # --- Entity-standing-decision growth-freshness sweep (task 2899 ζ) -----------
 # PRD plans/stage1-entity-standing-decision-prd.md §Staleness: a standing
 # decision's decision-time edge-count snapshot (``edge_count_at_decision``) is
@@ -907,6 +950,7 @@ async def _sweep_stale_mem0_pool(
     now: datetime | None = None,
     scroll_limit: int = 1000,
     count_short_circuit: bool = False,
+    enum_filters: dict | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -937,7 +981,11 @@ async def _sweep_stale_mem0_pool(
         project_id: Project scope for enumeration and delete calls.
         run_id: Current reconciliation run identifier used as
             ``causation_id`` in the audit journal.
-        source: The ``metadata.source`` value identifying this pool.
+        source: The ``metadata.source`` value identifying this pool. Also
+            used as the default enumeration/count filter (``{'source':
+            source}``) when ``enum_filters`` is not given, and always used
+            as the human-readable log label (e.g. in the scroll-cap
+            WARNING) regardless of which filter is actually applied.
         gc_sweep_source: The delete ``_source`` audit tag for this pool.
         max_age_days: Staleness cutoff in days.
         log_name: Public caller name, interpolated into log messages so
@@ -957,16 +1005,26 @@ async def _sweep_stale_mem0_pool(
             already-empty pool; deliberately NOT used for a still-active
             pool, where the count is almost never zero and the extra
             round-trip would be pure overhead.
+        enum_filters: Overrides the enumeration/count filter dict when the
+            pool cannot be identified by a ``{'source': source}`` payload
+            filter (e.g. a marker with no ``source`` field at all). Defaults
+            to ``None``, which preserves the ``{'source': source}`` filter
+            used by every caller before task 2966. When given, it is applied
+            verbatim to BOTH the ``count_short_circuit`` probe and the
+            enumeration scroll — ``source`` itself still supplies the
+            human-readable log label regardless.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
+    filters = enum_filters if enum_filters is not None else {'source': source}
+
     if count_short_circuit:
         try:
             count = await memory_service.count_memories_by_metadata(
                 project_id=project_id,
-                filters={'source': source},
+                filters=filters,
             )
         except Exception:
             count = None
@@ -976,7 +1034,7 @@ async def _sweep_stale_mem0_pool(
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            filters={'source': source},
+            filters=filters,
             limit=scroll_limit,
         )
     except Exception:
@@ -1179,6 +1237,151 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
     )
+
+
+async def _warn_on_flag_for_stage2_type_drift(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> None:
+    """Best-effort probe for the boolean/string type-drift gap (task 2966 review).
+
+    :func:`_sweep_stale_mem0_flag_for_stage2_markers`'s GC filter
+    (``_FLAG_FOR_STAGE2_ENUM_FILTERS`` == ``{'flag_for_stage2': True}``) is a
+    type-exact Qdrant payload match, but ``_query_stage2_flags``' consumer-side
+    check (``meta.get('flag_for_stage2')``) is a plain truthy check that also
+    accepts the string ``'true'``. Nothing at the ``add_memory`` write
+    boundary normalizes this key's type, so a producer writing the string
+    instead of the boolean would create a marker that Stage 2 renders and
+    consumes normally but that the GC filter can never see — an unbounded,
+    silent leak of exactly the shape this sweep exists to prevent.
+
+    Issues one supplementary ``count_memories_by_metadata`` call for the
+    string-typed variant (``_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS``) and
+    logs a WARNING when it is a positive integer, so drift surfaces loudly
+    instead of accumulating quietly (reviewer's stated minimum floor: "at
+    minimum add a log/metric when ... a type drift surfaces loudly rather
+    than growing unbounded and silent").
+
+    Purely diagnostic and fail-safe: any exception, or any non-``int``/
+    non-positive result (e.g. a falsy probe or an unexpected return shape),
+    is treated as "nothing to report" — this must never raise and must never
+    affect the caller's sweep count.
+    """
+    try:
+        string_variant_count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters=_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._sweep_stale_mem0_flag_for_stage2_markers: '
+            'flag_for_stage2 string-variant type-drift probe raised; skipping '
+            'this diagnostic (fail-safe, does not affect the sweep count).',
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return
+    if not isinstance(string_variant_count, int) or string_variant_count <= 0:
+        return
+    logger.warning(
+        'reconciliation._sweep_stale_mem0_flag_for_stage2_markers: found %d '
+        "flag_for_stage2 marker(s) stored as the string 'true' rather than "
+        'boolean True — _query_stage2_flags renders/consumes these normally '
+        "(truthy check) but this sweep's type-exact GC filter "
+        '(%r) can never match them, so they will accumulate forever; '
+        'investigate the producer (task 2966 review finding).',
+        string_variant_count,
+        _FLAG_FOR_STAGE2_ENUM_FILTERS,
+        extra={'project_id': project_id, 'run_id': run_id},
+    )
+
+
+async def _sweep_stale_mem0_flag_for_stage2_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    max_age_days: int = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """Age-GC the Mem0-only ``flag_for_stage2`` relay pool (task 2966).
+
+    ``flag_for_stage2`` markers are the Stage-1 -> Stage-2 relay channel:
+    written ONLY to Mem0 by the Stage-1 flag_dedup/LLM ``add_memory`` path
+    (``metadata.flag_for_stage2=true``), with no code path that ever upserts
+    a ``flag_for_stage2`` row into the ``recon_ledger`` SQLite table. This
+    means :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`
+    STRUCTURALLY cannot reap it — its ``record_kind IN (...)`` clause never
+    matches — even though ``recon_self_model.MARKER_LIFECYCLE`` classifies
+    ``flag_for_stage2`` as ``deleter=DELETER_GC`` (see that module for the
+    declared-vs-actual explanation, mirroring the identical
+    ``stage2_persistence_marker`` gap from task 2228 W5-κ). Absent this
+    sweep, the pool accumulates forever. This is the live in-cycle collector.
+
+    Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
+    shared enumerate -> age-filter -> gather_collect-delete -> count
+    skeleton, passing ``enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS`` — the
+    DISTINCT boolean payload filter ``{'flag_for_stage2': True}`` — because
+    these markers carry no ``source`` metadata field to filter on (unlike
+    ``stage1_flag_marker`` / ``stage2_persistence_marker`` above), and
+    because the stored value is a boolean ``True``, not the string ``'true'``
+    (Qdrant payload filters are type-sensitive; live verification against
+    dark_factory Mem0 confirmed this shape). See
+    :func:`_sweep_stale_mem0_pool`'s docstring for the fail-safe posture.
+
+    Passes ``count_short_circuit=True``: unlike ``stage2_persistence_marker``
+    (written nearly every cycle that has surviving flags), Stage-1 writes a
+    ``flag_for_stage2`` marker only intermittently — whenever Stage 1 flags
+    an item for Stage 2 — so an empty pool is a plausible steady state,
+    especially on the many non-dark_factory projects this per-project
+    every-cycle sweep also runs on. A cheap
+    ``count_memories_by_metadata`` probe short-circuits that steady state;
+    it fails OPEN (see :func:`_sweep_stale_mem0_pool`'s docstring), so this
+    can only ever skip a scroll that would itself have found nothing.
+
+    After the primary sweep, also runs
+    :func:`_warn_on_flag_for_stage2_type_drift` (task 2966 amendment,
+    reviewer finding) — a supplementary best-effort probe for markers stored
+    with the string ``'true'`` instead of boolean ``True``, which the
+    type-exact GC filter above can never see even though such markers are
+    consumed normally by ``_query_stage2_flags``'s truthy check. Purely
+    diagnostic: never affects this function's return value.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata``,
+            ``delete_memory``, and ``count_memories_by_metadata``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        max_age_days: Staleness cutoff in days (default
+            ``_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS`` == 14).
+        now: Reference "current time" for the cutoff calculation. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale, on
+        enumeration failure, or on a confirmed-empty count short-circuit).
+    """
+    swept = await _sweep_stale_mem0_pool(
+        memory_service,
+        project_id,
+        run_id,
+        source='flag_for_stage2',
+        gc_sweep_source=_FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+        max_age_days=max_age_days,
+        log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+        now=now,
+        scroll_limit=scroll_limit,
+        count_short_circuit=True,
+        enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+    )
+    # Diagnostic-only; never affects the returned sweep count (task 2966
+    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
+    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
+    return swept
 
 
 async def _sweep_entity_standing_decision_growth(
@@ -2693,6 +2896,20 @@ class TaskKnowledgeSync(BaseStage):
         # explicit zero for the same reason as the two GC stats above.
         report.stats['stale_mem0_flag_markers_gc_swept'] = await _sweep_stale_mem0_flag_markers(
             self.memory, self.project_id, run_id,
+        )
+
+        # Mem0-only flag_for_stage2 relay pool (task 2966): its only writer is
+        # the Stage-1 flag_dedup/LLM add_memory path, which writes solely to
+        # Mem0 (metadata.flag_for_stage2=true) — no code path upserts a
+        # flag_for_stage2 row into the recon_ledger, so ReconLedgerStore.gc()
+        # structurally cannot reach this pool (the same declared-vs-actual
+        # gap as stage2_persistence_marker above). Runs unconditionally every
+        # cycle, per-project, alongside the three sibling GC passes; explicit
+        # value so downstream consumers never need a .get(..., 0) fallback.
+        report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                self.memory, self.project_id, run_id,
+            )
         )
 
         # Entity-standing-decision growth-freshness sweep (task 2899 ζ) — a

@@ -7082,6 +7082,330 @@ class TestSweepStaleMem0FlagMarkers:
         memory_service.get_memories_by_metadata.assert_awaited_once()
 
 
+class TestSweepStaleMem0FlagForStage2Markers:
+    """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
+    flag_for_stage2 Stage-1 -> Stage-2 relay pool (task 2966).
+
+    flag_for_stage2 markers are written ONLY to Mem0 by the Stage-1
+    flag_dedup/LLM add_memory path (metadata.flag_for_stage2=true); no code
+    path upserts a flag_for_stage2 row into recon_ledger, so
+    ReconLedgerStore.gc()'s record_kind IN (...) clause never matches it —
+    the identical declared-vs-actual gap already documented for
+    stage2_persistence_marker (task 2228 W5-κ). This helper closes that gap
+    by delegating to the shared _sweep_stale_mem0_pool skeleton with a
+    DISTINCT enumeration/count filter: the boolean payload key
+    {'flag_for_stage2': True}, not a {'source': ...} filter (these markers
+    carry no source field) and not the string 'true' (Qdrant payload
+    filters are type-sensitive; live verification found the stored value is
+    boolean True).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_markers_deleted_fresh_marker_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'stale-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't1', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'stale-2',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't2', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'fresh-1',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {
+                    'flag_for_stage2': True, 'task_id': 't3', 'run_id': 'prior-run',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        assert 'fresh-1' not in deleted_ids
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r1'
+            assert kwargs.get('_source') == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters == {'flag_for_stage2': True}
+
+        # Deterministic scroll only — semantic search must never be used for GC.
+        memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_skips_scroll_when_count_is_zero(self):
+        """When count_memories_by_metadata reports an exact 0, the scroll is
+        skipped entirely — mirrors the stage1_flag_marker short circuit
+        (task 2853 review), applied here with the boolean flag_for_stage2
+        filter instead of a source filter.
+
+        The wrapper also issues a second, supplementary count call — the
+        string-variant type-drift probe (task 2966 amendment, reviewer
+        finding; see TestWarnOnFlagForStage2TypeDrift) — after the primary
+        sweep completes. Both calls return 0 here, so no drift is present
+        and the scroll still never runs.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1',
+        )
+
+        assert result == 0
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        filters_seen = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': True} in filters_seen
+        assert {'flag_for_stage2': 'true'} in filters_seen
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_short_circuit_fails_open_to_scroll_on_error(self):
+        """A count_memories_by_metadata failure must fall through to the
+        normal scroll path unchanged, not skip the sweep — the short circuit
+        may only ever skip work the scroll would itself have found empty."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wrapper_surfaces_type_drift_warning(self, caplog):
+        """End-to-end: when the string-'true' variant probe is positive, the
+        wrapper logs a loud WARNING (task 2966 amendment, reviewer finding).
+
+        _query_stage2_flags' consumer-side check is a plain truthy check
+        that accepts both boolean True and the string 'true', but the GC
+        filter above is type-exact (boolean True only) — so a string-typed
+        marker is consumed/rendered normally but invisible to this sweep and
+        would accumulate forever. This is the reviewer's stated minimum
+        floor: surface that drift loudly rather than growing unbounded and
+        silent.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        async def _count_side_effect(*, project_id, filters):
+            if filters == {'flag_for_stage2': 'true'}:
+                return 5
+            return 0  # boolean-filter probe: primary pool short-circuits empty
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_side_effect)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_mem0_flag_for_stage2_markers(
+                memory_service, 'reify', run_id='r1',
+            )
+
+        # Diagnostic-only: the drift warning must never affect the sweep's
+        # own return value (the primary boolean pool was genuinely empty).
+        assert result == 0
+        drift_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'flag_for_stage2' in rec.getMessage()
+            and "'true'" in rec.getMessage()
+        ]
+        assert len(drift_records) == 1, (
+            f'Expected exactly one type-drift WARNING; got: '
+            f'{[(r.levelno, r.message) for r in caplog.records]}'
+        )
+        assert '5' in drift_records[0].getMessage()
+
+
+class TestWarnOnFlagForStage2TypeDrift:
+    """_warn_on_flag_for_stage2_type_drift: best-effort boolean/string
+    type-drift diagnostic for the flag_for_stage2 GC sweep (task 2966
+    amendment, reviewer finding).
+
+    _query_stage2_flags' consumer-side check (``meta.get('flag_for_stage2')``)
+    is a plain truthy check that accepts both the boolean ``True`` and the
+    string ``'true'``, but _sweep_stale_mem0_flag_for_stage2_markers' GC
+    filter is type-exact (boolean ``True`` only, since Qdrant payload
+    filters are type-sensitive). A marker written with the string variant
+    would be consumed/rendered normally by Stage 2 but invisible to the GC
+    filter — an unbounded, silent leak. This helper probes for that
+    condition and must log loudly when found, while never raising or
+    otherwise affecting the caller.
+    """
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_string_variant_present(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=3)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        memory_service.count_memories_by_metadata.assert_awaited_once()
+        call = memory_service.count_memories_by_metadata.call_args
+        assert call.kwargs.get('project_id') == 'reify'
+        assert call.kwargs.get('filters') == {'flag_for_stage2': 'true'}
+
+        warning_records = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        assert len(warning_records) == 1
+        assert '3' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_string_variant_absent(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_exception_is_swallowed_but_logged(self, caplog):
+        """A count_memories_by_metadata failure must never raise (this probe
+        is purely diagnostic and best-effort), but the swallowed exception is
+        logged at WARNING with exc_info so it surfaces loudly rather than
+        silently — required by the repo-wide silent-fallthrough gate."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down'),
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            # Must not raise.
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        probe_warnings = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+        ]
+        # Exactly one fail-safe warning naming the swallowed probe failure;
+        # the string-variant drift warning must NOT fire (the probe never
+        # produced a count).
+        assert len(probe_warnings) == 1
+        assert 'probe raised' in probe_warnings[0].getMessage()
+        assert probe_warnings[0].exc_info is not None
+
+    @pytest.mark.asyncio
+    async def test_non_int_result_is_treated_as_nothing_to_report(self, caplog):
+        """A non-int return (unexpected backend shape) must not crash log
+        formatting — treated as fail-safe "nothing to report", not a warning."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _warn_on_flag_for_stage2_type_drift,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
+
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            for rec in caplog.records
+        )
+
+
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
 
@@ -8190,6 +8514,166 @@ class TestTaskKnowledgeSyncStaleMem0FlagMarkersGcSweptStat:
 
         assert 'stale_mem0_flag_markers_gc_swept' in report.stats
         assert report.stats['stale_mem0_flag_markers_gc_swept'] == 0
+
+
+class TestTaskKnowledgeSyncStaleMem0FlagForStage2MarkersGcSweptStat:
+    """TaskKnowledgeSync.run() sets
+    report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] after
+    super().run() (task 2966).
+
+    Monkeypatches the module-level _sweep_stale_mem0_flag_for_stage2_markers
+    helper rather than arranging real Mem0 flag_for_stage2 state — the
+    helper's own behavior is covered exhaustively by
+    TestSweepStaleMem0FlagForStage2Markers; these tests verify only that
+    run() calls it and threads its count into report.stats. Also patches the
+    three sibling GC helpers (_gc_recon_markers, _sweep_stale_persistence_markers,
+    _sweep_stale_mem0_flag_markers) purely for hermetic isolation — this
+    class's assertions are about the NEW stat only, but all four GC passes
+    run back-to-back in run() and an unpatched real _gc_recon_markers would
+    otherwise touch memory_service.recon_ledger/taskmaster attributes this
+    fixture does not configure.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_stat_set_after_run(self, mock_deps):
+        """run() calls _sweep_stale_mem0_flag_for_stage2_markers(self.memory,
+        self.project_id, run_id) exactly once and injects its return value
+        into report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'],
+        coexisting with the three sibling GC stats (none overwrites another)."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=5),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=4),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=3),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=7),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stale_mem0_flag_for_stage2_markers_gc_swept') == 7
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run',
+        )
+
+        # The sibling GC passes are independent and all run every cycle —
+        # none overwrites another in report.stats.
+        assert report.stats.get('recon_markers_gc_swept') == 5
+        assert report.stats.get('stale_persistence_markers_gc_swept') == 4
+        assert report.stats.get('stale_mem0_flag_markers_gc_swept') == 3
+
+    @pytest.mark.asyncio
+    async def test_stat_explicit_zero(self, mock_deps):
+        """When nothing is stale, the stat is 0 — explicitly set, not absent — so
+        downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._gc_recon_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_markers',
+                new=AM(return_value=0),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._sweep_stale_mem0_flag_for_stage2_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'stale_mem0_flag_for_stage2_markers_gc_swept' in report.stats
+        assert report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] == 0
 
 
 class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
