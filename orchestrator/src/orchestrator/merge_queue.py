@@ -3868,27 +3868,64 @@ async def retire_cancelled_merge_request(
 
         # (2) Route the in-flight worktree through the C1 primitive and emit
         # worktree_reaped (mirrors the C3 REPLACE arm, merge_queue.py:4186-4203).
+        #
+        # GUARDED: a git/IO failure in the find/remove/emit below must NOT
+        # propagate out of merge_cancel.  By this point the future is already
+        # cancelled and the slot released (steps above), so an escaping
+        # exception would (a) skip the yield-then-forget in step (3), leaving
+        # the sticky 'abandoned' record to shadow an immediate resubmit, and
+        # (b) hand the MCP caller an exception instead of the documented
+        # {cancelled: True, state: 'abandoned'} contract — even though the
+        # cancel itself succeeded.  Log loudly (loud-over-silent) and fall
+        # through so step (3) always clears the sticky result; the reaper
+        # collects any worktree left behind by the failed reap later (PRD D4).
         if git_ops is not None:
-            wt = await git_ops.find_inflight_merge_worktree(branch)
-            if wt is not None:
-                outcome = await git_ops.remove_merge_worktree_guarded(
-                    wt, reason=_MERGE_CANCEL_RETIRE_REASON,
-                )
-                if event_store is not None:
-                    event_store.emit(
-                        EventType.worktree_reaped,
-                        task_id=task_id,
-                        phase='merge',
-                        data={
-                            'branch': branch,
-                            'path': str(wt),
-                            'reason': _MERGE_CANCEL_RETIRE_REASON,
-                            'outcome': outcome,
-                        },
+            try:
+                wt = await git_ops.find_inflight_merge_worktree(branch)
+                if wt is not None:
+                    outcome = await git_ops.remove_merge_worktree_guarded(
+                        wt, reason=_MERGE_CANCEL_RETIRE_REASON,
                     )
+                    if event_store is not None:
+                        event_store.emit(
+                            EventType.worktree_reaped,
+                            task_id=task_id,
+                            phase='merge',
+                            data={
+                                'branch': branch,
+                                'path': str(wt),
+                                'reason': _MERGE_CANCEL_RETIRE_REASON,
+                                'outcome': outcome,
+                            },
+                        )
+            except Exception:
+                # CancelledError (BaseException) is intentionally NOT caught —
+                # a cancellation of the retirement coroutine itself must
+                # propagate.
+                logger.warning(
+                    'retire_cancelled_merge_request: worktree reap failed for '
+                    'branch %r (request_id=%r); degrading to sticky-clear only '
+                    '(fail-safe, I3) — the reaper collects any orphan later',
+                    branch, request_id,
+                    exc_info=True,
+                )
 
     # (3) Yield-then-forget: let the cancel's _on_finalized record 'abandoned'
     # FIRST, then clear the sticky per-request_id result permanently.
+    #
+    # ORDERING INVARIANT — this is correct only while
+    # ``enqueue_merge_request._on_finalized`` stays a SYNCHRONOUS done-callback
+    # (it calls ``retention.record`` BEFORE any await).  ``future.cancel()``
+    # schedules that callback via ``call_soon``, so it runs to completion on the
+    # first loop turn — one ``sleep(0)`` already suffices for the record to land.
+    # ``yields`` defaults to 3 (not 1) purely as belt-and-suspenders slack: once
+    # the record has landed each extra ``sleep(0)`` is a harmless no-op turn, and
+    # the margin absorbs a future leading await should ``_on_finalized`` ever
+    # gain one.  If that callback is ever made async such that ``record()`` lands
+    # AFTER an await, ``forget()`` here could win the race and a stale
+    # 'abandoned' record would survive — keep ``record()`` ahead of every await
+    # there, or gate this off the future's done/callback state instead of a fixed
+    # yield count.
     for _ in range(yields):
         await asyncio.sleep(0)
     if retention is not None:
