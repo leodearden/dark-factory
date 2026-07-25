@@ -2577,7 +2577,7 @@ async def test_no_auto_unhalt_when_disabled(
         await asyncio.wait_for(harness.run_loop(), timeout=0.3)
 
     unhalt_spy.assert_not_awaited()
-    rfc_mock.assert_not_called()
+    rfc_mock.assert_not_awaited()
     assert harness.judge.is_halted('test-project')  # still halted
 
 
@@ -2614,7 +2614,7 @@ async def test_no_auto_unhalt_before_cooldown_expiry(
         await asyncio.wait_for(harness.run_loop(), timeout=0.3)
 
     unhalt_spy.assert_not_awaited()
-    rfc_mock.assert_not_called()
+    rfc_mock.assert_not_awaited()
     assert harness.judge.is_halted('test-project')
 
 
