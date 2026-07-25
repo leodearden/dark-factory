@@ -600,6 +600,24 @@ Review this run and provide your verdict as JSON.
     def is_halted(self, project_id: str) -> bool:
         return project_id in self._halted_projects
 
+    def cooldown_expired(self, project_id: str) -> bool:
+        """True iff ``project_id`` is halted AND its recorded halt cooldown has
+        passed (``cooldown_until <= now``).
+
+        The harness uses this to decide auto-resume-after-cooldown when
+        ``auto_unhalt_after_cooldown`` is enabled (task 2920 deliverable c).
+        Returns False if the project is not halted, if no ``cooldown_until`` was
+        recorded, or if the cooldown is still in the future. Uses
+        ``datetime.now(UTC)`` directly, mirroring ``_check_error_trends`` /
+        ``_apply_halt`` (no injected clock).
+        """
+        if project_id not in self._halted_projects:
+            return False
+        cooldown_until = self._halt_cooldown_until.get(project_id)
+        if cooldown_until is None:
+            return False
+        return cooldown_until <= datetime.now(UTC)
+
     def halt_reason(self, project_id: str) -> str | None:
         """The reason the project was last halted, or None if not halted.
 

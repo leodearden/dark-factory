@@ -599,6 +599,26 @@ class TestReconciliationConfigJudgeInfraMaxConsecutiveFailures:
             ReconciliationConfig(judge_infra_max_consecutive_failures=-1)
 
 
+class TestReconciliationAutoUnhaltAfterCooldown:
+    """Tests for auto_unhalt_after_cooldown (task 2920 deliverable c).
+
+    When True, a judge-halted project is auto-unhalted (with the normal
+    post-unhalt grace) once its halt cooldown expires, so a transient/suspect
+    halt self-heals instead of sitting forever. Default False preserves the
+    legacy halt-until-manual-unhalt semantics for every existing test and
+    other deployments.
+    """
+
+    def test_default_is_false(self):
+        assert ReconciliationConfig().auto_unhalt_after_cooldown is False
+
+    def test_explicit_true_accepted(self):
+        assert (
+            ReconciliationConfig(auto_unhalt_after_cooldown=True).auto_unhalt_after_cooldown
+            is True
+        )
+
+
 class TestReconciliationConfigBacklogIterationBudget:
     """Tests for backlog_iteration_budget_seconds — the cumulative per-invocation
     wall-clock budget for BacklogIterator.run() (task 2040)."""

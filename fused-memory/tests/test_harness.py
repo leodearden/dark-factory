@@ -2483,6 +2483,228 @@ async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_me
     assert harness.judge.unhalt_grace_remaining('test-project') == 1
 
 
+async def _fake_completed_cycle(*_a, **_k):
+    """Stand-in for run_full_cycle so the auto-unhalt tests don't run a real
+    reconciliation cycle. Returns a completed ReconciliationRun."""
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+    )
+
+    return ReconciliationRun(
+        id=str(uuid.uuid4()),
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='auto_unhalt',
+        started_at=datetime.now(UTC),
+        events_processed=0,
+        status=RunStatus.completed,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_unhalt_resumes_after_cooldown_expiry(
+    journal, event_buffer, mock_memory_service
+):
+    """With auto_unhalt_after_cooldown enabled and the halt cooldown expired,
+    the halt-check auto-unhalts the project (awaiting judge.unhalt) and FALLS
+    THROUGH to run the cycle instead of skipping (task 2920 deliverable c)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    harness.config.auto_unhalt_after_cooldown = True
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) - timedelta(hours=1)  # expired
+    )
+    # Spy on unhalt while preserving real behaviour (clears halt, seeds grace).
+    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    harness.judge.unhalt = unhalt_spy
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ) as rfc_mock,
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.5)
+
+    unhalt_spy.assert_awaited()
+    assert unhalt_spy.await_args is not None
+    assert unhalt_spy.await_args.args[0] == 'test-project'
+    assert not harness.judge.is_halted('test-project')  # halt cleared
+    assert rfc_mock.called, 'cycle must NOT be early-returned after auto-unhalt'
+
+
+@pytest.mark.asyncio
+async def test_no_auto_unhalt_when_disabled(
+    journal, event_buffer, mock_memory_service
+):
+    """Default (auto_unhalt_after_cooldown=False): an expired-cooldown halt is
+    still SKIPPED — legacy halt-until-manual-unhalt behaviour preserved."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    harness.config.auto_unhalt_after_cooldown = False
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) - timedelta(hours=1)  # expired, but feature disabled
+    )
+    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    harness.judge.unhalt = unhalt_spy
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ) as rfc_mock,
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+    unhalt_spy.assert_not_awaited()
+    rfc_mock.assert_not_awaited()
+    assert harness.judge.is_halted('test-project')  # still halted
+
+
+@pytest.mark.asyncio
+async def test_no_auto_unhalt_before_cooldown_expiry(
+    journal, event_buffer, mock_memory_service
+):
+    """Enabled but cooldown still in the FUTURE → still skipped, because
+    cooldown_expired is False."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+
+    harness.config.auto_unhalt_after_cooldown = True
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) + timedelta(hours=1)  # not yet expired
+    )
+    unhalt_spy = AsyncMock(side_effect=harness.judge.unhalt)
+    harness.judge.unhalt = unhalt_spy
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ) as rfc_mock,
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+    unhalt_spy.assert_not_awaited()
+    rfc_mock.assert_not_awaited()
+    assert harness.judge.is_halted('test-project')
+
+
+@pytest.mark.asyncio
+async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
+    journal, event_buffer, mock_memory_service
+):
+    """The self-healing/re-latch contract (task 2920 RCA): an auto-unhalt seeds
+    post-unhalt grace just like a manual unhalt, AND clears the per-process
+    _halt_escalated sentinel so a subsequent re-halt re-fires a distinct, loud
+    escalation (the ~30-min drumbeat). Guards against a regression that broke
+    grace-seeding or _halt_escalated clearing on the AUTO path specifically."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.judge is not None
+    assert harness.config.halt_grace_cycles > 0  # precondition for grace-seeding
+
+    # Wire a backlog policy so _notify_judge_halt actually escalates, and
+    # pre-seed the sentinel as if the halt had already been escalated once
+    # before its cooldown expired (the incident's starting state).
+    harness._backlog_policy = MagicMock()
+    harness._backlog_policy.on_judge_halt = AsyncMock()
+    harness._halt_escalated.add('test-project')
+
+    harness.config.auto_unhalt_after_cooldown = True
+    harness.judge._halted_projects.add('test-project')
+    harness.judge._halt_cooldown_until['test-project'] = (
+        datetime.now(UTC) - timedelta(hours=1)  # expired
+    )
+
+    # Capture the grace counter at the instant the auto path calls judge.unhalt,
+    # BEFORE the resumed cycles consume it down — so assertion (1) isolates the
+    # SEEDING performed by the auto path from later per-cycle consumption (the
+    # driven loop spins several cycles because the mocked run_full_cycle never
+    # drains the buffer, so a post-loop read would race that consumption to 0).
+    grace_at_unhalt: dict[str, int] = {}
+    # Bind the bound methods here (harness.judge is narrowed non-None by the
+    # assert above) so the closure captures them already-narrowed.
+    real_unhalt = harness.judge.unhalt
+    grace_remaining = harness.judge.unhalt_grace_remaining
+
+    async def _capture_grace(pid):
+        await real_unhalt(pid)  # real unhalt seeds grace + clears _halt_escalated
+        grace_at_unhalt[pid] = grace_remaining(pid)
+
+    unhalt_mock = AsyncMock(side_effect=_capture_grace)
+    harness.judge.unhalt = unhalt_mock
+
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    harness._recover_stale_runs = AsyncMock(return_value=None)
+    harness._start_escalation_server = AsyncMock()
+    harness._stop_escalation_server = AsyncMock()
+
+    with (
+        patch.object(
+            harness, 'run_full_cycle', side_effect=_fake_completed_cycle,
+        ),
+        contextlib.suppress(TimeoutError),
+    ):
+        # 1.0s (vs the sibling tests' 0.5s) gives the driven loop extra headroom
+        # to reach the auto-unhalt branch under parallel-suite load, so a timing
+        # miss can't masquerade as a grace/sentinel regression.
+        await asyncio.wait_for(harness.run_loop(), timeout=1.0)
+
+    # Precondition: the auto-unhalt branch actually fired (distinguishes a real
+    # grace/sentinel regression below from a mere timing miss reaching the branch).
+    unhalt_mock.assert_awaited()
+
+    # (1) The auto path seeded post-unhalt grace exactly like a manual unhalt
+    # (halt_grace_cycles=3), captured at unhalt-time before the resumed cycles
+    # consumed it down.
+    assert grace_at_unhalt.get('test-project', 0) > 0
+    assert not harness.judge.is_halted('test-project')  # halt cleared
+
+    # (2) The unhalt callback cleared the _halt_escalated sentinel — the auto
+    # path did NOT re-escalate itself (skip branch was bypassed)...
+    assert 'test-project' not in harness._halt_escalated
+    harness._backlog_policy.on_judge_halt.assert_not_called()
+
+    # ...so if the judge re-halts (still-sick pipeline), the halt re-escalates
+    # rather than being deduped away — a distinct, loud signal per re-halt.
+    harness.judge._halted_projects.add('test-project')
+    await harness._notify_judge_halt('test-project', reason='re-halt after auto-resume')
+    harness._backlog_policy.on_judge_halt.assert_called_once()
+    args = harness._backlog_policy.on_judge_halt.call_args.args
+    assert args[0] == 'test-project'
+    assert args[1] == 're-halt after auto-resume'
+
+
 @pytest.mark.asyncio
 async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_memory_service):
     """_make_stages() returns fresh stage instances with no leftover per-run state.

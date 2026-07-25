@@ -22,7 +22,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -43,6 +43,15 @@ OrchestratorDetector = Callable[[str], bool]
 """Callable that takes a project_root path and returns True iff orchestrator is live."""
 
 TimeProvider = Callable[[], float]
+
+# Escalation-id prefix per fault kind. A judge halt and a drainer wedge each get
+# a DISTINCT prefix so they are never mis-identified as (or absorbed into)
+# generic backlog-overflow noise. See task 2920 deliverable (a).
+_ESC_ID_PREFIXES: dict[str, str] = {
+    'backlog': 'esc-reconciliation-backlog-',
+    'judge_halt': 'esc-reconciliation-halt-',
+    'wedge': 'esc-reconciliation-wedge-',
+}
 
 
 @dataclass(frozen=True)
@@ -79,9 +88,15 @@ class BacklogVerdict:
 
 @dataclass
 class _PolicyState:
-    """Per-project mutable state: last-escalation timestamp + root cache."""
+    """Per-project mutable state: per-kind last-escalation timestamps + root cache.
 
-    last_escalation_ts: float = 0.0
+    ``last_escalation_ts`` is keyed by escalation kind ('backlog' | 'judge_halt'
+    | 'wedge') so each fault class is rate-limited on an INDEPENDENT clock — a
+    hot backlog can never suppress a judge-halt or wedge escalation, and
+    vice-versa (task 2920 deliverable (a)).
+    """
+
+    last_escalation_ts: dict[str, float] = field(default_factory=dict)
     project_root: str | None = None
 
 
@@ -179,15 +194,19 @@ class BacklogPolicy:
         return await self._route_over_limit(
             project_id=project_id,
             backlog=backlog,
+            kind='backlog',
             error_type='ReconciliationBacklogExceeded',
             summary=(
                 f'Reconciliation backlog exceeded for {project_id}: '
                 f'{backlog}/{limit}'
             ),
             detail=(
-                f'Buffered events + queue depth = {backlog}, threshold = '
-                f'{limit}. Drain the backlog (run reconciliation '
-                f'or trigger_reconciliation) before retrying.'
+                f'reconciliation_backlog (buffered events + queue depth + '
+                f'retries) = {backlog} vs threshold {limit}. Drain the backlog '
+                f'(run reconciliation or trigger_reconciliation), then confirm '
+                f"the drain via get_queue_stats(project_id='{project_id}')."
+                f'reconciliation_backlog — NOT the durable-write-queue counts, '
+                f'a different subsystem that stays ~0.'
             ),
             suggested_action='drain_reconciliation',
         )
@@ -203,8 +222,9 @@ class BacklogPolicy:
         return await self._route_over_limit(
             project_id=project_id,
             backlog=backlog,
+            kind='judge_halt',
             error_type='ReconciliationJudgeHalted',
-            summary=f'Reconciliation judge halted for {project_id}',
+            summary=f'Reconciliation HALTED for {project_id}: {reason}',
             detail=(
                 f'Judge halted reconciliation for project {project_id}: '
                 f'{reason}. Backlog at halt: {backlog}.'
@@ -226,6 +246,7 @@ class BacklogPolicy:
             verdict = await self._route_over_limit(
                 project_id=project_id,
                 backlog=backlog,
+                kind='wedge',
                 error_type='SqliteDrainerWedged',
                 summary=f'SQLite drainer wedged for {project_id}',
                 detail=(
@@ -251,12 +272,17 @@ class BacklogPolicy:
         *,
         project_id: str,
         backlog: int,
+        kind: str,
         error_type: str,
         summary: str,
         detail: str,
         suggested_action: str,
     ) -> BacklogVerdict:
-        """Either write an escalation (if orchestrator live) or return a rejection."""
+        """Either write an escalation (if orchestrator live) or return a rejection.
+
+        ``kind`` ('backlog' | 'judge_halt' | 'wedge') selects the escalation-id
+        prefix and the independent per-kind rate-limit bucket (task 2920 (a)).
+        """
         limit = self.hard_limit_for(project_id)
         project_root = self.project_root_for(project_id)
         if project_root is not None and self._detector(project_root):
@@ -265,6 +291,7 @@ class BacklogPolicy:
                 project_root=project_root,
                 backlog=backlog,
                 threshold=limit,
+                kind=kind,
                 error_type=error_type,
                 summary=summary,
                 detail=detail,
@@ -294,28 +321,37 @@ class BacklogPolicy:
         project_root: str,
         backlog: int,
         threshold: int,
+        kind: str,
         error_type: str,
         summary: str,
         detail: str,
         suggested_action: str,
     ) -> Path | None:
-        """Write an escalation JSON unless rate-limited. Returns path on write."""
+        """Write an escalation JSON unless rate-limited. Returns path on write.
+
+        Rate-limiting is per-(project, ``kind``): a backlog escalation never
+        suppresses a judge-halt or wedge escalation within the window, and
+        vice-versa (task 2920 (a)). The id prefix is derived from ``kind`` so a
+        halt/wedge is never mis-filed as 'backlog'.
+        """
         async with self._lock:
             state = self._state.setdefault(project_id, _PolicyState())
             now = self._now()
-            if (now - state.last_escalation_ts) < self._rate_limit_seconds:
+            last = state.last_escalation_ts.get(kind, 0.0)
+            if (now - last) < self._rate_limit_seconds:
                 logger.info(
-                    'backlog_policy: rate-limited escalation for %s (%.0fs since last)',
-                    project_id, now - state.last_escalation_ts,
+                    'backlog_policy: rate-limited %s escalation for %s (%.0fs since last)',
+                    kind, project_id, now - last,
                 )
                 return None
-            state.last_escalation_ts = now
+            state.last_escalation_ts[kind] = now
 
         esc_dir = Path(project_root) / 'data' / 'escalations'
         esc_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.fromtimestamp(self._now(), tz=UTC).isoformat()
         safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
-        esc_id = f'esc-reconciliation-backlog-{safe_ts}'
+        prefix = _ESC_ID_PREFIXES.get(kind, _ESC_ID_PREFIXES['backlog'])
+        esc_id = f'{prefix}{safe_ts}'
         path = esc_dir / f'{esc_id}.json'
 
         record = {

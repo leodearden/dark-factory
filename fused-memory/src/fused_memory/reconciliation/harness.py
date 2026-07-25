@@ -2195,27 +2195,59 @@ class ReconciliationHarness:
 
                 # Halt check
                 if self.judge and self.judge.is_halted(project_id):
-                    logger.warning(f'Skipping cycle for halted project {project_id}')
-                    await self._notify_judge_halt(
-                        project_id,
-                        # Thread the REAL halt reason (infra 'judge-unreachable …',
-                        # 'Unparseable judge response …', or 'Serious verdict …')
-                        # into the escalation instead of a hardcoded generic
-                        # string (task 2947 ask b). Falls back when unset.
-                        reason=(
+                    if (
+                        self.config.auto_unhalt_after_cooldown
+                        and self.judge.cooldown_expired(project_id)
+                    ):
+                        # Auto-resume-after-cooldown (task 2920 deliverable c):
+                        # the halt cooldown has expired and this deployment opted
+                        # in, so unhalt (which seeds the normal post-unhalt grace
+                        # and clears the per-process _halt_escalated sentinel via
+                        # the unhalt callback so a re-halt re-escalates) and FALL
+                        # THROUGH to run the cycle. The judge re-halts on the very
+                        # next serious verdict / infra-failure threshold if the
+                        # pipeline is still sick — re-firing a distinct, loud halt
+                        # escalation — rather than resuming silently forever.
+                        halt_reason_text = (
                             self.judge.halt_reason(project_id)
                             or 'judge halted reconciliation'
-                        ),
-                    )
-                    try:
-                        await self._replay_deferred_writes(ProjectId(project_id))
-                    finally:
-                        # Scope the release to this instance — see
-                        # plans/recon-stale-recovery-rca.md.
-                        await self.buffer.mark_run_complete(
-                            project_id, instance_id=self.buffer.instance_id,
                         )
-                    return  # Don't keep spinning on a halted project
+                        logger.warning(
+                            f'Auto-unhalting {project_id} after halt cooldown '
+                            f'expiry — {halt_reason_text}; resuming with '
+                            f'post-unhalt grace (judge will re-halt if still sick)'
+                        )
+                        await self.judge.unhalt(project_id)
+                        # Record the resumed cycle's provenance as the auto-unhalt
+                        # resume — NOT the stale halt reason — so run history
+                        # reflects the true cause. `reason` (the buffer's
+                        # should_trigger reason) is preserved for context and is
+                        # passed to run_full_cycle below as trigger_reason.
+                        # Deliberately NO return: fall through to the normal
+                        # consume_grace_cycle + cycle path below.
+                        reason = f'auto_unhalt_after_cooldown (buffer: {reason})'
+                    else:
+                        logger.warning(f'Skipping cycle for halted project {project_id}')
+                        await self._notify_judge_halt(
+                            project_id,
+                            # Thread the REAL halt reason (infra 'judge-unreachable …',
+                            # 'Unparseable judge response …', or 'Serious verdict …')
+                            # into the escalation instead of a hardcoded generic
+                            # string (task 2947 ask b). Falls back when unset.
+                            reason=(
+                                self.judge.halt_reason(project_id)
+                                or 'judge halted reconciliation'
+                            ),
+                        )
+                        try:
+                            await self._replay_deferred_writes(ProjectId(project_id))
+                        finally:
+                            # Scope the release to this instance — see
+                            # plans/recon-stale-recovery-rca.md.
+                            await self.buffer.mark_run_complete(
+                                project_id, instance_id=self.buffer.instance_id,
+                            )
+                        return  # Don't keep spinning on a halted project
 
                 # Decrement post-unhalt grace counter. A just-unhalted project
                 # runs `halt_grace_cycles` cycles with trend detection skipped,
