@@ -161,15 +161,26 @@ Branches 1 and 2 are **domain-weighted**: they fire heavily for numerical/scient
 
 ## G7 — Design invariants pass
 
-**Level:** **block** (decompose); advisory in author mode (walk the sketch against the questions early — cheapest fix point).
+**Level:** **block** (decompose) when the project has adopted an invariant list; **advisory** when it has not (see *Application* below), and advisory in author mode either way (walk the sketch against the questions early — cheapest fix point).
 
-**What it catches.** Designs that re-introduce the agent-legibility survey's five cross-cutting root causes (§3): prose contracts, log-scraped stories, uncorroborated action, silent fail-soft, lock-step duplication.
+**What it catches.** Designs that re-introduce a project's known cross-cutting root causes. Dark-factory's five come from the agent-legibility survey (§3): prose contracts, log-scraped stories, uncorroborated action, silent fail-soft, lock-step duplication. Another project's list is derived from *its* own failure history and will name different causes.
 
-**Application (decompose).** After the G6 re-check, Read `docs/legibility/design-invariants.md` — it is the single normative list; do **not** restate the invariants in this section beyond their slugs, per INV-5 (`no-lockstep-duplication`). Walk **every task in the batch** (not only leaves — violations attach to mechanisms, which intermediates introduce too) against each invariant's checkable question. Trigger shapes: adds a detector/suppressor/fallback without a storm escape (`storm-escape-required`)? a tool without a declared filter/envelope convention (`contracts-machine-checked`)? a contract in prose (`contracts-machine-checked`)? a log-scrape of emitter-known facts (`structured-facts-at-failure`)? action on snapshot state without corroboration (`corroborate-before-acting`)? duplicated lock-step logic (`no-lockstep-duplication`)?
+**Application (decompose).** After the G6 re-check, Read **the decomposing project's own** `docs/legibility/design-invariants.md` — the path is project-relative, and that project's file is the single normative list for its batches; do **not** restate the invariants in this section beyond their slugs, per `no-lockstep-duplication`. Walk **every task in the batch** (not only leaves — violations attach to mechanisms, which intermediates introduce too) against each invariant's checkable question.
+
+**The families are per-project and genuinely differ** — walking one project's slugs against another's batch is the wrong gate, not a stricter one:
+
+| Project | Family |
+|---|---|
+| dark-factory | INV-1..5 — `contracts-machine-checked`, `structured-facts-at-failure`, `corroborate-before-acting`, `storm-escape-required`, `no-lockstep-duplication` |
+| reify | INV-SF-1..6 (silent-failure) — `undef-has-provenance`, `error-severity-exits-nonzero`, `declared-intent-consumed-or-diagnosed`, `indeterminate-attributable-transient`, `placeholders-owned-and-loud`, `diagnostics-carry-codes` |
+
+**If the project has no such file** — most targets don't — G7 is **advisory, not blocking**: screen the batch against the dark-factory trigger shapes below, record any hit in the decomposition record, and do not block on a list the project never adopted. Note the fallback explicitly rather than skipping G7 silently.
+
+Trigger shapes (dark-factory's family — illustrative of the *method*; re-derive the equivalents from whichever list is normative): adds a detector/suppressor/fallback without a storm escape (`storm-escape-required`)? a tool without a declared filter/envelope convention (`contracts-machine-checked`)? a contract in prose (`contracts-machine-checked`)? a log-scrape of emitter-known facts (`structured-facts-at-failure`)? action on snapshot state without corroboration (`corroborate-before-acting`)? duplicated lock-step logic (`no-lockstep-duplication`)?
 
 **Resolution.** Redesign the task (add the streak counter, move the contract to a schema field/lint, add the corroboration step, extract the helper) — or **waive**: record `G7 waiver: <slug> — <rationale>` in the PRD's decomposition-plan row AND stamp `metadata.g7_waivers: [{"invariant": <slug>, "rationale": <text>}]` on the filed task. An unresolved, unwaived hit blocks the batch.
 
-**Calibration:** seeded-violation fixtures + rehearsal verdict table will live at `docs/legibility/design-invariants-fixtures.md` once sibling task ε lands (file not yet present as of this doc's landing).
+**Calibration:** `docs/legibility/design-invariants-fixtures.md` (dark-factory; landed 2026-07-14, commit `df9f4dcf9d`) holds the seeded-violation fixtures — one PRD-leaf-shaped (`INV-N-PRD`) and one code-snippet-shaped (`INV-N-CODE`) per invariant — plus the rehearsal verdict table, for calibrating this walk against dark-factory's INV-1..5. A project with its own invariant family has its own fixtures or none.
 
 ---
 
@@ -228,7 +239,7 @@ Walk in this rough order; iterate freely as discussion surfaces new mechanisms:
 4. **G5 fourth.** Decide B vs B+H; if H, draft contract + boundary-test sketch now (they shape the decomposition).
 5. **G2 in the decomposition plan** — name an observable signal per task even though the hard check is at decompose time.
 6. **G6 alongside the G2 draft** — validate each drafted leaf signal's substantive premise; draft the **capability-manifest** bindings here so decompose only re-checks them.
-7. **G7 alongside the G2/G6 draft walk** — advisory walk of the sketch against `docs/legibility/design-invariants.md`'s checkable questions; the cheapest point to redesign or record a waiver.
+7. **G7 alongside the G2/G6 draft walk** — advisory walk of the sketch against the current project's `docs/legibility/design-invariants.md` checkable questions; the cheapest point to redesign or record a waiver.
 8. **META last.** Final sanity check before save.
 
 ## Gate-application order (decompose mode)
@@ -236,7 +247,7 @@ Walk in this rough order; iterate freely as discussion surfaces new mechanisms:
 1. **G1, G3, G4 re-check** against the saved PRD (fast; mostly drift detection).
 2. **G2 walk** — enumerate every task, classify leaf/intermediate, attach `user_observable_signal` / `consumer_ref`.
 3. **G6 re-check** — validate each leaf signal's premise. Escalate before filing if one can't be substantiated (cheaper than an implementer discovering it against a RED test).
-4. **G7 walk** — load `docs/legibility/design-invariants.md`, walk every task in the batch (not only leaves) against each invariant's checkable question; resolve or record waivers (`G7 waiver: <slug> — <rationale>` in the PRD row + `metadata.g7_waivers` on the filed task). An unresolved, unwaived hit blocks the batch.
+4. **G7 walk** — load the current project's `docs/legibility/design-invariants.md` (families differ per project; advisory-only if the project has none), walk every task in the batch (not only leaves) against each invariant's checkable question; resolve or record waivers (`G7 waiver: <slug> — <rationale>` in the PRD row + `metadata.g7_waivers` on the filed task). An unresolved, unwaived hit blocks the batch.
 5. **Capability manifest** — build the per-leaf manifest (capability→producer, DAG-direction, field-population, grammar-fixture, numeric-floor) and **commit it beside the PRD**, together with its YAML sidecar twin (see *Output contract* above); any FAIL binding blocks the batch until resolved.
 6. **G5 informational** — note B vs B+H; if B+H, verify the integration-gate task exists and points at the boundary-test sketch.
 7. File the batch (see `decompose-mode.md`).
