@@ -67,7 +67,15 @@ VERIFY_TIMEOUT_S = 14400  # generous: SCHED_IDLE stretches wall time
 # depth signal; excluding it removes a constant false-fail floor from P(pass|d).
 VERIFY_CMD = ['./scripts/verify.sh', 'test', '--scope', 'all']
 VERIFY_ENV = {'DF_VERIFY_ROLE': 'merge'}
-SCRIPT_VERSION = 3
+SCRIPT_VERSION = 4
+# Files removed from the (disposable) study checkout after each stack build.
+# Dropping --include-infra was not enough: each tree runs ITS OWN era's
+# verify.sh, and some eras run tests/infra/run_all.sh unconditionally — then
+# fail on env-sensitive infra assertions BEFORE any cargo test executes
+# (3 v3 A-runs censored this way, a different infra test than v2's). Every
+# era guards the step with `test -f tests/infra/run_all.sh`, so removing the
+# file censors the infra suite structurally, era-proof.
+STRIP_TREE_FILES = ['tests/infra/run_all.sh']
 NOOP_CPU_FLOOR_S = 60  # a "pass" burning less CPU than this is a suspect no-op
 SCRUB_ENV = [k for k in os.environ if k.startswith('CLAUDE')]
 
@@ -234,6 +242,8 @@ def build_stack(repo: Path, base: str, tips: list[list[str] | tuple[str, str]]) 
             git(repo, 'merge', '--abort', check=False)
             break
         merged += 1
+    for rel in STRIP_TREE_FILES:
+        (repo / rel).unlink(missing_ok=True)
     return git(repo, 'rev-parse', 'HEAD').stdout.strip(), merged
 
 
