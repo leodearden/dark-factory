@@ -1723,6 +1723,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: '(turn 30) Bash({"command": "find / -iname \"*72ca812e*\" ..."}) -> This Bash command contains multiple operations... requires approval; (turn 41) grep in ''/home/leo/.claude'' was blocked. For security, Claude Code may only search ... allowed working directories ... ''/home/leo/src/dark-factory'''
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 45ccca1d-66de-4d66-9be1-4255829f2f0c
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Census-verifier session conducted 12 tool_errors and repeated Bash approval-gated filesystem probes (ls, find, stat) while attempting to locate plan-state files, matching documented pattern of verifier blind-searching without path conventions
 - id: entry-cand-20260722-35
   title: watcher-rearm.sh's required DARK_FACTORY_ROOT env var absent from the rotation prompt's vocabulary
   severity: medium
@@ -2895,3 +2901,16 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: the memory_consolidator toolset lacks delete_entity/merge_entities, so the fix was done via update_edge(invalid_at=...) ... 'task 2992' ... now has zero valid edges and an empty summary but still exists as an orphan node — it needs delete_entity, which this stage cannot call.
+- id: cand-20260724-2
+  title: Session Startup Protocol's dual plan-state location contract doesn't resolve to a real path in pooled/W11-relocated worktrees
+  cause: The implementer prompt's Session Startup Protocol names two candidate locations for plan.json/iterations.jsonl ('.task/plan.json' and '.task-meta/<worktree-name>/plan.json') but in pooled .eval-worktrees layouts neither resolves; '.task/' holds only ephemeral 'claude-config-<task>' entries and '.task-meta/run-<id>/' yields no iterations.jsonl
+  area: worktree/plan-state discovery
+  first_seen: '2026-07-24'
+  disposition: pending
+  sightings:
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 45ccca1d-66de-4d66-9be1-4255829f2f0c
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: 'stat: cannot statx ''/home/leo/src/dark-factory/.eval-worktrees/df_task_12/.task-meta/run-4a79d4f3'': No such file or directory'
