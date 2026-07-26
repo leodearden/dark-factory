@@ -41,6 +41,7 @@ No .task-specific guards remain in this module.
 import asyncio
 import contextlib
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -378,6 +379,43 @@ _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 # 124 would be misattributed to a lock-wait timeout, but no script
 # convention in this codebase uses 124 for anything else.
 _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
+
+# The reify seed-warm-lane.sh opt-out flag a caller passes to assert it ALREADY
+# holds ${LANE_DIR}.lock, so seed skips its own acquire instead of self-refusing
+# against that lock (flock is not re-entrant across a process tree).  See
+# :meth:`GitOps._seed_warm_lane` for why this is load-bearing (reify 5556).
+_SEED_ASSUME_LANE_LOCK_HELD_FLAG = '--assume-lane-lock-held'
+
+
+@functools.lru_cache(maxsize=256)
+def _seed_script_supports_assume_lane_lock_held(script: Path) -> bool:
+    """Does this lane's ``seed-warm-lane.sh`` accept ``--assume-lane-lock-held``?
+
+    The seed script is read from the LANE's own checkout, so its vintage varies
+    per lane: a lane sitting on a pre-reify-5354 base predates the flag and
+    would reject it as a usage error (exit 2), converting a working seed into a
+    hard fault.  Probing the script text is the cheapest reliable capability
+    check — the flag string appears in the arg parser of every version that
+    supports it, and in none that don't.
+
+    Fails CLOSED (``False``) on any read error: omitting the flag restores the
+    pre-5354 behaviour, in which the script never takes the lane lock itself,
+    so a false negative is never worse than not having this fix at all.
+
+    Cached per resolved path — lane scripts change only on reseed, and a wrong
+    cached answer degrades to the same safe fallback.
+    """
+    try:
+        return _SEED_ASSUME_LANE_LOCK_HELD_FLAG in script.read_text(
+            encoding='utf-8', errors='replace',
+        )
+    except OSError:
+        logger.debug(
+            '_seed_script_supports_assume_lane_lock_held: unreadable %s — '
+            'assuming unsupported', script, exc_info=True,
+        )
+        return False
+
 
 # Short window (seconds) over which the θ soft-floor defer path memoizes the
 # α warm-lane-audit (:meth:`GitOps._warm_lane_audit_cached`).  α is
@@ -3465,6 +3503,28 @@ class GitOps:
                 if take_lane_lock
                 else []
             )
+            # reify 5556: when WE hold the outer lane lock above, seed must NOT
+            # re-open+flock the same file. reify's seed-warm-lane.sh acquires
+            # ${LANE_DIR}.lock by DEFAULT under --fresh-checkout as of reify
+            # 7b20d010c6 (task 5354) — previously opt-in via --lane-lock — and
+            # flock is not re-entrant across a process tree, so the script's
+            # own flock -n self-refuses against this method's lock and exits
+            # 75. That 75 is indistinguishable from genuine disk pressure at
+            # _classify_seed_rc, so every dispatch requeued as
+            # WarmLaneDiskPressure with agent_invocations=0, released the lane,
+            # and re-picked the same lowest-index free lane: a fleet-wide
+            # dispatch livelock (349 requeues / 4 completions per day).
+            # --assume-lane-lock-held (reify db9ea9387b, same task) is the
+            # sanctioned opt-out for exactly this caller shape.
+            #
+            # Capability-probed rather than passed blind: `script` is the LANE's
+            # own checked-out copy, so a lane sitting on a pre-5354 base would
+            # reject the unknown flag as a usage error (exit 2) and turn a
+            # working seed into a hard fault. Probe absent → omit the flag and
+            # keep the pre-5354 behaviour, where the script never self-locks.
+            seed_flags: list[str] = []
+            if take_lane_lock and _seed_script_supports_assume_lane_lock_held(script):
+                seed_flags.append(_SEED_ASSUME_LANE_LOCK_HELD_FLAG)
             base_path = self.warm_lane_base_target_path
             if base_path.is_symlink():
                 # D8: resolve relative-sibling symlink (target -> .gen.N) to the
@@ -3491,11 +3551,14 @@ class GitOps:
                 cmd = [
                     *lane_lock_flock,
                     'flock', '-s', str(lock_path),
-                    str(script), base_target, str(lane_dir), mode,
+                    str(script), base_target, str(lane_dir), mode, *seed_flags,
                 ]
             else:
                 base_target = str(base_path)
-                cmd = [*lane_lock_flock, str(script), base_target, str(lane_dir), mode]
+                cmd = [
+                    *lane_lock_flock,
+                    str(script), base_target, str(lane_dir), mode, *seed_flags,
+                ]
             rc, _, err = await _run(cmd, cwd=lane_dir)
             if rc == _SEED_WARM_LANE_LOCK_TIMEOUT_RC:
                 logger.warning(
