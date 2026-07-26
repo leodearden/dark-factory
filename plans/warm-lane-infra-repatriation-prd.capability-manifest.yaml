@@ -1,0 +1,230 @@
+prd: plans/warm-lane-infra-repatriation-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3072
+  title: Relocate the seven generic warm-lane scripts into dark-factory with resolution
+    preference order
+  capabilities:
+  - name: df-ships-generic-warm-lane-scripts
+    binding: capability→producer — α creates orchestrator/scripts/warm-lane/*.sh (0
+      toolchain tokens each, PRD §2.1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: warm-lane-gc\.sh
+      paths:
+      - orchestrator/scripts/
+      expect: present
+  - name: script-resolution-preference-order
+    binding: capability→producer (wired) — six existing sites git_ops.py:3701,3765,3816,3922,3970,4095
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: warm_lane_script_path|_resolve_warm_lane_script
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: absent-script-no-longer-silent
+    binding: rejection-mechanism — current silent path git_ops.py:3923-3926 (logger.debug
+      + rc 127)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: log-level change is asserted by B8's harness assertion, not a stable
+        grep
+- label: α2
+  task_id: 3073
+  title: Port the generic warm-lane bash tests into dark-factory and run them against
+    dark-factory's copies
+  capabilities:
+  - name: generic-warm-lane-bash-tests-run-in-df
+    binding: capability→producer — ports the subset of reify's 23 tests/infra/test_warm_lane_*.sh
+      covering relocated scripts
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: test_warm_lane_gc
+      paths:
+      - orchestrator/tests/
+      expect: present
+- label: β
+  task_id: 3074
+  title: lib_lane_state.sh — dark-factory-authoritative lane state and protected prefixes,
+    readable from bash
+  capabilities:
+  - name: durable-lane-record-readable-from-bash
+    binding: substrate CONFIRMED — .lane-state/<lane>.json verified live 2026-07-26
+      (_lane-28 → assigned 5551)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: lane-state
+      paths:
+      - orchestrator/scripts/warm-lane/
+      expect: present
+  - name: recordless-lane-returns-unknown
+    binding: capability→producer — fail-open branch; recordless _iact-* dirs exist
+      in the live pool
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fail-open behaviour is a test property of β's own fixtures
+  - name: protected-prefixes-rendered-not-mirrored
+    binding: INV-5 extraction — lockstep duplication confirmed at warm-lane-gc.sh:318
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PROTECTED_PREFIXES
+      paths:
+      - orchestrator/scripts/warm-lane/
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: γ
+  task_id: 3075
+  title: Reclaim consults the durable lane record per lane, immediately before reset,
+    under the flock
+  capabilities:
+  - name: assigned-lane-preserved-any-entry-point
+    binding: capability→producer, β upstream (wired) — closes esc-5334-6; boundary
+      test B1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: assigned to task
+      paths:
+      - orchestrator/scripts/warm-lane/
+      expect: present
+  - name: per-lane-recheck-not-snapshot
+    binding: INV-3 — B2 guards it; D5 forbids --assigned-lanes CSV marshalling (re-creates
+      the 5572 TOCTOU)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: --assigned-lanes
+      paths:
+      - orchestrator/scripts/warm-lane/
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: free-lane-still-reclaims
+    binding: non-regression of task 5326 — B3; the ENOSPC accretion path stays open
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: non-regression is asserted by B3 in the ported harness, not a grep
+  - name: recordless-lane-falls-back-to-proc-scan
+    binding: 'capability→producer upstream: reify:5572 (external dep wired) — B6'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: fallback ordering is a harness property (B6); the upstream lives in
+        another repo
+- label: δ
+  task_id: 3076
+  title: Populate LaneState.IN_USE — close the declared-only writer gap
+  capabilities:
+  - name: lane-state-in-use-written
+    binding: declared-only TODAY (enum :61 + transitions :77-78, ZERO writers, 55/55
+      live records 'assigned') → producer:δ
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: LaneState\.IN_USE
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+- label: ε
+  task_id: 3077
+  title: Whole-assignment lane lease replaces the two task_verify_lease call sites
+  capabilities:
+  - name: lease-held-across-whole-assignment
+    binding: capability→producer — generalizes DF 3027 (workflow.py:3330,7117) to
+      acquire→release
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: assignment_lease|whole_assignment
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: assigned-idle-still-reclaimable
+    binding: producer:δ upstream (wired) — B4 and B3 green in the same run as B5;
+      2026-07-10 ENOSPC regression guard
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the guard is 'three boundary tests green together', not a static pattern
+  - name: pressure-degrades-to-backpressure-not-corruption
+    binding: rejection-mechanism (INV-4) — B11; no reclaim-an-in_use-lane override
+      exists by design
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: absence of an override is asserted by B11's scenario, not a single grep
+- label: ζ
+  task_id: 3078
+  title: Cutover readiness go/no-go — confirm dark-factory's copies are the ones running
+  capabilities:
+  - name: df-copies-confirmed-live-before-deletion
+    binding: producer:α upstream (wired) — reads α's resolved-path INFO line; defuses
+      the migration landmine
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operational go/no-go; evidence is a recorded log observation, not a
+        repo artifact
+- label: η
+  task_id: 5613
+  title: Repoint the reify warm-lane GC systemd unit at dark-factory's sweep
+  capabilities:
+  - name: systemd-unit-points-at-df
+    binding: substrate CONFIRMED — hardcoded ExecStart at deploy/systemd/reify-warm-lane-gc.service:28
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reify/scripts/warm-lane-gc-sweep\.sh
+      paths:
+      - deploy/systemd/
+      expect: absent
+- label: θ
+  task_id: 5614
+  title: Narrow reify to the §5 contract — generalize the RUSTFLAGS stamp to --build-fingerprint
+  capabilities:
+  - name: build-fingerprint-generalized
+    binding: substrate CONFIRMED — RUSTFLAGS coupling at refresh-warm-base.sh:26,107,121,136,444
+      is the entire footprint
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: build-fingerprint
+      paths:
+      - scripts/refresh-warm-base.sh
+      expect: present
+- label: ι
+  task_id: 5615
+  title: Docs truth — rewrite the warm-lane invariants and the cross-repo seam claim
+  capabilities:
+  - name: docs-no-longer-claim-reclaim-time-enforcement
+    binding: rejection-mechanism — CLAUDE.md currently claims one-consumer-per-lane
+      'enforced at RECLAIM time', falsified by RC-1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: enforced at RECLAIM time
+      paths:
+      - CLAUDE.md
+      expect: absent
+- label: κ
+  task_id: 5616
+  title: Delete reify's relocated script copies and retire the duplicated tests
+  capabilities:
+  - name: reify-scripts-reduced-to-contract-primitives
+    binding: rejection-mechanism — the seven relocated scripts absent from reify/scripts/
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^scripts/warm-lane-gc\.sh$
+      paths:
+      - scripts/verify-pipeline-paths.txt
+      expect: absent
