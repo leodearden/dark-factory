@@ -1106,6 +1106,13 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: '"memory_consolidator": {..., "llm_calls": 35, "tokens_used": 0}, "task_knowledge_sync": {..., "llm_calls": 23, "tokens_used": 0}, "integrity_check": {..., "llm_calls": 39, "tokens_used": 0}'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c1a7f76e-673e-48d6-a9dc-c934a1b054d1
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: Cost telemetry (tokens_used) always zero despite nonzero llm_calls
+    note: 'memory_consolidator: llm_calls=27, tokens_used=0; task_knowledge_sync: llm_calls=15, tokens_used=0; integrity_check: llm_calls=32, tokens_used=0'
 - id: entry-cand-20260722-3
   title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
   severity: medium
@@ -1184,6 +1191,19 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: '{"operation": "add", "target": "?", "source": "write_journal", "created_at": "2026-07-17T18:59:35.301274+00:00"}'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 61f3f111-8c61-42cf-9805-52e774150fcf
+    origin_phase: recon
+    manifested_phase: recon
+    note: MCP action-provenance logger records target='?' for write_journal add/delete operations (10 actions, 4 with unresolved targets)
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c1a7f76e-673e-48d6-a9dc-c934a1b054d1
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: Recon action-provenance logger records target='?' for write_journal add/delete ops
+    note: MCP actions 1, 3, 5, 7, 9 all have target='?' with operations 'add' and 'delete' sourced from write_journal
 - id: entry-cand-20260722-10
   title: Trickle-coder digest pipeline recursively re-ingests its own prompts as session content, mislabeled as User Corrections
   severity: medium
@@ -1461,6 +1481,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: '"llm_calls": 21, "tokens_used": 0'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 61f3f111-8c61-42cf-9805-52e774150fcf
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'All three reconciliation stages report tokens_used=0 despite nonzero llm_calls (memory_consolidator: 38 calls, task_knowledge_sync: 33 calls, integrity_check: 33 calls)'
 - id: entry-cand-20260713-2
   title: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
   severity: medium
@@ -1474,6 +1500,13 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: '"memories_added": 3, ... "_reported": {"memories_written": 2.0, ... "memories_added": 2.0}'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c1a7f76e-673e-48d6-a9dc-c934a1b054d1
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
+    note: memory_consolidator._reported.memories_written=1.0 vs missing top-level equivalent; task_knowledge_sync._reported differs from top-level
 - id: entry-cand-20260722-23
   title: Recon stage report's top-level items_flagged contradicts its own nested stats.items_flagged
   severity: medium
@@ -1580,6 +1613,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: '"memories_added": 2, ... "_reported": {"memories_written": 2.0, "memories_added": 2.0}'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 61f3f111-8c61-42cf-9805-52e774150fcf
+    origin_phase: recon
+    manifested_phase: recon
+    note: Nested '_reported' subtotal dict duplicating top-level stats in memory_consolidator and task_knowledge_sync stages
 - id: entry-cand-20260722-27
   title: Trickle-coder digest pipeline ingests its own prior invocations as session digests
   severity: medium
@@ -2914,3 +2953,29 @@ candidates:
     origin_phase: unknown
     manifested_phase: implement
     evidence_quote: 'stat: cannot statx ''/home/leo/src/dark-factory/.eval-worktrees/df_task_12/.task-meta/run-4a79d4f3'': No such file or directory'
+- id: cand-20260725-1
+  title: Journal entries silent-dropped despite items_flagged>0
+  cause: Recon stage writes MCP actions but produces zero journal entries; items_flagged signals work occurred but journal ledger disagrees
+  area: recon-lifecycle-state-gaps
+  first_seen: '2026-07-25'
+  disposition: pending
+  sightings:
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c1a7f76e-673e-48d6-a9dc-c934a1b054d1
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: memory_consolidator items_flagged=1, integrity_check items_flagged=1, but 'Journal Entries (0 total)' and MCP actions show 10 operations
+- id: cand-20260725-2
+  title: '_reported field-name asymmetry: memories_written orphaned from top-level'
+  cause: Nested _reported dict introduces field names (memories_written) absent from top-level stats, breaking schema consistency
+  area: recon-prompt-schema-drift
+  first_seen: '2026-07-25'
+  disposition: pending
+  sightings:
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c1a7f76e-673e-48d6-a9dc-c934a1b054d1
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'memory_consolidator._reported has ''memories_written'': 1.0 with no top-level field by that name; top-level uses ''memories_added'' instead'
