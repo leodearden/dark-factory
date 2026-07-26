@@ -44,6 +44,7 @@ real dependency edge rather than assuming the capability already exists.
 | `durable-lane-record-readable-from-bash` | substrate CONFIRMED — `.lane-state/<lane>.json` verified live 2026-07-26 (`_lane-28` → `assigned 5551`, `_lane-50` → `assigned 5416`) | PASS |
 | `recordless-lane-returns-unknown` | capability→producer — β's fail-open branch; recordless dirs (`_iact-*`) exist in the live pool today | PASS |
 | `protected-prefixes-rendered-not-mirrored` | INV-5 extraction — current lockstep duplication confirmed at `warm-lane-gc.sh:318` (comment: "mirrors dark-factory's PROTECTED_PREFIXES … only ever grows") | PASS |
+| `audit-reader-unified-not-duplicated` | INV-5 extraction, **extract-after** — reify 5363 lands first (already implemented, merge-pending on `_merge-verify.lock` contention since 2026-07-26T16:51) shipping its own `.lane-state` reader in `warm-lane-audit.sh`; β folds it into the shared helper rather than 5363 consuming β. Direction corrected at decompose | PASS |
 
 ### γ — reclaim consults the durable record per lane, before reset, under the flock
 
