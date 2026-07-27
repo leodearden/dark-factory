@@ -134,6 +134,35 @@ tasks:
       - orchestrator/src/orchestrator/git_ops.py
       - orchestrator/src/orchestrator/workflow.py
       expect: present
+- label: δ2
+  task_id: 3081
+  title: Deterministic merge-verify flock release + self-owned-leak detection (D8)
+  capabilities:
+  - name: flock-released-on-cancellation
+    binding: absent TODAY → producer:δ2 — both asyncio.to_thread(acquire_merge_verify_flock)
+      sites (git_ops.py reset_persistent_merge_worktree, merge_verify_lease) document
+      the orphaned-fd leak as an accepted edge case; B12
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the property is 'a cancelled acquire leaves no surviving holder', proven
+        by B12 driving a real cancellation race, not by a static pattern
+  - name: self-owned-lock-distinguished-from-contention
+    binding: capability→producer — read_lock_holder_pgid/os.getpgrp() exists but gates
+      only _merge_verify_lease_active, never the acquire path; B13
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: self_owned|self-owned|getpgrp
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: present
+  - name: epsilon-blocked-until-hold-is-bounded
+    binding: producer:δ2 upstream (wired) — encoded as 3077 depends_on 3081, not prose
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency-edge assertion, verified in the tracker not the tree
 - label: ε
   task_id: 3077
   title: Whole-assignment lane lease replaces the two task_verify_lease call sites

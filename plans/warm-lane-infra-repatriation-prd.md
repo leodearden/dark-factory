@@ -71,6 +71,7 @@ Token scan for `cargo|rustc|RUSTFLAGS|OUT_DIR|Cargo|nextest|occt|manifold|reify-
 - **D4 — Relocated scripts stay bash.** They test bash; a Python rewrite of ~2,200 working lines buys idiom uniformity at the cost of the largest single risk item in the migration. reify's generic `tests/infra/test_warm_lane_*.sh` port to dark-factory **as bash**, run from dark-factory's suite.
 - **D5 — Liveness is read per lane, immediately before reset, from the on-disk record, under the lane flock.** Not marshalled as a CLI snapshot: an `--assigned-lanes CSV` argument would re-create exactly the up-front-snapshot TOCTOU that reify 5572 exists to fix. The records are files in the directory being swept; read them there.
 - **D6 — The flock's role narrows and is written down.** After δ/ε it is no longer a liveness oracle. It becomes (a) the mutex serialising the reseed operation itself, and (b) the cross-process guard for non-dark-factory actors (the systemd sweep, manual operator runs, reify's own scripts). Liveness comes from the record.
+- **D8 — A narrowed flock must still be *released deterministically*, and self-ownership is not contention.** D6 only holds if the mutex can be relied on to come back. Today it cannot: both `asyncio.to_thread(acquire_merge_verify_flock, …)` call sites (`git_ops.py` — `reset_persistent_merge_worktree` and `merge_verify_lease`) document an accepted edge case where cancelling the await cannot stop the worker thread, so a fd acquired *after* cancellation is never seen by the cancelled coroutine and **the lane lock stays held until process exit**. A mutex with an unbounded hold on cancellation is not a mutex; it is an outage that only a restart clears. Two consequences are written into the contract: release is shielded/`finally`-bound so a cancelled acquire cannot orphan a fd, and a holder that is *this same process* is detected (the `read_lock_holder_pgid` / `os.getpgrp()` comparison already used by `_merge_verify_lease_active` — extended to the acquire path) and surfaced as a self-owned-leak fault rather than failing closed as foreign contention. Leaf **δ2**. *Ordering: this is a hard precondition of ε* — ε widens the hold from `run_scoped_verification` to the whole assignment, so an unreleasable lock becomes proportionally worse, not better.
 - **D7 — reify task 5572 lands first and is not duplicated here.** Its per-lane live-consumer check is the stop-gap; its logic migrates with the script at leaf α and is *superseded* (not deleted) by the record read at leaf γ. The `/proc` scan is retained as a belt-and-braces second predicate for non-dark-factory-managed lanes (`_iact-*`, manual worktrees) which have no durable record.
 
 ## 5. Contract — the redrawn seam (H)
@@ -92,7 +93,7 @@ The seam moves from *"reify ships the primitive, dark-factory wires the invocati
 | **Cache dir name** | Declared by the project, not assumed. dark-factory passes it and never hardcodes `target` |
 | **Build fingerprint** | The project asserts its own config fingerprint (reify: RUSTFLAGS) and **fails closed** on mismatch. dark-factory treats it as an opaque string via `--build-fingerprint` |
 | **Exit codes** | `0` success · `75` disk pressure (EX_TEMPFAIL) · `124` lane-lock wait timeout · `127` absent/exception · other = script fault. dark-factory branches only on this taxonomy |
-| **Locking** | Acquires `<lane_dir>.lock` `flock -x` by default; `--assume-lane-lock-held` opts out when the caller already holds it |
+| **Locking** | Acquires `<lane_dir>.lock` `flock -x` by default; `--assume-lane-lock-held` opts out when the caller already holds it. **Release is unconditional**: every acquire path releases on cancellation and on exception, never only on the success path (D8). A lock still held by the acquiring *process* is a self-owned leak, reported as such — never as exit-`124` contention |
 | **Idempotence** | Safe to invoke on an empty, partial, or fully-populated cache dir |
 | **Purity** | Touches `<lane_dir>/<cache-dir>` only — never the source tree, never the branch ref |
 
@@ -115,6 +116,8 @@ The seam moves from *"reify ships the primitive, dark-factory wires the invocati
 | B9 | §5 contract honoured end-to-end | Stub project seed script: each of exit 0/75/124/127; a non-`target` cache-dir name; a mismatched build fingerprint | dark-factory branches per the taxonomy without inspecting stdout, passes the declared cache-dir name through, and surfaces the fingerprint refusal as a fail-closed error |
 | B10 | Whole-assignment lease does not deadlock reclaim | Lease held for a full assignment; reclaim pass runs | Reclaim proceeds on other lanes; B4 still reclaims this one if idle |
 | B11 | Fully-assigned pool degrades to backpressure, never to corruption | Every lane `in_use`; free space at the disk-guard floor | Reclaim resets **nothing**; `warm-lane-disk-guard.sh` returns 75 and dispatch admission blocks. No live lane's cache is reset under disk pressure |
+| B12 | Cancelled acquire never orphans the lane lock (D8) | An `acquire_merge_verify_flock` await is cancelled while the worker thread is still polling; the thread then wins the lock | The fd is released, not orphaned — `flock -n` on the lane lock succeeds afterwards, and `/proc/locks` shows no surviving holder in this process. Fails today: the lock stays held until process exit |
+| B13 | A self-owned leaked lock is diagnosed, not mistaken for contention (D8) | The lock is held by an fd in *this* process with no live verify | The wait path reports a self-owned-leak fault naming the holding pid/pgid, distinct from the exit-`124` foreign-contention timeout. Fails today: it times out after 30s as `a live reify/DF actor holds the lane lock` |
 
 B1 and B2 are the regression tests for esc-5334-6. B3 and B4 are the regression tests for the 2026-07-10 ENOSPC outage — **they must both stay green in the same run**, which is the whole point of doing δ before ε.
 
@@ -142,6 +145,7 @@ B1 and B2 are the regression tests for esc-5334-6. B3 and B4 are the regression 
 | reify **5572** (filed, pending) | upstream | per-lane `/proc` liveness inside `warm-lane-gc.sh` | **5572.** This PRD inherits and supersedes it at γ; retains it as the recordless fallback (D7) |
 | reify **5363** — audit LIVE/ASSIGNED/PINNED columns | **contested → resolved as extract-after** | both read `.lane-state/<lane>.json` | **5363 lands first.** Corrected at decompose: 5363 is already implemented (verify 210/210, review suggestions-only) and merge-pending, blocked since 2026-07-26T16:51 only on `_merge-verify.lock` contention. So leaf **β** must *extract and unify* — fold 5363's audit-side reader into `lib_lane_state.sh` and refactor `warm-lane-audit.sh` onto it — not publish-and-wait. Same INV-5 obligation as β's `PROTECTED_PREFIXES` half. 5363 also supplies this PRD's best independent corroboration: of 56 lanes, 33 read `assigned` but only **three** had a live task (esc-5556-1) |
 | DF **3027** (done) | superseded-by | `task_verify_lease` around `run_scoped_verification` | This PRD (leaf ε) generalises it to the whole assignment; 3027's two call sites collapse into one |
+| DF **3003** (pending) | complementary | same lane lock, same `merge_outcome_signature 3173b64436423738` | **3003.** It fixes the *contended* case — a legitimate long holder's 30s reset-path timeout misclassified as a task fault and tripping the anti-thrash guard. Leaf **δ2** fixes the *leaked* case, where no wait length can ever succeed because the fd is orphaned. Neither subsumes the other, and δ2's self-ownership check is the discriminator 3003 needs to tell a real holder from a leak |
 | reify **5354** (done) | preserved | `--lane-lock` acquire-time guard | reify. Unchanged — it is the §5 contract's locking clause |
 | reify task **5326** (done) | constraint | Pass-1 always-reclaim / ENOSPC accretion fix | Preserved by B3+B4. δ **must** precede ε |
 | `reify/docs/prds/warm-lane-pool-cow-seeding.md` §9.3/§9.5 | supersedes | canonical lifecycle contract + invariants | This PRD. Leaf ι rewrites §9.3/§9.5 to point at dark-factory and keeps only the §5 primitive contract in reify |
@@ -149,7 +153,7 @@ B1 and B2 are the regression tests for esc-5334-6. B3 and B4 are the regression 
 
 ## 9. Decomposition plan
 
-Phase ordering is load-bearing: **γ before ε**, **δ before ε**, **ζ after everything but before κ**.
+Phase ordering is load-bearing: **γ before ε**, **δ before ε**, **δ2 before ε**, **ζ after everything but before κ**.
 
 ### Phase 1 — Relocation at behaviour parity
 
@@ -184,10 +188,16 @@ Phase ordering is load-bearing: **γ before ε**, **δ before ε**, **ζ after e
   Transition `ASSIGNED → IN_USE` when dark-factory has a live child in the lane (agent invocation or verify), back to `ASSIGNED` when it exits. G3 found **zero writers** today; this leaf is the substrate the rest of Phase 3 assumes.
   *Signal:* during a live agent invocation, `.lane-state/<lane>.json` reads `in_use`; between phases it reads `assigned`. Deps: γ.
 
+- **δ2 — Deterministic flock release + self-owned-leak detection (D8).**
+  Modules: `orchestrator/src/orchestrator/git_ops.py`.
+  Shield/`finally`-bind the release of both `asyncio.to_thread(acquire_merge_verify_flock, …)` call sites (`reset_persistent_merge_worktree`, `merge_verify_lease`) so a cancelled acquire cannot orphan the fd, and extend the existing `read_lock_holder_pgid`/`os.getpgrp()` self-ownership comparison to the acquire path so a lock held by this same process is reported as a self-owned leak instead of failing closed as foreign contention.
+  *Signal:* B12 + B13 green. **Independent of Phases 1–2** (pure `git_ops.py` lock lifecycle; needs neither the relocation nor the record read), so it can land first.
+  *Incident anchor:* reify esc-5548-5, 2026-07-26 — a verify dispatch for reify task 5548 superseded by the dead-base-straggler re-merge path leaked the lane-lock fd at 17:27; kernel-confirmed (`/proc/locks` `FLOCK ADVISORY WRITE 588232` on inode `4300647613` = `_merge-verify.lock`). Every merge-verify from ~17:30 hit the 30s timeout; reify tasks 5548/5585/5599 blocked with the identical `merge_outcome_signature 3173b64436423738`; cleared only by the unattended 20:21 orchestrator restart. Deps: none.
+
 - **ε — Whole-assignment lease replaces the two `task_verify_lease` call sites.**
   Modules: `orchestrator/src/orchestrator/{git_ops,workflow}.py`.
   Shared lease held acquire→release. Safe only because γ+δ let reclaim distinguish idle from building, so B4 keeps working.
-  *Signal:* B5 + B10 green, **and B4 still green in the same run** — the regression guard against the 2026-07-10 ENOSPC outage. Deps: δ.
+  *Signal:* B5 + B10 green, **and B4 still green in the same run** — the regression guard against the 2026-07-10 ENOSPC outage. Deps: δ, **δ2** (widening the hold window is only safe once the hold is guaranteed to end — D8).
 
 ### Phase 4 — Cutover (irreversible; ordered last)
 

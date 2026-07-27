@@ -61,6 +61,14 @@ real dependency edge rather than assuming the capability already exists.
 |---|---|---|
 | `lane-state-in-use-written` | **declared-only TODAY → producer:δ.** Enum + transition table exist; zero writers; 55/55 live records `assigned`. δ IS the producer, so this binds PASS here and would have been a blocking `declared-only` FAIL on any downstream leaf that assumed it | PASS |
 
+### δ2 — deterministic flock release + self-owned-leak detection (D8)
+
+| Capability | Binding | Verdict |
+|---|---|---|
+| `flock-released-on-cancellation` | **absent TODAY → producer:δ2.** Both `asyncio.to_thread(acquire_merge_verify_flock, …)` sites (`git_ops.py` `reset_persistent_merge_worktree`, `merge_verify_lease`) document the leak as an accepted edge case — a fd won after cancellation is never released and "the lane lock stays held until process exit". B12 | PASS |
+| `self-owned-lock-distinguished-from-contention` | capability→producer — the `read_lock_holder_pgid`/`os.getpgrp()` comparison exists but gates only `_merge_verify_lease_active`, never the acquire path, so a self-owned leak is reported as foreign contention. B13 | PASS |
+| `epsilon-blocked-until-hold-is-bounded` | producer:δ2 upstream (wired) — ε widens the hold to the whole assignment; landing it over an unreleasable lock widens the outage. Encoded as `3077 depends_on 3081`, not prose | PASS |
+
 ### ε — whole-assignment lease
 
 | Capability | Binding | Verdict |
