@@ -457,3 +457,103 @@ class TestBuildPairSets:
         for records in ([], [_rec('c1', 'c1', 'canonical')]):
             got = _mod().build_pair_sets(records)
             assert all(len(v) == 0 for v in got.values()), f'{records} produced pairs'
+
+
+# ---------------------------------------------------------------------------
+# cosine_similarity / summarize_distribution
+# ---------------------------------------------------------------------------
+
+class TestCosineSimilarity:
+    """Assertions are mathematical identities over injected vectors.
+
+    Nothing here calls an embedder, so the suite needs no OPENAI_API_KEY.
+    """
+
+    def test_identical_vectors_score_one(self) -> None:
+        v = [0.3, -0.7, 1.2, 0.0]
+        assert _mod().cosine_similarity(v, list(v)) == pytest.approx(1.0, abs=1e-12)
+
+    def test_orthogonal_unit_vectors_score_zero(self) -> None:
+        assert _mod().cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0, abs=1e-12)
+
+    def test_antiparallel_vectors_score_minus_one(self) -> None:
+        assert _mod().cosine_similarity([1.0, 2.0], [-1.0, -2.0]) == pytest.approx(-1.0, abs=1e-12)
+
+    def test_is_symmetric_in_its_arguments(self) -> None:
+        a, b = [0.1, 0.9, -0.4], [0.5, -0.2, 0.8]
+        assert _mod().cosine_similarity(a, b) == pytest.approx(_mod().cosine_similarity(b, a), abs=1e-12)
+
+    def test_magnitude_does_not_affect_the_score(self) -> None:
+        a, b = [1.0, 2.0, 3.0], [2.0, 4.0, 6.0]
+        assert _mod().cosine_similarity(a, b) == pytest.approx(1.0, abs=1e-12)
+
+    @pytest.mark.parametrize(
+        ('a', 'b'),
+        [([0.0, 0.0], [1.0, 0.0]), ([1.0, 0.0], [0.0, 0.0]), ([0.0, 0.0], [0.0, 0.0])],
+    )
+    def test_zero_norm_raises_rather_than_returning_nan(self, a: list, b: list) -> None:
+        """Loud over silent: a NaN would propagate into the distributions and
+        quietly corrupt every derived statistic."""
+        with pytest.raises(ValueError):
+            _mod().cosine_similarity(a, b)
+
+    def test_length_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError):
+            _mod().cosine_similarity([1.0, 0.0], [1.0, 0.0, 0.0])
+
+
+class TestSummarizeDistribution:
+    SAMPLE = [round(i / 10, 1) for i in range(11)]  # 0.0 .. 1.0 in fixed steps
+
+    FIELDS = ('n', 'min', 'max', 'mean', 'median', 'p05', 'p25', 'p75', 'p95')
+
+    def test_reports_every_field(self) -> None:
+        got = _mod().summarize_distribution(self.SAMPLE)
+        for field in self.FIELDS:
+            assert field in got, f'missing statistic {field!r}'
+
+    def test_n_equals_the_input_length(self) -> None:
+        assert _mod().summarize_distribution(self.SAMPLE)['n'] == len(self.SAMPLE)
+
+    def test_min_max_and_median_are_the_expected_order_statistics(self) -> None:
+        got = _mod().summarize_distribution(self.SAMPLE)
+        assert got['min'] == pytest.approx(0.0)
+        assert got['max'] == pytest.approx(1.0)
+        assert got['median'] == pytest.approx(0.5)
+        assert got['mean'] == pytest.approx(0.5)
+
+    def test_quantiles_are_measured_values_never_interpolated(self) -> None:
+        """Every reported quantile must be a value actually observed.
+
+        derive_bands picks T_high from these, so an interpolated quantile
+        would be a threshold that no measurement supports.
+        """
+        got = _mod().summarize_distribution(self.SAMPLE)
+        for field in ('min', 'max', 'median', 'p05', 'p25', 'p75', 'p95'):
+            assert got[field] in self.SAMPLE, (
+                f'{field}={got[field]} is not a member of the measured sample'
+            )
+
+    def test_quantiles_are_ordered(self) -> None:
+        got = _mod().summarize_distribution(self.SAMPLE)
+        ordered = [got[f] for f in ('min', 'p05', 'p25', 'median', 'p75', 'p95', 'max')]
+        assert ordered == sorted(ordered), f'quantiles out of order: {ordered}'
+
+    def test_input_order_does_not_matter(self) -> None:
+        shuffled = list(reversed(self.SAMPLE))
+        assert _mod().summarize_distribution(shuffled) == _mod().summarize_distribution(self.SAMPLE)
+
+    def test_single_value_sample(self) -> None:
+        got = _mod().summarize_distribution([0.42])
+        assert got['n'] == 1
+        for field in ('min', 'max', 'median', 'p05', 'p95'):
+            assert got[field] == pytest.approx(0.42)
+
+    def test_empty_sample_reports_none_not_zero(self) -> None:
+        """An empty class must never be mistakable for a measured zero."""
+        got = _mod().summarize_distribution([])
+        assert got['n'] == 0
+        for field in self.FIELDS:
+            if field == 'n':
+                continue
+            assert got[field] is None, f'{field} must be None for an empty sample, got {got[field]!r}'
