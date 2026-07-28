@@ -210,3 +210,168 @@ read-existing-payload-then-forward-custom-subset logic currently private to
 `scripts/tag_cgl_eta_rehome_scope.py` into a shared module that both the script and the new
 service path import — never copy the constant or restate mem0's payload-overwrite semantics in a
 second place. §6 makes the specific module-location call.
+
+## §4 — Decision 2: authorization model, and the metadata-only vs content-amend bar
+
+### The honest baseline
+
+**There is no authorization layer on this write surface today.** Verified: `delete_memory`
+(`server/tools.py:1941-2012`) and `update_edge` (`:2058-2156`) — the two closest existing
+in-place/destructive Mem0-and-Graphiti mutation tools — have no allowlist, no confirmation flag,
+no dry-run, and no role check. Their guard prologues do only identity resolution
+(`_resolve_identity`), project-id canonicalization/validation
+(`_canonicalize_project_id_arg`/`validate_project_id`), and the known-project gate
+(`_known_project_gate`) — none of which is *authorization*, all of which would pass for any
+caller. `_install_safe_tool_wrapper` (`server/main.py:1639-1682`) is a `BaseException` catcher
+around FastMCP's dispatch chokepoint — defence-in-depth against a tool handler crashing the
+server, not an authorization boundary.
+
+Two real precedents exist, and this decision draws on both without pretending either is stronger
+than it is:
+
+- **`add_system_record`** (`server/tools.py:1282-1341`): rejects any `agent_id` not starting with
+  `'recon-stage-'` with `error_type='DedupExemptNotPermitted'`, checked *before* project/backlog
+  validation (`:1327-1332`). Its own docstring (`:1302-1307`) concedes the honest limit: *"this
+  checks the agent_id **string** the caller provides — it is a naming convention enforced
+  server-side, not cryptographic authorization. A caller that deliberately passes
+  agent_id='recon-stage-\*' can still reach this path."* This decision adopts that same honesty
+  rather than claiming a security property the system cannot deliver: `agent_id` is
+  self-reported by the caller, and every guard built on it (including the one this decision adds)
+  is a **misuse deterrent for cooperating callers**, not a defense against an adversarial one.
+- **`middleware/recon_write_policy.py:1-30`** — a **structural** precedent, not a code dependency.
+  This module gates a completely different write surface (`update_task` / `set_task_status` on
+  *tasks*, consulted from `TaskInterceptor`) — it has no relationship to Mem0 records and the new
+  tool must not import it. What it offers is the **shape** worth reusing: an `agent_id`-prefix gate
+  (Gate 1-3 in `check()`) WITH a carve-out for a "non-load-bearing, metadata-only, merge-mode"
+  write (`is_terminal_annotation_clear`/`is_terminal_annotation_add`, `:441-602`) plus a mandatory
+  `_causation_id` tracing co-key riding alongside it (`_CAUSATION_TRACING_KEYS`, `:151`). That is
+  *exactly* the shape "does a metadata-only patch get a lighter bar" needs — a prefix gate plus an
+  explicit metadata-only carve-out plus mandatory attribution — so this decision mirrors that
+  shape for the Mem0 write surface instead of inventing a new authorization-tier vocabulary
+  (INV-5). It is cited for its *design*, never called into.
+
+### The authorization model (DECIDED)
+
+**A new config section, `Mem0UpdateConfig`, added as its own top-level field on
+`FusedMemoryConfig`** (`config/schema.py`) — deliberately **not** nested under
+`ReconciliationConfig` alongside the `procedural_knowledge_near_dup_*` knobs, even though those are
+the closest existing precedent for a write-time server-enforced guard. `schema.py`'s own ownership
+note on those knobs (`:1071-1081`) already flags the trap: they live on `ReconciliationConfig`
+only because the guard they drive is "the write-time counterpart to Stage-1's reactive
+procedural_knowledge consolidation," and explicitly warns *"if this guard ever grows independent
+of reconciliation, move these two fields to a dedicated server-owned config section instead of
+assuming colocation implies subsystem ownership."* The Mem0-update authorization gate is general —
+recon Stage 1 is merely its first sanctioned caller, not its owner — so it starts in the place that
+note says a growing guard should move *to*, rather than repeating the trap and needing a later
+migration. `CuratorConfig` / `TicketJanitorConfig` / `SummaryRebuildConfig` are the existing
+precedent for a named capability getting its own top-level config section instead of being
+shoehorned into `ReconciliationConfig`.
+
+```python
+class Mem0UpdateConfig(BaseModel):
+    """Authorization + kill-switch config for the update_memory MCP tool (task 3088).
+
+    Two independently-configurable allowlists implement the differential bar decided in
+    plans/mem0-in-place-update-decision.md §4. Fail-safe default is a KILL SWITCH plus
+    narrow allowlists, not open allowlists — an unconfigured or partially-corrupt config
+    permits as little as possible (fail CLOSED), since this is a mutation-authorization
+    gate, not a soft-block guard where fail-open-on-error would be the safe direction.
+    """
+    enabled: bool = Field(default=True)  # named kill switch; False rejects every caller
+    content_amend_allowed_agent_prefixes: list[str] = Field(default_factory=lambda: ['recon-stage-'])
+    metadata_patch_allowed_agent_prefixes: list[str] = Field(default_factory=lambda: ['recon-stage-'])
+    storm_threshold: int = Field(default=20)          # content-amend calls per agent_id per window
+    storm_window_seconds: float = Field(default=3600.0)
+```
+
+- **Fail-safe default**: both allowlists ship seeded with exactly `['recon-stage-']` — the same
+  literal prefix `add_system_record` already uses (INV-5: reuse the string, don't mint a second
+  one) — which satisfies the task's minimum bar ("must at minimum admit recon Stage 1
+  `memory_consolidator`," named in task 3088's scope) out of the box, with nothing else able to
+  call either arm until an operator deliberately widens a list.
+- **Hot-reload tier: green**, alongside the existing `procedural_knowledge_near_dup_*` leaves in
+  `config/reload.py`'s `RELOADABLE_FIELDS` (`:43-55`) — but the follow-up **must** satisfy
+  `reload.py`'s own reload-safety rule (module docstring, `:8-16`) first: a leaf is only
+  reload-safe if every consumer re-reads it *live* from the shared config object on each call. The
+  implementer must write a `resolve_mem0_update_authorization(...)`-shaped live-read helper (same
+  pattern as `resolve_near_dup_guard_enabled` / `resolve_near_dup_threshold` in
+  `server/near_duplicate_guard.py`) before adding `mem0_update.*` leaves to `RELOADABLE_FIELDS` —
+  registering the leaf without the live-read helper would silently reintroduce a restart
+  requirement disguised as a hot-reload.
+- **Named kill switch**: `mem0_update.enabled`. `False` rejects every caller regardless of
+  `agent_id`, with a structured `{'error_type': 'Mem0UpdateToolDisabled'}` — same shape convention
+  as every other rejection on this surface.
+- **Model**: this section is the direct analogue of `plans/stage1-entity-standing-decision-prd.md`'s
+  `### Authorization gate (server-side, in the tool handler)` (line 110) — a server-side gate in
+  the tool handler, checked first (mirroring `add_system_record`'s ordering, `:1323-1326`, "before
+  any project/backlog/category validation work... happens on its behalf"), returning a structured
+  rejection (INV-1) rather than raising.
+- **Attributable writes**: both arms require a resolved `agent_id` matching their respective
+  allowlist. The content-amend arm additionally requires a non-empty `reason` (§3) — this is the
+  concrete "agent_id plus a reason" requirement task 3088 names, applied to the arm where a silent
+  rewrite of semantic content is possible. Every accepted call is journaled regardless of arm or
+  reason (§5) — attribution is never optional at the journal layer, only at the argument-validation
+  layer.
+
+### The differential bar (DECIDED: yes, metadata-only gets a lighter bar — but never an unguarded one)
+
+Task 3055's third scope question is answered on three concrete axes, not intuition:
+
+1. **Reconciliation semantics.** `scripts/tag_cgl_eta_rehome_scope.py:44-47` deliberately bypasses
+   `MemoryService` today specifically because *"a cosmetic provenance tag must not trigger a recon
+   cycle over these very facts."* Decision: the content-amend arm **always** emits
+   `EventType.memory_updated`; the metadata-patch arm does **not** emit it by default (an
+   `emit_event: bool = False` internal service-layer parameter exists for a future caller that
+   wants one, but no MCP-level argument surfaces it in the initial ship — task 3088 may add one if
+   a concrete consumer needs it).
+2. **Write path / embedding cost.** The content-amend arm re-embeds unconditionally (inherent to
+   `mem0.update()`, not a choice — §5). The metadata-patch arm **never** re-embeds — it routes
+   around mem0's `Memory.update` entirely (§5) precisely so tagging survivors stays cheap and
+   never perturbs semantic ranking.
+3. **Blast radius.** Metadata is not inert: `get_memories_by_metadata` / `count_by_metadata` make
+   it the input to *deterministic* retrieval, so a bad patch corrupts lookup silently, not loudly.
+   **"Lighter bar" therefore means a lower tier, never an unguarded one:** reserved-key rejection
+   (§3) and write-journal logging (§5) apply to **both** arms, unconditionally, with no
+   metadata-only exemption.
+
+Two further, concrete tiering mechanisms (beyond the three axes above) implement "lighter" at the
+authorization layer specifically:
+
+- **Independently configurable allowlists** (not independently *valued* by default — see above):
+  an operator can widen `metadata_patch_allowed_agent_prefixes` (e.g. to admit an interactive
+  curator session prefix for consolidation-closure tagging) without touching
+  `content_amend_allowed_agent_prefixes` at all. The bar is structurally decoupled even though it
+  ships identical on day one.
+- **Mandatory vs. optional `reason`** (§3): content-amend requires proof of "why"; metadata-only
+  does not.
+- **Storm-counter exemption** (below): only content-amend calls count toward the storm threshold.
+  A mistagged metadata patch is cheap to notice (`get_memory_by_id`) and cheap to correct (another
+  metadata-only patch); a runaway silent content rewrite is not.
+
+### INV-4 `storm-escape-required`
+
+An in-place content amend is a silent-rewrite primitive — the archetypal fail-soft-adjacent path
+INV-4 exists for. This decision specifies the escape rather than leaving it to the implementer:
+
+- **What is counted**: content-amend (`content` arm) calls only, keyed per `agent_id`. Metadata-only
+  patches are excluded (see differential-bar rationale above).
+- **Mechanism**: a rolling-window counter mirroring the **shape** of
+  `ReconciliationHarness`'s existing storm counters (`reconciliation/harness.py` — e.g. the
+  `_dead_owner_suppressions` deque + `dead_owner_suppression_storm_threshold`/`window_seconds` +
+  single-fire-per-window escalation via a stable finding fingerprint, `:159-168`, `:480-494`) — but
+  **implemented fresh**, not literally shared: the harness's counters live inside the
+  per-process `ReconciliationHarness` instance, a different lifetime and process from the MCP
+  server's tool-dispatch path that will host this counter, so there is no live object to import.
+  Same shape (deque of timestamps per agent_id, threshold + window config, single-fire dedup via a
+  stable category/agent_id fingerprint so a sustained storm folds into one pending escalation
+  rather than one per call) — new code, deliberately not a new *vocabulary*.
+- **Threshold**: `mem0_update.storm_threshold` (default 20) content-amend calls per `agent_id`
+  within `mem0_update.storm_window_seconds` (default 3600s / 1h) — both green-tier hot-reloadable
+  alongside the allowlists above, for the same reason.
+- **Who hears about it, and how**: a `severity='blocking'` escalation, category
+  `mem0_in_place_update_storm`, fingerprinted on `(category, agent_id)` — not on count/window, so
+  repeated storms from the same agent fold into a single pending escalation instead of paging
+  once per breach (mirroring `_DEAD_OWNER_STORM_FINDING`'s stable-fingerprint / variable-detail
+  split, `harness.py:164-168`). `blocking`, not `info`, because a runaway silent-rewrite loop is a
+  "someone must look at this now" condition, matching this repo's `recon_watchdog_kill_storm`
+  precedent — not a routine triage item.
