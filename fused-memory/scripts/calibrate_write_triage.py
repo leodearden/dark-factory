@@ -61,7 +61,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -393,7 +393,7 @@ def _band_counts(
 
 
 def build_report(
-    scores_by_class: dict[str, Sequence[float]],
+    scores_by_class: Mapping[str, Sequence[float]],
     t_high: float | None,
     t_low: float | None,
     reason: str | None,
