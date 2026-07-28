@@ -458,6 +458,15 @@ class ReconciliationHarness:
             dict(known_projects) if known_projects is not None
             else build_known_projects_map(self._project_root)
         )
+        # Task 2998 GAP A: seed the policy's project_root cache NOW, at
+        # construction.  Its only other writer is BacklogPolicy.check(), which
+        # runs on a mutating MCP call — so a halt rehydrated by
+        # Judge.initialize() fires _notify_judge_halt before any root has been
+        # registered, _route_over_limit falls to the rejection branch, and
+        # NOTHING is written (the 48h reify incident: 0 of 96 escalation files
+        # carried ReconciliationJudgeHalted, and no log line of any kind).
+        if self._backlog_policy is not None and self._known_projects:
+            self._backlog_policy.register_known_project_roots(self._known_projects)
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
