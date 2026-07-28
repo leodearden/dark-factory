@@ -2591,11 +2591,15 @@ class TestNotifyJudgeHaltDedupeToken:
     """
 
     def _harness(self, journal, event_buffer, mock_memory_service, verdict):
+        """Return (harness, on_judge_halt mock) — assertions target the mock
+        directly rather than reaching back through the optional
+        harness._backlog_policy attribute."""
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        harness._backlog_policy = MagicMock()
-        harness._backlog_policy.on_judge_halt = AsyncMock(return_value=verdict)
+        policy = MagicMock()
+        policy.on_judge_halt = AsyncMock(return_value=verdict)
+        harness._backlog_policy = policy
         harness._halt_escalated.discard('test-project')
-        return harness
+        return harness, policy.on_judge_halt
 
     @pytest.mark.asyncio
     async def test_rejection_does_not_burn_token(
@@ -2604,7 +2608,7 @@ class TestNotifyJudgeHaltDedupeToken:
         """Rejection verdict → sentinel unset, next halted tick retries."""
         from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 
-        harness = self._harness(
+        harness, on_judge_halt = self._harness(
             journal, event_buffer, mock_memory_service,
             BacklogVerdict(
                 outcome='rejection', project_id='test-project',
@@ -2616,7 +2620,7 @@ class TestNotifyJudgeHaltDedupeToken:
         assert 'test-project' not in harness._halt_escalated
 
         await harness._notify_judge_halt('test-project', reason='r')
-        assert harness._backlog_policy.on_judge_halt.call_count == 2
+        assert on_judge_halt.call_count == 2
 
     @pytest.mark.asyncio
     async def test_escalated_without_path_does_not_burn_token(
@@ -2625,7 +2629,7 @@ class TestNotifyJudgeHaltDedupeToken:
         """Rate-limited escalation (no file written) → sentinel unset."""
         from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 
-        harness = self._harness(
+        harness, on_judge_halt = self._harness(
             journal, event_buffer, mock_memory_service,
             BacklogVerdict(
                 outcome='escalated', project_id='test-project',
@@ -2637,7 +2641,7 @@ class TestNotifyJudgeHaltDedupeToken:
         assert 'test-project' not in harness._halt_escalated
 
         await harness._notify_judge_halt('test-project', reason='r')
-        assert harness._backlog_policy.on_judge_halt.call_count == 2
+        assert on_judge_halt.call_count == 2
 
     @pytest.mark.asyncio
     async def test_escalated_with_path_sets_token_and_dedupes(
@@ -2646,7 +2650,7 @@ class TestNotifyJudgeHaltDedupeToken:
         """A real file written → sentinel SET, second call is a no-op."""
         from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 
-        harness = self._harness(
+        harness, on_judge_halt = self._harness(
             journal, event_buffer, mock_memory_service,
             BacklogVerdict(
                 outcome='escalated', project_id='test-project',
@@ -2659,7 +2663,7 @@ class TestNotifyJudgeHaltDedupeToken:
         assert 'test-project' in harness._halt_escalated
 
         await harness._notify_judge_halt('test-project', reason='r')
-        assert harness._backlog_policy.on_judge_halt.call_count == 1
+        assert on_judge_halt.call_count == 1
 
     @pytest.mark.asyncio
     async def test_notify_judge_halt_logs_when_no_escalation_written(
@@ -2668,7 +2672,7 @@ class TestNotifyJudgeHaltDedupeToken:
         """A halt that escalated to nothing must say so — loud over silent."""
         from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 
-        harness = self._harness(
+        harness, on_judge_halt = self._harness(
             journal, event_buffer, mock_memory_service,
             BacklogVerdict(
                 outcome='rejection', project_id='test-project',

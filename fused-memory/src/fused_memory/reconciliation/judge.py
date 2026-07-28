@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
+"""Fired by :meth:`Judge.unhalt` after the halt state is cleared.
+
+The harness's implementation (``ReconciliationHarness._on_judge_unhalt``)
+clears the per-process escalation dedupe sentinel AND closes the
+``esc-reconciliation-halt-*`` escalation the halt opened (task 2998), so this
+callback is not merely bookkeeping — skipping it leaves a pending escalation
+for a halt that no longer exists.
+"""
 
 
 class JudgeInfraError(Exception):
@@ -659,6 +667,12 @@ Review this run and provide your verdict as JSON.
         unhalt gets a fixed number of fresh cycles to accumulate clean verdicts
         before the trend detector re-engages. Without this, historical moderates
         immediately re-halt on the next cycle.
+
+        Fires ``on_unhalt_cb`` when the project WAS halted; that callback also
+        closes the halt's escalation record (task 2998) — see
+        :data:`UnhaltCallback`. Awaitable results are awaited, and callback
+        failures are logged rather than raised, so a close failure never blocks
+        the unhalt itself.
         """
         was_halted = project_id in self._halted_projects
         self._halted_projects.discard(project_id)

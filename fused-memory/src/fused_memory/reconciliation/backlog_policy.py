@@ -312,7 +312,7 @@ class BacklogPolicy:
                 project_id,
             )
             return []
-        if not _HAS_ESCALATION:  # pragma: no cover — minimal envs only
+        if not _HAS_ESCALATION or EscalationQueue is None:  # pragma: no cover
             logger.warning(
                 'backlog_policy: cannot close halt escalation for %s — '
                 'escalation package unavailable',
@@ -404,9 +404,11 @@ class BacklogPolicy:
         """
         candidates: list[str] = []
         for project_id in sorted(self._state.keys()):
-            if project_id in self._startup_seeded:
-                if await self.current_backlog(project_id) == 0:
-                    continue
+            if (
+                project_id in self._startup_seeded
+                and await self.current_backlog(project_id) == 0
+            ):
+                continue
             candidates.append(project_id)
         return candidates
 

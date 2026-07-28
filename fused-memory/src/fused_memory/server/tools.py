@@ -3085,6 +3085,14 @@ def create_mcp_server(
         The judge halts a project when it detects serious issues or error
         trends. This tool clears the halt so reconciliation cycles can resume.
 
+        Clearing a halt also RESOLVES the matching
+        ``esc-reconciliation-halt-*`` escalation(s) under
+        ``<project_root>/data/escalations/`` — before task 2998 those records
+        stayed pending forever, so the dashboard kept showing a halt that no
+        longer existed. The ids closed are returned in
+        ``escalations_resolved`` (empty when there was nothing pending) and
+        named in ``message``.
+
         Args:
             project_id: Project to unhalt
         """
@@ -3098,16 +3106,27 @@ def create_mcp_server(
         was_halted = reconciliation_harness.judge.is_halted(project_id)
         await reconciliation_harness.judge.unhalt(project_id)
         grace = reconciliation_harness.judge.unhalt_grace_remaining(project_id)
+        resolved = reconciliation_harness.take_resolved_halt_escalations(project_id)
+        if was_halted:
+            message = (
+                f'Reconciliation unhalted for {project_id}. Next cycle will run '
+                f'within ~5 seconds; trend detector suppressed for {grace} cycles.'
+            )
+            # Loud over silent: state the auto-close in prose so the operator
+            # sees it here rather than having to go check the queue.
+            if resolved:
+                message += (
+                    f' Auto-resolved {len(resolved)} pending halt escalation(s): '
+                    f"{', '.join(resolved)}."
+                )
+        else:
+            message = f'Project {project_id} was not halted.'
         return {
             'status': 'unhalted' if was_halted else 'already_running',
             'project_id': project_id,
             'grace_cycles_remaining': grace,
-            'message': (
-                f'Reconciliation unhalted for {project_id}. Next cycle will run '
-                f'within ~5 seconds; trend detector suppressed for {grace} cycles.'
-                if was_halted
-                else f'Project {project_id} was not halted.'
-            ),
+            'escalations_resolved': resolved,
+            'message': message,
         }
 
     @mcp.tool()
