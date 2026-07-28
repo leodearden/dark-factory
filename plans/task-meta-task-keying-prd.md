@@ -147,11 +147,18 @@ Fix: stamp `_base_commit` into `plan.json` beside the existing `_session_id` /
 then travels with the artifact it describes rather than living in a sibling
 file that does not travel (INV-5: one site, not two that must agree).
 
-`_apply_revalidation_skip` and `update_base_commit` must keep the two coherent,
-and Layer-B iteration hygiene (`workflow.py:2248-2259`), whose discriminator is
-`_old_plan_base != base_commit`, must retain its current semantics: wipe
-`iterations.jsonl` on a definitive re-dispatch onto a **new fork point**, and
-only then.
+The two values are **semantically distinct, not a lock-step pair** (INV-5):
+`metadata.json.base_commit` is *this dispatch's worktree fork point*;
+`plan.json._base_commit` is *the main SHA the plan was last validated against*.
+They coincide on a first dispatch and legitimately diverge afterwards, so
+neither is a copy of the other and no agreement invariant is owed.
+`_apply_revalidation_skip` advances the plan's stamp; `update_base_commit`
+advances the dispatch's.
+
+Layer-B iteration hygiene (`workflow.py:2248-2259`) must retain its current
+semantics — wipe `iterations.jsonl` on a definitive re-dispatch onto a **new
+fork point**, and only then — which means its discriminator stays the
+*dispatch* base, not the plan stamp.
 
 ### M3 — self-healing adoption at dispatch
 
@@ -187,6 +194,13 @@ pass. Per INV-4 the sweep carries a consecutive-failure streak counter that
 escalates rather than degrading silently. 14 days is deliberately longer than
 any observed requeue gap (5069's was 2 days), so the sweep can never race a
 live task's return.
+
+Deletion is irreversible, so per INV-3 the terminal status is **re-read
+immediately before each `rmtree`**, not taken from the batch snapshot the sweep
+opened with: a task that was reopened to `pending` between the snapshot and the
+delete must survive (boundary case B8). The escalation carries structured
+fields — reclaimed count, failed paths, the errno — not a prose summary
+(INV-2).
 
 ### M6 — one path for agents
 
@@ -282,6 +296,20 @@ and this one holds every integration task.
 | `review_state.json` | task | documented task-lifetime counters (defect 2) |
 | `reconcile_state.json` | task | cross-restart dedup keys for this task's steps (2764) |
 
+### Named surface (stable anchors — the delivered-check twins bind to these)
+
+| Symbol / string | Owner | Purpose |
+|---|---|---|
+| `TaskArtifacts.task_root_for(worktree_base, task_id)` | β | task-lifetime root derivation |
+| `TaskArtifacts.read_lane_task_id(meta_root)` | α | lane→task resolution off `metadata.json`, replacing the `plan.json` reads at `git_ops.py:5442` and `:6386` |
+| `TaskArtifacts.clear_reviews()` | ε | per-round clear of the whole `reviews/` dir, generalizing the `reviews/merge.json` single-file clear |
+| `plan.json` key `_base_commit` | δ | the plan's own fork point (M2) |
+| log `adopted task-scoped artifacts from` | γ | the one INFO line adoption emits |
+| log `task-meta gc: reclaimed` | ζ | the sweep's per-pass reclaimed count |
+
+These names are contract, not suggestion: they are what the capability
+manifest's dispatch-time checks grep for.
+
 ### Adoption invariants
 
 1. Adoption fires only when `task_root_for(id)` is absent.
@@ -290,7 +318,10 @@ and this one holds every integration task.
    a different task.
 3. Adoption is a move; on success the source's task-scoped members no longer
    exist. Partial failure leaves the source intact and logs at WARNING — never
-   raises into the dispatch path.
+   raises into the dispatch path. Because that is a fail-soft path, it carries
+   a consecutive-failure streak counter that escalates once the threshold is
+   crossed (INV-4): a filesystem fault that silently costs every returning task
+   its plan is precisely the degradation this PRD exists to make loud.
 4. Adoption emits exactly one INFO line naming the source lane.
 
 ## Boundary-test sketch (the ω integration gate's signal)
@@ -372,12 +403,17 @@ Labels are intra-batch; real ids are assigned at decompose time.
   *Signal (leaf):* the B1–B9 suite green; in particular B2 asserting **zero**
   architect invocations on a cross-lane re-dispatch. Depends γ, δ, ε, η.
 
-G7 walk (advisory at author time; re-walked at decompose): ζ is the only task
-introducing a fail-soft path and it ships the INV-4 streak counter by
-construction. γ acts on `.lane-state` snapshot state and carries the INV-3
-corroboration explicitly. β and η both *remove* duplication (one routing table
-replacing hand-joined roots; one prompt path replacing two spellings), so
-INV-5 is satisfied rather than waived. No waivers anticipated.
+### G7 walk (every task, not only leaves)
+
+| Invariant | Hit | Resolution (in-design, no waiver) |
+|---|---|---|
+| INV-1 `contracts-machine-checked` | β introduces the artifact→root contract | it lands as a routing **table in code** consumed at the single derivation point, and §Named surface is bound by the manifest's dispatch-time greps — not prose |
+| INV-2 `structured-facts-at-failure` | ζ's failure escalation | carries reclaimed count / failed paths / errno as structured fields (M5) |
+| INV-3 `corroborate-before-acting` | γ moves on a `.lane-state` snapshot; **ζ deletes on a status snapshot** | γ: eligibility re-checked against `.lane-state` (adoption invariant 2). ζ: terminal status **re-read immediately before each `rmtree`** (M5) — the sharper of the two, since deletion is irreversible |
+| INV-4 `storm-escape-required` | ζ's sweep **and γ's never-raise adoption path** | both ship a consecutive-failure streak counter that escalates; γ's was added on this walk — a silent adoption fault would cost every returning task its plan, which is the exact degradation this PRD exists to make loud |
+| INV-5 `no-lockstep-duplication` | δ appears to duplicate a base commit | resolved by semantics, not by a second copy: `metadata.json.base_commit` is the *dispatch* fork point, `plan.json._base_commit` is the *plan's* last-validated main SHA (M2). β and η both net-*remove* duplication (one routing table replacing hand-joined roots; one prompt path replacing two spellings) |
+
+No waivers.
 
 ## Out of scope
 
