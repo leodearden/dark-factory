@@ -506,7 +506,10 @@ async def run_architect_eval(
     architect run means exactly that case, and aggregates EXCLUDE such cells
     rather than averaging in a fabricated zero. An architect that ran fine and
     merely produced a bad or absent plan still scores 0.0 — that is a real
-    reliability signal, not an infra failure. The result carries
+    reliability signal, not an infra failure. A refusal of the JUDGE alone is
+    recorded in ``invocation_error`` (prefixed ``judge:``) but does NOT taint:
+    the structural floor is still derived from a real produced plan, so the cell
+    stays a content measurement and stays in the aggregate. The result carries
     ``role_under_test='architect'`` and is persisted via :func:`save_result`.
     """
     from orchestrator.agents.briefing import BriefingAssembler
@@ -643,6 +646,7 @@ async def run_architect_eval(
     #    non-sentinel float — UNLESS the architect invocation itself was refused
     #    at the transport layer, in which case there is nothing to score.
     plan_quality: float | None = None
+    judge_error: str | None = None
     if arch_error:
         # We never got to ask the model: the plan artifact is empty, so every
         # available number would be FABRICATED — and a fabricated 0.0 is
@@ -660,6 +664,9 @@ async def run_architect_eval(
         try:
             verdict = await judge_plan_quality(plan, reference_diff, task)
             plan_quality = verdict.plan_quality
+            # getattr, not attribute access: a monkeypatched or legacy verdict
+            # without the field must not break scoring.
+            judge_error = getattr(verdict, 'invocation_error', None)
         except Exception:
             logger.warning(
                 f'plan judge raised for {task_id}; degrading to structural floor',
@@ -670,13 +677,23 @@ async def run_architect_eval(
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
+    # The marker names WHICH stage was refused; the join keeps the field
+    # well-defined if both ever fire (today an architect-side refusal skips the
+    # judge, so at most one does). cap_tainted keys on the ARCHITECT side ONLY:
+    # a judge-only refusal still leaves a real plan behind a real structural
+    # score, so excluding that cell would discard a valid measurement.
+    stage_markers = [
+        f'{stage}:{marker}'
+        for stage, marker in (('architect', arch_error), ('judge', judge_error))
+        if marker
+    ]
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
         plan_steps=len(plan.get('steps', [])),
         cost_usd=cost_usd,
         workflow_duration_ms=arch_duration_ms,
-        invocation_error=f'architect:{arch_error}' if arch_error else None,
+        invocation_error='; '.join(stage_markers) or None,
         cap_tainted=bool(arch_error),
     )
     result_obj = EvalResult(
@@ -693,7 +710,11 @@ async def run_architect_eval(
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
         f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
-        + (f' [cap_tainted: {metrics.invocation_error}]' if arch_error else '')
+        + (
+            f' [{"cap_tainted" if arch_error else "invocation_error"}: '
+            f'{metrics.invocation_error}]'
+            if metrics.invocation_error else ''
+        )
     )
     return result_obj
 
