@@ -38,6 +38,57 @@ from orchestrator.verify_plan import (
 )
 
 # ---------------------------------------------------------------------------
+# Real config command strings, verbatim from the repo's orchestrator configs
+# (verified byte-identical to the live YAML). Every subproject's lint_command
+# chains a `python3 fused-memory/scripts/check_*.py <dir>` sibling checker, so
+# these are the corpus that decides whether the pre-merge scoper preserves a
+# trailing clause or truncates at the keyword.
+# ---------------------------------------------------------------------------
+
+# fused-memory/orchestrator.yaml:11 — the only 3-segment chain (two checkers)
+_FM_LINT_COMMAND = (
+    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
+    ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+)
+
+# cockpit/dashboard/escalation/orchestrator/sampler/shared orchestrator.yaml —
+# each the same 2-segment shape, differing only in the module name.
+_MODULE_LINT_COMMANDS = {
+    module: (
+        f'uv run --project {module} --directory {module} ruff check src/ tests/'
+        f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
+    )
+    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
+}
+
+# dark-factory-orchestrator.yaml:50
+_ROOT_LINT_COMMAND = (
+    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+)
+
+# dark-factory-orchestrator.yaml:51
+_ROOT_TYPE_CHECK_COMMAND = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+    ' && cd ../dashboard && npx pyright'
+)
+
+# dark-factory-orchestrator.yaml:41
+_ROOT_TEST_COMMAND = (
+    'cd shared && uv run pytest tests/ --timeout=300'
+    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
+    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
+    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
+    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
+    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
+    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+)
+
+
+# ---------------------------------------------------------------------------
 # GOLDEN incident fixtures
 # ---------------------------------------------------------------------------
 
@@ -792,6 +843,75 @@ class TestDeriveVerifyPlanMergeBreadth:
         assert len(plan.runs) == 1
         assert plan.runs[0].scope_kind is ScopeKind.TRIVIAL
         assert plan.needs_pipeline_guard_check is True
+
+
+# ---------------------------------------------------------------------------
+# verify._reproject_str: &&-chain tail awareness (task 3061)
+# ---------------------------------------------------------------------------
+
+
+class TestReprojectStrChainTail:
+    """_reproject_str must reproject a chained command's head, not give up on it.
+
+    The fallback path (verify.py:2314-2321) scopes a config command with
+    ``_scope_to_keyword`` and then reprojects it into ``_FALLBACK_UV_PROJECT``,
+    because — per task 2036 — the depless workspace-root uv project cannot
+    spawn ruff/pyright. Losing the ``--project`` injection is therefore a hard
+    breakage (exit 127, command not found), not a cosmetic diff.
+
+    Once the scoper starts preserving a trailing ``&&`` clause, the string
+    handed to ``_reproject_str`` is a chain; re-parsing the whole chain
+    classifies it OPAQUE and the injection is SILENTLY dropped. This class
+    guards that regression BEFORE the scopers change, so no intermediate
+    commit is red.
+    """
+
+    def test_chained_head_is_reprojected_and_tail_survives_verbatim(self):
+        """The regression case: bare ``uv run`` head + sibling-checker tail."""
+        raw = (
+            'uv run ruff check f.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+        )
+        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == (
+            'uv run --project shared ruff check f.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+        )
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('uv run ruff check f.py', 'uv run --project shared ruff check f.py'),
+            ('uv run pyright f.py', 'uv run --project shared pyright f.py'),
+            (
+                'uv run --project fused-memory ruff check f.py',
+                'uv run --project fused-memory ruff check f.py',
+            ),
+            ('mypy src/', 'mypy src/'),
+            ('true', 'true'),
+        ],
+        ids=[
+            'bare-uv-run-ruff',
+            'bare-uv-run-pyright',
+            'explicit-project-is-a-no-op',
+            'opaque-is-a-no-op',
+            'no-op-command',
+        ],
+    )
+    def test_single_clause_commands_are_byte_identical_goldens(self, raw, expected):
+        """No-tail regression corpus: literal goldens, deliberately not derived."""
+        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_ROOT_TYPE_CHECK_COMMAND, _ROOT_TEST_COMMAND],
+        ids=['root-type-check-cd-fan-out', 'root-test-subshell-fan-out'],
+    )
+    def test_gate_reject_cases_still_no_op(self, raw):
+        """A cwd-sequenced / subshell fan-out is returned untouched, never truncated."""
+        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == raw
+
+    def test_none_is_passed_through(self):
+        assert verify._reproject_str(None, verify._FALLBACK_UV_PROJECT) is None
 
 
 # ---------------------------------------------------------------------------
