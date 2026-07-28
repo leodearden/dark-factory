@@ -180,6 +180,22 @@ implementation. Do not rename either to make them match.
   match `update_task`'s existing `metadata_mode` vocabulary (`'merge'` / `'replace'`) deliberately —
   same operator-facing naming, not the same code (tasks and Mem0 records are different backends;
   see §6 for why the underlying logic justifiably differs, not just the label).
+- **`metadata_mode='replace'` with an absent or empty `metadata_patch` is a `ValidationError`**,
+  naming both arguments. Decided explicitly here rather than left to fall out of the other gates,
+  because the combination is otherwise *reachable and silently destructive*: the at-least-one-arm
+  check below is satisfied by `content` alone, and the replace+`metadata_delete_keys` rejection one
+  bullet down does not apply, so
+  `update_memory(memory_id=..., content='new text', metadata_mode='replace')` would pass every
+  other gate and — per §5(b)'s combined-call rule — wipe every custom provenance key on the record
+  (`kind`, `src_project`, `topic`, …). That is precisely the task-2180 metadata-wipe failure mode
+  (`append=False` silently meaning "replace with nothing") this section cites two bullets down as
+  its own reason for rejecting a magic deletion sentinel, and it would defeat the
+  provenance-preservation guarantee §6 calls the entire point of the tool. **"Replace with nothing"
+  is therefore never an implicit wipe**: a caller that genuinely wants to clear custom keys must
+  name them in `metadata_delete_keys`, where the intent is explicit and auditable in the journal
+  row. Note the asymmetry is deliberate — `metadata_mode='merge'` (the default) with no
+  `metadata_patch` is *not* an error, because an empty merge is a well-defined no-op on the
+  metadata arm; only `replace` turns emptiness into destruction.
 - **`metadata_delete_keys: list[str] | None`** is the explicit **key-deletion mechanism** — this is
   the "sentinel" the deletion question (task 3055 planning note) asks to be decided. **Decision: no
   magic sentinel value.** A sentinel string or `None`-means-delete convention was rejected because
@@ -212,6 +228,25 @@ implementation. Do not rename either to make them match.
 - **At least one of `content`, `metadata_patch`, `metadata_delete_keys` must be non-empty.**
   Supplying none is a `ValidationError` (mirrors `update_edge`'s equivalent
   neither-argument-supplied check, `:2140-2144`).
+- **A `memory_id` that does not exist is a structured `{'error_type': 'MemoryNotFound'}` rejection,
+  in every arm** — never a success envelope. Decided here because the §5(b) metadata-only fast paths
+  make the alternative a *silent-success hole*, not merely an unspecified case: the
+  `metadata_patch`-alone and `metadata_delete_keys`-alone routes call
+  `AsyncQdrantClient.set_payload`/`delete_payload` directly with no read-before-write, and Qdrant
+  treats both as **no-ops for an unknown point id**, returning `acknowledged`/`completed` rather
+  than an error. Without an explicit existence check, `update_memory` would emit the success
+  envelope below (`{'status': 'updated', 'id': memory_id, 'metadata_patched': True}`) **and** a
+  journal row claiming a write that never touched anything — the exact "caller believes it wrote
+  something it did not" failure class the reserved-key rejection above exists to prevent, and a
+  violation of this repo's no-silent-fail-soft invariant that `Mem0Backend.get_point_by_id`'s
+  docstring (`backends/mem0_client.py:426-446`) goes out of its way to honour by distinguishing
+  *absent* from *timed-out*. **Every arm therefore verifies existence first via the §5(c) read leg**
+  (`MemoryService.get_memory_by_id` → `Mem0Backend.get_point_by_id`) before any write. A read
+  *timeout* (as opposed to a confirmed absence) must **not** be reported as `MemoryNotFound` — it is
+  a distinct transient error, and `get_point_by_id` already separates the two so the implementer
+  does not have to infer it. This makes the metadata-only fast paths one read + one write; the
+  one-backend-**write** invariant stated at the end of §5(b) is unaffected, since the existence
+  check is a read.
 - **The point id / UUID is preserved and echoed in the result envelope** — e.g.
   `{'status': 'updated', 'store': 'mem0', 'id': memory_id, 'content_amended': bool,
   'metadata_patched': bool, ...}`, mirroring `update_edge`'s `{'status': 'reassigned', 'store':
@@ -393,10 +428,11 @@ INV-4 exists for. This decision specifies the escape rather than leaving it to t
   2. **Construction order.** `MemoryService(config)` is constructed at `:537` — before
      `curator_escalator` (`:607`) and before `ReconciliationHarness` (`:891`), both built later in
      the same startup function. No harness or curator-escalator reference is in scope at
-     `MemoryService.__init__` time; reusing either would require a post-construction setter (the
-     existing `set_event_buffer`/`set_write_journal`/`set_recon_ledger` pattern,
-     `services/memory_service.py:774-788`) or a reordering of server startup — the design below
-     needs neither.
+     `MemoryService.__init__` time. Reusing either would require both a post-construction setter
+     **and** acceptance of their conditional lifetimes; the design below needs a setter (for the
+     project-root map only — see "Resolving `project_id` → `project_root`" below) but crucially
+     **not** a dependency on any conditionally-constructed component, which is what reason 1 is
+     about.
 
   Same *shape* as the harness counters (deque of timestamps per `agent_id`, threshold + window
   config) — new code, deliberately not a new vocabulary. The single-fire-per-window *folding* of
@@ -433,6 +469,37 @@ INV-4 exists for. This decision specifies the escape rather than leaving it to t
     `curator_escalator` is needed, no startup reordering, and it behaves identically whether
     reconciliation is enabled or disabled. This is precisely what makes reason 1 above hold: the
     alarm's existence never depends on `config.reconciliation.enabled`.
+
+  **Resolving `project_id` → `project_root` (DECIDED — this is the gap that would otherwise force
+  the implementer to invent a delivery path).** `_queue_for` needs a filesystem `project_root`, but
+  `update_memory`'s signature (§3) carries only `project_id`, and **`MemoryService` has no
+  `project_root` anywhere** — verified: a grep for `project_root` in
+  `services/memory_service.py` returns zero hits, and `ScopeViolationEscalator`'s own callers get
+  the root passed in from `server/main.py`'s `_known_projects_map`. Nothing analogous is in scope
+  inside `MemoryService`. The decision:
+
+  1. **Inject the existing registry, do not derive a new one.** `server/main.py:627` already builds
+     `_known_projects_map = build_known_projects_map(_primary_root, _extra_roots)` — a
+     `{project_id: project_root}` map that is explicitly "the single source of truth for the project
+     registry" and is already handed to `ReconciliationHarness` (`:894`) and `TicketJanitor`
+     (`:985`) as `known_projects=`. `update_memory` resolves its `project_id` against that same
+     snapshot. Note `:627` sits **before** the `config.reconciliation.enabled` block opened at
+     `:702`, so the map is built unconditionally — reason 1 above still holds.
+  2. **Delivered via a `set_known_projects(...)` setter**, following the established
+     `set_event_buffer`/`set_write_journal`/`set_recon_ledger`/`set_planned_registry` pattern
+     (`services/memory_service.py:774-788`) and called at server startup after `:627`. A setter is
+     required because `MemoryService` is constructed at `:537`, before the map exists at `:627`;
+     this is a pure-data injection with no lifetime coupling to any conditional component, which is
+     why it does not reintroduce reason 1's problem.
+  3. **Fallback when the root cannot be resolved — structured WARN log + no-op, never a guess.**
+     If the setter was never called, or `project_id` is absent from the map, the escalator logs a
+     structured WARN (naming the `project_id`, the storm count, and the window, so the signal is
+     still recoverable from logs) and skips submission. The triggering `update_memory` call still
+     succeeds — identical to the `HAS_ESCALATION=False` defensive-import path above, so there is
+     one no-op posture for the alarm, not two. **Explicitly forbidden: falling back to
+     `config.taskmaster.project_root`**, which defaults to `'.'` and would silently write
+     escalations into the server process's cwd — an alarm that appears to fire but reaches nobody
+     is strictly worse than one that says in the log that it could not fire.
 - **Who hears about it, and how**: `MemoryService.update_memory`'s post-write observe step (§5(a)
   step 7) calls the owned `Mem0UpdateStormEscalator`'s report method once the per-`agent_id` count
   reaches `mem0_update.storm_threshold` within the configured window. It submits a
@@ -547,10 +614,19 @@ same dependency the fused-memory venv resolves):
   - **`metadata_patch` alone** (`metadata_mode='merge'`, the default, no `metadata_delete_keys`):
     `AsyncQdrantClient.set_payload(payload=<custom subset>, points=[memory_id])`. Qdrant's
     `set_payload` is *already* a genuine partial-payload merge at the storage layer (unlike mem0's
-    `_update_memory`) — no read-before-write is needed. `tests/test_mem0_qdrant_integration.py:69-90`
-    (`test_set_payload_without_vector`) already covers this primitive.
+    `_update_memory`) — no read-modify-write cycle is needed to compute the new payload.
+    `tests/test_mem0_qdrant_integration.py:69-90` (`test_set_payload_without_vector`) already covers
+    this primitive.
   - **`metadata_delete_keys` alone** (no `metadata_patch`): `AsyncQdrantClient.delete_payload(
-    keys=[...], points=[memory_id])` — also native, also no read-before-write.
+    keys=[...], points=[memory_id])` — also native, also no read-modify-write cycle.
+
+  **Both fast paths still perform the §3 existence check first.** "No read-modify-write cycle"
+  means the *new payload* is computed without reading the old one — it does **not** mean the call
+  skips the §5(c) read leg. Qdrant returns `acknowledged`/`completed` for `set_payload` and
+  `delete_payload` against an unknown point id, so omitting the existence check here is exactly what
+  would turn these two fast paths into silent-success holes (§3). Each is therefore one existence
+  read + one write; the one-backend-**write** invariant below counts writes, not reads, and is
+  unaffected.
   - **Both `metadata_patch` and `metadata_delete_keys` supplied together** (the
     `metadata_mode='replace'` + `metadata_delete_keys` combination is instead rejected at the
     boundary, §3): a single read-modify-`overwrite_payload` write — read the existing payload via
@@ -624,6 +700,19 @@ one):
 - A key present in both `metadata_patch` and `metadata_delete_keys` is a `ValidationError`.
 - **`metadata_mode='replace'` supplied together with a non-empty `metadata_delete_keys` is a
   `ValidationError`** naming both arguments — defends §3's replace+delete combination rule.
+- **`metadata_mode='replace'` with an absent/empty `metadata_patch` is a `ValidationError`** naming
+  both arguments — including the specific reachable shape
+  `update_memory(memory_id=..., content='new text', metadata_mode='replace')`, which passes every
+  other gate. Assert additionally that the record's custom provenance keys (`kind`, `src_project`,
+  `topic`) are **unchanged** after the rejected call, so the test fails against an implementation
+  that validates but has already wiped. Defends §3's no-implicit-wipe rule (task-2180 regression).
+  Companion positive case: `metadata_mode='merge'` with no `metadata_patch` is **not** an error.
+- **A `memory_id` that does not exist is rejected with `{'error_type': 'MemoryNotFound'}` in every
+  arm** — parameterised over the content-amend arm, the `metadata_patch`-alone arm, and the
+  `metadata_delete_keys`-alone arm, since the latter two are the §5(b) fast paths where Qdrant's
+  unknown-point-id no-op would otherwise manufacture a false success. Assert both that no backend
+  write is issued **and** that no journal row is written. Separately assert that a read *timeout*
+  from `get_point_by_id` surfaces as its own transient error, **not** as `MemoryNotFound`.
 - **A metadata-only call supplying both `metadata_patch` (merge) and `metadata_delete_keys` in the
   same call routes through exactly one `overwrite_payload` backend call** — never a `set_payload`
   followed by a `delete_payload` — and the resulting payload shows both the merged keys and the
