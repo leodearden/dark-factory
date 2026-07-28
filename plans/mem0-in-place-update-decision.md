@@ -450,9 +450,21 @@ same dependency the fused-memory venv resolves):
   (`main.py:2498-2508`) are all *correct* here — a real content change should perturb ranking and
   should leave its own trace in mem0's history table, in addition to the fused-memory-level journal
   and `memory_updated` event (§4).
-- The **metadata-patch arm** must **not** route through `Mem0Backend.update` / mem0's
-  `Memory.update` at all — doing so would needlessly re-embed, rewrite `updated_at`, and append a
-  spurious mem0 history row for what may be a purely cosmetic tag. Instead, a **new**,
+- **Combined call** (`content` *and* `metadata_patch`/`metadata_delete_keys` supplied together —
+  §3 deliberately allows this, to avoid the torn-intermediate-state problem a two-tool design
+  would have had): when `content` is present, the metadata-arm changes are folded into the *same*
+  `Mem0Backend.update` call, not routed separately. Concretely: read the existing payload (c),
+  strip mem0-owned keys, apply the `metadata_patch` merge/replace and `metadata_delete_keys`
+  removals to that custom subset exactly as the metadata-only path would, then forward the
+  resulting dict as `Mem0Backend.update`'s `metadata=` argument alongside the new `data=content` —
+  the same read-modify-forward dance `tag_cgl_eta_rehome_scope.py`'s `apply_tags` already performs
+  (§2 point 3), just with the metadata delta coming from the caller instead of a fixed scope tag.
+  There is exactly one write, one journal row, and one `memory_updated` event (content-amend's
+  event rule wins whenever `content` is present) — never two writes for one call.
+- The **metadata-only arm** (no `content` in the call) must **not** route through
+  `Mem0Backend.update` / mem0's `Memory.update` at all — doing so would needlessly re-embed,
+  rewrite `updated_at`, and append a spurious mem0 history row for what may be a purely cosmetic
+  tag. Instead, a **new**,
   payload-only `Mem0Backend` method(s) using the backend's existing `_get_async_qdrant()`
   (`mem0_client.py:272-281`) and Qdrant's own partial-payload primitives — verified present on
   `AsyncQdrantClient`: `set_payload`, `delete_payload`, `overwrite_payload`:
@@ -568,3 +580,95 @@ Qdrant.
   The follow-up must re-read both hint strings against the shipped tool's actual name/arguments and
   confirm they still read correctly (e.g. that "update" unambiguously means `update_memory` and not
   some other tool) rather than leaving them newly-actionable but subtly wrong.
+
+## §7 — Hand-off
+
+**No new follow-up task is filed by this decision.** Task **3088** ("Implement the in-place Mem0
+update tool...", `status=pending`, `priority=high`) already exists and already declares
+`dependencies: [3055]` — confirmed via `get_task(3088)` and `get_task(3055)` against the canonical
+store (`/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db`) at hand-off time. Filing a second
+implementation task would create a duplicate for the curator to reconcile against an
+already-correct dependency edge.
+
+### Scope-resolution mapping
+
+Every scope bullet in task 3088's description is answered by a specific section of this document,
+so its implementer needs no further design decisions:
+
+| 3088 scope bullet | Resolved by |
+|---|---|
+| "An MCP tool that patches metadata and/or amends content of an existing Mem0 record IN PLACE, preserving the Qdrant point id" | §3 (full tool contract: signature, arms, `store` handling, point-id preservation in the result envelope) |
+| "Decide and implement re-embedding policy: a content amend must re-embed; a metadata-only patch must NOT" | §5(b) (the write-path fork, verified against mem0's actual `_update_memory`/Qdrant source) |
+| "Merge semantics for metadata must be non-destructive shallow-merge by default... Provide an explicit replace mode and key-deletion" | §3 (`metadata_mode='merge'`\|`'replace'`, `metadata_delete_keys`) |
+| "Authorization model per 3055: at minimum usable by recon Stage 1 (memory_consolidator)" | §4 (`Mem0UpdateConfig`, both allowlists seeded with `'recon-stage-'`) |
+| "Writes should be journalled/attributable (agent_id + a reason)" | §4 (mandatory `reason` for content-amend, optional for metadata-only) + §5(a) (unconditional journal row for both arms) |
+
+**No 3088 scope bullet is left unresolved by this document.** (Two design details that emerged
+only while writing this doc and are *not* literally present in 3088's text — the combined
+content+metadata-patch call in one write, §5(b), and the INV-4 storm counter, §4 — are additions
+this decision makes to satisfy the design invariants gating `/review` phase 2, not gaps in 3088's
+original ask.)
+
+### Proposed `metadata.delivered_checks` (INV-1 — for the implementer to apply to task 3088)
+
+These checks belong on task **3088** itself (the delivering task), per `DeliveredCheckMeta`'s
+gating rule: checks live on the task that claims to deliver the capability, and gate *its*
+dependents — so a future task that depends on 3088 is protected from trusting a `done` status
+that doesn't correspond to a real capability on `main`, exactly the failure category INV-1
+exists to close off. Shape follows `docs/task-authoring.md:288-308` (`grep` preferred over
+`script`); this is proposed text, not applied from here — the implementer or orchestrator adds it
+to 3088's `metadata.delivered_checks` when 3088 is picked up:
+
+```json
+[
+  {
+    "name": "update_memory_mcp_tool_exists",
+    "kind": "grep",
+    "pattern": "async def update_memory\\(",
+    "expect": "present",
+    "paths": ["fused-memory/src/fused_memory/server/tools.py"]
+  },
+  {
+    "name": "update_memory_service_method_exists",
+    "kind": "grep",
+    "pattern": "async def update_memory\\(",
+    "expect": "present",
+    "paths": ["fused-memory/src/fused_memory/services/memory_service.py"]
+  },
+  {
+    "name": "mem0_update_authz_config_exists",
+    "kind": "grep",
+    "pattern": "class Mem0UpdateConfig",
+    "expect": "present",
+    "paths": ["fused-memory/src/fused_memory/config/schema.py"]
+  }
+]
+```
+
+All three are cheap, exact structural greps against `main` (no working-checkout dependency), and
+together assert the headline contract this decision makes machine-checkable: a real MCP tool, a
+real service method, and a real config-enforced authorization gate — not merely a task record
+marked `done`.
+
+### What would falsify this decision
+
+- **The storm-counter scoping (content-amend only, §4) is wrong** if recon Stage 1's legitimate
+  per-cycle tagging volume routinely trips a counter that *does* include metadata-only calls, or if
+  a legitimate bulk content-correction cycle routinely trips the content-amend counter at its
+  default threshold — either would mean the threshold (or the arm split itself) needs
+  recalibration, not that the mechanism is wrong.
+- **The authorization model is under-scoped** if a second, non-`recon-stage-*` caller needs
+  content-amend or metadata-patch authority before an operator has had a chance to widen the
+  relevant allowlist — e.g. an interactive curator-gate correction flow. §4 anticipated this
+  (independently configurable allowlists) but shipped both identical; a real second caller
+  arriving quickly would validate widening one list, not redesigning the gate.
+- **The write-path fork (§5(b)) is version-pinned to the mem0/qdrant-client releases verified in
+  this worktree.** If either library's internals change (e.g. `_update_memory` starts merging
+  metadata instead of replacing it, or `vector_store.update` stops always supplying a vector), the
+  "metadata-only must route around `Memory.update`" mechanical justification must be re-verified
+  against the new source before the follow-up ships against it.
+- **"Consolidation-closure" turns out to need more than a single-key `metadata.topic` stamp** (e.g.
+  a structured/versioned tagging scheme) once it is ever formally specified (§2's scoping caveat) —
+  the shallow-merge contract in §3 already supports multi-key patches without change, but a
+  schema-validated metadata vocabulary would need its own reserved-key list layered on top of
+  `_MEM0_MANAGED_METADATA_KEYS`, not a replacement of it.
