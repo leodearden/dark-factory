@@ -23,7 +23,7 @@ import pytest
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import parse_config_command
+from orchestrator.verify_cmd import parse_config_command, render
 from orchestrator.verify_plan import (
     FileKind,
     PlannedRun,
@@ -32,6 +32,7 @@ from orchestrator.verify_plan import (
     _is_collectable_test_file,
     _is_conftest,
     _is_test_file,
+    _scope_prefix_to_keyword,
     classify_file,
     derive_verify_plan,
     reverse_dependent_test_targets,
@@ -843,6 +844,141 @@ class TestDeriveVerifyPlanMergeBreadth:
         assert len(plan.runs) == 1
         assert plan.runs[0].scope_kind is ScopeKind.TRIVIAL
         assert plan.needs_pipeline_guard_check is True
+
+
+# ---------------------------------------------------------------------------
+# The two scopers: &&-chain trailing-clause preservation (task 3061)
+# ---------------------------------------------------------------------------
+
+# Every real config command, paired with the keyword its slot scopes on. Used
+# as the lockstep corpus below; `_scope_to_keyword` and `_scope_prefix_to_keyword`
+# must agree on ALL of them, for EVERY keyword — including the mismatched
+# pairings, which exercise the keyword-absent and keyword-in-a-later-segment
+# rejections.
+_REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
+    *((f'{module}-lint', cmd) for module, cmd in _MODULE_LINT_COMMANDS.items()),
+    ('fm-lint', _FM_LINT_COMMAND),
+    ('root-lint', _ROOT_LINT_COMMAND),
+    ('root-type-check', _ROOT_TYPE_CHECK_COMMAND),
+    ('root-test', _ROOT_TEST_COMMAND),
+    ('ruff-trailing-value-flag', 'ruff check src/ --select E'),
+    ('opaque-mypy', 'mypy src/'),
+    ('no-op-true', 'true'),
+]
+
+_LOCKSTEP_KEYWORDS = ('ruff check', 'pyright', 'pytest')
+
+_LOCKSTEP_CASES = [
+    (raw, keyword, f'{name}::{keyword.replace(" ", "-")}')
+    for name, raw in _REAL_CONFIG_COMMANDS
+    for keyword in _LOCKSTEP_KEYWORDS
+]
+
+
+class TestScoperTrailingClausePreservation:
+    """A sibling-checker clause chained after the scoped tool must SURVIVE.
+
+    Task 3061: every subproject's ``lint_command`` chains a
+    ``python3 fused-memory/scripts/check_*.py <dir>`` gate after ``ruff
+    check``. Both scopers truncated at the keyword, so scoped pre-merge
+    verify silently ran only ruff — the bare-MagicMock and asyncmock-
+    assertion gates were invisible until post-merge (task 2920's violation
+    landed exactly this way).
+
+    A cwd-sequenced same-tool fan-out must KEEP being truncated, though —
+    see ``test_root_type_check_fan_out_still_truncates`` for why that is a
+    correctness requirement, not merely a scoping preference.
+    """
+
+    _FILES = ['fused-memory/tests/test_harness.py']
+
+    def test_fused_memory_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
+        """The task's headline case, as a full literal golden.
+
+        The ruff clause is narrowed to the one touched file (its unscoped
+        ``src/ tests/`` targets are gone); both sibling checkers survive
+        byte-identically, still pointed at the whole ``fused-memory/tests``
+        directory they assert an invariant over.
+        """
+        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        assert scoped == (
+            'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
+            ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+        )
+        assert 'src/ tests/' not in scoped
+        for checker in (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests',
+            '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
+        ):
+            assert checker in scoped, f'{checker!r} must survive verbatim'
+            assert checker in _FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
+
+    def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
+        """dark-factory-orchestrator.yaml:50 — the fallback path's own command."""
+        scoped = verify._scope_to_keyword(_ROOT_LINT_COMMAND, 'ruff check', self._FILES)
+        assert scoped == (
+            'uv run ruff check fused-memory/tests/test_harness.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+            ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+        )
+
+    def test_trailing_value_flag_still_truncates_at_the_keyword(self):
+        """The flag-misread guard is untouched: intra-segment truncation still applies.
+
+        ``--select E``'s value would be misread as an extra ruff target by
+        ``scope_to`` if the whole segment were parsed, so truncating at the
+        keyword WITHIN the matched segment stays exactly as it was.
+        """
+        scoped = verify._scope_to_keyword('ruff check src/ --select E', 'ruff check', ['a.py'])
+        assert scoped == 'ruff check a.py'
+        assert '--select' not in scoped
+
+    @pytest.mark.parametrize(
+        'raw', ['mypy src/', 'true'], ids=['opaque-mypy', 'no-op-true'],
+    )
+    def test_keyword_absent_returns_byte_identical(self, raw):
+        assert verify._scope_to_keyword(raw, 'ruff check', self._FILES) == raw
+
+    def test_root_type_check_fan_out_still_truncates(self):
+        """HAZARD GUARD: a cwd-sequenced same-tool fan-out must NOT keep its tail.
+
+        ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
+        pyright && cd ../orchestrator && npx pyright && cd ../dashboard &&
+        npx pyright``. Preserving that tail would (a) run pyright fully
+        UNSCOPED over two more subprojects, defeating scoping entirely, and
+        (b) break correctness — scoping applies ``strip_cwd``, which removes
+        the leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
+        would resolve relative to the worktree ROOT and escape the repo.
+        """
+        scoped = verify._scope_to_keyword(_ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
+        assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
+        assert 'cd ../orchestrator' not in scoped
+        assert 'cd ../dashboard' not in scoped
+
+    def test_root_test_fan_out_still_truncates(self):
+        """Same hazard for ``dark-factory-orchestrator.yaml:41``'s 8-segment fan-out."""
+        scoped = verify._scope_to_keyword(_ROOT_TEST_COMMAND, 'pytest', self._FILES)
+        assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
+        assert 'cd ../escalation' not in scoped
+        assert 'cockpit' not in scoped
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [(raw, keyword) for raw, keyword, _ in _LOCKSTEP_CASES],
+        ids=[test_id for _, _, test_id in _LOCKSTEP_CASES],
+    )
+    def test_lockstep_between_the_two_scopers(self, raw, keyword):
+        """The string scoper and the VerifyCmd scoper must never disagree.
+
+        They were historically kept in sync only by a docstring mandate —
+        a convention this very bug shows was load-bearing and unenforced.
+        Both now route through the shared ``split_chain_tail`` gate, so this
+        asserts a property that holds by construction.
+        """
+        assert verify._scope_to_keyword(raw, keyword, self._FILES) == render(
+            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+        )
 
 
 # ---------------------------------------------------------------------------

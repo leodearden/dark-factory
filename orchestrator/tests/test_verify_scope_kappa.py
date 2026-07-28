@@ -1416,17 +1416,27 @@ class TestModuleConfigOpaqueChainScoping:
     unchanged (``strip_cwd(scope_to(parse_config_command(x), files))``
     no-ops on an OPAQUE/raw-retained command — see ``verify_cmd.scope_to``'s
     P1 guard) and ``_executed_module_configs_from_plan`` renders it verbatim
-    (``render()==raw``), so the whole unscoped chain — plus any trailing
-    ``&&``-chained clause — executes instead of a file-scoped first clause.
+    (``render()==raw``), so the whole unscoped chain executes instead of a
+    file-scoped first clause.
+
+    Task 3061 refined what "first-clause scoped" means for the TAIL. A
+    SIBLING-CHECKER clause (a different tool, no ``cd`` sequencing — the
+    ``python3 .../check_*.py <dir>`` gates every subproject chains after
+    ``ruff check``) is now PRESERVED unscoped and verbatim: it asserts a
+    whole-directory invariant, so dropping it made the gate invisible to
+    scoped pre-merge verify. A SAME-TOOL FAN-OUT (the root config's ``cd X
+    && npx pyright`` chain) keeps being truncated — see
+    ``verify_cmd.split_chain_tail``'s gate.
     """
 
     @pytest.mark.asyncio
     async def test_lint_real_subproject_chain_scopes_to_first_clause(self, tmp_path: Path):
         """(1) LINT — the real subproject shape (config.yaml-style): an
-        OPAQUE ``ruff check`` clause followed by an unrelated
-        ``check_bare_magicmock_config.py`` clause -> first-clause scoped,
-        the trailing clause and the unscoped ``src/ tests/`` targets both
-        dropped.
+        OPAQUE ``ruff check`` clause followed by a
+        ``check_bare_magicmock_config.py`` sibling-checker clause -> the ruff
+        clause is file-scoped (its unscoped ``src/ tests/`` targets dropped)
+        while the trailing checker is PRESERVED unscoped and verbatim
+        (task 3061).
         """
         (tmp_path / 'escalation' / 'src').mkdir(parents=True)
         touched = 'escalation/src/thing.py'
@@ -1453,14 +1463,65 @@ class TestModuleConfigOpaqueChainScoping:
             f'expected the first-clause-scoped string {expected!r}, got '
             f'{executed[0].lint_command!r}'
         )
-        assert 'check_bare_magicmock_config' not in (executed[0].lint_command or ''), (
-            f'the trailing (unrelated) clause must be dropped, not re-enabled: '
-            f'{executed[0].lint_command!r}'
+        assert 'check_bare_magicmock_config' in (executed[0].lint_command or ''), (
+            f'the trailing sibling-checker clause must be PRESERVED (unscoped and '
+            f'verbatim — it asserts a whole-directory invariant) while the ruff '
+            f'clause is file-scoped: {executed[0].lint_command!r}'
         )
         assert 'src/ tests/' not in (executed[0].lint_command or ''), (
             f'the unscoped src/ tests/ targets must not survive scoping: '
             f'{executed[0].lint_command!r}'
         )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'lint:', executed[0].lint_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fused_memory_real_lint_chain_runs_asyncmock_checker(self, tmp_path: Path):
+        """(1b) TASK-2920 REPRODUCTION — the checker that caught it post-merge now runs.
+
+        Task 2920's asyncmock-assertion violation landed on main and was only
+        caught by the post-merge full-config run, because the scoped
+        pre-merge lint silently truncated fused-memory's REAL 3-segment
+        ``lint_command`` at ``ruff check`` and dropped both sibling gates.
+        With the trailing clauses preserved, ``check_asyncmock_assertion_style.py``
+        executes on the pre-merge scoped path — i.e. the same violation would
+        now be caught before the merge, not after.
+        """
+        (tmp_path / 'fused-memory' / 'tests').mkdir(parents=True)
+        touched = 'fused-memory/tests/test_harness.py'
+        (tmp_path / touched).write_text('def test_harness(): pass\n')
+
+        # Verbatim fused-memory/orchestrator.yaml:11.
+        lint_command = (
+            'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests '
+            '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+        )
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='fused-memory', lint_command=lint_command)]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[touched],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert 'check_asyncmock_assertion_style.py' in (executed[0].lint_command or ''), (
+            f'task 2920 acceptance: the asyncmock-assertion gate must run on the '
+            f'scoped pre-merge path, not only post-merge: {executed[0].lint_command!r}'
+        )
+        assert 'check_bare_magicmock_config.py' in (executed[0].lint_command or '')
+        assert 'src/ tests/' not in (executed[0].lint_command or ''), (
+            f'the ruff clause itself must still be file-scoped: '
+            f'{executed[0].lint_command!r}'
+        )
+        assert touched in (executed[0].lint_command or '')
 
         assert result.plan is not None
         _assert_plan_run_matches_executed(
