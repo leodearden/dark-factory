@@ -144,6 +144,143 @@ def _split_pytest_args(rest: list[str]) -> tuple[tuple[str, ...], tuple[str, ...
     return tuple(base_flags), tuple(targets)
 
 
+# Unquoted tokens that mean *raw* is doing shell control flow beyond a plain
+# left-to-right `&&` chain. `split_chain_tail` refuses to carry a tail across
+# any of them: a `||` alternative, a `;` sequence, a `|` pipe or a `( ... )`
+# subshell all make "everything after segment 0" something other than "further
+# independent commands that would have run anyway".
+_NON_AND_CHAIN_TOKENS = frozenset({'||', ';', '|', '(', ')'})
+
+
+def split_top_level_and(raw: str) -> list[str]:
+    """Split *raw* on `&&` at shell quote depth 0, returning segments VERBATIM.
+
+    A character-scan state machine tracking single-quote / double-quote state
+    and backslash escapes (POSIX rules, matching ``shlex.split``: a backslash
+    escapes outside quotes and inside double quotes, but is literal inside
+    single quotes). A `&&` inside quotes is an argument value — pytest's
+    ``-k 'a && b'`` is the real case — not a chain operator, so it is not a
+    split point.
+
+    Segments keep every byte between separators, boundary whitespace
+    included, so ``'&&'.join(split_top_level_and(raw)) == raw`` exactly. That
+    losslessness is the point: ``split_chain_tail``'s caller re-emits the tail
+    verbatim rather than re-rendering it, and can only do so safely if the
+    decomposition consumed nothing but the separators themselves.
+    """
+    segments: list[str] = []
+    start = 0
+    i = 0
+    quote: str | None = None
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if quote is None:
+            if ch == '\\':
+                i += 2
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                continue
+            if ch == '&' and raw[i + 1 : i + 2] == '&':
+                segments.append(raw[start:i])
+                i += 2
+                start = i
+                continue
+            i += 1
+            continue
+        # Inside quotes: only a double-quote context honours backslash escapes.
+        if quote == '"' and ch == '\\':
+            i += 2
+            continue
+        if ch == quote:
+            quote = None
+        i += 1
+    segments.append(raw[start:])
+    return segments
+
+
+def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
+    """Split *raw* into a *keyword*-bearing head and a preservable trailing chain.
+
+    Returns ``(segments[0], tail)`` when the gate below ACCEPTS — ``tail`` is
+    every byte after segment 0, so it carries its own leading `&&` and
+    ``head + tail == raw`` exactly. Returns ``(raw, '')`` on every REJECT:
+    deliberately the WHOLE original string, so a caller's existing
+    truncate-at-*keyword* algorithm then runs on an untouched input and its
+    output stays byte-identical to the pre-gate behaviour BY CONSTRUCTION.
+    (Rejecting to ``(segments[0], '')`` would silently truncate — precisely
+    the class of bug this helper exists to fix.)
+
+    **The rule for a preserved tail: it RUNS UNSCOPED AND VERBATIM.** It is
+    never re-parsed, re-rendered, or narrowed to the caller's file list. This
+    repo's real trailing clauses are the reason: they are bare
+    ``python3 fused-memory/scripts/check_*.py <dir>`` invocations that take a
+    whole DIRECTORY (``fused-memory/tests``) and are single-pass AST/text
+    scans asserting a whole-directory invariant. Narrowing them to the
+    touched files would be WRONG, not merely wasteful — the invariant is over
+    the directory, not over a diff — and running them unscoped costs
+    essentially nothing. They also have no structured ``VerifyCmd`` form
+    (they parse OPAQUE), so re-rendering is not even expressible.
+
+    The gate, cheapest condition first — ACCEPT requires ALL of:
+
+    1. ``shlex.split(raw)`` succeeds (an unbalanced quote means the string is
+       not safely decomposable at all);
+    2. no token in ``_NON_AND_CHAIN_TOKENS`` — the chain is plain `&&`, with
+       no ``||`` / ``;`` / ``|`` / ``(`` / ``)`` control flow;
+    3. no ``cd`` token anywhere;
+    4. ``len(split_top_level_and(raw)) - 1 == tokens.count('&&')`` — the
+       quote-aware splitter and ``shlex``'s tokenizer must agree on how many
+       `&&` operators there are. On disagreement the gate bails rather than
+       risk corrupting a quoted `&&`;
+    5. at least two segments (nothing to preserve otherwise);
+    6. *keyword* occurs in ``segments[0]`` and in NO later segment.
+
+    Conditions 3 and 6 are what distinguish a SIBLING-CHECKER chain (a
+    different tool, no cwd sequencing — safe and desirable to preserve) from
+    a SAME-TOOL FAN-OUT (which must keep being truncated), and both are load-
+    bearing against real configs:
+
+    * ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
+      pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx
+      pyright``. Preserving that tail would (a) run pyright fully UNSCOPED
+      over two more subprojects, defeating scoping entirely, and (b) break
+      correctness — the caller applies ``strip_cwd``, which removes the
+      leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
+      would resolve relative to the worktree root and escape the repo. The
+      ``cd``-token rejection (3) stops it; the duplicate-``pyright``
+      rejection (6) independently stops it too.
+    * ``dark-factory-orchestrator.yaml:41`` is an 8-segment ``cd X && uv run
+      pytest`` fan-out with a ``( ... )`` subshell — rejected by (2), (3) and
+      (6) alike.
+
+    A ``cd`` token anywhere is disqualifying rather than only in the tail:
+    once any segment shifts the shell's cwd, every later segment's relative
+    paths depend on that sequencing, so a tail lifted out of it cannot be
+    replayed after ``strip_cwd`` has flattened the head.
+    """
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return raw, ''
+    if any(tok in _NON_AND_CHAIN_TOKENS for tok in tokens):
+        return raw, ''
+    if 'cd' in tokens:
+        return raw, ''
+    segments = split_top_level_and(raw)
+    if len(segments) - 1 != tokens.count('&&'):
+        return raw, ''
+    if len(segments) < 2:
+        return raw, ''
+    if keyword not in segments[0]:
+        return raw, ''
+    if any(keyword in segment for segment in segments[1:]):
+        return raw, ''
+    return segments[0], raw[len(segments[0]) :]
+
+
 def parse_config_command(raw: str) -> VerifyCmd:
     """Parse a config-level command string into a VerifyCmd.
 
