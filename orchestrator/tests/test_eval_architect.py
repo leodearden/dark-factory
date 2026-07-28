@@ -399,12 +399,20 @@ async def _run_architect_eval_hermetic(
     judge_side_effect=None,
     arch_success: bool = True,
     invoke_side_effect=None,
+    arch_result=None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
     Returns ``(result, mocks)`` where ``mocks`` exposes the invoke/verify/save/
     judge mocks for assertions. ``invoke_side_effect`` lets a test make the live
     architect invoke raise (e.g. ``TimeoutError`` to simulate --timeout expiry).
+
+    ``arch_result``, when supplied, is used VERBATIM as ``invoke_agent``'s
+    return value instead of the default duck-typed MagicMock — the injection
+    point the cap tests use to feed a REAL ``shared.cli_invoke.AgentResult``
+    carrying the campaign 429 payload (``api_error_status=429`` +
+    "You've hit your session limit · resets 8pm"), which the MagicMock cannot
+    express because every attribute access on it returns a truthy Mock.
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -414,10 +422,10 @@ async def _run_architect_eval_hermetic(
             plan_quality=0.77, per_criterion={}, reasoning='good',
         )
 
-    arch_result = MagicMock(
+    invoke_return = arch_result if arch_result is not None else MagicMock(
         success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
     )
-    mock_invoke = AsyncMock(return_value=arch_result, side_effect=invoke_side_effect)
+    mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
 
     artifacts_instance = MagicMock()
     artifacts_instance.read_plan.return_value = produced_plan
