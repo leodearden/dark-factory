@@ -30,6 +30,16 @@ from typing import TYPE_CHECKING, Literal, Protocol
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
+# The escalation package is a declared workspace dependency, but keep the
+# import guarded exactly as targeted.py / ticket_janitor.py do so a minimal
+# env degrades to a logged no-op rather than failing to import the policy.
+try:
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    _HAS_ESCALATION = True
+except ImportError:  # pragma: no cover — exercised only in minimal envs
+    EscalationQueue = None  # type: ignore[assignment,misc]
+    _HAS_ESCALATION = False
+
 
 class EventQueueLike(Protocol):
     """Structural interface for the event queue; only ``stats()`` is used."""
@@ -266,6 +276,90 @@ class BacklogPolicy:
             ),
             suggested_action='inspect_judge_halt',
         )
+
+    async def on_judge_unhalt(self, project_id: str) -> list[str]:
+        """Close the halt escalation(s) this policy opened for ``project_id``.
+
+        Invoked by the harness's unhalt callback (manual
+        ``unhalt_reconciliation`` or auto-unhalt-after-cooldown). Before task
+        2998 nothing closed these records: the judge's in-memory + journal
+        state cleared, but the ``esc-reconciliation-halt-*.json`` stayed
+        pending forever, so the dashboard kept showing a halt that no longer
+        existed.
+
+        Write and close stay with the class that owns the record. This is NOT
+        a violation of the A7b "harness never calls queue.resolve()" invariant
+        — that invariant is scoped to the recon escalation queue at
+        ``config.escalation_queue_dir``, closed solely by the port-8103
+        watcher. The halt record lives in a different queue,
+        ``<project_root>/data/escalations/``.
+
+        Only ``judge_halt``-prefixed records that are still ``pending`` AND
+        carry a matching ``project_id`` are touched — backlog/wedge records
+        and other projects' halts are left alone. The project filter reads the
+        RAW json because ``Escalation.from_dict`` keeps only dataclass fields
+        and therefore DROPS the ``project_id`` key this policy writes, making
+        ``queue.get_pending()`` unfilterable by project.
+
+        Returns the ids actually resolved (empty when there is nothing to do),
+        so the caller can report them to the operator.
+        """
+        project_root = self.project_root_for(project_id)
+        if project_root is None:
+            logger.info(
+                'backlog_policy: no halt escalation closed for %s — '
+                'project_root not registered',
+                project_id,
+            )
+            return []
+        if not _HAS_ESCALATION:  # pragma: no cover — minimal envs only
+            logger.warning(
+                'backlog_policy: cannot close halt escalation for %s — '
+                'escalation package unavailable',
+                project_id,
+            )
+            return []
+
+        esc_dir = Path(project_root) / 'data' / 'escalations'
+        if not esc_dir.is_dir():
+            logger.info(
+                'backlog_policy: no halt escalation closed for %s — %s absent',
+                project_id, esc_dir,
+            )
+            return []
+
+        queue = EscalationQueue(esc_dir)
+        resolved: list[str] = []
+        for path in sorted(esc_dir.glob(f"{_ESC_ID_PREFIXES['judge_halt']}*.json")):
+            try:
+                record = json.loads(path.read_text(encoding='utf-8'))
+                if (
+                    record.get('status') != 'pending'
+                    or record.get('project_id') != project_id
+                ):
+                    continue
+                esc_id = record.get('id') or path.stem
+                queue.resolve(
+                    esc_id,
+                    resolution=(
+                        f'Reconciliation halt cleared for {project_id} '
+                        f'(unhalt_reconciliation / auto-unhalt-after-cooldown).'
+                    ),
+                    resolved_by='fused-memory-judge-unhalt',
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                # One unreadable record must never block closing the rest.
+                logger.warning(
+                    'backlog_policy: could not close halt escalation %s: %s',
+                    path, exc,
+                )
+                continue
+            resolved.append(esc_id)
+            logger.info(
+                'backlog_policy: resolved halt escalation %s on unhalt of %s',
+                esc_id, project_id,
+            )
+        return resolved
 
     async def on_watchdog_wedge(self, payload: dict) -> list[BacklogVerdict]:
         """Invoked by :class:`SqliteWatchdog` when the drainer is wedged.
