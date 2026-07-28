@@ -714,6 +714,60 @@ def _is_scope_divergence_orphan(esc: Escalation) -> bool:
     )
 
 
+def _has_fresh_stamp(
+    task: dict | None, now: datetime, grace_secs: float, *path: str,
+) -> bool:
+    """Return True iff ``task['metadata']`` carries an ISO-8601 timestamp at
+    *path* that is within *grace_secs* of *now*.
+
+    Shared implementation behind the orphan-L0 reaper's two liveness gates,
+    :func:`_has_fresh_dispatch` (``routing.latest.decided_at``, task 2931)
+    and :func:`_has_fresh_merge_phase` (``merge_phase_liveness.entered_at``,
+    task 2991). They differ ONLY in that key path, so keeping ONE
+    implementation keeps their fail-safe semantics — and any future
+    refinement of them (e.g. assuming UTC for a tz-naive stamp instead of
+    failing open, or clamping negative deltas) — from silently applying to
+    one gate but not the other.
+
+    Args:
+        task: The task dict as returned by ``scheduler.get_task`` (or
+            ``None`` when it could not be read).
+        now: The sweep snapshot instant to measure staleness against.
+        grace_secs: Freshness window; a stamp younger than this is "fresh".
+        path: Key path INSIDE ``task['metadata']``, ending at the timestamp
+            leaf — e.g. ``('routing', 'latest', 'decided_at')``.
+
+    Fail-safe (mirrors :func:`_is_terminal_merged`): a ``None`` *task*, a
+    missing/non-dict ``metadata`` or intermediate path segment, an
+    absent/non-str leaf, and an unparseable or tz-mismatched timestamp are
+    all treated as "not fresh" (return False) rather than raising — the
+    caller then promotes (surfaces) instead of silently suppressing whenever
+    liveness cannot be positively confirmed, preserving task 2878's boundary
+    guard and the loud-over-silent-degradation norm. A stamp NEWER than *now*
+    (written after the sweep snapshot) yields a negative delta
+    ``< grace_secs`` -> True (fresh), matching the "newer than the sweep
+    snapshot" wording.
+    """
+    if task is None or not path:
+        return False
+    node: object = task.get('metadata')
+    for key in path[:-1]:
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    if not isinstance(node, dict):
+        return False
+    stamped_at = node.get(path[-1])
+    if not isinstance(stamped_at, str):
+        return False
+    try:
+        stamped_dt = datetime.fromisoformat(stamped_at)
+        delta_secs = (now - stamped_dt).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return delta_secs < grace_secs
+
+
 def _has_fresh_dispatch(
     task: dict | None, now: datetime, grace_secs: float,
 ) -> bool:
@@ -728,37 +782,17 @@ def _has_fresh_dispatch(
     lacks, to defer (not drop) the divergence class while a dispatch is
     genuinely live.
 
-    Fail-safe (mirrors :func:`_is_terminal_merged`): a ``None`` *task*, a
-    missing/non-dict ``metadata``/``routing``/``latest``, an absent/non-str
-    ``decided_at``, and an unparseable or tz-mismatched timestamp are all
-    treated as "not fresh" (return False) rather than raising — the caller
-    then promotes (surfaces) instead of silently suppressing whenever
-    liveness cannot be positively confirmed, preserving task 2878's boundary
-    guard and the loud-over-silent-degradation norm. A ``decided_at`` newer
-    than *now* (a dispatch that landed after the sweep snapshot) yields a
-    negative delta ``< grace_secs`` -> True (fresh), matching the "newer than
-    the sweep snapshot" wording.
+    Fail-safe: shared with :func:`_has_fresh_merge_phase` via
+    :func:`_has_fresh_stamp` — a ``None`` *task*, a missing/non-dict
+    ``metadata``/``routing``/``latest``, an absent/non-str ``decided_at``,
+    and an unparseable or tz-mismatched timestamp are all treated as "not
+    fresh" (return False) rather than raising, so the caller promotes
+    (surfaces) whenever liveness cannot be positively confirmed. See
+    :func:`_has_fresh_stamp` for the full contract.
     """
-    if task is None:
-        return False
-    metadata = task.get('metadata')
-    if not isinstance(metadata, dict):
-        return False
-    routing = metadata.get('routing')
-    if not isinstance(routing, dict):
-        return False
-    latest = routing.get('latest')
-    if not isinstance(latest, dict):
-        return False
-    decided_at = latest.get('decided_at')
-    if not isinstance(decided_at, str):
-        return False
-    try:
-        decided_dt = datetime.fromisoformat(decided_at)
-        delta_secs = (now - decided_dt).total_seconds()
-    except (ValueError, TypeError):
-        return False
-    return delta_secs < grace_secs
+    return _has_fresh_stamp(
+        task, now, grace_secs, 'routing', 'latest', 'decided_at',
+    )
 
 
 def _has_fresh_merge_phase(
@@ -782,33 +816,17 @@ def _has_fresh_merge_phase(
     L0 even immediately after an orchestrator restart, when the per-process
     ``Scheduler._merge_phase_at`` is still empty.
 
-    Fail-safe (mirrors :func:`_has_fresh_dispatch`): a ``None`` *task*, a
-    missing/non-dict ``metadata``/``merge_phase_liveness``, an absent/non-str
-    ``entered_at``, and an unparseable or tz-mismatched timestamp are all
-    treated as "not fresh" (return False) rather than raising — the caller
-    then promotes (surfaces) instead of silently suppressing whenever
-    merge-phase liveness cannot be positively confirmed, preserving task
-    2878's boundary guard and the loud-over-silent-degradation norm. An
-    ``entered_at`` newer than *now* (a stamp written after the sweep
-    snapshot) yields a negative delta ``< grace_secs`` -> True (fresh).
+    Fail-safe: shared with :func:`_has_fresh_dispatch` via
+    :func:`_has_fresh_stamp` — a ``None`` *task*, a missing/non-dict
+    ``metadata``/``merge_phase_liveness``, an absent/non-str ``entered_at``,
+    and an unparseable or tz-mismatched timestamp are all treated as "not
+    fresh" (return False) rather than raising, so the caller promotes
+    (surfaces) whenever merge-phase liveness cannot be positively confirmed.
+    See :func:`_has_fresh_stamp` for the full contract.
     """
-    if task is None:
-        return False
-    metadata = task.get('metadata')
-    if not isinstance(metadata, dict):
-        return False
-    liveness = metadata.get('merge_phase_liveness')
-    if not isinstance(liveness, dict):
-        return False
-    entered_at = liveness.get('entered_at')
-    if not isinstance(entered_at, str):
-        return False
-    try:
-        entered_dt = datetime.fromisoformat(entered_at)
-        delta_secs = (now - entered_dt).total_seconds()
-    except (ValueError, TypeError):
-        return False
-    return delta_secs < grace_secs
+    return _has_fresh_stamp(
+        task, now, grace_secs, 'merge_phase_liveness', 'entered_at',
+    )
 
 
 def _acquire_project_lock(project_root: Path) -> IO:

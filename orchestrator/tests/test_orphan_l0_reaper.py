@@ -16,6 +16,7 @@ from orchestrator.harness import (
     Harness,
     _has_fresh_dispatch,
     _has_fresh_merge_phase,
+    _has_fresh_stamp,
 )
 from orchestrator.review_checkpoint import ReviewCheckpoint
 
@@ -1142,6 +1143,64 @@ class TestHasFreshMergePhase:
         }
         now = datetime.now(UTC)  # tz-aware
         assert _has_fresh_merge_phase(task, now, 120.0) is False
+
+
+class TestHasFreshStamp:
+    """The shared path-walking implementation behind both liveness gates.
+
+    ``_has_fresh_dispatch`` and ``_has_fresh_merge_phase`` differ ONLY in
+    their key path, so they delegate to ``_has_fresh_stamp`` (amendment for
+    the code-duplication review finding). The two wrapper classes above stay
+    as the per-gate contract pins; this class pins the generic parts they
+    share — the path walk itself and the fail-safe branches that a future
+    refinement (tz-naive handling, negative-delta clamping) would touch.
+    """
+
+    _PATH = ('merge_phase_liveness', 'entered_at')
+
+    def test_walks_arbitrary_path_and_measures_freshness(self):
+        fresh = (datetime.now(UTC) - timedelta(seconds=5.0)).isoformat()
+        task = {'metadata': {'a': {'b': {'c': fresh}}}}
+        assert _has_fresh_stamp(task, datetime.now(UTC), 120.0, 'a', 'b', 'c')
+        # Same stamp, tighter grace -> stale.
+        assert _has_fresh_stamp(
+            task, datetime.now(UTC), 1.0, 'a', 'b', 'c',
+        ) is False
+
+    def test_stamp_newer_than_now_is_fresh(self):
+        """A stamp written AFTER the sweep snapshot yields a negative delta,
+        which is ``< grace_secs`` -> fresh. Pins the documented "newer than
+        the sweep snapshot" wording for both gates at once."""
+        future = (datetime.now(UTC) + timedelta(seconds=30.0)).isoformat()
+        task = {'metadata': {'merge_phase_liveness': {'entered_at': future}}}
+        assert _has_fresh_stamp(task, datetime.now(UTC), 120.0, *self._PATH)
+
+    @pytest.mark.parametrize(
+        'task',
+        [
+            None,                                        # unreadable task
+            {},                                          # no metadata
+            {'metadata': 'not-a-dict'},                  # non-dict metadata
+            {'metadata': {}},                            # no such path
+            {'metadata': {'merge_phase_liveness': 'x'}},  # non-dict node
+            {'metadata': {'merge_phase_liveness': {}}},  # no leaf
+            {'metadata': {'merge_phase_liveness': {'entered_at': 17}}},  # non-str
+        ],
+        ids=[
+            'task-none', 'no-metadata', 'metadata-non-dict', 'path-missing',
+            'node-non-dict', 'leaf-missing', 'leaf-non-str',
+        ],
+    )
+    def test_malformed_inputs_fail_open(self, task):
+        """Every guard returns False (never raises), so the reaper PROMOTES
+        (surfaces) rather than silently suppressing whenever liveness cannot
+        be positively confirmed — task 2878's boundary guard."""
+        assert _has_fresh_stamp(task, datetime.now(UTC), 120.0, *self._PATH) is False
+
+    def test_empty_path_fails_open(self):
+        """Degenerate call (no key path) must not raise on the leaf unpack."""
+        task = {'metadata': {'merge_phase_liveness': {'entered_at': 'x'}}}
+        assert _has_fresh_stamp(task, datetime.now(UTC), 120.0) is False
 
 
 class TestReviewerEscalationPromotion:
