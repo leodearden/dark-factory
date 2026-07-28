@@ -3279,3 +3279,77 @@ class TestStewardOutcomeChannelGiveUpGuards:
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
         assert channel.get_nowait() == StewardReescalatedL1(esc_id=submitted.id)
+
+
+# ---------------------------------------------------------------------------
+# Converged give-up contract: every give-up dismisses its own L0 (task 3170)
+# ---------------------------------------------------------------------------
+
+
+def _assert_dismissed_own_l0(steward, esc_id: str) -> None:
+    """Assert the converged give-up contract for *esc_id*.
+
+    THE contract (task 3170): a steward give-up ALWAYS dismisses its own L0
+    before publishing an outcome — no pending L0 survives a steward give-up.
+
+    This is what both workflow waiters rely on.  ``_await_steward_completion``
+    (reached via ``_mark_blocked``) reads the typed outcome off the channel,
+    but ``_wait_for_resolution`` (reached via ``run()``'s ESCALATED branch) is
+    escalation-queue-only: its ONLY wake signal is
+    ``EscalationQueue.resolve`` → ``_resolve_callback`` →
+    ``harness._on_escalation_resolved`` → ``_escalation_events[task_id].set()``.
+    A give-up that publishes without dismissing strands that waiter forever.
+    """
+    steward.escalation_queue.resolve.assert_called_once()
+    call_args = steward.escalation_queue.resolve.call_args
+    assert call_args[0][0] == esc_id, (
+        f'give-up must dismiss its OWN L0 ({esc_id}); '
+        f'resolved {call_args[0][0]!r} instead'
+    )
+    assert call_args[1].get('dismiss') is True, (
+        'the L0 must be DISMISSED (not resolved) — the steward gave up on it'
+    )
+    assert call_args[1].get('resolved_by') == 'auto-dismissed', (
+        "resolved_by must be 'auto-dismissed' so archived records stay "
+        "greppable by the same signature as _mark_blocked's dismissal loop"
+    )
+    assert esc_id not in steward._retry_counts
+    assert esc_id not in steward._timeout_counts
+    assert esc_id not in steward._empty_output_counts
+
+
+@pytest.mark.asyncio
+class TestGiveUpAlwaysDismissesOwnL0:
+    """The two wip-gated give-up branches (task 2248) must dismiss their L0.
+
+    Every OTHER give-up path already does, via ``_auto_escalate_to_human``.
+    These two skipped it on the theory that ``_mark_blocked`` would dismiss
+    the still-pending L0 — true only on that one path.  On the
+    ``run()``-ESCALATED path nothing dismisses it and nothing reads the
+    channel, so the workflow waits forever on a record only the steward can
+    clear (reify 5189: 20.5h stall, 1,183,854 log lines).
+    """
+
+    async def test_attempt_cap_wip_present_dismisses_own_l0(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1  # at cap
+        steward._timeout_counts['esc-42-1'] = 1  # stale sibling counter
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        _assert_dismissed_own_l0(steward, 'esc-42-1')
+        # Task-2060 resume-plan semantics are preserved: dismissal is NOT an
+        # L1 hand-off.  The workflow resumes the plan; it does not triage.
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='attempt_cap', wip_commits_present=True,
+        )
+        assert channel.empty(), 'exactly one outcome must be published'
