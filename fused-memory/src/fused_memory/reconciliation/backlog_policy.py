@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -129,6 +129,10 @@ class BacklogPolicy:
         self._rate_limit_seconds = rate_limit_seconds
         self._now = time_provider
         self._state: dict[str, _PolicyState] = {}
+        # Project ids whose root was seeded at STARTUP from the known-projects
+        # map rather than observed on a real mutating call.  See
+        # register_known_project_roots for why the provenance is tracked.
+        self._startup_seeded: set[str] = set()
         self._lock = asyncio.Lock()
 
     @property
@@ -149,9 +153,40 @@ class BacklogPolicy:
         Invoked by the task interceptor on every mutating call. Memory tools
         that only know project_id read from this cache to locate the
         escalation directory.
+
+        A call here is evidence of REAL activity for ``project_id``, so it
+        clears any startup-seeded provenance: the project is promoted from
+        "merely known" to "active" and participates unconditionally in
+        ``_projects_with_backlog`` again.
         """
         state = self._state.setdefault(project_id, _PolicyState())
         state.project_root = project_root
+        self._startup_seeded.discard(project_id)
+
+    def register_known_project_roots(self, roots: Mapping[str, str]) -> None:
+        """Seed the project_root cache for every KNOWN project at startup.
+
+        Without this, ``register_project_root``'s only caller is ``check()``,
+        so a halt rehydrated by ``Judge.initialize()`` fires
+        ``_notify_judge_halt`` before any mutating MCP call has registered a
+        root — ``_route_over_limit`` then falls to the rejection branch and
+        NOTHING is written (task 2998 GAP A; the 48h reify incident in which
+        0 of 96 escalation files carried ``ReconciliationJudgeHalted``).
+
+        Each seeded id is recorded in ``_startup_seeded``.  That provenance
+        matters because seeding puts an entry in ``_state`` for every known
+        project, and ``_projects_with_backlog`` derives its fan-out set from
+        ``_state`` — without the marker a single drainer wedge would emit one
+        escalation per KNOWN project instead of per ACTIVE one.  The marker is
+        consumed in ``_projects_with_backlog`` (skip startup-seeded ids whose
+        backlog is 0) and cleared by ``register_project_root``.
+        """
+        for project_id, project_root in roots.items():
+            if not project_id or not project_root:
+                continue
+            state = self._state.setdefault(project_id, _PolicyState())
+            state.project_root = project_root
+            self._startup_seeded.add(project_id)
 
     def project_root_for(self, project_id: str) -> str | None:
         state = self._state.get(project_id)
