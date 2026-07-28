@@ -3384,3 +3384,87 @@ class TestGiveUpAlwaysDismissesOwnL0:
             reason='timeout', wip_commits_present=True,
         )
         assert channel.empty(), 'exactly one outcome must be published'
+
+
+# ---------------------------------------------------------------------------
+# Capped escalations are terminal for this steward (task 3170, fix B)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCappedEscalationIsTerminal:
+    """A capped escalation must never be re-handled by THIS steward.
+
+    Independent of fix A (which dismisses the L0 so it stops being returned
+    at all), this is the structural guarantee: nothing recorded that an
+    escalation had already been given up on, so ANY early return from
+    _handle_escalation left the record pending, _next_escalation re-returned
+    it from a synchronous read, and _run_loop re-handled it at loop speed
+    with no sleep and no state change — 1,183,854 log lines in 20.5h on
+    reify 5189, each iteration also awaiting a `git rev-list` subprocess via
+    the wip probe.
+    """
+
+    async def test_second_handle_of_capped_escalation_is_a_no_op(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        wip_probe = AsyncMock(return_value=True)
+        steward.set_wip_probe(wip_probe)
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock):
+            await steward._handle_escalation(esc)
+
+        # First handle did the give-up work.
+        assert wip_probe.await_count == 1
+        assert channel.qsize() == 1
+        steward.escalation_queue.resolve.assert_called_once()
+
+        # Re-arm every observable so the second call's effects are unambiguous.
+        wip_probe.reset_mock()
+        steward.escalation_queue.reset_mock()
+        while not channel.empty():
+            channel.get_nowait()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            # A realistic result so that a regression surfaces as the
+            # assertions below (the second handle DID work) rather than as a
+            # TypeError deep inside the invocation path.
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+
+        assert wip_probe.await_count == 0, (
+            'a capped escalation must not re-run the wip probe — that is the '
+            'git rev-list subprocess the incident spun on'
+        )
+        steward.escalation_queue.resolve.assert_not_called()
+        steward.escalation_queue.submit.assert_not_called()
+        mock_invoke.assert_not_called()
+        assert channel.empty(), 'no duplicate outcome may be published'
+
+    async def test_next_escalation_skips_capped_ids(self, steward):
+        """A capped-but-still-pending record must not short-circuit the
+        synchronous pending read into a hot return.
+
+        The watcher must still be consulted — that is what makes the loop
+        BLOCK on inotify rather than spin.
+        """
+        capped = _make_escalation(id='esc-42-1')
+        steward._capped_escalations = {'esc-42-1'}
+        steward.escalation_queue.get_by_task.return_value = [capped]
+
+        with patch.object(
+            steward, '_watch_for_escalation', new_callable=AsyncMock,
+        ) as mock_watch:
+            mock_watch.return_value = None
+            result = await steward._next_escalation()
+
+        assert result is None, 'the capped escalation must be filtered out'
+        mock_watch.assert_awaited_once(), (
+            'the watcher must still be consulted so the loop blocks on '
+            'inotify instead of hot-returning the capped record'
+        )
