@@ -405,11 +405,24 @@ def check_config(config_path: Path | None):
     field is DISCARDED before validation with no error — the 2026-07-22 incident
     where a top-level ``spare_warm_lanes: 8`` (the field lives on ``git.``) was
     dropped for weeks.  This offline gate walks the RAW project YAML against the
-    schema via ``census_unknown_config_keys`` DIRECTLY (not a full validated
-    load), so it still reports phantom keys even when the config has an unrelated
-    value-level validation error.  Exits 1 if any unknown key is found, else 0.
+    schema via ``census_config_keys`` DIRECTLY (not a full validated load), so it
+    still reports phantom keys even when the config has an unrelated value-level
+    validation error.
+
+    A key deliberately present for NON-OrchestratorConfig consumers (e.g. one the
+    project's own scripts read) can be excused two ways, and is then listed in an
+    INFORMATIONAL section that never affects the exit code:
+
+    \b
+      * name it with the reserved ``x_``/``x-`` prefix (works at any depth, no
+        config ceremony) — the preferred form for a NEW knob;
+      * add its dotted path to ``config_key_census.ignore`` in the same YAML
+        (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
+        for existing names other tooling already greps for.
+
+    Exits 1 if any GENUINELY-unknown key is found, else 0.
     """
-    from orchestrator.config import census_unknown_config_keys
+    from orchestrator.config import census_config_keys
 
     # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
     # constructing a validated config — census only needs the raw YAML path.
@@ -425,14 +438,34 @@ def check_config(config_path: Path | None):
             click.echo(f'Error: Config file not found: {config_path}', err=True)
             sys.exit(1)
 
-    census = census_unknown_config_keys(config_path)
-    if not census:
+    census = census_config_keys(config_path)
+
+    # Informational FIRST, and explicitly marked as such: these keys were
+    # deliberately excused, so listing them keeps an over-broad glob auditable
+    # without ever reading as a failure or touching the exit code.
+    if census.ignored:
+        _REASONS = {
+            'reserved_prefix': 'ignored: reserved prefix',
+            'allowlist': 'ignored: config_key_census.ignore',
+        }
+        click.echo(
+            f'{len(census.ignored)} key(s) excused from the census '
+            '(informational — does not affect the exit code):'
+        )
+        for ik in census.ignored:
+            click.echo(f'  {ik.path}  ({_REASONS.get(ik.reason, f"ignored: {ik.reason}")})')
+        click.echo('')
+
+    if not census.unknown:
         click.echo(f'OK: {config_path} has no unknown config keys.')
         sys.exit(0)
 
-    click.echo(f'Found {len(census)} unknown config key(s) in {config_path}:')
-    for uk in census:
+    click.echo(f'Found {len(census.unknown)} unknown config key(s) in {config_path}:')
+    for uk in census.unknown:
         if uk.shadow_hint:
+            # Advisory ONLY: a shadow hint is a NAME match against the model
+            # tree and may be a coincidental collision, so it stays phrased as a
+            # question rather than an instruction to move the key.
             click.echo(f'  {uk.path}  → did you mean {uk.shadow_hint}?')
         else:
             click.echo(f'  {uk.path}')
