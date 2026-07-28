@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.project_prefix_registry import (
+    DARK_FACTORY_ROOT,
+    ProjectPrefixRegistry,
+)
 
 
 def _mkproj(parent: Path, name: str, dirs: list[str]) -> Path:
@@ -364,11 +367,149 @@ class TestProjectForPathAbsolute:
         absolute-path ownership from the built-in root constant. A checkout at
         a different path simply fails to match — fail-OPEN to the pre-3109
         verdict, never a false rejection.
+
+        The positive path is DERIVED from the constant rather than hardcoded:
+        the constant's own comment invites an operator to update it for a
+        differently-located checkout, which must not break a test whose
+        semantics (default registry owns absolute paths under its own root;
+        unrelated roots stay unowned) remain true. The negative case keeps an
+        unrelated literal root on purpose.
         """
         registry = ProjectPrefixRegistry.default()
         assert registry.project_for_path(
-            '/home/leo/src/dark-factory/orchestrator/x.py') == 'dark_factory'
+            f'{DARK_FACTORY_ROOT}/orchestrator/x.py') == 'dark_factory'
         assert registry.project_for_path('/home/leo/src/reify/crates/x.rs') is None
+
+
+# ---------------------------------------------------------------------------
+# Absolute-path NORMALISATION (task 3109 amendment).
+#
+# `_owner_for_absolute_path` compares lexically, so unnormalised spellings of
+# a real path defeat the comparison in BOTH directions unless normalised
+# first: a '..' segment produces a FALSE rejection (a sibling-repo file
+# matching the root by bare startswith), duplicate separators produce a MISSED
+# rejection.  os.path.normpath fixes both purely lexically — no symlink
+# resolution, no stat — so the deliberate no-I/O property is preserved.
+# ---------------------------------------------------------------------------
+
+
+class TestAbsolutePathNormalisation:
+    @pytest.fixture
+    def registry(self, tmp_path):
+        a = _mkproj(tmp_path, 'reify', ['crates'])
+        b = _mkproj(tmp_path, 'dark-factory', ['fused-memory', 'orchestrator', 'docs'])
+        return ProjectPrefixRegistry.from_roots([str(a), str(b)])
+
+    def test_parent_segment_does_not_produce_false_ownership(self, registry):
+        """'<df_root>/../reify/crates/x.rs' is a REIFY file, not a DF one.
+
+        Without normalisation this matched the dark-factory root by bare
+        ``startswith`` and rejected a legitimately-local file — a FALSE
+        rejection, the one failure direction the docstrings promise never
+        happens.
+        """
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        escaped = f'{df}/../reify/crates/x.rs'
+        assert registry.project_for_path(escaped) == 'reify'
+        assert registry.project_for_path(escaped) != 'dark_factory'
+
+    def test_parent_segment_escaping_all_known_roots_is_unowned(self, registry):
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        assert registry.project_for_path(f'{df}/../../elsewhere/x.py') is None
+
+    def test_duplicate_separators_still_resolve_owner(self, registry):
+        """'//' inside the path must not silently disarm the guard."""
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        head, _, tail = df.rpartition('/')
+        assert registry.project_for_path(
+            f'{head}//{tail}/orchestrator/x.py') == 'dark_factory'
+        assert registry.project_for_path(
+            f'{df}//orchestrator//x.py') == 'dark_factory'
+
+    def test_trailing_slash_on_root_spelling_resolves_owner(self, registry):
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        assert registry.project_for_path(f'{df}/') == 'dark_factory'
+
+    def test_default_registry_normalises_both_directions(self):
+        """The same two shapes on the built-in single-project registry."""
+        registry = ProjectPrefixRegistry.default()
+        head, _, tail = DARK_FACTORY_ROOT.rpartition('/')
+        assert registry.project_for_path(
+            f'{head}//{tail}/orchestrator/x.py') == 'dark_factory'
+        # A sibling-repo file reached via '..' must NOT be claimed.
+        assert registry.project_for_path(
+            f'{DARK_FACTORY_ROOT}/../reify/crates/x.rs') is None
+
+    def test_unnormalised_root_in_hand_built_registry_still_matches(self):
+        """Roots are normalised too — from_roots resolves them, but a
+        hand-built or config-sourced registry need not be clean."""
+        registry = ProjectPrefixRegistry(
+            project_to_root={'proj': '/a//b/c/../'},
+        )
+        assert registry.project_for_path('/a/b/x.py') == 'proj'
+        assert registry.project_for_path('/a/b') == 'proj'
+        assert registry.project_for_path('/a/bc/x.py') is None
+
+    def test_tilde_path_resolves_like_its_absolute_spelling(self, registry, monkeypatch):
+        """'~/dark-factory/orchestrator/x.py' is the same file as its absolute
+        spelling — an agent that has been shelling around emits it that way.
+
+        HOME is derived from the RESOLVED root so the expansion lines up with
+        what ``from_roots`` stored (matters if tmp_path is ever a symlink).
+        """
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        monkeypatch.setenv('HOME', str(Path(df).parent))
+
+        assert registry.project_for_path(
+            '~/dark-factory/orchestrator/x.py') == 'dark_factory'
+        assert registry.project_for_path('~/reify/crates/x.rs') == 'reify'
+        assert registry.project_for_path('~/unknown-proj/x.py') is None
+        # Bare '~' expands to the HOME dir, which is under no known root.
+        assert registry.project_for_path('~') is None
+
+    def test_known_unhandled_spellings_fail_open(self, registry, monkeypatch):
+        """Documented residue: spellings that stay UNOWNED by design.
+
+        Each needs something this resolver deliberately does not have — a base
+        directory for parent-relative paths, an NSS lookup for '~user', or a
+        POSIX interpretation of a leading '//'. All three degrade fail-OPEN (a
+        missed rejection, never a false one). Pinned so the gap is visible to
+        the next reader rather than implied covered by the docstrings.
+        """
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        monkeypatch.setenv('HOME', str(Path(df).parent))
+
+        # Parent-relative: unresolvable without a base directory.
+        assert registry.project_for_path('../dark-factory/orchestrator/x.py') is None
+        # '~user/' would need an NSS/passwd lookup (I/O) to expand.
+        assert registry.project_for_path('~nobody/dark-factory/orchestrator/x.py') is None
+        # POSIX reserves a leading '//'; normpath preserves it by design.
+        assert registry.project_for_path(f'/{df}/orchestrator/x.py') is None
+
+    def test_roots_longest_first_is_precomputed_and_ordered(self, registry):
+        """The per-lookup work is hoisted to a cached, ordered table.
+
+        Longest-root-wins now lives in the ORDERING (first match wins), and
+        degenerate roots are filtered once at build time rather than on every
+        lookup of the hot submit path.
+        """
+        pairs = registry._roots_longest_first
+        assert pairs is registry._roots_longest_first, 'expected a cached table'
+        lengths = [len(root) for root, _ in pairs]
+        assert lengths == sorted(lengths, reverse=True)
+        assert {pid for _, pid in pairs} == {'reify', 'dark_factory'}
+        assert all(root and not root.endswith('/') for root, _ in pairs)
+
+        degenerate = ProjectPrefixRegistry(
+            project_to_root={'bogus': '/', 'blank': '', 'dots': '/a/..'},
+        )
+        assert degenerate._roots_longest_first == ()
 
 
 # ---------------------------------------------------------------------------
