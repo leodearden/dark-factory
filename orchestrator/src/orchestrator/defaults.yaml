@@ -326,6 +326,14 @@ routing:
 
 # Models per role
 models:
+  # architect: EVAL-GOVERNED (task iota, plans/adaptive-model-routing-prd.md
+  # §ι) -- measured against opus-high/sonnet-high/fable-high alternatives via
+  # the eval campaign of 2026-07-27
+  # (plans/eval-architect-effort-verdict-2026-07-27.md, esc-2848-1/task 2848).
+  # Verdict MARGINAL: held at opus/max rather than flipped -- see
+  # plans/architect-effort-adoption-decision-2026-07-28.md. Decisive next step
+  # before revisiting: re-run the OFAT screen at --trials 3 for the opus
+  # candidates only.
   architect: "opus"
   implementer: "sonnet"
   debugger: "sonnet"
@@ -373,6 +381,9 @@ max_turns:
 
 # Reasoning effort per role
 effort:
+  # architect: EVAL-GOVERNED -- see the models.architect comment above and
+  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; MARGINAL
+  # verdict 2026-07-27, held at max rather than flipped to high).
   architect: "max"
   implementer: "max"
   debugger: "max"
