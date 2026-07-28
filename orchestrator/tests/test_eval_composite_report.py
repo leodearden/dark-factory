@@ -223,6 +223,7 @@ def _mresult(
     tests_pass=True, cost_source='price_table', recovery_score=None,
     plan_quality=None, role_under_test='implementer',
     judge_invocations=0, judge_cost_usd=0.0,
+    cap_tainted=False, invocation_error=None,
 ):
     """Build a synthetic EvalResult with a production-shaped metrics dict."""
     from orchestrator.evals.metrics import EvalMetrics
@@ -239,6 +240,8 @@ def _mresult(
         role_under_test=role_under_test,
         judge_invocations=judge_invocations,
         judge_cost_usd=judge_cost_usd,
+        cap_tainted=cap_tainted,
+        invocation_error=invocation_error,
     )
     return EvalResult(
         task_id=task_id,
@@ -350,6 +353,33 @@ class TestBuildCompositeReport:
         assert rows['A']['plan_quality'] is None
         assert rows['C']['role_under_test'] == 'architect'
         assert rows['C']['plan_quality'] == pytest.approx(0.9)
+
+    def test_cap_tainted_first_trial_does_not_blank_the_plan_quality_passthrough(self):
+        # The passthrough takes the FIRST trial's metrics, so a config whose
+        # first trial was cap-refused would report plan_quality=None despite
+        # having healthy trials — the infra failure blanking a real measurement
+        # (task 3118). It must skip tainted trials and count the exclusions.
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'capped-first', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=None, cap_tainted=True,
+                     invocation_error='architect:cap_hit: session limit'),
+            _mresult('f1', 'capped-first', 2, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.82),
+            _mresult('f1', 'healthy', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.55),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+
+        assert rows['capped-first']['plan_quality'] == pytest.approx(0.82)
+        assert rows['capped-first']['plan_quality_cap_excluded'] == 1
+        # A config with no tainted trials keeps today's passthrough exactly.
+        assert rows['healthy']['plan_quality'] == pytest.approx(0.55)
+        assert rows['healthy']['plan_quality_cap_excluded'] == 0
 
     def test_price_table_echo_and_sorted_rows(self):
         from orchestrator.evals.report import build_composite_report
