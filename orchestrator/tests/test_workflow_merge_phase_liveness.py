@@ -348,7 +348,8 @@ class TestEntryOrdering:
         ``_enter_phase`` / ``_stamp_merge_phase_entered`` /
         ``_check_scope_invariant`` are attached to one parent mock so
         ``parent.mock_calls`` records their global call order; asserts
-        enter < stamp < scope and that stamp + scope were each awaited once.
+        enter < FIRST stamp < scope (``.index`` finds the first occurrence, and
+        the merge-entry stamp is the only one above the retry loop).
 
         RED on main: ``_run_merge_phase`` never calls
         ``_stamp_merge_phase_entered`` (the stamp name is absent from
@@ -396,7 +397,15 @@ class TestEntryOrdering:
         result = await wf._run_merge_phase('task/77')
 
         assert result is None  # fell through to SUCCESS
-        stamp.assert_awaited_once()
+        # Two writes with max_merge_retries=1: the merge-entry stamp asserted
+        # here, plus the review-fix R2-B re-stamp at the top of the single
+        # retry attempt (see TestRetryLoopReStamp). The duplicate on attempt 1
+        # is the accepted cost of keeping both write points — the entry one
+        # must precede _check_scope_invariant, which sits above the loop.
+        assert stamp.await_count == 2, (
+            f'expected entry stamp + 1 loop-top re-stamp; got '
+            f'{stamp.await_count}'
+        )
         scope.assert_awaited_once()
         # Global call order across the shared parent: enter → stamp → scope.
         names = [c[0] for c in parent.mock_calls]

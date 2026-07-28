@@ -3380,6 +3380,25 @@ class TaskWorkflow:
             # Cleared at the durable-enqueue boundary in _submit_to_merge_queue
             # and defensively in the harness _run_slot finally.
             self.scheduler.note_merge_phase_entered(self.task_id)
+            # task 2991 (review-fix R2-B): refresh the DURABLE liveness stamp
+            # alongside the in-memory one above, for the same reason. Each
+            # REQUEUED retry re-runs a full vulnerable pre-enqueue window
+            # (Phase-1 rebase + scoped re-verify, minutes, zero LLM calls)
+            # AFTER _submit_to_merge_queue discharged the stamp at the enqueue
+            # boundary. Without this re-stamp that window has neither a durable
+            # merge_phase_liveness nor a fresh routing.latest, so the task
+            # 2931/2991 divergence false positive recurs on every merge retry
+            # (a REQUEUED retry goes through a steward resolution first, so the
+            # merge-entry L0 is already older than orphan_l0_timeout_secs when
+            # attempt 2 begins). The merge-entry stamp above is KEPT — it must
+            # precede _check_scope_invariant and the gating bail, both of which
+            # sit above this loop — so attempt 1 writes twice: an accepted cost
+            # (two cheap best-effort metadata writes, bounded by
+            # max_merge_retries+1 per merge entry) for the simple invariant "a
+            # fresh durable stamp exists at the start of every pre-enqueue
+            # window", which an `if _merge_attempt > 0` would make dependent on
+            # loop-index reasoning.
+            await self._stamp_merge_phase_entered()
             # Phase 1: pre-merge rebase (no lock, no queue slot)
             # Rebase the task branch onto current main and re-verify
             # so the queued merge phase is fast/trivial.
@@ -5334,12 +5353,22 @@ class TaskWorkflow:
         ``metadata.routing.latest.decided_at`` — the reaper's task-2931
         ``_has_fresh_dispatch`` gate cannot see a legitimately-live merge-stage
         task and false-promotes its scope-invariant L0 to a human-facing L1
-        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}`` at
-        merge entry; the reaper's ``_has_fresh_merge_phase`` gate defers a
-        divergence L0 whose task carries a fresh stamp. Being durable task
-        metadata it survives an orchestrator restart (unlike the per-process
+        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}``;
+        the reaper's ``_has_fresh_merge_phase`` gate defers a divergence L0
+        whose task carries a fresh stamp. Being durable task metadata it
+        survives an orchestrator restart (unlike the per-process
         ``Scheduler._merge_phase_at``), covering the exact redispatch window in
         which the false positive wedged 2789/2885.
+
+        Written at TWO points in :meth:`_run_merge_phase`, so a fresh stamp
+        exists at the start of every pre-enqueue window: (1) on merge entry,
+        before ``_check_scope_invariant`` files the divergence L0 and before
+        the gating bail — hence refreshed on every (re-)dispatch into merge
+        phase, including passes that immediately bail to ESCALATED; and (2) at
+        the top of each retry attempt, beside the in-memory
+        ``note_merge_phase_entered``, because ``_submit_to_merge_queue``
+        discharges the stamp at the enqueue boundary INSIDE that loop
+        (review-fix R2-B).
 
         Mirrors :meth:`_stamp_merge_retry_pending`'s durability contract but
         carries only a timestamp (no worktree HEAD / base SHA): read fresh
