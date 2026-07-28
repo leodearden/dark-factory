@@ -1924,6 +1924,292 @@ class TestContendedLeaseDefers:
             'dead-verify-abort counter untouched'
         )
 
+    async def test_two_consecutive_contended_resets_produce_no_blocked_outcome(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003, the ANTI-THRASH invariant — the incident's exact shape.
+
+        Two consecutive dispatch attempts for the SAME task against a lane
+        lock that is held throughout must produce ZERO ``MergeOutcome``s.
+
+        Why this is the right altitude for "consecutive_merge_thrash
+        untouched", and not a workflow-level harness: ``workflow.py`` gates its
+        whole anti-thrash block on ``self._last_merge_block_reason``, which is
+        only ever set from a RESOLVED blocked outcome.  A defer leaves
+        ``req.result`` PENDING, so ``compute_merge_outcome_signature`` is never
+        computed and ``consecutive_merge_thrash`` is never incremented — the
+        counter is STRUCTURALLY unreachable for this failure class rather than
+        merely happening to stay at zero.  Asserting "no outcome, future
+        pending, twice in a row" is therefore the strongest honest statement
+        available here; reading a counter that is never written would be
+        theatre.
+
+        Two is the number that matters: ``max_consecutive_merge_thrash``
+        defaults to 2, so two identical contended timeouts were precisely what
+        tripped the false-positive L2 (reify 5354/5300/5328, signature
+        3173b64436423738) — each attempt used to resolve
+        ``MergeOutcome('blocked', reason='Verification error: Timed out after
+        30s ...')``, a reason string with no varying component, hence the same
+        signature every time.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        task_id = 'thrash-shape'
+
+        async def _must_not_run(*_a: object, **_k: object) -> object:
+            raise AssertionError(
+                'the warm-swap reset must raise BEFORE any verify is dispatched'
+            )
+
+        lock_path = lane_lock_path(warm_git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            reqs = []
+            for i in range(2):
+                # Fresh merged item on a distinct branch, SAME task_id — this
+                # is what a re-dispatch of the same task looks like.
+                req, item = await _make_merged_item(
+                    warm_git_ops, warm_config, f'thrash-{i}', f'thrash{i}.py',
+                    'x=1\n', task_id=task_id,
+                )
+                worker._register_owned_merge_worktree(item.merge_wt)
+                worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+                with patch(
+                    'orchestrator.merge_queue._run_post_merge_verify', _must_not_run,
+                ):
+                    result = await asyncio.wait_for(
+                        worker._run_inflight_verify(item, lease), timeout=15.0,
+                    )
+                reqs.append(req)
+
+                assert result.status == InflightStatus.REQUEUED, (
+                    f'attempt #{i + 1} against a held lane lock must REQUEUE, '
+                    f'got status={result.status!r} outcome={result.outcome!r}'
+                )
+                assert result.outcome is None, (
+                    f'attempt #{i + 1} produced a MergeOutcome — with a '
+                    f'deterministic reason this is exactly the thrash food '
+                    f'that tripped the false-positive L2: {result.outcome!r}'
+                )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        assert not any(r.result.done() for r in reqs), (
+            'ZERO MergeOutcomes across two consecutive contended attempts — '
+            'every req.result must still be PENDING, so no merge_outcome_'
+            'signature is ever computed and consecutive_merge_thrash stays '
+            'structurally unreachable'
+        )
+        assert worker._contended_lease_requeues[task_id] == 2, (
+            'both defers must land on the same per-task streak counter so a '
+            'genuinely wedged holder is still operator-visible'
+        )
+
+    async def test_genuine_verify_failure_still_blocks_on_warm_path(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """SCOPE FENCE: with the lane lock FREE, a real verify failure on the
+        warm path must still surface its failure — the defer must not have
+        swallowed the normal blocked route.
+
+        Both failure shapes are covered, and they legitimately differ:
+
+        * the verify RAISES → the generic ``except Exception`` resolves
+          ``MergeOutcome('blocked')`` on ``req.result`` immediately (so a
+          failed verify never stalls the queue);
+        * the verify RETURNS a failing outcome → ``_run_inflight_verify``
+          hands it back on ``InflightVerifyResult.outcome`` and leaves
+          ``req.result`` for ``_finalize_inflight`` to resolve, which is that
+          method's documented contract ("does NOT resolve req.result ...
+          except on exception").
+
+        What must hold for BOTH: NOT requeued, and the contended-lane streak
+        POPPED — because the lane lock genuinely WAS acquired here, so any
+        prior streak is broken.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        failing = MergeOutcome('blocked', reason='verify failed: 3 tests')
+
+        async def _verify_raises(*_a: object, **_k: object) -> object:
+            raise RuntimeError('verify boom')
+
+        async def _verify_returns_failure(*_a: object, **_k: object) -> object:
+            return failing
+
+        # ── Shape 1: the verify RAISES ──
+        task_id_a = 'warm-verify-raises'
+        req_a, item_a = await _make_merged_item(
+            warm_git_ops, warm_config, 'warm-fail-raise', 'wfr.py', 'x=1\n',
+            task_id=task_id_a,
+        )
+        worker._register_owned_merge_worktree(item_a.merge_wt)
+        worker._request_ledger.on_dequeue(req_a, now=1_000_000.0)
+        # Pre-seed a streak so we can prove an ACQUIRED lane breaks it.
+        worker._contended_lease_requeues[task_id_a] = 1
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _verify_raises):
+            result_a = await asyncio.wait_for(
+                worker._run_inflight_verify(item_a, lease), timeout=15.0,
+            )
+
+        assert result_a.status != InflightStatus.REQUEUED, (
+            'a genuine verify failure must NOT be deferred — the lane lock was '
+            'free and the verify really ran'
+        )
+        assert result_a.outcome is not None and result_a.outcome.status == 'blocked', (
+            f'expected a blocked MergeOutcome, got {result_a.outcome!r}'
+        )
+        assert 'verify boom' in result_a.outcome.reason
+        assert req_a.result.done(), (
+            'a raising verify resolves req.result immediately so the failure '
+            'never stalls the queue'
+        )
+        assert q.empty(), 'a genuine verify failure must not be re-queued'
+        assert task_id_a not in worker._contended_lease_requeues, (
+            'the lane lock WAS acquired, so any prior contended streak is '
+            'broken and must be popped'
+        )
+
+        # ── Shape 2: the verify RETURNS a failing outcome ──
+        task_id_b = 'warm-verify-returns-fail'
+        req_b, item_b = await _make_merged_item(
+            warm_git_ops, warm_config, 'warm-fail-return', 'wfrt.py', 'y=1\n',
+            task_id=task_id_b,
+        )
+        worker._register_owned_merge_worktree(item_b.merge_wt)
+        worker._request_ledger.on_dequeue(req_b, now=1_000_000.0)
+        worker._contended_lease_requeues[task_id_b] = 1
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _verify_returns_failure,
+        ):
+            result_b = await asyncio.wait_for(
+                worker._run_inflight_verify(item_b, lease), timeout=15.0,
+            )
+
+        assert result_b.status != InflightStatus.REQUEUED, (
+            'a returned verify failure must NOT be deferred'
+        )
+        assert result_b.outcome is failing, (
+            f'the failing outcome must be handed back verbatim, got '
+            f'{result_b.outcome!r}'
+        )
+        assert q.empty(), 'a genuine verify failure must not be re-queued'
+        assert task_id_b not in worker._contended_lease_requeues, (
+            'the lane lock WAS acquired, so any prior contended streak is '
+            'broken and must be popped'
+        )
+
+    async def test_reset_git_failure_still_blocks(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """SCOPE FENCE: a non-contention fault from INSIDE the reset's body
+        must still map to ``MergeOutcome('blocked')``, never to a defer.
+
+        This is what keeps the typed raise honest.  ``reset_persistent_merge_
+        worktree`` raises a plain ``RuntimeError`` for every git fault in its
+        body (``git worktree add`` / ``git reset --hard`` / the artifact-
+        retaining clean) and ``MergeVerifyLeaseContended`` ONLY at the lock
+        acquire.  If the typed raise had been scoped any wider — e.g. wrapping
+        the whole method — a genuine, PERMANENT git fault would be re-queued
+        forever, converting a loud blocked outcome into a silent infinite
+        defer loop.  So this test is the reason the raise is site-local.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        async def _reset_git_fault(*_a: object, **_k: object) -> Path:
+            # Verbatim shape of the in-body faults at git_ops.py's
+            # reset-in-place branch (a plain RuntimeError, NOT the typed class).
+            raise RuntimeError(
+                f'Failed to reset persistent merge worktree '
+                f'{warm_git_ops.persistent_merge_worktree_path} to deadbeef: '
+                f'fatal: Could not reset index file to revision'
+            )
+
+        async def _must_not_run(*_a: object, **_k: object) -> object:
+            raise AssertionError('the reset faulted — no verify may be dispatched')
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'reset-git-fault', 'rgf.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        with (
+            patch.object(
+                warm_git_ops, 'reset_persistent_merge_worktree', _reset_git_fault,
+            ),
+            patch('orchestrator.merge_queue._run_post_merge_verify', _must_not_run),
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert result.status != InflightStatus.REQUEUED, (
+            f'a git fault inside the reset is a REAL failure, not a busy lane — '
+            f'deferring it would loop forever, got status={result.status!r}'
+        )
+        assert result.outcome is not None and result.outcome.status == 'blocked', (
+            f'expected a blocked MergeOutcome, got {result.outcome!r}'
+        )
+        assert 'Failed to reset persistent merge worktree' in result.outcome.reason
+        assert req.result.done(), 'a genuine git fault must RESOLVE req.result'
+        assert q.empty(), 'a genuine git fault must not be re-queued'
+        assert req.task_id not in worker._contended_lease_requeues, (
+            'a git fault is not lane contention — it must never open a '
+            'contended-lane streak'
+        )
+
     async def test_consecutive_contended_requeues_raise_log_severity(
         self,
         git_ops: GitOps,
