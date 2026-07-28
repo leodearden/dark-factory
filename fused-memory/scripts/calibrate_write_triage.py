@@ -216,3 +216,68 @@ def summarize_distribution(scores: Sequence[float]) -> dict[str, Any]:
         'p75': _order_statistic(ordered, 0.75),
         'p95': _order_statistic(ordered, 0.95),
     }
+
+
+# ---------------------------------------------------------------------------
+# Band derivation
+# ---------------------------------------------------------------------------
+
+# Machine-readable refusal codes. A caller branches on these rather than
+# matching prose; each is emitted with the measurements that produced it.
+REASON_EMPTY_CLASS = 'empty_class'
+REASON_NOT_SEPARABLE = 'not_separable'
+REASON_NO_JUDGE_BAND = 'no_judge_band'
+
+
+def derive_bands(
+    dup_scores: Sequence[float],
+    negative_scores: Sequence[float],
+) -> tuple[float | None, float | None, str | None]:
+    """Derive ``(t_high, t_low, reason)`` from two measured score samples.
+
+    Both thresholds are order statistics of the observed duplicate
+    distribution — never interpolated, never defaulted:
+
+    - ``t_high`` is the SMALLEST measured duplicate score that strictly
+      exceeds every measured negative. So the deterministic restate band
+      admits zero measured false positives by construction, and taking the
+      smallest such value keeps that band as wide as the evidence allows.
+    - ``t_low`` is the duplicate distribution's lower tail (p05), so
+      substantially all curator-confirmed rediscoveries reach at least the
+      judge band.
+
+    Every degenerate input returns ``None`` plus a reason code instead of a
+    fabricated number. ``None`` means UNCALIBRATED and the triage router
+    must fail open to ``stored``.
+    """
+    if not dup_scores or not negative_scores:
+        return None, None, (
+            f'{REASON_EMPTY_CLASS}: cannot separate two classes when one is empty '
+            f'(n_duplicate={len(dup_scores)}, n_negative={len(negative_scores)})'
+        )
+
+    max_negative = max(negative_scores)
+    ordered_dups = sorted(float(s) for s in dup_scores)
+    separating = [s for s in ordered_dups if s > max_negative]
+    if not separating:
+        return None, None, (
+            f'{REASON_NOT_SEPARABLE}: the highest measured negative ({max_negative}) is at or '
+            f'above every measured duplicate (max={ordered_dups[-1]}), so no measured value '
+            'separates the classes. Refusing to interpolate a threshold the data does not '
+            'support — this outcome is itself the calibration finding.'
+        )
+
+    t_high = separating[0]
+    t_low = _order_statistic(ordered_dups, 0.05)
+    if t_low >= t_high:
+        # Perfect separation: t_high IS the duplicate class's own lower
+        # bound, so no measured duplicate sits strictly below it and no
+        # judge band is derivable from this sample.
+        return t_high, None, (
+            f'{REASON_NO_JUDGE_BAND}: every measured duplicate ({ordered_dups[0]}..'
+            f'{ordered_dups[-1]}) already clears every measured negative (max={max_negative}), '
+            f'so t_high={t_high} is the duplicate lower bound and no measured value lies '
+            'strictly below it. No judge band is derivable from this sample.'
+        )
+
+    return t_high, t_low, None
