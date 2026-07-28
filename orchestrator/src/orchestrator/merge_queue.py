@@ -37,6 +37,7 @@ from orchestrator.git_ops import (
     GitOps,
     MergeResult,
     MergeVerifyLeaseContended,
+    MergeVerifyLeaseHeld,
     WorktreeMissing,
     _run,
 )
@@ -13795,20 +13796,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
             )
-        except MergeVerifyLeaseContended as exc:
-            # The merge-verify lane lock stayed contended past its bounded wait,
-            # so merge_verify_lease RAISED rather than run this verify
-            # UNPROTECTED (task 2828, limb 2). This is a transient "come back
-            # later," not a verify failure — DEFER by re-queuing for a later
-            # re-verify, mirroring the operator-halt abort branch above VERBATIM
-            # (release_or_cleanup + put_nowait + on_requeued + _note_requeue +
-            # InflightStatus.REQUEUED). req.result is left PENDING and the
-            # per-task dead-verify-abort counter is untouched, so this never
-            # counts as a dead-verify abort or a 'blocked' resolution. Placed
-            # BEFORE the generic `except Exception`, which would otherwise map
-            # it to MergeOutcome('blocked'). The verify_task has already failed
-            # (the lease raised on acquire, before the verify body ran), so
-            # there is no in-flight verify to abort/cancel here.
+        except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
+            # The shared merge-verify <lane_dir>.lock was unavailable, so the
+            # raiser refused to proceed rather than act UNPROTECTED. This is a
+            # transient "come back later," not a verify failure — DEFER by
+            # re-queuing for a later re-verify, mirroring the operator-halt
+            # abort branch above VERBATIM (release_or_cleanup + put_nowait +
+            # on_requeued + _note_requeue + InflightStatus.REQUEUED).
+            # req.result is left PENDING and the per-task dead-verify-abort
+            # counter is untouched, so this never counts as a dead-verify abort
+            # or a 'blocked' resolution. Placed BEFORE the generic
+            # `except Exception`, which would otherwise map every one of these
+            # to MergeOutcome('blocked') — with a DETERMINISTIC reason string,
+            # hence an identical merge_outcome_signature on every attempt,
+            # which is exactly what tripped workflow.py's
+            # consecutive_merge_thrash ladder into a false-positive human
+            # escalation (reify 5354/5300/5328).
+            #
+            # THREE raise sites now land here:
+            #   1. merge_verify_lease's contended acquire (task 2828, limb 2) —
+            #      MergeVerifyLeaseContended, raised while the verify was
+            #      STARTING, surfacing at verify_task.result().
+            #   2. reset_persistent_merge_worktree's contended acquire (task
+            #      3003, limbs a/b), reached via _acquire_warm_verify_worktree
+            #      in the LOCAL warm-swap branch above —
+            #      MergeVerifyLeaseContended with operation=.
+            #   3. reset_persistent_merge_worktree's FOREIGN-holder pre-check
+            #      (task 3003, limb c) — MergeVerifyLeaseHeld, whose REQUEUE /
+            #      counts_against_requeue_cap=False disposition row in
+            #      workflow_types.py already declared this policy; before 3003
+            #      only the merge worker disagreed.
+            #
+            # In BOTH reset cases (2 and 3) the exception fires before
+            # verify_task exists at all, so merge_wt is still the ephemeral
+            # item.merge_wt and _spec_warm is still False — precisely what
+            # _release_or_cleanup(merge_wt, spec_warm=_spec_warm) already
+            # handled on today's blocked path. In case 1 the verify_task has
+            # already failed (the lease raised on acquire, before the verify
+            # body ran). So in no case is there an in-flight verify to
+            # abort/cancel here.
+            #
             # task 2828 amend (reviewer_comprehensive, robustness): count the
             # UNBROKEN contended-lease requeue streak for this task and RAISE the
             # log severity once it crosses CONTENDED_LEASE_REQUEUE_WARN_STREAK, so
@@ -13818,20 +13845,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _contended_streak = self._contended_lease_requeues.get(req.task_id, 0) + 1
             self._contended_lease_requeues[req.task_id] = _contended_streak
             if _contended_streak >= self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+                # task 3003: the "~N min of continuous contention" estimate is
+                # only meaningful for the two BOUNDED-WAIT raisers, which carry
+                # wait_secs. MergeVerifyLeaseHeld has no such attribute — its
+                # pre-check refuses IMMEDIATELY, so there is no wait to
+                # multiply. Rendering getattr(..., 0.0) as "~0 min" would tell
+                # an operator the exact opposite of the truth (the holder has
+                # been there a while; this exception simply cannot say how
+                # long), so the duration clause is SUPPRESSED when absent
+                # rather than printed as zero. The streak count and the
+                # exception detail (which names the holder pgid) are kept in
+                # both variants.
+                _wait_secs = getattr(exc, 'wait_secs', None)
+                _duration_clause = (
+                    f' (~{_contended_streak * _wait_secs / 60.0:.0f} min of '
+                    f'continuous contention)'
+                    if _wait_secs is not None
+                    else ''
+                )
                 logger.error(
-                    'Task %s: merge-verify lease contended (%s) — DEFERRED %d '
-                    'times in a row (~%.0f min of continuous contention). A '
-                    'long-running or wedged lane holder is blocking this verify; '
-                    're-queuing again rather than running unprotected. If this '
-                    'persists, inspect the merge-verify lane lock holder.',
-                    req.task_id, exc, _contended_streak,
-                    _contended_streak * getattr(exc, 'wait_secs', 0.0) / 60.0,
+                    'Task %s: merge-verify lane unavailable (%s) — DEFERRED %d '
+                    'times in a row%s. A long-running or wedged lane holder is '
+                    'blocking this verify; re-queuing again rather than running '
+                    'unprotected. If this persists, inspect the merge-verify '
+                    'lane lock holder.',
+                    req.task_id, exc, _contended_streak, _duration_clause,
                 )
             else:
+                # task 3003: "lane unavailable" rather than "lease contended" —
+                # this arm now also covers MergeVerifyLeaseHeld (a FOREIGN
+                # holder refused immediately, never a bounded-wait contention)
+                # and the warm-swap reset's own acquire. The exception detail
+                # (%s) names which of the three it was.
                 logger.warning(
-                    'Task %s: merge-verify lease contended (%s) — re-queuing '
-                    'merge for re-verify rather than running the verify '
-                    'unprotected (consecutive contended-lease requeue #%d)',
+                    'Task %s: merge-verify lane unavailable (%s) — re-queuing '
+                    'merge for re-verify rather than proceeding unprotected '
+                    '(consecutive contended-lane requeue #%d)',
                     req.task_id, exc, _contended_streak,
                 )
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
