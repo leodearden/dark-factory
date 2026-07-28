@@ -10,13 +10,18 @@ raw-YAML-vs-model pass.  These tests pin the pure census engine.
 import logging
 from pathlib import Path
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
 from orchestrator.cli import main
 from orchestrator.config import (
+    RELOADABLE_FIELDS,
+    ConfigIgnoredKey,
+    ConfigKeyCensusConfig,
     ConfigUnknownKey,
     OrchestratorConfig,
+    census_config_keys,
     census_unknown_config_keys,
     config_unknown_keys_signature,
     load_config,
@@ -216,3 +221,260 @@ def test_check_config_reports_unknown_keys_and_exits_one(tmp_path):
     assert 'spare_warm_lanes' in result.output
     # The placement hint points at the real home of the incident key.
     assert 'git.spare_warm_lanes' in result.output
+
+
+# =============================================================================
+# Census escape hatches (review round 1 — steps 11/12)
+#
+# Without an escape hatch the always-on born-at-L2 files a PERMANENT,
+# UNRESOLVABLE critical on any project whose YAML deliberately carries keys for
+# NON-OrchestratorConfig consumers (measured on this machine: /home/leo/src/reify
+# and /home/leo/src/reify-unblock-5196 each carry 6 such keys, read verbatim by
+# reify's own scripts).  Two hatches classify such a key as `ignored` instead of
+# `unknown`: a reserved `x_`/`x-` name prefix at any depth, and an operator
+# `config_key_census.ignore` dotted-glob allowlist read from the same raw YAML.
+# =============================================================================
+
+
+# --- (a) reserved-prefix hatch ------------------------------------------------
+
+
+def test_reserved_prefix_keys_are_ignored_not_unknown(tmp_path):
+    """`x_`/`x-` prefixed keys are classified ignored (reason='reserved_prefix').
+
+    Case-insensitive, mirroring OrchestratorConfig's case_sensitive=False.
+    """
+    p = _write_yaml(tmp_path, {'x_foo': 1, 'x-bar': 1, 'X_Baz': 1})
+    census = census_config_keys(p)
+    assert census.unknown == []
+    ignored = {ik.path: ik.reason for ik in census.ignored}
+    assert ignored == {
+        'x_foo': 'reserved_prefix',
+        'x-bar': 'reserved_prefix',
+        'X_Baz': 'reserved_prefix',
+    }
+
+
+def test_reserved_prefix_applies_at_nested_depth(tmp_path):
+    """The prefix hatch works at ANY depth, and does not disturb real nested keys."""
+    p = _write_yaml(tmp_path, {'git': {'x_custom': 1, 'remote': 'origin'}})
+    census = census_config_keys(p)
+    assert census.unknown == []
+    assert ConfigIgnoredKey('git.x_custom', 'reserved_prefix') in census.ignored
+    assert 'git.remote' not in {ik.path for ik in census.ignored}
+
+
+# --- (b) operator allowlist (the real reify shape) ----------------------------
+
+
+def _reify_shape(extra: dict | None = None) -> dict:
+    """The measured reify mixed-consumer shape: reify-owned knobs living in the
+    SAME yaml blocks as real OrchestratorConfig fields."""
+    data = {
+        'config_key_census': {'ignore': ['cpu_governance.*', 'fairness.scheduler_v2']},
+        'cpu_governance': {
+            'enabled': True,                 # real CpuGovernConfig field
+            'weights': {'task': 100},        # reify-owned
+            'agent_admit': {'enabled': True},  # reify-owned
+        },
+        'fairness': {
+            'skip_threshold': 3,   # real FairnessConfig field
+            'scheduler_v2': True,  # reify-owned
+        },
+    }
+    if extra:
+        data.update(extra)
+    return data
+
+
+def test_allowlist_opts_out_mixed_consumer_namespace(tmp_path):
+    p = _write_yaml(tmp_path, _reify_shape())
+    census = census_config_keys(p)
+    assert census.unknown == [], 'allowlisted keys must not be unknown'
+    ignored = {ik.path: ik.reason for ik in census.ignored}
+    assert ignored.get('cpu_governance.weights') == 'allowlist'
+    assert ignored.get('cpu_governance.agent_admit') == 'allowlist'
+    assert ignored.get('fairness.scheduler_v2') == 'allowlist'
+    # Sibling REAL model keys are never flagged by either list.
+    assert 'cpu_governance.enabled' not in ignored
+    assert 'fairness.skip_threshold' not in ignored
+
+
+# --- (c) self-flag regression guard -------------------------------------------
+
+
+def test_config_key_census_block_does_not_self_flag(tmp_path):
+    """The key that CONFIGURES the census must itself be a real model field.
+
+    Otherwise an operator applying the documented remediation would trade one
+    born-at-L2 for another.
+    """
+    p = _write_yaml(tmp_path, {'config_key_census': {'ignore': ['some.path']}})
+    census = census_config_keys(p)
+    assert census.unknown == []
+    assert 'config_key_census' not in {ik.path for ik in census.ignored}
+    # And it is a declared model field with the documented shape.
+    assert 'config_key_census' in OrchestratorConfig.model_fields
+    assert ConfigKeyCensusConfig().ignore == []
+
+
+# --- (d) genuine signal is preserved through the hatch ------------------------
+
+
+def test_allowlist_does_not_suppress_genuine_unknown_keys(tmp_path):
+    """SYNTHETIC fixture: an unallowlisted key stays unknown, and a name that
+    shadows a nested model field still produces its advisory hint.
+
+    This is a claim about WALK BEHAVIOUR only — deliberately NOT a claim that
+    reify's real top-level `warm_lane_pool:` is misplaced (it is a legitimate
+    reify-owned dict; shadow hints are advisory and may be coincidental name
+    collisions).
+    """
+    p = _write_yaml(tmp_path, _reify_shape({'warm_lane_pool': 6, 'bogus_key': 1}))
+    census = census_config_keys(p)
+    by_path = {uk.path: uk for uk in census.unknown}
+    assert set(by_path) == {'warm_lane_pool', 'bogus_key'}
+    hint = by_path['warm_lane_pool'].shadow_hint
+    assert hint is not None and 'git.warm_lane_pool' in hint
+    assert by_path['bogus_key'].shadow_hint is None
+
+
+# --- (e) exact-path vs glob matching, and the bare-parent fnmatch trap ---------
+
+
+def test_exact_path_allowlist_entry_matches(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['fairness.scheduler_v2']},
+            'fairness': {'scheduler_v2': True, 'other_bogus': 1},
+        },
+    )
+    census = census_config_keys(p)
+    assert ConfigIgnoredKey('fairness.scheduler_v2', 'allowlist') in census.ignored
+    # An exact entry opts out ONLY that path — its sibling stays unknown.
+    assert [uk.path for uk in census.unknown] == ['fairness.other_bogus']
+
+
+def test_glob_does_not_match_bare_parent_key(tmp_path):
+    """fnmatch trap: `<name>.*` does NOT match the bare top-level key `<name>`.
+
+    Opting out a top-level dict key therefore requires listing it EXACTLY.  This
+    is load-bearing for the reify follow-up: a `warm_lane_pool.*` entry alone
+    would leave the born-at-L2 firing permanently.
+    """
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['warm_lane_pool.*']},
+            'warm_lane_pool': {'sizing': {'safety_divisor': 2}},
+        },
+    )
+    census = census_config_keys(p)
+    assert [uk.path for uk in census.unknown] == ['warm_lane_pool']
+
+    # Listing it exactly DOES opt it out (and the walk still does not descend).
+    p2 = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['warm_lane_pool']},
+            'warm_lane_pool': {'sizing': {'safety_divisor': 2}},
+        },
+        name='exact.yaml',
+    )
+    census2 = census_config_keys(p2)
+    assert census2.unknown == []
+    assert ConfigIgnoredKey('warm_lane_pool', 'allowlist') in census2.ignored
+
+
+# --- (f) signature isolation + unchanged public wrapper -----------------------
+
+
+def test_signature_ignores_escape_hatched_keys(tmp_path):
+    """The L2 dedup discriminator is computed over UNKNOWN keys only, so adding
+    an escape-hatched key never re-files a distinct L2."""
+    plain = _write_yaml(tmp_path, {'bogus_key': 1}, name='plain.yaml')
+    hatched = _write_yaml(
+        tmp_path,
+        {
+            'bogus_key': 1,
+            'x_extra': 1,
+            'config_key_census': {'ignore': ['cpu_governance.*']},
+            'cpu_governance': {'weights': {'task': 100}},
+        },
+        name='hatched.yaml',
+    )
+    sig_plain = config_unknown_keys_signature(census_config_keys(plain).unknown)
+    sig_hatched = config_unknown_keys_signature(census_config_keys(hatched).unknown)
+    assert sig_plain == sig_hatched
+
+
+def test_public_wrapper_returns_unknown_view(tmp_path):
+    """census_unknown_config_keys keeps its exact signature/semantics — it is a
+    thin wrapper over the one walk (INV-5: one implementation, two views)."""
+    p = _write_yaml(tmp_path, _reify_shape({'bogus_key': 1}))
+    assert census_unknown_config_keys(p) == census_config_keys(p).unknown
+
+
+# --- (g) fail-open on a malformed hatch ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    'hatch',
+    [
+        5,                          # non-dict config_key_census
+        {'ignore': 'not-a-list'},   # non-list ignore
+        {'ignore': [123]},          # non-str entries
+        {'ignore': None},
+        [],
+    ],
+)
+def test_malformed_hatch_is_treated_as_empty_allowlist(tmp_path, hatch):
+    """A malformed hatch must never raise — it degrades to "no allowlist"."""
+    p = _write_yaml(
+        tmp_path,
+        {'config_key_census': hatch, 'bogus_key': 1},
+        name='malformed.yaml',
+    )
+    census = census_config_keys(p)
+    assert 'bogus_key' in {uk.path for uk in census.unknown}
+    assert not any(ik.reason == 'allowlist' for ik in census.ignored)
+
+
+# --- (h) load-time stash of BOTH views ----------------------------------------
+
+
+def test_load_config_stashes_both_censuses(tmp_path, monkeypatch):
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(tmp_path),
+            'config_key_census': {'ignore': ['cpu_governance.*']},
+            'cpu_governance': {'weights': {'task': 100}},
+            'bogus_key': 1,
+        },
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    config = load_config(p)
+    assert [uk.path for uk in config.unknown_key_census] == ['bogus_key']
+    assert ConfigIgnoredKey('cpu_governance.weights', 'allowlist') in (
+        config.ignored_key_census
+    )
+
+
+def test_direct_construction_yields_empty_ignored_census(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    assert OrchestratorConfig().ignored_key_census == []
+
+
+# --- (i) hot-reload promise ----------------------------------------------------
+
+
+def test_config_key_census_ignore_is_green_tier():
+    """Pins the operator-facing promise the L2 remediation text makes: the
+    allowlist can be applied to a LIVE unit via hot-reload.  If this leaf were
+    not in RELOADABLE_FIELDS, apply_reload would report restart_required and
+    that remediation line would be a lie."""
+    assert 'config_key_census.ignore' in RELOADABLE_FIELDS
