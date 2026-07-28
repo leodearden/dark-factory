@@ -889,6 +889,28 @@ def _implementer_result(
     )
 
 
+def _cap_tainted_result(
+    task_id: str = 'df_task_3118',
+    config_name: str = 'architect-sonnet-high',
+):
+    """An architect cell whose invocation was refused — NOT a measurement."""
+    from orchestrator.evals.runner import EvalResult
+
+    return EvalResult(
+        task_id=task_id,
+        config_name=config_name,
+        outcome='blocked',
+        metrics={
+            'role_under_test': 'architect',
+            'plan_quality': None,
+            'cap_tainted': True,
+            'invocation_error': f'architect:cap_hit: {_CAP_TEXT}',
+            'composite_score': 0.0,
+        },
+        worktree_path='/tmp/wt-arch-capped',
+    )
+
+
 class TestPlanQualityReport:
     def test_build_plan_quality_report_rows(self):
         from orchestrator.evals.report import build_plan_quality_report
@@ -944,6 +966,95 @@ class TestPlanQualityReport:
         )
         assert '-' in impl_line           # null sentinel rendered as '-'
         assert '0.7500' not in impl_line  # implementer row is NOT populated
+
+    # -- cap-tainted exclusion (task 3118) --------------------------------
+    # A cap-tainted cell is an INFRA failure, not a content measurement, so the
+    # aggregate must EXCLUDE it and COUNT the exclusion — never average in a
+    # fabricated zero, which would penalise whichever candidate happened to be
+    # scheduled inside a cap window.
+
+    def test_rows_carry_cap_tainted_and_invocation_error(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report(
+            [_architect_result(), _cap_tainted_result(), _implementer_result()]
+        )
+        by_task = {r['task_id']: r for r in report['rows']}
+
+        capped = by_task['df_task_3118']
+        assert capped['cap_tainted'] is True
+        assert capped['invocation_error'].startswith('architect:')
+        assert capped['plan_quality'] is None
+
+        # Legacy results, whose metrics predate both keys, read back default-safe.
+        assert by_task['df_task_2605']['cap_tainted'] is False
+        assert by_task['df_task_2605']['invocation_error'] is None
+        assert by_task['df_task_1993']['cap_tainted'] is False
+
+    def test_per_config_mean_excludes_cap_tainted_cells(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name=cfg, plan_quality=0.9),
+            _architect_result(task_id='t2', config_name=cfg, plan_quality=0.7),
+            _cap_tainted_result(task_id='t3', config_name=cfg),
+        ])
+        configs = {c['config_name']: c for c in report['configs']}
+        agg = configs[cfg]
+
+        # (0.9 + 0.7) / 2 — NOT (0.9 + 0.7 + 0.0) / 3 == 0.5333.
+        assert agg['mean_plan_quality'] == 0.8
+        assert agg['n'] == 2
+        assert agg['cap_excluded'] == 1
+        assert agg['total'] == 3
+
+    def test_report_level_cap_excluded_total(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name='a', plan_quality=0.9),
+            _cap_tainted_result(task_id='t2', config_name='a'),
+            _cap_tainted_result(task_id='t3', config_name='b'),
+        ])
+        assert report['cap_excluded'] == 2
+
+    def test_all_cells_tainted_yields_null_mean_never_zero(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _cap_tainted_result(task_id='t1', config_name='doomed'),
+            _cap_tainted_result(task_id='t2', config_name='doomed'),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}['doomed']
+        assert agg['mean_plan_quality'] is None
+        assert agg['mean_plan_quality'] != 0.0
+        assert agg['n'] == 0
+        assert agg['cap_excluded'] == 2
+
+    def test_implementer_rows_stay_out_of_the_architect_aggregate(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report(
+            [_architect_result(), _implementer_result()]
+        )
+        assert [c['config_name'] for c in report['configs']] == [
+            'architect-sonnet-high',
+        ]
+        # ...while both still appear as ROWS, sorted deterministically.
+        keys = [(r['task_id'], r['config_name']) for r in report['rows']]
+        assert keys == sorted(keys)
+        assert len(keys) == 2
+
+    def test_configs_sorted_by_config_name(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name='z-cfg'),
+            _architect_result(task_id='t2', config_name='a-cfg'),
+        ])
+        names = [c['config_name'] for c in report['configs']]
+        assert names == sorted(names)
 
     def test_table_renders_byte_identically_regardless_of_input_order(self):
         from orchestrator.evals.report import (
