@@ -371,13 +371,19 @@ class PlanQualityVerdict:
     plan, or ``None`` — the parse-failure sentinel — when the judge output could
     not be parsed. ``run_architect_eval`` treats ``None`` as its signal to
     degrade to the deterministic :func:`score_plan_structure` floor, so the
-    persisted ``plan_quality`` is ALWAYS a non-sentinel float even when the
-    judge fails.
+    persisted ``plan_quality`` is a non-sentinel float even when the judge
+    fails (a judge failure never nulls a cell that has a real plan behind it).
     """
 
     plan_quality: float | None
     per_criterion: dict[str, Any]
     reasoning: str
+    # Set when the JUDGE'S OWN invocation was refused at the transport layer (a
+    # 429 cap hit / auth failure), so this ``None`` plan_quality is an INFRA
+    # failure — we never got a judgement — rather than an unparseable answer.
+    # Trailing and defaulted, so every existing 3-arg construction (including
+    # the parse-failure fallback below) is unaffected and keeps reading None.
+    invocation_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -412,7 +418,12 @@ async def judge_plan_quality(
     :func:`score_plan_structure` weights deterministically.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
-    sentinel :func:`run_architect_eval` degrades on), never a crash.
+    sentinel :func:`run_architect_eval` degrades on), never a crash. When the
+    judge's OWN invocation was refused at the transport layer (a 429 cap hit /
+    auth failure) the verdict additionally carries ``invocation_error``, so that
+    infra cause stays distinguishable from an unparseable answer; the caller
+    still degrades to the deterministic structural floor, which remains a
+    legitimate content-derived score whenever a real plan exists.
     """
     task_name = task.get('name', task.get('id', 'unknown'))
     task_desc = task.get('task_definition', {}).get('description', '')
@@ -465,6 +476,27 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
         max_budget_usd=5.0,
         output_schema=PLAN_QUALITY_SCHEMA,
     )
+
+    # Was the JUDGE ITSELF refused at the transport layer? Checked BEFORE the
+    # parse block, because a 429 body is not JSON and would otherwise land in
+    # the parse-failure fallback — making an infra refusal indistinguishable
+    # from a judge that answered badly. Local import: keeps judge.py's
+    # module-level import surface unchanged (and there is no cycle either way —
+    # metrics.py does not import judge).
+    from .metrics import detect_invocation_error
+
+    invocation_error = detect_invocation_error(result)
+    if invocation_error:
+        logger.warning(
+            f'Plan judge invocation REFUSED at the transport layer: '
+            f'{invocation_error}'
+        )
+        return PlanQualityVerdict(
+            plan_quality=None,
+            per_criterion={},
+            reasoning=f'plan judge invocation refused: {invocation_error}',
+            invocation_error=invocation_error,
+        )
 
     # Parse verdict — structured_output first, else json.loads(output); a
     # missing/None/non-numeric plan_quality degrades to the None sentinel.
