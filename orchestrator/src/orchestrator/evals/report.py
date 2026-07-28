@@ -210,7 +210,10 @@ def build_composite_report(
     ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
     working time, not wall-clock, so eval/scheduler overhead is not charged to
     the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` are
-    passthroughs of any trial's metrics (η/θ surfaces). ``cost_source`` (P5) is
+    passthroughs of any trial's metrics (η/θ surfaces) — except that
+    ``plan_quality`` deliberately skips CAP-TAINTED trials (task 3118) so an
+    infra refusal landing on the first trial cannot blank out a config that has
+    healthy trials; ``plan_quality_cap_excluded`` reports how many were skipped. ``cost_source`` (P5) is
     the config's single distinct per-trial source, or ``'mixed'`` when its
     trials span more than one — since ``cost_usd`` is a cross-trial mean,
     labelling it with just the first trial's source would mislabel a blended
@@ -257,6 +260,8 @@ def build_composite_report(
             'judge_invocations': 0, 'judge_cost_usd': 0.0,
             'cost_sources': set(),
             'first_metrics': None,
+            'first_untainted_metrics': None,
+            'plan_quality_cap_excluded': 0,
         }
 
     by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
@@ -286,6 +291,13 @@ def build_composite_report(
         acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
         if acc['first_metrics'] is None:
             acc['first_metrics'] = m
+        # The plan-quality passthrough deliberately skips cap-tainted trials, so
+        # an infra refusal that happened to land on the FIRST trial cannot blank
+        # out a config that has healthy ones (task 3118).
+        if m.get('cap_tainted'):
+            acc['plan_quality_cap_excluded'] += 1
+        elif acc['first_untainted_metrics'] is None:
+            acc['first_untainted_metrics'] = m
 
     rows: list[dict[str, Any]] = []
     for cfg in sorted(by_config):
@@ -317,7 +329,11 @@ def build_composite_report(
                 'cost_usd': acc['judge_cost_usd'],
             },
             'recovery_score': fm.get('recovery_score'),
-            'plan_quality': fm.get('plan_quality'),
+            # Falls back to fm only when EVERY trial was tainted — there is no
+            # untainted measurement to report, and the accompanying
+            # plan_quality_cap_excluded count says why.
+            'plan_quality': (acc['first_untainted_metrics'] or fm).get('plan_quality'),
+            'plan_quality_cap_excluded': acc['plan_quality_cap_excluded'],
         })
 
     return {
