@@ -44,8 +44,8 @@ One JSON object per line:
 ```
 
 `cluster_id` is the **canonical entry's UUID, never the gate id.** Gates
-`esc-5534`, `esc-5547` and `esc-5561` each produced *two* canonicals, so
-keying clusters by gate would fuse two unrelated canonicals' members into
+`esc-5534`, `esc-5547`, `esc-5561` and `esc-5610` each produced *two*
+canonicals, so keying clusters by gate would fuse two canonicals' members into
 one cluster and inject pairs that are not duplicates into the positive
 class — which would drag the derived `T_high` downward and manufacture
 exactly the deterministic-band false positives the calibration exists to
@@ -132,12 +132,39 @@ Measured at extraction (`step-2`); see `Known label ambiguities` below for
 the caveats these counts carry.
 
 <!-- COVERAGE:BEGIN -->
-- Delete calls issued in session: _TBD_
-- Ids with recovered content: _TBD_
-- Records emitted: _TBD_
-- Unrecovered (excluded): _TBD_
-- Clusters: _TBD_
-- Per-label counts: _TBD_
+**Records emitted: 104** across **20 clusters**.
+
+| label | count |
+|---|---|
+| `duplicate` | 75 |
+| `canonical` | 20 |
+| `pseudo_contradiction` | 6 |
+| `distinct` | 3 |
+
+Recovery source, per record:
+
+| `provenance.source` | count |
+|---|---|
+| `get_memory_by_id` | 69 |
+| `add_memory_input` | 20 (the canonicals) |
+| `search` | 11 |
+| `get_memories_by_metadata` | 4 |
+
+Accounting against the session's 90 `delete_memory` calls — every id is
+either emitted or explicitly tallied, none silently dropped:
+
+| disposition | n | why |
+|---|---|---|
+| emitted as a cluster member | 84 | |
+| excluded — intra-session canonical | 1 | `8d79e0e4…` |
+| excluded — spent Stage-1 flag marker | 1 | `43a47400…` |
+| excluded — canonical unrecoverable | 3 | gate `esc-5571` (below) |
+| excluded — ambiguous attribution | 1 | `97557618…` (below) |
+| **total** | **90** | |
+
+Plus the 20 canonicals themselves (each keying its own cluster) = 104
+records. **Content recovery was complete: 0 records were dropped for
+unrecoverable content**, so no record carries placeholder text.
 <!-- COVERAGE:END -->
 
 There is deliberately **no test asserting a total record count.** The three
@@ -159,3 +186,22 @@ Recorded rather than silently guessed:
   machine-resolvable from the session edges.
 - **`c759c53b…` / `9f2d2ae6…`** carry a secondary cross-reference from
   `esc-5600` in addition to their primary cluster attribution.
+- **`97557618…` is excluded, not coin-flipped.** It is named in the
+  `merged_from` of *both* `esc-5547` canonicals (`d4b39613…` at transcript
+  line 386, `a063640d…` at line 389) — the only id in the session whose
+  edges name two owners. Forcing it into one cluster would make its pairs
+  against the other canonical's members read as *unrelated* negatives when
+  they are in fact near-duplicates; because `T_high` must exceed every
+  measured negative, one spuriously-high negative can drag the headline
+  threshold up on its own. Excluding one record is the cheaper error.
+- **`esc-5571`'s cluster is absent entirely.** Its canonical `add_memory`
+  call (transcript line 527) returned `"The operation timed out."` rather
+  than a `memory_ids` payload, and the curator never retried it, so the
+  canonical's UUID is unrecoverable. Its 3 `retired_suppressions` members
+  (`48c5cba2…`, `f5a52915…`, `f0cb8363…` — the Stage-1 stub records) are
+  therefore dropped rather than emitted against a fabricated cluster id,
+  which would have violated the no-dangling-members invariant.
+- **The 6 members of the excluded `8d79e0e4…` are re-attributed to
+  `bf91bc5c…`**, the `esc-5610` canonical that superseded it within the
+  same session. An excluded canonical never takes ownership, so its
+  members fall through to the surviving one rather than being orphaned.
