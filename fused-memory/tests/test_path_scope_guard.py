@@ -72,8 +72,18 @@ class TestFindPaths:
         assert find_paths('see crates/x.rs', ('crates/',)) == ['crates/']
 
     def test_dedup_and_order(self):
+        """RE-POINTED by task 3120: the single-bare-segment shape is now
+        deliberately NOT a match.
+
+        ``crates/a`` has no right-context that looks like a path segment (no
+        further '/', no file extension), so under the right-boundary contract
+        it no longer lexes as a path.  This is a synthetic fixture with no
+        witness in the live corpus.  Dedup-and-order over *genuine* multi-hit
+        text is retained in
+        ``TestFindPathsRightBoundary::test_dedup_and_order_retained``.
+        """
         result = find_paths('crates/a then gui/b then crates/c', ('crates/', 'gui/'))
-        assert result == ['crates/', 'gui/']
+        assert result == []
 
     def test_word_boundary_no_match_on_suffix(self):
         # "supercrates/" must not match "crates/"
@@ -92,12 +102,29 @@ class TestFindPaths:
         assert find_paths('repo/test/corpus/expr.txt', ('corpus/',)) == []
 
     def test_leading_prefix_still_matches(self):
-        """A bare leading reference still matches (regression guard)."""
-        assert find_paths('corpus/x', ('corpus/',)) == ['corpus/']
+        """RE-POINTED by task 3120: the single-bare-segment shape is now
+        deliberately NOT a match.
+
+        The LEFT boundary is still satisfied here (start-of-string), but the
+        RIGHT boundary is not: ``x`` is neither followed by another '/' nor
+        does it carry a file extension.  A synthetic fixture with no witness
+        in the live corpus.  Leading-position matching over a genuine path is
+        retained in
+        ``TestFindPathsRightBoundary::test_accepted_right_context_further_slash``.
+        """
+        assert find_paths('corpus/x', ('corpus/',)) == []
 
     def test_space_preceded_still_matches(self):
-        """A prefix after a space still matches (regression guard)."""
-        assert find_paths('see corpus/x', ('corpus/',)) == ['corpus/']
+        """RE-POINTED by task 3120: the single-bare-segment shape is now
+        deliberately NOT a match.
+
+        A space is still a valid LEFT boundary; the failure is on the right —
+        ``x`` does not look like a path segment.  A synthetic fixture with no
+        witness in the live corpus.  Space-preceded matching over a genuine
+        path is retained in ``TestFindPaths::test_single_match``
+        ('see crates/x.rs').
+        """
+        assert find_paths('see corpus/x', ('corpus/',)) == []
 
     def test_dot_preceded_no_match(self):
         """A prefix immediately preceded by '.' must NOT match (task-1494).
@@ -122,6 +149,144 @@ class TestFindPaths:
         don't accidentally re-introduce it.
         """
         assert find_paths('./corpus/x', ('corpus/',)) == []
+
+
+# ---------------------------------------------------------------------------
+# New right-boundary contract (task 3120): the token AFTER '<prefix>/' must
+# look like a path segment — either another '/' follows, or it carries a file
+# extension.  Without this, any English slash-construction whose left half
+# happens to name a registered top-level directory ("not a backend/timeout
+# error", "tools/call") lexed as a path.
+# ---------------------------------------------------------------------------
+
+
+class TestFindPathsRightBoundary:
+    """Task 3120: a registered prefix only matches when what follows it looks
+    like a path, not when the '/' is English punctuation.
+
+    Every negative fixture below is a MEASURED false positive taken from live
+    corpus text, not a synthetic construction.
+    """
+
+    # ------------------------------------------------------------------
+    # REJECTED: '/' used as English punctuation
+    # ------------------------------------------------------------------
+
+    def test_english_slash_backend_timeout(self):
+        assert (
+            find_paths(
+                'get_memory_by_id returned found=false, not a backend/timeout error',
+                ('backend/',),
+            )
+            == []
+        )
+
+    def test_english_slash_corpus_compile(self):
+        assert find_paths('already hosts corpus/compile helpers', ('corpus/',)) == []
+
+    def test_english_slash_archive_pause(self):
+        assert (
+            find_paths(
+                'or (b) explicitly archive/pause its reconciliation cadence',
+                ('archive/',),
+            )
+            == []
+        )
+
+    def test_english_slash_tools_call(self):
+        assert find_paths('sends a JSON-RPC tools/call envelope', ('tools/',)) == []
+
+    def test_english_slash_research_status(self):
+        assert (
+            find_paths(
+                'uncommitted plans/*.md/.txt research/status docs',
+                ('research/',),
+            )
+            == []
+        )
+
+    # ------------------------------------------------------------------
+    # ACCEPTED right context A: another '/' follows
+    # ------------------------------------------------------------------
+
+    def test_accepted_right_context_further_slash(self):
+        """A multi-segment path still matches — including at start-of-string."""
+        assert find_paths('crates/reify-eval/src/engine_edit.rs', ('crates/',)) == [
+            'crates/'
+        ]
+        assert find_paths('backend/v2/api.py', ('backend/',)) == ['backend/']
+
+    # ------------------------------------------------------------------
+    # ACCEPTED right context B: a file extension follows
+    # ------------------------------------------------------------------
+
+    def test_accepted_right_context_file_extension(self):
+        assert find_paths('gui/package.json', ('gui/',)) == ['gui/']
+        assert find_paths('see crates/x.rs', ('crates/',)) == ['crates/']
+
+    def test_accepted_right_context_multi_dot_stem(self):
+        """A multi-dot stem ('a.b.txt') still reads as a file."""
+        assert find_paths('gui/a.b.txt', ('gui/',)) == ['gui/']
+
+    def test_accepted_right_context_extension_is_case_insensitive(self):
+        """An upper-case extension is still an extension."""
+        assert find_paths('crates/x.RS', ('crates/',)) == ['crates/']
+
+    def test_dedup_and_order_retained(self):
+        """Dedup + first-seen ordering still hold over genuine path text.
+
+        Retains the coverage dropped when ``TestFindPaths::test_dedup_and_order``
+        was re-pointed to the new contract.
+        """
+        result = find_paths(
+            'crates/a.rs then gui/b.json then crates/c/d.rs',
+            ('crates/', 'gui/'),
+        )
+        assert result == ['crates/', 'gui/']
+
+    # ------------------------------------------------------------------
+    # REJECTED right context: end-of-token
+    # ------------------------------------------------------------------
+
+    def test_end_of_token_is_not_an_accepted_right_context(self):
+        """Design decision 2 (task 3120): a bare trailing '<prefix>/' does NOT match.
+
+        This is the 28% bare-MENTION class — "see fused-memory/", "the
+        'corpus/' dir".  Admitting end-of-token as a right context would
+        re-admit almost all of the noise this change exists to remove, so it
+        is deliberately excluded even though it looks like a regression in
+        isolation.
+
+        No real protection is lost: the FILES-certain check
+        (``check_files_for_scope`` -> ``registry.project_for_path``) still
+        hard-rejects a genuinely DECLARED foreign file, and that path is
+        untouched by this change.
+        """
+        assert find_paths('crates/', ('crates/',)) == []
+        assert find_paths("the quoted token 'corpus/' here", ('corpus/',)) == []
+
+    # ------------------------------------------------------------------
+    # KNOWN FAIL-OPEN residue, deliberately not closed
+    # ------------------------------------------------------------------
+
+    def test_known_fail_open_residue_leading_dot_file(self):
+        """MISSED detection, never a false one — pinned so the gap stays visible.
+
+        'docs/.gitignore' has an empty stem plus a >6-char extension, so it
+        satisfies neither right-context alternative.  Widening the classes to
+        admit it would start re-admitting the punctuation shapes above.
+        """
+        assert find_paths('docs/.gitignore', ('docs/',)) == []
+
+    def test_known_fail_open_residue_glob_spelling(self):
+        """MISSED detection, never a false one — pinned so the gap stays visible.
+
+        The glob metacharacter in 'plans/*.md' is in neither the segment class
+        nor the extension class.  Same conservative direction the guard
+        already takes for '../other-repo/x.py' and '~user/...' in
+        ``project_for_path``.
+        """
+        assert find_paths('plans/*.md', ('plans/',)) == []
 
 
 # ---------------------------------------------------------------------------
