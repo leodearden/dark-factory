@@ -1188,17 +1188,20 @@ def _fake_eval_result(**over):
     return EvalResult(**defaults)
 
 
-def _dispatch_single_eval(cfg, capsys):
+def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
     """Drive ``cli._run_single_eval`` with a resolved config, both runners patched.
 
     ``get_config_by_name`` is patched to return ``cfg`` so the dispatch is
-    exercised purely on ``cfg.role``. Returns ``(out, run_eval, run_architect)``.
+    exercised purely on ``cfg.role``. ``arch_metrics`` overrides the fake
+    architect result's metrics dict. Returns ``(out, run_eval, run_architect)``.
     """
     from orchestrator import cli
 
     arch_result = _fake_eval_result(
         config_name=cfg.name,
-        metrics={'role_under_test': 'architect', 'plan_quality': 0.75},
+        metrics=arch_metrics or {
+            'role_under_test': 'architect', 'plan_quality': 0.75,
+        },
     )
     impl_result = _fake_eval_result(config_name=cfg.name)
 
@@ -1241,6 +1244,29 @@ class TestCliArchitectDispatch:
         # The per-fixture plan-quality score is echoed to the operator.
         assert 'plan_quality' in out
         assert '0.75' in out
+
+    def test_cap_tainted_cell_echo_names_the_taint(self, capsys):
+        # An operator watching the run must see the infra refusal LIVE, not a
+        # bare `plan_quality=None` that reads like a scoring quirk.
+        marker = f'architect:cap_hit: {_CAP_TEXT}'
+        out, _, _ = _dispatch_single_eval(
+            self._arch_cfg(), capsys,
+            arch_metrics={
+                'role_under_test': 'architect',
+                'plan_quality': None,
+                'cap_tainted': True,
+                'invocation_error': marker,
+            },
+        )
+        # Scoped to the PER-CELL echo line ('plan_quality=' with the '='), not
+        # the whole capture: the plan-quality table printed after the loop
+        # already names the exclusion, and asserting over `out` would pass on
+        # that alone while the live per-cell line still read a bare None.
+        echo_line = next(
+            ln for ln in out.splitlines() if 'plan_quality=' in ln
+        )
+        assert 'cap-tainted' in echo_line
+        assert marker in echo_line
 
     def test_implementer_config_still_routes_to_run_eval(self, capsys):
         _, run_eval, run_arch = _dispatch_single_eval(self._impl_cfg(), capsys)
