@@ -76,6 +76,28 @@ LABEL_PSEUDO_CONTRADICTION = 'pseudo_contradiction'
 
 _NEGATIVE_LABELS = frozenset({LABEL_DISTINCT, LABEL_PSEUDO_CONTRADICTION})
 
+# The fused-memory package root — the anchor for paths RECORDED in config.yaml
+# and in the report's provenance.
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
+
+def package_relative(path: str | Path) -> str:
+    """Render `path` relative to the fused-memory package root when inside it.
+
+    Paths that get WRITTEN INTO config.yaml and the report provenance must not
+    bake in the absolute checkout they happened to be produced in: this script
+    runs in a per-task git worktree, so an absolute
+    `/.../.worktrees/<n>/fused-memory/calibration/...` string would be a
+    dangling reference the moment that worktree is reset or the branch merges.
+    Anything outside the package (e.g. an explicit `--report-path /tmp/x.json`)
+    is returned unchanged, since there is no stable anchor for it.
+    """
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(_PACKAGE_ROOT))
+    except ValueError:
+        return str(path)
+
 
 # ---------------------------------------------------------------------------
 # Fixture loading
@@ -654,15 +676,35 @@ async def _run(args: Any) -> int:
         embed_fn = build_embed_fn(config)
 
         async def _search_async(record: dict, k: int) -> dict:
+            # stores=['mem0'] is load-bearing, not a narrowing convenience.
+            # An unscoped MemoryService.search runs the read ROUTER first, and
+            # for this corpus the router sends every fixture query to graphiti
+            # alone — so the top-k comes back full of graphiti edge UUIDs,
+            # which can never equal a mem0 memory_id, and recall reads ~0 for
+            # reasons that have nothing to do with retrieval quality.
+            # Write triage's candidate set is the mem0/Qdrant neighbourhood
+            # (near_duplicate_guard searches mem0; the 21 canonicals live in
+            # the fused_reify Qdrant collection), so mem0 is the store whose
+            # recall the bands actually depend on. Measured on a 6-record
+            # probe: 0/6 canonicals in top-10 unscoped vs 4/6 scoped to mem0.
             results = await memory.search(
                 query=record['content'], project_id=args.project_id, limit=k,
+                stores=['mem0'],
             )
             rows = results.get('results', results) if isinstance(results, dict) else results
-            candidates = [str(r.get('id')) for r in rows or []]
+            # MemoryService.search returns pydantic MemoryResult rows, not dicts.
+            candidates = [
+                str(r['id'] if isinstance(r, dict) else r.id) for r in rows or []
+            ]
             canonical = await memory.get_memory_by_id(
-                record['cluster_id'], project_id=args.project_id,
+                args.project_id, record['cluster_id'],
             )
-            present = bool(canonical and canonical.get('found', True))
+            if canonical is None:
+                present = False
+            elif isinstance(canonical, dict):
+                present = bool(canonical.get('found', True))
+            else:
+                present = bool(getattr(canonical, 'found', True))
             return {'candidates': candidates, 'canonical_present': present}
 
         # Pre-resolve retrievals on this loop, then hand run_calibration a
@@ -681,11 +723,12 @@ async def _run(args: Any) -> int:
             report_path=args.report_path,
             ks=args.k,
             provenance={
-                'fixture_path': str(args.fixture),
+                'fixture_path': package_relative(args.fixture),
                 'project_id': args.project_id,
                 'embedder_model': config.embedder.model,
                 'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
-                'search_categories': 'all (MemoryService.search)',
+                'search_stores': 'mem0 (MemoryService.search, stores=[mem0])',
+                'search_categories': 'all',
             },
         )
 
@@ -713,7 +756,7 @@ async def _run(args: Any) -> int:
         )
         updated = write_triage_config_block(
             config_path.read_text(), result['t_high'], result['t_low'],
-            str(args.report_path),
+            package_relative(args.report_path),
         )
         config_path.write_text(updated)
         logger.info('Wrote write_triage block to %s', config_path)

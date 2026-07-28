@@ -1179,3 +1179,74 @@ class TestRunCalibration:
         assert result.get('config_written') is not True, (
             'an uncalibrated run must never reach the config write'
         )
+
+
+class TestCommittedCalibrationIsTraceable:
+    """The committed thresholds must be traceable to the run that produced them.
+
+    This is the task's headline signal, and the reason
+    ``calibration_report_path`` exists at all: a reader must be able to get
+    from a number in config.yaml back to the measured distributions that
+    justify it, without taking anyone's word that it was not hand-picked.
+    These tests read only committed artifacts — no network, no Qdrant.
+    """
+
+    CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+
+    @functools.cache
+    @staticmethod
+    def _committed():
+        import yaml  # noqa: PLC0415
+
+        block = yaml.safe_load(
+            TestCommittedCalibrationIsTraceable.CONFIG_PATH.read_text()
+        ).get('write_triage') or {}
+        report_path = block.get('calibration_report_path')
+        report = None
+        if report_path is not None:
+            resolved = Path(__file__).parent.parent / report_path
+            if resolved.exists():
+                report = json.loads(resolved.read_text())
+        return block, report
+
+    def test_the_report_path_resolves_to_a_committed_report(self):
+        block, report = self._committed()
+        if block.get('t_high') is None:
+            pytest.skip('config is uncalibrated — nothing to trace')
+        assert block.get('calibration_report_path'), (
+            'calibrated thresholds without a report path are untraceable numbers'
+        )
+        assert not Path(block['calibration_report_path']).is_absolute(), (
+            'the report path must not bake in the checkout it was produced in — '
+            'this script runs in per-task worktrees that get reset'
+        )
+        assert report is not None, (
+            f'calibration_report_path {block["calibration_report_path"]!r} does not '
+            f'resolve to a committed report'
+        )
+
+    def test_the_committed_thresholds_are_exactly_the_reports(self):
+        block, report = self._committed()
+        if block.get('t_high') is None or report is None:
+            pytest.skip('config is uncalibrated — nothing to trace')
+        assert block['t_high'] == report['chosen_t_high']
+        assert block['t_low'] == report['chosen_t_low'], (
+            'a config value that differs from the report is a hand-edited '
+            'threshold, which is exactly what this leaf forbids'
+        )
+
+    def test_the_committed_thresholds_separate_the_measured_classes(self):
+        block, report = self._committed()
+        if block.get('t_high') is None or report is None:
+            pytest.skip('config is uncalibrated — nothing to trace')
+        dists = report['distributions']
+        worst_negative = max(
+            dists[cls]['max'] for cls in ('unrelated', 'hard_negative')
+            if dists.get(cls, {}).get('n')
+        )
+        assert block['t_high'] > worst_negative, (
+            'the deterministic band must sit strictly above every measured '
+            'negative, or it fires on pairs the curator ruled distinct'
+        )
+        assert block['t_low'] < block['t_high']
+        assert report['deterministic_band_false_positives'] == 0

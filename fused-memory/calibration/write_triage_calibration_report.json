@@ -1,0 +1,167 @@
+{
+  "chosen_t_high": 0.8866152951292025,
+  "chosen_t_low": 0.5229672433064231,
+  "reason": null,
+  "deterministic_band_false_positives": 0,
+  "distributions": {
+    "true_dup": {
+      "n": 301,
+      "min": 0.304489836999617,
+      "max": 0.9656990321321789,
+      "mean": 0.7009785970998916,
+      "median": 0.7097019587340561,
+      "p05": 0.5229672433064231,
+      "p25": 0.616469997275294,
+      "p75": 0.7848812749556767,
+      "p95": 0.8646358352421091
+    },
+    "unrelated": {
+      "n": 5037,
+      "min": 0.14919289635377908,
+      "max": 0.8349946484778277,
+      "mean": 0.4340987465042551,
+      "median": 0.4254843144420686,
+      "p05": 0.2786760529807258,
+      "p25": 0.363907026930481,
+      "p75": 0.4976748718478162,
+      "p95": 0.6135410083022856
+    },
+    "hard_negative": {
+      "n": 18,
+      "min": 0.72269872821749,
+      "max": 0.8843398698463949,
+      "mean": 0.7883329261995402,
+      "median": 0.7846241438547253,
+      "p05": 0.72269872821749,
+      "p25": 0.7481498721880528,
+      "p75": 0.8215389446744906,
+      "p95": 0.8843398698463949
+    }
+  },
+  "per_band": {
+    "true_dup": {
+      "deterministic": 7,
+      "judge": 279,
+      "store": 15
+    },
+    "unrelated": {
+      "deterministic": 0,
+      "judge": 920,
+      "store": 4117
+    },
+    "hard_negative": {
+      "deterministic": 0,
+      "judge": 18,
+      "store": 0
+    }
+  },
+  "recall_at_k": {
+    "per_k": [
+      {
+        "k": 1,
+        "hits": 20,
+        "total": 68,
+        "recall": 0.29411764705882354
+      },
+      {
+        "k": 3,
+        "hits": 29,
+        "total": 68,
+        "recall": 0.4264705882352941
+      },
+      {
+        "k": 5,
+        "hits": 35,
+        "total": 68,
+        "recall": 0.5147058823529411
+      },
+      {
+        "k": 10,
+        "hits": 50,
+        "total": 68,
+        "recall": 0.7352941176470589
+      }
+    ],
+    "canonical_absent": [
+      {
+        "memory_id": "0e46ec63-01c9-4505-a0c9-dcd3a003ad28",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "166f5106-00da-4364-9c6f-d0a0d514db7a",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "1d54d1d7-da71-44fe-894b-3011a41161af",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "31632470-5c39-4929-a768-23e98cd9217c",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "335028f7-0e0e-4aac-a4c3-9c47885c36f3",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "6fa72085-4198-4a2e-8bfa-8e7a82a55a3a",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "74fc3315-f5e3-4544-972e-32e8a2c3eaaa",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "77bf2f5c-523b-41af-8ce4-9eb0cd3cb08e",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "8a3fad31-386b-4102-aa8d-1abf2984450d",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "8b47b378-d154-4460-9cf6-0fa681a02ce1",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "a390babf-8bad-4d98-b047-35c75e25755b",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "ce42b17f-2c80-47c8-ae92-61f1f7bbef0e",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "f6a4bd31-0414-4a8a-a900-5520655b9af2",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "4743c358-c9dc-4197-a475-651e16edc809",
+        "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      },
+      {
+        "memory_id": "c77d25d9-70b0-44f4-a6fd-b00c7a63118b",
+        "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      },
+      {
+        "memory_id": "e17a20d2-8011-4e3a-8f9e-21c302ae5ed8",
+        "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      }
+    ]
+  },
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "project_id": "reify",
+    "embedder_model": "text-embedding-3-small",
+    "embedder_dimensions": 1536,
+    "search_stores": "mem0 (MemoryService.search, stores=[mem0])",
+    "search_categories": "all",
+    "record_count": 104,
+    "cluster_count": 20,
+    "pair_counts": {
+      "true_dup": 301,
+      "unrelated": 5037,
+      "hard_negative": 18
+    }
+  }
+}

@@ -1435,11 +1435,35 @@ class TestWriteTriageConfig:
 
     @pytest.mark.parametrize('field', ['t_high', 't_low', 'calibration_report_path'])
     def test_every_field_defaults_to_none(self, field):
-        value = getattr(FusedMemoryConfig().write_triage, field)
+        # Asserted on the SCHEMA CLASS, not on FusedMemoryConfig(), and the
+        # distinction is the whole point. FusedMemoryConfig is a BaseSettings:
+        # constructing it LOADS config.yaml, which by design now carries the
+        # calibration run's measured thresholds. Asserting None there would
+        # forbid the calibrated config this leaf exists to produce, while
+        # saying nothing about whether a guessed number is baked into the
+        # code. The invariant that actually matters is that the schema ships
+        # no a-priori number, so any value the server reads had to come from
+        # a calibration run.
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        value = getattr(WriteTriageConfig(), field)
         assert value is None, (
             f'write_triage.{field} must default to None (UNCALIBRATED). '
             f'A shipped default would be an a-priori threshold; got {value!r}'
         )
+
+    @pytest.mark.parametrize('field', ['t_high', 't_low', 'calibration_report_path'])
+    def test_root_wiring_introduces_no_default(self, field):
+        """The `write_triage` field itself must not smuggle in a default.
+
+        Guards the other half of the same invariant: a
+        ``Field(default_factory=lambda: WriteTriageConfig(t_high=0.9))`` would
+        leave the submodel's own defaults clean while still shipping an
+        a-priori threshold to every deployment.
+        """
+        factory = FusedMemoryConfig.model_fields['write_triage'].default_factory
+        assert factory is not None, 'write_triage must be a bare submodel with a factory'
+        assert getattr(factory(), field) is None  # type: ignore[call-arg]
 
     @pytest.mark.parametrize('field', ['t_high', 't_low'])
     @pytest.mark.parametrize('value', [0.0, 0.5, 1.0])

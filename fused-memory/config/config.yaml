@@ -221,3 +221,15 @@ summary_rebuild:
   interval_seconds: 3600
   projects: []
   force: false
+
+write_triage:
+  # CALIBRATION OUTPUT — do not hand-edit.
+  # Derived from measured similarity distributions by
+  # scripts/calibrate_write_triage.py; both values are order statistics of
+  # the observed curator-labeled corpus, not chosen constants.
+  # Report: calibration/write_triage_calibration_report.json
+  # -- records the measured distributions and the deterministic band's
+  # false-positive count. Re-run the script to change these values.
+  t_high: 0.8866152951292025
+  t_low: 0.5229672433064231
+  calibration_report_path: calibration/write_triage_calibration_report.json
