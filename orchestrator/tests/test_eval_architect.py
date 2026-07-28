@@ -762,6 +762,50 @@ class TestRunArchitectEval:
         # Still persisted, so the marked cell is recoverable from the JSON.
         mocks['save'].assert_called_once()
 
+    async def test_judge_cap_keeps_structural_floor_and_records_marker(self):
+        """A JUDGE-only refusal is marked but must NOT taint the cell.
+
+        The architect ran fine and produced a real plan, so the deterministic
+        structural score is genuinely derived from model CONTENT. Nulling it
+        would throw away a valid measurement and shrink n for no reason — taint
+        is keyed strictly on the ARCHITECT-side refusal, the case where no model
+        content exists at all. The marker is still stamped so a reader knows the
+        LLM judge never ran on this cell.
+        """
+        from orchestrator.evals.judge import PlanQualityVerdict, score_plan_structure
+
+        plan = _well_formed_plan()
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=PlanQualityVerdict(
+                plan_quality=None,
+                per_criterion={},
+                reasoning='plan judge invocation refused: cap_hit: ...',
+                invocation_error=f'cap_hit: {_CAP_TEXT}',
+            ),
+        )
+
+        # The content-derived floor is KEPT — not nulled, not excluded.
+        assert result.metrics['plan_quality'] is not None
+        assert result.metrics['plan_quality'] == score_plan_structure(plan)
+        assert result.metrics['cap_tainted'] is False
+
+        # ...but the judge's refusal is recorded, named by STAGE.
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker
+        assert marker.startswith('judge:')
+        assert 'cap' in marker.lower()
+
+    async def test_healthy_run_carries_no_marker_and_is_not_tainted(self):
+        # The untouched baseline: nothing refused anywhere → no marker at all.
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+        assert result.metrics['invocation_error'] is None
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['plan_quality'] == 0.77
+
     async def test_wires_plan_tools_mcp_into_architect_invoke(self):
         # BUG 1: the eval architect must be wired with plan-tools MCP exactly
         # like real dispatch — otherwise read_plan() returns {} → plan_steps=0 →
