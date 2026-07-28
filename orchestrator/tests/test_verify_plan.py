@@ -1000,6 +1000,22 @@ class TestReprojectStrChainTail:
     classifies it OPAQUE and the injection is SILENTLY dropped. This class
     guards that regression BEFORE the scopers change, so no intermediate
     commit is red.
+
+    It ALSO guards the converse hazard (task 3061 step-7). ``_reproject_str``
+    is the only one of the three ``split_chain_tail`` call sites that
+    re-renders a parsed head WITHOUT ``strip_cwd``, and ``render()`` re-emits
+    a parsed ``cwd_rel`` as a LEADING ``cd X &&``. ``split_chain_tail``'s gate
+    rejects a literal ``cd`` TOKEN precisely because a cwd shift voids every
+    later segment's relative paths — but it inspects the INPUT string, where
+    that shift is still spelled ``--directory X`` and is therefore invisible
+    to it. So a tail may only be carried when the head has NO cwd to re-emit;
+    otherwise ``_reproject_str`` must bail to the untouched original.
+
+    That is not theoretical: all seven module ``lint_command``s are exactly
+    the ``--directory <mod>`` + ``&&``-chained
+    ``python3 fused-memory/scripts/check_bare_magicmock_config.py <mod>/tests``
+    shape, so an introduced ``cd <mod> &&`` makes the tail resolve as
+    ``<mod>/fused-memory/scripts/...`` -> exit 2 -> a spurious RED verify.
     """
 
     def test_chained_head_is_reprojected_and_tail_survives_verbatim(self):
@@ -1048,6 +1064,80 @@ class TestReprojectStrChainTail:
 
     def test_none_is_passed_through(self):
         assert verify._reproject_str(None, verify._FALLBACK_UV_PROJECT) is None
+
+    # -- cwd-shifting head + preserved tail must bail (task 3061 step-7) -----
+
+    def test_directory_head_with_tail_bails_byte_identically(self):
+        """A ``--directory`` head + tail is returned UNCHANGED, not renormalised.
+
+        ``render()`` would turn the parsed ``cwd_rel`` back into a leading
+        ``cd sub &&``, shifting the shell's cwd out from under a tail that was
+        written against the worktree root.
+
+        The bail forfeits nothing: ``reproject`` is a documented no-op when
+        ``cwd_rel is not None`` (verify_cmd.py "an explicit ``--directory`` is
+        already set"), so the discarded expression was a pure re-render with
+        no ``--project`` injection to lose.
+        """
+        raw = 'uv run --directory sub pyright src/ && python3 tools/check.py d'
+        assert verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT) == raw
+
+    def test_real_module_lint_command_does_not_double_its_own_path(self):
+        """The realistic shape: every module ``lint_command`` is this chain.
+
+        A leading ``cd fused-memory &&`` makes the tail's
+        ``fused-memory/scripts/check_*.py`` resolve from INSIDE that directory
+        — i.e. ``fused-memory/fused-memory/scripts/...`` -> exit 2 "can't open
+        file" -> a spurious RED verify on a clean tree.
+        """
+        result = verify._reproject_str(_FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
+        assert result == _FM_LINT_COMMAND
+        assert 'fused-memory/fused-memory' not in (result or '')
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            _FM_LINT_COMMAND,
+            *_MODULE_LINT_COMMANDS.values(),
+            _ROOT_LINT_COMMAND,
+            _ROOT_TYPE_CHECK_COMMAND,
+            _ROOT_TEST_COMMAND,
+            'uv run --directory sub pyright src/ && python3 tools/check.py d',
+        ],
+        ids=[
+            'fused-memory-lint',
+            *(f'{module}-lint' for module in _MODULE_LINT_COMMANDS),
+            'root-lint',
+            'root-type-check-cd-fan-out',
+            'root-test-subshell-fan-out',
+            'synthetic-directory-head',
+        ],
+    )
+    def test_never_introduces_a_leading_cd_into_a_surviving_chain(self, raw):
+        """INVARIANT: a preserved tail never gains a cwd shift it lacked.
+
+        Stated as "never INTRODUCES", because the two root fan-outs are
+        gate-rejected and returned byte-identically — they legitimately keep
+        the leading ``cd`` they arrived with. What must never happen is the
+        rewrite ADDING one under a tail.
+        """
+        result = verify._reproject_str(raw, verify._FALLBACK_UV_PROJECT)
+        assert result is not None
+        if '&&' in result:
+            assert result.startswith('cd ') == raw.startswith('cd '), (
+                'a surviving tail must not gain a leading `cd` it did not arrive with'
+            )
+
+    def test_no_tail_directory_renormalisation_is_unchanged(self):
+        """PRE-EXISTING and deliberately out of scope: lone ``--directory`` head.
+
+        ``--directory sub`` -> ``cd sub &&`` is semantically equivalent for a
+        head with nothing chained after it, and predates task 3061. Only the
+        TAIL case is being fixed, so this golden must not move.
+        """
+        assert verify._reproject_str(
+            'uv run --directory sub pyright src/', verify._FALLBACK_UV_PROJECT,
+        ) == 'cd sub && uv run pyright src/'
 
 
 # ---------------------------------------------------------------------------
