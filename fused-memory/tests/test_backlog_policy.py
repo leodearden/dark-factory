@@ -873,3 +873,112 @@ async def test_backlog_escalation_detail_names_correct_probe(event_buffer, tmp_p
     assert 'get_queue_stats' in detail, detail
     # Explicitly contrasts against the durable-write-queue subsystem.
     assert 'durable' in detail.lower(), detail
+
+
+# ── on_judge_unhalt: auto-close the halt escalation (task 2998 GAP 3) ──────
+
+
+class TestOnJudgeUnhalt:
+    """Clearing a halt must close the escalation the halt opened.
+
+    Before task 2998 the halt record was written by BacklogPolicy but nothing
+    ever closed it: ``unhalt_reconciliation`` cleared the judge's in-memory +
+    journal state only, leaving an ``esc-reconciliation-halt-*.json`` pending
+    forever.
+    """
+
+    async def _setup(self, event_buffer, tmp_path):
+        """Write one halt + one backlog escalation for 'proj', plus a
+        foreign-project halt record in the SAME directory."""
+        project_root = tmp_path / 'proj_root'
+        project_root.mkdir()
+
+        policy = BacklogPolicy(
+            event_buffer, _StubQueue(), lambda _: True, hard_limit=10,
+        )
+        policy.register_project_root('proj', str(project_root))
+
+        halt_verdict = await policy.on_judge_halt('proj', reason='seed halt')
+        assert halt_verdict.escalation_path is not None
+        halt_id = Path(halt_verdict.escalation_path).stem
+
+        await _seed_buffered(event_buffer, 'proj', n=12)
+        backlog_verdict = await policy.check('proj')
+        assert backlog_verdict.outcome == 'escalated'
+        assert backlog_verdict.escalation_path is not None
+        backlog_id = Path(backlog_verdict.escalation_path).stem
+
+        esc_dir = project_root / 'data' / 'escalations'
+        other_id = 'esc-reconciliation-halt-other-project'
+        (esc_dir / f'{other_id}.json').write_text(
+            json.dumps({
+                'id': other_id,
+                'task_id': None,
+                'agent_role': 'fused-memory',
+                'severity': 'blocking',
+                'category': 'infra_issue',
+                'summary': 'Reconciliation HALTED for other',
+                'detail': 'halt belonging to a DIFFERENT project',
+                'suggested_action': 'inspect_judge_halt',
+                'timestamp': '2026-07-28T00:00:00+00:00',
+                'status': 'pending',
+                'level': 1,
+                'workflow_state': 'infra',
+                'project_id': 'other',
+                'error_type': 'ReconciliationJudgeHalted',
+            }, indent=2),
+            encoding='utf-8',
+        )
+        return policy, esc_dir, halt_id, backlog_id, other_id
+
+    @pytest.mark.asyncio
+    async def test_resolves_only_this_projects_halt_escalation(
+        self, event_buffer, tmp_path,
+    ):
+        from escalation.queue import EscalationQueue
+
+        policy, esc_dir, halt_id, backlog_id, other_id = await self._setup(
+            event_buffer, tmp_path,
+        )
+
+        resolved = await policy.on_judge_unhalt('proj')
+        assert resolved == [halt_id]
+
+        # resolve() ARCHIVES the file — probe via get(), not path.exists().
+        queue = EscalationQueue(esc_dir)
+        closed = queue.get(halt_id)
+        assert closed is not None
+        assert closed.status == 'resolved'
+        assert closed.resolution
+        assert closed.resolved_by is not None
+        assert 'unhalt' in closed.resolved_by
+
+        # The backlog escalation and the foreign-project halt stay pending.
+        still_pending = {e.id for e in queue.get_pending()}
+        assert backlog_id in still_pending
+        assert other_id in still_pending
+        assert halt_id not in still_pending
+
+    @pytest.mark.asyncio
+    async def test_second_unhalt_is_idempotent(self, event_buffer, tmp_path):
+        policy, _esc_dir, halt_id, _backlog_id, _other = await self._setup(
+            event_buffer, tmp_path,
+        )
+
+        assert await policy.on_judge_unhalt('proj') == [halt_id]
+        assert await policy.on_judge_unhalt('proj') == []
+
+    @pytest.mark.asyncio
+    async def test_unregistered_project_returns_empty_and_logs(
+        self, event_buffer, caplog,
+    ):
+        logger_name = 'fused_memory.reconciliation.backlog_policy'
+        policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            assert await policy.on_judge_unhalt('nope') == []
+
+        text = '\n'.join(
+            r.getMessage() for r in caplog.records if r.name == logger_name
+        )
+        assert 'nope' in text
