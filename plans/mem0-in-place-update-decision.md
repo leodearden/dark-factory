@@ -193,6 +193,19 @@ implementation. Do not rename either to make them match.
   `clear_invalid_at` mutual-exclusivity check, `:2134-2139`). Reserved keys are rejected in
   `metadata_delete_keys` exactly as in `metadata_patch` — a caller cannot delete `created_at`
   either.
+- **`metadata_mode='replace'` together with a non-empty `metadata_delete_keys` is also a
+  `ValidationError`**, naming both arguments in the message. Decided here rather than left for the
+  implementer to guess: replace mode (§5(b)) already replaces the entire custom-provenance subset
+  with exactly what `metadata_patch` supplies, so every custom key not named there is dropped
+  regardless — a delete list under replace mode is therefore simultaneously **redundant** (the
+  named keys are dropped anyway) and **contradictory** (it implies some keys survive replace that
+  in fact do not), and §5(b)'s replace path maps to a single `overwrite_payload` call with no place
+  for a delete list to apply against. Rejecting the combination — rather than silently no-op'ing
+  it, silently applying the delete after the overwrite, or guessing at an ordering — matches the
+  same fail-loud posture already applied one bullet up (the both-lists key conflict) and to
+  `update_edge`'s `invalid_at`/`clear_invalid_at` mutual-exclusivity check (`:2134-2139`): silently
+  discarding a caller-supplied argument is exactly the class of "caller believes it wrote something
+  it did not" failure the reserved-key rejection above exists to prevent.
 - **`reason`**: required (non-empty) when `content` is supplied; optional when only the
   metadata-patch arm is used (§4 — this is one concrete piece of the differential bar). Not stored
   in the patched payload itself — flows to the write journal only (§5).
@@ -526,24 +539,47 @@ same dependency the fused-memory venv resolves):
 - The **metadata-only arm** (no `content` in the call) must **not** route through
   `Mem0Backend.update` / mem0's `Memory.update` at all — doing so would needlessly re-embed,
   rewrite `updated_at`, and append a spurious mem0 history row for what may be a purely cosmetic
-  tag. Instead, a **new**,
-  payload-only `Mem0Backend` method(s) using the backend's existing `_get_async_qdrant()`
-  (`mem0_client.py:272-281`) and Qdrant's own partial-payload primitives — verified present on
-  `AsyncQdrantClient`: `set_payload`, `delete_payload`, `overwrite_payload`:
-  - **merge** (`metadata_mode='merge'`, the default): `AsyncQdrantClient.set_payload(payload=<custom
-    subset>, points=[memory_id])`. Qdrant's `set_payload` is *already* a genuine partial-payload
-    merge at the storage layer (unlike mem0's `_update_memory`) — no read-before-write is needed.
-    `tests/test_mem0_qdrant_integration.py:69-90` (`test_set_payload_without_vector`) already
-    covers this primitive.
-  - **key deletion** (`metadata_delete_keys`): `AsyncQdrantClient.delete_payload(keys=[...],
-    points=[memory_id])` — also native, also no read-before-write.
-  - **replace** (`metadata_mode='replace'`): the **one** case that does need a read first —
+  tag. Instead, a **new**, payload-only `Mem0Backend` method(s) using the backend's existing
+  `_get_async_qdrant()` (`mem0_client.py:272-281`) and Qdrant's own partial-payload primitives —
+  verified present on `AsyncQdrantClient`: `set_payload`, `delete_payload`, `overwrite_payload`.
+  Routing among these three is decided by *which arguments the call supplies*, read as one coherent
+  decision table rather than three unrelated primitives:
+  - **`metadata_patch` alone** (`metadata_mode='merge'`, the default, no `metadata_delete_keys`):
+    `AsyncQdrantClient.set_payload(payload=<custom subset>, points=[memory_id])`. Qdrant's
+    `set_payload` is *already* a genuine partial-payload merge at the storage layer (unlike mem0's
+    `_update_memory`) — no read-before-write is needed. `tests/test_mem0_qdrant_integration.py:69-90`
+    (`test_set_payload_without_vector`) already covers this primitive.
+  - **`metadata_delete_keys` alone** (no `metadata_patch`): `AsyncQdrantClient.delete_payload(
+    keys=[...], points=[memory_id])` — also native, also no read-before-write.
+  - **Both `metadata_patch` and `metadata_delete_keys` supplied together** (the
+    `metadata_mode='replace'` + `metadata_delete_keys` combination is instead rejected at the
+    boundary, §3): a single read-modify-`overwrite_payload` write — read the existing payload via
+    (c) below, apply the merge and the deletions to the custom subset **in memory**, then issue
+    exactly one `overwrite_payload` call with the mem0-owned key subset re-attached underneath.
+    **Decided this way rather than issuing `set_payload` followed by `delete_payload` as two
+    independent native calls**: two round-trips have no ordering guarantee, no atomicity, and no
+    rollback — if the second call fails, the record is left half-patched while the journal row
+    (§5(a)) claims the whole edit landed, reintroducing *inside the unified tool* precisely the
+    "torn intermediate state" §3 cites as its own reason for rejecting the two-tool design. Routing
+    through read-modify-`overwrite_payload` instead adds no new machinery — it is the exact shape
+    plain `replace` mode already needs (next bullet), and it reuses the (c) read leg: one
+    round-trip, one atomic payload write, no ordering question to answer.
+  - **`metadata_mode='replace'` alone** (no `metadata_delete_keys`): the entire custom-provenance
+    subset is replaced with exactly what `metadata_patch` supplies. This is the same
+    read-modify-`overwrite_payload` shape as the combined merge+delete case immediately above —
     `overwrite_payload` replaces the **entire** point payload, so the mem0-owned key subset must be
     read back and re-attached before calling it, or the point loses its own `data`/`hash`/
     `created_at` and becomes unreadable by mem0's own `get`/`search`. This read reuses (c) below —
     no new read primitive.
-  - Reserved-key rejection at the tool boundary (§3) means none of these three operations ever
-    needs to defend against a caller supplying a mem0-owned key directly.
+  - Reserved-key rejection at the tool boundary (§3) means none of these operations ever needs to
+    defend against a caller supplying a mem0-owned key directly.
+
+  **Invariant (checkable, not aspirational): every `update_memory` call performs exactly one
+  backend write, in every arm combination.** One `Mem0Backend.update` call when `content` is
+  present (the "Combined call" case above folds any metadata delta into that same call); otherwise
+  exactly one of `set_payload` / `delete_payload` / `overwrite_payload` on the metadata-only path
+  per the table above. This is what makes the "one journal row, one event" guarantee (§5(a)) true
+  uniformly across every arm combination, not only on the content arm.
 
 ### (c) Read-before-write
 
