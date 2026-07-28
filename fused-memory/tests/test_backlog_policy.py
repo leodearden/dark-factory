@@ -285,6 +285,49 @@ async def test_on_watchdog_wedge_writes_escalation_with_wedge_error_type(
     assert 'stale_for_seconds' in body['detail']
 
 
+# ── Startup seeding of known project roots (task 2998 GAP A) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_register_known_project_roots_seeds_every_root(event_buffer, tmp_path):
+    """Every known root is locatable BEFORE any check()/mutating MCP call.
+
+    GAP A: at startup the only caller of ``register_project_root`` was
+    ``check()``, so a halt rehydrated by ``Judge.initialize()`` had no root to
+    escalate against.
+    """
+    root_a = tmp_path / 'reify_root'
+    root_b = tmp_path / 'df_root'
+    root_a.mkdir()
+    root_b.mkdir()
+
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+    policy.register_known_project_roots({
+        'reify': str(root_a),
+        'dark_factory': str(root_b),
+    })
+
+    # No check() has run — the roots must already resolve.
+    assert policy.project_root_for('reify') == str(root_a)
+    assert policy.project_root_for('dark_factory') == str(root_b)
+
+
+@pytest.mark.asyncio
+async def test_explicit_registration_clears_startup_seeded_provenance(
+    event_buffer, tmp_path,
+):
+    """A real mutating-call registration promotes a seeded id back to active."""
+    root_a = tmp_path / 'reify_root'
+    root_a.mkdir()
+
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+    policy.register_known_project_roots({'reify': str(root_a)})
+    assert 'reify' in policy._startup_seeded
+
+    policy.register_project_root('reify', str(root_a))
+    assert 'reify' not in policy._startup_seeded
+
+
 # ── orchestrator_detector ─────────────────────────────────────────────────
 
 
