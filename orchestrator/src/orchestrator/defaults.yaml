@@ -436,6 +436,34 @@ fairness:
     low: 4
     polish: 9999
 
+# Unknown-config-key census escape hatch (task 2989).
+#
+# Pydantic's extra='ignore' DISCARDS unknown keys before validation, so a
+# misplaced key is accepted silently (the 2026-07-22 incident: a top-level
+# `spare_warm_lanes: 8` did nothing for 3 weeks — the field lives on git.).
+# A separate raw-YAML-vs-model walk detects that class of typo and files a
+# born-at-L2; `orchestrator check-config --config <path>` is the offline gate.
+#
+# A key deliberately present for NON-orchestrator consumers (read by the
+# project's own scripts) must not be escalated.  Excuse it either by naming it
+# with the reserved `x_`/`x-` prefix — works at ANY depth, no config ceremony,
+# and is the preferred form for a NEW knob — or by listing its dotted path
+# here, for an existing name other tooling already greps for.
+#
+# Entries are fnmatch globs where `*` spans dots, so `cpu_governance.*` excuses
+# a whole namespace.  TRAP: `<name>.*` does NOT match the bare parent key
+# `<name>`, so a top-level dict key must be listed EXACTLY.
+#
+# Excused keys stay listed by check-config (at exit 0) and in reload_config's
+# `ignored_config_keys`, so an over-broad glob remains auditable.
+# See OPERATIONS.md §6a.
+config_key_census:
+  ignore: []
+  # ignore:
+  #   - 'cpu_governance.*'       # whole namespace
+  #   - 'fairness.scheduler_v2'  # exact path
+  #   - 'warm_lane_pool'         # top-level dict key — must be exact
+
 # Starvation watchdog (task 1880).
 #
 # Files exactly ONE INFO-level escalation for a dispatch-eligible pending task

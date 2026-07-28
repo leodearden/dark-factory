@@ -41,6 +41,7 @@ from orchestrator.background_service import (
 from orchestrator.config import (
     OrchestratorConfig,
     apply_reload,
+    config_unknown_keys_signature,
     load_config,
 )
 from orchestrator.delivered_checks import (
@@ -173,6 +174,12 @@ def _bumped_routing_dump(metadata: Any, by: int = 1) -> dict[str, Any]:
 # waits on this sentinel, so dispatch is never blocked. A stable sentinel
 # also gives get_by_task(..., level=2) a durable dedup key across restarts.
 _DIRTY_TREE_ESCALATION_SENTINEL: str = 'dirty-project-root-startup'
+
+# Sentinel task_id for the unknown-config-key born-at-L2 filer (task 2989),
+# mirroring _DIRTY_TREE_ESCALATION_SENTINEL: a stable synthetic task_id that no
+# workflow waits on, giving get_by_task(..., level=2) a durable self-heal handle
+# and make_id a per-sentinel counter across restarts.
+_CONFIG_UNKNOWN_KEYS_SENTINEL: str = 'config-unknown-keys-startup'
 
 # Statuses swept by _reconcile_stranded_in_progress for stranded-task recovery.
 # Intentionally EXCLUDES:
@@ -1864,6 +1871,18 @@ class Harness:
                 await self._file_dirty_tree_escalation(force_dirty_start)
             except Exception as e:
                 logger.warning(f'Failed to file dirty-tree escalation: {e}')
+
+            # 1c0-config-keys. Surface the unknown-config-key census (task 2989)
+            # as a born-at-L2 escalation so a phantom key that pydantic's
+            # extra='ignore' silently dropped (the 2026-07-22 spare_warm_lanes
+            # incident) can never again vanish unnoticed.  Own try/except
+            # (non-fatal), like every neighboring startup step and matching the
+            # dirty-tree guard above, so a fault here never aborts startup.  The
+            # method is itself fail-open; this is defense in depth.
+            try:
+                await self._file_config_unknown_keys_escalation()
+            except Exception as e:
+                logger.warning(f'Failed to file config-unknown-keys escalation: {e}')
 
             # 1c0. Rehydrate merge-halt state from preserved L1s (non-fatal).
             # Must run after _dismiss_stale_escalations so we scan the
@@ -7016,6 +7035,137 @@ class Harness:
                 ),
             )
         self._escalation_queue.submit(esc)
+
+    async def _file_config_unknown_keys_escalation(self) -> None:
+        """File (or self-heal) a born-at-L2 escalation for unknown project-config keys.
+
+        Surfaces the unknown-config-key census (config.py, stashed by load_config
+        onto ``self.config.unknown_key_census``) so a key that pydantic's
+        ``extra='ignore'`` silently dropped — the 2026-07-22 top-level
+        ``spare_warm_lanes`` incident (the field lives on ``git.``) — can never
+        again vanish unnoticed for weeks.
+
+        Mirrors ``_file_dirty_tree_escalation``:
+          - None-safe: a no-op when ``_escalation_queue`` is None (bare-Harness
+            unit tests, or the escalation package missing).
+          - Self-closing: an empty census resolves any pending L2 this filer left
+            under ``_CONFIG_UNKNOWN_KEYS_SENTINEL`` (operator fixed the config and
+            restarted), so the remediation clears the L2 without a manual resolve.
+          - Fail-open: the whole body is wrapped in try/except so a fault in the
+            escalation path never aborts startup and recreates the RCA 2026-07-08
+            silent crash-loop (the startup call site also wraps this in its own
+            try/except — defense in depth).
+
+        Dedup: ``root_cause`` encodes the unknown-key-set signature, so an
+        identical key-set files exactly one L2 (storm escape, INV-4) via
+        ``find_pending_l2_by_root_cause``; a changed set re-files a distinct L2.
+        """
+        queue = getattr(self, '_escalation_queue', None)
+        if queue is None:
+            return
+        try:
+            census = self.config.unknown_key_census
+            if not census:
+                # Self-heal: the config is now clean — resolve any L2 we filed.
+                for esc in queue.get_by_task(
+                    _CONFIG_UNKNOWN_KEYS_SENTINEL, status='pending', level=2,
+                ):
+                    queue.resolve(
+                        esc.id,
+                        'config now has no unknown keys at startup',
+                        resolved_by='orchestrator-config-key-guard',
+                    )
+                return
+
+            project_id = self.config.fused_memory.project_id
+            signature = config_unknown_keys_signature(census)
+            root_cause = f'config_unknown_keys:{project_id}:{signature}'
+            if queue.find_pending_l2_by_root_cause(root_cause) is not None:
+                return  # dedup: one open L2 per unknown-key-set (same-set escape)
+
+            from escalation.models import Escalation
+
+            key_lines = '\n'.join(
+                f'  {uk.path}'
+                + (f'  → did you mean {uk.shadow_hint}?' if uk.shadow_hint else '')
+                for uk in census
+            )
+            summary = (
+                f'{len(census)} unknown config key(s) silently dropped by pydantic '
+                'extra=ignore'
+            )[:200]
+            detail = (
+                f'The project config for {project_id} has {len(census)} key(s) with '
+                'no matching OrchestratorConfig field.  Pydantic discards unknown '
+                'keys BEFORE validation (extra=ignore), so these are SILENTLY '
+                'dropped with no error — the 2026-07-22 incident where a top-level '
+                'spare_warm_lanes (the field actually lives on git.) was ignored '
+                'for weeks.\n\n'
+                f'Unknown keys (dotted path → placement hint):\n{key_lines}\n\n'
+                'A placement hint is ADVISORY: it is a name match against the '
+                'model tree and may be a coincidental collision, so confirm the '
+                'key is really misplaced before moving it.\n\n'
+                'Fix each key (move it to the hinted path, or remove it) and '
+                'restart — a clean census auto-resolves this escalation.  Run '
+                '`orchestrator check-config --config <path>` to verify.\n\n'
+                'If a key is INTENTIONAL — deliberately present for tooling '
+                'other than the orchestrator, e.g. read by this project\'s own '
+                'scripts — do not delete it.  Excuse it instead, either by '
+                'renaming it under the reserved `x_`/`x-` prefix (works at any '
+                'depth, no config ceremony) or by adding its dotted path to '
+                '`config_key_census.ignore` in the same YAML (fnmatch globs, so '
+                '`some_namespace.*` excuses a whole namespace; note a '
+                '`<name>.*` glob does NOT match the bare parent key `<name>`, '
+                'which must be listed exactly).  Then restart — or hot-reload, '
+                'since `config_key_census.*` is green-tier — and this escalation '
+                'auto-resolves.  Excused keys stay listed by check-config at '
+                'exit 0, so the opt-out remains auditable.'
+            )
+            esc = Escalation(
+                id=queue.make_id(_CONFIG_UNKNOWN_KEYS_SENTINEL),
+                task_id=_CONFIG_UNKNOWN_KEYS_SENTINEL,
+                agent_role='orchestrator-config-key-guard',
+                severity='critical',
+                level=2,
+                category='infra_issue',
+                root_cause=root_cause,
+                summary=summary,
+                detail=detail,
+                suggested_action='fix_unknown_config_keys',
+            )
+            queue.submit(esc)
+            try:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_created,
+                        task_id=_CONFIG_UNKNOWN_KEYS_SENTINEL,
+                        data={
+                            'escalation_id': esc.id,
+                            'category': esc.category,
+                            'severity': esc.severity,
+                            'level': esc.level,
+                            'reason': 'config-unknown-keys',
+                        },
+                    )
+            except Exception:
+                # Isolated: the L2 is already filed, so an emit failure is an
+                # observability-only miss, never a "failed to file L2".
+                logger.warning(
+                    'config-unknown-keys: L2 %s filed but escalation_created '
+                    'emit failed', esc.id, exc_info=True,
+                )
+            logger.warning(
+                'config-unknown-keys: filed born-at-L2 %s for %d unknown key(s): %s',
+                esc.id, len(census), ', '.join(uk.path for uk in census),
+            )
+        except Exception:
+            # Fail-open (RCA 2026-07-08): a startup guard fault must never abort
+            # startup.  The caller wraps this too; this inner guard keeps the
+            # method safe when invoked directly (e.g. unit tests).
+            logger.warning(
+                'config-unknown-keys: failed to file/heal escalation (non-fatal)',
+                exc_info=True,
+            )
 
     async def _run_slot(
         self, assignment, sem: asyncio.Semaphore
@@ -12219,6 +12369,11 @@ class Harness:
                 'restart_required': {},
                 'unchanged': 0,
                 'error': error,
+                # Always present so callers can read report['unknown_config_keys']
+                # / report['ignored_config_keys'] unconditionally; a failed load
+                # has no fresh config to census.
+                'unknown_config_keys': [],
+                'ignored_config_keys': [],
             }
             if self.event_store:
                 self.event_store.emit(EventType.config_reload, data=report)
@@ -12240,6 +12395,30 @@ class Harness:
 
         report = apply_reload(self.config, fresh)
         report['config_path'] = config_path
+        # Surface the freshly-loaded config's unknown-key census (task 2989) so
+        # the reload MCP tool reports phantom keys pydantic silently dropped.
+        # apply_reload itself is left unchanged (it only diffs model_fields).
+        report['unknown_config_keys'] = [
+            uk._asdict() for uk in fresh.unknown_key_census
+        ]
+        # Keys deliberately excused by an escape hatch (reserved x_/x- prefix, or
+        # an operator config_key_census.ignore entry).  Reported separately and
+        # never folded into unknown_config_keys, so an over-broad glob stays
+        # visible to the operator without ever reading as a failure.
+        report['ignored_config_keys'] = [
+            ik._asdict() for ik in fresh.ignored_key_census
+        ]
+        # Treat reload symmetrically with startup (INV-5, ONE implementation).
+        # apply_reload copies only model_fields, so the _unknown_key_census
+        # PrivateAttr would otherwise keep its stale startup value on the live
+        # config; copy the freshly-loaded census across, then re-run the
+        # born-at-L2 filer so a hot-reload that INTRODUCES a phantom key files an
+        # L2 and a hot-reload that FIXES the config self-heals the pending one —
+        # exactly as startup does.  The filer is None-safe (no-op without an
+        # escalation queue) and fail-open, so it can never break a reload.
+        self.config._unknown_key_census = fresh.unknown_key_census
+        self.config._ignored_key_census = fresh.ignored_key_census
+        await self._file_config_unknown_keys_escalation()
         if self.event_store:
             self.event_store.emit(EventType.config_reload, data=report)
         if report['restart_required'] or not report['reloaded']:

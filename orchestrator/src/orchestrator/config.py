@@ -1,5 +1,6 @@
 """Configuration schema for the orchestrator."""
 
+import fnmatch
 import hashlib
 import importlib.resources
 import logging
@@ -8,7 +9,8 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from types import UnionType
+from typing import Any, Literal, NamedTuple, Union, get_args, get_origin
 
 import yaml
 from pydantic import (
@@ -2389,6 +2391,85 @@ def default_price_table() -> dict[str, dict[str, float]]:
     return {model: dict(rates) for model, rates in _DEFAULT_PRICES.items()}
 
 
+class ConfigUnknownKey(NamedTuple):
+    """A project-YAML key that has no matching model field.
+
+    Emitted by the unknown-config-key census (see ``census_unknown_config_keys``
+    below OrchestratorConfig).  ``path`` is the dotted location of the key in the
+    project YAML (e.g. ``spare_warm_lanes`` or ``git.bogus_nested``).
+    ``shadow_hint`` names the real dotted home when the same field name lives
+    elsewhere in the model tree (e.g. a top-level ``spare_warm_lanes`` →
+    ``git.spare_warm_lanes``), else ``None``.
+
+    Defined here (before OrchestratorConfig) so the ``_unknown_key_census``
+    PrivateAttr can reference it eagerly, mirroring the ModuleConfig precedent.
+    """
+
+    path: str
+    shadow_hint: str | None
+
+
+class ConfigIgnoredKey(NamedTuple):
+    """A project-YAML key with no matching model field that was DELIBERATELY
+    excused from the unknown-key census by an escape hatch.
+
+    ``path`` is the dotted location (same shape as ``ConfigUnknownKey.path``).
+    ``reason`` is ``'reserved_prefix'`` (the key's name starts with ``x_``/``x-``
+    — the forward-looking convention for non-orchestrator knobs, mirroring the
+    task-metadata Tier-C ``x_`` namespace) or ``'allowlist'`` (an operator listed
+    it under ``config_key_census.ignore``).
+
+    Ignored keys are excluded from ``.unknown`` and therefore from the census
+    signature and the born-at-L2, but are still reported informationally by
+    ``orchestrator check-config`` (at exit 0) so an over-broad glob stays
+    auditable rather than becoming an invisible blind spot.
+    """
+
+    path: str
+    reason: str
+
+
+class ConfigKeyCensus(NamedTuple):
+    """Both views produced by the ONE census walk (INV-5).
+
+    ``unknown`` drives the loud paths (WARNING, born-at-L2, check-config exit
+    code); ``ignored`` is informational only.  Because a single walk classifies
+    every key into exactly one of the two, the escalation and the lint can never
+    disagree about what is suppressed.
+    """
+
+    unknown: list[ConfigUnknownKey]
+    ignored: list[ConfigIgnoredKey]
+
+
+class ConfigKeyCensusConfig(BaseModel):
+    """Operator escape hatch for the unknown-config-key census.
+
+    MUST be declared as a real ``OrchestratorConfig`` field (it is, below):
+    otherwise the very block that suppresses false positives becomes a new
+    false positive, and an operator applying the documented remediation would
+    trade one born-at-L2 for another.
+    """
+
+    ignore: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Dotted paths of project-YAML keys that are deliberately present for '
+            'NON-OrchestratorConfig consumers (e.g. keys read by the project\'s own '
+            'scripts) and must therefore not be reported as unknown config keys. '
+            'Entries are matched against the dotted key path with '
+            'fnmatch.fnmatchcase, so shell-style globs work — NOTE that `*` spans '
+            'dots, so `cpu_governance.*` opts out that whole namespace. The '
+            'converse fnmatch trap: `<name>.*` does NOT match the bare parent key '
+            '`<name>`, so opting out a top-level dict key requires listing it '
+            'exactly. Prefer renaming a new non-orchestrator knob under the '
+            'reserved `x_`/`x-` prefix (auto-excused at any depth, no config '
+            'ceremony) and reserve this list for existing key names that other '
+            'tooling already greps for.'
+        ),
+    )
+
+
 # --- Top-level ---
 
 
@@ -3800,6 +3881,16 @@ class OrchestratorConfig(BaseSettings):
     # 'judge' here. See _build_agent_env (workflow.py).
     role_env_overrides: dict[str, dict[str, str]] = Field(default_factory=dict)
 
+    # Unknown-config-key census escape hatch.  Declared as a REAL model field
+    # (not read off the raw tree alone) so the census does not self-flag the very
+    # key that configures it — see ConfigKeyCensusConfig.  The allowlist is still
+    # READ from the raw YAML tree by census_config_keys, because check-config must
+    # keep working when the config has an unrelated value-level validation error
+    # that would make a full load raise.
+    config_key_census: ConfigKeyCensusConfig = Field(
+        default_factory=ConfigKeyCensusConfig
+    )
+
     # Project
     project_root: Path = Field(default=Path('.'))
 
@@ -3815,6 +3906,18 @@ class OrchestratorConfig(BaseSettings):
     # Prefer the `module_configs_or_empty` property below over inline `or {}`
     # guards so new consumers cannot silently omit the normalization.
     _module_configs: dict[str, ModuleConfig] | None = PrivateAttr(default=None)
+
+    # Unknown-config-key census (populated by load_config via
+    # census_unknown_config_keys).  None means "census never ran" (direct
+    # OrchestratorConfig() instantiation in evals/tests); any list (including [])
+    # means "census ran".  Read through the `unknown_key_census` property below,
+    # which normalizes the None sentinel to [] — mirrors _module_configs.
+    _unknown_key_census: list[ConfigUnknownKey] | None = PrivateAttr(default=None)
+
+    # Escape-hatched keys from the SAME census walk (reserved x_/x- prefix or an
+    # operator config_key_census.ignore entry).  Same None-sentinel contract as
+    # _unknown_key_census above; read through `ignored_key_census`.
+    _ignored_key_census: list[ConfigIgnoredKey] | None = PrivateAttr(default=None)
 
     @field_validator('project_root', mode='after')
     @classmethod
@@ -4114,6 +4217,27 @@ class OrchestratorConfig(BaseSettings):
         """
         return self._module_configs or {}
 
+    @property
+    def unknown_key_census(self) -> list[ConfigUnknownKey]:
+        """Return the unknown-config-key census, normalizing the None sentinel to [].
+
+        Populated by ``load_config`` (which stashes
+        ``census_unknown_config_keys(config_path)``).  A directly-constructed
+        ``OrchestratorConfig()`` never ran the census, so the sentinel stays None
+        and this returns [] — mirrors ``module_configs_or_empty``.
+        """
+        return self._unknown_key_census or []
+
+    @property
+    def ignored_key_census(self) -> list[ConfigIgnoredKey]:
+        """Return the escape-hatched half of the census, None sentinel → [].
+
+        Informational only: these keys were deliberately excused (reserved
+        ``x_``/``x-`` prefix, or an operator ``config_key_census.ignore`` entry)
+        and therefore never reach the WARNING, the signature, or the L2.
+        """
+        return self._ignored_key_census or []
+
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return the ModuleConfig whose registered prefix is the longest (deepest) match
         for *module_path*, or None if no registered prefix matches at all.
@@ -4190,6 +4314,200 @@ class OrchestratorConfig(BaseSettings):
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
 
+# ---------------------------------------------------------------------------
+# Unknown-config-key census (plans/warm-lane-exhaustion-hardening-prd.md leaf ζ)
+#
+# Pydantic's ``extra='ignore'`` silently DISCARDS unknown keys before validation
+# on both OrchestratorConfig and every nested BaseModel, so a misplaced key like
+# a top-level ``spare_warm_lanes: 8`` (the field actually lives on GitConfig)
+# vanishes with no error.  These pure helpers detect that class of typo by
+# walking the RAW project YAML against the model schema — a separate pass from
+# pydantic validation, because validation never sees the dropped keys.
+#
+# ``ConfigUnknownKey`` itself is defined above OrchestratorConfig (so the
+# ``_unknown_key_census`` PrivateAttr can reference it eagerly); the walk
+# functions live here because they reference OrchestratorConfig's schema.
+# ---------------------------------------------------------------------------
+
+
+def _model_from_annotation(annotation: Any) -> type[BaseModel] | None:
+    """Return the single nested ``BaseModel`` subclass an annotation refers to.
+
+    Handles a bare ``SubModel`` and an ``Optional``/``SubModel | None`` wrapper.
+    Returns ``None`` for scalars, ``dict[...]`` and ``list[...]`` (whose value
+    models carry arbitrary operator DATA keys — the walk deliberately stops
+    there) and any other non-single-BaseModel annotation.
+    """
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    # Only unwrap a Union (Optional[X] / X | None); NEVER dict[...]/list[...],
+    # whose get_args would expose a DATA value-model (e.g. dict[str, PriceEntry]).
+    if origin is Union or origin is UnionType:
+        for arg in get_args(annotation):
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                return arg
+    return None
+
+
+def _build_shadow_index(
+    model_cls: type[BaseModel],
+    prefix: str = '',
+    index: dict[str, list[str]] | None = None,
+    _ancestors: frozenset[type[BaseModel]] = frozenset(),
+) -> dict[str, list[str]]:
+    """Map every field NAME (lowercased) in the model tree → its dotted path(s).
+
+    Recurses into single nested ``BaseModel`` fields only (mirroring the walk),
+    so an unknown top-level ``spare_warm_lanes`` can be pointed at its real home
+    ``git.spare_warm_lanes``.  ``_ancestors`` guards against pathological
+    recursion cycles while still allowing the same submodel at sibling paths.
+    """
+    if index is None:
+        index = {}
+    if model_cls in _ancestors:
+        return index
+    child_ancestors = _ancestors | {model_cls}
+    for name, field in model_cls.model_fields.items():
+        dotted = f'{prefix}{name}'
+        index.setdefault(name.lower(), []).append(dotted)
+        sub = _model_from_annotation(field.annotation)
+        if sub is not None:
+            _build_shadow_index(sub, dotted + '.', index, child_ancestors)
+    return index
+
+
+# Key-name prefixes that excuse a key from the census at ANY depth, with no
+# config ceremony.  Mirrors the task-metadata Tier-C ``x_`` namespace documented
+# at docs/task-authoring.md — the forward-looking convention for a knob that
+# lives in the project YAML but is consumed by the project's OWN tooling rather
+# than by OrchestratorConfig.
+_CENSUS_RESERVED_PREFIXES = ('x_', 'x-')
+
+
+def _walk_unknown_keys(
+    tree: dict[Any, Any],
+    model_cls: type[BaseModel],
+    prefix: str,
+    shadow_index: dict[str, list[str]],
+    ignore_patterns: tuple[str, ...],
+    ignored: list[ConfigIgnoredKey],
+) -> list[ConfigUnknownKey]:
+    """Recursively collect keys in ``tree`` with no matching field on ``model_cls``.
+
+    Matching is case-insensitive on the field NAME (mirrors
+    ``model_config.case_sensitive=False``; OrchestratorConfig defines no field
+    aliases).  A key with no matching field is CLASSIFIED — reserved-prefix or
+    allowlisted keys are appended to *ignored*, everything else is returned as
+    unknown — and in all three cases is NOT descended into.  A known key is
+    descended into only when its field is a single nested ``BaseModel`` AND its
+    value is a dict — scalars, ``list`` values, and ``dict`` DATA fields stop the
+    walk so arbitrary operator data keys are never flagged.
+
+    Classification happens at this ONE site (INV-5), so the loud consumers
+    (WARNING/L2) and the informational one (check-config) can never disagree.
+    """
+    fields_lower = {
+        name.lower(): (name, field) for name, field in model_cls.model_fields.items()
+    }
+    unknown: list[ConfigUnknownKey] = []
+    for key, value in tree.items():
+        key_name = str(key)
+        key_lower = key_name.lower()
+        dotted = f'{prefix}{key_name}'
+        match = fields_lower.get(key_lower)
+        if match is None:
+            if key_lower.startswith(_CENSUS_RESERVED_PREFIXES):
+                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix'))
+            elif any(fnmatch.fnmatchcase(dotted, pat) for pat in ignore_patterns):
+                ignored.append(ConfigIgnoredKey(dotted, 'allowlist'))
+            else:
+                candidates = [c for c in shadow_index.get(key_lower, []) if c != dotted]
+                hint = ' or '.join(candidates) if candidates else None
+                unknown.append(ConfigUnknownKey(dotted, hint))
+            continue
+        _name, field = match
+        sub = _model_from_annotation(field.annotation)
+        if sub is not None and isinstance(value, dict):
+            unknown.extend(
+                _walk_unknown_keys(
+                    value, sub, dotted + '.', shadow_index, ignore_patterns, ignored
+                )
+            )
+    return unknown
+
+
+def _census_ignore_patterns(tree: dict[Any, Any]) -> tuple[str, ...]:
+    """Read ``config_key_census.ignore`` off the RAW project tree, fail-open.
+
+    Read from the raw tree rather than a validated OrchestratorConfig so the
+    census keeps working when the config has an unrelated value-level validation
+    error (the same reason check-config calls the census directly).  A malformed
+    hatch — non-dict block, non-list ``ignore``, non-str entries — degrades to
+    "no allowlist" instead of raising: a broken escape hatch must never take out
+    the census that surfaces real phantom keys.
+    """
+    block = tree.get('config_key_census')
+    if not isinstance(block, dict):
+        return ()
+    raw = block.get('ignore')
+    if not isinstance(raw, list):
+        return ()
+    return tuple(entry for entry in raw if isinstance(entry, str))
+
+
+def census_config_keys(config_path: Path) -> ConfigKeyCensus:
+    """Return BOTH census views for the PROJECT YAML at *config_path*.
+
+    Parses the project file directly (NOT the defaults-merged YamlSettingsSource
+    tree — defaults.yaml is version-controlled and trusted; see design decision
+    1) and walks it against ``OrchestratorConfig``'s schema in ONE pass,
+    classifying every non-model key as either genuinely ``unknown`` or
+    deliberately ``ignored`` (reserved ``x_``/``x-`` prefix, or an operator
+    ``config_key_census.ignore`` entry).  A ``None``/non-dict document or an
+    unreadable/malformed file yields an empty census (fail-open — the census
+    cannot detect keys it cannot parse; load_config surfaces parse errors loudly
+    on its own path).
+    """
+    try:
+        with open(config_path) as f:
+            tree = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return ConfigKeyCensus([], [])
+    if not isinstance(tree, dict):
+        return ConfigKeyCensus([], [])
+    shadow_index = _build_shadow_index(OrchestratorConfig)
+    ignored: list[ConfigIgnoredKey] = []
+    unknown = _walk_unknown_keys(
+        tree, OrchestratorConfig, '', shadow_index,
+        _census_ignore_patterns(tree), ignored,
+    )
+    return ConfigKeyCensus(unknown, ignored)
+
+
+def census_unknown_config_keys(config_path: Path) -> list[ConfigUnknownKey]:
+    """Return only the GENUINELY-unknown half of the census for *config_path*.
+
+    Thin wrapper over ``census_config_keys`` (one walk, two views — INV-5).  Its
+    signature and semantics are unchanged from before the escape hatches existed;
+    escape-hatched keys are simply never in this list, which is what keeps them
+    out of the census signature and therefore out of the born-at-L2.
+    """
+    return census_config_keys(config_path).unknown
+
+
+def config_unknown_keys_signature(census: list[ConfigUnknownKey]) -> str:
+    """Short, order-independent sha256 hex of the census's unknown-key PATHS.
+
+    Paths only (hints are deterministically derived from paths + model, so they
+    are redundant).  Single-sources the escalation dedup discriminator: an
+    identical key-set yields a stable signature (same-set dedup, the storm
+    escape) while any change to the set re-files.
+    """
+    joined = ','.join(sorted(uk.path for uk in census))
+    return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from an explicit YAML file.
 
@@ -4250,6 +4568,40 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 'Move the orchestrator.yaml up or raise lock_depth.',
                 prefix, prefix_depth, config.lock_depth,
             )
+    # Unknown-config-key census: detect project-YAML keys that pydantic's
+    # extra='ignore' silently dropped (the 2026-07-22 spare_warm_lanes incident).
+    # Stash it beside _module_configs so consumers (startup L2 filer, reload
+    # response, check-config) read one computed result, and warn loudly now
+    # (loud-over-silent) so the phantom key is never invisible.
+    #
+    # SCOPE (intentional): the census walks the TOP-LEVEL project config only.
+    # The per-module orchestrator.yaml files discovered just above by
+    # _discover_module_configs are deliberately NOT censused, so a typo'd key in
+    # a per-package orchestrator.yaml is still silently dropped by pydantic
+    # extra='ignore'.  This mirrors design decision 1 (project-config-only walk):
+    # the incident key lived in the top-level project YAML.  Extending the census
+    # to module configs (walk each discovered ModuleConfig YAML against
+    # ModuleConfig's schema) is a deferred follow-up, not an oversight.
+    #
+    # Both views come from ONE walk (INV-5): escape-hatched keys (reserved
+    # x_/x- prefix, or an operator config_key_census.ignore entry) are stashed
+    # separately and deliberately kept OUT of the WARNING below — they are
+    # informational only, surfaced by `orchestrator check-config`.
+    full_census = census_config_keys(config_path)
+    census = full_census.unknown
+    config._unknown_key_census = census
+    config._ignored_key_census = full_census.ignored
+    if census:
+        logger.warning(
+            'Config %s has %d unknown key(s) that pydantic silently dropped '
+            '(extra=ignore): %s',
+            config_path,
+            len(census),
+            '; '.join(
+                uk.path + (f' (did you mean {uk.shadow_hint}?)' if uk.shadow_hint else '')
+                for uk in census
+            ),
+        )
     return config
 
 
@@ -4336,6 +4688,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
     # RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
+    # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
+    # operator to add a path to config_key_census.ignore and hot-reload, and a
+    # restart-only leaf would make that remediation line a lie (the reload would
+    # report restart_required instead of applying).  Given the watchdog revive
+    # and the 8h fleet-redeploy cadence, clearing a false-positive L2 without a
+    # restart is materially better.
+    _submodel_leaf_paths('config_key_census', ConfigKeyCensusConfig),
     {
         # Steward grace
         'steward_completion_timeout',

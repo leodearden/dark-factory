@@ -393,6 +393,85 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     click.echo(f'Wrote model availability artifact to {out_path}')
 
 
+@main.command('check-config')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to the project orchestrator config YAML to lint (REQUIRED '
+                   'unless ORCH_CONFIG_PATH is set).')
+def check_config(config_path: Path | None):
+    """Lint a project config YAML for unknown keys that pydantic silently drops.
+
+    OrchestratorConfig uses ``extra='ignore'``, so any key with no matching model
+    field is DISCARDED before validation with no error — the 2026-07-22 incident
+    where a top-level ``spare_warm_lanes: 8`` (the field lives on ``git.``) was
+    dropped for weeks.  This offline gate walks the RAW project YAML against the
+    schema via ``census_config_keys`` DIRECTLY (not a full validated load), so it
+    still reports phantom keys even when the config has an unrelated value-level
+    validation error.
+
+    A key deliberately present for NON-OrchestratorConfig consumers (e.g. one the
+    project's own scripts read) can be excused two ways, and is then listed in an
+    INFORMATIONAL section that never affects the exit code:
+
+    \b
+      * name it with the reserved ``x_``/``x-`` prefix (works at any depth, no
+        config ceremony) — the preferred form for a NEW knob;
+      * add its dotted path to ``config_key_census.ignore`` in the same YAML
+        (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
+        for existing names other tooling already greps for.
+
+    Exits 1 if any GENUINELY-unknown key is found, else 0.
+    """
+    from orchestrator.config import census_config_keys
+
+    # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
+    # constructing a validated config — census only needs the raw YAML path.
+    if config_path is None:
+        env_path = os.environ.get('ORCH_CONFIG_PATH')
+        if not env_path:
+            click.echo(
+                'Error: --config is required (or set ORCH_CONFIG_PATH).', err=True
+            )
+            sys.exit(1)
+        config_path = Path(env_path)
+        if not config_path.exists():
+            click.echo(f'Error: Config file not found: {config_path}', err=True)
+            sys.exit(1)
+
+    census = census_config_keys(config_path)
+
+    # Informational FIRST, and explicitly marked as such: these keys were
+    # deliberately excused, so listing them keeps an over-broad glob auditable
+    # without ever reading as a failure or touching the exit code.
+    if census.ignored:
+        _REASONS = {
+            'reserved_prefix': 'ignored: reserved prefix',
+            'allowlist': 'ignored: config_key_census.ignore',
+        }
+        click.echo(
+            f'{len(census.ignored)} key(s) excused from the census '
+            '(informational — does not affect the exit code):'
+        )
+        for ik in census.ignored:
+            click.echo(f'  {ik.path}  ({_REASONS.get(ik.reason, f"ignored: {ik.reason}")})')
+        click.echo('')
+
+    if not census.unknown:
+        click.echo(f'OK: {config_path} has no unknown config keys.')
+        sys.exit(0)
+
+    click.echo(f'Found {len(census.unknown)} unknown config key(s) in {config_path}:')
+    for uk in census.unknown:
+        if uk.shadow_hint:
+            # Advisory ONLY: a shadow hint is a NAME match against the model
+            # tree and may be a coincidental collision, so it stays phrased as a
+            # question rather than an instruction to move the key.
+            click.echo(f'  {uk.path}  → did you mean {uk.shadow_hint}?')
+        else:
+            click.echo(f'  {uk.path}')
+    sys.exit(1)
+
+
 @main.command('verify-merge')
 @click.option('--sha', required=True, help='Merge commit SHA to verify (must be present in the local repo)')
 @click.option('--spec', 'spec_json', required=True, help='MergeVerifySpec as a JSON string (from RemoteRunner dispatch)')

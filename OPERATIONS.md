@@ -419,6 +419,9 @@ takes no arguments: it always re-reads that process's own
 - `unblock_auto.*`
 - `verify_env`
 - The `git.offline_lane_*` leaf tunables
+- `config_key_census.*` (the unknown-key census escape hatch — see
+  [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
+  false-positive L2 can be cleared on a live unit)
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -444,6 +447,109 @@ the cold start pays a warm-lane reseed, a module-tagger pass, and up to a
 few minutes waiting on fused-memory to answer. For a pure tuning-knob
 change, reload buys you all of that for free — reserve a restart for
 red-tier changes.
+
+---
+
+## 6a. Unknown-config-key census
+
+`OrchestratorConfig` uses pydantic `extra='ignore'`, which **discards
+unknown keys before validation** — on the top-level model *and* on every
+nested one. A misplaced key is therefore accepted silently, with no error
+and no log line. On 2026-07-22 a top-level `spare_warm_lanes: 8` in a
+project YAML did nothing for three weeks for exactly this reason: the
+field lives on `git.`, so the top-level spelling was dropped.
+
+Pydantic can never detect this itself (it never sees the dropped keys), so
+a **separate raw-YAML-vs-model pass** walks the project config and reports
+keys with no matching model field. It runs in three places, all off the
+same single walk:
+
+- **at startup** — a clean census resolves any prior escalation; a dirty
+  one files a born-at-L2 (`critical`, `agent_role`
+  `orchestrator-config-key-guard`), deduped on the unknown-key-set
+  signature so an unchanged key-set files exactly once;
+- **on `reload_config`** — the report carries `unknown_config_keys` and
+  `ignored_config_keys`, and files/self-heals the L2 symmetrically with
+  startup;
+- **offline**, via the gate below.
+
+### The offline gate
+
+```bash
+uv run --project orchestrator orchestrator check-config \
+    --config /path/to/dark-factory-orchestrator.yaml
+```
+
+Exit **1** iff at least one genuinely-unknown key is found; exit **0**
+otherwise — *including* when excused keys were listed. It calls the census
+directly rather than building a validated config, so it still reports
+phantom keys when the config has an unrelated value-level validation error
+that a full load would raise on first.
+
+Each unknown key may carry a placement hint (`→ did you mean
+git.spare_warm_lanes?`). **Hints are advisory**: a hint is a *name* match
+against the model tree and can be a coincidental collision. Confirm the
+key is really misplaced before moving it — see the worked example below
+for a case where following the hint would take the unit down.
+
+### Excusing an intentional key
+
+A project YAML may legitimately carry keys for **non-orchestrator**
+consumers — knobs the project's own scripts read. Those must not be
+deleted, and must not file a permanent L2. Two opt-outs, both classified
+at the same point in the walk:
+
+| Opt-out | Scope | Use for |
+|---|---|---|
+| Reserved `x_` / `x-` name prefix | any depth, case-insensitive, no config ceremony | **new** non-orchestrator knobs — mirrors the task-metadata Tier-C `x_` namespace in `docs/task-authoring.md` |
+| `config_key_census.ignore` | dotted paths in the same YAML, fnmatch globs | **existing** key names other tooling already greps for, where renaming would be a breaking change |
+
+```yaml
+config_key_census:
+  ignore:
+    - 'cpu_governance.*'      # `*` spans dots → whole namespace
+    - 'fairness.scheduler_v2' # exact path
+    - 'warm_lane_pool'        # top-level dict key — MUST be exact
+```
+
+> **fnmatch trap:** `<name>.*` does **not** match the bare parent key
+> `<name>`. Opting out a top-level dict key requires listing it exactly.
+> Getting this wrong leaves the L2 firing.
+
+Excused keys are still **listed by `check-config`** with their reason (at
+exit 0) and reported as `ignored_config_keys` by `reload_config`, so an
+over-broad glob stays auditable instead of becoming an invisible blind
+spot.
+
+### Worked example: a mixed-consumer namespace
+
+`reify`'s config puts reify-owned knobs in the *same YAML blocks* as real
+model fields — `cpu_governance.enabled` is an `OrchestratorConfig` field,
+while its siblings `cpu_governance.weights` / `agent_admit` /
+`DF_AGENT_CPU_GOVERN` / `fleet_load_detector` are read verbatim by
+`scripts/cpu-governed-exec.sh` and friends. Same for
+`fairness.skip_threshold` (model) vs `fairness.scheduler_v2` (reify).
+
+Its top-level `warm_lane_pool:` is the cautionary case: the census hints at
+`git.warm_lane_pool`, but that field is a **`bool`** and reify already sets
+it correctly — the top-level key is an unrelated reify-owned *dict*.
+Following the hint would feed a dict to a bool field and hard-fail config
+validation, taking the unit down. It belongs in the allowlist (listed
+exactly), not moved.
+
+### Clearing the escalation
+
+Fix the config — move/remove a genuinely misplaced key, or excuse an
+intentional one — then **restart, or hot-reload** (`config_key_census.*`
+is green-tier, see [§6](#6-config-reload-vs-restart)). Either path re-runs
+the census, and an empty census **auto-resolves** the pending L2; no manual
+resolve is needed. Verify with `check-config` first.
+
+**Scope:** the census walks the **top-level project config only**.
+`defaults.yaml` is version-controlled and trusted, and the per-package
+`orchestrator.yaml` files found by module discovery are not censused —
+a typo in one of those is still silently dropped. Extending the walk to
+module configs is a known follow-up, not an oversight.
 
 ---
 
