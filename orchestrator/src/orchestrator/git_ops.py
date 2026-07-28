@@ -370,6 +370,36 @@ _TASK_VERIFY_LEASE_WAIT_SECS: float = 300.0
 # to lean on fractional-timeout CLI parsing for what is a whole-second value.
 _SEED_WARM_LANE_LOCK_WAIT_SECS: int = 30
 
+# Bounded-wait timeout (seconds) for GitOps.reset_persistent_merge_worktree()'s
+# own <lane_dir>.lock acquire (task 3003).  SPLIT OUT of the shared
+# _SEED_WARM_LANE_LOCK_WAIT_SECS above at the SAME value (30) — the split is
+# the point, not a retune: the reset previously borrowed the seed's constant,
+# which coupled two unrelated call sites with opposite tuning pressures.
+#
+# Why 30 here and NOT task 2828's 300s (_MERGE_VERIFY_LEASE_WAIT_SECS above):
+#   1. 2828 chose 300s so a SHORT legitimate holder (a reseed/thin/gc —
+#      seconds to low minutes) never forces a needless requeue.  That argument
+#      barely applies on this path: the observed holder class is a 1--2h
+#      verify or a speculative merge-ahead train, which outlasts 30s and 300s
+#      identically.  No bounded wait short of HOURS changes the outcome for
+#      the incident this constant was split for — the CLASSIFICATION of the
+#      timeout (MergeVerifyLeaseContended -> DEFER, below) is the fix, not the
+#      length of the wait.
+#   2. Raising the seed constant in place would have been actively harmful:
+#      _seed_warm_lane stringifies it straight into `flock(1) -w`
+#      (str(_SEED_WARM_LANE_LOCK_WAIT_SECS), hence its `int` declaration) on
+#      the latency-sensitive warm-lane ACQUISITION hot path.
+#   3. This same acquire also backs the laptop `verify-merge` CLI via
+#      acquire_host_verify_worktree, where cli.py treats the timeout as a
+#      TERMINAL bail ("verify exits without ever building") rather than a
+#      requeue — 300s there would buy up to 5 min of dead laptop wall-clock
+#      per contended run for no benefit.
+# Declared `int` to mirror the seed constant's whole-second convention; unlike
+# it, this value is never handed to a CLI, only to the in-process
+# acquire_merge_verify_flock helper.  A plain module constant (no config knob,
+# no env override), monkeypatchable in tests via the module global.
+_RESET_WARM_LANE_LOCK_WAIT_SECS: int = 30
+
 # flock's --conflict-exit-code (-E) for _SEED_WARM_LANE_LOCK_WAIT_SECS above.
 # Deliberately mirrors timeout(1)'s well-known 124 "command timed out"
 # convention so the sentinel is self-documenting in logs, and is chosen
@@ -1172,32 +1202,67 @@ class MergeVerifyLeaseHeld(RuntimeError):
 
 
 class MergeVerifyLeaseContended(RuntimeError):
-    """Raised by :meth:`GitOps.merge_verify_lease` when the merge-verify flock
-    stays contended past its bounded wait (task 2828, limb 2).
+    """Raised when the shared merge-verify ``<lane_dir>.lock`` stays contended
+    past a bounded wait, so the caller must DEFER rather than proceed
+    unprotected.
 
-    Before this task, a contended flock (``acquire_merge_verify_flock``'s
-    bounded wait timing out) made ``merge_verify_lease`` yield WITHOUT
-    recording a lease — the local verify then ran 1--2h fully UNPROTECTED, so
-    a concurrent reseed/thin/gc could clobber its working tree mid-run. The
-    lease now RAISES this instead, propagating cleanly out of
-    ``_run_post_merge_verify``'s ``AsyncExitStack`` to the merge worker's
-    requeue seam so the dispatch is DEFERRED (requeued to try again later),
-    never run unprotected.
+    TWO raise sites, both on the SAME lock inode with the SAME correct
+    response:
+
+    * :meth:`GitOps.merge_verify_lease` — the verify-span lease (task 2828,
+      limb 2).  Before that task a contended flock
+      (``acquire_merge_verify_flock``'s bounded wait timing out) made the
+      lease yield WITHOUT recording a lease — the local verify then ran 1--2h
+      fully UNPROTECTED, so a concurrent reseed/thin/gc could clobber its
+      working tree mid-run.
+    * :meth:`GitOps.reset_persistent_merge_worktree` — the warm-swap RESET's
+      own acquire, reached via ``_acquire_warm_verify_worktree`` (task 3003).
+      Here the raise means the warm worktree was NEVER touched (fail-CLOSED,
+      the tree is left exactly as the holder found it) — NOT that a verify ran
+      unprotected.  It fires BEFORE any verify is dispatched at all.
+
+    Both propagate to the merge worker's requeue seam
+    (``_run_inflight_verify``), which DEFERS the dispatch — re-queued to try
+    again later — instead of resolving a ``MergeOutcome('blocked')``.  That
+    placement matters: a blocked resolution here would carry a DETERMINISTIC
+    reason string, producing an identical ``merge_outcome_signature`` on every
+    attempt and tripping workflow.py's ``consecutive_merge_thrash`` ladder into
+    a false-positive human escalation.
 
     Modeled on :class:`MergeVerifyLeaseHeld` (a RuntimeError carrying lock
     context). Its workflow_types disposition row (REQUEUE,
     ``counts_against_requeue_cap=False``) mirrors MergeVerifyLeaseHeld's — a
-    contended lease is a transient "come back later," not a task failure.
+    contended lane is a transient "come back later," not a task failure.
+
+    Args:
+        lock_path: The contended ``<lane_dir>.lock``.
+        wait_secs: The bounded wait that elapsed before giving up.
+        operation: Optional name of the acquire that contended, used ONLY to
+            shape the message so an operator log says WHICH acquire lost the
+            race.  ``None`` (the default) reproduces the task-2828 message
+            byte-for-byte, keeping every existing raiser and test unchanged.
+            The ``(lock_path, wait_secs)`` positional signature is likewise
+            unchanged.
     """
 
-    def __init__(self, lock_path: Path, wait_secs: float):
+    def __init__(
+        self, lock_path: Path, wait_secs: float, *, operation: str | None = None,
+    ):
         self.lock_path = lock_path
         self.wait_secs = wait_secs
-        super().__init__(
-            f'merge-verify lane lock {lock_path} still contended after a '
-            f'{wait_secs}s bounded wait — deferring this dispatch rather than '
-            f'running the verify unprotected'
-        )
+        self.operation = operation
+        if operation is None:
+            super().__init__(
+                f'merge-verify lane lock {lock_path} still contended after a '
+                f'{wait_secs}s bounded wait — deferring this dispatch rather than '
+                f'running the verify unprotected'
+            )
+        else:
+            super().__init__(
+                f'merge-verify lane lock {lock_path} still contended after a '
+                f'{wait_secs}s bounded wait during {operation} — deferring this '
+                f'dispatch rather than proceeding unprotected'
+            )
 
 
 async def _run(
@@ -8971,9 +9036,20 @@ class GitOps:
 
         Returns the fixed path (:attr:`persistent_merge_worktree_path`).
         Raises :exc:`RuntimeError` on git failure (mirrors
-        :meth:`_create_merge_worktree`) or on a bounded-wait timeout
-        acquiring the lane lock below (fail-CLOSED — a live reify/DF
-        holder must block the mutation, never be silently ignored).
+        :meth:`_create_merge_worktree`).
+        Raises :exc:`MergeVerifyLeaseContended` (task 3003) on a bounded-wait
+        timeout acquiring the lane lock below (fail-CLOSED — a live reify/DF
+        holder must block the mutation, never be silently ignored).  The
+        typed class is load-bearing, not decoration: the tree is untouched,
+        so the caller is expected to DEFER the whole dispatch (requeue and
+        retry later), NOT to classify it as a merge/verify failure.  A bare
+        ``RuntimeError`` here used to be mapped to a deterministic-reason
+        ``MergeOutcome('blocked')`` by the merge worker's generic handler,
+        whose identical signature on every attempt tripped
+        ``consecutive_merge_thrash`` into a false-positive human escalation.
+        The raise is deliberately SITE-LOCAL to the acquire — the git
+        failures inside the body below stay plain ``RuntimeError`` so a
+        genuine git fault still classifies as blocked.
         Raises :exc:`MergeVerifyLeaseHeld` (task 2315, BUG 1) BEFORE
         touching the tree at all when a DIFFERENT live process holds the
         merge-verify lease — self pgid is excluded so the normal
@@ -9003,7 +9079,7 @@ class GitOps:
         :func:`release_merge_verify_flock` never runs for it and the lane
         lock stays held until process exit. This window requires
         cancellation to race the acquire and is bounded by
-        ``_SEED_WARM_LANE_LOCK_WAIT_SECS``, so it is treated as an accepted,
+        ``_RESET_WARM_LANE_LOCK_WAIT_SECS``, so it is treated as an accepted,
         documented edge case here rather than guarded — a shielded-cleanup
         fix would add async-ownership complexity out of proportion to this
         task's scope.
@@ -9019,13 +9095,20 @@ class GitOps:
         # this await cannot stop the to_thread worker, so a fd acquired
         # after cancellation has already propagated is discarded unreleased.
         fd = await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, _SEED_WARM_LANE_LOCK_WAIT_SECS,
+            acquire_merge_verify_flock, lock_path, _RESET_WARM_LANE_LOCK_WAIT_SECS,
         )
         if fd is None:
-            raise RuntimeError(
-                f'Timed out after {_SEED_WARM_LANE_LOCK_WAIT_SECS}s waiting to '
-                f'acquire {lock_path} — a live reify/DF actor holds the lane '
-                f'lock; refusing to mutate {warm_path} unprotected'
+            # SITE-LOCAL raise (task 3003): scoped to the lock ACQUIRE alone.
+            # A live reify/DF actor still holds the lane lock, so the tree is
+            # left completely untouched (fail-CLOSED) and the caller must
+            # DEFER — this is a transient "come back later," not a merge
+            # failure.  The git faults inside the try body below deliberately
+            # keep raising plain RuntimeError so a genuine git fault still
+            # classifies as 'blocked' rather than looping on a defer.
+            raise MergeVerifyLeaseContended(
+                lock_path,
+                _RESET_WARM_LANE_LOCK_WAIT_SECS,
+                operation='warm merge-worktree reset',
             )
         try:
             if not await self._is_registered_worktree(warm_path):

@@ -467,8 +467,9 @@ class TestResetHoldsLaneLock:
         # Comfortably longer than the ~0.3s external hold below, but far
         # short of the real 30s default so a regression that never
         # acquires (and so never blocks at all) still fails fast rather
-        # than via this test hanging for 30s.
-        monkeypatch.setattr(git_ops_mod, '_SEED_WARM_LANE_LOCK_WAIT_SECS', 5)
+        # than via this test hanging for 30s.  The RESET path has its own
+        # constant (task 3003), distinct from _seed_warm_lane's.
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 5)
 
         merge_commit_a = await _get_merge_commit(real_git_ops, 'reset-lock-a1', 'rla1.py')
         await real_git_ops.reset_persistent_merge_worktree(merge_commit_a)  # create-once
