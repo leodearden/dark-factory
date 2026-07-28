@@ -268,11 +268,10 @@ def check_files_for_scope(
     the registry is not given — ``'../other-repo/x.py'``, ``'~user/...'`` —
     remain UNOWNED and so fail open here, exactly as they did pre-3109; see
     :meth:`ProjectPrefixRegistry._owner_for_absolute_path` for the pinned
-    residue.  Used
-    by the interceptor's FILES-certain check (task 2206) to hard-reject a
-    submission whose ``metadata.files`` name a path under a KNOWN other
-    project's tree — no LLM adjudication, since an exact owner lookup leaves
-    nothing to adjudicate.
+    residue.  Used by the interceptor's FILES-certain check (task 2206) to
+    hard-reject a submission whose ``metadata.files`` name a path under a
+    KNOWN other project's tree — no LLM adjudication, since an exact owner
+    lookup leaves nothing to adjudicate.
 
     Returns ``ok`` when the registry is empty/falsy, *files* is empty/falsy,
     or every file is either unowned or owned by *project_id*.  On a
@@ -340,9 +339,9 @@ def all_files_foreign_owner(
     so an all-absolute foreign file set is tagged just like its repo-relative
     spelling (task 3109), and its residual fail-open spellings
     (``'../other-repo/x.py'``, ``'~user/...'``), which stay unowned.  Files
-    with no registered owner (``project_for_path`` returns
-    ``None``) are neutral — they neither block nor establish cross-repo
-    (conservative, matching :func:`_aggregate_owner_mismatches`).
+    with no registered owner (``project_for_path`` returns ``None``) are
+    neutral — they neither block nor establish cross-repo (conservative,
+    matching :func:`_aggregate_owner_mismatches`).
 
     Returns ``None`` when the registry/*files* are empty, when the FILER
     (*project_id*) is not a registered project, when ANY file is owned by

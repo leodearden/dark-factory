@@ -254,10 +254,9 @@ class ProjectPrefixRegistry:
         segments resolved, duplicate separators collapsed — still no
         filesystem access), then a root ``R`` owns *file_path* when
         ``file_path == R`` or ``file_path.startswith(R + '/')`` (component
-        boundary, so
-        ``'/home/leo/src/dark-factory-old/x'`` does NOT match the root
-        ``'/home/leo/src/dark-factory'``); the LONGEST matching root wins when
-        roots nest. This is ROOT-AUTHORITATIVE: an absolute path under a known
+        boundary, so ``'/home/leo/src/dark-factory-old/x'`` does NOT match the
+        root ``'/home/leo/src/dark-factory'``); the LONGEST matching root wins
+        when roots nest. This is ROOT-AUTHORITATIVE: an absolute path under a known
         root is owned by that project even when its remainder matches NO
         registered prefix (e.g. ``<root>/docs/x.md``, whose ``docs/`` is in
         ``_GENERIC_DIRS``, or a bare ``<root>/README.md``) — an absolute path
