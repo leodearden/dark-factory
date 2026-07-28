@@ -7102,9 +7102,24 @@ class Harness:
                 'spare_warm_lanes (the field actually lives on git.) was ignored '
                 'for weeks.\n\n'
                 f'Unknown keys (dotted path → placement hint):\n{key_lines}\n\n'
+                'A placement hint is ADVISORY: it is a name match against the '
+                'model tree and may be a coincidental collision, so confirm the '
+                'key is really misplaced before moving it.\n\n'
                 'Fix each key (move it to the hinted path, or remove it) and '
                 'restart — a clean census auto-resolves this escalation.  Run '
-                '`orchestrator check-config --config <path>` to verify.'
+                '`orchestrator check-config --config <path>` to verify.\n\n'
+                'If a key is INTENTIONAL — deliberately present for tooling '
+                'other than the orchestrator, e.g. read by this project\'s own '
+                'scripts — do not delete it.  Excuse it instead, either by '
+                'renaming it under the reserved `x_`/`x-` prefix (works at any '
+                'depth, no config ceremony) or by adding its dotted path to '
+                '`config_key_census.ignore` in the same YAML (fnmatch globs, so '
+                '`some_namespace.*` excuses a whole namespace; note a '
+                '`<name>.*` glob does NOT match the bare parent key `<name>`, '
+                'which must be listed exactly).  Then restart — or hot-reload, '
+                'since `config_key_census.*` is green-tier — and this escalation '
+                'auto-resolves.  Excused keys stay listed by check-config at '
+                'exit 0, so the opt-out remains auditable.'
             )
             esc = Escalation(
                 id=queue.make_id(_CONFIG_UNKNOWN_KEYS_SENTINEL),
@@ -12355,8 +12370,10 @@ class Harness:
                 'unchanged': 0,
                 'error': error,
                 # Always present so callers can read report['unknown_config_keys']
-                # unconditionally; a failed load has no fresh config to census.
+                # / report['ignored_config_keys'] unconditionally; a failed load
+                # has no fresh config to census.
                 'unknown_config_keys': [],
+                'ignored_config_keys': [],
             }
             if self.event_store:
                 self.event_store.emit(EventType.config_reload, data=report)
@@ -12384,6 +12401,13 @@ class Harness:
         report['unknown_config_keys'] = [
             uk._asdict() for uk in fresh.unknown_key_census
         ]
+        # Keys deliberately excused by an escape hatch (reserved x_/x- prefix, or
+        # an operator config_key_census.ignore entry).  Reported separately and
+        # never folded into unknown_config_keys, so an over-broad glob stays
+        # visible to the operator without ever reading as a failure.
+        report['ignored_config_keys'] = [
+            ik._asdict() for ik in fresh.ignored_key_census
+        ]
         # Treat reload symmetrically with startup (INV-5, ONE implementation).
         # apply_reload copies only model_fields, so the _unknown_key_census
         # PrivateAttr would otherwise keep its stale startup value on the live
@@ -12393,6 +12417,7 @@ class Harness:
         # exactly as startup does.  The filer is None-safe (no-op without an
         # escalation queue) and fail-open, so it can never break a reload.
         self.config._unknown_key_census = fresh.unknown_key_census
+        self.config._ignored_key_census = fresh.ignored_key_census
         await self._file_config_unknown_keys_escalation()
         if self.event_store:
             self.event_store.emit(EventType.config_reload, data=report)
