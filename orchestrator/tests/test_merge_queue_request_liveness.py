@@ -1742,6 +1742,7 @@ class TestContendedLeaseDefers:
         from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
         from orchestrator.merge_queue import (  # noqa: PLC0415
             InflightStatus,
+            InflightVerifyResult,
             SpeculativeMergeWorker,
         )
         from orchestrator.verify_runner import HostLease  # noqa: PLC0415
@@ -1767,7 +1768,7 @@ class TestContendedLeaseDefers:
 
         task_id = 'lease-held-holder'
 
-        async def _drive_one(branch: str) -> tuple[MergeRequest, object]:
+        async def _drive_one(branch: str) -> tuple[MergeRequest, InflightVerifyResult]:
             # Fresh merged item on a distinct branch but the SAME task_id, so
             # the per-task streak counter accumulates across dispatch attempts.
             req, item = await _make_merged_item(
