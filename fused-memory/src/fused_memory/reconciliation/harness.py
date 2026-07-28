@@ -111,8 +111,13 @@ except ImportError:
 # HAS_ESCALATION before using it.
 #
 # Escalation-closure contract (A7b / plans/afk-A7-recon-closure.md):
-#   - The reconciliation harness NEVER calls queue.resolve().
+#   - The reconciliation harness NEVER calls queue.resolve() ON THE RECON
+#     ESCALATION QUEUE (config.escalation_queue_dir).
 #   - The watcher session (port 8103) is the sole closer of recon escalations.
+#     Scope note (task 2998): the judge-halt record BacklogPolicy writes to
+#     <project_root>/data/escalations/ lives in a DIFFERENT queue and is closed
+#     by BacklogPolicy.on_judge_unhalt — write and close stay with the class
+#     that owns that record, so this invariant is not contradicted.
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
@@ -575,20 +580,43 @@ class ReconciliationHarness:
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
 
-        Routes to escalation when an orchestrator is live for this project;
-        otherwise the next mutating MCP call will surface the halt as a
-        structured rejection via :class:`BacklogPolicy`. Best-effort: a
-        failure here must not break the harness loop.
+        Routes to escalation when an orchestrator is live for this project.
+        When it does not — the rejection branch, or a rate-limited call that
+        wrote no file — the halt reaches NO caller: the ``ReconciliationJudgeHalted``
+        verdict returned here is not surfaced anywhere (the next mutating MCP
+        call runs ``BacklogPolicy.check()``, which re-evaluates the BACKLOG
+        condition and yields ``ReconciliationBacklogExceeded`` instead). The
+        only fallback is the retry below: the dedupe sentinel is claimed ONLY
+        on a verdict that actually wrote an escalation file, so a failed
+        attempt is retried on the next halted tick (~5s) rather than burning
+        the single per-process token (task 2998 GAP B / 2b).
+
+        Best-effort: a failure here must not break the harness loop.
         """
         if self._backlog_policy is None or project_id in self._halt_escalated:
             return
-        self._halt_escalated.add(project_id)
         try:
-            await self._backlog_policy.on_judge_halt(project_id, reason)
+            verdict = await self._backlog_policy.on_judge_halt(project_id, reason)
         except Exception:
             logger.exception(
                 'harness: backlog_policy.on_judge_halt raised for %s', project_id,
             )
+            return
+
+        if (
+            verdict is not None
+            and verdict.outcome == 'escalated'
+            and verdict.escalation_path is not None
+        ):
+            self._halt_escalated.add(project_id)
+            return
+
+        outcome = getattr(verdict, 'outcome', None)
+        logger.warning(
+            'harness: judge halt for %s escalated to nothing (outcome=%s) — '
+            'will retry on next halted tick',
+            project_id, outcome,
+        )
 
     def _on_judge_unhalt(self, project_id: str) -> None:
         """Callback invoked by Judge.unhalt so a subsequent halt re-escalates.
@@ -1957,8 +1985,11 @@ class ReconciliationHarness:
         """Submit an escalation to the queue (fire-and-forget).
 
         Routing contract (A7b):
-        - The harness NEVER calls queue.resolve() — the escalation-watcher
+        - The harness NEVER calls queue.resolve() **on the recon escalation
+          queue** (``config.escalation_queue_dir``) — the escalation-watcher
           session (port 8103) is the sole closer per plans/afk-A7-recon-closure.md.
+          The judge-halt record in ``<project_root>/data/escalations/`` is a
+          DIFFERENT queue, written and closed by BacklogPolicy (see task 2998).
         - Dedup folds only on the way IN, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
         - When finding is not None (a finding dict with category / affected_ids /
           description), the fingerprint is keyed on finding identity so the same
