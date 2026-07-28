@@ -375,3 +375,196 @@ INV-4 exists for. This decision specifies the escape rather than leaving it to t
   split, `harness.py:164-168`). `blocking`, not `info`, because a runaway silent-rewrite loop is a
   "someone must look at this now" condition, matching this repo's `recon_watchdog_kill_storm`
   precedent — not a routine triage item.
+- **This is a monitoring alarm, not a rate limiter.** Crossing the threshold does **not** reject
+  the triggering call — the write still proceeds and is still journaled. INV-4's house pattern
+  (the harness storm counters cited above) is uniformly "observe the rate, escalate loudly," never
+  "block at N+1." A hard block here would risk a legitimate large consolidation cycle failing
+  mid-run over its own success count. The implementer must not invent a blocking behavior that was
+  never decided.
+
+## §5 — Implementation hand-off
+
+### (a) Layering
+
+Mirrors `update_edge` exactly: MCP tool in `server/tools.py` → `MemoryService.update_memory` →
+`_journaled_backend_call(backend='mem0', operation=...)` → `_write_journal.log_write_op` →
+conditional `_emit_event`. The tool-level guard sequence, in order:
+
+1. `_resolve_identity(agent_id, session_id, ctx)` — must run first; nothing downstream can check
+   `agent_id` against an allowlist before it is resolved.
+2. **The §4 authorization gate**, checked immediately next — before project canonicalization,
+   before `store`/arm validation, before anything else — mirroring `add_system_record`'s explicit
+   rationale for the same ordering (`:1323-1326`): the gate "is the whole point of this tool," so
+   an unauthorized caller is rejected before any other validation work happens on its behalf. Which
+   allowlist(s) apply depends on which arm(s) the call requests (content → the content-amend
+   allowlist; metadata_patch/metadata_delete_keys → the metadata-patch allowlist; both arms in one
+   call → both allowlists must pass).
+3. `_canonicalize_project_id_arg` → `validate_project_id` → `_known_project_gate` — reused verbatim
+   from `delete_memory`'s prologue (`:1976-1983`). **No `_backlog_gate`** — that gate exists for
+   tools that create new backlog pressure (`add_memory`, `add_system_record`); `update_memory`
+   mutates an existing record and creates none, matching `delete_memory`'s (not `add_memory`'s)
+   omission of it.
+4. `store` validated against `_VALID_STORES`; `store='graphiti'` is rejected with a
+   `ValidationError` naming `update_edge` (§3).
+5. Arm validation: at least one of `content`/`metadata_patch`/`metadata_delete_keys` non-empty;
+   `content` non-empty when supplied; `reason` non-empty when `content` is supplied; reserved
+   (`_MEM0_MANAGED_METADATA_KEYS`) keys rejected from both `metadata_patch` and
+   `metadata_delete_keys`; a key present in both is rejected as contradictory (§3).
+6. `_extract_causation(metadata, agent_id)` (`:479-497`) — unchanged from every sibling tool.
+7. Dispatch to `memory_service.update_memory(...)`, which performs the storm-counter
+   observe-and-maybe-escalate step (content-amend calls only, post-write) alongside the journal and
+   event steps below.
+
+### (b) The write-path fork — the load-bearing mechanical finding
+
+Verified directly against this environment's pinned mem0 (`.venv/lib/python3.13/site-packages/mem0`,
+same dependency the fused-memory venv resolves):
+
+- **`AsyncMemory.update`'s own docstring is wrong.** `mem0/memory/main.py:2253-2254` reads:
+  *"metadata (dict, optional): Additional metadata to update. Existing metadata fields not
+  specified here will be preserved."* This is false. `_update_memory` (`:2449-2509`) builds
+  `new_metadata = deepcopy(metadata) if metadata is not None else {}` (`:2463`) — a **fresh** dict,
+  not a merge — and re-attaches only nine keys from the existing payload: `data` (`:2465`,
+  overwritten to the new content), `hash` (`:2466`, recomputed), `created_at` (`:2467`, preserved
+  from the existing point), `updated_at` (`:2468`, always regenerated to now), `user_id` /
+  `agent_id` / `run_id` (`:2471-2476`, only if not already present in the caller's `metadata`),
+  and `actor_id` / `role` (`:2478-2481`). Every one of these nine keys is exactly
+  `_MEM0_MANAGED_METADATA_KEYS`'s membership (`scripts/tag_cgl_eta_rehome_scope.py:235-238`) — the
+  script's constant is not a guess, it is this exact list, independently confirmed by reading
+  `_update_memory`'s source. Do not trust the docstring; trust `_update_memory`.
+- **`Memory.update` always supplies a vector, so Qdrant's payload-only path is unreachable through
+  it.** `_update_memory` unconditionally computes `embeddings` (`:2483-2488`) and calls
+  `self.vector_store.update(vector_id=memory_id, vector=embeddings, payload=new_metadata)`
+  (`:2490-2495`) — `vector` is never `None`. Qdrant's own `update` wrapper
+  (`mem0/vector_stores/qdrant.py:347-370`) branches on `if vector is not None and payload is not
+  None:` (`:356`) → full-point `upsert` with a `PointStruct` (`:357-358`); only the `else` arm
+  (`:359-370`) contains the payload-only `set_payload` call (`:361-365`). Since `_update_memory`
+  always supplies both, that `if` branch always wins — the `set_payload` arm is **structurally
+  unreachable** through `Memory.update`/`Mem0Backend.update`, confirming the plan's premise with
+  the exact mechanism, not just the symptom.
+
+**Consequence (DECIDED):**
+
+- The **content-amend arm** routes through the existing `Mem0Backend.update` (`mem0_client.py:238-262`)
+  unchanged. Re-embedding, the `updated_at` rewrite, and the mem0-internal `db.add_history` row
+  (`main.py:2498-2508`) are all *correct* here — a real content change should perturb ranking and
+  should leave its own trace in mem0's history table, in addition to the fused-memory-level journal
+  and `memory_updated` event (§4).
+- The **metadata-patch arm** must **not** route through `Mem0Backend.update` / mem0's
+  `Memory.update` at all — doing so would needlessly re-embed, rewrite `updated_at`, and append a
+  spurious mem0 history row for what may be a purely cosmetic tag. Instead, a **new**,
+  payload-only `Mem0Backend` method(s) using the backend's existing `_get_async_qdrant()`
+  (`mem0_client.py:272-281`) and Qdrant's own partial-payload primitives — verified present on
+  `AsyncQdrantClient`: `set_payload`, `delete_payload`, `overwrite_payload`:
+  - **merge** (`metadata_mode='merge'`, the default): `AsyncQdrantClient.set_payload(payload=<custom
+    subset>, points=[memory_id])`. Qdrant's `set_payload` is *already* a genuine partial-payload
+    merge at the storage layer (unlike mem0's `_update_memory`) — no read-before-write is needed.
+    `tests/test_mem0_qdrant_integration.py:69-90` (`test_set_payload_without_vector`) already
+    covers this primitive.
+  - **key deletion** (`metadata_delete_keys`): `AsyncQdrantClient.delete_payload(keys=[...],
+    points=[memory_id])` — also native, also no read-before-write.
+  - **replace** (`metadata_mode='replace'`): the **one** case that does need a read first —
+    `overwrite_payload` replaces the **entire** point payload, so the mem0-owned key subset must be
+    read back and re-attached before calling it, or the point loses its own `data`/`hash`/
+    `created_at` and becomes unreadable by mem0's own `get`/`search`. This read reuses (c) below —
+    no new read primitive.
+  - Reserved-key rejection at the tool boundary (§3) means none of these three operations ever
+    needs to defend against a caller supplying a mem0-owned key directly.
+
+### (c) Read-before-write
+
+`MemoryService.get_memory_by_id` (`:3339-3375`, shipped by task 2765 — commit `3a4de2a71e`)
+already returns the full raw Qdrant payload via `Mem0Backend.get_point_by_id`. This is the existing
+read leg for **both** the content-amend arm's metadata-reforwarding (mirroring
+`tag_cgl_eta_rehome_scope.py`'s `apply_tags`) **and** the metadata-patch arm's replace-mode
+read-before-`overwrite_payload`. No new read primitive is needed anywhere in this design.
+
+### (d) The TDD plan the implementer inherits
+
+Harness: `create_mcp_server(mock_service)` + `await mcp_server._tool_manager.call_tool(...)` + a
+local `_parse_tool_result` JSON decoder — exactly `tests/test_update_edge_tool.py:14-75`'s pattern
+(its own header comments itself as "Step N: RED tests (fail before step-N+1 implementation)," the
+established convention for this repo's tool-level TDD). Extend the existing
+`TestMem0BackendUpdate` class (`tests/test_mem0_client.py:379`, whose docstring currently records
+that `Mem0Backend.update` "had zero callers") rather than starting a new one. Service-level tests
+alongside `TestUpdateEdge`/`TestDeleteMemory` in `tests/test_memory_service.py`. Authz-gate tests
+alongside `tests/server/test_add_system_record_gate.py`.
+
+Required RED tests (enumerated so the follow-up inherits a concrete plan rather than re-deriving
+one):
+
+- Point-id/UUID stability across both arms (response echoes the same id the call was made with).
+- `created_at` preservation across both arms.
+- Metadata-patch shallow-merge preserves unlisted existing custom keys (merge mode).
+- `metadata_mode='replace'` replaces the custom subset but still preserves mem0-owned keys
+  underneath.
+- `metadata_delete_keys` removes exactly the named keys and nothing else.
+- Reserved-key rejection: a mem0-owned key in `metadata_patch` or `metadata_delete_keys` is a
+  `ValidationError`.
+- A key present in both `metadata_patch` and `metadata_delete_keys` is a `ValidationError`.
+- `store='graphiti'` is rejected, error message names `update_edge`.
+- Neither arm supplied → `ValidationError`.
+- `content` supplied with empty/missing `reason` → `ValidationError`; metadata-only arm with no
+  `reason` succeeds.
+- Authz-gate denial: an `agent_id` not matching the relevant allowlist is rejected before any
+  write, for each arm independently.
+- `mem0_update.enabled=False` rejects every caller regardless of `agent_id`.
+- `EventType.memory_updated` is emitted for the content-amend arm and **not** emitted by default
+  for a metadata-only patch.
+- Both arms produce a `WriteJournal.log_write_op`/`log_backend_op` row regardless of event
+  emission.
+- Storm counter fires the `mem0_in_place_update_storm` escalation once `storm_threshold`
+  content-amend calls from the same `agent_id` land within `storm_window_seconds`, and does
+  **not** count metadata-only calls toward it; the triggering call still succeeds (§4).
+
+Respect `fused-memory/pyproject.toml`'s pytest conventions: `asyncio_mode = "strict"` (`:33`),
+default deselection of live tests (`addopts = "...-m 'not integration'"`, `:34`), and
+`qdrant_skipif()` (`tests/test_mem0_qdrant_integration.py:16,25`) for any test that needs a live
+Qdrant.
+
+## §6 — Risks & rejected alternatives
+
+- **Uncontrolled mutation of historical records.** The mitigation is journal + event + config gate
+  (§4/§5), not immutability — this repo already treats Mem0/Graphiti records as correctable
+  (`delete_memory`, `update_edge`) rather than append-only, so an in-place Mem0 update is
+  consistent with the existing posture, not a new risk category. What was missing was the
+  *guardrail*, not the precedent for mutability; §4 supplies the guardrail this decision adds.
+- **The `created_at` preservation guarantee is the entire point.** It is the specific property
+  whose *absence* forced `prune_recon_cycle_summaries.py` and `sweep_orphan_flag_markers.py` to
+  delete rather than retag (§2). Both arms must preserve it; the RED test list in §5(d) makes this
+  non-negotiable rather than aspirational.
+- **INV-5 `no-lockstep-duplication` — the module-location call for `_MEM0_MANAGED_METADATA_KEYS`.**
+  §3 deferred *where* the shared extraction lands; deciding it here: **`fused_memory/backends/mem0_client.py`**
+  (module-level, alongside `Mem0Backend`), **not** `fused_memory/maintenance/rehome_scope_tag.py`.
+  Reasoning: `rehome_scope_tag.py`'s docstring (`:11-14`) scopes it explicitly to CGL-eta
+  rehome-specific content-tagging (`apply_scope_tag`/`scope_tag_for`/`CGL_ETA_REHOME_KIND`) — a
+  different concern from the generic "what does mem0 do to a payload on update" knowledge
+  `_MEM0_MANAGED_METADATA_KEYS` represents. `mem0_client.py` is where that knowledge already lives
+  today (`Mem0Backend.update`'s own docstring, `:245-256`, states the exact constraint this
+  constant encodes) and where the new metadata-only-arm backend method(s) (§5(b)) will live too —
+  so the constant, the docstring-documented constraint it encodes, and the two backend methods
+  that depend on it are colocated in one file, with a pinning test
+  (`tests/test_mem0_client.py`) asserting the frozenset's membership matches `_update_memory`'s
+  actual preserved-key set. `scripts/tag_cgl_eta_rehome_scope.py` imports the constant from there
+  instead of defining it; `rehome_scope_tag.py` is untouched, since its own concern (content-tag
+  prefixing) is orthogonal.
+- **INV-5, second obligation — do not duplicate `update_task`'s metadata-merge footgun one layer
+  up.** Task 1827's whole-blob `metadata_mode='replace'` destroyed sibling keys on tasks; task 395
+  resolved the general question of key-deletion/replace semantics for `update_task`
+  (`backends/sqlite_task_backend.py:_resolve_metadata_mode`, `:3204-3254`) by requiring an
+  *explicit* `metadata_mode` co-signal rather than an implicit/ambiguous one (the `append=False`
+  rejection, `:3243-3254`, is exactly this principle). `update_memory`'s `metadata_mode` reuses
+  that **naming** and that **explicit-intent philosophy** deliberately — same operator-facing
+  vocabulary (`'merge'`/`'replace'`), same "reject ambiguity, don't guess" posture — but does
+  **not** share a code path with `_resolve_metadata_mode`, and justifiably so: tasks store metadata
+  as a flat JSON column resolved in Python; Mem0 records store it as a Qdrant point payload
+  resolved via `set_payload`/`overwrite_payload`. A shared helper across two different backends
+  with different native partial-update primitives would itself be a false abstraction — INV-5
+  targets duplicated *logic that must agree byte-for-byte*, not duplicated *vocabulary*, and the
+  vocabulary is what's shared here.
+- **The near-duplicate guard's existing hints become actionable, not yet verified correct.** Once
+  `update_memory` lands, `server/near_duplicate_guard.py`'s "search first and update or skip" (`:40`)
+  and "update/consolidate" (`:52`) hints stop instructing agents to do the impossible (§2 point 1).
+  The follow-up must re-read both hint strings against the shipped tool's actual name/arguments and
+  confirm they still read correctly (e.g. that "update" unambiguously means `update_memory` and not
+  some other tool) rather than leaving them newly-actionable but subtly wrong.
