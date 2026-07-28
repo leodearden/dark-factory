@@ -5322,6 +5322,17 @@ class TaskWorkflow:
           server-side.  Keeping them in agreement means that same-dispatch clear
           is a real retry.
 
+        ACCEPTED residual race (review amendment): ``'replace'`` is not
+        unconditionally safe even when the read SUCCEEDED. Read and write
+        straddle an ``await`` boundary, so a whole-blob overwrite silently
+        drops any key another process wrote in between (``'merge'`` could not
+        lose an unsupplied key that way). See
+        :meth:`_clear_merge_phase_entered` for the full statement of the
+        window, its mitigations, and why it cannot be eliminated without a
+        targeted key-delete backend mode (the backend accepts only
+        ``{'merge', 'additive', 'replace'}``) — task 3151 above is that
+        vehicle for both clears.
+
         Idempotent no-op when no stamp is present: returns immediately without a
         fresh-metadata read or backend write, so it is cheap and safe to call
         unconditionally on every merge success (the common case never stamped).
@@ -5453,6 +5464,28 @@ class TaskWorkflow:
         The bounded cost of skipping is that the reaper may keep deferring for
         up to ``orphan_l0_merge_phase_freshness_secs`` before the stale stamp
         ages out (deferral, never suppression).
+
+        ACCEPTED residual race (review amendment) — ``'replace'`` is NOT
+        unconditionally safe once the read succeeded. This is a
+        read-modify-write across an ``await`` boundary (two MCP round-trips),
+        and a whole-blob overwrite drops any key another process wrote in
+        between; ``'merge'`` mode could not lose an unsupplied key that way.
+        At risk in that window: ``memory_hints`` re-attached by Stage-2
+        reconciliation, ``_causation_id``, and ``routing.latest`` — the input
+        to the reaper's SIBLING ``_has_fresh_dispatch`` gate, so a clobber
+        there would re-open the task-2931 false positive. Mitigations, in
+        order: (1) read and write are back-to-back with no intervening awaits,
+        which is the narrowest this can be without a new backend primitive;
+        (2) this workflow issues no LLM call while the clear runs, so its own
+        routing mirror is not a competing writer (an external writer such as
+        reconciliation still can be); (3) the write is skipped entirely when
+        the read failed or returned a corrupt blob. It cannot be ELIMINATED
+        here: the backend accepts only ``{'merge', 'additive', 'replace'}``
+        (``sqlite_task_backend._METADATA_MODES``) and offers no targeted
+        key-delete. A ``delete_keys`` mode would make both clears atomic and
+        is filed as follow-up work (fused-memory backend + scheduler, outside
+        this task's module scope). Pinned by
+        ``test_clear_replace_loses_concurrent_backend_write_in_read_window``.
 
         Deliberately NOT cleared defensively in the harness ``_run_slot``
         finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an

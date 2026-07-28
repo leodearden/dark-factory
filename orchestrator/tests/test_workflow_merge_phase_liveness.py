@@ -315,6 +315,59 @@ class TestClearHelper:
         assert f.wf.task['metadata']['retry_ledger'] == {'x': 1}
 
     @pytest.mark.asyncio
+    async def test_clear_replace_loses_concurrent_backend_write_in_read_window(self):
+        """Characterization test — documents an ACCEPTED cost of 'replace',
+        not desired behaviour.
+
+        Switching the clear to ``metadata_mode='replace'`` is what makes
+        delete-by-omission work, but it opens a lost-update window that
+        ``'merge'`` mode did not have: read-modify-write across an ``await``
+        boundary, then a WHOLE-BLOB overwrite. Any key another process writes
+        between the two round-trips is silently dropped — including
+        ``routing.latest``, the input to the reaper's sibling
+        ``_has_fresh_dispatch`` gate. Pinned here so the next reader finds it
+        as a known property rather than a surprise; it cannot be eliminated
+        without a targeted key-delete mode (the backend accepts only
+        {'merge', 'additive', 'replace'} — sqlite_task_backend._METADATA_MODES).
+
+        Models a real backend blob so the loss is observable rather than
+        asserted about a mock payload.
+        """
+        backend_blob = {
+            'merge_phase_liveness': dict(_STAMP),
+            'memory_hints': ['h1'],
+        }
+        f = _make(metadata={'merge_phase_liveness': dict(_STAMP)})
+
+        async def _get_task(_task_id):
+            snapshot = {'metadata': dict(backend_blob)}
+            # ...and now ANOTHER writer lands a key before our write does.
+            backend_blob['routing'] = {
+                'latest': {'decided_at': '2026-07-24T05:00:05+00:00'},
+            }
+            return snapshot
+
+        async def _update_task(_task_id, metadata=None, metadata_mode=None, **_kw):
+            assert metadata_mode == 'replace'
+            backend_blob.clear()
+            backend_blob.update(metadata or {})   # whole-blob overwrite
+            return True
+
+        f.scheduler.get_task = AsyncMock(side_effect=_get_task)
+        f.scheduler.update_task = AsyncMock(side_effect=_update_task)
+
+        await f.wf._clear_merge_phase_entered()
+
+        # The clear does its job: the stamp is really gone from the backend
+        # copy, and the sibling key read in the same snapshot survives.
+        assert 'merge_phase_liveness' not in backend_blob
+        assert backend_blob['memory_hints'] == ['h1']
+        # ACCEPTED LOSS: the interleaved write is gone. Under the old 'merge'
+        # mode it would have survived (omitted keys were preserved) — but so
+        # would the stamp, which is the bug this clear exists to fix.
+        assert 'routing' not in backend_blob
+
+    @pytest.mark.asyncio
     async def test_clear_skips_durable_write_when_backend_metadata_is_non_dict(self):
         # Third unreadable-blob shape: get_task returns a task whose persisted
         # `metadata` is CORRUPT (a non-dict) — a case scheduler.update_task's
