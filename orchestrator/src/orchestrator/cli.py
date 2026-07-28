@@ -1174,9 +1174,17 @@ def _run_single_eval(
                 )
                 architect_results.append(result)
                 plan_quality = result.metrics.get('plan_quality')
+                # A cap-tainted cell names its infra refusal inline, so an
+                # operator watching the run sees it LIVE rather than a bare
+                # `plan_quality=None` that reads like a scoring quirk. Healthy
+                # cells echo exactly as before.
+                taint = (
+                    f' cap-tainted: {result.metrics.get("invocation_error")}'
+                    if result.metrics.get('cap_tainted') else ''
+                )
                 click.echo(
                     f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} plan_quality={plan_quality} '
+                    f'{result.outcome} plan_quality={plan_quality}{taint} '
                     f'({result.wall_clock_ms / 1000:.1f}s)'
                 )
             else:
