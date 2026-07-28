@@ -5,22 +5,22 @@ PRD: docs/prds/merge-worktree-lifecycle-integrity.md, task zeta (the B+H
 done-gate).  All five prerequisite legs are LANDED and BEHAVIOUR-FROZEN for
 this batch:
 
-  alpha (2924) -- GitOps.remove_merge_worktree_guarded (git_ops.py:8239):
+  alpha (2924) -- GitOps.remove_merge_worktree_guarded (git_ops.py):
       lease-enforced removal primitive; outcome vocabulary 'removed' /
       'skipped_lease_held' / 'skipped_persistent' / 'not_present' / 'failed'.
-  beta  (2925) -- classify_worktree_entry (git_ops.py:467) + the C2 namespace
-      guard in Harness._recover_crashed_tasks (harness.py:2842-2859): the
+  beta  (2925) -- classify_worktree_entry (git_ops.py) + the C2 namespace
+      guard in Harness._recover_crashed_tasks (harness.py): the
       crash-recovery sweep SKIPS+REPORTS `_merge-*`/infra bands instead of
       force-removing them (the 2026-07-22 task/5326 incident).
   gamma (2926) -- recover_pending_merges' registry-gated per-branch collapse
-      (merge_queue_store.py:433-537): a branch with N surviving journal
+      (merge_queue_store.py): a branch with N surviving journal
       entries enqueues exactly ONE winner (descendant-most snapshot tip);
       every loser attaches as a peer waiter whose future mirrors the
       winner's terminal outcome.
   delta (2927) -- coalesce_or_enqueue_merge_request's duplicate_in_verify
-      reject (merge_queue.py:2991/4293): a newer SHA submitted while the
-      earlier SHA is IN VERIFY is structurally REJECTed, not coalesced or
-      replaced.
+      reject (merge_queue.py, reject code _C3_DUPLICATE_IN_VERIFY_CODE): a
+      newer SHA submitted while the earlier SHA is IN VERIFY is structurally
+      REJECTed, not coalesced or replaced.
   epsilon (2928) -- retire_cancelled_merge_request (see
       test_merge_cancel_retire.py): a merge_cancel FULLY retires the
       cancelled entry (registry slot + worktree + sticky retention) before
@@ -61,8 +61,8 @@ leaf, PRD Sec.8/Sec.9), so it is not exercised here.
 Concurrency model -- READ THIS BEFORE editing test bodies
 -----------------------------------------------------------
 Harness.run()'s two startup recovery entry points, `_recover_pending_merges`
-(step 1c0a, harness.py:1881) and `_recover_crashed_tasks` (step 2c,
-harness.py:2010), are SEQUENTIAL awaits -- NOT gathered/parallelized. The
+(run() step 1c0a) and `_recover_crashed_tasks` (run() step 2c), are
+SEQUENTIAL awaits -- NOT gathered/parallelized. The
 2026-07-22 task/5326 incident's concurrency was the pre-launched merge-worker
 BACKGROUND TASK (step 1b, `_start_merge_worker` -> create_task) draining the
 re-enqueued `_merge_queue` WHILE the crash-recovery sweep scanned worktrees.
@@ -129,7 +129,11 @@ the evidence that is actually load-bearing for that leg:
   of paths offered to `cleanup_worktree`, NOT `.exists()`:
     * every `_merge-*` / infra entry survives by the C2
       `classify_worktree_entry` skip, proven by
-      `cleaned_paths.isdisjoint(protected)` plus an exact-set pin.
+      `cleaned_paths.isdisjoint(protected)` plus an UPPER-BOUND pin
+      (`cleaned_paths <= {the two task-id-shaped entries}`, so any extra
+      offered path fails; the bound is deliberately not an equality --
+      see the pin's own comment for why freezing the live merge's source
+      worktree as REQUIRED would be pinning a mock artifact).
     * the task-shaped planless '999' dir is the POSITIVE CONTROL the same
       sweep cleans.
     DELIBERATE NON-FIX: `cleanup_worktree` stays an AsyncMock spy on this
@@ -153,11 +157,48 @@ the concurrency lock on the hottest files in the repo (harness.py,
 merge_queue.py) and conflict with the frozen seam the prerequisite tasks
 already landed.
 
-STALE-OFFSET WARNING
-------------------------
-Every `:NNNN` line citation above (and in inline comments below) can drift
-as the modules it cites are edited by unrelated work. Always locate
-symbols BY NAME (grep/search), never trust a line offset.
+NO LINE-OFFSET CITATIONS
+----------------------------
+Nothing in this file cites a `module.py:NNNN` offset, deliberately: an
+offset into harness.py / merge_queue.py / git_ops.py is stale within days
+of being written, and a citation a reader has to re-verify costs more than
+it saves. Every reference above and below names the SYMBOL (function,
+method, class, constant, or pytest node id) instead -- locate it with
+grep/search. Keep it that way when editing: cite by name, never by line.
+
+PROVENANCE -- these row classes are PORTS, not originals
+------------------------------------------------------------
+Only :class:`TestFiveThreeTwoSixReplayGate` is new behaviour coverage (it
+is the only test that composes the five legs under the incident's actual
+concurrency). Every other class here is a deliberate PORT of an existing
+unit test, re-homed so the PRD Sec.9 row matrix is legible and executable
+as ONE gate rather than scattered across five modules:
+
+  row(s) | test in this file                          | ported from
+  -------+--------------------------------------------+----------------------
+  1,2,4  | TestDeleterFace::                          | test_crash_recovery.py::
+         |   test_merge_and_infra_trees_survive_      |   TestRecoverCrashedTasksC2Namespace::
+         |   sweep_task_shaped_cleaned                |   test_infra_and_merge_survive_sweep_only_task_shaped_cleaned
+  3      | TestDeleterFace::                          | test_remove_merge_worktree_guarded.py::
+         |   test_dead_holder_fails_open_live_        |   the live-held-skip / dead-holder
+         |   holder_skips                             |   fail-open pair
+  6,7    | TestIdentityFaceRecoveryDedupe (x3)        | test_merge_queue_store.py::
+         |                                            |   TestRecoverPendingMergesRegistryDedup
+  8      | TestIdentityFaceInVerifyReject             | test_merge_queue_c3_submit_identity.py::
+         |                                            |   TestC3SubmitGateInVerify::test_in_verify_newer_sha_rejects
+  9      | TestIdentityFaceCancelResubmit             | test_merge_cancel_retire.py::
+         |                                            |   TestRetireCancelledMergeRequest (basic-retire
+         |                                            |   + identity-guard)
+  5      | (capstone only -- no standalone test)      | (new)
+
+MAINTENANCE CONSEQUENCE, stated so it is never a surprise: a production
+behaviour change on any of these legs turns BOTH this file and the module
+in the right-hand column red, and both must be updated. That cost is
+accepted on purpose -- the PRD's done gate is defined as a single readable
+Sec.9 row matrix -- but if you are here because a change made two files
+red, the right-hand column is where the ORIGINAL unit-level contract
+lives; treat this file as the composition/traceability layer over it, and
+do not deepen a port here that would be better expressed upstream.
 """
 
 from __future__ import annotations
@@ -273,7 +314,7 @@ async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
 
 # ---------------------------------------------------------------------------
 # Recovery-harness factory (ported from test_crash_recovery.py's ``harness``
-# fixture, lines 29-88) -- a plain factory function (not a fixture) so the
+# fixture) -- a plain factory function (not a fixture) so the
 # capstone can attach additional real components (merge store/registry/
 # worker) after construction without a second fixture indirection layer.
 # ---------------------------------------------------------------------------
@@ -1319,7 +1360,7 @@ class TestIdentityFaceInVerifyReject:
 
 # ---------------------------------------------------------------------------
 # Retire+resubmit fixture (row 9) -- ported from
-# test_merge_cancel_retire.py:43-69.
+# test_merge_cancel_retire.py's ``_RetireSpy``.
 # ---------------------------------------------------------------------------
 
 
