@@ -4598,6 +4598,89 @@ class TaskWorkflow:
         )
         return False
 
+    async def _read_fresh_backend_metadata(
+        self,
+        *,
+        log_context: str,
+        require_fresh: bool = False,
+    ) -> dict | None:
+        """Read the backend's current task metadata blob, or ``None`` on failure.
+
+        Extracted from :meth:`_merge_fresh_metadata` (task 2991) so a caller can
+        distinguish "read OK" from "could not read".  That distinction matters
+        only for the delete-by-omission clears
+        (:meth:`_clear_merge_phase_entered`, :meth:`_clear_merge_retry_pending`):
+        they persist with ``metadata_mode='replace'``, a whole-blob overwrite,
+        so writing a payload built from in-memory-only metadata would DELETE
+        every backend-only key (``memory_hints`` re-attached by Stage-2
+        reconciliation, ``_causation_id``) — the #4271 sibling-clobber bug.
+
+        Such a caller has two equivalent ways to refuse an unverified write, and
+        both funnel through here (rebase reconciliation, task 2991 vs task 3024):
+
+        * ``require_fresh=False`` (default) — a failed read returns ``None`` and
+          the caller skips its durable write itself.  Used by
+          :meth:`_clear_merge_phase_entered`, which needs the read-failed signal
+          inline so it can still clear the in-memory copy.
+        * ``require_fresh=True`` — a failed read RAISES instead of returning
+          ``None``, so a caller already wrapping its read+write in one
+          best-effort ``try`` (:meth:`_clear_merge_retry_pending`, via
+          :meth:`_merge_fresh_metadata`) lands the refusal in the same handler
+          as a persist failure.
+
+        Args:
+            log_context: Short descriptor of the write site, used verbatim in
+                the warning (e.g. ``'merge_phase_liveness clear'``).
+            require_fresh: When True, raise rather than report a failed read.
+                Never returns ``None`` under this flag.
+
+        Returns:
+            ``{}`` — read OK, backend metadata is empty.
+            ``dict`` — the backend's metadata blob.
+            ``None`` — could not read (``get_task`` raised, or returned a
+            non-dict such as ``None`` for a vanished/unreadable task).  Not
+            reachable when ``require_fresh`` is True.
+
+        Raises:
+            Exception: Only when ``require_fresh`` is True — the underlying
+                ``get_task`` error verbatim, or a :class:`RuntimeError` if the
+                read returned something other than a task dict.
+        """
+        try:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
+            if require_fresh:
+                logger.warning(
+                    'Task %s: failed to refresh metadata before %s write; '
+                    'refusing to build an unverified whole-blob payload '
+                    '(caller requires a backend-verified read): %s',
+                    self.task_id, log_context, exc,
+                )
+                raise
+            logger.warning(
+                'Task %s: failed to refresh metadata before %s write; '
+                'falling back to in-memory metadata '
+                '(memory_hints may be clobbered): %s',
+                self.task_id, log_context, exc,
+            )
+            return None
+        # Non-dict return (e.g. None for a vanished task) is the path production
+        # actually takes — Scheduler.get_task catches every exception and
+        # returns None.  Silent by design when require_fresh is False, which
+        # preserves the pre-extraction behaviour (it warned only on the
+        # exception branch).
+        if not isinstance(fresh_task, dict):
+            if require_fresh:
+                msg = (
+                    f'Task {self.task_id}: metadata refresh before {log_context} '
+                    f'write returned {type(fresh_task).__name__}, not a task dict '
+                    f'— refusing to build an unverified whole-blob payload'
+                )
+                logger.warning(msg)
+                raise RuntimeError(msg)
+            return None
+        return fresh_task.get('metadata') or {}
+
     async def _merge_fresh_metadata(
         self,
         in_memory_metadata: dict,
@@ -4616,7 +4699,10 @@ class TaskWorkflow:
 
         If ``get_task`` fails, logs a warning containing ``log_context`` and falls
         back to ``in_memory_metadata`` alone.  Mirrors the boundary-normalisation
-        pattern used in ``_handle_terminal_exit_on_block``.
+        pattern used in ``_handle_terminal_exit_on_block``.  The backend read
+        itself lives in :meth:`_read_fresh_backend_metadata`, which callers
+        needing the read-failed signal (the ``'replace'``-mode clears) use
+        directly.
 
         Args:
             in_memory_metadata: The in-memory metadata dict (from
@@ -4644,41 +4730,16 @@ class TaskWorkflow:
                 ``get_task`` error verbatim, or a :class:`RuntimeError` if the
                 read returned something other than a task dict.
         """
-        try:
-            fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
-            if require_fresh:
-                logger.warning(
-                    'Task %s: failed to refresh metadata before %s write; '
-                    'refusing to build an unverified whole-blob payload '
-                    '(caller requires a backend-verified read): %s',
-                    self.task_id, log_context, exc,
-                )
-                raise
-            logger.warning(
-                'Task %s: failed to refresh metadata before %s write; '
-                'falling back to in-memory metadata '
-                '(memory_hints may be clobbered): %s',
-                self.task_id, log_context, exc,
-            )
-            fresh_task = None
-        if require_fresh and not isinstance(fresh_task, dict):
-            msg = (
-                f'Task {self.task_id}: metadata refresh before {log_context} write '
-                f'returned {type(fresh_task).__name__}, not a task dict — refusing '
-                f'to build an unverified whole-blob payload'
-            )
-            logger.warning(msg)
-            raise RuntimeError(msg)
         # Merge: start from in-memory metadata so that locally-set keys not yet
         # persisted are preserved, then overlay fresh backend keys so that
         # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
-        # win on collision.  When get_task failed (fresh_task is None) the
-        # backend overlay is empty and we fall back to the in-memory copy only.
-        return {
-            **in_memory_metadata,
-            **((fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else {}),
-        }
+        # win on collision.  When the read failed (None, only reachable with
+        # require_fresh=False) the backend overlay is empty and we fall back to
+        # the in-memory copy only.
+        backend = await self._read_fresh_backend_metadata(
+            log_context=log_context, require_fresh=require_fresh,
+        )
+        return {**in_memory_metadata, **(backend or {})}
 
     async def _handle_no_plan_failure(
         self, reason: str, *, detail: str,
@@ -5314,9 +5375,24 @@ class TaskWorkflow:
         :meth:`_submit_to_merge_queue` (alongside ``scheduler.clear_merge_phase``)
         and on merge SUCCESS in :meth:`_merge_and_finalise`, so a just-enqueued
         / just-merged task does not carry a fresh stamp that would briefly defer
-        an unrelated stranded divergence orphan. Uses the full-dict
-        :meth:`_merge_fresh_metadata` + ``scheduler.update_task(metadata=...)``
-        pattern because only a full-dict write can REMOVE a key.
+        an unrelated stranded divergence orphan.
+
+        Deletion requires ``metadata_mode='replace'`` (review-fix R2-A). A plain
+        ``scheduler.update_task(metadata=...)`` resolves to
+        ``metadata_mode='merge'`` (scheduler.py), which the backend implements
+        as a shallow last-write-wins ``{**old, **new}`` where omitted keys are
+        PRESERVED — so popping a key out of the payload is a backend NO-OP.
+        ``'replace'`` is the mode the scheduler docstring designates for
+        delete-by-omission; it is a whole-blob overwrite, safe here ONLY because
+        the payload is built from a backend blob that was just re-read into
+        ``fresh``. Hence the guard: when
+        :meth:`_read_fresh_backend_metadata` reports a failed read the durable
+        write is SKIPPED (in-memory clear only), because a ``'replace'`` built
+        from in-memory-only metadata would delete backend-only keys
+        (``memory_hints``, ``_causation_id``) — the #4271 sibling-clobber bug.
+        The bounded cost of skipping is that the reaper may keep deferring for
+        up to ``orphan_l0_merge_phase_freshness_secs`` before the stale stamp
+        ages out (deferral, never suppression).
 
         Deliberately NOT cleared defensively in the harness ``_run_slot``
         finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an
@@ -5333,13 +5409,31 @@ class TaskWorkflow:
         metadata = self.task.get('metadata') or {}
         if 'merge_phase_liveness' not in metadata:
             return
-        fresh = await self._merge_fresh_metadata(
-            metadata, log_context='merge_phase_liveness clear',
+        backend = await self._read_fresh_backend_metadata(
+            log_context='merge_phase_liveness clear',
         )
+        if backend is None:
+            logger.warning(
+                'Task %s: skipping durable merge_phase_liveness clear — could '
+                'not re-read backend metadata, and a replace-mode write built '
+                'from in-memory metadata alone would clobber backend-only keys '
+                '(clearing in-memory only; the stale stamp ages out of the '
+                'reaper grace on its own)',
+                self.task_id,
+            )
+            self.task['metadata'] = {
+                k: v for k, v in metadata.items() if k != 'merge_phase_liveness'
+            }
+            return
+        fresh = {**metadata, **backend}
         fresh.pop('merge_phase_liveness', None)
         self.task['metadata'] = fresh
         try:
-            await self.scheduler.update_task(self.task_id, metadata=fresh)
+            await self.scheduler.update_task(
+                self.task_id,
+                metadata=fresh,
+                metadata_mode='replace',  # type: ignore[reportCallIssue]
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_phase_liveness clear: %s',
