@@ -116,6 +116,8 @@ Five thrusts, decomposed as chains (§9):
 | In-place update primitive | DF 3055 (in-progress) | none — add-only design throughout |
 | Consolidation-gate filing machinery (`milestone_gate`) | existing orchestrator/recon (deterministic_runner.py:1433, recon_self_model.py:552) | κ changes only the *input* (deterministic report), not the filing mechanism |
 | Writer briefings (roles) | orchestrator repo (same batch, leaf ε) | ε edits `roles.py` only; no reify-side text |
+| Task-metadata citation repointing on consolidation deletes | DF 3108 (in-progress, from reify esc-5710-1) | θ's op does **not** claim citation repointing; 3108's sweep remains valid whether deletes go through θ or not |
+| Prompt-level UUID-resolution discipline (failed predecessor of η) | DF 1144 (done 2026-05-09; documentedly insufficient per stage1.py:113) | η is the API-level enforcement 1144 could not provide |
 | G7 invariants doc | `docs/legibility/design-invariants.md` (single normative copy) | contracts cite slugs, no restatement |
 
 ## 9. Decomposition plan (one bullet per leaf; signals are the G2 gate)
