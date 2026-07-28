@@ -397,16 +397,26 @@ class BacklogPolicy:
         buffered count happens to be 0 right now.
 
         Ids known only from startup seeding (``register_known_project_roots``,
-        tracked in ``_startup_seeded``) are returned ONLY when their current
-        backlog is non-zero.  Without that filter, seeding every known project
-        at startup (task 2998 GAP A) would turn a single drainer wedge into
-        one escalation per KNOWN project rather than per ACTIVE one.
+        tracked in ``_startup_seeded``) are returned ONLY when the project's
+        OWN buffered count is non-zero.  Without that filter, seeding every
+        known project at startup (task 2998 GAP A) would turn a single drainer
+        wedge into one escalation per KNOWN project rather than per ACTIVE one.
+
+        The idle test deliberately reads ``count_buffered`` directly rather
+        than ``current_backlog``.  ``current_backlog`` folds in the GLOBAL
+        ``queue_depth`` + ``retry_in_flight`` (intentionally — a global
+        backlog is real pressure on every project), but the only caller of
+        this method is ``on_watchdog_wedge``, which the watchdog fires ONLY
+        when ``queue_depth + retry_in_flight > 0``.  Using it here would make
+        ``current_backlog(pid) >= outstanding > 0`` hold for EVERY project by
+        construction, so the filter would be inert and the fan-out regression
+        would be live.  The signal must be per-project only.
         """
         candidates: list[str] = []
         for project_id in sorted(self._state.keys()):
             if (
                 project_id in self._startup_seeded
-                and await self.current_backlog(project_id) == 0
+                and await self._event_buffer.count_buffered(project_id) == 0
             ):
                 continue
             candidates.append(project_id)
