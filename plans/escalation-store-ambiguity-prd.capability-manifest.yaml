@@ -1,0 +1,266 @@
+prd: plans/escalation-store-ambiguity-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3163
+  title: Deny escalation read tools to reconciliation stage agents
+  capabilities:
+  - name: recon-stage-disallow-covers-escalation-reads
+    binding: capability→producer (wired) — α edits cli_stage_runner.py:77-84; hook
+      stages/base.py:97 and argv path base.py:287 → cli_stage_runner.py:393 → shared/cli_invoke.py:1537
+      confirmed live
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mcp__escalation__get_pending_escalations
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: present
+  - name: escalation-write-stays-sanctioned
+    binding: rejection-mechanism, inverted — escalate_blocker must NOT appear in any
+      disallow list; it is the sole sanctioned recon use (prompts/stage2.py:623,647-648),
+      so over-denying breaks Stage 2 FIX D
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mcp__escalation__escalate_blocker
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: absent
+  - name: stage-prompt-declares-the-boundary
+    binding: capability→producer — boundary paragraph rendered from ONE ESCALATION_BOUNDARY*
+      module constant (INV-5), extending the scope wording at prompts/stage2.py:647-648
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ESCALATION_BOUNDARY
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+  - name: mcp-tool-names-honored-in-disallow-lists
+    binding: substrate CONFIRMED — mcp__fused-memory__delete_entity et al. already
+      listed at cli_stage_runner.py:38-49 and production-proven
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate α consumes, not a deliverable of α
+- label: β
+  task_id: 3164
+  title: Add get_task_escalation_history — archive-inclusive per-task escalation read
+  capabilities:
+  - name: get_task_escalation_history-tool-exists
+    binding: capability→producer — β registers it via @mcp.tool() (21 existing instances
+      in escalation/server.py)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def get_task_escalation_history
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: archive-inclusive-per-task-primitive
+    binding: substrate CONFIRMED — queue.py:396-430 two-tier scan; proven in-process
+      at orchestrator/harness.py:11024 and deterministic_runner.py:1954, both already
+      passing status=None
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing primitive β wraps; the wrapper itself is covered by the
+        tool-exists check
+  - name: b6-both-halves-hold-on-disk
+    binding: premise verified EMPIRICALLY against /home/leo/src/reify/data/escalations
+      — get_by_task('5534', status='pending') → [] while get_by_task('5534') → esc-5534-1
+      status='resolved' level=2; same for 5557
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: get_task_escalation_history
+      paths:
+      - escalation/tests/
+      expect: present
+  - name: pending-only-semantics-unchanged
+    binding: non-regression — test_queue.py:376 and :386 are spec-locked; β wraps,
+      never widens, the status='pending' fast path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: test_get_by_task_status_pending_excludes_archive
+      paths:
+      - escalation/tests/test_queue.py
+      expect: present
+- label: γ1
+  task_id: 3165
+  title: Thread StoreIdentity into create_server and both production call sites
+  capabilities:
+  - name: StoreIdentity-declared
+    binding: capability→producer — γ1 introduces the frozen dataclass (PRD §6.1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class StoreIdentity
+      paths:
+      - escalation/src/escalation/
+      expect: present
+  - name: both-production-call-sites-wired
+    binding: capability→producer (WIRED, not merely declared) — exactly two production
+      sites, orchestrator/harness.py:9097 and reconciliation/harness.py:1909; the
+      same-named create_server in orchestrator/mcp/plan_tools.py:962 and verdict_tools.py:320
+      are different functions, out of scope
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: store_identity
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      - fused-memory/src/fused_memory/reconciliation/harness.py
+      expect: present
+  - name: config.project_id-populated
+    binding: substrate CONFIRMED — orchestrator/config.py:955 Field(default='dark_factory');
+      populated in all 8 per-project dark-factory-orchestrator.yaml
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing config field; population verified across the 8 project
+        configs at authoring
+  - name: identity-optional-degrades-to-today
+    binding: non-regression — store_identity=None (tests, standalone) accepts no assertion,
+      renders no identity line, never raises (PRD §6.1)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the property is 'byte-identical to pre-change behaviour', asserted by
+        boundary test B3, not by a static pattern
+- label: γ2
+  task_id: 3166
+  title: Optional project_root assertion on escalation read + write tools, with mismatch
+    storm escape
+  capabilities:
+  - name: project_root-assertion-on-read-and-write-tools
+    binding: capability→producer, γ1 upstream (wired edge) — the five tools of PRD
+      §6.3
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'project_root: str \| None = None'
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: recon-endpoint-names-itself-not-a-path-diff
+    binding: rejection-mechanism, PRODUCER IS SELF — γ2 delivers the rejection its
+      own signal asserts, so the binding holds by construction; the recon branch names
+      the reconciliation store because there is no project path to diff against
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reconciliation store
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: mismatch-streak-escape
+    binding: INV-4 — per-asserted-project_root consecutive-streak counter; at threshold
+      (default 5, config-tunable) files ONE infra_issue L1 into the server's own queue,
+      then re-arms. House pattern merge_liveness.py:446-501 (generalized by 2558)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mismatch_streak
+      paths:
+      - escalation/src/escalation/
+      expect: present
+  - name: guard-reuse-not-reimplementation
+    binding: INV-5 extraction — _require_matching_project_root (server.py:115-137)
+      is reused and generalized; it reads harness.git_ops.project_root today and the
+      recon server is harness-less, so the generalization to StoreIdentity is load-bearing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: one-site-plus-a-call is a review property; B1/B2 assert the two branches
+        behave, not that the code is unduplicated
+  - name: omitted-assertion-byte-identical
+    binding: non-regression (B3) — the fleet-agent path passes no project_root and
+      must be unchanged
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: byte-identical-result assertion lives in B3, not in a static pattern
+- label: γ3
+  task_id: 3167
+  title: Render store identity into every escalation tool description
+  capabilities:
+  - name: fastmcp-description-override
+    binding: substrate CONFIRMED EMPIRICALLY — fastmcp 3.2.2 (re-verified at decompose);
+      @mcp.tool(description=<text>) overrides the docstring and is what (await mcp.get_tool(name)).description
+      returns
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a library-version/runtime fact; B4 asserts the end-to-end consequence
+        via list_tools
+  - name: descriptions-carry-store-identity
+    binding: capability→producer, γ1 upstream (wired edge) — the PRD §6.2 block, built
+      at create_server time from the identity
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: THIS ENDPOINT SERVES
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: identity-block-single-render-site
+    binding: INV-5 — rendered from one helper consumed by all tools, not pasted per
+      tool (PRD §6.2)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: single-render-site is a review property; B4 asserts the rendered content
+  - name: wire-shape-unchanged
+    binding: non-regression — get_pending_escalations keeps returning list[dict[str,
+      Any]]; the envelope alternative was rejected in PRD §5.1 because five skill
+      files perform list operations on it (escalation-watcher-auto/SKILL.md:234-268)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the property is 'five skill files' list operations keep working', asserted
+        by B3, not by a static pattern
+- label: γ4
+  task_id: 3168
+  title: Two-way boundary tests for the store-identity seam (B1-B8)
+  capabilities:
+  - name: server-side-boundary-tests-b1-b4-b7
+    binding: capability→producer, γ2 + γ3 upstream (wired edges) — B1/B2/B3/B4/B7
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_b1_
+      paths:
+      - escalation/tests/
+      expect: present
+  - name: consumer-side-boundary-test-b8
+    binding: capability→producer, α UPSTREAM (wired edge) — the recon-stage argv assertion;
+      α owns the mechanism, γ4 owns the test
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_b8_
+      paths:
+      - fused-memory/tests/
+      expect: present
+  - name: b6-history-vs-pending
+    binding: capability→producer, β UPSTREAM (wired edge). DAG-direction PASS — β
+      is a prerequisite of γ4, never a dependent. Both halves already verified on
+      disk against the live reify store
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_b6_
+      paths:
+      - escalation/tests/
+      expect: present
+  - name: b5-agent-side-attribution
+    binding: capability→producer, γ3 upstream (wired edge) — an agent on 8103 receives
+      [] AND a description naming the store, sufficient to attribute the emptiness
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an agent-facing observation asserted qualitatively by B5, not by a repo
+        pattern
