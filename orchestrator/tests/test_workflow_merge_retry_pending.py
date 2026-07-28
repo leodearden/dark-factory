@@ -200,6 +200,13 @@ class TestStampClearHelpers:
         # task 3024: the payload omitting the key is NOT enough — the default
         # 'merge' mode preserves omitted keys, so a clear that ships no
         # metadata_mode logs a removal it never performs.  Pin the mode.
+        #
+        # Task 2991 filed an identical assertion plus a skip-the-write-on-failed-
+        # read test for this same clear; task 3024 landed first with strictly
+        # broader coverage (see the "'replace' makes a STALE payload
+        # destructive" block below, which covers BOTH the raising and the
+        # returns-None refresh paths), so the 2991 duplicates were dropped at
+        # rebase rather than kept as a second, weaker copy.
         assert _persisted_mode(f.update_task) == 'replace'
 
     @pytest.mark.asyncio
