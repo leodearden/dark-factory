@@ -113,11 +113,18 @@ class EvalMetrics:
     # from the base composite, populated ONLY for architect runs
     # (role_under_test=='architect'); ``None`` is the C4 ``plan_quality | null``
     # sentinel for non-architect (implementer) runs, kept distinct from a
-    # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to
-    # None on failure), an architect run ALWAYS emits a non-sentinel float —
-    # ``run_architect_eval`` degrades to the deterministic ``score_plan_structure``
-    # floor if the LLM plan judge fails, so None here means "not an architect
-    # run", never "architect run whose scoring failed".
+    # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to None
+    # on failure), an architect run that was actually ASKED always emits a
+    # non-sentinel float — ``run_architect_eval`` degrades to the deterministic
+    # ``score_plan_structure`` floor if the LLM plan judge fails.
+    #
+    # ``None`` therefore has exactly TWO causes, disambiguated by the markers
+    # below: (1) not an architect run at all (``role_under_test != 'architect'``,
+    # ``cap_tainted`` False), or (2) an architect run we could NOT measure
+    # because the invocation was refused at the transport layer — a 429 cap hit
+    # or auth failure — which carries ``cap_tainted=True`` and a stage-prefixed
+    # ``invocation_error`` (task 3118). A scoring FAILURE is still never a cause:
+    # it degrades to the structural floor, not to None.
     plan_quality: float | None = None
 
     # Which role this run put UNDER TEST (eval-revival θ / C4 role_under_test),

@@ -41,7 +41,7 @@ from .configs import (
     claude_endpoint_price_table,
     matrix_pairs,
 )
-from .metrics import EvalMetrics, collect_metrics
+from .metrics import EvalMetrics, collect_metrics, detect_invocation_error
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
 
@@ -495,8 +495,18 @@ async def run_architect_eval(
     judge, against the REAL landed reference diff
     ``pre_task_commit..reference.post_task_commit`` — the always-available
     ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
-    the deterministic :func:`score_plan_structure` floor on ANY judge failure so
-    ``plan_quality`` is ALWAYS a non-sentinel float. The result carries
+    the deterministic :func:`score_plan_structure` floor on ANY judge failure.
+
+    ``plan_quality`` is therefore a non-sentinel float whenever the architect
+    was actually ASKED — with ONE deliberate exception (task 3118): when the
+    architect invocation is refused at the TRANSPORT layer (a CLI 429 cap hit,
+    an auth failure), no model content exists at all, so scoring is skipped
+    entirely and the cell records ``plan_quality=None`` plus ``cap_tainted=True``
+    and a stage-prefixed ``invocation_error``. ``plan_quality is None`` on an
+    architect run means exactly that case, and aggregates EXCLUDE such cells
+    rather than averaging in a fabricated zero. An architect that ran fine and
+    merely produced a bad or absent plan still scores 0.0 — that is a real
+    reliability signal, not an infra failure. The result carries
     ``role_under_test='architect'`` and is persisted via :func:`save_result`.
     """
     from orchestrator.agents.briefing import BriefingAssembler
@@ -525,6 +535,10 @@ async def run_architect_eval(
     cost_usd = 0.0
     arch_duration_ms = 0
     outcome = 'done'
+    # The architect-side TRANSPORT-refusal marker (task 3118). Stays None on the
+    # timeout/exception paths below (no AgentResult was ever produced there, so
+    # there is nothing to classify) — those already have their own outcomes.
+    arch_error: str | None = None
     # Honor the operator's --timeout around the LIVE architect invoke, exactly
     # as run_eval bounds workflow.run(). timeout_override is in MINUTES
     # (run_eval convention — the CLI threads the same --timeout to both); without
@@ -581,6 +595,20 @@ async def run_architect_eval(
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
+        # Was this a TRANSPORT-layer refusal (a 429 cap hit / auth failure — we
+        # never got to ask the model) rather than an ordinary content failure?
+        # The outcome vocabulary stays 'blocked' either way; the distinction
+        # lives in metrics, which is what the report and the persisted JSON
+        # read. Guarded so a classifier bug degrades to an unmarked cell rather
+        # than nuking the whole run.
+        try:
+            arch_error = detect_invocation_error(result, backend=config.backend)
+        except Exception:
+            logger.warning(
+                f'invocation-error classification raised for {task_id} × '
+                f'{config.name}; leaving the cell unmarked',
+                exc_info=True,
+            )
         # 5. Read the produced plan artifact (the scoring input).
         plan = artifacts.read_plan() or {}
     except TimeoutError:
@@ -611,19 +639,34 @@ async def run_architect_eval(
             logger.warning(f'reference diff failed for {task_id}: {e}')
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
-    #    deterministic structural floor on ANY failure so plan_quality is ALWAYS
-    #    a non-sentinel float (unlike recovery scoring, which degrades to None).
+    #    deterministic structural floor on ANY judge failure so plan_quality is a
+    #    non-sentinel float — UNLESS the architect invocation itself was refused
+    #    at the transport layer, in which case there is nothing to score.
     plan_quality: float | None = None
-    try:
-        verdict = await judge_plan_quality(plan, reference_diff, task)
-        plan_quality = verdict.plan_quality
-    except Exception:
+    if arch_error:
+        # We never got to ask the model: the plan artifact is empty, so every
+        # available number would be FABRICATED — and a fabricated 0.0 is
+        # byte-indistinguishable from a genuinely terrible plan, which is the
+        # defect this marker exists to remove. The judge is skipped rather than
+        # invoked-and-discarded: it has nothing to judge, and inside a cap
+        # window it would 429 too (the second-order failure that manufactured
+        # the 0.0), burning an opus call on a doomed request.
         logger.warning(
-            f'plan judge raised for {task_id}; degrading to structural floor',
-            exc_info=True,
+            f'Architect eval {task_id} × {config.name}: invocation REFUSED at '
+            f'the transport layer ({arch_error}) — plan judge skipped, '
+            f'plan_quality=None, cell marked cap_tainted (NOT scored 0.0)'
         )
-    if plan_quality is None:
-        plan_quality = score_plan_structure(plan)
+    else:
+        try:
+            verdict = await judge_plan_quality(plan, reference_diff, task)
+            plan_quality = verdict.plan_quality
+        except Exception:
+            logger.warning(
+                f'plan judge raised for {task_id}; degrading to structural floor',
+                exc_info=True,
+            )
+        if plan_quality is None:
+            plan_quality = score_plan_structure(plan)
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
@@ -633,6 +676,8 @@ async def run_architect_eval(
         plan_steps=len(plan.get('steps', [])),
         cost_usd=cost_usd,
         workflow_duration_ms=arch_duration_ms,
+        invocation_error=f'architect:{arch_error}' if arch_error else None,
+        cap_tainted=bool(arch_error),
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -648,6 +693,7 @@ async def run_architect_eval(
     logger.info(
         f'Architect eval complete: {task_id} × {config.name} → '
         f'plan_quality={plan_quality} ({wall_clock_ms / 1000:.1f}s)'
+        + (f' [cap_tainted: {metrics.invocation_error}]' if arch_error else '')
     )
     return result_obj
 
