@@ -911,6 +911,20 @@ def _cap_tainted_result(
     )
 
 
+_MEAN_SECTION_HEADER = 'plan_quality by config:'
+
+
+def _mean_section_line(table: str, config_name: str) -> str:
+    """The per-config-mean line for *config_name*, scoped to the mean SECTION.
+
+    Scoped deliberately: a config name also appears in the per-cell rows above,
+    so a bare ``in`` search over the whole table would match the wrong line.
+    """
+    lines = table.splitlines()
+    start = lines.index(_MEAN_SECTION_HEADER)
+    return next(ln for ln in lines[start:] if ln.startswith(config_name))
+
+
 class TestPlanQualityReport:
     def test_build_plan_quality_report_rows(self):
         from orchestrator.evals.report import build_plan_quality_report
@@ -1068,6 +1082,85 @@ class TestPlanQualityReport:
             build_plan_quality_report(list(reversed(results)))
         )
         assert a == b  # deterministic (sorted rows, no wall-clock dependence)
+
+    # -- rendered exclusion surface (task 3118) ---------------------------
+
+    def test_cap_tainted_cell_renders_excluded_marker_not_a_zero(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        table = format_plan_quality_table(build_plan_quality_report(
+            [_architect_result(), _cap_tainted_result(), _implementer_result()]
+        ))
+        capped_line = next(
+            ln for ln in table.splitlines() if 'df_task_3118' in ln
+        )
+        # Explicit exclusion marker, WITH its reason — never a score...
+        assert 'cap-excluded' in capped_line
+        assert '0.0000' not in capped_line
+        assert 'cap_hit' in capped_line
+        # ...and visibly distinct from the '-' null sentinel a non-architect row
+        # uses, so "not an architect run" cannot be confused with "architect run
+        # we could not measure".
+        impl_line = next(ln for ln in table.splitlines() if 'df_task_1993' in ln)
+        assert 'cap-excluded' not in impl_line
+
+    def test_table_renders_exclusion_summary_and_per_config_means(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        cfg = 'architect-opus-high'
+        table = format_plan_quality_table(build_plan_quality_report([
+            _architect_result(task_id='t1', config_name=cfg, plan_quality=0.9),
+            _architect_result(task_id='t2', config_name=cfg, plan_quality=0.7),
+            _cap_tainted_result(task_id='t3', config_name=cfg),
+        ]))
+
+        # The reader sees "n=2 of 3, 1 cap-excluded", not a silently shrunk mean.
+        summary = next(
+            ln for ln in table.splitlines() if ln.startswith('excluded:')
+        )
+        assert '1' in summary and '3' in summary
+
+        mean_line = _mean_section_line(table, cfg)
+        assert '0.8000' in mean_line   # the EXCLUDING mean, not 0.5333
+        assert '0.5333' not in table
+
+    def test_config_with_no_scored_cells_renders_dash_not_zero(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        table = format_plan_quality_table(build_plan_quality_report([
+            _cap_tainted_result(task_id='t1', config_name='doomed'),
+            _cap_tainted_result(task_id='t2', config_name='doomed'),
+        ]))
+        mean_line = _mean_section_line(table, 'doomed')
+        assert mean_line.endswith('-')
+        assert '0.0000' not in mean_line
+
+    def test_exclusion_table_is_byte_identical_regardless_of_input_order(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        results = [
+            _architect_result(task_id='t1', config_name='a', plan_quality=0.9),
+            _cap_tainted_result(task_id='t2', config_name='a'),
+            _architect_result(task_id='t3', config_name='b', plan_quality=0.5),
+            _implementer_result(),
+        ]
+        a = format_plan_quality_table(build_plan_quality_report(results))
+        b = format_plan_quality_table(
+            build_plan_quality_report(list(reversed(results)))
+        )
+        assert a == b
 
 
 # ---------------------------------------------------------------------------
