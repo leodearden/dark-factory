@@ -218,6 +218,78 @@ class TestClearHelper:
         assert meta['retry_ledger'] == {'x': 1}
         # (a) key also removed from in-memory task metadata.
         assert 'merge_phase_liveness' not in f.wf.task['metadata']
+        # The payload assertion above is NOT sufficient on its own: an omitted
+        # metadata_mode resolves to 'merge' (scheduler.py:3795-3799), which the
+        # backend implements as shallow json.dumps({**old, **new})
+        # (sqlite_task_backend.py:3362-3364) — "omitted keys are PRESERVED", so
+        # popping a key out of the payload is a backend NO-OP. Only the
+        # sanctioned delete-by-omission mode actually removes it.
+        assert f.update_task.await_args.kwargs['metadata_mode'] == 'replace'
+
+    @pytest.mark.asyncio
+    async def test_clear_replace_payload_carries_backend_only_keys(self):
+        # A 'replace' write is a whole-blob overwrite, so the payload MUST be
+        # built from the freshly-read backend blob — otherwise every
+        # backend-only key (memory_hints re-attached by Stage-2 reconciliation,
+        # _causation_id) is deleted along with the stamp (the #4271
+        # sibling-clobber bug). Nothing but the popped key may disappear.
+        f = _make(
+            metadata={'merge_phase_liveness': dict(_STAMP)},
+            backend_metadata={
+                'memory_hints': {'q': 1},
+                'merge_phase_liveness': dict(_STAMP),
+            },
+        )
+
+        await f.wf._clear_merge_phase_entered()
+
+        meta = _persisted_metadata(f.update_task)
+        assert meta['memory_hints'] == {'q': 1}
+        assert 'merge_phase_liveness' not in meta
+        assert f.update_task.await_args.kwargs['metadata_mode'] == 'replace'
+
+    @pytest.mark.asyncio
+    async def test_clear_skips_durable_write_when_fresh_read_fails(self):
+        # _merge_fresh_metadata falls back to in-memory-only metadata when
+        # get_task raises. Under the old 'merge' mode that fallback was
+        # harmless (omitted backend-only keys survived); under 'replace' it
+        # would DELETE every backend-only key. So a failed read must SKIP the
+        # durable write entirely — bounded cost: the reaper may keep deferring
+        # for up to orphan_l0_merge_phase_freshness_secs until the stale stamp
+        # ages out (deferral, never suppression).
+        f = _make(
+            metadata={
+                'merge_phase_liveness': dict(_STAMP),
+                'retry_ledger': {'x': 1},
+            },
+        )
+        f.scheduler.get_task = AsyncMock(side_effect=RuntimeError('mcp down'))
+
+        await f.wf._clear_merge_phase_entered()   # must not raise
+
+        f.update_task.assert_not_awaited()
+        # In-memory copy is still cleared (siblings intact).
+        assert 'merge_phase_liveness' not in f.wf.task['metadata']
+        assert f.wf.task['metadata']['retry_ledger'] == {'x': 1}
+
+    @pytest.mark.asyncio
+    async def test_clear_skips_durable_write_when_get_task_returns_non_dict(self):
+        # Same guard for the silent non-dict branch (get_task returning None on
+        # a vanished/unreadable task): a 'replace' built from in-memory-only
+        # metadata would clobber backend-only siblings.
+        f = _make(
+            metadata={
+                'merge_phase_liveness': dict(_STAMP),
+                'retry_ledger': {'x': 1},
+            },
+        )
+        f.scheduler.get_task = AsyncMock(return_value=None)
+
+        await f.wf._clear_merge_phase_entered()   # must not raise
+
+        f.update_task.assert_not_awaited()
+        assert 'merge_phase_liveness' not in f.wf.task['metadata']
+        assert f.wf.task['metadata']['retry_ledger'] == {'x': 1}
 
     @pytest.mark.asyncio
     async def test_clear_is_best_effort_and_does_not_raise_on_persist_failure(self):
