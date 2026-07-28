@@ -2436,6 +2436,78 @@ async def test_harness_init_seeds_backlog_policy_project_roots(
     assert 'Unparseable judge response in run X' in body['detail']
 
 
+class TestHarnessUnhaltClosesEscalation:
+    """GAP 3: clearing a halt must also close the escalation it opened.
+
+    ``Judge.unhalt`` fires ``harness._on_judge_unhalt``, which used to only
+    discard the dedupe sentinel — the ``esc-reconciliation-halt-*.json`` stayed
+    pending forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_judge_unhalt_awaits_policy_on_judge_unhalt(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        assert harness.judge is not None
+        harness._backlog_policy = MagicMock()
+        harness._backlog_policy.on_judge_unhalt = AsyncMock(
+            return_value=['esc-reconciliation-halt-X'],
+        )
+        harness._halt_escalated.add('test-project')
+        await harness.judge._apply_halt('test-project', reason='seed')
+
+        await harness.judge.unhalt('test-project')
+
+        harness._backlog_policy.on_judge_unhalt.assert_awaited_once_with(
+            'test-project',
+        )
+        assert 'test-project' not in harness._halt_escalated
+        # Pop-once handoff for the MCP tool layer.
+        assert harness.take_resolved_halt_escalations('test-project') == [
+            'esc-reconciliation-halt-X',
+        ]
+        assert harness.take_resolved_halt_escalations('test-project') == []
+
+    @pytest.mark.asyncio
+    async def test_unhalt_still_clears_sentinel_when_resolve_raises(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """A resolve failure must never leave a stale sentinel behind.
+
+        A stale sentinel would suppress the NEXT halt escalation entirely —
+        strictly worse than the un-closed record we failed to resolve.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        assert harness.judge is not None
+        harness._backlog_policy = MagicMock()
+        harness._backlog_policy.on_judge_unhalt = AsyncMock(
+            side_effect=OSError('disk'),
+        )
+        harness._halt_escalated.add('test-project')
+        await harness.judge._apply_halt('test-project', reason='seed')
+
+        await harness.judge.unhalt('test-project')
+
+        assert 'test-project' not in harness._halt_escalated
+        assert harness.take_resolved_halt_escalations('test-project') == []
+
+    @pytest.mark.asyncio
+    async def test_unhalt_is_noop_without_backlog_policy(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        assert harness.judge is not None
+        assert harness._backlog_policy is None
+        harness._halt_escalated.add('test-project')
+        await harness.judge._apply_halt('test-project', reason='seed')
+
+        await harness.judge.unhalt('test-project')
+
+        assert 'test-project' not in harness._halt_escalated
+        assert harness.take_resolved_halt_escalations('test-project') == []
+
+
 async def _drive_halt_notify(harness, event_buffer):
     """Drive one run_loop iteration for a pre-halted project so the halt-check
     branch (which calls _notify_judge_halt) fires. Mirrors
@@ -2467,6 +2539,10 @@ async def test_notify_judge_halt_threads_truthful_reason(
 
     harness._backlog_policy = MagicMock()
     harness._backlog_policy.on_judge_halt = AsyncMock()
+    # AsyncMock (not a bare MagicMock attr): _on_judge_unhalt awaits this, and
+    # Judge.unhalt swallows callback exceptions — a non-awaitable result would
+    # make an unhalt assertion pass for the wrong reason (task 2998).
+    harness._backlog_policy.on_judge_unhalt = AsyncMock(return_value=[])
     harness._halt_escalated.discard('test-project')
 
     await _drive_halt_notify(harness, event_buffer)
@@ -2490,6 +2566,10 @@ async def test_notify_judge_halt_falls_back_to_generic_reason_when_none(
 
     harness._backlog_policy = MagicMock()
     harness._backlog_policy.on_judge_halt = AsyncMock()
+    # AsyncMock (not a bare MagicMock attr): _on_judge_unhalt awaits this, and
+    # Judge.unhalt swallows callback exceptions — a non-awaitable result would
+    # make an unhalt assertion pass for the wrong reason (task 2998).
+    harness._backlog_policy.on_judge_unhalt = AsyncMock(return_value=[])
     harness._halt_escalated.discard('test-project')
 
     await _drive_halt_notify(harness, event_buffer)
@@ -2806,6 +2886,10 @@ async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
     # before its cooldown expired (the incident's starting state).
     harness._backlog_policy = MagicMock()
     harness._backlog_policy.on_judge_halt = AsyncMock()
+    # AsyncMock (not a bare MagicMock attr): _on_judge_unhalt awaits this, and
+    # Judge.unhalt swallows callback exceptions — a non-awaitable result would
+    # make an unhalt assertion pass for the wrong reason (task 2998).
+    harness._backlog_policy.on_judge_unhalt = AsyncMock(return_value=[])
     harness._halt_escalated.add('test-project')
 
     harness.config.auto_unhalt_after_cooldown = True
