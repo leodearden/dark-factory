@@ -170,8 +170,9 @@ class TestDetectInvocationError:
         # OK short-circuit: a HEALTHY run whose output merely QUOTES a cap string
         # (e.g. an agent discussing a usage-limit message) is not an infra
         # refusal and must never be excluded from the aggregate.
-        from orchestrator.evals.metrics import detect_invocation_error
         from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
 
         ok = AgentResult(
             success=True, output=f'the CLI printed: {_CAP_TEXT}',
@@ -193,8 +194,9 @@ class TestDetectInvocationError:
         # 429 is deliberately EXCLUDED from AuthFailed (it routes to the cap-text
         # tier), so a 429 with no cap body classifies as a wedge/unclassified
         # failure — the structured api_error_status fallback must still catch it.
-        from orchestrator.evals.metrics import detect_invocation_error
         from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
 
         bare = AgentResult(
             success=False, output='', stderr='', cost_usd=0.0,
@@ -205,8 +207,9 @@ class TestDetectInvocationError:
         assert '429' in marker
 
     def test_auth_failure_yields_auth_marker(self):
-        from orchestrator.evals.metrics import detect_invocation_error
         from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
 
         unauthorized = AgentResult(
             success=False, output='', cost_usd=0.0, duration_ms=200,
@@ -221,8 +224,9 @@ class TestDetectInvocationError:
         # THE load-bearing negative: an architect that really ran (non-zero cost,
         # real turns) and simply failed to produce a good plan is a CONTENT
         # signal — it must keep scoring 0.0, never be excluded as infra.
-        from orchestrator.evals.metrics import detect_invocation_error
         from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
 
         content_failure = AgentResult(
             success=False, output='I could not complete the plan',
@@ -436,8 +440,9 @@ class TestJudgePlanQuality:
         # answered and simply produced garbage is a CONTENT failure, so its
         # None plan_quality stays unmarked and run_architect_eval keeps
         # degrading to the deterministic structural floor.
-        from orchestrator.evals.judge import judge_plan_quality
         from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.judge import judge_plan_quality
 
         answered = AgentResult(
             success=True, output='not json at all {{{',
