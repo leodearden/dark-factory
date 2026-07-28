@@ -3353,3 +3353,34 @@ class TestGiveUpAlwaysDismissesOwnL0:
             reason='attempt_cap', wip_commits_present=True,
         )
         assert channel.empty(), 'exactly one outcome must be published'
+
+    async def test_timeout_cap_wip_present_dismisses_own_l0(
+        self, steward, mock_config,
+    ):
+        """The timeout-kill cap's wip branch is the SECOND instance of the
+        same 2248 bug — identical shape, identical strand.  Fixing only the
+        attempt-cap branch would leave the ESCALATED path strandable via a
+        different door, so both are pinned here.
+        """
+        mock_config.steward_max_timeouts_per_escalation = 3
+        # Raised above the seeded _retry_counts entry so the ATTEMPT cap (which
+        # is checked first, and whose fixture default is 1) does not fire —
+        # this test must exercise the timeout guard specifically.
+        mock_config.steward_max_attempts = 5
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        esc = _make_escalation(id='esc-42-1')
+        steward._timeout_counts['esc-42-1'] = 3  # at cap
+        steward._retry_counts['esc-42-1'] = 1  # stale sibling counter, below cap
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        _assert_dismissed_own_l0(steward, 'esc-42-1')
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='timeout', wip_commits_present=True,
+        )
+        assert channel.empty(), 'exactly one outcome must be published'
