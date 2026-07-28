@@ -385,8 +385,16 @@ class TaskSteward:
             if wip:
                 # Task-2060 lesson: a wall-clock kill with partial WIP commits
                 # must resume the plan, not be triaged as "steward failed" via
-                # an L1. Skip _auto_escalate_to_human entirely — the workflow's
-                # _mark_blocked dismisses the still-pending L0 and re-pends.
+                # an L1.  Skip _auto_escalate_to_human entirely — but still
+                # dismiss the L0 first, per the converged give-up contract
+                # (task 3170; see this method's docstring).  Dismiss-THEN-
+                # publish: the dismissal wakes the run()-ESCALATED waiter via
+                # the resolve callback, the publish hands the typed outcome to
+                # the _mark_blocked waiter.  Both downstream dismissal sites
+                # (_mark_blocked's loop, _await_steward_completion's override)
+                # remain as idempotent backstops — EscalationQueue.resolve is a
+                # documented no-op on a non-pending record.
+                self._dismiss_capped_l0(escalation, 'attempt_cap')
                 self._publish_outcome(outcome)
             else:
                 self._auto_escalate_to_human(
@@ -857,6 +865,49 @@ class TaskSteward:
                     f'{len(triage_result["skipped"])} skipped'
                 ),
             },
+        )
+
+    # ------------------------------------------------------------------
+    # Give-up without an L1 hand-off (task-2060 resume-plan branches)
+    # ------------------------------------------------------------------
+
+    def _dismiss_capped_l0(self, escalation: Escalation, reason: str) -> None:
+        """Dismiss *escalation* on a give-up that files no L1 (task 3170).
+
+        The wip-gated cap branches deliberately skip
+        :meth:`_auto_escalate_to_human` (task-2060: a resumable interruption
+        must not be triaged as "steward failed").  They must still uphold the
+        converged give-up contract that both workflow waiters depend on —
+        **no pending L0 survives a steward give-up** — so this is the
+        L1-free half of what ``_auto_escalate_to_human`` does: the same
+        ``resolve(..., dismiss=True)`` call and the same three-dict counter
+        cleanup, minus the level-1 submission.
+
+        Going through ``EscalationQueue.resolve`` (never a direct file write)
+        is load-bearing: it fires the queue's ``_resolve_callback``, which the
+        harness wires to ``_escalation_events[task_id].set()`` — the ONLY
+        signal that wakes ``TaskWorkflow._wait_for_resolution`` on the
+        ``run()``-ESCALATED path.
+        """
+        self.escalation_queue.resolve(
+            escalation.id,
+            f'Auto-dismissed: steward interrupted ({reason}) with WIP present '
+            f'— resuming plan, not escalating',
+            dismiss=True,
+            resolved_by='auto-dismissed',
+        )
+
+        # Same cleanup as _auto_escalate_to_human: cap-fire paths skip the
+        # success-path cleanup, so the dicts would otherwise retain stale
+        # entries for this escalation id.
+        self._retry_counts.pop(escalation.id, None)
+        self._timeout_counts.pop(escalation.id, None)
+        self._empty_output_counts.pop(escalation.id, None)
+
+        logger.warning(
+            f'Steward for task {self.task_id}: gave up on {escalation.id} '
+            f'({reason}) with WIP present — dismissed the L0 and published a '
+            f'resume-plan interruption (no L1 filed)'
         )
 
     # ------------------------------------------------------------------
