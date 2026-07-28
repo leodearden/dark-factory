@@ -472,6 +472,67 @@ def test_direct_construction_yields_empty_ignored_census(tmp_path, monkeypatch):
 # --- (i) hot-reload promise ----------------------------------------------------
 
 
+def test_check_config_escape_hatched_only_exits_zero(tmp_path):
+    """The reviewer's explicit requirement: a config whose only non-model keys
+    are escape-hatched is NOT a failure — exit 0 — but the hatched paths are
+    still LISTED informationally with their reason, so an over-broad glob stays
+    auditable rather than becoming an invisible blind spot."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'x_custom': 1,
+            'config_key_census': {'ignore': ['cpu_governance.*']},
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+        name='config.yaml',
+    )
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+    assert result.exit_code == 0, result.output
+    assert 'x_custom' in result.output
+    assert 'cpu_governance.weights' in result.output
+    # Each row names WHY it was excused.
+    assert 'reserved prefix' in result.output
+    assert 'config_key_census.ignore' in result.output
+    # ...and it never reads as a failure.
+    assert 'ignored' in result.output.lower()
+
+
+def test_check_config_mixed_lists_both_and_exits_one(tmp_path):
+    """A real unknown key still fails the gate, the ignored section is still
+    shown, and hatched paths are NOT counted in the unknown total."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'x_custom': 1,
+            'config_key_census': {'ignore': ['cpu_governance.*']},
+            'cpu_governance': {'weights': {'task': 100}},
+            'warm_lane_pool': 6,
+        },
+        name='config.yaml',
+    )
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+    assert result.exit_code == 1, result.output
+    assert 'warm_lane_pool' in result.output
+    assert 'git.warm_lane_pool' in result.output  # advisory placement hint
+    # The informational section is still present alongside the failure.
+    assert 'x_custom' in result.output
+    assert 'cpu_governance.weights' in result.output
+    # Exactly ONE unknown key — the two hatched paths are not in the total.
+    assert '1 unknown config key(s)' in result.output
+
+
+def test_check_config_clean_shows_no_ignored_section(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'max_concurrent_tasks': 3, 'git': {'remote': 'origin'}},
+        name='config.yaml',
+    )
+    result = CliRunner().invoke(main, ['check-config', '--config', str(p)])
+    assert result.exit_code == 0, result.output
+    assert 'OK' in result.output
+    assert 'ignored' not in result.output.lower()
+
+
 def test_config_key_census_ignore_is_green_tier():
     """Pins the operator-facing promise the L2 remediation text makes: the
     allowlist can be applied to a LIVE unit via hot-reload.  If this leaf were
