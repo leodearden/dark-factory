@@ -412,6 +412,48 @@ class TestJudgePlanQuality:
         assert verdict.plan_quality is None
         assert isinstance(verdict.reasoning, str)
 
+    async def test_cap_refused_judge_invoke_records_invocation_error(self):
+        # The judge's OWN invoke can 429 — historically indistinguishable from
+        # an unparseable answer, because both produced the same bare
+        # plan_quality=None verdict. The marker makes the infra cause legible.
+        from orchestrator.evals.judge import judge_plan_quality
+
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=_cap_agent_result()),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert isinstance(verdict.invocation_error, str)
+        assert verdict.invocation_error
+        assert 'cap' in verdict.invocation_error.lower()
+
+    async def test_unparseable_but_successful_judge_output_carries_no_marker(self):
+        # The CONTRAST that makes the marker meaningful: a judge that really
+        # answered and simply produced garbage is a CONTENT failure, so its
+        # None plan_quality stays unmarked and run_architect_eval keeps
+        # degrading to the deterministic structural floor.
+        from orchestrator.evals.judge import judge_plan_quality
+        from shared.cli_invoke import AgentResult
+
+        answered = AgentResult(
+            success=True, output='not json at all {{{',
+            cost_usd=0.4, duration_ms=3000, turns=1,
+        )
+        with patch(
+            'orchestrator.evals.judge.invoke_agent',
+            AsyncMock(return_value=answered),
+        ):
+            verdict = await judge_plan_quality(
+                _well_formed_plan(), 'diff', _judge_task(),
+            )
+
+        assert verdict.plan_quality is None
+        assert verdict.invocation_error is None
+
     async def test_missing_plan_quality_key_degrades_to_fallback(self):
         from orchestrator.evals.judge import judge_plan_quality
 
