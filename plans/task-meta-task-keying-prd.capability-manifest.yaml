@@ -1,169 +1,192 @@
-# Machine-readable twin of task-meta-task-keying-prd.capability-manifest.md
-# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc);
-# field reference in plans/capability-delivered-checks-prd.md §Contract.
-# delivered_check patterns bind to the PRD's §Named surface table — those
-# symbols/strings are contract, so the greps stay honest as the code moves.
 prd: plans/task-meta-task-keying-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Lane↔task resolution off plan.json, onto metadata.json"
-    capabilities:
-      - name: "lane-task-id-read-from-metadata-json"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:305 init() writes task_id into metadata.json every dispatch"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def read_lane_task_id"
-          paths: ["orchestrator/src/orchestrator/artifacts.py"]
-          expect: present
-      - name: "disk-backstop-no-longer-reads-lane-plan-json"
-        binding: "rejection-mechanism — the plan.json read at git_ops.py:5442 is the defect surface; its absence is the delivered state"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "read_lane_task_id"
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
-          expect: present
-
-  - label: "β"
-    task_id: null
-    title: "TaskArtifacts dual-root + artifact routing table + sandbox grant"
-    capabilities:
-      - name: "task-lifetime-root-derivation"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:262-287 meta_root_for is the sole TASK_META_DIRNAME joiner"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def task_root_for"
-          paths: ["orchestrator/src/orchestrator/artifacts.py"]
-          expect: present
-      - name: "sandbox-grants-the-task-root"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/agents/write_set.py:152 task_meta= single call site in compute_write_set"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "task_root_for"
-          paths: ["orchestrator/src/orchestrator/agents/write_set.py"]
-          expect: present
-      - name: "task-id-cannot-escape-task-meta"
-        binding: "rejection-mechanism — mirrors artifacts.py:191-208 _validate_verdict_role; β's tests observe the ValueError fire on a separator/.. id"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "escape-rejection quality is judged by β's own validator fixtures, not a grep"
-
-  - label: "γ"
-    task_id: null
-    title: "Self-healing adoption of a prior lane's task-scoped artifacts at dispatch"
-    capabilities:
-      - name: "adoption-emits-one-operator-line"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:2229-2246 _setup_worktree_and_artifacts is the every-dispatch hook point"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "adopted task-scoped artifacts from"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "lane-state-corroborated-before-move"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/warm_lane_pool.py:295 _note_assigned_durable writes .lane-state/<lane>.json with task_id (INV-3)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the corroboration is a conditional guard, not a symbol; γ's tests assert the refuse-on-live-source case (B5)"
-
-  - label: "δ"
-    task_id: null
-    title: "plan.json carries its own _base_commit so revalidation survives a lane change"
-    capabilities:
-      - name: "plan-carries-base-commit"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:349-352 write_plan already stamps underscore-prefixed provenance keys"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "['\"]_base_commit['\"]"
-          paths: ["orchestrator/src/orchestrator/artifacts.py", "orchestrator/src/orchestrator/workflow.py"]
-          expect: present
-      - name: "revalidation-branch-widened-past-old-plan-base"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:3733-3737 the `and self._old_plan_base` predicate this task widens"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the change is a predicate widening, not a new symbol; δ's tests assert the revalidation branch is taken with _old_plan_base absent (B2)"
-      - name: "layer-b-new-fork-point-semantics-preserved"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:2248-2259 the iterations.jsonl hygiene gate sharing this discriminator"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "a preservation property — asserted by δ's regression test over the existing Layer-B cases, not greppable"
-
-  - label: "ε"
-    task_id: null
-    title: "Clear the whole reviews/ dir per review round, not just merge.json"
-    capabilities:
-      - name: "per-round-reviews-clear"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:5449-5453 the reviews/merge.json single-file clear being generalized"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def clear_reviews"
-          paths: ["orchestrator/src/orchestrator/artifacts.py"]
-          expect: present
-      - name: "verdict-cache-needs-no-second-rule"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:599 verdicts are keyed by committed-tree hash, so reuse is tree-gated by construction"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "a no-change justification; nothing is delivered for this capability"
-
-  - label: "ζ"
-    task_id: null
-    title: "Terminal-task GC sweep for .task-meta/task-<id>/ (14d grace, INV-4 streak)"
-    capabilities:
-      - name: "sweep-logs-reclaimed-count"
-        binding: "capability→producer (wired) — get_statuses bulk status read (CLAUDE.md §Task Routing); task roots are name-parseable via producer:β upstream"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "task-meta gc: reclaimed"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "storm-escape-on-repeated-sweep-failure"
-        binding: "capability→producer (wired) — INV-4 house pattern, merge_liveness.py consecutive-streak gate (docs/legibility/design-invariants.md §INV-4)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "streak-then-escalate is a behavioural property; ζ's tests assert the escalation fires at the threshold"
-
-  - label: "η"
-    task_id: null
-    title: "Role/briefing prompts name .task/ only; delete the meta-path arithmetic"
-    capabilities:
-      - name: "meta-path-arithmetic-gone-from-prompts"
-        binding: "rejection-mechanism — the string is present at 14 sites today (roles.py:417,433,493,505,808,1137,1467; briefing.py:528,532,636,651,653,882), so its absence is an observed state change, not vacuous"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "task-meta/<worktree-name>"
-          paths: ["orchestrator/src/orchestrator/agents/"]
-          expect: absent
-      - name: "iterations-reachable-from-the-lane"
-        binding: "capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:354-386 ensure_lane_plan_symlink (task 2763) is the mechanism being extended"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "\\.task/iterations\\.jsonl"
-          paths: ["orchestrator/src/orchestrator/agents/"]
-          expect: present
-
-  - label: "ω"
-    task_id: null
-    title: "Integration gate — cross-lane re-dispatch boundary matrix B1-B9"
-    capabilities:
-      - name: "boundary-matrix-green-e2e"
-        binding: "DAG-direction — every leg produced upstream (β root, γ adoption, δ revalidation, ε review staleness, η prompts); ω depends on γ/δ/ε/η"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the task IS the check suite; its signal is the green B1-B9 matrix, in particular B2's zero-architect-invocation assertion"
+- label: α
+  task_id: 3154
+  title: Lane↔task resolution off plan.json, onto metadata.json
+  capabilities:
+  - name: lane-task-id-read-from-metadata-json
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:305
+      init() writes task_id into metadata.json every dispatch
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def read_lane_task_id
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: disk-backstop-no-longer-reads-lane-plan-json
+    binding: rejection-mechanism — the plan.json read at git_ops.py:5442 is the defect
+      surface; its absence is the delivered state
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: read_lane_task_id
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: present
+- label: β
+  task_id: 3155
+  title: TaskArtifacts dual-root + artifact routing table + sandbox grant
+  capabilities:
+  - name: task-lifetime-root-derivation
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:262-287
+      meta_root_for is the sole TASK_META_DIRNAME joiner
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def task_root_for
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: sandbox-grants-the-task-root
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/agents/write_set.py:152
+      task_meta= single call site in compute_write_set
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_root_for
+      paths:
+      - orchestrator/src/orchestrator/agents/write_set.py
+      expect: present
+  - name: task-id-cannot-escape-task-meta
+    binding: rejection-mechanism — mirrors artifacts.py:191-208 _validate_verdict_role;
+      β's tests observe the ValueError fire on a separator/.. id
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: escape-rejection quality is judged by β's own validator fixtures, not
+        a grep
+- label: γ
+  task_id: 3156
+  title: Self-healing adoption of a prior lane's task-scoped artifacts at dispatch
+  capabilities:
+  - name: adoption-emits-one-operator-line
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:2229-2246
+      _setup_worktree_and_artifacts is the every-dispatch hook point
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: adopted task-scoped artifacts from
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: lane-state-corroborated-before-move
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/warm_lane_pool.py:295
+      _note_assigned_durable writes .lane-state/<lane>.json with task_id (INV-3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the corroboration is a conditional guard, not a symbol; γ's tests assert
+        the refuse-on-live-source case (B5)
+- label: δ
+  task_id: 3157
+  title: plan.json carries its own _base_commit so revalidation survives a lane change
+  capabilities:
+  - name: plan-carries-base-commit
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:349-352
+      write_plan already stamps underscore-prefixed provenance keys
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]_base_commit[''"]'
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: revalidation-branch-widened-past-old-plan-base
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:3733-3737
+      the `and self._old_plan_base` predicate this task widens
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the change is a predicate widening, not a new symbol; δ's tests assert
+        the revalidation branch is taken with _old_plan_base absent (B2)
+  - name: layer-b-new-fork-point-semantics-preserved
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:2248-2259
+      the iterations.jsonl hygiene gate sharing this discriminator
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a preservation property — asserted by δ's regression test over the existing
+        Layer-B cases, not greppable
+- label: ε
+  task_id: 3158
+  title: Clear the whole reviews/ dir per review round, not just merge.json
+  capabilities:
+  - name: per-round-reviews-clear
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/workflow.py:5449-5453
+      the reviews/merge.json single-file clear being generalized
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def clear_reviews
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: verdict-cache-needs-no-second-rule
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:599
+      verdicts are keyed by committed-tree hash, so reuse is tree-gated by construction
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a no-change justification; nothing is delivered for this capability
+- label: ζ
+  task_id: 3159
+  title: Terminal-task GC sweep for .task-meta/task-<id>/ (14d grace, INV-4 streak)
+  capabilities:
+  - name: sweep-logs-reclaimed-count
+    binding: capability→producer (wired) — get_statuses bulk status read (CLAUDE.md
+      §Task Routing); task roots are name-parseable via producer:β upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'task-meta gc: reclaimed'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: storm-escape-on-repeated-sweep-failure
+    binding: capability→producer (wired) — INV-4 house pattern, merge_liveness.py
+      consecutive-streak gate (docs/legibility/design-invariants.md §INV-4)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: streak-then-escalate is a behavioural property; ζ's tests assert the
+        escalation fires at the threshold
+- label: η
+  task_id: 3160
+  title: Role/briefing prompts name .task/ only; delete the meta-path arithmetic
+  capabilities:
+  - name: meta-path-arithmetic-gone-from-prompts
+    binding: rejection-mechanism — the string is present at 14 sites today (roles.py:417,433,493,505,808,1137,1467;
+      briefing.py:528,532,636,651,653,882), so its absence is an observed state change,
+      not vacuous
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task-meta/<worktree-name>
+      paths:
+      - orchestrator/src/orchestrator/agents/
+      expect: absent
+  - name: iterations-reachable-from-the-lane
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/artifacts.py:354-386
+      ensure_lane_plan_symlink (task 2763) is the mechanism being extended
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.task/iterations\.jsonl
+      paths:
+      - orchestrator/src/orchestrator/agents/
+      expect: present
+- label: ω
+  task_id: 3161
+  title: Integration gate — cross-lane re-dispatch boundary matrix B1-B9
+  capabilities:
+  - name: boundary-matrix-green-e2e
+    binding: DAG-direction — every leg produced upstream (β root, γ adoption, δ revalidation,
+      ε review staleness, η prompts); ω depends on γ/δ/ε/η
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is the green B1-B9 matrix, in
+        particular B2's zero-architect-invocation assertion
