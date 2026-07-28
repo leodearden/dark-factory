@@ -2508,10 +2508,21 @@ class TestHarnessUnhaltClosesEscalation:
         assert harness.take_resolved_halt_escalations('test-project') == []
 
 
-async def _drive_halt_notify(harness, event_buffer):
-    """Drive one run_loop iteration for a pre-halted project so the halt-check
-    branch (which calls _notify_judge_halt) fires. Mirrors
-    test_halted_project_skips_cycle's run_loop-driving setup."""
+async def _drive_halt_notify(harness, event_buffer, timeout: float = 10.0):
+    """Drive run_loop for a pre-halted project until the halt-check branch
+    (which calls _notify_judge_halt) has fired, then cancel the loop. Mirrors
+    test_halted_project_skips_cycle's run_loop-driving setup.
+
+    Waits on the OBSERVABLE EVENT (on_judge_halt was called), not on a fixed
+    wall-clock budget. The path to the halt check crosses run_loop's whole
+    startup sequence plus several SQLite awaits (should_trigger,
+    mark_run_active), and under ``pytest -n 16`` on a loaded box the previous
+    hardcoded 0.3s budget was not reliably enough — an intermittent
+    'on_judge_halt called 0 times' failure that had nothing to do with the
+    behaviour under test. The generous ``timeout`` is a deadlock backstop
+    only: the happy path exits within ~10ms of the call, well before run_loop's
+    5s tick could respawn the project loop and call the mock a second time.
+    """
     import asyncio
     import contextlib
 
@@ -2520,8 +2531,18 @@ async def _drive_halt_notify(harness, event_buffer):
     harness._stop_escalation_server = AsyncMock()
     for _ in range(3):
         await event_buffer.push(_make_event())
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.3)
+
+    loop_task = asyncio.create_task(harness.run_loop())
+    try:
+        # TimeoutError → fall through and let the caller's assertion report it.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout):
+                while not harness._backlog_policy.on_judge_halt.called:
+                    await asyncio.sleep(0.01)
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
 
 
 @pytest.mark.asyncio
