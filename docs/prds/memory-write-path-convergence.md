@@ -83,7 +83,7 @@ Five thrusts, decomposed as chains (§9):
 - **D7** roles.py inversion (ε) lands only after triage is live end-to-end (deps γ): capture stays eager; dedup is the server's job. The instruction gets *simpler*, not longer.
 - **D8** `audit_duplicate_memories.py` scheduled via systemd user timer (precedent: `fused-memory-flag-marker-sweep.timer`); its deterministic report becomes the consolidation-gate filing input; LLM demoted to adjudicator.
 - **D9** Rediscovery count = count of sighting children, computed at read; consumers: grouped read (D4) and κ's report ranking (which topics aren't reaching agents through briefings).
-- **D10** Staged rollout: `write_triage_enabled` default off; flipped on when γ's boundary tests pass; ε lands after.
+- **D10** Staged rollout: `write_triage_enabled` default off; flipped on when γ's boundary tests pass; ε lands after. The flip decision is deterministically gated: task **3169** (pure gate — `task_kind=deterministic`, `always_escalates`, deps γ) escalates born-at-L2 the moment γ lands, prompting the operator to review γ's accuracy report + α's calibration report; ε (3131) is dep-gated behind 3169's resolution so the inverted writer instruction can never land while the flag is off.
 
 ## 6. Pre-conditions / substrate (G3 — verified 2026-07-27/28 against live source)
 
