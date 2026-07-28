@@ -725,7 +725,19 @@ def format_recovery_table(report: dict[str, Any]) -> str:
 # consume in the interim, mirroring η's recovery surface.
 # ---------------------------------------------------------------------------
 
-_PLAN_QUALITY_COLUMNS = ('task_id', 'config_name', 'role_under_test', 'plan_quality')
+_PLAN_QUALITY_COLUMNS = (
+    'task_id', 'config_name', 'role_under_test', 'plan_quality',
+    'invocation_error',
+)
+_PLAN_QUALITY_MEAN_COLUMNS = (
+    'config_name', 'n', 'cap_excluded', 'mean_plan_quality',
+)
+# The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
+# the bare '-' null sentinel (which already means "not an architect run"): a
+# reader must be able to tell "this candidate scored nothing" from "we could not
+# measure this candidate" at a glance.
+_CAP_EXCLUDED_CELL = 'cap-excluded'
+_PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
 
 
 def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
@@ -801,28 +813,83 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     }
 
 
+def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
+    """Render the per-config mean block: how many cells actually scored.
+
+    The point of the block is that ``mean_plan_quality`` is reported ALONGSIDE
+    the ``n`` it was computed over and the ``cap_excluded`` count it left out,
+    so a mean over 19 of 22 cells reads as exactly that instead of looking like
+    a mean over all of them. A config with nothing scored renders ``-``, never
+    ``0.0000``.
+    """
+    configs = report.get('configs', [])
+    rendered = [
+        {
+            'config_name': str(c['config_name']),
+            'n': str(c['n']),
+            'cap_excluded': str(c['cap_excluded']),
+            'mean_plan_quality': (
+                '-' if c['mean_plan_quality'] is None
+                else f'{float(c["mean_plan_quality"]):.4f}'
+            ),
+        }
+        for c in configs
+    ]
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in _PLAN_QUALITY_MEAN_COLUMNS
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(
+            cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_MEAN_COLUMNS
+        ).rstrip()
+
+    lines = [_PLAN_QUALITY_MEAN_HEADER]
+    lines.append(_fmt({col: col for col in _PLAN_QUALITY_MEAN_COLUMNS}))
+    lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_MEAN_COLUMNS))
+    lines.extend(_fmt(rr) for rr in rendered)
+    return lines
+
+
 def format_plan_quality_table(report: dict[str, Any]) -> str:
     """Render :func:`build_plan_quality_report` output as a deterministic table.
 
     A ``plan_quality`` column shows the populated float (4 dp) for architect rows
     and ``-`` (the null sentinel) for non-architect rows; ``role_under_test``
-    renders ``-`` when ``None``. The same report always renders byte-identically
-    (no wall-clock or dict-order dependence).
+    and ``invocation_error`` render ``-`` when ``None``. A CAP-TAINTED row shows
+    the explicit ``cap-excluded`` marker in place of a score, alongside the
+    ``invocation_error`` that caused it — a transport refusal must never render
+    as ``0.0000``, and must stay distinguishable from the ``-`` a non-architect
+    row uses.
+
+    Two sections follow the rows: the exclusion count (how many of the architect
+    cells were not measurable) and the per-config mean block. Both are computed
+    from the report, so the CLI caller picks the exclusion up with no change of
+    its own. The same report always renders byte-identically (no wall-clock or
+    dict-order dependence).
     """
     rows = report.get('rows', [])
 
-    def _score_cell(value: float | None) -> str:
+    def _score_cell(row: dict[str, Any]) -> str:
+        if row.get('cap_tainted'):
+            return _CAP_EXCLUDED_CELL
+        value = row['plan_quality']
         return '-' if value is None else f'{value:.4f}'
 
-    def _role_cell(value: str | None) -> str:
+    def _text_cell(value: str | None) -> str:
         return '-' if value is None else str(value)
 
     rendered = [
         {
             'task_id': str(r['task_id']),
             'config_name': str(r['config_name']),
-            'role_under_test': _role_cell(r['role_under_test']),
-            'plan_quality': _score_cell(r['plan_quality']),
+            'role_under_test': _text_cell(r['role_under_test']),
+            'plan_quality': _score_cell(r),
+            'invocation_error': _text_cell(r.get('invocation_error')),
         }
         for r in rows
     ]
@@ -835,12 +902,23 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     }
 
     def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_COLUMNS)
+        return '  '.join(
+            cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_COLUMNS
+        ).rstrip()
 
     lines = ['plan_quality report:']
     lines.append(_fmt({col: col for col in _PLAN_QUALITY_COLUMNS}))
     lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_COLUMNS))
     lines.extend(_fmt(rr) for rr in rendered)
+
+    architect_cells = sum(c['total'] for c in report.get('configs', []))
+    lines.append('')
+    lines.append(
+        f'excluded: {report.get("cap_excluded", 0)} cap-tainted cell(s) of '
+        f'{architect_cells} architect cell(s)'
+    )
+    lines.append('')
+    lines.extend(_format_plan_quality_mean_section(report))
     return '\n'.join(lines)
 
 
