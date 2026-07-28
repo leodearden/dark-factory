@@ -61,13 +61,20 @@ _GENERIC_DIRS: frozenset[str] = frozenset({
 
 DARK_FACTORY_PROJECT_ID: str = 'dark_factory'
 
-# Assumes the canonical dark_factory checkout path. This is informational
-# only — it feeds `suggested_root` on scope_violation escalations (surfaced
-# to an operator) and is never used for queue placement or dispatch
-# decisions, so a deployment checked out elsewhere degrades to a stale
-# suggestion, not a functional break. If that ever needs to be exact,
-# override it by constructing a custom `ProjectPrefixRegistry` (e.g. via
-# `from_roots`) instead of `default()`, or update this constant.
+# Assumes the canonical dark_factory checkout path. Two consumers:
+#   - `suggested_root` on scope_violation escalations (surfaced to an
+#     operator) — informational.
+#   - LOAD-BEARING since task 3109: under the `default()` registry this is
+#     the only known project root, so it decides ownership for ABSOLUTE
+#     `metadata.files` paths (`project_for_path`) and therefore whether the
+#     path-scope guard rejects them.
+# A deployment checked out elsewhere degrades fail-OPEN: no root matches, the
+# path classifies as unowned, and the verdict is exactly what it was before
+# task 3109 — a missed rejection, never a false one (same direction the
+# `suggested_root` staleness already accepted). If it needs to be exact,
+# override by constructing a custom `ProjectPrefixRegistry` (e.g. via
+# `from_roots`, which resolves real roots) instead of `default()`, or update
+# this constant.
 DARK_FACTORY_ROOT: str = '/home/leo/src/dark-factory'
 
 DARK_FACTORY_PATH_PREFIXES: tuple[str, ...] = (
@@ -237,23 +244,43 @@ class ProjectPrefixRegistry:
 
         Unlike :meth:`project_for_prefix` (exact prefix-string lookup) or the
         guard's regex-over-prose ``find_paths``, this resolves an arbitrary
-        file path via exact leading-path-*component* matching: a registered
-        prefix ``P`` (always trailing-slash-terminated) owns *file_path* when
-        ``file_path == P.rstrip('/')`` (the bare directory name, no trailing
-        content) or ``file_path.startswith(P)`` — the trailing ``/`` on ``P``
-        enforces the component boundary, so e.g. ``'cratesfoo/x'`` does NOT
-        match the prefix ``'crates/'``, and ``'vendor/crates/x'`` does not
-        either (``crates/`` is not a *leading* component there).
+        file path to an owner. There are TWO disjoint regimes, selected by
+        whether the (normalised) path is absolute:
 
-        A leading ``'./'`` is stripped before matching. When more than one
-        registered prefix matches, the LONGEST one wins (its owner is
-        returned). Returns ``None`` for an empty/falsy *file_path* or when no
-        registered prefix matches.
+        ABSOLUTE (task 3109) — resolved against the registry's known project
+        ROOTS (:attr:`project_to_root`), not against the prefix table: a root
+        ``R`` owns *file_path* when ``file_path == R`` or
+        ``file_path.startswith(R + '/')`` (component boundary, so
+        ``'/home/leo/src/dark-factory-old/x'`` does NOT match the root
+        ``'/home/leo/src/dark-factory'``); the LONGEST matching root wins when
+        roots nest. This is ROOT-AUTHORITATIVE: an absolute path under a known
+        root is owned by that project even when its remainder matches NO
+        registered prefix (e.g. ``<root>/docs/x.md``, whose ``docs/`` is in
+        ``_GENERIC_DIRS``, or a bare ``<root>/README.md``) — an absolute path
+        under a project root is unambiguous evidence of ownership, whereas the
+        denylist and prefix table exist only to disambiguate BARE RELATIVE
+        prefixes across projects (tasks 1494/2434). Returns ``None`` when the
+        path lies under no known root.
+
+        RELATIVE — exact leading-path-*component* matching against registered
+        prefixes: a prefix ``P`` (always trailing-slash-terminated) owns
+        *file_path* when ``file_path == P.rstrip('/')`` (the bare directory
+        name, no trailing content) or ``file_path.startswith(P)`` — the
+        trailing ``/`` on ``P`` enforces the component boundary, so e.g.
+        ``'cratesfoo/x'`` does NOT match the prefix ``'crates/'``, and
+        ``'vendor/crates/x'`` does not either (``crates/`` is not a *leading*
+        component there). When more than one registered prefix matches, the
+        LONGEST one wins.
+
+        A leading ``'./'`` is stripped before matching. Returns ``None`` for
+        an empty/falsy *file_path*.
 
         This is the CERTAIN/structured counterpart to the heuristic prose
         scanners in :mod:`fused_memory.middleware.path_scope_guard` — used by
         ``check_files_for_scope`` to classify concrete ``metadata.files``
-        entries (task 2206).
+        entries (task 2206) and by ``all_files_foreign_owner`` for the
+        cross-repo tagger (task 3004). Both spellings of the same logical file
+        now classify identically (task 3109).
         """
         path = (file_path or '').strip()
         if path.startswith('./'):
@@ -304,17 +331,27 @@ class ProjectPrefixRegistry:
         ``/home/leo/src/dark-factory``. Degenerate roots (``''``, ``'/'``)
         are skipped rather than allowed to own everything.
 
+        When roots NEST (a project root and a worktree root beneath it can
+        both be configured), the LONGEST matching root wins, so the most
+        specific root is authoritative deterministically, independent of dict
+        insertion order — mirroring :meth:`project_for_path`'s
+        longest-prefix-wins tiebreak at the other granularity.
+
         Returns ``None`` when *path* lies under no known root — genuinely
         unclassifiable, which fails OPEN (unowned = the pre-3109 verdict,
         never a false rejection).
         """
+        best_root = ''
+        best_owner: str | None = None
         for project_id, root in self.project_to_root.items():
             root_norm = root.rstrip('/')
             if not root_norm:
                 continue  # '' / '/' roots would own everything — skip
-            if path == root_norm or path.startswith(root_norm + '/'):
-                return project_id
-        return None
+            matches = path == root_norm or path.startswith(root_norm + '/')
+            if matches and len(root_norm) > len(best_root):
+                best_root = root_norm
+                best_owner = project_id
+        return best_owner
 
     def root_for_project(self, project_id: str) -> str | None:
         """Return the configured project_root for *project_id*, or None."""
