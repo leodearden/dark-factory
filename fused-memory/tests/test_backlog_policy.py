@@ -328,6 +328,38 @@ async def test_explicit_registration_clears_startup_seeded_provenance(
     assert 'reify' not in policy._startup_seeded
 
 
+@pytest.mark.asyncio
+async def test_watchdog_wedge_does_not_fan_out_to_idle_startup_seeded_projects(
+    event_buffer, tmp_path,
+):
+    """Startup seeding must not turn one drainer wedge into N escalations.
+
+    Seeding populates ``_state`` for every KNOWN project, and
+    ``_projects_with_backlog`` derives its fan-out set from ``_state``.  An
+    idle startup-seeded project (zero buffered events) must be skipped; an
+    explicitly-registered project is escalated unconditionally, preserving
+    ``test_on_watchdog_wedge_writes_escalation_with_wedge_error_type``.
+    """
+    roots = {}
+    for name in ('active', 'idle', 'explicit'):
+        root = tmp_path / f'{name}_root'
+        root.mkdir()
+        roots[name] = root
+
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+    policy.register_known_project_roots({
+        'active': str(roots['active']),
+        'idle': str(roots['idle']),
+    })
+    policy.register_project_root('explicit', str(roots['explicit']))
+    await _seed_buffered(event_buffer, 'active', n=3)
+
+    verdicts = await policy.on_watchdog_wedge({'stale_for_seconds': 180.0})
+
+    assert {v.project_id for v in verdicts} == {'active', 'explicit'}
+    assert not (roots['idle'] / 'data' / 'escalations').exists()
+
+
 # ── orchestrator_detector ─────────────────────────────────────────────────
 
 
