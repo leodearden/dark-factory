@@ -1049,3 +1049,133 @@ class TestWriteTriageConfigBlock:
         with pytest.raises(ValueError):
             _mod().write_triage_config_block(WITH_BLOCK, None, None, 'r.json')
         assert 'write_triage' in WITH_BLOCK and '0.11' in WITH_BLOCK, 'input untouched'
+
+
+# ---------------------------------------------------------------------------
+# run_calibration (end-to-end, injected edges)
+# ---------------------------------------------------------------------------
+
+def _e2e_records() -> list[dict]:
+    return [
+        _rec('c1', 'c1', 'canonical'), _rec('d1', 'c1', 'duplicate'),
+        _rec('c2', 'c2', 'canonical'), _rec('d2', 'c2', 'duplicate'),
+    ]
+
+
+def _embed_fn(separable: bool = True):
+    """Cluster-1 and cluster-2 vectors are near-orthogonal, so same-cluster
+    pairs score high and cross-cluster pairs score low."""
+    vectors = {
+        'c1': [1.0, 0.0], 'd1': [0.99, 0.14],
+        'c2': [0.0, 1.0], 'd2': [0.14, 0.99],
+    }
+    if not separable:
+        vectors['d2'] = [0.99, 0.14]  # collapses the classes together
+    calls: list[str] = []
+
+    def embed(mid: str, content: str) -> list[float]:
+        calls.append(mid)
+        return vectors[mid]
+
+    embed.calls = calls  # type: ignore[attr-defined]
+    return embed
+
+
+def _search_fn(hits: dict[str, list[str]] | None = None, present: set[str] | None = None):
+    hits = hits if hits is not None else {'d1': ['c1'], 'd2': ['c2']}
+    present = present if present is not None else {'c1', 'c2'}
+
+    def search(record: dict, k: int) -> dict:
+        return {
+            'candidates': hits.get(record['memory_id'], []),
+            'canonical_present': record['cluster_id'] in present,
+        }
+
+    return search
+
+
+def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5)):
+    return _mod().run_calibration(
+        records=records if records is not None else _e2e_records(),
+        embed_fn=embed if embed is not None else _embed_fn(),
+        search_fn=search if search is not None else _search_fn(),
+        report_path=tmp_path / 'report.json',
+        ks=list(ks),
+        provenance={'fixture_path': 'x.jsonl', 'embedder_model': 'text-embedding-3-small',
+                    'embedder_dimensions': 1536},
+    )
+
+
+class TestRunCalibration:
+    def test_writes_the_json_report(self, tmp_path: Path) -> None:
+        result = _run(tmp_path)
+        written = json.loads((tmp_path / 'report.json').read_text())
+        assert written == result['report'], 'the JSON on disk must be the report built'
+
+    def test_writes_a_markdown_sibling(self, tmp_path: Path) -> None:
+        _run(tmp_path)
+        assert (tmp_path / 'report.md').exists(), 'a human-readable sibling must be written'
+
+    def test_the_markdown_carries_the_band_table_and_false_positive_figure(
+        self, tmp_path: Path,
+    ) -> None:
+        """Assert on the numbers and structure, not on prose wording."""
+        result = _run(tmp_path)
+        md = (tmp_path / 'report.md').read_text()
+        for name in PAIR_CLASSES:
+            assert name in md, f'the band table must cover {name}'
+        fps = result['report']['deterministic_band_false_positives']
+        assert str(fps) in md, 'the deterministic-band false-positive count must be readable'
+
+    def test_embeds_each_distinct_record_exactly_once(self, tmp_path: Path) -> None:
+        """Pair-wise embedding would multiply API cost by O(n)."""
+        embed = _embed_fn()
+        records = _e2e_records()
+        _run(tmp_path, embed=embed)
+        assert len(embed.calls) == len(records), (
+            f'expected {len(records)} embed calls (one per record), got {len(embed.calls)}'
+        )
+        assert sorted(embed.calls) == sorted(r['memory_id'] for r in records)
+
+    def test_the_returned_bands_match_derive_bands_over_the_measured_scores(
+        self, tmp_path: Path,
+    ) -> None:
+        result = _run(tmp_path)
+        scores = result['scores_by_class']
+        negatives = list(scores['unrelated']) + list(scores['hard_negative'])
+        expected = _mod().derive_bands(scores['true_dup'], negatives)
+        assert (result['t_high'], result['t_low']) == (expected[0], expected[1])
+
+    def test_an_embed_failure_propagates_rather_than_silently_shrinking_the_sample(
+        self, tmp_path: Path,
+    ) -> None:
+        """A partial distribution would yield a thresholds-look-fine artifact
+        computed on a subset."""
+        def boom(mid: str, content: str) -> list[float]:
+            if mid == 'd2':
+                raise RuntimeError('embedding failed')
+            return [1.0, 0.0]
+
+        with pytest.raises(RuntimeError):
+            _run(tmp_path, embed=boom)
+
+    def test_a_search_failure_surfaces_rather_than_scoring_a_miss(
+        self, tmp_path: Path,
+    ) -> None:
+        def boom(record: dict, k: int) -> dict:
+            raise RuntimeError('search failed')
+
+        with pytest.raises(RuntimeError):
+            _run(tmp_path, search=boom)
+
+    def test_a_refusal_still_writes_the_report(self, tmp_path: Path) -> None:
+        result = _run(tmp_path, embed=_embed_fn(separable=False))
+        assert (tmp_path / 'report.json').exists(), 'the refusal IS the finding — record it'
+        assert result['report']['reason'], 'the refusal must carry its reason'
+
+    def test_a_refusal_does_not_attempt_the_config_write(self, tmp_path: Path) -> None:
+        result = _run(tmp_path, embed=_embed_fn(separable=False))
+        assert result['t_high'] is None or result['t_low'] is None
+        assert result.get('config_written') is not True, (
+            'an uncalibrated run must never reach the config write'
+        )
