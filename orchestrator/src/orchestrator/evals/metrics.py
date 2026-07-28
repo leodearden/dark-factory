@@ -113,6 +113,33 @@ class EvalMetrics:
     # ``'architect'``.
     role_under_test: str | None = None
 
+    # Infra-failure markers (task 3118) — the pair that keeps a TRANSPORT-layer
+    # refusal from being read as a CONTENT-domain score.
+    #
+    # ``invocation_error`` records WHAT happened: a stage-prefixed marker for an
+    # infra refusal observed while producing this cell, e.g.
+    # ``"architect:cap_hit: You've hit your session limit · resets 8pm"`` or
+    # ``"judge:api_error: HTTP 429"``. ``None`` means no infra refusal was
+    # observed — including for an ordinary content failure (an architect that
+    # ran fine and simply produced a bad/absent plan), which must keep scoring
+    # on content.
+    #
+    # ``cap_tainted`` is the SCORING DECISION derived from it: this cell is not
+    # a content measurement at all, so every aggregate must EXCLUDE it rather
+    # than average in a fabricated zero (which would penalise whichever
+    # candidate happened to be scheduled inside a cap window). It is kept as an
+    # explicit boolean — not inferred from ``plan_quality is None`` — for the
+    # same reason ``adversarial`` is kept distinct from ``recovery_score``: a
+    # null score would otherwise be ambiguous between "not an architect run"
+    # and "architect run we could not measure". This is the same null-gating
+    # discipline ``_is_false_green`` / ``_is_null_work`` already apply to
+    # ``tests_pass``, applied to the cap path.
+    #
+    # Both defaults are safe, so results persisted before these fields existed
+    # read back unchanged (no marker, not tainted).
+    invocation_error: str | None = None
+    cap_tainted: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
