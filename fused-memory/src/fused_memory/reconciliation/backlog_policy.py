@@ -355,6 +355,20 @@ class BacklogPolicy:
                 escalation_path=str(path) if path else None,
             )
 
+        # Loud-over-silent (task 2998): the reject branch writes no escalation
+        # file, so without this line the drop is invisible — the defining
+        # symptom of the 48h reify incident was NO backlog_policy log of any
+        # kind. One line per rejection: a halted tick retries every ~5s.
+        cause = (
+            'project_root not registered'
+            if project_root is None
+            else f'no live orchestrator for {project_root}'
+        )
+        logger.warning(
+            'backlog_policy: no escalation written for %s (kind=%s, '
+            'error_type=%s, backlog=%d) — %s',
+            project_id, kind, error_type, backlog, cause,
+        )
         return BacklogVerdict(
             outcome='rejection',
             backlog=backlog,
