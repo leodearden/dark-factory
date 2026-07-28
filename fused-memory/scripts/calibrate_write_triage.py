@@ -281,3 +281,53 @@ def derive_bands(
         )
 
     return t_high, t_low, None
+
+
+# ---------------------------------------------------------------------------
+# Candidate-retrieval recall
+# ---------------------------------------------------------------------------
+
+def compute_recall_at_k(
+    retrievals: Sequence[dict[str, Any]],
+    ks: Sequence[int],
+) -> dict[str, Any]:
+    """Measure how often the existing search surfaces the ground-truth canonical.
+
+    Each retrieval carries ``memory_id``, ``canonical_id``,
+    ``canonical_present`` and the ranked ``candidates`` search returned.
+
+    Retrievals whose canonical is not in the corpus are listed under
+    ``canonical_absent`` and dropped from the denominator. The session's
+    duplicates were deleted, so an absent canonical is a CORPUS GAP rather
+    than a retrieval failure; scoring it as a miss would understate recall
+    and could push T_low lower than the evidence supports.
+
+    An empty denominator reports ``recall=None``, not ``0.0`` — no
+    measurement is not a measured zero.
+    """
+    scorable: list[dict[str, Any]] = []
+    absent: list[dict[str, str]] = []
+    for item in retrievals:
+        if item.get('canonical_present'):
+            scorable.append(item)
+        else:
+            absent.append({
+                'memory_id': str(item.get('memory_id')),
+                'canonical_id': str(item.get('canonical_id')),
+            })
+
+    per_k: list[dict[str, Any]] = []
+    for k in ks:
+        hits = sum(
+            1 for item in scorable
+            if item['canonical_id'] in list(item.get('candidates') or [])[:k]
+        )
+        total = len(scorable)
+        per_k.append({
+            'k': k,
+            'hits': hits,
+            'total': total,
+            'recall': (hits / total) if total else None,
+        })
+
+    return {'per_k': per_k, 'canonical_absent': absent}
