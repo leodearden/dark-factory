@@ -492,3 +492,259 @@ def write_triage_config_block(
         end -= 1
 
     return ''.join(lines[:start]) + block + trailing + ''.join(lines[end:])
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    """Human-readable sibling of the JSON report.
+
+    Carries the per-band table so the deterministic band's false-positive
+    risk is readable without parsing JSON.
+    """
+    lines = [
+        '# Write-triage calibration report',
+        '',
+        f'- `t_high`: `{report["chosen_t_high"]}`',
+        f'- `t_low`: `{report["chosen_t_low"]}`',
+        f'- deterministic-band false positives: '
+        f'**{report["deterministic_band_false_positives"]}**',
+    ]
+    if report.get('reason'):
+        lines.append(f'- refusal reason: `{report["reason"]}`')
+    lines += ['', '## Measured distributions', '',
+              '| pair class | n | min | p25 | median | p75 | max |',
+              '|---|---|---|---|---|---|---|']
+    for name in PAIR_CLASSES:
+        d = report['distributions'][name]
+        lines.append(
+            f'| {name} | {d["n"]} | {d["min"]} | {d["p25"]} | {d["median"]} '
+            f'| {d["p75"]} | {d["max"]} |',
+        )
+    lines += ['', '## Per-band counts', '',
+              '| pair class | deterministic (s>=t_high) | judge | store |',
+              '|---|---|---|---|']
+    for name in PAIR_CLASSES:
+        b = report['per_band'][name]
+        lines.append(f'| {name} | {b["deterministic"]} | {b["judge"]} | {b["store"]} |')
+    lines += ['', '## Candidate-retrieval recall', '',
+              '| k | hits | total | recall |', '|---|---|---|---|']
+    for row in report['recall_at_k'].get('per_k', []):
+        lines.append(f'| {row["k"]} | {row["hits"]} | {row["total"]} | {row["recall"]} |')
+    absent = report['recall_at_k'].get('canonical_absent') or []
+    lines += ['', f'Canonicals absent from the corpus (excluded from the denominator): '
+                  f'{len(absent)}', '', '## Provenance', '']
+    for key, value in report['provenance'].items():
+        lines.append(f'- `{key}`: `{value}`')
+    return '\n'.join(lines) + '\n'
+
+
+def run_calibration(
+    records: list[dict[str, Any]],
+    embed_fn: Any,
+    search_fn: Any,
+    report_path: str | Path,
+    ks: Sequence[int],
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    """Measure, derive, and write the report. Never writes config.
+
+    ``embed_fn(memory_id, content)`` is called exactly ONCE per distinct
+    record — embedding per pair would multiply API cost by O(n).
+    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``.
+
+    Neither callable's failure is caught. A swallowed embed error would
+    silently shrink the measured population, producing a report whose
+    thresholds look fine but were computed on a subset; a swallowed search
+    error would be indistinguishable from a genuine recall miss.
+    """
+    vectors = {r['memory_id']: embed_fn(r['memory_id'], r['content']) for r in records}
+    logger.info('Embedded %d distinct record(s)', len(vectors))
+
+    pair_sets = build_pair_sets(records)
+    scores_by_class = {
+        name: [
+            cosine_similarity(vectors[p['a']], vectors[p['b']])
+            for p in pair_sets[f'{name}_pairs']
+        ]
+        for name in PAIR_CLASSES
+    }
+
+    negatives = [s for name in NEGATIVE_PAIR_CLASSES for s in scores_by_class[name]]
+    t_high, t_low, reason = derive_bands(scores_by_class['true_dup'], negatives)
+    if reason:
+        logger.warning('Band derivation returned no complete calibration: %s', reason)
+
+    max_k = max(ks) if ks else 0
+    retrievals = []
+    for record in records:
+        if record['label'] == LABEL_CANONICAL:
+            continue
+        hit = search_fn(record, max_k)
+        retrievals.append({
+            'memory_id': record['memory_id'],
+            'canonical_id': record['cluster_id'],
+            'canonical_present': bool(hit.get('canonical_present')),
+            'candidates': list(hit.get('candidates') or []),
+        })
+    recall = compute_recall_at_k(retrievals, list(ks))
+
+    run_provenance = dict(provenance)
+    run_provenance.setdefault('record_count', len(records))
+    run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
+    report = build_report(
+        scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
+        reason=reason, recall=recall, provenance=run_provenance,
+    )
+
+    report_path = Path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+    report_path.with_suffix('.md').write_text(render_markdown(report))
+    logger.info('Wrote %s and its .md sibling', report_path)
+
+    return {
+        'report': report, 'scores_by_class': scores_by_class,
+        't_high': t_high, 't_low': t_low, 'reason': reason,
+        'config_written': False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Live edge / CLI
+# ---------------------------------------------------------------------------
+
+def build_embed_fn(config: Any) -> Any:
+    """Mirror Mem0's own embedder wiring — model + api_key, NO dimensions.
+
+    See the module docstring: passing a custom dimensionality would move the
+    measurement into a different metric space than the guard's
+    relevance_score, making the derived thresholds inapplicable.
+    """
+    from openai import OpenAI  # noqa: PLC0415
+
+    embedder = config.embedder
+    api_key = embedder.providers.get('openai', {}).get('api_key') if isinstance(
+        getattr(embedder, 'providers', None), dict,
+    ) else None
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+
+    def embed(memory_id: str, content: str) -> list[float]:
+        response = client.embeddings.create(model=embedder.model, input=content)
+        return list(response.data[0].embedding)
+
+    return embed
+
+
+async def _run(args: Any) -> int:
+    import os  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    memory = MemoryService(config)
+    await memory.initialize()
+    try:
+        records = load_fixture(args.fixture)
+        logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
+
+        embed_fn = build_embed_fn(config)
+
+        async def _search_async(record: dict, k: int) -> dict:
+            results = await memory.search(
+                query=record['content'], project_id=args.project_id, limit=k,
+            )
+            rows = results.get('results', results) if isinstance(results, dict) else results
+            candidates = [str(r.get('id')) for r in rows or []]
+            canonical = await memory.get_memory_by_id(
+                record['cluster_id'], project_id=args.project_id,
+            )
+            present = bool(canonical and canonical.get('found', True))
+            return {'candidates': candidates, 'canonical_present': present}
+
+        # Pre-resolve retrievals on this loop, then hand run_calibration a
+        # plain lookup — keeps the orchestrator fully synchronous and
+        # testable while the I/O stays async here.
+        max_k = max(args.k)
+        prefetched: dict[str, dict] = {}
+        for record in records:
+            if record['label'] != LABEL_CANONICAL:
+                prefetched[record['memory_id']] = await _search_async(record, max_k)
+
+        result = run_calibration(
+            records=records,
+            embed_fn=embed_fn,
+            search_fn=lambda record, k: prefetched[record['memory_id']],
+            report_path=args.report_path,
+            ks=args.k,
+            provenance={
+                'fixture_path': str(args.fixture),
+                'project_id': args.project_id,
+                'embedder_model': config.embedder.model,
+                'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
+                'search_categories': 'all (MemoryService.search)',
+            },
+        )
+
+        print(json.dumps(result['report'], indent=2))
+        logger.info(
+            't_high=%s t_low=%s deterministic-band false positives=%s',
+            result['t_high'], result['t_low'],
+            result['report']['deterministic_band_false_positives'],
+        )
+
+        if not args.write_config:
+            logger.info('Report only — config unchanged. Use --write-config to commit.')
+            return 0
+        if result['t_high'] is None or result['t_low'] is None:
+            logger.error(
+                'ABORT: no complete calibration was derived (%s) — refusing to write '
+                'config. Leaving write_triage uncalibrated means triage fails open '
+                'to `stored`, which is the correct behaviour for this outcome.',
+                result['reason'],
+            )
+            return 1
+
+        config_path = Path(args.config) if args.config else (
+            Path(__file__).parent.parent / 'config' / 'config.yaml'
+        )
+        updated = write_triage_config_block(
+            config_path.read_text(), result['t_high'], result['t_low'],
+            str(args.report_path),
+        )
+        config_path.write_text(updated)
+        logger.info('Wrote write_triage block to %s', config_path)
+        return 0
+    finally:
+        await memory.close()
+
+
+def main() -> int:
+    import argparse  # noqa: PLC0415
+    import asyncio  # noqa: PLC0415
+
+    repo = Path(__file__).parent.parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--fixture', default=str(
+        repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'))
+    parser.add_argument('--project-id', dest='project_id', default='reify')
+    parser.add_argument('--k', type=int, action='append', default=None,
+                        help='recall@k value (repeatable; default 1 3 5 10)')
+    parser.add_argument('--report-path', dest='report_path', default=str(
+        repo / 'calibration' / 'write_triage_calibration_report.json'))
+    parser.add_argument('--config', default=None,
+                        help='Path to fused-memory config file (sets CONFIG_PATH)')
+    parser.add_argument('--write-config', dest='write_config', action='store_true',
+                        help='Write the derived thresholds into config.yaml '
+                             '(default: report only)')
+    args = parser.parse_args()
+    if not args.k:
+        args.k = [1, 3, 5, 10]
+    return asyncio.run(_run(args))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
