@@ -778,3 +778,153 @@ class TestComputeRecallAtK:
         assert row['total'] == 0
         assert row['recall'] is None
         assert len(got['canonical_absent']) == 1
+
+
+# ---------------------------------------------------------------------------
+# build_report
+# ---------------------------------------------------------------------------
+
+PAIR_CLASSES = ('true_dup', 'unrelated', 'hard_negative')
+
+_PROVENANCE = {
+    'fixture_path': 'tests/fixtures/write_triage_calibration.jsonl',
+    'record_count': 6,
+    'cluster_count': 2,
+    'embedder_model': 'text-embedding-3-small',
+    'embedder_dimensions': 1536,
+}
+
+# Cleanly separated: every negative sits below every duplicate.
+CLEAN_SCORES = {
+    'true_dup': [0.70, 0.80, 0.90],
+    'unrelated': [0.10, 0.20, 0.30],
+    'hard_negative': [0.40, 0.50],
+}
+# Deliberately overlapping: two negatives sit at/above the duplicate lower tail.
+OVERLAP_SCORES = {
+    'true_dup': [0.70, 0.80, 0.90],
+    'unrelated': [0.10, 0.85],
+    'hard_negative': [0.40, 0.95],
+}
+
+
+def _report(scores: dict, t_high, t_low, reason=None, recall=None) -> dict:
+    return _mod().build_report(
+        scores_by_class=scores,
+        t_high=t_high,
+        t_low=t_low,
+        reason=reason,
+        recall=recall if recall is not None else {'per_k': [], 'canonical_absent': []},
+        provenance=dict(_PROVENANCE),
+    )
+
+
+class TestBuildReport:
+    def test_carries_a_distribution_summary_per_pair_class(self) -> None:
+        got = _report(CLEAN_SCORES, 0.70, 0.60)
+        for name in PAIR_CLASSES:
+            assert name in got['distributions'], f'missing distribution for {name}'
+            assert got['distributions'][name]['n'] == len(CLEAN_SCORES[name])
+
+    def test_echoes_the_chosen_thresholds(self) -> None:
+        got = _report(CLEAN_SCORES, 0.70, 0.60)
+        assert got['chosen_t_high'] == pytest.approx(0.70)
+        assert got['chosen_t_low'] == pytest.approx(0.60)
+
+    def test_carries_the_recall_block(self) -> None:
+        recall = {'per_k': [{'k': 1, 'hits': 2, 'total': 3, 'recall': 2 / 3}],
+                  'canonical_absent': []}
+        got = _report(CLEAN_SCORES, 0.70, 0.60, recall=recall)
+        assert got['recall_at_k'] == recall
+
+    def test_carries_run_provenance(self) -> None:
+        got = _report(CLEAN_SCORES, 0.70, 0.60)
+        prov = got['provenance']
+        for key in ('fixture_path', 'record_count', 'cluster_count',
+                    'embedder_model', 'embedder_dimensions'):
+            assert key in prov, f'provenance missing {key!r}'
+        assert prov['pair_counts'] == {name: len(CLEAN_SCORES[name]) for name in PAIR_CLASSES}, (
+            'per-class pair counts must be recorded so the report is self-describing'
+        )
+
+    def test_counts_every_pair_class_across_the_three_bands(self) -> None:
+        got = _report(CLEAN_SCORES, 0.70, 0.60)
+        for name in PAIR_CLASSES:
+            bands = got['per_band'][name]
+            for band in ('deterministic', 'judge', 'store'):
+                assert band in bands, f'{name} missing band count {band!r}'
+
+    def test_band_counts_sum_to_each_class_n(self) -> None:
+        """Accounting invariant: no pair is silently dropped from the report."""
+        for scores, t_high, t_low in (
+            (CLEAN_SCORES, 0.70, 0.60), (OVERLAP_SCORES, 0.90, 0.70),
+        ):
+            got = _report(scores, t_high, t_low)
+            for name in PAIR_CLASSES:
+                bands = got['per_band'][name]
+                total = bands['deterministic'] + bands['judge'] + bands['store']
+                assert total == len(scores[name]), (
+                    f'{name}: band counts {bands} sum to {total}, expected {len(scores[name])}'
+                )
+
+    def test_bands_are_assigned_at_the_documented_boundaries(self) -> None:
+        """s >= t_high deterministic; t_low <= s < t_high judge; s < t_low store."""
+        got = _report({'true_dup': [0.60, 0.70, 0.80], 'unrelated': [], 'hard_negative': []},
+                      0.70, 0.60)
+        bands = got['per_band']['true_dup']
+        assert bands['deterministic'] == 2, 't_high is inclusive (0.70 and 0.80)'
+        assert bands['judge'] == 1, 't_low is inclusive (0.60)'
+        assert bands['store'] == 0
+
+    def test_deterministic_band_false_positives_is_zero_for_a_clean_separation(self) -> None:
+        got = _report(CLEAN_SCORES, 0.70, 0.60)
+        assert got['deterministic_band_false_positives'] == 0
+
+    def test_deterministic_band_false_positives_counts_negatives_at_or_above_t_high(self) -> None:
+        """The task's headline risk figure: unrelated PLUS hard_negative pairs
+        that the deterministic band would restate without asking a judge."""
+        got = _report(OVERLAP_SCORES, 0.80, 0.70)
+        # unrelated 0.85 and hard_negative 0.95 both clear t_high=0.80.
+        assert got['deterministic_band_false_positives'] == 2
+
+    def test_false_positives_equal_the_negative_classes_deterministic_counts(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70)
+        expected = (got['per_band']['unrelated']['deterministic']
+                    + got['per_band']['hard_negative']['deterministic'])
+        assert got['deterministic_band_false_positives'] == expected
+        # True duplicates DO reach the deterministic band — that is the band
+        # working. They must never be tallied as false positives.
+        assert got['per_band']['true_dup']['deterministic'] > 0, 'sample sanity'
+        assert got['deterministic_band_false_positives'] < (
+            expected + got['per_band']['true_dup']['deterministic']
+        )
+
+    def test_an_uncalibrated_run_still_emits_the_distributions(self) -> None:
+        """t_high=None must not raise: the refusal IS the finding, and the
+        measured distributions are what justify it."""
+        got = _report(CLEAN_SCORES, None, None, reason='not_separable: ...')
+        assert got['chosen_t_high'] is None
+        assert got['chosen_t_low'] is None
+        assert got['reason'] == 'not_separable: ...'
+        for name in PAIR_CLASSES:
+            assert got['distributions'][name]['n'] == len(CLEAN_SCORES[name])
+
+    def test_an_uncalibrated_run_reports_no_band_counts_rather_than_zeroes(self) -> None:
+        got = _report(CLEAN_SCORES, None, None, reason='not_separable: ...')
+        assert got['deterministic_band_false_positives'] is None, (
+            'with no t_high there is no deterministic band; 0 would read as '
+            '"measured, and safe"'
+        )
+
+    def test_a_missing_judge_band_still_accounts_for_every_pair(self) -> None:
+        """Perfect separation: t_high derived, t_low None."""
+        got = _report(CLEAN_SCORES, 0.70, None, reason='no_judge_band: ...')
+        for name in PAIR_CLASSES:
+            bands = got['per_band'][name]
+            assert bands['judge'] == 0
+            total = bands['deterministic'] + bands['judge'] + bands['store']
+            assert total == len(CLEAN_SCORES[name]), f'{name}: {bands}'
+
+    def test_the_report_is_json_serializable(self) -> None:
+        got = _report(OVERLAP_SCORES, 0.80, 0.70)
+        assert json.loads(json.dumps(got)) == got
