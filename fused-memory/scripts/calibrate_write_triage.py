@@ -331,3 +331,89 @@ def compute_recall_at_k(
         })
 
     return {'per_k': per_k, 'canonical_absent': absent}
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+# Pair classes, in report order. The last two are the NEGATIVE classes: a
+# pair from either that reaches the deterministic band is a false positive.
+PAIR_CLASSES = ('true_dup', 'unrelated', 'hard_negative')
+NEGATIVE_PAIR_CLASSES = ('unrelated', 'hard_negative')
+
+
+def _band_counts(
+    scores: Sequence[float],
+    t_high: float | None,
+    t_low: float | None,
+) -> dict[str, int]:
+    """Count a class's scores across the three triage bands.
+
+    ``s >= t_high`` deterministic; ``t_low <= s < t_high`` judge;
+    ``s < t_low`` store. A ``None`` t_low means no judge band is derivable,
+    so everything below t_high falls to store — the counts still sum to the
+    class's n either way.
+    """
+    deterministic = sum(1 for s in scores if t_high is not None and s >= t_high)
+    if t_low is None:
+        judge = 0
+    else:
+        judge = sum(
+            1 for s in scores
+            if s >= t_low and (t_high is None or s < t_high)
+        )
+    return {
+        'deterministic': deterministic,
+        'judge': judge,
+        'store': len(scores) - deterministic - judge,
+    }
+
+
+def build_report(
+    scores_by_class: dict[str, Sequence[float]],
+    t_high: float | None,
+    t_low: float | None,
+    reason: str | None,
+    recall: dict[str, Any],
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble the JSON-serializable calibration report.
+
+    Its job is to make the deterministic band's false-positive risk
+    visible: ``deterministic_band_false_positives`` counts the unrelated
+    and hard-negative pairs that would be restated WITHOUT a judge under
+    the chosen ``t_high``. True duplicates in that band are the band
+    working and are never tallied there.
+
+    Tolerates an uncalibrated run (``t_high=None``): the measured
+    distributions plus the refusal reason are exactly what justify the
+    refusal, so they are still emitted. The false-positive tally is then
+    ``None`` rather than ``0`` — with no deterministic band, ``0`` would
+    read as "measured, and safe".
+    """
+    scores = {name: list(scores_by_class.get(name) or []) for name in PAIR_CLASSES}
+
+    per_band = {
+        name: _band_counts(values, t_high, t_low) for name, values in scores.items()
+    }
+    false_positives = (
+        None if t_high is None
+        else sum(per_band[name]['deterministic'] for name in NEGATIVE_PAIR_CLASSES)
+    )
+
+    run_provenance = dict(provenance)
+    run_provenance['pair_counts'] = {name: len(values) for name, values in scores.items()}
+
+    return {
+        'chosen_t_high': t_high,
+        'chosen_t_low': t_low,
+        'reason': reason,
+        'deterministic_band_false_positives': false_positives,
+        'distributions': {
+            name: summarize_distribution(values) for name, values in scores.items()
+        },
+        'per_band': per_band,
+        'recall_at_k': recall,
+        'provenance': run_provenance,
+    }
