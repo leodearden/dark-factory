@@ -295,12 +295,26 @@ class BacklogPolicy:
         return verdicts
 
     async def _projects_with_backlog(self) -> list[str]:
-        """Project ids with any registered state or buffered events.
+        """Project ids a fleet-wide fault (e.g. a drainer wedge) should escalate.
 
-        Falls back to the cached set so wedge alerts fire even when the
-        buffer count query is unavailable.
+        Every EXPLICITLY registered id (one observed on a real mutating call,
+        via ``register_project_root``) is returned unconditionally, including
+        at zero backlog — an active project deserves the alert even when its
+        buffered count happens to be 0 right now.
+
+        Ids known only from startup seeding (``register_known_project_roots``,
+        tracked in ``_startup_seeded``) are returned ONLY when their current
+        backlog is non-zero.  Without that filter, seeding every known project
+        at startup (task 2998 GAP A) would turn a single drainer wedge into
+        one escalation per KNOWN project rather than per ACTIVE one.
         """
-        return sorted(self._state.keys())
+        candidates: list[str] = []
+        for project_id in sorted(self._state.keys()):
+            if project_id in self._startup_seeded:
+                if await self.current_backlog(project_id) == 0:
+                    continue
+            candidates.append(project_id)
+        return candidates
 
     async def _route_over_limit(
         self,
