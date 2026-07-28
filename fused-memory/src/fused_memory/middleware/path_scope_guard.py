@@ -259,12 +259,19 @@ def check_files_for_scope(
 
     CERTAIN counterpart to :func:`check_candidate_for_scope` /
     :func:`check_text_for_scope`: classifies each concrete file path via
-    :meth:`ProjectPrefixRegistry.project_for_path` (exact leading-path-
-    component match) instead of the heuristic regex-over-prose
-    :func:`find_paths`.  Used by the interceptor's FILES-certain check
-    (task 2206) to hard-reject a submission whose ``metadata.files`` name a
-    path under a KNOWN other project's tree — no LLM adjudication, since an
-    exact owner lookup leaves nothing to adjudicate.
+    :meth:`ProjectPrefixRegistry.project_for_path` instead of the heuristic
+    regex-over-prose :func:`find_paths`.  That lookup resolves ABSOLUTE
+    entries (and ``~/``-prefixed ones) against the registry's known project
+    roots and RELATIVE ones by exact leading-path-component match, so an
+    absolute foreign path is classified identically to its repo-relative
+    spelling (task 3109).  Spellings resolvable only against a base directory
+    the registry is not given — ``'../other-repo/x.py'``, ``'~user/...'`` —
+    remain UNOWNED and so fail open here, exactly as they did pre-3109; see
+    :meth:`ProjectPrefixRegistry._owner_for_absolute_path` for the pinned
+    residue.  Used by the interceptor's FILES-certain check (task 2206) to
+    hard-reject a submission whose ``metadata.files`` name a path under a
+    KNOWN other project's tree — no LLM adjudication, since an exact owner
+    lookup leaves nothing to adjudicate.
 
     Returns ``ok`` when the registry is empty/falsy, *files* is empty/falsy,
     or every file is either unowned or owned by *project_id*.  On a
@@ -327,10 +334,14 @@ def all_files_foreign_owner(
     file: here the submission must be ENTIRELY foreign under a SINGLE owner,
     with NO locally-owned file, before it qualifies.  Reuses
     :meth:`ProjectPrefixRegistry.project_for_path` exactly as
-    ``check_files_for_scope`` does; files with no registered owner
-    (``project_for_path`` returns ``None``) are neutral — they neither block
-    nor establish cross-repo (conservative, matching
-    :func:`_aggregate_owner_mismatches`).
+    ``check_files_for_scope`` does — including its resolution of ABSOLUTE
+    (and ``~/``-prefixed) entries against the registry's known project roots,
+    so an all-absolute foreign file set is tagged just like its repo-relative
+    spelling (task 3109), and its residual fail-open spellings
+    (``'../other-repo/x.py'``, ``'~user/...'``), which stay unowned.  Files
+    with no registered owner (``project_for_path`` returns ``None``) are
+    neutral — they neither block nor establish cross-repo (conservative,
+    matching :func:`_aggregate_owner_mismatches`).
 
     Returns ``None`` when the registry/*files* are empty, when the FILER
     (*project_id*) is not a registered project, when ANY file is owned by
