@@ -31,6 +31,7 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.git_ops import ConflictProbe
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow_types import StewardResolved
 
@@ -85,6 +86,12 @@ def _make(
 
     git_ops = MagicMock()
     git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    # The resume guard probes whether the (unchanged) branch STILL merges cleanly
+    # onto current main before fast-pathing to merge.  Default to clean so the
+    # HEAD-match resume path behaves as before; conflict tests override this.
+    git_ops.merge_tree_conflicts = AsyncMock(
+        return_value=ConflictProbe(clean=True, conflicted_paths=[])
+    )
 
     queue = MagicMock()
     queue.get_by_task = MagicMock(return_value=[])
@@ -465,6 +472,39 @@ class TestResumeGuard:
 
         assert outcome is None
         spies.merge_and_finalise.assert_not_awaited()
+
+    # -- task 3024 step-1: HEAD match but the branch no longer merges cleanly --
+
+    @pytest.mark.asyncio
+    async def test_head_match_but_since_developed_conflict_clears_and_falls_back(
+        self, monkeypatch,
+    ):
+        """HEAD still matches the stamp, but main advanced and introduced a conflict.
+
+        The stamped branch is unchanged (HEAD match), so the pre-3024 guard
+        fast-pathed straight to _merge_and_finalise with an empty ``plan.files``
+        — tripping the merge-entry scope invariant and looping forever.  The
+        clean-merge probe must void the now-unsatisfiable stamp and fall back to
+        the full plan/execute/verify/review pipeline instead.
+        """
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        spies = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+        f.git_ops.merge_tree_conflicts = AsyncMock(
+            return_value=ConflictProbe(
+                clean=False,
+                conflicted_paths=['orchestrator/src/orchestrator/merge_queue.py'],
+            )
+        )
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        # A confirmed conflict voids the resume obligation — clear it.
+        spies.clear_merge_retry_pending.assert_awaited_once()
+        # ...and never hand an empty-plan workflow to the merge phase.
+        spies.merge_and_finalise.assert_not_awaited()
+        f.git_ops.merge_tree_conflicts.assert_awaited_once_with('BASE-SHA', 'HEAD-SHA')
 
 
 class TestDrivePlacement:
