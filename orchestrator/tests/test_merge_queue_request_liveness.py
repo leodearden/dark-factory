@@ -92,6 +92,42 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     return OrchestratorConfig(project_root=git_repo, git=git_config)
 
 
+# ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
+# The plain `git_config` above omits `persistent_merge_worktree`, which
+# defaults to False (config.py:1483).  With the knob off,
+# `_acquire_warm_verify_worktree` returns `merge_wt` unchanged
+# (merge_liveness.py:712-713) and `reset_persistent_merge_worktree` is never
+# reached — the warm-swap reset seam would be untestable from this file.  The
+# `warm_*` trio below is byte-identical to the plain trio except for that one
+# knob, so a test can drive the LOCAL serial-head warm path for real (the
+# reset-contention seam this task fixes) while every pre-existing test keeps
+# the cold ephemeral path unchanged.
+
+
+@pytest.fixture
+def warm_git_config() -> GitConfig:
+    """`git_config` with the persistent warm merge-verify worktree ENABLED."""
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        persistent_merge_worktree=True,
+    )
+
+
+@pytest.fixture
+def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(warm_git_config, git_repo)
+
+
+@pytest.fixture
+def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
+    """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
+    return OrchestratorConfig(project_root=git_repo, git=warm_git_config)
+
+
 def _make_request(
     task_id: str,
     branch: str,
