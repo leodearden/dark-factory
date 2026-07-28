@@ -605,6 +605,16 @@ one):
 
 - Point-id/UUID stability across both arms (response echoes the same id the call was made with).
 - `created_at` preservation across both arms.
+- **Content amend with NO `metadata_patch`/`metadata_delete_keys` supplied preserves every
+  pre-existing custom payload key verbatim** (e.g. `kind`, `src_project`, `topic`) — defends §2
+  point 3 / §5(b)'s read-modify-forward requirement, and **is the load-bearing regression test in
+  this list**: `created_at` (the bullet above) is one of the keys mem0's own `_update_memory`
+  unconditionally re-preserves (§5(b)), so an implementation containing the exact payload-overwrite
+  bug §2 point 3 documents — forgetting the read-existing-payload-then-reforward-custom-subset
+  dance `scripts/tag_cgl_eta_rehome_scope.py`'s `apply_tags` already had to solve — would still pass
+  the `created_at` test. This test asserts on keys mem0 does *not* restore on its own, so it is the
+  only listed test that actually fails against that bug; it must not be dropped as redundant with
+  the `created_at` test.
 - Metadata-patch shallow-merge preserves unlisted existing custom keys (merge mode).
 - `metadata_mode='replace'` replaces the custom subset but still preserves mem0-owned keys
   underneath.
@@ -612,6 +622,14 @@ one):
 - Reserved-key rejection: a mem0-owned key in `metadata_patch` or `metadata_delete_keys` is a
   `ValidationError`.
 - A key present in both `metadata_patch` and `metadata_delete_keys` is a `ValidationError`.
+- **`metadata_mode='replace'` supplied together with a non-empty `metadata_delete_keys` is a
+  `ValidationError`** naming both arguments — defends §3's replace+delete combination rule.
+- **A metadata-only call supplying both `metadata_patch` (merge) and `metadata_delete_keys` in the
+  same call routes through exactly one `overwrite_payload` backend call** — never a `set_payload`
+  followed by a `delete_payload` — and the resulting payload shows both the merged keys and the
+  removed keys. Defends §5(b)'s read-modify-`overwrite_payload` decision for the combined
+  metadata-only case, and doubles as one concrete instance of the one-backend-write invariant
+  §5(b) now states explicitly.
 - `store='graphiti'` is rejected, error message names `update_edge`.
 - Neither arm supplied → `ValidationError`.
 - `content` supplied with empty/missing `reason` → `ValidationError`; metadata-only arm with no
@@ -621,8 +639,20 @@ one):
 - `mem0_update.enabled=False` rejects every caller regardless of `agent_id`.
 - `EventType.memory_updated` is emitted for the content-amend arm and **not** emitted by default
   for a metadata-only patch.
+- **The metadata-only arm does not re-embed and leaves `updated_at` untouched.** Defends §4/§5(b)'s
+  write-path/embedding-cost axis of the differential bar — the bullet above pins only the "no
+  event" half of that asymmetry. Assertion shape: on the metadata-only path, the embedder (or, at
+  the `Mem0Backend` boundary, `Mem0Backend.update`/mem0's `Memory.update`) is asserted **never
+  called** (mock/spy), and the record's `updated_at` value is byte-identical before and after the
+  call.
 - Both arms produce a `WriteJournal.log_write_op`/`log_backend_op` row regardless of event
   emission.
+- **A combined `content` + (`metadata_patch` and/or `metadata_delete_keys`) call produces exactly
+  one backend write (one `Mem0Backend.update` call), one journal row, one `memory_updated` event,
+  and a payload reflecting both the new content and the merged/deleted metadata.** Defends §5(b)'s
+  "Combined call" decision — introduced by this document and, before this step, entirely untested
+  despite §5(b) asserting the one-write/one-row/one-event guarantee explicitly; this test is what
+  makes that assertion checkable rather than aspirational.
 - Storm counter fires the `mem0_in_place_update_storm` escalation once `storm_threshold`
   content-amend calls from the same `agent_id` land within `storm_window_seconds`, and does
   **not** count metadata-only calls toward it; the triggering call still succeeds (§4).
