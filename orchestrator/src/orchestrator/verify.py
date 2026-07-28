@@ -142,22 +142,41 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     (P1 — an OPAQUE or raw-retained/unparseable prefix is left untouched
     rather than truncated into a possibly-broken argv).
 
-    Content after the matched *keyword* occurrence — including any further
-    ``&&``-chained clause — is intentionally dropped: scoping to specific
-    files means running the tool once against them, not once per chained
-    segment (dark_factory's real per-subproject ``type_check_command`` /
-    ``lint_command`` chain multiple ``cd X && TOOL`` segments; scoping runs
-    only the first, matching the historical behaviour).
+    Content after the matched *keyword* occurrence is truncated WITHIN the
+    matched segment: a value-taking flag positioned after the target (e.g.
+    ``'ruff check src/ --select E'``) would otherwise have its value misread
+    as an extra target by ``scope_to``, so truncating first is what keeps
+    this safe.
+
+    A trailing ``&&``-chained clause is a separate question, decided by
+    ``verify_cmd.split_chain_tail``: a SIBLING CHECKER (a different tool, no
+    ``cd`` sequencing — every subproject's ``lint_command`` chains a
+    ``python3 .../check_*.py <dir>`` gate after ``ruff check``) is PRESERVED
+    unscoped and verbatim, because it asserts a whole-directory invariant
+    that narrowing would break; a SAME-TOOL FAN-OUT (the root config's ``cd X
+    && npx pyright`` chain) is still dropped, since preserving it would run
+    two more subprojects unscoped AND leave a ``cd ../orchestrator`` that
+    misresolves once ``strip_cwd`` has removed the leading ``cd``.
+
+    Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
+    layer counterpart) is now STRUCTURAL rather than a convention: both route
+    through that one shared ``split_chain_tail`` gate. When the gate rejects,
+    ``head is cmd`` and ``tail == ''``, so the body below collapses to its
+    pre-gate form byte-for-byte. Both bail-outs return *cmd* — the full
+    original, never ``head`` — so a gate-accepted command can never be
+    silently truncated on the unparseable path.
     """
     if cmd is None:
         return None
-    idx = cmd.find(keyword)
+    head, tail = split_chain_tail(cmd, keyword)
+    idx = head.find(keyword)
     if idx == -1:
         return cmd
-    parsed = parse_config_command(cmd[: idx + len(keyword)])
+    parsed = parse_config_command(head[: idx + len(keyword)])
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
-    return render(strip_cwd(scope_to(parsed, files)))
+    rendered = render(strip_cwd(scope_to(parsed, files)))
+    return f'{rendered} {tail}' if tail else rendered
 
 
 def _reproject_str(cmd: str | None, project: str) -> str | None:

@@ -951,14 +951,27 @@ class TestFallbackPlanAuthorityGoldens:
     @pytest.mark.asyncio
     async def test_opaque_fleet_chain_lint_type_scoped_to_first_clause(self, tmp_path: Path):
         """(f) UNREGISTERED_PATH_DIFF against the REAL OPAQUE fleet lint/type chains ->
-        LINT/TYPE scope to their first clause (``_scope_to_keyword``, dropping the
-        rest); the OPAQUE TEST chain runs verbatim (P1).
+        LINT/TYPE scope to their first clause (``_scope_to_keyword``); the
+        OPAQUE TEST chain runs verbatim (P1).
 
         RED today for LINT/TYPE: the fallback plan records the WHOLE
         untouched multi-clause chain (parses OPAQUE at the full-string
         level), while execution truncates-then-parses the first clause only,
         producing a completely different, file-scoped string. TEST is
         already GREEN today — P1 means neither layer scopes it.
+
+        The two chains diverge on what happens to the TAIL (task 3061). LINT
+        is a SIBLING-CHECKER chain, so its trailing
+        ``check_bare_magicmock_config.py`` clause is preserved unscoped and
+        verbatim. TYPE is a ``cd``-sequenced SAME-TOOL FAN-OUT, so its tail
+        is still dropped — preserving it would run two more subprojects
+        unscoped and leave a ``cd ../orchestrator`` that misresolves once
+        ``strip_cwd`` has removed the leading ``cd``.
+
+        LINT also exercises the fallback path's reprojection end-to-end: the
+        scoped head is a bare ``uv run``, and ``_reproject_str`` must still
+        inject ``--project shared`` into it despite the appended tail (task
+        2036 — the depless workspace-root project cannot spawn ruff).
         """
         test_path = UNREGISTERED_PATH_DIFF[0]
         full = tmp_path / test_path
@@ -984,9 +997,15 @@ class TestFallbackPlanAuthorityGoldens:
         assert executed[0].prefix == '__fallback__'
         # P1: the OPAQUE fleet TEST chain is never scoped/mutated — verbatim.
         assert executed[0].test_command == _FLEET_TEST_COMMAND
-        # LINT/TYPE scope to the first clause, dropping the rest of the chain.
-        assert executed[0].lint_command == f'uv run --project shared ruff check {test_path}'
-        assert 'check_bare_magicmock_config' not in (executed[0].lint_command or '')
+        # LINT: ruff is file-scoped AND reprojected into the fallback uv
+        # project, while the trailing sibling-checker clause survives verbatim.
+        assert executed[0].lint_command == (
+            f'uv run --project shared ruff check {test_path}'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
+            'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+        )
+        assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
+        # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.
         assert executed[0].type_check_command == f'npx pyright {test_path}'
         assert 'orchestrator' not in (executed[0].type_check_command or '')
         assert 'dashboard' not in (executed[0].type_check_command or '')
