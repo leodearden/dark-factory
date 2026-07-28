@@ -96,6 +96,35 @@ class TestEvalMetricsPlanQualityField:
 
 
 # ---------------------------------------------------------------------------
+# EvalMetrics.invocation_error / cap_tainted fields (task 3118 step-1/2)
+#
+# The infra-failure markers that let a reader tell "the model wrote a terrible
+# plan" from "we never got to ask the model": ``invocation_error`` records WHAT
+# happened at the transport layer (stage-prefixed), ``cap_tainted`` is the
+# machine-checkable exclusion predicate every aggregate keys on. Both are
+# default-safe so a result JSON persisted before these fields existed reads
+# back unchanged.
+# ---------------------------------------------------------------------------
+
+class TestEvalMetricsInvocationErrorField:
+    def test_invocation_error_default_is_none(self):
+        assert EvalMetrics().invocation_error is None
+
+    def test_cap_tainted_default_is_false(self):
+        assert EvalMetrics().cap_tainted is False
+
+    def test_to_dict_carries_invocation_error_key_defaulting_none(self):
+        d = EvalMetrics().to_dict()
+        assert 'invocation_error' in d
+        assert d['invocation_error'] is None
+
+    def test_to_dict_carries_cap_tainted_key_defaulting_false(self):
+        d = EvalMetrics().to_dict()
+        assert 'cap_tainted' in d
+        assert d['cap_tainted'] is False
+
+
+# ---------------------------------------------------------------------------
 # Deterministic structural plan-quality rubric (step-3/4)
 #
 # score_plan_structure(plan) -> float reads ONLY the produced plan dict — no
