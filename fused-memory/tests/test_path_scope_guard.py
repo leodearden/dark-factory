@@ -499,6 +499,121 @@ class TestAllFilesForeignOwner:
 
 
 # ---------------------------------------------------------------------------
+# Task 3109: ABSOLUTE metadata.files entries are classified identically to
+# their repo-relative spelling.
+#
+# Before this task, project_for_path matched only registered RELATIVE prefixes
+# as a leading path component, so an absolute path ('/home/.../orchestrator/
+# x.py') could never match any prefix and came back None = "unowned" —
+# silently disarming BOTH the FILES-certain hard reject (check_files_for_scope
+# returned 'ok') and the task-3004 cross-repo tagger (all_files_foreign_owner
+# returned None). Absolute paths are the shape an agent produces after
+# actually reading a foreign repo, i.e. exactly the incident case.
+# ---------------------------------------------------------------------------
+
+
+class TestAbsoluteForeignPaths:
+    """Absolute foreign paths must produce the same verdict as relative ones.
+
+    Absolute paths are derived from ``registry.root_for_project(...)`` rather
+    than re-joined from ``tmp_path`` by hand, so the strings line up with the
+    ``Path(...).resolve()``-normalised roots ``from_roots`` stores (matters if
+    pytest's tmp_path is ever a symlink).
+    """
+
+    @staticmethod
+    def _abs_incident_files(registry) -> list[str]:
+        """The four incident-shaped dark-factory files, absolute spelling."""
+        df = registry.root_for_project('dark_factory')
+        assert df is not None
+        return [
+            f'{df}/orchestrator/src/orchestrator/git_ops.py',
+            f'{df}/orchestrator/src/orchestrator/merge_worker.py',
+            f'{df}/fused-memory/src/fused_memory/middleware/task_interceptor.py',
+            f'{df}/fused-memory/src/x.py',
+        ]
+
+    _REL_INCIDENT_FILES = [
+        'orchestrator/src/orchestrator/git_ops.py',
+        'orchestrator/src/orchestrator/merge_worker.py',
+        'fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        'fused-memory/src/x.py',
+    ]
+
+    def test_check_files_for_scope_rejects_absolute_foreign_paths(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        abs_files = self._abs_incident_files(registry)
+
+        verdict = check_files_for_scope(abs_files, 'reify', registry)
+
+        assert verdict.outcome == 'rejection', (
+            f'Absolute foreign paths must hard-reject, got: {verdict!r}'
+        )
+        assert verdict.suggested_project == 'dark_factory'
+        assert list(verdict.matched_paths) == abs_files
+
+        # The two spellings must never diverge again: the absolute verdict has
+        # to match the repo-relative verdict for the same logical files.
+        rel_verdict = check_files_for_scope(
+            self._REL_INCIDENT_FILES, 'reify', registry,
+        )
+        assert verdict.outcome == rel_verdict.outcome
+        assert verdict.suggested_project == rel_verdict.suggested_project
+
+    def test_all_files_foreign_owner_tags_absolute_cross_repo(self, tmp_path):
+        """Task-3004's allow-and-tag path must fire for the all-absolute shape."""
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        abs_files = self._abs_incident_files(registry)
+
+        assert all_files_foreign_owner(abs_files, 'reify', registry) == 'dark_factory'
+
+    def test_absolute_paths_under_own_root_are_ok(self, tmp_path):
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        reify = registry.root_for_project('reify')
+        assert reify is not None
+        own_files = [f'{reify}/crates/widget.rs', f'{reify}/crates/other.rs']
+
+        assert check_files_for_scope(own_files, 'reify', registry).outcome == 'ok'
+        assert all_files_foreign_owner(own_files, 'reify', registry) is None
+
+    def test_absolute_path_under_no_known_root_is_ok(self, tmp_path):
+        """An absolute path under NO registered root stays unowned (fail-open).
+
+        Deliberate boundary: 'unowned stays unowned'. The dir is created but
+        never passed to from_roots, so nothing in the registry can claim it —
+        even though 'crates/' IS a registered prefix in its relative spelling.
+        """
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        stranger = _mkproj(tmp_path, 'unknown-proj', ['crates'])
+        files = [str(stranger / 'crates' / 'x.rs')]
+
+        assert check_files_for_scope(files, 'reify', registry).outcome == 'ok'
+        assert all_files_foreign_owner(files, 'reify', registry) is None
+
+    def test_mixed_absolute_foreign_and_local_is_hard_reject(self, tmp_path):
+        """Task-2206's mixed-scope hard reject survives the absolute spelling.
+
+        An absolute foreign path must not become an all-foreign escape hatch
+        when a locally-owned file is also declared.
+        """
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+        df = registry.root_for_project('dark_factory')
+        files = [f'{df}/fused-memory/src/x.py', 'crates/local_widget.rs']
+
+        verdict = check_files_for_scope(files, 'reify', registry)
+        assert verdict.outcome == 'rejection', f'got: {verdict!r}'
+        assert all_files_foreign_owner(files, 'reify', registry) is None
+
+
+# ---------------------------------------------------------------------------
 # Verdict.to_error_dict
 # ---------------------------------------------------------------------------
 
