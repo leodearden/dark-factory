@@ -6629,6 +6629,69 @@ class TestSubmitTaskCrossRepoDeliverable:
         )
 
     @pytest.mark.asyncio
+    async def test_all_absolute_foreign_files_allowed_and_tagged_cross_repo(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """Task 3109: the SAME allow-and-tag path, files spelled ABSOLUTELY.
+
+        This is the actual reify-5638 incident shape (an agent that has been
+        shelling around in a foreign checkout emits absolute paths), and it
+        takes the task-3004 branch rather than the hard reject. Before task
+        3109 it was accepted but UNTAGGED — a silent regression no test would
+        have caught, since the submission still succeeds and only the
+        orchestrator's pre-merge routing degrades.
+
+        Direct A/B against the sibling
+        ``test_all_foreign_files_allowed_and_tagged_cross_repo``: identical in
+        everything but the path spelling. The unit-level
+        ``test_all_files_foreign_owner_tags_absolute_cross_repo`` pins the
+        classifier; this pins the interceptor wiring that turns the returned
+        owner into PERSISTED tags.
+        """
+        registry = self._reify_df_registry(tmp_path)
+        interceptor_with_store._prefix_registry = registry
+        df_root = registry.root_for_project('dark_factory')
+        assert df_root is not None
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Cross-repo deliverable landing in dark_factory',
+                description='Deliverable lands on the DF branch; this branch is empty',
+                metadata={'files': [
+                    f'{df_root}/orchestrator/src/orchestrator/offline_lane.py',
+                    f'{df_root}/orchestrator/tests/test_offline_lane.py',
+                ]},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, (
+            f'Expected the absolute spelling to be ALLOWED (all-foreign under '
+            f'one owner), got: {result}'
+        )
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_ ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        assert meta.get('cross_repo') is True, (
+            f'Expected cross_repo=True for the absolute spelling: {blob!r}'
+        )
+        assert meta.get('cross_repo_project') == 'dark_factory', (
+            f'Expected cross_repo_project=dark_factory: {blob!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_mixed_local_and_foreign_still_rejected_not_tagged(
         self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
