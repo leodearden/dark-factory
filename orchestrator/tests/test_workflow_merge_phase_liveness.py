@@ -517,6 +517,118 @@ class TestEntryOrdering:
         )
 
 
+class TestEntryReadCoalescing:
+    """Review amendment (efficiency): the merge-entry stamp and the
+    scope-invariant check read the SAME backend blob, so they must share one
+    ``get_task`` round-trip instead of issuing two back-to-back (15s timeout
+    each) on the merge hot path. Sharing also makes the two evaluate one
+    snapshot rather than two taken at different instants."""
+
+    @pytest.mark.asyncio
+    async def test_scope_check_uses_prefetched_metadata_without_a_second_read(self):
+        f = _make()
+        f.wf.plan = {'files': ['pkg/a.py']}
+        spy = MagicMock()
+        f.wf._escalate_scope_invariant_violation = spy  # type: ignore[method-assign]
+
+        await f.wf._check_scope_invariant(
+            backend_metadata={'files': ['other/b.py']},
+        )
+
+        f.scheduler.get_task.assert_not_awaited()
+        # The prefetched blob really drove the comparison (divergent modules
+        # at lock_depth=2 -> escalation filed with those metadata files).
+        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+
+    @pytest.mark.asyncio
+    async def test_scope_check_falls_back_to_own_read_when_prefetch_unavailable(self):
+        # None means "the stamp could not read the backend" — the check must
+        # fall back to its own get_task, so its documented fail-safe (an
+        # unreadable task is skipped, never treated as divergent) is unchanged.
+        f = _make()
+        f.wf.plan = {'files': ['pkg/a.py']}
+        f.scheduler.get_task = AsyncMock(
+            return_value={'metadata': {'files': ['other/b.py']}},
+        )
+        spy = MagicMock()
+        f.wf._escalate_scope_invariant_violation = spy  # type: ignore[method-assign]
+
+        await f.wf._check_scope_invariant(backend_metadata=None)
+
+        f.scheduler.get_task.assert_awaited_once()
+        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+
+    @pytest.mark.asyncio
+    async def test_scope_check_skips_when_own_read_returns_none(self):
+        f = _make()
+        f.wf.plan = {'files': ['pkg/a.py']}
+        f.scheduler.get_task = AsyncMock(return_value=None)
+        spy = MagicMock()
+        f.wf._escalate_scope_invariant_violation = spy  # type: ignore[method-assign]
+
+        await f.wf._check_scope_invariant()
+
+        spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_merge_entry_issues_one_get_task_for_stamp_and_scope_check(
+        self, monkeypatch,
+    ):
+        """Drive the real merge entry with the REAL stamp and REAL scope check
+        and count backend reads at the moment the check completes.
+
+        Before the amendment: stamp read (1) + scope-check read (2). After:
+        the scope check reuses the stamp's blob, so the count is still 1.
+        (Reads by the retry-loop re-stamp land after the check and are
+        deliberately outside this measurement.)
+        """
+        f = _make(backend_metadata={'files': ['other/b.py']})
+        wf = f.wf
+        wf.plan = {'files': ['pkg/a.py']}
+        wf.event_store = None
+        wf.config.max_merge_retries = 1
+        wf.config.max_pre_merge_retries = 1
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'branch_head_sha\n', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=_PASSING_VERIFY_RESULT),
+        )
+
+        reads_at_scope_check: list[int] = []
+        real_scope = wf._check_scope_invariant
+
+        async def _spy_scope(**kwargs):
+            await real_scope(**kwargs)
+            reads_at_scope_check.append(f.scheduler.get_task.await_count)
+
+        wf._check_scope_invariant = _spy_scope  # type: ignore[method-assign]
+        escalate = MagicMock()
+        wf._escalate_scope_invariant_violation = escalate  # type: ignore[method-assign]
+
+        wf._enter_phase = MagicMock()  # type: ignore[method-assign]
+        wf._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+        wf._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
+        wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+        wf._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
+            return_value=WorkflowOutcome.DONE,
+        )
+
+        assert await wf._run_merge_phase('task/77') is None
+
+        assert reads_at_scope_check == [1], (
+            f'stamp + scope check must share ONE get_task; got '
+            f'{reads_at_scope_check}'
+        )
+        # The shared blob still drove a real comparison, not a skipped one.
+        escalate.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+
+
 # ---------------------------------------------------------------------------
 # step-13: the stamp must survive into merge attempt 2+ (review-fix R2-B)
 # ---------------------------------------------------------------------------

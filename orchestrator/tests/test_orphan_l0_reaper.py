@@ -582,6 +582,74 @@ class TestOrphanL0Reaper:
         assert len(l1s) == 0
 
     @pytest.mark.asyncio
+    async def test_post_enqueue_restart_still_promotes_known_accepted_gap(
+        self, harness: Harness,
+    ):
+        """Characterization test — pins a KNOWN, ACCEPTED gap, not desired
+        behaviour (review amendment; see the comment at the discharge site in
+        ``_submit_to_merge_queue``).
+
+        The durable stamp is discharged at the enqueue boundary, so the
+        POST-enqueue window (request on the merge journal; worker rebasing /
+        verifying / merging — the code's own ETA heuristic is 600s and its
+        cold-verify ceiling 7200s) carries no durable liveness signal:
+        ``merge_phase_liveness`` is gone and ``routing.latest`` is still stale
+        (the merge worker makes no LLM calls either). In-process that window
+        is covered by ``is_actively_held``; after a restart ``_dispatched`` is
+        empty, and neither restart path re-stamps —
+        ``Harness._recover_pending_merges`` hands the rebuilt request to the
+        WORKER without re-entering ``_run_merge_phase``, and
+        ``_reconcile_stranded_in_progress`` LEAVEs (does not re-dispatch) a
+        task that has an open escalation, which the merge-entry divergence L0
+        is. So this class of restart still promotes.
+
+        Same setup as the pre-enqueue restart test above, differing ONLY in
+        that the stamp has been discharged — which is exactly the difference
+        the gap is made of.
+        """
+        assert harness._escalation_queue is not None
+        harness.config.orphan_l0_merge_phase_freshness_secs = 120.0
+
+        bare_scheduler = MagicMock()
+        bare_scheduler.is_actively_held = MagicMock(return_value=False)
+        bare_scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'in-progress',
+                'workflow_state': 'merge',
+                # Enqueued: stamp discharged, routing.latest still stale.
+                'metadata': {},
+            },
+        )
+        harness.scheduler = bare_scheduler
+
+        ts = (datetime.now(UTC) - timedelta(seconds=300.0)).isoformat()
+        original = Escalation(
+            id=harness._escalation_queue.make_id('task-postq'),
+            task_id='task-postq',
+            agent_role='orchestrator',
+            severity='blocking',
+            category='infra_issue',
+            summary=(
+                'plan.files/metadata.files divergence detected for task '
+                'task-postq'
+            ),
+            detail='detail',
+            suggested_action='investigate_and_retry',
+            timestamp=ts,
+            level=0,
+        )
+        harness._escalation_queue.submit(original)
+
+        # ACCEPTED: promoted to a human-facing L1 despite the merge being
+        # genuinely live in the queue. Moving the discharge to the merge
+        # terminal outcome would close this (deferral bounded by
+        # orphan_l0_merge_phase_freshness_secs, never suppression) — filed as
+        # follow-up rather than changed here, because the enqueue boundary is
+        # where task 2753's in-memory grace clears too and the pairing is
+        # pinned by TestEnqueueClearWiring.
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+    @pytest.mark.asyncio
     async def test_merge_phase_deferral_survives_restart_no_inmemory_state(
         self, harness: Harness,
     ):

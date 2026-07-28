@@ -3328,13 +3328,18 @@ class TaskWorkflow:
         # to ESCALATED — exactly the passes a live-but-wedged task cycles
         # through. (Distinct from the in-memory note_merge_phase_entered at the
         # retry-loop top, which is the self-redeploy coordinator's signal.)
-        await self._stamp_merge_phase_entered()
+        _entry_metadata = await self._stamp_merge_phase_entered()
 
         # Tripwire (task 2505): plan.files must equal metadata.files by
         # construction (the scope-reconciliation choke point keeps them in
         # lockstep) — a divergence here means some path bypassed it. Purely
         # observational: logs + escalates, never blocks the merge.
-        await self._check_scope_invariant()
+        # The stamp above already read this task's backend metadata blob;
+        # thread it in rather than issuing a second identical get_task on the
+        # merge hot path (review amendment). A None/unreadable prefetch falls
+        # back to _check_scope_invariant's own read, so its fail-safe is
+        # unchanged.
+        await self._check_scope_invariant(backend_metadata=_entry_metadata)
 
         # Defense-in-depth: any blocking L0 escalation, or any
         # born-at-L2 (critical/urgent), or any level≥2 escalation
@@ -5386,7 +5391,7 @@ class TaskWorkflow:
         # leaves the in-memory stamp for the merge-success clear to retry.
         self.task['metadata'] = fresh
 
-    async def _stamp_merge_phase_entered(self) -> None:
+    async def _stamp_merge_phase_entered(self) -> dict | None:
         """Persist a durable merge-phase-liveness stamp into task metadata.
 
         Task 2991: the restart-survivable analog of ``routing.latest`` for the
@@ -5414,17 +5419,31 @@ class TaskWorkflow:
 
         Mirrors :meth:`_stamp_merge_retry_pending`'s durability contract but
         carries only a timestamp (no worktree HEAD / base SHA): read fresh
-        backend metadata (via :meth:`_merge_fresh_metadata`) so a concurrent
-        write (``retry_ledger``, ``memory_hints``) is not clobbered, update the
+        backend metadata (via :meth:`_read_fresh_backend_metadata`, the same
+        read :meth:`_merge_fresh_metadata` performs) so a concurrent write
+        (``retry_ledger``, ``memory_hints``) is not clobbered, update the
         in-memory task, and persist via ``scheduler.update_task`` inside a
         logged try/except. A persistence failure must never crash the merge
         path — a lost stamp is self-healing (re-written on the next merge entry,
         and at worst the reaper promotes rather than silently suppresses).
+
+        Returns:
+            The backend metadata blob this stamp just read (``{}`` when the
+            backend blob is empty), or ``None`` when it could not be read.
+            The merge-entry caller threads it straight into
+            :meth:`_check_scope_invariant`, which needs the SAME blob — that
+            saves a second ``get_task`` round-trip on the merge hot path and
+            makes the stamp and the scope check evaluate one snapshot rather
+            than two taken at different instants (review amendment).
         """
         metadata = self.task.get('metadata') or {}
-        fresh = await self._merge_fresh_metadata(
-            metadata, log_context='merge_phase_liveness stamp',
+        backend = await self._read_fresh_backend_metadata(
+            log_context='merge_phase_liveness stamp',
         )
+        # Same merge policy as _merge_fresh_metadata: in-memory first, backend
+        # overlaid (a backend-side addition is an external write that must not
+        # be discarded); an unreadable backend (None) falls back to in-memory.
+        fresh = {**metadata, **(backend or {})}
         fresh['merge_phase_liveness'] = {
             'entered_at': datetime.now(UTC).isoformat(),
         }
@@ -5437,6 +5456,7 @@ class TaskWorkflow:
                 '(merge-phase liveness not durable this cycle): %s',
                 self.task_id, exc,
             )
+        return backend
 
     async def _clear_merge_phase_entered(self) -> None:
         """Remove the durable merge-phase-liveness stamp from task metadata.
@@ -8691,6 +8711,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # cleared defensively in the harness _run_slot finally: an abnormal exit
         # before this point must LEAVE the stamp so the reaper keeps deferring
         # across the crash/restart/redispatch window.
+        #
+        # KNOWN, ACCEPTED GAP (review amendment): discharging here leaves the
+        # POST-enqueue window (queue wait + worker rebase/verify/merge) with no
+        # durable liveness signal — the stamp is gone and routing.latest stays
+        # stale, since the merge worker makes no LLM calls either. In-process
+        # that window IS covered: the task is still in _dispatched, so
+        # is_actively_held short-circuits the reaper. After a restart it is
+        # NOT: Harness._recover_pending_merges rebuilds the request from the
+        # merge journal and hands it to the WORKER, which never re-enters
+        # _run_merge_phase (nothing re-stamps), and _reconcile_stranded_in_
+        # progress LEAVEs — does not re-dispatch — a task that has an open
+        # escalation, which the merge-entry divergence L0 is. So a restart
+        # while the merge is queued/in-flight still promotes that L0.
+        # Accepted here rather than fixed: closing it means moving the
+        # discharge to the merge terminal outcome, which changes the
+        # stamp/clear pairing this task deliberately co-located with task
+        # 2753's in-memory clear_merge_phase (pinned by TestEnqueueClearWiring)
+        # — filed as follow-up work. The gap is pinned meanwhile by
+        # test_orphan_l0_reaper.py::...::
+        # test_post_enqueue_restart_still_promotes_known_accepted_gap, so it is
+        # visible in the suite instead of silently absent from it.
         await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
@@ -12046,7 +12087,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
             raise
 
-    async def _check_scope_invariant(self) -> None:
+    async def _check_scope_invariant(
+        self, *, backend_metadata: dict | None = None,
+    ) -> None:
         """Tripwire (task 2505): warn + escalate if ``plan.files`` and
         ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
 
@@ -12077,12 +12120,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ``None`` — e.g. a transient backend hiccup) is treated as "cannot
         check" and skipped, not "divergent" — a read failure must not wedge
         an otherwise-valid merge or false-escalate.
+
+        Args:
+            backend_metadata: Optional pre-read backend metadata blob. The
+                merge-entry caller passes the blob
+                :meth:`_stamp_merge_phase_entered` just read (review
+                amendment), which is the SAME data this check would otherwise
+                fetch — two back-to-back ``get_task`` round-trips (15s timeout
+                each) for one blob, on the merge hot path. Threading it also
+                removes a small inconsistency: the two reads happened at
+                different instants, so the stamp and this check could see
+                different snapshots of the same task. Anything that is not a
+                dict (including ``None`` — the stamp could not read) falls
+                back to this method's own ``get_task``, preserving the
+                fail-safe above unchanged.
         """
-        fresh_task = await self.scheduler.get_task(self.task_id)
-        if fresh_task is None:
-            return
+        if isinstance(backend_metadata, dict):
+            metadata = backend_metadata
+        else:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+            if fresh_task is None:
+                return
+            metadata = fresh_task.get('metadata') or {}
         plan_files = sanitize_files_for_persist(self.plan.get('files', []))
-        metadata_files = list((fresh_task.get('metadata') or {}).get('files') or [])
+        metadata_files = list(metadata.get('files') or [])
         plan_modules = set(files_to_modules(plan_files, self.config.lock_depth))
         metadata_modules = set(
             files_to_modules(metadata_files, self.config.lock_depth)
