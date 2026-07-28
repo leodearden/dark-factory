@@ -739,6 +739,19 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     / ``role_under_test`` key) reads back as ``None`` for each, so old reports
     render unchanged. Rows are sorted by ``(task_id, config_name)`` so the
     surface is deterministic.
+
+    Rows additionally carry the task-3118 infra markers ``cap_tainted`` /
+    ``invocation_error`` (likewise default-safe: ``False`` / ``None`` for
+    metrics predating them), and the report gains a per-config aggregate over
+    ARCHITECT rows plus a report-level ``cap_excluded`` total.
+
+    THE INVARIANT: a cap-tainted cell is a TRANSPORT-layer failure — we never
+    got to ask the model — so it is EXCLUDED from ``mean_plan_quality`` and
+    COUNTED as excluded, never averaged in as a zero. Averaging it in would
+    penalise whichever candidate happened to be scheduled inside a cap window,
+    which is a property of the schedule, not of the candidate. A config with no
+    scored cells reports ``mean_plan_quality=None`` rather than ``0.0``, so
+    "we measured nothing" can never read as "it scored nothing".
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -747,9 +760,45 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'config_name': result.config_name,
             'role_under_test': result.metrics.get('role_under_test'),
             'plan_quality': result.metrics.get('plan_quality'),
+            'cap_tainted': bool(result.metrics.get('cap_tainted')),
+            'invocation_error': result.metrics.get('invocation_error'),
         })
     rows.sort(key=lambda r: (r['task_id'], r['config_name']))
-    return {'rows': rows}
+
+    # Per-config aggregate over ARCHITECT rows only — an implementer run never
+    # invokes the plan judge, so its null score is a different thing entirely
+    # and must not dilute the architect mean.
+    scored: dict[str, list[float]] = defaultdict(list)
+    excluded: dict[str, int] = defaultdict(int)
+    totals: dict[str, int] = defaultdict(int)
+    for row in rows:
+        if row['role_under_test'] != 'architect':
+            continue
+        cfg = row['config_name']
+        totals[cfg] += 1
+        if row['cap_tainted']:
+            excluded[cfg] += 1
+        elif row['plan_quality'] is not None:
+            scored[cfg].append(float(row['plan_quality']))
+
+    configs = [
+        {
+            'config_name': cfg,
+            'n': len(scored[cfg]),
+            'cap_excluded': excluded[cfg],
+            'total': totals[cfg],
+            'mean_plan_quality': (
+                round(sum(scored[cfg]) / len(scored[cfg]), 4)
+                if scored[cfg] else None
+            ),
+        }
+        for cfg in sorted(totals)
+    ]
+    return {
+        'rows': rows,
+        'configs': configs,
+        'cap_excluded': sum(excluded.values()),
+    }
 
 
 def format_plan_quality_table(report: dict[str, Any]) -> str:
