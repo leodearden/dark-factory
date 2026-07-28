@@ -417,6 +417,53 @@ _SEED_WARM_LANE_LOCK_TIMEOUT_RC: int = 124
 _SEED_ASSUME_LANE_LOCK_HELD_FLAG = '--assume-lane-lock-held'
 
 
+# ── warm-lane script resolution (task 3072, PRD leaf α) ───────────────────────
+#
+# dark-factory ships its own copies of the project-agnostic warm-lane scripts
+# under orchestrator/scripts/warm-lane/ so a project that carries no warm-lane
+# tooling still gets GC, disk guarding, thinning and auditing of its lane pool.
+#
+# Resolved repo-relative from this file (PRD open question 1 / design decision
+# D3): orchestrator/pyproject.toml packages only ``src/orchestrator`` in the
+# wheel and the deployed orchestrator runs ``uv run --project orchestrator``
+# from a checkout, so a repo-relative walk is both sufficient and the smallest
+# change — making the scripts package data would need a build-backend change
+# that buys nothing for the only deployment mode in use.  Same idiom and same
+# depth as workflow.py's ``_ORCH_PROJECT_DIR``, so it survives worktrees and
+# CWD changes identically.  If dark-factory is ever installed as a wheel this
+# path simply will not exist, and resolution then fails LOUDLY through
+# :meth:`GitOps._resolve_warm_lane_script`'s both-paths WARNING at the call
+# sites rather than silently — exactly the migration landmine leaf α exists to
+# remove.
+_DF_WARM_LANE_SCRIPT_DIR: Path = (
+    Path(__file__).resolve().parents[2] / 'scripts' / 'warm-lane'
+)
+
+#: Test-only override for :data:`_DF_WARM_LANE_SCRIPT_DIR`.  Production NEVER
+#: sets this: resolution is repo-relative.  It exists because ~200 existing
+#: tests build a synthetic tmp_path repo and assert the "script absent →
+#: fail-soft sentinel" path; without a seam an unconditional repo-relative
+#: fallback would make every one of them execute the REAL warm-lane scripts
+#: (rm -rf on lane dirs, flock acquisition, df probes) against tmp_path.  The
+#: autouse ``_isolate_warm_lane_script_dir`` fixture in tests/conftest.py pins
+#: it at a guaranteed-absent directory suite-wide.
+_DF_WARM_LANE_SCRIPT_DIR_ENV = 'ORCH_WARM_LANE_SCRIPT_DIR'
+
+
+def _df_warm_lane_script_dir() -> Path:
+    """Return the directory holding dark-factory's own warm-lane scripts.
+
+    Reads :data:`_DF_WARM_LANE_SCRIPT_DIR_ENV` at CALL time (not import time)
+    so ``monkeypatch.setenv`` is effective without a module reload; falls back
+    to the repo-relative :data:`_DF_WARM_LANE_SCRIPT_DIR`, which is what
+    production always uses.
+    """
+    override = os.environ.get(_DF_WARM_LANE_SCRIPT_DIR_ENV)
+    if override:
+        return Path(override)
+    return _DF_WARM_LANE_SCRIPT_DIR
+
+
 @functools.lru_cache(maxsize=256)
 def _seed_script_supports_assume_lane_lock_held(script: Path) -> bool:
     """Does this lane's ``seed-warm-lane.sh`` accept ``--assume-lane-lock-held``?
@@ -3764,6 +3811,57 @@ class GitOps:
         except Exception:
             logger.warning('refresh_warm_base: unexpected error', exc_info=True)
             return False
+
+    # warm-lane script resolution (task 3072, PRD leaf α) ----------------------
+
+    def _resolve_warm_lane_script(self, name: str) -> tuple[Path, str] | None:
+        """Locate warm-lane script ``name``, project override first.
+
+        Resolution order (PRD ``warm-lane-infra-repatriation-prd.md`` design
+        decision D3):
+
+        1. ``<project_root>/scripts/<name>`` — the PROJECT OVERRIDE. A project
+           that has invested in its own warm-lane tooling keeps it;
+           dark-factory's copy is the floor, not the ceiling. This is also
+           what makes leaf α a behavioural no-op for reify, whose own copies
+           still win at every call site.
+        2. :func:`_df_warm_lane_script_dir` ``/ <name>`` — dark-factory's own
+           relocated copy under ``orchestrator/scripts/warm-lane/``.
+        3. Neither → ``None``, so the caller emits a WARNING naming BOTH tried
+           paths and returns its existing fail-soft sentinel.
+
+        Keys on **existence, not the execute bit** — byte-identical to the
+        ``script.exists()`` predicate every call site used pre-relocation. A
+        present-but-broken project override therefore still reaches the
+        subprocess spawn and fails there, keeping the failure attributable to
+        the project rather than silently masked by substituting dark-factory's
+        copy.
+
+        Args:
+            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
+
+        Returns:
+            ``(resolved_path, origin)`` where origin is ``'project'`` or
+            ``'dark-factory'``, or ``None`` when neither location has it.
+        """
+        project_path = self.project_root / 'scripts' / name
+        if project_path.exists():
+            return (project_path, 'project')
+        df_path = _df_warm_lane_script_dir() / name
+        if df_path.exists():
+            return (df_path, 'dark-factory')
+        return None
+
+    def _warm_lane_script_paths_tried(self, name: str) -> tuple[Path, Path]:
+        """Both candidate paths for ``name``, for the not-found WARNING.
+
+        Kept beside :meth:`_resolve_warm_lane_script` so the message an
+        operator reads can never drift from the order actually searched.
+        """
+        return (
+            self.project_root / 'scripts' / name,
+            _df_warm_lane_script_dir() / name,
+        )
 
     # ε: warm-lane disk-guard admission helpers --------------------------------
 
