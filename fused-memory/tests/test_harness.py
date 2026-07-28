@@ -2500,6 +2500,115 @@ async def test_notify_judge_halt_falls_back_to_generic_reason_when_none(
     assert args[1] == 'judge halted reconciliation'
 
 
+class TestNotifyJudgeHaltDedupeToken:
+    """GAP B: the per-process dedupe token must not burn on a FAILED write.
+
+    _notify_judge_halt used to add project_id to _halt_escalated BEFORE
+    awaiting the policy and then discard the verdict entirely.  A halt that
+    escalated to nothing (rejection branch, or rate-limited with no file
+    written) therefore consumed the single per-process retry token and was
+    never attempted again for the life of the harness.
+    """
+
+    def _harness(self, journal, event_buffer, mock_memory_service, verdict):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness._backlog_policy = MagicMock()
+        harness._backlog_policy.on_judge_halt = AsyncMock(return_value=verdict)
+        harness._halt_escalated.discard('test-project')
+        return harness
+
+    @pytest.mark.asyncio
+    async def test_rejection_does_not_burn_token(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """Rejection verdict → sentinel unset, next halted tick retries."""
+        from fused_memory.reconciliation.backlog_policy import BacklogVerdict
+
+        harness = self._harness(
+            journal, event_buffer, mock_memory_service,
+            BacklogVerdict(
+                outcome='rejection', project_id='test-project',
+                error_type='ReconciliationJudgeHalted',
+            ),
+        )
+
+        await harness._notify_judge_halt('test-project', reason='r')
+        assert 'test-project' not in harness._halt_escalated
+
+        await harness._notify_judge_halt('test-project', reason='r')
+        assert harness._backlog_policy.on_judge_halt.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_escalated_without_path_does_not_burn_token(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """Rate-limited escalation (no file written) → sentinel unset."""
+        from fused_memory.reconciliation.backlog_policy import BacklogVerdict
+
+        harness = self._harness(
+            journal, event_buffer, mock_memory_service,
+            BacklogVerdict(
+                outcome='escalated', project_id='test-project',
+                error_type='ReconciliationJudgeHalted', escalation_path=None,
+            ),
+        )
+
+        await harness._notify_judge_halt('test-project', reason='r')
+        assert 'test-project' not in harness._halt_escalated
+
+        await harness._notify_judge_halt('test-project', reason='r')
+        assert harness._backlog_policy.on_judge_halt.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_escalated_with_path_sets_token_and_dedupes(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """A real file written → sentinel SET, second call is a no-op."""
+        from fused_memory.reconciliation.backlog_policy import BacklogVerdict
+
+        harness = self._harness(
+            journal, event_buffer, mock_memory_service,
+            BacklogVerdict(
+                outcome='escalated', project_id='test-project',
+                error_type='ReconciliationJudgeHalted',
+                escalation_path='/x/data/escalations/esc-reconciliation-halt-1.json',
+            ),
+        )
+
+        await harness._notify_judge_halt('test-project', reason='r')
+        assert 'test-project' in harness._halt_escalated
+
+        await harness._notify_judge_halt('test-project', reason='r')
+        assert harness._backlog_policy.on_judge_halt.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_notify_judge_halt_logs_when_no_escalation_written(
+        self, journal, event_buffer, mock_memory_service, caplog,
+    ):
+        """A halt that escalated to nothing must say so — loud over silent."""
+        from fused_memory.reconciliation.backlog_policy import BacklogVerdict
+
+        harness = self._harness(
+            journal, event_buffer, mock_memory_service,
+            BacklogVerdict(
+                outcome='rejection', project_id='test-project',
+                error_type='ReconciliationJudgeHalted',
+            ),
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.harness',
+        ):
+            await harness._notify_judge_halt('test-project', reason='r')
+
+        text = '\n'.join(
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.reconciliation.harness'
+        )
+        assert 'test-project' in text
+        assert 'rejection' in text
+
+
 @pytest.mark.asyncio
 async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_memory_service):
     """_project_loop decrements post-unhalt grace before running a cycle."""
