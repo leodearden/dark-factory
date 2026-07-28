@@ -103,3 +103,110 @@ lighter authorization bar, §4), but does not assume it has, or will ever have, 
 beyond what task 3055 states. A future task that formalizes "consolidation-closure" should
 reconcile against §4/§5 here rather than re-deciding the write-path question this doc already
 settles.
+
+## §3 — Decision 1: tool shape
+
+**DECIDED: one unified MCP tool, `update_memory`, Mem0-only, with two independently-optional
+arms** — `content` (semantic amend) and the metadata-patch family (`metadata_patch` /
+`metadata_delete_keys` / `metadata_mode`) — rather than two separate tools. At least one arm must
+be supplied; supplying none is a `ValidationError`.
+
+### Alternatives considered and rejected
+
+- **Two narrow tools** (`amend_memory_content` + `update_memory_metadata`). Rejected: the
+  point-id/UUID-preservation guarantee and the mem0 payload-overwrite mitigation (§2 point 3, §5)
+  would then have to live in two places that must agree byte-for-byte — an INV-5
+  (`no-lockstep-duplication`) violation waiting to happen the first time one of the two tools is
+  touched and the other isn't. It would also force a caller that legitimately wants to amend
+  content **and** re-tag metadata in the same logical edit into two separate writes with two
+  journal entries and a torn intermediate state (the record briefly exists with new content but
+  stale metadata, or vice versa).
+- **Extending `add_memory` with an optional `memory_id`.** Rejected: it overloads the
+  near-duplicate guard's write path (which is specifically about *new* content colliding with
+  existing content) and makes an in-place mutation indistinguishable from a create in the write
+  journal — a journal reader could no longer tell "this row is a new memory" from "this row
+  overwrote memory X" without inspecting a side channel.
+
+### The contract
+
+**Signature** (mirrors `delete_memory`'s parameter shape — `server/tools.py:1941-1949` — since
+callers already hold `store`/`project_id`/`memory_id` from a prior `search` result and should not
+have to remember a different shape for update vs. delete):
+
+```python
+async def update_memory(
+    memory_id: str,
+    store: str,
+    project_id: str,
+    content: str | None = None,
+    metadata_patch: dict | None = None,
+    metadata_delete_keys: list[str] | None = None,
+    metadata_mode: str = 'merge',       # 'merge' | 'replace' — governs metadata_patch only
+    reason: str | None = None,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    metadata: dict | None = None,        # envelope only — may carry _causation_id; NOT the patch
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+```
+
+**Naming collision warning (implementer must preserve this distinction):** the pre-existing
+`metadata: dict | None` parameter name is the causation/envelope kwarg every other tool already
+uses (consumed by `_extract_causation(metadata, agent_id)`, `server/tools.py:479-497`) — it is
+never stored on the record. The new record-payload argument is deliberately named
+**`metadata_patch`**, not `metadata`, so the two can never be confused at the call site or in the
+implementation. Do not rename either to make them match.
+
+- **`store`**: validated against `_VALID_STORES` exactly like `delete_memory` (`:1998-2002`). A
+  valid-but-wrong value of `'graphiti'` is rejected with a `ValidationError` naming `update_edge`
+  as the correct tool — **do not silently fan out**. `store` is accepted (rather than omitted,
+  since the tool is Mem0-only in practice) purely for this fail-fast ergonomics: every `search`
+  result already carries a `store` field, so a caller updating a record it just found does not have
+  to branch client-side before calling; it calls the same way it would call `delete_memory`, and a
+  wrong `store` value produces an actionable error instead of `update_memory` quietly assuming
+  Mem0 was meant.
+- **`content`** (the content-amend arm): when supplied, must be non-empty (mirrors `update_edge`'s
+  `fact` validation, `:2116-2122`). Routes through the existing `Mem0Backend.update` (§5) —
+  re-embeds unconditionally; this is inherent to mem0's own `update()`, not a design choice (§5).
+- **`metadata_patch`** (the metadata-patch arm) is a **shallow merge** over the record's existing
+  custom payload when `metadata_mode='merge'` (the default) — it never replaces the whole payload.
+  Reserved/mem0-owned keys (`_MEM0_MANAGED_METADATA_KEYS` — `data`, `hash`, `created_at`,
+  `updated_at`, `user_id`, `agent_id`, `run_id`, `actor_id`, `role`; see §2 point 3 and §6) present
+  in `metadata_patch` are **rejected at the boundary** with a `ValidationError` naming the offending
+  key(s) — never silently dropped, so a caller can never believe it wrote `created_at`.
+- **`metadata_mode='replace'`** replaces the entire **custom-provenance subset** of the payload
+  with exactly what `metadata_patch` supplies (mem0-owned keys are still preserved verbatim
+  underneath — "replace" never means "replace the whole Qdrant payload"). Named and valued to
+  match `update_task`'s existing `metadata_mode` vocabulary (`'merge'` / `'replace'`) deliberately —
+  same operator-facing naming, not the same code (tasks and Mem0 records are different backends;
+  see §6 for why the underlying logic justifiably differs, not just the label).
+- **`metadata_delete_keys: list[str] | None`** is the explicit **key-deletion mechanism** — this is
+  the "sentinel" the deletion question (task 3055 planning note) asks to be decided. **Decision: no
+  magic sentinel value.** A sentinel string or `None`-means-delete convention was rejected because
+  it either collides with legitimate data (a real metadata value equal to the sentinel string) or
+  reintroduces exactly the ambiguity task-2180's metadata-wipe incident was about (`append=False`
+  silently meaning "replace with nothing" — `backends/sqlite_task_backend.py:3214-3226`). A
+  dedicated list parameter has no such ambiguity: a key is deleted iff its name appears in
+  `metadata_delete_keys`, full stop; an *omitted* key — the common case — can never mean delete.
+  A key present in **both** `metadata_patch` and `metadata_delete_keys` is a `ValidationError`
+  (contradictory intent, same fail-loud posture as `update_edge`'s `invalid_at` /
+  `clear_invalid_at` mutual-exclusivity check, `:2134-2139`). Reserved keys are rejected in
+  `metadata_delete_keys` exactly as in `metadata_patch` — a caller cannot delete `created_at`
+  either.
+- **`reason`**: required (non-empty) when `content` is supplied; optional when only the
+  metadata-patch arm is used (§4 — this is one concrete piece of the differential bar). Not stored
+  in the patched payload itself — flows to the write journal only (§5).
+- **At least one of `content`, `metadata_patch`, `metadata_delete_keys` must be non-empty.**
+  Supplying none is a `ValidationError` (mirrors `update_edge`'s equivalent
+  neither-argument-supplied check, `:2140-2144`).
+- **The point id / UUID is preserved and echoed in the result envelope** — e.g.
+  `{'status': 'updated', 'store': 'mem0', 'id': memory_id, 'content_amended': bool,
+  'metadata_patched': bool, ...}`, mirroring `update_edge`'s `{'status': 'reassigned', 'store':
+  'graphiti', **result}` convention (`services/memory_service.py:3785`) — so a caller can assert
+  identity stability directly from the response, not by re-fetching.
+
+Per **INV-5**, the follow-up must **extract** `_MEM0_MANAGED_METADATA_KEYS` and the
+read-existing-payload-then-forward-custom-subset logic currently private to
+`scripts/tag_cgl_eta_rehome_scope.py` into a shared module that both the script and the new
+service path import — never copy the constant or restate mem0's payload-overwrite semantics in a
+second place. §6 makes the specific module-location call.
