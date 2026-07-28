@@ -557,3 +557,118 @@ class TestSummarizeDistribution:
             if field == 'n':
                 continue
             assert got[field] is None, f'{field} must be None for an empty sample, got {got[field]!r}'
+
+
+# ---------------------------------------------------------------------------
+# derive_bands
+# ---------------------------------------------------------------------------
+
+class TestDeriveBands:
+    """Every assertion is relational or derived from the injected sample.
+
+    Not one pins a constant — that is the whole point of the leaf.
+    """
+
+    # A realistic sample: the negative class overlaps the duplicate class's
+    # lower tail, so the bands are non-trivially separated.
+    DUPS = [0.5, 0.6, 0.7, 0.8, 0.9]
+    NEGS = [0.1, 0.2, 0.55]
+
+    def test_t_high_strictly_exceeds_every_measured_negative(self) -> None:
+        """The deterministic band must admit ZERO measured false positives."""
+        t_high, _, _ = _mod().derive_bands(self.DUPS, self.NEGS)
+        assert t_high is not None
+        assert t_high > max(self.NEGS), (
+            f't_high={t_high} does not clear the highest measured negative {max(self.NEGS)}'
+        )
+
+    def test_t_high_is_a_measured_order_statistic_of_the_duplicate_class(self) -> None:
+        """Traceable to data, never interpolated out of thin air."""
+        t_high, _, _ = _mod().derive_bands(self.DUPS, self.NEGS)
+        assert t_high in self.DUPS, f't_high={t_high} is not a value observed in dup_scores'
+
+    def test_t_high_is_the_smallest_such_order_statistic(self) -> None:
+        """Picking a higher one would needlessly shrink the deterministic band."""
+        t_high, _, _ = _mod().derive_bands(self.DUPS, self.NEGS)
+        smaller = [s for s in self.DUPS if s > max(self.NEGS) and s < t_high]
+        assert not smaller, f'a smaller separating dup score exists: {smaller}'
+
+    def test_t_low_comes_from_the_duplicate_lower_tail(self) -> None:
+        _, t_low, _ = _mod().derive_bands(self.DUPS, self.NEGS)
+        assert t_low is not None
+        assert t_low in self.DUPS, f't_low={t_low} is not a value observed in dup_scores'
+        assert t_low <= _mod().summarize_distribution(self.DUPS)['median'], (
+            't_low must come from the lower tail of the duplicate distribution'
+        )
+
+    def test_t_low_is_strictly_below_t_high(self) -> None:
+        t_high, t_low, _ = _mod().derive_bands(self.DUPS, self.NEGS)
+        assert t_low < t_high, f'expected t_low < t_high, got {t_low} !< {t_high}'
+
+    def test_both_bands_are_within_the_cosine_unit_range(self) -> None:
+        t_high, t_low, _ = _mod().derive_bands(self.DUPS, self.NEGS)
+        for name, value in (('t_high', t_high), ('t_low', t_low)):
+            assert 0.0 <= value <= 1.0, f'{name}={value} outside [0.0, 1.0]'
+
+    # -- refusal paths: what stops an uncalibrated number reaching config ---
+
+    @pytest.mark.parametrize(
+        ('dups', 'negs'),
+        [([], [0.1, 0.2]), ([0.8, 0.9], []), ([], [])],
+    )
+    def test_an_empty_class_refuses_with_a_reason(self, dups: list, negs: list) -> None:
+        t_high, t_low, reason = _mod().derive_bands(dups, negs)
+        assert t_high is None and t_low is None, (
+            f'an empty class must yield no thresholds, got t_high={t_high} t_low={t_low}'
+        )
+        assert isinstance(reason, str) and reason.strip(), (
+            'a refusal must carry a machine-readable reason'
+        )
+
+    def test_fully_overlapping_distributions_refuse_rather_than_inventing_a_threshold(
+        self,
+    ) -> None:
+        """max(negative) >= max(duplicate): no measured value separates them.
+
+        The honest output is no threshold plus a reason. Interpolating one
+        here would produce a number that looks calibrated and is not — the
+        exact failure this leaf exists to prevent.
+        """
+        t_high, _, reason = _mod().derive_bands([0.4, 0.5, 0.6], [0.1, 0.6, 0.95])
+        assert t_high is None, f'expected refusal, got t_high={t_high}'
+        assert isinstance(reason, str) and reason.strip()
+
+    def test_the_refusal_reason_is_machine_readable(self) -> None:
+        """Distinguishable causes, so a caller can branch without prose matching."""
+        _, _, empty_reason = _mod().derive_bands([], [0.1])
+        _, _, overlap_reason = _mod().derive_bands([0.4, 0.5], [0.6, 0.7])
+        assert empty_reason != overlap_reason, (
+            'an empty class and a non-separable overlap are different findings '
+            'and must not share one reason code'
+        )
+
+    def test_perfect_separation_yields_no_judge_band_rather_than_a_fake_one(self) -> None:
+        """Every duplicate already clears every negative.
+
+        t_high is then the duplicate class's own minimum, so no measured
+        value can sit strictly below it — the judge band is not derivable
+        from this sample, and saying so beats inventing a floor.
+        """
+        t_high, t_low, reason = _mod().derive_bands([0.8, 0.85, 0.9], [0.1, 0.2])
+        assert t_high == 0.8
+        assert t_low is None, f'expected no derivable judge band, got t_low={t_low}'
+        assert isinstance(reason, str) and reason.strip()
+
+    def test_module_defines_no_numeric_threshold_constant(self) -> None:
+        """No default can silently leak in through a module attribute."""
+        offenders = {
+            name: value
+            for name, value in vars(_mod()).items()
+            if not name.startswith('__')
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and any(tok in name.upper() for tok in ('T_HIGH', 'T_LOW', 'THRESHOLD', 'SIMILARITY'))
+        }
+        assert not offenders, (
+            f'no a-priori numeric threshold may exist at module scope; found {offenders}'
+        )
