@@ -410,6 +410,10 @@ class TaskSteward:
             wip = await self._wip_probe() if self._wip_probe else False
             outcome = StewardInterrupted(reason='timeout', wip_commits_present=wip)
             if wip:
+                # Same converged give-up contract as the attempt-cap branch
+                # above (task 3170): dismiss THEN publish, so neither wip
+                # branch can drift from the other.
+                self._dismiss_capped_l0(escalation, 'timeout')
                 self._publish_outcome(outcome)
             else:
                 self._auto_escalate_to_human(
