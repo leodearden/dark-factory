@@ -21,14 +21,18 @@ host scripts against a ``tmp_path``.  Tests here opt back in explicitly.
 """
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
 import orchestrator.git_ops as git_ops_mod
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
+
+GIT_OPS_LOGGER = 'orchestrator.git_ops'
 
 #: Env seam for the dark-factory fallback root.  Test hermeticity only —
 #: production resolution is repo-relative and never reads this.
@@ -68,6 +72,66 @@ def _write_stub(path: Path, body: str = 'exit 0\n', mode: int = 0o755) -> Path:
     path.write_text('#!/usr/bin/env bash\n' + body)
     path.chmod(mode)
     return path
+
+
+# ---------------------------------------------------------------------------
+# The six warm-lane script wrappers, as one table
+# ---------------------------------------------------------------------------
+
+
+class Wrapper(NamedTuple):
+    """One fail-soft warm-lane wrapper, its script, and its absent-script sentinel."""
+
+    method: str
+    script: str
+    sentinel: Any
+
+    def invoke(self, git_ops: GitOps) -> Awaitable[Any]:
+        """Call the wrapper with whatever arguments it happens to take."""
+        fn: Callable[..., Awaitable[Any]] = getattr(git_ops, self.method)
+        if self.method == 'warm_lane_ref_is_degenerate':
+            return fn('3072')
+        if self.method == '_run_thin_warm_lane':
+            return fn(git_ops.worktree_base / 'task-3072')
+        return fn()
+
+
+#: Sentinels are the pre-relocation fail-soft contract, preserved verbatim:
+#: an absent script must degrade to exactly these, never raise.
+WRAPPERS = (
+    Wrapper('_run_warm_lane_disk_guard', 'warm-lane-disk-guard.sh', 127),
+    Wrapper('_run_warm_lane_soft_guard', 'warm-lane-disk-guard.sh', 127),
+    Wrapper('_run_warm_lane_audit', 'warm-lane-audit.sh', None),
+    Wrapper('_run_warm_lane_gc_reclaim', 'warm-lane-gc.sh', 127),
+    Wrapper('warm_lane_ref_is_degenerate', 'warm-lane-degenerate-ref-check.sh', False),
+    Wrapper('_run_thin_warm_lane', 'thin-warm-lane.sh', 127),
+)
+
+WRAPPER_PARAMS = [pytest.param(w, id=w.method.lstrip('_')) for w in WRAPPERS]
+
+
+@pytest.fixture
+def project_root(tmp_path: Path) -> Path:
+    """Bare project root whose pool storage reads as PRESENT.
+
+    The ``.pool-root`` sentinel keeps the pre-resolution pool-storage guards in
+    ``_run_warm_lane_gc_reclaim`` and ``_run_thin_warm_lane`` from
+    short-circuiting, so tests here reach the resolution step they mean to
+    exercise.  ``TestPreResolutionGuardsStillWinTheRace`` deliberately removes
+    it to pin the opposite.
+    """
+    root = tmp_path / 'proj'
+    (root / '.worktrees').mkdir(parents=True)
+    (root / '.worktrees' / '.pool-root').touch()
+    return root
+
+
+def _records(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    """Formatted messages of every captured record at exactly ``level``."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == level and r.name == GIT_OPS_LOGGER
+    ]
 
 
 class TestResolveWarmLaneScript:
@@ -200,4 +264,156 @@ class TestResolveWarmLaneScript:
 
         assert git_ops._resolve_warm_lane_script(self.NAME) == (
             df_script, 'dark-factory',
+        )
+
+
+@pytest.mark.asyncio
+class TestNeitherLocationIsLoud:
+    """B8 — "no implementation at either location" is never a silent no-op.
+
+    Pre-relocation each wrapper logged ``logger.debug('<method>: script absent
+    at %s — no-op')`` naming ONE path. After the relocation there are two
+    candidate locations, so a DEBUG line naming one of them is actively
+    misleading: an operator greping for why GC stopped would see nothing at
+    default verbosity and no hint that a second location was even searched.
+    dark-factory now always ships its own copy, so "neither location" can only
+    mean a genuinely broken deployment — rare in production, never routine
+    noise, and therefore a WARNING.
+    """
+
+    async def test_sentinel_is_unchanged(
+        self,
+        project_root: Path,
+        df_warm_lane_script_dir,
+    ) -> None:
+        """Neither location → each wrapper returns its documented sentinel."""
+        df_warm_lane_script_dir(project_root.parent / 'absent-df-dir')
+        git_ops = _make_git_ops(project_root)
+
+        for wrapper in WRAPPERS:
+            result = await wrapper.invoke(git_ops)
+            assert result == wrapper.sentinel and type(result) is type(
+                wrapper.sentinel,
+            ), (
+                f'{wrapper.method} must degrade to {wrapper.sentinel!r} when no '
+                f'implementation exists at either location (fail-soft contract '
+                f'preserved byte-for-byte); got {result!r}'
+            )
+
+    @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
+    async def test_warning_names_both_tried_paths(
+        self,
+        wrapper: Wrapper,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The WARNING names the project path AND the dark-factory path."""
+        df_dir = df_warm_lane_script_dir(project_root.parent / 'absent-df-dir')
+        git_ops = _make_git_ops(project_root)
+        project_path = project_root / 'scripts' / wrapper.script
+        df_path = df_dir / wrapper.script
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await wrapper.invoke(git_ops)
+
+        warnings = _records(caplog, logging.WARNING)
+        matching = [
+            m for m in warnings
+            if str(project_path) in m and str(df_path) in m
+        ]
+        assert matching, (
+            f'{wrapper.method} must WARN naming BOTH tried paths so a broken '
+            f'deployment is diagnosable from one log line.\n'
+            f'  expected both: {project_path}\n'
+            f'             and: {df_path}\n'
+            f'  captured WARNINGs: {warnings!r}'
+        )
+
+    @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
+    async def test_no_debug_only_absent_line_remains(
+        self,
+        wrapper: Wrapper,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The old single-path DEBUG line is gone, not merely supplemented."""
+        df_warm_lane_script_dir(project_root.parent / 'absent-df-dir')
+        git_ops = _make_git_ops(project_root)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await wrapper.invoke(git_ops)
+
+        stale = [m for m in _records(caplog, logging.DEBUG) if 'script absent at' in m]
+        assert not stale, (
+            f'{wrapper.method} still emits the pre-relocation single-path DEBUG '
+            f'line, which names only one of two searched locations: {stale!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestPreResolutionGuardsStillWinTheRace:
+    """Guards that run BEFORE resolution keep their level, message and ordering.
+
+    Attributability is the point: a skipped reclaim must stay blamed on the
+    held merge-verify lease or the unmounted pool, never misreported as a
+    missing script. Both guards are asserted to short-circuit *without*
+    emitting the new both-paths WARNING.
+    """
+
+    async def test_merge_verify_lease_defers_before_resolution(
+        self,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A held lease still defers via its INFO line, with no both-paths WARNING."""
+        df_dir = df_warm_lane_script_dir(project_root.parent / 'absent-df-dir')
+        git_ops = _make_git_ops(project_root)
+        monkeypatch.setattr(git_ops, '_merge_verify_lease_active', lambda: True)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            result = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert result == 127
+        infos = _records(caplog, logging.INFO)
+        assert any('merge-verify in flight' in m for m in infos), (
+            f'The lease deferral must stay attributable at INFO; got {infos!r}'
+        )
+        warnings = _records(caplog, logging.WARNING)
+        assert not [
+            m for m in warnings if str(df_dir / 'warm-lane-gc.sh') in m
+        ], (
+            'A lease-deferred reclaim must NOT be misreported as a missing '
+            f'script — the lease guard runs first by design; got {warnings!r}'
+        )
+
+    async def test_pool_storage_absent_refuses_before_resolution(
+        self,
+        tmp_path: Path,
+        df_warm_lane_script_dir,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Absent pool storage still refuses thin via its own WARNING."""
+        # No .pool-root sentinel: pool_in_use() and not pool_storage_present().
+        root = tmp_path / 'proj'
+        (root / '.worktrees').mkdir(parents=True)
+        df_dir = df_warm_lane_script_dir(tmp_path / 'absent-df-dir')
+        git_ops = _make_git_ops(root)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            result = await git_ops._run_thin_warm_lane(git_ops.worktree_base / 'lane')
+
+        assert result == 127
+        warnings = _records(caplog, logging.WARNING)
+        assert any('pool storage absent/unmounted' in m for m in warnings), (
+            f'The pool-storage refusal must stay attributable; got {warnings!r}'
+        )
+        assert not [
+            m for m in warnings if str(df_dir / 'thin-warm-lane.sh') in m
+        ], (
+            'An unmounted pool must NOT be misreported as a missing script — '
+            f'the pool-storage guard runs first by design; got {warnings!r}'
         )
