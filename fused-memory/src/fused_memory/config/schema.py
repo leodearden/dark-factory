@@ -1418,6 +1418,70 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
+class WriteTriageConfig(BaseModel):
+    """Server-owned band thresholds for add_memory write triage (task 3130).
+
+    This is the dedicated server-owned section that ReconciliationConfig's
+    near-dup ownership note anticipated ("if this guard ever grows independent
+    of reconciliation, move these two fields to a dedicated server-owned config
+    section instead of assuming colocation implies subsystem ownership") —
+    write triage IS that growth, so the bands land here rather than accreting
+    onto the reconciliation submodel. PRD leaf beta adds `write_triage_enabled`
+    to this same section.
+
+    Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
+    config/reload.py's `_iter_leaves` descends into per-leaf paths. An
+    `X | None` submodel is compared whole and lands as a single
+    restart_required entry (esc-2718-1), which would force a server restart
+    for every calibration run.
+
+    Every field defaults to None, and that is load-bearing: None means
+    UNCALIBRATED, which the triage router must read as fail-open to `stored`.
+    """
+
+    t_high: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Similarity at or above which a write is deterministically treated as a '
+            'restatement of an existing memory, with no judge call. None means '
+            'UNCALIBRATED and triage must fail open to `stored`. This value is an '
+            'OUTPUT of scripts/calibrate_write_triage.py — the smallest measured '
+            'duplicate score that strictly exceeds every measured negative — and '
+            'must never be hand-set to a guessed number. The sibling '
+            'reconciliation.procedural_knowledge_near_dup_threshold shows why: its '
+            '0.92 was inherited from Mem0\'s cited figure and sits above a genuine '
+            'rediscovery pair measured at 0.824, so it could not fire on the case it '
+            'exists to catch. Green-tier hot-reloadable via reload_config.'
+        ),
+    )
+    t_low: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            'Similarity below which a write is stored as new without a judge call. '
+            'Between t_low and t_high the write is routed to the judge. None means '
+            'UNCALIBRATED (fail open to `stored`). Also an OUTPUT of '
+            'scripts/calibrate_write_triage.py — the measured lower tail (p05) of the '
+            'curator-confirmed duplicate distribution — never hand-set. Green-tier '
+            'hot-reloadable via reload_config.'
+        ),
+    )
+    calibration_report_path: str | None = Field(
+        default=None,
+        description=(
+            'Path to the JSON calibration report that produced t_high/t_low — the '
+            'traceability link from the thresholds in this config back to the run '
+            'and the measured distributions that justify them, including the '
+            'deterministic band\'s measured false-positive count. Written by '
+            'scripts/calibrate_write_triage.py --write-config. Green-tier '
+            'hot-reloadable via reload_config.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -1432,6 +1496,10 @@ class FusedMemoryConfig(BaseSettings):
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     task_status: TaskStatusConfig = Field(default_factory=TaskStatusConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
+    # Bare (non-Optional) submodel on purpose — see WriteTriageConfig's docstring:
+    # reload.py descends only into required submodels, so nullability here would
+    # cost the section its per-leaf hot-reload.
+    write_triage: WriteTriageConfig = Field(default_factory=WriteTriageConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

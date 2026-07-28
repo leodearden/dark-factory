@@ -53,6 +53,19 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
     # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
     'reconciliation.procedural_knowledge_topic_guard_clusters',
+    # Write-triage band thresholds (task 3130). Written by
+    # scripts/calibrate_write_triage.py --write-config, which derives them from
+    # measured similarity distributions -- so hot-reload is what lets a
+    # re-calibration take effect on a running server instead of waiting for a
+    # restart. Read live off the shared memory_service.config.write_triage
+    # object per add_memory write, the same live-read path as the near-dup
+    # knobs above. None means UNCALIBRATED and triage fails open to `stored`,
+    # so a reload that clears a threshold degrades safely.
+    'write_triage.t_high',
+    'write_triage.t_low',
+    # Traceability pointer to the report that produced the two thresholds
+    # above; reloaded alongside them so config never names a stale run.
+    'write_triage.calibration_report_path',
 })
 
 
