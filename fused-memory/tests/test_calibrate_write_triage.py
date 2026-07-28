@@ -672,3 +672,109 @@ class TestDeriveBands:
         assert not offenders, (
             f'no a-priori numeric threshold may exist at module scope; found {offenders}'
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_recall_at_k
+# ---------------------------------------------------------------------------
+
+def _retrieval(mid: str, canonical: str, candidates: list[str], *, present: bool = True) -> dict:
+    """One duplicate's ground-truth canonical + the ranked ids search returned.
+
+    ``canonical_present`` is resolved by a direct lookup at the live edge,
+    NOT by whether search happened to return it — that distinction is what
+    separates a corpus gap from a retrieval failure.
+    """
+    return {
+        'memory_id': mid,
+        'canonical_id': canonical,
+        'canonical_present': present,
+        'candidates': candidates,
+    }
+
+
+def _recall_by_k(result: dict) -> dict[int, float | None]:
+    return {row['k']: row['recall'] for row in result['per_k']}
+
+
+class TestComputeRecallAtK:
+    """Retrievals are injected, so no live Qdrant or embedder is needed."""
+
+    RETRIEVALS = [
+        _retrieval('d1', 'c1', ['c1', 'z', 'y']),            # rank 1
+        _retrieval('d2', 'c2', ['z', 'y', 'x', 'w', 'c2']),  # rank 5
+        _retrieval('d3', 'c3', ['z', 'y']),                  # never returned
+    ]
+
+    def test_reports_a_row_per_requested_k(self) -> None:
+        got = _mod().compute_recall_at_k(self.RETRIEVALS, [1, 5, 10])
+        assert [row['k'] for row in got['per_k']] == [1, 5, 10]
+
+    def test_hits_and_total_are_reported_so_the_denominator_is_auditable(self) -> None:
+        got = _mod().compute_recall_at_k(self.RETRIEVALS, [1, 5])
+        for row in got['per_k']:
+            assert 'hits' in row and 'total' in row, f'row {row} hides its counts'
+            assert row['total'] == 3, 'all three canonicals are present in the corpus'
+            assert row['recall'] == pytest.approx(row['hits'] / row['total'])
+
+    def test_a_canonical_at_rank_one_counts_at_every_k(self) -> None:
+        got = _recall_by_k(_mod().compute_recall_at_k([self.RETRIEVALS[0]], [1, 5, 10]))
+        assert got == {1: pytest.approx(1.0), 5: pytest.approx(1.0), 10: pytest.approx(1.0)}
+
+    def test_a_canonical_below_k_does_not_count(self) -> None:
+        got = _recall_by_k(_mod().compute_recall_at_k([self.RETRIEVALS[1]], [1, 5]))
+        assert got[1] == pytest.approx(0.0), 'rank 5 must not count at k=1'
+        assert got[5] == pytest.approx(1.0), 'rank 5 must count at k=5'
+
+    def test_recall_is_monotonically_non_decreasing_in_k(self) -> None:
+        """A structural property of the measure, not a target number."""
+        got = _mod().compute_recall_at_k(self.RETRIEVALS, [1, 3, 5, 10])
+        recalls = [row['recall'] for row in got['per_k']]
+        assert recalls == sorted(recalls), f'recall@k must not decrease as k grows: {recalls}'
+
+    def test_an_absent_canonical_is_excluded_from_the_denominator_not_scored_a_miss(
+        self,
+    ) -> None:
+        """The duplicates were deleted, so an absent canonical is a CORPUS GAP.
+
+        Scoring it as a retrieval miss would understate recall and could
+        push T_low lower than the evidence supports.
+        """
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1']),
+            _retrieval('d2', 'gone', ['z', 'y'], present=False),
+        ]
+        got = _mod().compute_recall_at_k(retrievals, [1])
+        row = got['per_k'][0]
+        assert row['total'] == 1, f'the absent canonical must leave the denominator: {row}'
+        assert row['hits'] == 1
+        assert row['recall'] == pytest.approx(1.0)
+
+    def test_absent_canonicals_are_reported_separately(self) -> None:
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1']),
+            _retrieval('d2', 'gone', ['z'], present=False),
+        ]
+        got = _mod().compute_recall_at_k(retrievals, [1])
+        assert 'canonical_absent' in got, 'a corpus gap must be visible in the report'
+        reported = json.dumps(got['canonical_absent'])
+        assert 'd2' in reported or 'gone' in reported, (
+            f'the absent-canonical record must be identifiable: {got["canonical_absent"]}'
+        )
+        assert len(got['canonical_absent']) == 1
+
+    def test_empty_input_reports_none_ratios_not_zero(self) -> None:
+        """No measurement is not the same as a measured zero."""
+        got = _mod().compute_recall_at_k([], [1, 5])
+        for row in got['per_k']:
+            assert row['total'] == 0
+            assert row['recall'] is None, f'expected None recall for an empty sample, got {row}'
+
+    def test_all_canonicals_absent_reports_none_ratios(self) -> None:
+        got = _mod().compute_recall_at_k(
+            [_retrieval('d1', 'gone', ['z'], present=False)], [1],
+        )
+        row = got['per_k'][0]
+        assert row['total'] == 0
+        assert row['recall'] is None
+        assert len(got['canonical_absent']) == 1
