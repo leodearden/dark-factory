@@ -928,3 +928,124 @@ class TestBuildReport:
     def test_the_report_is_json_serializable(self) -> None:
         got = _report(OVERLAP_SCORES, 0.80, 0.70)
         assert json.loads(json.dumps(got)) == got
+
+
+# ---------------------------------------------------------------------------
+# write_triage_config_block
+# ---------------------------------------------------------------------------
+
+import yaml  # noqa: E402
+
+BASE_YAML = """\
+# Leading comment that must survive.
+server:
+  host: localhost  # inline comment
+  port: 8080
+
+reconciliation:
+  # An explanatory comment operators rely on.
+  stale_run_recovery_seconds: 900
+
+curator:
+  enabled: true
+"""
+
+WITH_BLOCK = """\
+# Leading comment that must survive.
+server:
+  host: localhost
+
+write_triage:
+  # stale annotation
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+
+curator:
+  # A comment AFTER the write_triage block.
+  enabled: true
+"""
+
+
+def _call(text: str, t_high=0.87, t_low=0.61, path='calibration/r.json') -> str:
+    return _mod().write_triage_config_block(text, t_high, t_low, path)
+
+
+class TestWriteTriageConfigBlock:
+    def test_appends_the_block_when_absent(self) -> None:
+        got = yaml.safe_load(_call(BASE_YAML))['write_triage']
+        assert got == {
+            't_high': 0.87, 't_low': 0.61, 'calibration_report_path': 'calibration/r.json',
+        }
+
+    def test_preserves_every_other_line_byte_for_byte_when_appending(self) -> None:
+        """config.yaml's explanatory comments are load-bearing for operators,
+        which is why this is a surgical text edit and not a safe_dump
+        round-trip (pyyaml is the only YAML dep; it would strip them)."""
+        out_lines = _call(BASE_YAML).splitlines()
+        in_block = False
+        kept = []
+        for line in out_lines:
+            if line.startswith('write_triage:'):
+                in_block = True
+                continue
+            if in_block:
+                if line and not line[0].isspace() and not line.startswith('#'):
+                    in_block = False
+                else:
+                    continue
+            kept.append(line)
+        assert [ln for ln in kept if ln.strip()] == [
+            ln for ln in BASE_YAML.splitlines() if ln.strip()
+        ]
+
+    def test_replaces_only_the_existing_block(self) -> None:
+        got = yaml.safe_load(_call(WITH_BLOCK))
+        assert got['write_triage'] == {
+            't_high': 0.87, 't_low': 0.61, 'calibration_report_path': 'calibration/r.json',
+        }
+        assert got['server'] == {'host': 'localhost'}
+
+    def test_a_section_declared_after_the_block_survives(self) -> None:
+        """Guards against a regex eating to end-of-file."""
+        out = _call(WITH_BLOCK)
+        assert 'curator:' in out
+        assert '# A comment AFTER the write_triage block.' in out
+        assert yaml.safe_load(out)['curator'] == {'enabled': True}
+
+    def test_the_stale_block_body_is_gone(self) -> None:
+        out = _call(WITH_BLOCK)
+        assert '0.11' not in out and 'old/report.json' not in out
+        assert '# stale annotation' not in out
+
+    def test_comments_outside_the_block_survive_a_replacement(self) -> None:
+        assert '# Leading comment that must survive.' in _call(WITH_BLOCK)
+
+    def test_result_parses_and_round_trips(self) -> None:
+        for text in (BASE_YAML, WITH_BLOCK):
+            parsed = yaml.safe_load(_call(text, 0.5, 0.25, 'x/y.json'))
+            assert parsed['write_triage']['t_high'] == pytest.approx(0.5)
+            assert parsed['write_triage']['t_low'] == pytest.approx(0.25)
+            assert parsed['write_triage']['calibration_report_path'] == 'x/y.json'
+
+    def test_the_written_block_is_annotated(self) -> None:
+        """A reader of config.yaml must see where the numbers came from."""
+        out = _call(BASE_YAML, path='calibration/report.json')
+        block = out[out.index('write_triage:'):]
+        comments = '\n'.join(ln for ln in block.splitlines() if ln.strip().startswith('#'))
+        assert 'calibration/report.json' in comments, 'the block must name its report'
+        assert 'calibrate_write_triage' in comments, 'the block must name its producer'
+        assert 'hand' in comments.lower() or 'edit' in comments.lower(), (
+            'the block must say the values are calibration outputs, not hand-editable'
+        )
+
+    @pytest.mark.parametrize(('t_high', 't_low'), [(None, 0.6), (0.9, None), (None, None)])
+    def test_refuses_to_write_an_uncalibrated_threshold(self, t_high, t_low) -> None:
+        """An uncalibrated run must never put a null threshold into config."""
+        with pytest.raises(ValueError):
+            _mod().write_triage_config_block(BASE_YAML, t_high, t_low, 'r.json')
+
+    def test_a_refused_write_leaves_no_partial_block(self) -> None:
+        with pytest.raises(ValueError):
+            _mod().write_triage_config_block(WITH_BLOCK, None, None, 'r.json')
+        assert 'write_triage' in WITH_BLOCK and '0.11' in WITH_BLOCK, 'input untouched'
