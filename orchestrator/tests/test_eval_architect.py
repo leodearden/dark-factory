@@ -681,6 +681,45 @@ class TestRunArchitectEval:
         assert isinstance(result.metrics['plan_quality'], float)
         assert result.metrics['role_under_test'] == 'architect'
 
+    async def test_cap_refused_architect_invoke_is_marked_not_scored_zero(self):
+        """A CLI 429 must be MARKED as infra, never scored as a terrible plan.
+
+        BEFORE this fix the exact same input recorded ``plan_quality=0.0`` with
+        no marker: ``result.success`` was False, so the plan artifact read back
+        empty, the plan judge was invoked anyway (429ing in the same cap
+        window), its parse-failure sentinel degraded to
+        ``score_plan_structure({}) == 0.0``, and the persisted result JSON was
+        byte-indistinguishable from a genuinely terrible plan. Recovering those
+        cells cost a hand-correlation of result-JSON mtimes against 429 payloads
+        in the run log (plans/eval-architect-effort-verdict-2026-07-27.md,
+        "Data hygiene": 3 of 22 fixtures).
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_result=_cap_agent_result(),
+        )
+
+        # The cell is marked as NOT a content measurement...
+        assert result.metrics['cap_tainted'] is True
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker
+        assert marker.startswith('architect:')   # names the refused STAGE
+        assert 'cap' in marker.lower()           # ...and the refusal itself
+
+        # ...so the score is the explicit null, NOT a fabricated zero.
+        assert result.metrics['plan_quality'] is None
+        assert result.metrics['plan_quality'] != 0.0
+        assert result.metrics['role_under_test'] == 'architect'
+        assert result.metrics['plan_steps'] == 0
+
+        # The plan judge is SKIPPED entirely: there is nothing to judge, and in
+        # a cap window that invocation would 429 too — the second-order failure
+        # that manufactured the 0.0.
+        mocks['judge'].assert_not_called()
+        # Still persisted, so the marked cell is recoverable from the JSON.
+        mocks['save'].assert_called_once()
+
     async def test_wires_plan_tools_mcp_into_architect_invoke(self):
         # BUG 1: the eval architect must be wired with plan-tools MCP exactly
         # like real dispatch — otherwise read_plan() returns {} → plan_steps=0 →
