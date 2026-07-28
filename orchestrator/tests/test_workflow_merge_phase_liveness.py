@@ -406,6 +406,113 @@ class TestEntryOrdering:
 
 
 # ---------------------------------------------------------------------------
+# step-13: the stamp must survive into merge attempt 2+ (review-fix R2-B)
+# ---------------------------------------------------------------------------
+
+
+class TestRetryLoopReStamp:
+    @pytest.mark.asyncio
+    async def test_stamp_refreshed_at_top_of_each_merge_attempt(self, monkeypatch):
+        """Every pre-enqueue window starts with a FRESH durable stamp.
+
+        The merge-entry stamp is written once, ABOVE the ``for _merge_attempt
+        in range(max_merge_retries)`` loop, while ``_submit_to_merge_queue``
+        discharges it INSIDE that loop at the enqueue boundary. So once the
+        clear actually deletes (step-12), attempt 2+ runs its entire
+        pre-enqueue window — Phase-1 rebase plus a full scoped re-verify,
+        minutes long, zero LLM calls and therefore no fresh ``routing.latest``
+        either — with NO liveness signal at all, recurring exactly the
+        divergence false positive this task exists to suppress. (A REQUEUED
+        retry passes through a steward resolution first, so the merge-entry L0
+        has already aged past ``orphan_l0_timeout_secs`` by then.)
+
+        The in-memory ``note_merge_phase_entered`` is already re-stamped at the
+        loop top for precisely this reason; the durable one must be symmetric.
+
+        RED on main: snapshot 2 carries no ``merge_phase_liveness``.
+        """
+        import copy
+
+        f = _make(metadata={'retry_ledger': {'x': 1}})
+        wf = f.wf
+        wf.plan = {'files': ['a.py']}
+        wf.event_store = None
+        wf.config.max_merge_retries = 2
+        wf.config.max_pre_merge_retries = 1
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'branch_head_sha\n', ''
+
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=_PASSING_VERIFY_RESULT),
+        )
+
+        wf._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf._enter_phase = MagicMock()  # type: ignore[method-assign]
+        wf._check_scope_invariant = AsyncMock()  # type: ignore[method-assign]
+        wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+        wf._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf._check_merge_outcome_thrash = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
+        wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+        # False → the "branch landed on main after steward resolution" break
+        # does not fire, so the loop actually reaches attempt 2.
+        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+
+        # The REAL stamp/clear helpers run; the stamp is only wrapped so calls
+        # are counted. get_task mirrors the in-memory blob so the
+        # read-modify-write round-trips coherently.
+        f.scheduler.get_task = AsyncMock(
+            side_effect=lambda *_a, **_kw: {
+                'metadata': copy.deepcopy(wf.task.get('metadata') or {}),
+            },
+        )
+        real_stamp = wf._stamp_merge_phase_entered
+        stamp_spy = AsyncMock(side_effect=real_stamp)
+        wf._stamp_merge_phase_entered = stamp_spy  # type: ignore[method-assign]
+
+        snapshots: list[dict] = []
+        outcomes = [WorkflowOutcome.REQUEUED, WorkflowOutcome.DONE]
+
+        async def _submit(*_a, **_kw):
+            # Snapshot the metadata the reaper would see during this attempt's
+            # pre-enqueue window, then faithfully model the production
+            # enqueue-boundary clear (_submit_to_merge_queue).
+            snapshots.append(copy.deepcopy(wf.task.get('metadata') or {}))
+            await wf._clear_merge_phase_entered()
+            return outcomes[len(snapshots) - 1]
+
+        wf._submit_to_merge_queue = AsyncMock(side_effect=_submit)  # type: ignore[method-assign]
+
+        result = await wf._run_merge_phase('task/77')
+
+        assert result is None            # attempt 2 returned DONE → break
+        assert len(snapshots) == 2       # the loop really ran twice
+
+        stamps = []
+        for i, snap in enumerate(snapshots, start=1):
+            assert 'merge_phase_liveness' in snap, (
+                f'merge attempt {i} ran its pre-enqueue window with no durable '
+                f'liveness stamp: {snap}'
+            )
+            entered_at = snap['merge_phase_liveness']['entered_at']
+            assert isinstance(entered_at, str) and entered_at
+            stamps.append(entered_at)
+
+        # A genuine re-stamp, not a survivor of the attempt-1 write.
+        assert stamps[0] != stamps[1], (
+            f'expected a fresh entered_at per attempt; got {stamps}'
+        )
+        # merge entry + once per attempt.
+        assert stamp_spy.await_count == 3, (
+            f'expected 3 stamp writes (entry + 2 attempts); '
+            f'got {stamp_spy.await_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-9: symmetric clear wiring — durable-enqueue boundary + merge success
 # ---------------------------------------------------------------------------
 
