@@ -54,6 +54,7 @@ from orchestrator.verify_cmd import (
     reproject,
     scope_to,
     serial_pytest,
+    split_chain_tail,
     strip_cwd,
     with_junitxml,
     with_pytest_timeout,
@@ -167,13 +168,32 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
     no-op when *cmd* is ``None`` or does not parse into a structured,
     non-OPAQUE VerifyCmd (covers ``'true'``/``mypy``-based commands, which
     ``reproject`` would never touch anyway).
+
+    A gated trailing ``&&``-chained clause is carried through VERBATIM and is
+    NOT itself reprojected — it is a sibling checker, not a uv invocation
+    (see ``split_chain_tail``). Without this, a chain reaching here would
+    re-parse as OPAQUE and the ``--project`` injection would be SILENTLY
+    dropped; per the fallback path's own comment (and task 2036) the depless
+    workspace-root project cannot spawn ruff/pyright, so that is an exit-127
+    breakage rather than a cosmetic diff.
+
+    The gate is driven with the keyword ``'uv run'`` because that is exactly
+    the head phrase ``reproject`` rewrites: "the thing I am about to rewrite
+    lives in segment 0, appears in no later segment, and there is no ``cd``
+    sequencing" is precisely the right admission test here too. When the gate
+    rejects, ``head is cmd`` and ``tail == ''``, so the body below collapses
+    to its pre-gate form byte-for-byte. Both bail-outs return *cmd* — the
+    full original, never ``head`` — so a rejected command can never be
+    silently truncated.
     """
     if cmd is None:
         return None
-    parsed = parse_config_command(cmd)
+    head, tail = split_chain_tail(cmd, 'uv run')
+    parsed = parse_config_command(head)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
-    return render(reproject(parsed, project))
+    rendered = render(reproject(parsed, project))
+    return f'{rendered} {tail}' if tail else rendered
 
 
 def _cargo_scope_str(cmd: str | None, crates: list[str]) -> str | None:
