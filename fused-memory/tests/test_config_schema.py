@@ -1417,3 +1417,57 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         result = find_matching_topic_cluster(note, clusters)
         assert result is not None
         assert result[0].topic_id == 'architect-plan-revalidation-requeue-lock'
+
+
+class TestWriteTriageConfig:
+    """The write-triage band thresholds (task 3130, PRD leaf alpha).
+
+    The schema's job here is to assert NO a-priori numeric threshold (PRD
+    G6): both bounds default to None, meaning UNCALIBRATED, which the
+    triage router must read as fail-open to ``stored``. A numeric default
+    would reproduce exactly the failure this leaf corrects — the near-dup
+    guard's inherited 0.92 could never fire on a genuine rediscovery pair
+    measured at 0.824.
+    """
+
+    def test_section_exists_on_the_root_config(self):
+        assert FusedMemoryConfig().write_triage is not None
+
+    @pytest.mark.parametrize('field', ['t_high', 't_low', 'calibration_report_path'])
+    def test_every_field_defaults_to_none(self, field):
+        value = getattr(FusedMemoryConfig().write_triage, field)
+        assert value is None, (
+            f'write_triage.{field} must default to None (UNCALIBRATED). '
+            f'A shipped default would be an a-priori threshold; got {value!r}'
+        )
+
+    @pytest.mark.parametrize('field', ['t_high', 't_low'])
+    @pytest.mark.parametrize('value', [0.0, 0.5, 1.0])
+    def test_thresholds_accept_the_cosine_unit_range(self, field, value):
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert getattr(WriteTriageConfig(**{field: value}), field) == value
+
+    @pytest.mark.parametrize('field', ['t_high', 't_low'])
+    @pytest.mark.parametrize('value', [-0.1, 1.1, 42.0])
+    def test_thresholds_reject_out_of_range_values(self, field, value):
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(**{field: value})
+
+    def test_write_triage_is_a_bare_non_optional_submodel(self):
+        """Required, not ``WriteTriageConfig | None``.
+
+        reload.py's ``_iter_leaves`` descends only into a bare submodel; an
+        ``X | None`` field is compared WHOLE and collapses to a single
+        restart_required leaf (the esc-2718-1 lesson). That would make the
+        calibration script's config write need a server restart instead of
+        a hot reload.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        annotation = FusedMemoryConfig.model_fields['write_triage'].annotation
+        assert isinstance(annotation, type) and issubclass(annotation, WriteTriageConfig), (
+            f'write_triage must be annotated as a bare submodel, got {annotation!r}'
+        )

@@ -405,3 +405,46 @@ class TestReloadConfigTool:
         assert isinstance(result['error'], str) and 'timed out' in result['error']
         # Live config completely untouched — no apply on the timeout path.
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
+
+
+class TestWriteTriageLeavesAreGreenTier:
+    """The calibration script's config write must be hot-reloadable.
+
+    Modelled on test_topic_guard_clusters_leaf_is_green_tier_applied_candidate.
+    The existing test_reloadable_fields_are_all_real_leaves guards these
+    paths against typos automatically.
+    """
+
+    PATHS = (
+        'write_triage.t_high',
+        'write_triage.t_low',
+        'write_triage.calibration_report_path',
+    )
+
+    @pytest.mark.parametrize('path', PATHS)
+    def test_leaf_is_allowlisted(self, path):
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+    @pytest.mark.parametrize(
+        ('path', 'new_value'),
+        [
+            ('write_triage.t_high', 0.87),
+            ('write_triage.t_low', 0.61),
+            ('write_triage.calibration_report_path', 'calibration/report.json'),
+        ],
+    )
+    def test_changed_leaf_lands_in_applied_candidates(self, path, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        field = path.split('.', 1)[1]
+        old = getattr(live.write_triage, field)
+        assert old is None, 'the uncalibrated default is None'
+        object.__setattr__(fresh.write_triage, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates, (
+            f'{path} must hot-apply so a calibration run is picked up without a restart'
+        )
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
