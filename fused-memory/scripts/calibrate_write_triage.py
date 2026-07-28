@@ -417,3 +417,78 @@ def build_report(
         'recall_at_k': recall,
         'provenance': run_provenance,
     }
+
+
+# ---------------------------------------------------------------------------
+# Config write
+# ---------------------------------------------------------------------------
+
+_BLOCK_KEY = 'write_triage:'
+
+
+def write_triage_config_block(
+    yaml_text: str,
+    t_high: float | None,
+    t_low: float | None,
+    report_path: str,
+) -> str:
+    """Return *yaml_text* with only its ``write_triage:`` block replaced.
+
+    Deliberately a line-oriented surgical edit, NOT a ``yaml.safe_dump``
+    round-trip: pyyaml is the only YAML dependency (no ruamel), and dumping
+    would strip config.yaml's extensive explanatory comments, which are
+    load-bearing for operators.
+
+    Raises when either threshold is ``None`` — an uncalibrated run must
+    never put a null threshold into config. The input string is never
+    mutated, so a refusal leaves no partial block behind.
+    """
+    if t_high is None or t_low is None:
+        raise ValueError(
+            f'refusing to write an uncalibrated threshold into config '
+            f'(t_high={t_high!r}, t_low={t_low!r}). Leave the section absent so '
+            'triage fails open to `stored`.',
+        )
+
+    block = (
+        f'{_BLOCK_KEY}\n'
+        '  # CALIBRATION OUTPUT — do not hand-edit.\n'
+        '  # Derived from measured similarity distributions by\n'
+        '  # scripts/calibrate_write_triage.py; both values are order statistics of\n'
+        '  # the observed curator-labeled corpus, not chosen constants.\n'
+        f'  # Report: {report_path}\n'
+        "  # -- records the measured distributions and the deterministic band's\n"
+        '  # false-positive count. Re-run the script to change these values.\n'
+        f'  t_high: {t_high}\n'
+        f'  t_low: {t_low}\n'
+        f'  calibration_report_path: {report_path}\n'
+    )
+
+    lines = yaml_text.splitlines(keepends=True)
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(_BLOCK_KEY)),
+        None,
+    )
+    if start is None:
+        separator = '' if yaml_text.endswith('\n\n') or not yaml_text else '\n'
+        return yaml_text + separator + block
+
+    # Scan to the next line that opens a new TOP-LEVEL key (column 0, not a
+    # comment and not blank). Anything indented, blank or commented belongs to
+    # this block. Bounding the span this way is what keeps a section declared
+    # after write_triage from being eaten.
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
+            end = i
+            break
+
+    # Trailing blank lines inside the span belong between the sections, not to
+    # the block — preserve them so spacing survives the replacement.
+    trailing = ''
+    while end > start + 1 and not lines[end - 1].strip():
+        trailing = lines[end - 1] + trailing
+        end -= 1
+
+    return ''.join(lines[:start]) + block + trailing + ''.join(lines[end:])
