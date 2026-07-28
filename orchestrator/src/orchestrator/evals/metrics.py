@@ -18,8 +18,22 @@ from typing import TYPE_CHECKING, Any
 # module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
+# The W4 cap/error classification seam (task 3118). Module-level import is safe
+# for the same reason agents.invoke above is: shared.invocation_outcome reaches
+# only shared.cli_invoke and has no import back into orchestrator, so there is
+# no cycle. detect_invocation_error below delegates to it rather than forking
+# its cap/auth string tables into the eval layer.
+from shared.invocation_outcome import (
+    OK,
+    AuthFailed,
+    CapHit,
+    ModelNotFound,
+    classify_invocation,
+)
+
 if TYPE_CHECKING:
     from orchestrator.workflow import TaskWorkflow
+    from shared.cli_invoke import AgentResult
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +193,64 @@ def _is_null_work(m: EvalMetrics) -> bool:
         and m.files_changed == 0
         and m.cost_usd > 0
     )
+
+
+# Cap/auth reasons are free-form CLI text; clip them so the marker stays a
+# single short line in result JSON and in the report tables.
+_MARKER_REASON_CHARS = 80
+
+
+def detect_invocation_error(
+    result: AgentResult | None, *, backend: str = 'claude',
+) -> str | None:
+    """Name the TRANSPORT-layer refusal behind a failed invocation, if any.
+
+    The third infra-failure guard alongside :func:`_is_false_green` /
+    :func:`_is_null_work`, and the input to the ``cap_tainted`` scoring
+    decision: it answers "did we ever actually get to ask the model?" so a CLI
+    429 stops being scored as if the model had answered badly.
+
+    Classification is DELEGATED to
+    :func:`shared.invocation_outcome.classify_invocation` rather than
+    re-matching 429/cap strings here — that seam already owns the cap/auth/
+    model-not-found tables (under a drift guard) and short-circuits ``OK`` on
+    ``result.success``, which is what stops a healthy run whose OUTPUT merely
+    quotes a cap string from being falsely tainted. Forking those tables into
+    the eval layer would reproduce exactly the false-positive class they were
+    built to prevent.
+
+    The explicit ``api_error_status == 429`` fallback is still required: 429 is
+    deliberately EXCLUDED from the ``AuthFailed`` variant (it normally carries a
+    cap-message body that the cap-TEXT tier recognises), so a BODY-LESS 429
+    would otherwise fall through to ``Failure(unclassified)`` and go unmarked.
+
+    Returns ``None`` — deliberately, not a marker — for ``result is None``, for
+    a successful invocation, and for every non-infra variant. An ORDINARY
+    content failure (an architect that really ran and simply produced a bad or
+    absent plan) is a genuine reliability signal that must keep scoring on
+    content; laundering it into an exclusion would hide it.
+
+    Pure: no I/O, no LLM, no mutation. Raising is left to the caller to guard
+    (``run_architect_eval`` wraps the call) so a classifier bug degrades that
+    one cell rather than being silently swallowed everywhere.
+    """
+    if result is None:
+        return None
+
+    outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+    if isinstance(outcome, CapHit):
+        return f'cap_hit: {outcome.reason[:_MARKER_REASON_CHARS]}'
+    if isinstance(outcome, AuthFailed):
+        return f'auth_failed: HTTP {outcome.status}'
+    if isinstance(outcome, ModelNotFound):
+        return f'model_not_found: {outcome.reason[:_MARKER_REASON_CHARS]}'
+    if isinstance(outcome, OK):
+        # Preserve classify_invocation's OK short-circuit through the fallback
+        # below: a successful invocation is never an infra refusal.
+        return None
+    if getattr(result, 'api_error_status', None) == 429:
+        return 'api_error: HTTP 429'
+    return None
 
 
 def compute_composite(m: EvalMetrics) -> float:
