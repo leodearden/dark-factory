@@ -6452,10 +6452,13 @@ class TestSubmitTaskGuardrailMultiProject:
         interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
 
         try:
+            # Task 3120: the multi-segment spelling is deliberate — this test
+            # exercises ticket PERSISTENCE of the advisory marker, not the
+            # single-bare-segment lexer shape.
             result = await interceptor_with_store.submit_task(
                 project_root=str(tmp_path / 'reify'),
-                title='Investigate fused-memory/harness deadlock',
-                description='See fused-memory/ for context',
+                title='Investigate fused-memory/src/harness.py deadlock',
+                description='See fused-memory/src/ for context',
                 metadata={'files': ['crates/widget.rs']},
             )
         finally:
@@ -7436,8 +7439,11 @@ class TestPathGuardCheckProseOnly:
         )
         interceptor._prefix_registry = registry
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the prose-vs-files ROUTING split, not the
+        # single-bare-segment lexer shape.
         candidate = CandidateTask(
-            title='Edit fused-memory/X',
+            title='Edit fused-memory/src/x.py',
             description='',
             details='',
             files_to_modify=[],
@@ -7489,9 +7495,12 @@ class TestPathGuardOrSkipProseAdvisory:
         fake_adjudicator.adjudicate = AsyncMock()
         interceptor._path_scope_adjudicator = fake_adjudicator
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the ADVISORY/escalation machinery, not the
+        # single-bare-segment lexer shape.
         kwargs: dict[str, Any] = {
-            'title': 'Investigate fused-memory/harness deadlock',
-            'description': 'See fused-memory/ for context',
+            'title': 'Investigate fused-memory/src/harness.py deadlock',
+            'description': 'See fused-memory/src/ for context',
         }
         result = await interceptor._path_guard_or_skip(
             kwargs,

@@ -145,8 +145,12 @@ class TestCheckCandidateForScope:
         assert v.outcome == 'ok'
 
     def test_other_project_paths_rejected(self, tmp_path):
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the ROUTING/verdict machinery, not the single-bare-segment
+        # lexer shape (whose right-boundary contract lives in
+        # TestFindPathsRightBoundary).
         registry = _two_project_registry(tmp_path)
-        c = _candidate(title='Edit fused-memory/X')
+        c = _candidate(title='Edit fused-memory/src/x.py')
         v = check_candidate_for_scope(c, 'reify', registry)
         assert v.outcome == 'rejection'
         assert v.matched_paths == ('fused-memory/',)
@@ -170,9 +174,12 @@ class TestCheckCandidateForScope:
             str(_mkproj(tmp_path, 'dark-factory', ['fused-memory'])),
             str(c_root),
         ])
+        # Task 3120: the multi-segment/extensioned spelling is deliberate —
+        # this test exercises the ambiguous-suggestion ROUTING path, not the
+        # single-bare-segment lexer shape.
         c = _candidate(
             title='wat',
-            description='Edit fused-memory/X and crates/Y',
+            description='Edit fused-memory/src/x.py and crates/y.rs',
         )
         v = check_candidate_for_scope(c, 'cthird', registry)
         assert v.outcome == 'rejection'
@@ -278,8 +285,11 @@ class TestCheckTextForScope:
         assert v.outcome == 'ok'
 
     def test_text_with_other_project_path_rejected(self, tmp_path):
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the prompt-only ROUTING branch, not the
+        # single-bare-segment lexer shape.
         registry = _two_project_registry(tmp_path)
-        v = check_text_for_scope('please patch fused-memory/foo', 'reify', registry)
+        v = check_text_for_scope('please patch fused-memory/src/foo.py', 'reify', registry)
         assert v.outcome == 'rejection'
         assert v.suggested_project == 'dark_factory'
 
