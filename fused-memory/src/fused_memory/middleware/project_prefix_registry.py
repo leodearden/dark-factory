@@ -261,6 +261,17 @@ class ProjectPrefixRegistry:
         if not path:
             return None
 
+        if path.startswith('/'):
+            # ABSOLUTE regime (task 3109): resolved against known project
+            # ROOTS, never against the relative prefix table below. The two
+            # regimes are disjoint by construction — a registered prefix is
+            # always a top-level dir name, so it can never lead an absolute
+            # path, and roots are always absolute, so they can never match a
+            # relative candidate. This early return is therefore a
+            # short-circuit, not a semantic change for relative input, which
+            # keeps the prefix scan below byte-identical.
+            return self._owner_for_absolute_path(path)
+
         best_prefix = ''
         best_owner: str | None = None
         for prefix, owner in self.prefix_to_project.items():
@@ -269,6 +280,41 @@ class ProjectPrefixRegistry:
                 best_prefix = prefix
                 best_owner = owner
         return best_owner
+
+    def _owner_for_absolute_path(self, path: str) -> str | None:
+        """Return the project whose known root contains absolute *path*.
+
+        Root-authoritative (task 3109): an absolute path under a registered
+        ``project_root`` is owned by that project DIRECTLY, without requiring
+        its remainder to also match a registered prefix. The ``_GENERIC_DIRS``
+        denylist and the leading-component prefix match exist to disambiguate
+        BARE RELATIVE prefixes between projects (tasks 1494/2434); an absolute
+        path under a project root carries no such ambiguity.
+
+        No filesystem access: this is a pure lexical comparison on a hot
+        submit path. ``from_roots`` already resolved the ROOTS at build time,
+        which is the side that needs canonicalising; resolving the CANDIDATE
+        would make ownership depend on symlink state and on whether the file
+        exists yet (a task may legitimately declare files it is about to
+        create).
+
+        The ``root_norm + '/'`` boundary is the analogue of the relative
+        scan's trailing-slash component boundary, so a sibling root like
+        ``/home/leo/src/dark-factory-old`` does NOT match the root
+        ``/home/leo/src/dark-factory``. Degenerate roots (``''``, ``'/'``)
+        are skipped rather than allowed to own everything.
+
+        Returns ``None`` when *path* lies under no known root — genuinely
+        unclassifiable, which fails OPEN (unowned = the pre-3109 verdict,
+        never a false rejection).
+        """
+        for project_id, root in self.project_to_root.items():
+            root_norm = root.rstrip('/')
+            if not root_norm:
+                continue  # '' / '/' roots would own everything — skip
+            if path == root_norm or path.startswith(root_norm + '/'):
+                return project_id
+        return None
 
     def root_for_project(self, project_id: str) -> str | None:
         """Return the configured project_root for *project_id*, or None."""
