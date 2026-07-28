@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -358,6 +359,52 @@ async def test_watchdog_wedge_does_not_fan_out_to_idle_startup_seeded_projects(
 
     assert {v.project_id for v in verdicts} == {'active', 'explicit'}
     assert not (roots['idle'] / 'data' / 'escalations').exists()
+
+
+@pytest.mark.asyncio
+async def test_rejection_branch_logs_why_no_escalation_was_written(
+    event_buffer, tmp_path, caplog,
+):
+    """The rejection branch must say WHY nothing was written.
+
+    The incident's defining symptom was that a halted project produced NO
+    backlog_policy log line of ANY kind, so the drop was invisible. The two
+    causes must be discriminated: an unregistered project_root vs. no live
+    orchestrator for a root we do have.
+    """
+    logger_name = 'fused_memory.reconciliation.backlog_policy'
+
+    # (a) No registered root at all.
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        verdict = await policy.on_judge_halt('unregistered', reason='r')
+    assert verdict.outcome == 'rejection'
+    text = '\n'.join(
+        r.getMessage() for r in caplog.records if r.name == logger_name
+    )
+    assert 'unregistered' in text
+    assert 'judge_halt' in text
+    assert 'ReconciliationJudgeHalted' in text
+    assert 'project_root' in text and 'not registered' in text
+    assert 'orchestrator' not in text
+
+    # (b) Root registered, but no live orchestrator.
+    caplog.clear()
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+    policy_b = BacklogPolicy(event_buffer, _StubQueue(), lambda _: False)
+    policy_b.register_project_root('proj', str(project_root))
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        verdict_b = await policy_b.on_judge_halt('proj', reason='r')
+    assert verdict_b.outcome == 'rejection'
+    text_b = '\n'.join(
+        r.getMessage() for r in caplog.records if r.name == logger_name
+    )
+    assert 'proj' in text_b
+    assert 'judge_halt' in text_b
+    assert 'ReconciliationJudgeHalted' in text_b
+    assert 'no live orchestrator' in text_b
+    assert str(project_root) in text_b
 
 
 # ── orchestrator_detector ─────────────────────────────────────────────────
