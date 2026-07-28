@@ -358,23 +358,82 @@ INV-4 exists for. This decision specifies the escape rather than leaving it to t
 - **Mechanism**: a rolling-window counter mirroring the **shape** of
   `ReconciliationHarness`'s existing storm counters (`reconciliation/harness.py` — e.g. the
   `_dead_owner_suppressions` deque + `dead_owner_suppression_storm_threshold`/`window_seconds` +
-  single-fire-per-window escalation via a stable finding fingerprint, `:159-168`, `:480-494`) — but
-  **implemented fresh**, not literally shared: the harness's counters live inside the
-  per-process `ReconciliationHarness` instance, a different lifetime and process from the MCP
-  server's tool-dispatch path that will host this counter, so there is no live object to import.
-  Same shape (deque of timestamps per agent_id, threshold + window config, single-fire dedup via a
-  stable category/agent_id fingerprint so a sustained storm folds into one pending escalation
-  rather than one per call) — new code, deliberately not a new *vocabulary*.
+  single-fire-per-window escalation via a stable finding fingerprint, `:159-168`, `:480-494`) —
+  implemented as **new code**, owned by `MemoryService` alongside its other instance state
+  (`services/memory_service.py:758-772`), not by importing the harness's counter object.
+
+  **Correction — this replaces a factually wrong justification in an earlier draft of this
+  section.** Reuse was previously rejected here on the claim that the harness's counters "live
+  inside the per-process `ReconciliationHarness` instance, a different lifetime and process from
+  the MCP server's tool-dispatch path that will host this counter." That claim is **false**:
+  `ReconciliationHarness` is constructed at `server/main.py:891-897`, inside the `if
+  config.reconciliation and config.reconciliation.enabled:` block opened at `:702`, in the *same*
+  asyncio process that hosts FastMCP tool dispatch — there is no process boundary to cross. The two
+  real reasons not to bind this counter to the harness are wiring/reachability facts, not a process
+  boundary:
+  1. **Conditional existence.** Harness construction is gated on `config.reconciliation.enabled`
+     (`:702`). A storm alarm bound to the harness would silently cease to exist whenever
+     reconciliation is disabled — vanishing in exactly the degraded configuration where an
+     unattended rewrite loop is *least* likely to be noticed any other way. INV-4 requires the
+     escape to exist unconditionally, so it cannot depend on a component that is itself
+     conditionally constructed.
+  2. **Construction order.** `MemoryService(config)` is constructed at `:537` — before
+     `curator_escalator` (`:607`) and before `ReconciliationHarness` (`:891`), both built later in
+     the same startup function. No harness or curator-escalator reference is in scope at
+     `MemoryService.__init__` time; reusing either would require a post-construction setter (the
+     existing `set_event_buffer`/`set_write_journal`/`set_recon_ledger` pattern,
+     `services/memory_service.py:774-788`) or a reordering of server startup — the design below
+     needs neither.
+
+  Same *shape* as the harness counters (deque of timestamps per `agent_id`, threshold + window
+  config) — new code, deliberately not a new vocabulary. The single-fire-per-window *folding* of
+  repeated breaches is **not** hand-rolled, though — see the escalation channel below.
 - **Threshold**: `mem0_update.storm_threshold` (default 20) content-amend calls per `agent_id`
   within `mem0_update.storm_window_seconds` (default 3600s / 1h) — both green-tier hot-reloadable
   alongside the allowlists above, for the same reason.
-- **Who hears about it, and how**: a `severity='blocking'` escalation, category
-  `mem0_in_place_update_storm`, fingerprinted on `(category, agent_id)` — not on count/window, so
-  repeated storms from the same agent fold into a single pending escalation instead of paging
-  once per breach (mirroring `_DEAD_OWNER_STORM_FINDING`'s stable-fingerprint / variable-detail
-  split, `harness.py:164-168`). `blocking`, not `info`, because a runaway silent-rewrite loop is a
-  "someone must look at this now" condition, matching this repo's `recon_watchdog_kill_storm`
-  precedent — not a routine triage item.
+- **Emission channel (DECIDED): a new, zero-arg `Mem0UpdateStormEscalator`**, in
+  `fused-memory/src/fused_memory/middleware/`, modelled directly on
+  `middleware/scope_violation_escalator.py` — the house pattern for exactly this job (its own
+  module docstring already records that its design mirrors `CuratorEscalator`). This is the
+  load-bearing half of this finding: `MemoryService` has **no** escalation API today — a repo-wide
+  grep for `escalat` in `services/memory_service.py` returns exactly one hit, a docstring mention
+  at `:3282` — so without naming a concrete channel here, an implementer would have had to invent
+  the delivery path, risking a counter that counts correctly but reaches nobody. Mirroring
+  `ScopeViolationEscalator` means reusing, not reimplementing (INV-5):
+  - **Defensive import** of the optional `escalation` workspace package
+    (`scope_violation_escalator.py:50-61`) — when the package is absent, the escalate call is a
+    logged no-op and the triggering `update_memory` call still succeeds, consistent with the
+    "monitoring alarm, not a rate limiter" rule below.
+  - **A per-project `EscalationQueue` cache keyed on `project_root`** (`_queue_for`,
+    `scope_violation_escalator.py:126-138`), landing in `{project_root}/data/escalations` — the
+    same queue an operator already watches for scope-violation and curator escalations.
+  - **Burst folding via `escalation.dedupe.submit_or_dedupe`**
+    (`scope_violation_escalator.py:247`), with a `dedupe_fingerprint` computed over `(category,
+    agent_id)` (i.e. `compute_content_fingerprint('mem0_in_place_update_storm', agent_id)`) and
+    `infra_dedupe_categories=('mem0_in_place_update_storm',)`. This **replaces** the hand-rolled
+    "single-fire-per-window" dedup an implementer would otherwise have had to build by hand: a
+    sustained storm from one `agent_id` folds into one pending escalation (incrementing
+    `dedupe_count`) instead of paging once per call past threshold — satisfying the fingerprint
+    requirement below by **reuse**, not reimplementation.
+  - **Ownership/wiring**: constructed zero-arg inside `MemoryService.__init__`, exactly like
+    `ScopeViolationEscalator()` at `server/main.py:633`/`:650` — no reference to the harness or to
+    `curator_escalator` is needed, no startup reordering, and it behaves identically whether
+    reconciliation is enabled or disabled. This is precisely what makes reason 1 above hold: the
+    alarm's existence never depends on `config.reconciliation.enabled`.
+- **Who hears about it, and how**: `MemoryService.update_memory`'s post-write observe step (§5(a)
+  step 7) calls the owned `Mem0UpdateStormEscalator`'s report method once the per-`agent_id` count
+  reaches `mem0_update.storm_threshold` within the configured window. It submits a
+  `severity='blocking'` escalation, category `mem0_in_place_update_storm`, fingerprinted on
+  `(category, agent_id)` as above — not on count/window, so repeated storms from the same agent
+  fold into a single pending escalation instead of paging once per breach (mirroring
+  `_DEAD_OWNER_STORM_FINDING`'s stable-fingerprint / variable-detail split, `harness.py:164-168`).
+  `blocking`, not `info`, because a runaway silent-rewrite loop is a "someone must look at this
+  now" condition, matching this repo's `recon_watchdog_kill_storm` precedent — not a routine
+  triage item.
+- **Behaviour when reconciliation is disabled: unchanged.** The counter and the escalator are both
+  owned by `MemoryService` and constructed unconditionally in its `__init__`; neither has any
+  dependency on `config.reconciliation.enabled`, `ReconciliationHarness`, or `curator_escalator`, so
+  this alarm fires identically regardless of whether reconciliation is on.
 - **This is a monitoring alarm, not a rate limiter.** Crossing the threshold does **not** reject
   the triggering call — the write still proceeds and is still journaled. INV-4's house pattern
   (the harness storm counters cited above) is uniformly "observe the rate, escalate loudly," never
@@ -413,7 +472,10 @@ conditional `_emit_event`. The tool-level guard sequence, in order:
 6. `_extract_causation(metadata, agent_id)` (`:479-497`) — unchanged from every sibling tool.
 7. Dispatch to `memory_service.update_memory(...)`, which performs the storm-counter
    observe-and-maybe-escalate step (content-amend calls only, post-write) alongside the journal and
-   event steps below.
+   event steps below. "Maybe-escalate" means a call into `MemoryService`'s own, zero-arg-constructed
+   `Mem0UpdateStormEscalator` (§4) once the per-`agent_id` count reaches
+   `mem0_update.storm_threshold` within the window — never a call into `ReconciliationHarness`,
+   which is conditionally constructed and may not exist at all (§4).
 
 ### (b) The write-path fork — the load-bearing mechanical finding
 
