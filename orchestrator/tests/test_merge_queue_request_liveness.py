@@ -1708,6 +1708,145 @@ class TestContendedLeaseDefers:
             'dead-verify-abort counter untouched'
         )
 
+    async def test_reset_lane_lease_held_defers(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """task 3003, limb (c): a DIFFERENT-process lease holder on the SAME
+        warm-swap seam must ALSO defer, not block.
+
+        ``MergeVerifyLeaseHeld`` is raised by the fail-CLOSED pre-check at the
+        very top of ``reset_persistent_merge_worktree`` (git_ops.py) when a
+        FOREIGN live pgid holds the merge-verify lease.  It reaches
+        ``_run_inflight_verify`` through exactly the same
+        ``_acquire_warm_verify_worktree`` call as the contended timeout, and
+        it deserves exactly the same response — the tree was never touched and
+        the holder will eventually go away.
+
+        RED on main: the type is not in the requeue ``except`` arm, so it falls
+        to the generic ``except Exception`` and resolves
+        ``MergeOutcome('blocked', reason='Verification error: Refusing to reset
+        persistent merge worktree ...')`` — another deterministic,
+        thrash-feeding signature, and a direct contradiction of the REQUEUE /
+        ``counts_against_requeue_cap=False`` disposition ALREADY declared for
+        this exact type in workflow_types.py.
+
+        Also pins the streak log's honesty: ``MergeVerifyLeaseHeld`` carries no
+        ``wait_secs``, so the rising-severity ERROR must NOT print a fabricated
+        "~0 min of continuous contention" duration — a zero there would tell an
+        operator the opposite of the truth (the holder has been there a while;
+        we simply cannot say how long from this exception).
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        # A pgid that is neither ours nor live (Linux pid_max is nowhere near
+        # 2**31-1) — stands in for the foreign holder the real pre-check finds.
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+
+        async def _lease_held_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseHeld(warm_path, foreign_pgid)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        # Small threshold so the SECOND attempt deterministically crosses it
+        # (mirrors test_consecutive_contended_requeues_raise_log_severity).
+        worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 2
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        task_id = 'lease-held-holder'
+
+        async def _drive_one(branch: str) -> tuple[MergeRequest, object]:
+            # Fresh merged item on a distinct branch but the SAME task_id, so
+            # the per-task streak counter accumulates across dispatch attempts.
+            req, item = await _make_merged_item(
+                warm_git_ops, warm_config, branch, f'{branch}.py', 'x=1\n',
+                task_id=task_id,
+            )
+            worker._register_owned_merge_worktree(item.merge_wt)
+            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            with patch.object(
+                warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+            ):
+                result = await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=15.0,
+                )
+            return req, result
+
+        # ── Attempt 1: the full defer contract, identical to the contended case ──
+        worker._inflight_dead_verify_aborts[task_id] = 2
+        with (
+            patch.object(
+                worker, '_note_requeue', wraps=worker._note_requeue,
+            ) as spy_note,
+            patch.object(
+                worker, '_release_or_cleanup', wraps=worker._release_or_cleanup,
+            ) as spy_release,
+        ):
+            req, result = await _drive_one('lhd-0')
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'a foreign-held merge-verify lease on the warm-swap reset must '
+            f'REQUEUE, got status={result.status!r} outcome={result.outcome!r}'
+        )
+        assert result.outcome is None, 'requeue must carry no MergeOutcome'
+        assert result.merge_wt is None, 'merge_wt must be released on requeue'
+        assert not req.result.done(), (
+            'req.result must be left PENDING (deferred), never resolved to blocked'
+        )
+        assert not q.empty(), 'the request must be re-dispatched onto _queue'
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request '
+            'never ages out'
+        )
+        spy_release.assert_called_once()
+        spy_note.assert_called_once()
+        assert worker._inflight_dead_verify_aborts.get(task_id) == 2, (
+            'the lease-held requeue must leave the per-task dead-verify-abort '
+            'counter untouched'
+        )
+
+        # ── Attempt 2: crosses the streak threshold — the ERROR must not lie ──
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            _, result2 = await _drive_one('lhd-1')
+
+        assert result2.status == InflightStatus.REQUEUED
+        streak = worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK
+        assert worker._contended_lease_requeues[task_id] == streak, (
+            'consecutive lease-held defers for one task must accumulate the '
+            'same operator-visible streak a contended lease does'
+        )
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'crossing the streak threshold must log an ERROR'
+        msg = errors[0].getMessage()
+        assert str(streak) in msg, (
+            'the rising-severity ERROR must still name the streak length'
+        )
+        assert str(foreign_pgid) in msg, (
+            'the ERROR must name the foreign holder pgid so an operator can '
+            'identify who is holding the lane'
+        )
+        assert 'continuous contention' not in msg, (
+            'MergeVerifyLeaseHeld carries no wait_secs, so the streak ERROR '
+            'must NOT print a fabricated duration estimate (getattr(..., 0.0) '
+            'renders "~0 min of continuous contention", which tells the '
+            'operator the exact opposite of the truth). Suppress the duration '
+            'clause — or substitute a holder-pgid clause — when wait_secs is '
+            f'absent. Got: {msg!r}'
+        )
+
     async def test_contended_lease_requeues_and_leaves_result_pending(
         self,
         git_ops: GitOps,
