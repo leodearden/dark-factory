@@ -60,6 +60,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -150,4 +152,67 @@ def build_pair_sets(records: list[dict[str, Any]]) -> dict[str, list[dict[str, s
         'true_dup_pairs': true_dup,
         'unrelated_pairs': unrelated,
         'hard_negative_pairs': hard_negative,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Similarity + distribution statistics
+# ---------------------------------------------------------------------------
+
+def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    """Raw cosine between two embedding vectors.
+
+    This is deliberately the same quantity Qdrant reports as
+    ``relevance_score`` — see the module docstring's metric-space parity
+    note. stdlib only; no numpy dependency is added for a dot product.
+
+    A zero-norm or mismatched-length input raises rather than yielding NaN:
+    a NaN would propagate silently through the distributions and corrupt
+    every statistic derived from them.
+    """
+    if len(a) != len(b):
+        raise ValueError(f'vector length mismatch: {len(a)} != {len(b)}')
+    norm_a = math.sqrt(math.fsum(x * x for x in a))
+    norm_b = math.sqrt(math.fsum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        raise ValueError(
+            'cosine_similarity received a zero-norm vector — refusing to return NaN '
+            '(a NaN here would silently corrupt the measured distributions)',
+        )
+    return math.fsum(x * y for x, y in zip(a, b, strict=True)) / (norm_a * norm_b)
+
+
+def _order_statistic(ordered: list[float], quantile: float) -> float:
+    """Nearest-rank quantile: always a value actually present in the sample.
+
+    Interpolating would produce a threshold no measurement supports, which
+    is precisely what derive_bands must not do.
+    """
+    idx = math.ceil(quantile * len(ordered)) - 1
+    return ordered[min(max(idx, 0), len(ordered) - 1)]
+
+
+def summarize_distribution(scores: Sequence[float]) -> dict[str, Any]:
+    """Order-statistic summary of a measured score sample.
+
+    An empty sample reports ``n=0`` with every statistic ``None`` rather
+    than ``0.0``, so an empty pair class can never be misread as a measured
+    zero.
+    """
+    if not scores:
+        return {
+            'n': 0, 'min': None, 'max': None, 'mean': None, 'median': None,
+            'p05': None, 'p25': None, 'p75': None, 'p95': None,
+        }
+    ordered = sorted(float(s) for s in scores)
+    return {
+        'n': len(ordered),
+        'min': ordered[0],
+        'max': ordered[-1],
+        'mean': math.fsum(ordered) / len(ordered),
+        'median': _order_statistic(ordered, 0.50),
+        'p05': _order_statistic(ordered, 0.05),
+        'p25': _order_statistic(ordered, 0.25),
+        'p75': _order_statistic(ordered, 0.75),
+        'p95': _order_statistic(ordered, 0.95),
     }
