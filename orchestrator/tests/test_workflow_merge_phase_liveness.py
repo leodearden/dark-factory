@@ -180,6 +180,29 @@ class TestStampHelper:
         assert meta['memory_hints'] == ['h1']     # backend sibling overlaid
 
     @pytest.mark.asyncio
+    async def test_stamp_survives_corrupt_non_dict_backend_metadata(self):
+        # The stamp's read-modify-write goes through _merge_fresh_metadata ->
+        # _read_fresh_backend_metadata, whose documented contract is
+        # {} = read OK / dict = the blob / None = could not read. A CORRUPT
+        # persisted blob (non-dict) must map to "could not read", not be
+        # returned raw — `{**in_memory, **'corrupt'}` raises
+        # `TypeError: 'str' object is not a mapping` from a code path with no
+        # try/except around it, on the merge critical path. Not hypothetical:
+        # the whole point of the stamp is to be readable after a crash, i.e.
+        # exactly when a partial write may have left a bad blob.
+        f = _make(metadata={'retry_ledger': {'x': 1}})
+        f.scheduler.get_task = AsyncMock(return_value={'metadata': 'corrupt'})
+
+        await f.wf._stamp_merge_phase_entered()   # must not raise
+
+        meta = _persisted_metadata(f.update_task)
+        assert meta['merge_phase_liveness']['entered_at']
+        # Fell back to in-memory metadata alone (the corrupt blob is ignored,
+        # not overlaid). The stamp write itself stays 'merge' mode, so the
+        # backend repairs the key it can and leaves the rest alone.
+        assert meta['retry_ledger'] == {'x': 1}
+
+    @pytest.mark.asyncio
     async def test_stamp_is_best_effort_and_does_not_raise_on_persist_failure(self):
         f = _make(update_task_raises=True)
 
@@ -284,6 +307,33 @@ class TestClearHelper:
             },
         )
         f.scheduler.get_task = AsyncMock(return_value=None)
+
+        await f.wf._clear_merge_phase_entered()   # must not raise
+
+        f.update_task.assert_not_awaited()
+        assert 'merge_phase_liveness' not in f.wf.task['metadata']
+        assert f.wf.task['metadata']['retry_ledger'] == {'x': 1}
+
+    @pytest.mark.asyncio
+    async def test_clear_skips_durable_write_when_backend_metadata_is_non_dict(self):
+        # Third unreadable-blob shape: get_task returns a task whose persisted
+        # `metadata` is CORRUPT (a non-dict) — a case scheduler.update_task's
+        # own docstring acknowledges ("the sanctioned repair path if a task's
+        # persisted metadata is corrupt (non-dict)"). Without the isinstance
+        # guard in _read_fresh_backend_metadata the corrupt value is returned
+        # and `{**metadata, **backend}` raises
+        # `TypeError: 'str' object is not a mapping` OUTSIDE the try/except
+        # that wraps only update_task — propagating out of
+        # _submit_to_merge_queue on the merge critical path. Treat it as
+        # unreadable: skip the whole-blob 'replace' write (never overwrite a
+        # blob nobody understands) and clear in-memory only.
+        f = _make(
+            metadata={
+                'merge_phase_liveness': dict(_STAMP),
+                'retry_ledger': {'x': 1},
+            },
+        )
+        f.scheduler.get_task = AsyncMock(return_value={'metadata': 'corrupt'})
 
         await f.wf._clear_merge_phase_entered()   # must not raise
 

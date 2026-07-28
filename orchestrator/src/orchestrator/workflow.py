@@ -4654,16 +4654,20 @@ class TaskWorkflow:
                 Never returns ``None`` under this flag.
 
         Returns:
-            ``{}`` — read OK, backend metadata is empty.
+            ``{}`` — read OK, backend metadata is empty/absent.
             ``dict`` — the backend's metadata blob.
-            ``None`` — could not read (``get_task`` raised, or returned a
-            non-dict such as ``None`` for a vanished/unreadable task).  Not
-            reachable when ``require_fresh`` is True.
+            ``None`` — could not read: ``get_task`` raised, returned a
+            non-dict (e.g. ``None`` for a vanished/unreadable task), or
+            returned a task whose persisted ``metadata`` is CORRUPT (a
+            non-dict — a state ``Scheduler.update_task``'s own docstring
+            acknowledges as the reason ``metadata_mode='replace'`` exists).
+            Not reachable when ``require_fresh`` is True.
 
         Raises:
             Exception: Only when ``require_fresh`` is True — the underlying
-                ``get_task`` error verbatim, or a :class:`RuntimeError` if the
-                read returned something other than a task dict.
+                ``get_task`` error verbatim, or a :class:`RuntimeError` for
+                every other unreadable shape (non-task result, corrupt
+                non-dict ``metadata``).
         """
         try:
             fresh_task = await self.scheduler.get_task(self.task_id)
@@ -4698,7 +4702,34 @@ class TaskWorkflow:
                 logger.warning(msg)
                 raise RuntimeError(msg)
             return None
-        return fresh_task.get('metadata') or {}
+        meta = fresh_task.get('metadata')
+        if meta is None:
+            return {}
+        if not isinstance(meta, dict):
+            # A corrupt persisted blob must be reported as UNREADABLE, not
+            # returned raw: every caller immediately unpacks the result
+            # (``{**in_memory, **(backend or {})}`` / ``{**metadata,
+            # **backend}``) and a truthy non-dict raises `TypeError: 'X' object
+            # is not a mapping` from an unguarded line — on the merge critical
+            # path, since _clear_merge_phase_entered runs inside
+            # _submit_to_merge_queue. Reporting None also gives the two clears
+            # the right behaviour for free: skip the whole-blob 'replace' write
+            # rather than overwrite a blob nobody understands.
+            msg = (
+                f'Task {self.task_id}: backend metadata is non-dict '
+                f'({type(meta).__name__}) before {log_context} write; '
+                f'treating as unreadable'
+            )
+            logger.warning(msg)
+            if require_fresh:
+                # A require_fresh caller reads the RETURN value as proof the
+                # blob is backend-verified, so reporting None here would send it
+                # down _merge_fresh_metadata's in-memory-only fallback and
+                # straight into the 'replace' clobber this guard exists to
+                # prevent. Refuse the same way the other unreadable shapes do.
+                raise RuntimeError(msg)
+            return None
+        return meta
 
     async def _merge_fresh_metadata(
         self,
