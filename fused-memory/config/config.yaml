@@ -230,6 +230,6 @@ write_triage:
   # Report: calibration/write_triage_calibration_report.json
   # -- records the measured distributions and the deterministic band's
   # false-positive count. Re-run the script to change these values.
-  t_high: 0.8866152951292025
-  t_low: 0.5229672433064231
+  t_high: 0.8868293243724489
+  t_low: 0.522971590497168
   calibration_report_path: calibration/write_triage_calibration_report.json

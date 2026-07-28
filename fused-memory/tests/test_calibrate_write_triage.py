@@ -1193,8 +1193,14 @@ class TestCommittedCalibrationIsTraceable:
 
     CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
 
-    @functools.cache
+    # Decorator order is load-bearing: ``staticmethod`` must be OUTERMOST so
+    # ``self._committed()`` resolves through the descriptor and calls the
+    # cached function with zero arguments. Stacking them the other way round
+    # leaves ``functools.cache``'s plain-function wrapper as the class
+    # attribute, which binds ``self`` as its first argument and raises
+    # TypeError on every access.
     @staticmethod
+    @functools.cache
     def _committed():
         import yaml  # noqa: PLC0415
 
