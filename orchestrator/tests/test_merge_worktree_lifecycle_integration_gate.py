@@ -112,11 +112,15 @@ the evidence that is actually load-bearing for that leg:
     * `_merge-cafe5326` (aged, LEASED) -- the ONLY C1-attributable
       survival on this leg: OFFERED to C1, which answered
       `skipped_lease_held`.
-    * `_merge-beefbeef` (aged, UNLEASED) -- POSITIVE CONTROL: offered and
-      REAPED, so the leg is demonstrably capable of removal. Its outcome
-      string is deliberately unpinned ('removed' and 'failed'->rmtree
-      fallback both end with the tree gone -- assert the filesystem, not
-      the branch taken).
+    * the aged UNLEASED REAL ephemeral `_merge-<uuid>` worktree --
+      POSITIVE CONTROL: offered to C1, which answered `removed`, and
+      gone from disk. Both are pinned, and the control is a genuinely
+      REGISTERED git worktree on purpose: C1 answers `failed` for a
+      merely `mkdir()`'d directory (its pinned contract) and the tree
+      then vanishes via cleanup_merge_worktree's rmtree FALLBACK, so a
+      fake-worktree control would stay green even if C1's uncontended
+      removal branch regressed -- the exact branch the leased decoy's
+      refusal is contrasted against.
     Both merge-band decoys are BACK-DATED past
     RESOURCE_AUDIT_WORKTREE_GRACE_SECS first; without that the reap loop
     `continue`s past them and the whole leg is vacuous.
@@ -374,19 +378,6 @@ def _plant_task_dir(base: Path, task_id: str) -> Path:
     return path
 
 
-def _plant_unleased_tree(path: Path) -> Path:
-    """Create *path* with NO lease and NO holder-pgid record.
-
-    The counterpart to :func:`_plant_leased_tree`: nothing holds this
-    tree's merge-verify flock, so ``remove_merge_worktree_guarded``'s
-    non-blocking acquire succeeds and removal proceeds. Used as the merge
-    reaper's POSITIVE CONTROL -- an entry the sweep MUST remove, proving
-    the leased decoy beside it survived by refusal rather than by neglect.
-    """
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def _age_tree(path: Path, age_secs: float) -> None:
     """Back-date *path*'s mtime by *age_secs* seconds.
 
@@ -564,6 +555,13 @@ class TestDeleterFace:
 
         fd_live = _plant_leased_tree(base, live_wt)
         try:
+            # Scope the WARNING count to THIS call and to git_ops' own logger:
+            # `caplog.records` accumulates every propagated record for the whole
+            # call phase (including the dead-holder removal above, and any
+            # WARNING from an unrelated logger), so an unscoped
+            # `len(warnings) == 1` would be an assertion about global session
+            # log noise rather than about the live-lease skip.
+            caplog.clear()
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
                 outcome_live = await git_ops.remove_merge_worktree_guarded(live_wt, reason='reaper')
 
@@ -572,10 +570,13 @@ class TestDeleterFace:
             )
             assert live_wt.exists(), 'a live lease holder must leave the tree intact'
 
-            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            warnings = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and r.name == 'orchestrator.git_ops'
+            ]
             assert len(warnings) == 1, (
-                f'expected exactly one WARNING, got {len(warnings)}: '
-                f'{[r.getMessage() for r in warnings]}'
+                f'expected exactly one orchestrator.git_ops WARNING, got '
+                f'{len(warnings)}: {[r.getMessage() for r in warnings]}'
             )
             message = warnings[0].getMessage()
             assert str(os.getpgrp()) in message, message
@@ -868,12 +869,13 @@ class TestFiveThreeTwoSixReplayGate:
           `_merge-<hash>` verify tree by the owned-ledger/grace window,
           and the aged LEASED `_merge-cafe5326` by C1 answering
           `skipped_lease_held` when the reaper OFFERED it (spy-recorded)
-          -- with the aged UNLEASED `_merge-beefbeef` reaped as that
-          leg's positive control;
+          -- with an aged UNLEASED REAL ephemeral `_merge-<uuid>`
+          worktree, which C1 answered `removed` for, as that leg's
+          positive control;
           CRASH-RECOVERY-SWEEP leg: every `_merge-*`/infra entry survives
           by the C2 classify_worktree_entry skip, proven by the SET of
           paths offered to `cleanup_worktree` (disjoint-from-protected +
-          exact-set pin), NOT by `.exists()` -- `cleanup_worktree` is
+          upper-bound pin), NOT by `.exists()` -- `cleanup_worktree` is
           deliberately an AsyncMock spy here, so `.exists()` is inert on
           this leg -- with the '999' planless dir as its positive control;
       (b) the gated verify runner's own worktree-existence observations
@@ -951,11 +953,21 @@ class TestFiveThreeTwoSixReplayGate:
         # the lane `.lock` is a SIBLING of the tree, so planting the lease
         # above did not re-touch this directory's mtime.
         #
-        # `_merge-beefbeef` is the reaper-specific POSITIVE CONTROL: aged
-        # and UNLEASED, so the same sweep that must SKIP the leased decoy
-        # must REMOVE this one.
-        merge_unleased = base / '_merge-beefbeef'
-        _plant_unleased_tree(merge_unleased)
+        # The reaper-specific POSITIVE CONTROL is a REAL registered ephemeral
+        # `_merge-<uuid>` worktree, aged and UNLEASED: the same sweep that must
+        # SKIP the leased decoy must REMOVE this one, and it must do so through
+        # C1's `'removed'` branch. A plain `mkdir()`'d directory would NOT
+        # prove that -- per GitOps.cleanup_merge_worktree's own docstring (and
+        # the contract pinned by test_remove_merge_worktree_guarded.py::
+        # test_non_worktree_directory_returns_failed), C1 answers `'failed'`
+        # for a non-worktree dir and the tree then disappears via
+        # cleanup_merge_worktree's shutil.rmtree FALLBACK. That control would
+        # stay green even if C1's uncontended removal branch regressed to
+        # always returning `'failed'` -- exactly the branch the leased decoy's
+        # `skipped_lease_held` is being contrasted against. Using a real
+        # worktree here makes the outcome pinnable, matching row 3's use of
+        # `_make_ephemeral_worktree` for the same reason.
+        merge_unleased = await _make_ephemeral_worktree(harness.git_ops)
         _age_tree(merge_uuid, 100_000)
         _age_tree(merge_unleased, 100_000)
 
@@ -1036,21 +1048,33 @@ class TestFiveThreeTwoSixReplayGate:
                     '_merge-cafe5326 must survive the reaper: C1 answered '
                     'skipped_lease_held'
                 )
-                # REAPER POSITIVE CONTROL: the aged UNLEASED decoy was
-                # offered too, and is GONE -- this leg genuinely removes, so
-                # the leased decoy's survival above is a real refusal. The
-                # outcome string is deliberately NOT pinned ('removed' and
-                # 'failed'->rmtree-fallback both end with the tree gone):
-                # assert the filesystem, not the branch taken.
+                # REAPER POSITIVE CONTROL: the aged UNLEASED real worktree was
+                # offered too, and C1 itself REMOVED it -- so the leg exercises
+                # the same guarded-removal branch the leased decoy refused, and
+                # the leased decoy's survival above is a real refusal rather
+                # than an inert (or fallback-only) sweep. Both the C1 outcome
+                # and the filesystem are pinned: `'removed'` alone would not
+                # prove the tree is gone, and `not .exists()` alone would also
+                # be satisfied by cleanup_merge_worktree's `'failed'`->rmtree
+                # fallback (which would leave a regressed C1 undetected).
                 assert merge_unleased in offered, (
-                    f'the aged unleased decoy was never offered to C1 -- the '
+                    f'the aged unleased worktree was never offered to C1 -- the '
                     f'reaper never reached the removal primitive; '
                     f'offered={offered}'
                 )
+                unleased_outcomes = spy.outcomes_for(
+                    merge_unleased, records=reap_records,
+                )
+                assert 'removed' in unleased_outcomes, (
+                    f'C1 must REMOVE an aged, unleased, unowned merge worktree '
+                    f'through its own guarded-removal branch (not via '
+                    f'cleanup_merge_worktree\'s rmtree fallback); got '
+                    f'outcomes={unleased_outcomes}'
+                )
                 assert not merge_unleased.exists(), (
-                    '_merge-beefbeef (aged, unleased, unowned) must be reaped '
-                    '-- otherwise this leg proves nothing about the leased '
-                    'decoy that survived it'
+                    f'{merge_unleased.name} (aged, unleased, unowned) must be '
+                    f'reaped -- otherwise this leg proves nothing about the '
+                    f'leased decoy that survived it'
                 )
 
                 # Survivors protected by OTHER mechanisms on this leg (see
@@ -1098,18 +1122,28 @@ class TestFiveThreeTwoSixReplayGate:
                     f'positive control: the task-shaped planless dir must be '
                     f'cleaned by this sweep; cleaned={cleaned_paths}'
                 )
-                # EXACT-SET pin (OBSERVED, not inferred): the sweep offers
-                # exactly the two task-id-shaped entries -- the planless
-                # '999' decoy and the real task/5326 branch worktree, which
-                # is itself task-id-shaped and planless under this test's
+                # UPPER-BOUND pin (OBSERVED, not inferred): the sweep offers
+                # at most the two task-id-shaped entries -- the planless '999'
+                # decoy and the real task/5326 branch worktree, which is
+                # itself task-id-shaped and planless under this test's
                 # MagicMock scheduler. Pinning the whole set (rather than
                 # `assert_any_call`) makes ANY extra cleanup call a failure,
                 # which is what turns a C2 regression into a red test.
                 # Nothing is actually deleted here -- cleanup_worktree is an
                 # AsyncMock spy -- so the live merge below is unaffected.
-                assert cleaned_paths == {wt_task, wt}, (
-                    f'unexpected cleanup_worktree call set: '
-                    f'{cleaned_paths ^ {wt_task, wt}}'
+                #
+                # Deliberately `<=`, not `==`: `wt` is in the observed set only
+                # because the MagicMock scheduler makes a real branch worktree
+                # look planless. Pinning its PRESENCE would freeze a mock
+                # artifact into this gate, so a future production change that
+                # (correctly) taught the sweep to skip a worktree backing an
+                # in-flight merge would turn the leg's own regression detector
+                # red. The subset bound keeps every tooth that matters -- any
+                # EXTRA offered path, protected or not, still fails -- while
+                # `wt_task in cleaned_paths` above keeps the positive control.
+                assert cleaned_paths <= {wt_task, wt}, (
+                    f'unexpected cleanup_worktree calls beyond the two '
+                    f'task-id-shaped entries: {cleaned_paths - {wt_task, wt}}'
                 )
 
                 # (4) Release the gated verify; await the recovered merge.
@@ -1337,7 +1371,7 @@ class TestIdentityFaceCancelResubmit:
     """
 
     async def test_full_retirement_then_immediate_resubmit_gets_fresh_slot(
-        self, tmp_path: Path,
+        self, tmp_path: Path, config: OrchestratorConfig,
     ) -> None:
         registry = InFlightMergeRegistry()
         retention = TerminalOutcomeRetention()
@@ -1367,14 +1401,60 @@ class TestIdentityFaceCancelResubmit:
         assert retention.get_by_task('T') is None
         assert retention.get('mr-old') is None
 
-        # IMMEDIATE resubmit: a genuinely FRESH entry, not a coalesce onto /
-        # mirror of the retired corpse -- positive control: a real new work
-        # item, whose future is NOT cancelled.
-        fut_new: asyncio.Future = asyncio.get_running_loop().create_future()
-        claimed = registry.acquire(
-            '5326', 'T2', fut_new, request_id='mr-new', snapshot_tip='sha-new',
+        # IMMEDIATE resubmit through the PRODUCTION entry point -- a genuinely
+        # FRESH DISPATCH, not a coalesce onto / mirror of the retired corpse.
+        #
+        # Driven via coalesce_or_enqueue_merge_request (NOT a bare
+        # registry.acquire) precisely because that is the only call that
+        # consults BOTH sources the failure mode lives in: the registry slot
+        # AND the TerminalOutcomeRetention ring the retirement just cleared. A
+        # direct acquire on a just-released registry cannot observe a resubmit
+        # coalescing onto a surviving sticky record, so it could not detect the
+        # regression this row exists to catch.
+        queue: asyncio.Queue = asyncio.Queue()
+        req_new = _make_request(
+            'T2', '5326', tmp_path, config,
+            request_id='mr-new', snapshot_tip='sha-new',
         )
-        assert claimed is True, 'resubmit must claim a FREE slot, not coalesce'
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req_new, None, registry, git_ops=None, retention=retention,
+        )
+
+        assert result.dispatched is True, (
+            f'the resubmit must DISPATCH a fresh merge; got {result}'
+        )
+        assert result.in_flight is False, (
+            f'the resubmit must NOT coalesce onto the retired entry; got {result}'
+        )
+        assert result.rejected is False, result
+        assert queue.qsize() == 1
+        assert queue.get_nowait() is req_new
         entry = registry.entry('5326')
         assert entry is not None and entry.request_id == 'mr-new'
-        assert not fut_new.cancelled()
+        assert not req_new.result.cancelled()
+        # The retired sticky record stayed forgotten -- a resurrected 'mr-old'
+        # record is exactly what would mirror a terminal outcome onto the
+        # fresh submitter.
+        assert retention.get('mr-old') is None
+        assert retention.get_by_branch('5326') is None
+
+        # IDENTITY GUARD: a LATE duplicate retirement for the now-stale
+        # 'mr-old' (the shape a retried/duplicated merge_cancel produces) must
+        # NOT drop the fresh slot the resubmit above just claimed.
+        await retire_cancelled_merge_request(
+            request_id='mr-old', branch='5326', task_id='T',
+            registry=registry, retention=retention, git_ops=None, event_store=None,
+        )
+        entry_after = registry.entry('5326')
+        assert entry_after is not None, (
+            'the late stale retirement dropped the fresh slot entirely'
+        )
+        assert entry_after.request_id == 'mr-new', (
+            f'the identity guard must only release a slot still owned by the '
+            f'retiring request_id; got {entry_after.request_id}'
+        )
+        assert not req_new.result.done(), (
+            'the fresh submitter\'s future was resolved/cancelled by a stale '
+            'retirement'
+        )
+        req_new.result.cancel()  # cleanup: nothing will ever resolve it here
