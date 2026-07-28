@@ -475,6 +475,9 @@ class ReconciliationHarness:
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
+        # Task 2998: escalation ids closed by the most recent unhalt, staged
+        # for the MCP tool layer. Pop-once — see take_resolved_halt_escalations.
+        self._resolved_halt_escalations: dict[str, list[str]] = {}
 
         # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
         # DISTINCT dead-owner instance UUIDs among dead_owner_shielded
@@ -618,14 +621,47 @@ class ReconciliationHarness:
             project_id, outcome,
         )
 
-    def _on_judge_unhalt(self, project_id: str) -> None:
-        """Callback invoked by Judge.unhalt so a subsequent halt re-escalates.
+    async def _on_judge_unhalt(self, project_id: str) -> None:
+        """Callback invoked by Judge.unhalt. Two responsibilities:
 
-        Without clearing the escalation sentinel, a manual unhalt followed by
-        the halt re-firing (for whatever reason) would silently skip the
-        escalation path because _notify_judge_halt dedupes per-process.
+        1. Clear the escalation sentinel so a subsequent halt re-escalates.
+           Without this, a manual unhalt followed by the halt re-firing (for
+           whatever reason) would silently skip the escalation path because
+           _notify_judge_halt dedupes per-process.
+        2. Close the escalation the halt opened, via
+           ``BacklogPolicy.on_judge_unhalt`` — otherwise the
+           ``esc-reconciliation-halt-*.json`` stays pending forever and the
+           dashboard keeps showing a halt that no longer exists (task 2998).
+
+        Order matters: the sentinel is discarded FIRST, so a failure to close
+        the record can never leave a stale sentinel behind — that would
+        suppress the NEXT halt escalation entirely, which is strictly worse
+        than one un-closed record.
+
+        No Judge plumbing change is needed for the async signature:
+        ``UnhaltCallback`` is typed ``Callable[[str], Awaitable[None] | None]``
+        and ``Judge.unhalt`` already awaits an awaitable callback result.
         """
         self._halt_escalated.discard(project_id)
+        if self._backlog_policy is None:
+            return
+        try:
+            resolved = await self._backlog_policy.on_judge_unhalt(project_id)
+        except Exception:
+            logger.exception(
+                'harness: backlog_policy.on_judge_unhalt raised for %s', project_id,
+            )
+            return
+        if resolved:
+            self._resolved_halt_escalations[project_id] = list(resolved)
+
+    def take_resolved_halt_escalations(self, project_id: str) -> list[str]:
+        """Pop the escalation ids closed by the most recent unhalt.
+
+        A pop-once handoff for the MCP tool layer (``unhalt_reconciliation``):
+        reading it clears it, so the same close is never reported twice.
+        """
+        return self._resolved_halt_escalations.pop(project_id, [])
 
     @property
     def project_root(self) -> str:
