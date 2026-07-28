@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -2373,6 +2374,66 @@ async def test_judge_unhalt_clears_halt_escalated(journal, event_buffer, mock_me
     assert not harness.judge.is_halted('test-project')
     # Harness callback must have fired and cleared the sentinel
     assert 'test-project' not in harness._halt_escalated
+
+
+@pytest.mark.asyncio
+async def test_harness_init_seeds_backlog_policy_project_roots(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """GAP A regression: __init__ must seed the policy's project_root cache.
+
+    Before task 2998, ``register_project_root``'s only caller was
+    ``BacklogPolicy.check()``.  A halt rehydrated by ``Judge.initialize()`` at
+    startup therefore reached ``_route_over_limit`` with
+    ``project_root_for() is None`` → rejection branch → no escalation file and
+    no log of any kind (the 48h reify incident: 0 of 96 escalation files
+    carried ``ReconciliationJudgeHalted``).
+
+    Built directly rather than via ``_make_test_harness``, which sets
+    ``_known_projects`` AFTER construction and passes no policy.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.backlog_policy import BacklogPolicy
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    reify_root = tmp_path / 'reify'
+    df_root = tmp_path / 'dark_factory'
+    reify_root.mkdir()
+    df_root.mkdir()
+
+    policy = BacklogPolicy(event_buffer, None, lambda _: True)
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+    ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+        backlog_policy=policy,
+        known_projects={'reify': str(reify_root), 'dark_factory': str(df_root)},
+    )
+
+    # No MCP call, no check() — the roots must already resolve.
+    assert policy.project_root_for('reify') == str(reify_root)
+    assert policy.project_root_for('dark_factory') == str(df_root)
+
+    # End-to-end consequence: a halt now actually writes the escalation.
+    verdict = await policy.on_judge_halt(
+        'reify', reason='Unparseable judge response in run X',
+    )
+    assert verdict.outcome == 'escalated'
+    files = list((reify_root / 'data' / 'escalations').glob('*.json'))
+    assert len(files) == 1
+    body = json.loads(files[0].read_text())
+    assert body['error_type'] == 'ReconciliationJudgeHalted'
+    assert 'Unparseable judge response in run X' in body['detail']
 
 
 async def _drive_halt_notify(harness, event_buffer):
