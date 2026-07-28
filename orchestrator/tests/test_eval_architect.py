@@ -125,6 +125,113 @@ class TestEvalMetricsInvocationErrorField:
 
 
 # ---------------------------------------------------------------------------
+# detect_invocation_error — the pure transport-refusal classifier (3118 step-3/4)
+#
+# Delegates to the existing shared.invocation_outcome.classify_invocation seam
+# (do NOT re-implement 429/cap string matching in the eval layer) plus a
+# structured api_error_status==429 fallback, since 429 is deliberately excluded
+# from the AuthFailed variant and routes to the cap-TEXT tier — a body-less 429
+# would otherwise classify as Failure(unclassified).
+#
+# The load-bearing property is asymmetric: an INFRA refusal must be marked, but
+# an ORDINARY content failure (an architect that ran fine and produced a bad or
+# absent plan) must NOT be — that is a real reliability signal and must keep
+# scoring 0.0 rather than being laundered into an exclusion.
+# ---------------------------------------------------------------------------
+
+# The exact payload the Claude CLI emitted during the 2026-07-27 architect-effort
+# campaign, which produced the 3 hand-excluded fixtures this task automates away
+# (plans/eval-architect-effort-verdict-2026-07-27.md, "Data hygiene").
+_CAP_TEXT = "You've hit your session limit · resets 8pm"
+
+
+def _cap_agent_result():
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False,
+        output=_CAP_TEXT,
+        cost_usd=0.0,
+        duration_ms=1200,
+        turns=0,
+        subtype='error',
+        api_error_status=429,
+    )
+
+
+class TestDetectInvocationError:
+    def test_none_result_is_not_an_invocation_error(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        assert detect_invocation_error(None) is None
+
+    def test_successful_run_quoting_cap_text_is_not_tainted(self):
+        # The no-false-taint property, inherited free from classify_invocation's
+        # OK short-circuit: a HEALTHY run whose output merely QUOTES a cap string
+        # (e.g. an agent discussing a usage-limit message) is not an infra
+        # refusal and must never be excluded from the aggregate.
+        from orchestrator.evals.metrics import detect_invocation_error
+        from shared.cli_invoke import AgentResult
+
+        ok = AgentResult(
+            success=True, output=f'the CLI printed: {_CAP_TEXT}',
+            cost_usd=1.5, duration_ms=9000, turns=12,
+        )
+        assert detect_invocation_error(ok) is None
+
+    def test_campaign_429_payload_yields_marker_naming_the_cap(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_cap_agent_result())
+        assert isinstance(marker, str) and marker
+        assert 'cap' in marker.lower()
+        # The marker quotes the REASON, so a human reading the result JSON sees
+        # the forensic evidence, not just a boolean.
+        assert 'session limit' in marker
+
+    def test_body_less_429_yields_marker_via_structured_fallback(self):
+        # 429 is deliberately EXCLUDED from AuthFailed (it routes to the cap-text
+        # tier), so a 429 with no cap body classifies as a wedge/unclassified
+        # failure — the structured api_error_status fallback must still catch it.
+        from orchestrator.evals.metrics import detect_invocation_error
+        from shared.cli_invoke import AgentResult
+
+        bare = AgentResult(
+            success=False, output='', stderr='', cost_usd=0.0,
+            duration_ms=800, turns=0, api_error_status=429,
+        )
+        marker = detect_invocation_error(bare)
+        assert isinstance(marker, str) and marker
+        assert '429' in marker
+
+    def test_auth_failure_yields_auth_marker(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+        from shared.cli_invoke import AgentResult
+
+        unauthorized = AgentResult(
+            success=False, output='', cost_usd=0.0, duration_ms=200,
+            turns=0, api_error_status=401,
+        )
+        marker = detect_invocation_error(unauthorized)
+        assert isinstance(marker, str) and marker
+        assert 'auth' in marker.lower()
+        assert '401' in marker
+
+    def test_ordinary_content_failure_is_not_tainted(self):
+        # THE load-bearing negative: an architect that really ran (non-zero cost,
+        # real turns) and simply failed to produce a good plan is a CONTENT
+        # signal — it must keep scoring 0.0, never be excluded as infra.
+        from orchestrator.evals.metrics import detect_invocation_error
+        from shared.cli_invoke import AgentResult
+
+        content_failure = AgentResult(
+            success=False, output='I could not complete the plan',
+            cost_usd=1.2, duration_ms=45000, turns=8, api_error_status=None,
+        )
+        assert detect_invocation_error(content_failure) is None
+
+
+# ---------------------------------------------------------------------------
 # Deterministic structural plan-quality rubric (step-3/4)
 #
 # score_plan_structure(plan) -> float reads ONLY the produced plan dict — no
