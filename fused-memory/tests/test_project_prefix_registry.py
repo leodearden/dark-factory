@@ -259,6 +259,119 @@ class TestProjectForPath:
 
 
 # ---------------------------------------------------------------------------
+# project_for_path — ABSOLUTE regime, resolved against known project roots
+# (task 3109)
+#
+# Before task 3109 an absolute path could never match a registered prefix
+# (prefixes are top-level dir names; an absolute path leads with '/'), so it
+# always came back None = "unowned", silently disarming the path-scope guard
+# for exactly the file shape an agent produces after reading a foreign repo.
+# ---------------------------------------------------------------------------
+
+
+class TestProjectForPathAbsolute:
+    """Absolute paths resolve against ``project_to_root``, root-authoritatively.
+
+    Two disjoint regimes: absolute candidates are matched against known
+    project ROOTS (component boundary, longest-root-wins); relative
+    candidates keep the untouched leading-path-component prefix scan.
+    """
+
+    @pytest.fixture
+    def registry(self, tmp_path):
+        a = _mkproj(tmp_path, 'reify', ['crates'])
+        b = _mkproj(tmp_path, 'dark-factory', ['fused-memory', 'orchestrator', 'docs'])
+        return ProjectPrefixRegistry.from_roots([str(a), str(b)])
+
+    def test_project_for_path_absolute_under_known_root_resolves_owner(self, registry):
+        """The incident-shaped absolute paths all resolve to dark_factory.
+
+        Includes a path under a _GENERIC_DIRS directory ('docs/') and a
+        repo-root-level file ('README.md'), pinning the ROOT-AUTHORITATIVE
+        semantics: an absolute path under a known root is owned even when its
+        remainder matches NO registered prefix. The mirrored reify direction
+        pins that the fix is symmetric, not dark-factory-special.
+        """
+        df = registry.root_for_project('dark_factory')
+        reify = registry.root_for_project('reify')
+        assert df is not None and reify is not None
+
+        assert registry.project_for_path(
+            f'{df}/orchestrator/src/orchestrator/git_ops.py') == 'dark_factory'
+        assert registry.project_for_path(
+            f'{df}/fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        ) == 'dark_factory'
+        # _GENERIC_DIRS member — unowned in its RELATIVE spelling, owned here.
+        assert registry.project_for_path(f'{df}/docs/task-authoring.md') == 'dark_factory'
+        assert registry.project_for_path('docs/task-authoring.md') is None
+        # Repo-root-level file — no leading prefix at all.
+        assert registry.project_for_path(f'{df}/README.md') == 'dark_factory'
+
+        assert registry.project_for_path(f'{reify}/crates/foo.rs') == 'reify'
+
+    def test_longest_root_wins_for_nested_roots(self):
+        """Nested roots (a project root and a worktree root beneath it) are real.
+
+        Hand-built so dict insertion order puts the SHORTER root first — a
+        first-match scan would deterministically return 'outer'. Mirrors the
+        relative scan's ``test_longest_prefix_wins`` tiebreak.
+        """
+        registry = ProjectPrefixRegistry(
+            project_to_root={'outer': '/a', 'inner': '/a/b'},
+        )
+        assert registry.project_for_path('/a/b/c.py') == 'inner'
+        assert registry.project_for_path('/a/z.py') == 'outer'
+
+    def test_absolute_sibling_root_prefix_does_not_match(self, registry):
+        """A sibling root sharing a string prefix must not match (component boundary)."""
+        df = registry.root_for_project('dark_factory')
+        assert registry.project_for_path(f'{df}-old/orchestrator/x.py') is None
+
+    def test_absolute_path_equal_to_root_returns_owner(self, registry):
+        """Mirrors test_exact_dir_with_no_trailing_content for the absolute case."""
+        df = registry.root_for_project('dark_factory')
+        assert registry.project_for_path(df) == 'dark_factory'
+
+    def test_absolute_path_under_no_known_root_returns_none(self, registry):
+        """Genuinely unclassifiable stays unowned — even with a registered
+        prefix ('orchestrator/') appearing inside the path."""
+        assert registry.project_for_path('/var/tmp/somewhere/orchestrator/x.py') is None
+
+    def test_empty_or_slash_only_root_never_owns(self):
+        """Degenerate roots must not turn startswith('' + '/') into a universal match."""
+        registry = ProjectPrefixRegistry(
+            project_to_root={'bogus': '/', 'other': ''},
+        )
+        assert registry.project_for_path('/anything/x.py') is None
+
+    def test_relative_path_behaviour_unchanged(self, registry):
+        """Explicit regression block: the RELATIVE regime is byte-identical."""
+        assert registry.project_for_path('orchestrator/foo.py') == 'dark_factory'
+        assert registry.project_for_path('crates') == 'reify'
+        assert registry.project_for_path('./orchestrator/x') == 'dark_factory'
+        # task 1494: component boundary + non-leading segment
+        assert registry.project_for_path('cratesfoo/x') is None
+        assert registry.project_for_path('vendor/crates/x') is None
+        # task 2434: generic-dir denylist
+        assert registry.project_for_path('docs/task-authoring.md') is None
+        assert registry.project_for_path('') is None
+        assert registry.project_for_path(None) is None
+
+    def test_default_registry_resolves_absolute_dark_factory_path(self):
+        """DARK_FACTORY_ROOT is now classification-load-bearing under default().
+
+        Single-project deployments (no known_project_roots configured) get
+        absolute-path ownership from the built-in root constant. A checkout at
+        a different path simply fails to match — fail-OPEN to the pre-3109
+        verdict, never a false rejection.
+        """
+        registry = ProjectPrefixRegistry.default()
+        assert registry.project_for_path(
+            '/home/leo/src/dark-factory/orchestrator/x.py') == 'dark_factory'
+        assert registry.project_for_path('/home/leo/src/reify/crates/x.rs') is None
+
+
+# ---------------------------------------------------------------------------
 # Edge: non-existent root does not crash
 # ---------------------------------------------------------------------------
 
