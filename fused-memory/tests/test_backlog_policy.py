@@ -340,6 +340,16 @@ async def test_watchdog_wedge_does_not_fan_out_to_idle_startup_seeded_projects(
     idle startup-seeded project (zero buffered events) must be skipped; an
     explicitly-registered project is escalated unconditionally, preserving
     ``test_on_watchdog_wedge_writes_escalation_with_wedge_error_type``.
+
+    The queue MUST be non-empty here.  ``SqliteWatchdog._tick`` computes
+    ``outstanding = queue_depth + retry_in_flight`` and fires the wedge
+    callback only inside the ``wedged = outstanding > 0 and stale_for >
+    threshold`` branch (sqlite_watchdog.py:118-159), so a zero-depth queue
+    is a state in which ``on_watchdog_wedge`` can NEVER be invoked in
+    production.  Exercising the guard against ``_StubQueue()`` would
+    green-light a filter that is dead code at runtime: ``current_backlog``
+    folds the GLOBAL queue depth into every project's count, which is
+    non-zero by construction whenever a real wedge fires.
     """
     roots = {}
     for name in ('active', 'idle', 'explicit'):
@@ -347,7 +357,7 @@ async def test_watchdog_wedge_does_not_fan_out_to_idle_startup_seeded_projects(
         root.mkdir()
         roots[name] = root
 
-    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+    policy = BacklogPolicy(event_buffer, _StubQueue(queue_depth=5), lambda _: True)
     policy.register_known_project_roots({
         'active': str(roots['active']),
         'idle': str(roots['idle']),
