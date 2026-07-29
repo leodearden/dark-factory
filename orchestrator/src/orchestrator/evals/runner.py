@@ -689,8 +689,9 @@ async def run_architect_eval(
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
     #    deterministic structural floor on ANY judge failure so plan_quality is a
-    #    non-sentinel float — UNLESS the architect invocation itself was refused
-    #    at the transport layer, in which case there is nothing to score.
+    #    non-sentinel float — UNLESS the architect invocation failed in a way
+    #    that left NOTHING to score (see the docstring's taint table for which
+    #    failures qualify and why a timeout deliberately does not).
     plan_quality: float | None = None
     judge_error: str | None = None
     # The taint decision CONSULTS THE ARTIFACT rather than assuming the refusal
