@@ -288,6 +288,32 @@ class TestFindPathsRightBoundary:
         """
         assert find_paths('plans/*.md', ('plans/',)) == []
 
+    # ------------------------------------------------------------------
+    # RETENTION: the task-1494 LEFT boundary survives the right-boundary change
+    # ------------------------------------------------------------------
+
+    def test_left_boundary_contract_survives(self):
+        """All six task-1494 left-boundary shapes still return [] (task 3120).
+
+        The right-boundary assertion is an ADDITIONAL narrowing, not a
+        replacement: adding a lookahead must not accidentally relax the
+        lookbehind.  Each shape below is individually covered in
+        ``TestFindPaths``; asserting them together here pins that the LEFT
+        contract is still enforced *after* the right-context assertion was
+        introduced, in the same commit that introduced it.
+
+        Note these fixtures deliberately carry a genuine right context (a
+        further '/' or a file extension) where the original does, so a
+        failure here can only mean the left boundary regressed — it cannot be
+        masked by the new right-boundary rejection.
+        """
+        assert find_paths('a/corpus/x', ('corpus/',)) == []
+        assert find_paths('repo/test/corpus/expr.txt', ('corpus/',)) == []
+        assert find_paths('a.corpus/x', ('corpus/',)) == []
+        assert find_paths('pkg.corpus/grammar.js', ('corpus/',)) == []
+        assert find_paths('./corpus/x', ('corpus/',)) == []
+        assert find_paths('supercrates/x.rs', ('crates/',)) == []
+
 
 # ---------------------------------------------------------------------------
 # check_candidate_for_scope
