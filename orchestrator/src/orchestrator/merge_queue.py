@@ -7703,7 +7703,27 @@ def _request_id_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> str:
     return obj.request.request_id
 
 
+def _request_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> MergeRequest:
+    """Return the underlying :class:`MergeRequest` for *obj* (task 3082).
+
+    The object-level counterpart of :func:`_request_id_of` — same three-shape
+    dispatch, same reason for the three shapes existing (see that function's
+    docstring). Kept literally beside it so a future FOURTH ``_live_items``
+    shape has exactly one place to be taught.
+
+    Sole caller: :meth:`SpeculativeMergeWorker._coalesce_reentrant_drain`,
+    which needs the live object's ``result`` future — not just its id — to tell
+    a re-drain of the LIVE ORIGINAL apart from a duplicate twin.
+    """
+    if isinstance(obj, InflightEntry):
+        return obj.item.request
+    if isinstance(obj, MergeRequest):
+        return obj
+    return obj.request
+
+
 _LIFECYCLE_TRANSITION_REJECTED_SENTINEL_PREFIX = '__merge_lifecycle_transition_rejected__'
+_COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX = '__merge_coalesce_live_original__'
 
 
 def _lifecycle_transition_rejected_sentinel(request_id: str) -> str:
@@ -7794,6 +7814,108 @@ def _alarm_illegal_lifecycle_transition(
                 'request_id': request_id,
                 'from_state': str(from_state),
                 'to_state': str(to_state),
+            },
+        )
+
+
+def _alarm_coalesce_live_original(
+    escalation_queue: Any,
+    request: MergeRequest,
+    current_state: ItemLifecycleState,
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for a re-entrant drain of the LIVE
+    ORIGINAL request object (task 3082).
+
+    Modeled verbatim on :func:`_alarm_illegal_lifecycle_transition`'s dedup'd
+    ``has_open_l1``/``make_id`` idiom. Fires at most ONCE per open episode per
+    request_id. OBSERVATION + ESCALATION only: never mutates queue/inflight
+    state (PRD design decision 4: invariants escalate loudly, degrade never).
+
+    Distinct from the benign task-2852 journal-recovery twin, which is a
+    DIFFERENT object carrying its own fresh, unobserved future. When the
+    arriving item IS the live original, some requeue site put it back on
+    ``_queue`` without returning the registry to QUEUED, so the drain
+    chokepoint mistook a genuinely live request for a duplicate — a
+    requeue-wiring bug.
+
+    * ``level=1`` (L1 blocking).
+    * ``category='merge_coalesce_live_original'``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = f'{_COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX}{request.request_id}'
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    summary = (
+        f'Re-entrant merge drain of the LIVE ORIGINAL request '
+        f'{request.request_id!r} (branch={request.branch.bare_id}, registry at '
+        f'{current_state!r}) — a requeue-wiring bug, not a benign duplicate twin'
+    )
+    detail = (
+        f'request_id: {request.request_id}\n'
+        f'task_id: {request.task_id}\n'
+        f'branch: {request.branch.bare_id}\n'
+        f'registry current state: {current_state!r}\n'
+        '\n'
+        'The merge drain chokepoint received the SAME MergeRequest object that '
+        'is already live in the lifecycle registry (matched by result-future '
+        'identity), not a distinct journal-recovery twin. That means a requeue '
+        'site put this request back on _queue WITHOUT returning the registry to '
+        'QUEUED, so _buffer_owned_request classified a genuinely live request '
+        'as a duplicate and coalesced it away.\n'
+        '\n'
+        'The request was NOT buffered and its Future was deliberately left '
+        'PENDING — resolving it would hand the real waiter a fabricated '
+        "'already_merged' AND silence the merge_request_stuck watchdog (the "
+        'request ledger drops any resolved entry before the stuck sweep sees '
+        'it). Expect a merge_request_stuck alarm for this request_id as the '
+        'slower backstop if it is never re-dispatched.\n'
+        '\n'
+        'This condition is unreachable in normal operation: every requeue site '
+        'pairs on_requeued with _note_requeue (pinned structurally by '
+        'test_merge_queue_lifecycle_registry.py::'
+        'TestOnRequeuedIsAlwaysPairedWithNoteRequeue), so it fires only if a '
+        'requeue site has regressed.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-lifecycle-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_coalesce_live_original',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Find the requeue site that re-queued request_id '
+            f'{request.request_id!r} without calling _note_requeue — check the '
+            'abort/defer branches of _run_inflight_verify, _dispatch_item, and '
+            'the head-failure cascade. The registry read '
+            f'{current_state!r} instead of QUEUED at the drain.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            task_id=request.task_id,
+            data={
+                'request_id': request.request_id,
+                'current_state': str(current_state),
+                'category': 'merge_coalesce_live_original',
             },
         )
 
@@ -9660,42 +9782,87 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         clobber of the live original's durable entry under that same
         request_id.
 
-        Logs loudly at WARNING — deliberately NOT an escalation: once
-        recognized here the divergence is HANDLED and benign, and
-        escalating would re-introduce the exact
-        ``merge_lifecycle_transition_rejected`` noise this task removes
-        (PRD design decision 4: invariants escalate loudly, degrade never —
-        satisfied here via the WARNING without silently degrading).
+        Two cases, discriminated by RESULT-FUTURE IDENTITY against the live
+        registry object (task 3082) — see :func:`_request_of`:
 
-        Also, defensively:
+        **A genuine TWIN** (a distinct object with its own fresh, unobserved
+        future — the confirmed journal-recovery shape). Logged loudly at
+        WARNING and deliberately NOT escalated: once recognized here the
+        divergence is HANDLED and benign, and escalating would re-introduce
+        the exact ``merge_lifecycle_transition_rejected`` noise task 2852
+        removes (PRD design decision 4: invariants escalate loudly, degrade
+        never — satisfied via the WARNING without silently degrading). Its
+        ``result`` Future is resolved (if not already done) to a benign
+        ``MergeOutcome(status='already_merged')`` so no hypothetical waiter
+        hangs forever. For THIS case only, that resolution is robustness
+        rather than a correctness dependency.
 
-          * resolves *item*'s ``result`` Future (if not already done) to a
-            benign ``MergeOutcome(status='already_merged')`` so no
-            (hypothetical) waiter on the twin's future hangs forever — the
-            confirmed journal-recovery twin has a fresh, unobserved future,
-            so this is robustness, not a correctness dependency; and
-          * emits a ``merge_coalesced`` observability event
-            (``source='duplicate_submission'``) via the shared
-            :func:`_emit_merge_coalesced` helper, None-safe when this
-            worker has no ``_event_store`` wired.
+        **The LIVE ORIGINAL** (the same ``result`` future the live registry
+        object carries). Logged at ERROR and ESCALATED via
+        :func:`_alarm_coalesce_live_original`, and its Future is deliberately
+        left PENDING. Here the resolution is load-bearing and WRONG in both
+        directions: it lies to a REAL waiter (an ``already_merged`` that
+        escalation's server maps to ``'done'``), and it silences the only
+        watchdog that would catch the wedge — the request ledger's
+        ``sweep_resolved`` drops any ``done()`` entry before the stuck sweep
+        sees it, so ``merge_request_stuck`` never fires. Leaving it pending
+        re-arms that alarm as the slower backstop, so the two signals are
+        complementary rather than duplicative. Unreachable in normal
+        operation: every requeue site pairs ``on_requeued`` with
+        ``_note_requeue``, so it fires only if a requeue site regresses.
+
+        In BOTH cases a ``merge_coalesced`` observability event
+        (``source='duplicate_submission'``) is emitted via the shared
+        :func:`_emit_merge_coalesced` helper (None-safe when this worker has
+        no ``_event_store`` wired) — observability must not depend on which
+        branch was taken.
         """
-        logger.warning(
-            'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
-            'merge submission for request_id=%s branch=%s; registry already at '
-            '%s. Coalescing as a benign no-op — NOT buffering a divergent '
-            'twin, NOT escalated.',
-            item.request_id, item.branch.bare_id, current_state,
-        )
-        if not item.result.done():
-            item.result.set_result(
-                MergeOutcome(
-                    status='already_merged',
-                    reason=(
-                        'duplicate/re-entrant merge submission coalesced onto '
-                        'in-flight/landed request'
-                    ),
-                ),
+        # task 3082: is the arriving item the LIVE ORIGINAL, or a genuine twin?
+        #
+        # Discriminated by FUTURE identity, deliberately NOT by object identity
+        # of the item: `_live_items[rid]` legitimately changes SHAPE across the
+        # pipeline (MergeRequest -> SpeculativeItem -> InflightEntry) while
+        # carrying the SAME `request.result`, so an `is`-on-the-item check would
+        # silently fail open exactly when the entry is deepest in the pipeline —
+        # which is when this bug bites. The future is invariant across every
+        # shape, and it is precisely the thing that must never be falsely
+        # resolved.
+        _live_obj = self._live_items.get(item.request_id)
+        _live_req = _request_of(_live_obj) if _live_obj is not None else None
+        _is_live_original = _live_req is not None and _live_req.result is item.result
+
+        if _is_live_original:
+            logger.error(
+                'merge_queue: _buffer_owned_request: re-entrant drain of the LIVE '
+                'ORIGINAL request_id=%s branch=%s; registry at %s. NOT buffering '
+                'and NOT resolving its Future (a real waiter is attached) — this '
+                'is a requeue-wiring bug, not a benign duplicate twin. Escalated.',
+                item.request_id, item.branch.bare_id, current_state,
             )
+            _alarm_coalesce_live_original(
+                self._escalation_queue, item, current_state,
+                event_store=self._event_store,
+            )
+        else:
+            logger.warning(
+                'merge_queue: _buffer_owned_request: dropping duplicate/re-entrant '
+                'merge submission for request_id=%s branch=%s; registry already at '
+                '%s. Coalescing as a benign no-op — NOT buffering a divergent '
+                'twin, NOT escalated.',
+                item.request_id, item.branch.bare_id, current_state,
+            )
+            if not item.result.done():
+                item.result.set_result(
+                    MergeOutcome(
+                        status='already_merged',
+                        reason=(
+                            'duplicate/re-entrant merge submission coalesced onto '
+                            'in-flight/landed request'
+                        ),
+                    ),
+                )
+        # Emitted UNCONDITIONALLY in both branches: observability must not depend
+        # on which one was taken.
         _emit_merge_coalesced(self._event_store, item, source='duplicate_submission', eta=None)
 
     def _drain_queue_into_lanes(self) -> None:
