@@ -16,18 +16,50 @@ the estimator cannot make the test agree with itself.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
 from shared.memory_eval_limits import (
     LimitsConfig,
+    MetricVerdict,
     binomial_two_sided_p,
     derive_alpha,
+    evaluate_count,
+    evaluate_proportion,
+    evaluate_series,
     evaluate_tripwire,
     grandfather_set_hash,
     poisson_two_sided_p,
 )
-from shared.memory_eval_metrics import Metric, TripwireItem
+from shared.memory_eval_metrics import Metric, MetricSeries, TripwireItem, load_metric_series
+
+_FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
+_BASELINE_STAMPS = ('20260701T031500Z', '20260702T031500Z', '20260703T031500Z')
+_REGRESSION_STAMP = '20260704T031500Z'
+_QUIET_STAMP = '20260705T031500Z'
+
+# The committed exemplars are the shared corpus for both this suite and the
+# boundary suite (the two-consumer precedent of test_invocation_outcome.py +
+# ..._boundary.py), so the numbers below are never restated in code.
+_ALARMED_METRIC_COUNT = 4  # 1 proportion + 2 counts + 1 tripwire; scalar never alarms
+_MIN_SAMPLES = 10
+
+
+def _series(stamp: str, *, eval_id: str = 'e1-retrieval-health') -> MetricSeries:
+    return load_metric_series(_FIXTURES / eval_id / f'metrics-{stamp}.json')
+
+
+def _baseline() -> list[MetricSeries]:
+    return [_series(stamp) for stamp in _BASELINE_STAMPS]
+
+
+def _metric(series: MetricSeries, metric_id: str) -> Metric:
+    return next(m for m in series.metrics if m.metric_id == metric_id)
+
+
+def _verdict_for(result, metric_id: str) -> MetricVerdict:
+    return next(v for v in result.verdicts if v.metric_id == metric_id)
 
 
 def _tripwire(results: dict[str, bool], *, metric_id: str = 'topic-canonical-present') -> Metric:
@@ -442,6 +474,285 @@ class TestStructuralTripwireRatchet:
             digest = grandfather_set_hash(keys)
             assert len(digest) == 64
             assert set(digest) <= set('0123456789abcdef')
+
+
+class TestProportionAndCountRules:
+    """Rules (b) and (c) against the trailing baseline window, at the derived alpha.
+
+    alpha here is 1/360 — budget of 1 false alarm/quarter, the D10 daily
+    cadence, 4 alarm-eligible metrics. Every fixture anchor sits three or more
+    orders of magnitude clear of it on one side or the other, so no verdict
+    below is knife-edge and a small change in the estimator cannot flip one.
+    """
+
+    ALPHA = 1 / 360
+
+    def test_regression_run_proportion_alarms(self):
+        verdict = evaluate_proportion(
+            _metric(_series(_REGRESSION_STAMP), 'canonical-in-top-5'),
+            _baseline(),
+            self.ALPHA,
+            _MIN_SAMPLES,
+        )
+        assert verdict.status == 'alarm'
+        assert verdict.p_value == pytest.approx(1.8424e-06, rel=1e-4)
+        assert verdict.p_value is not None and verdict.p_value < self.ALPHA
+
+    def test_quiet_run_proportion_does_not_alarm(self):
+        verdict = evaluate_proportion(
+            _metric(_series(_QUIET_STAMP), 'canonical-in-top-5'),
+            _baseline(),
+            self.ALPHA,
+            _MIN_SAMPLES,
+        )
+        assert verdict.status == 'ok'
+        assert verdict.p_value == pytest.approx(0.10527, rel=1e-4)
+        assert verdict.alarms == ()
+
+    def test_an_unchanged_proportion_is_exactly_unsurprising(self):
+        # 24/30 IS the pooled baseline, so it sits at the mode: p == 1.0 by the
+        # identity, not by luck.
+        unchanged = Metric(
+            metric_id='canonical-in-top-5', kind='proportion', value=0.8, n=30, denominator=30
+        )
+        verdict = evaluate_proportion(unchanged, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'ok'
+        assert verdict.p_value == 1.0
+
+    def test_regression_run_count_alarms(self):
+        verdict = evaluate_count(
+            _metric(_series(_REGRESSION_STAMP), 'dangling-pointers'),
+            _baseline(),
+            self.ALPHA,
+            _MIN_SAMPLES,
+        )
+        assert verdict.status == 'alarm'
+        assert verdict.p_value == pytest.approx(3.4521e-07, rel=1e-4)
+
+    def test_quiet_run_count_does_not_alarm(self):
+        verdict = evaluate_count(
+            _metric(_series(_QUIET_STAMP), 'dangling-pointers'),
+            _baseline(),
+            self.ALPHA,
+            _MIN_SAMPLES,
+        )
+        assert verdict.status == 'ok'
+        assert verdict.p_value == pytest.approx(0.17380, rel=1e-4)
+
+    def test_proportion_baseline_is_pooled_across_the_window(self):
+        # 24/30 three times over pools to 72/90 == 0.8. Pooling (rather than
+        # averaging the three ratios) is what gives the exact test a single
+        # honest trial count to work from.
+        verdict = evaluate_proportion(
+            _metric(_series(_QUIET_STAMP), 'canonical-in-top-5'),
+            _baseline(),
+            self.ALPHA,
+            _MIN_SAMPLES,
+        )
+        assert verdict.baseline == pytest.approx(0.8)
+
+    def test_count_baseline_is_the_window_mean_rate(self):
+        # 4, 5, 6 over the three baseline runs -> lam = 5.0.
+        verdict = evaluate_count(
+            _metric(_series(_QUIET_STAMP), 'dangling-pointers'),
+            _baseline(),
+            self.ALPHA,
+            _MIN_SAMPLES,
+        )
+        assert verdict.baseline == pytest.approx(5.0)
+
+    @pytest.mark.parametrize('metric_id', ['canonical-in-top-5', 'dangling-pointers'])
+    def test_a_verdict_carries_its_provenance(self, metric_id):
+        """Provenance travels with the verdict — never a bare boolean.
+
+        Someone reading this hours later must be able to re-derive the call by
+        hand: which runs formed the baseline, what the baseline was, what the
+        p-value was, and what bar it was held to.
+        """
+        series = _series(_REGRESSION_STAMP)
+        metric = _metric(series, metric_id)
+        evaluate = evaluate_proportion if metric.kind == 'proportion' else evaluate_count
+        verdict = evaluate(metric, _baseline(), self.ALPHA, _MIN_SAMPLES)
+
+        assert verdict.metric_id == metric_id
+        assert verdict.rule_kind == metric.kind
+        assert verdict.alpha == self.ALPHA
+        assert verdict.p_value is not None
+        assert verdict.baseline is not None
+        assert verdict.baseline_run_stamps == _BASELINE_STAMPS
+
+    @pytest.mark.parametrize('metric_id', ['canonical-in-top-5', 'dangling-pointers'])
+    def test_ok_verdicts_still_expose_the_numbers(self, metric_id):
+        # Canary precedent: "fine" must still answer "fine, but how close?".
+        series = _series(_QUIET_STAMP)
+        metric = _metric(series, metric_id)
+        evaluate = evaluate_proportion if metric.kind == 'proportion' else evaluate_count
+        verdict = evaluate(metric, _baseline(), self.ALPHA, _MIN_SAMPLES)
+
+        assert verdict.status == 'ok'
+        assert verdict.p_value is not None
+        assert verdict.baseline is not None
+        assert verdict.alpha == self.ALPHA
+        assert verdict.value == metric.value
+
+
+class TestMinSamplesGuard:
+    """``insufficient_data`` is a REPORT STATUS and is NEVER an alarm.
+
+    A thin run is not evidence of a regression — it is an absence of evidence,
+    and the two must not be conflated. This is the canary's ``min_samples``
+    precedent (``canary.py``), and it is a guard on the SAMPLE COUNT, not a
+    threshold on the statistic.
+    """
+
+    ALPHA = 1 / 360
+
+    def test_a_thin_current_run_is_insufficient(self):
+        # The committed e1-thin exemplar, n=6 against min_samples=10. Its
+        # baseline is borrowed from e1-retrieval-health, whose metric ids it
+        # shares — the guard fires before any of that matters.
+        thin = _metric(_series(_REGRESSION_STAMP, eval_id='e1-thin'), 'canonical-in-top-5')
+        verdict = evaluate_proportion(thin, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+
+    def test_a_catastrophic_looking_thin_run_still_does_not_alarm(self):
+        """The assertion that earns this guard its place.
+
+        0/6 against a baseline of 0.8 has p == 6.4e-05, comfortably below
+        alpha=1/360 — so WITHOUT the guard this alarms. It must not: six probes
+        is too few to distinguish a real collapse from a bad afternoon, and
+        crying wolf here is exactly how an eval gets ignored.
+        """
+        catastrophic = Metric(
+            metric_id='canonical-in-top-5', kind='proportion', value=0.0, n=6, denominator=6
+        )
+        assert binomial_two_sided_p(0, 6, 0.8) < self.ALPHA  # it WOULD alarm
+
+        verdict = evaluate_proportion(catastrophic, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+
+    def test_a_thin_run_still_reports_its_numbers(self):
+        # Inconclusive is not opaque: the numbers are computed anyway so a
+        # reader can see the trend even though it is not actionable yet.
+        catastrophic = Metric(
+            metric_id='canonical-in-top-5', kind='proportion', value=0.0, n=6, denominator=6
+        )
+        verdict = evaluate_proportion(catastrophic, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.p_value == pytest.approx(6.4e-05, rel=1e-4)
+        assert verdict.baseline == pytest.approx(0.8)
+        assert verdict.value == 0.0
+
+    def test_a_thin_count_run_is_insufficient(self):
+        thin = _metric(_series(_REGRESSION_STAMP, eval_id='e1-thin'), 'dangling-pointers')
+        verdict = evaluate_count(thin, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+
+    @pytest.mark.parametrize('evaluate', [evaluate_proportion, evaluate_count])
+    def test_an_empty_baseline_window_is_insufficient_not_a_division_error(self, evaluate):
+        # The very first run of a new eval. There is nothing to compare to, and
+        # dividing by an empty window would be a crash where a status belongs.
+        metric = _metric(_series(_REGRESSION_STAMP), 'canonical-in-top-5')
+        if evaluate is evaluate_count:
+            metric = _metric(_series(_REGRESSION_STAMP), 'dangling-pointers')
+        verdict = evaluate(metric, [], self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+        assert verdict.p_value is None
+
+    def test_a_baseline_missing_this_metric_is_insufficient(self):
+        # A newly added metric: the window exists but has never measured it.
+        fresh = Metric(metric_id='brand-new-probe', kind='count', value=99.0, n=30)
+        verdict = evaluate_count(fresh, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+
+
+class TestBudgetMovesTheVerdict:
+    """The behavioural half of G6, over the committed fixture series.
+
+    A source-text scan for numeric literals would pin authoring habits, not
+    runtime behaviour, and any literal spelled as an expression would defeat
+    it. Showing that the SAME data yields a DIFFERENT verdict when only the
+    declared false-alarm budget changes is strictly stronger: it is direct
+    evidence that alpha flows from config, through ``derive_alpha``, into the
+    comparison — rather than being baked in anywhere along the way.
+    """
+
+    def _config(self, budget: float) -> LimitsConfig:
+        return LimitsConfig(
+            false_alarm_budget=budget,
+            runs_per_quarter=90,
+            min_samples=_MIN_SAMPLES,
+            baseline_window=3,
+        )
+
+    def _evaluate(self, budget: float, stamp: str):
+        return evaluate_series(_series(stamp), _baseline(), self._config(budget), None)
+
+    def test_a_stricter_budget_silences_a_regression(self):
+        # p == 1.84e-06 for the regression run's proportion. At a budget of 1
+        # false alarm/quarter (alpha = 2.8e-03) that alarms; at 1e-4/quarter
+        # (alpha = 2.8e-07) the same data does not clear the bar.
+        loud = _verdict_for(self._evaluate(1.0, _REGRESSION_STAMP), 'canonical-in-top-5')
+        strict = _verdict_for(self._evaluate(1e-4, _REGRESSION_STAMP), 'canonical-in-top-5')
+
+        assert loud.status == 'alarm'
+        assert strict.status == 'ok'
+        assert loud.p_value == strict.p_value  # identical data, identical statistic
+        assert strict.alpha is not None and loud.alpha is not None
+        assert strict.alpha < loud.alpha  # only the bar moved
+
+    def test_a_looser_budget_alarms_on_a_quiet_run(self):
+        # And in the other direction: p == 0.105 is unremarkable at a budget of
+        # 1/quarter, but an operator who declares they will tolerate 100 false
+        # alarms a quarter (alpha = 0.278) has asked to hear about it.
+        quiet = _verdict_for(self._evaluate(1.0, _QUIET_STAMP), 'canonical-in-top-5')
+        loose = _verdict_for(self._evaluate(100.0, _QUIET_STAMP), 'canonical-in-top-5')
+
+        assert quiet.status == 'ok'
+        assert loose.status == 'alarm'
+        assert quiet.p_value == loose.p_value
+
+    def test_the_result_alpha_is_the_documented_derivation(self):
+        result = self._evaluate(1.0, _REGRESSION_STAMP)
+        assert result.alarmed_metric_count == _ALARMED_METRIC_COUNT
+        assert result.alpha == derive_alpha(1.0, 90, _ALARMED_METRIC_COUNT)
+        assert result.alpha == 1 / 360
+
+    def test_scalar_metrics_are_reported_but_never_alarm(self):
+        # A latency scalar has no rule attached yet, so it rides along in the
+        # report and spends none of the budget — which is why the alarm-eligible
+        # count is 4 and not 5.
+        result = self._evaluate(100.0, _REGRESSION_STAMP)
+        latency = _verdict_for(result, 'search-latency-p50-ms')
+        assert latency.rule_kind == 'scalar'
+        assert latency.status != 'alarm'
+        assert latency.alarms == ()
+        assert latency.value == 44.0
+
+    def test_every_metric_in_the_series_gets_a_verdict(self):
+        result = self._evaluate(1.0, _REGRESSION_STAMP)
+        assert {v.metric_id for v in result.verdicts} == {
+            m.metric_id for m in _series(_REGRESSION_STAMP).metrics
+        }
+
+    def test_the_alarm_list_is_the_union_of_the_verdicts_alarms(self):
+        result = self._evaluate(1.0, _REGRESSION_STAMP)
+        assert list(result.alarms) == [a for v in result.verdicts for a in v.alarms]
+
+    def test_only_the_trailing_baseline_window_is_used(self):
+        # Given more history than configured, the evaluator judges against the
+        # most recent `baseline_window` runs — a baseline that silently grew
+        # without bound would drift away from current behaviour.
+        config = LimitsConfig(runs_per_quarter=90, min_samples=_MIN_SAMPLES, baseline_window=2)
+        result = evaluate_series(_series(_QUIET_STAMP), _baseline(), config, None)
+        verdict = _verdict_for(result, 'dangling-pointers')
+        # Trailing two runs are 5 and 6 -> lam == 5.5, not the 5.0 of all three.
+        assert verdict.baseline == pytest.approx(5.5)
+        assert verdict.baseline_run_stamps == _BASELINE_STAMPS[1:]
 
     def test_config_defaults_to_one_false_alarm_per_quarter(self):
         # The PRD-sanctioned default (M2) — a budget DECLARATION, not a
