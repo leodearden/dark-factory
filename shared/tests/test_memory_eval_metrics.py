@@ -16,9 +16,11 @@ from shared.memory_eval_metrics import (
     SCHEMA_VERSION,
     Corpus,
     Metric,
+    MetricSchemaError,
     MetricSeries,
     TripwireItem,
     parse_metric_series,
+    validate_metric_series,
 )
 
 
@@ -140,3 +142,95 @@ class TestMetricSeriesSchema:
         assert metric.kind == 'count'
         assert metric.value == 5.0
         assert metric.n == 30
+
+
+# (malformed metric dict, the metric_id the error message must name)
+_MALFORMED_METRICS = {
+    'unknown-kind': (_make_metric(kind='histogram'), 'canonical-in-top-5'),
+    'proportion-value-above-one': (_make_metric(value=1.4), 'canonical-in-top-5'),
+    'proportion-value-negative': (_make_metric(value=-0.1), 'canonical-in-top-5'),
+    'proportion-missing-denominator': (
+        {'metric_id': 'canonical-in-top-5', 'kind': 'proportion', 'value': 0.8, 'n': 30},
+        'canonical-in-top-5',
+    ),
+    # 0.815 * 30 == 24.45 successes — a proportion no binomial outcome produces.
+    'proportion-non-integral-successes': (_make_metric(value=0.815), 'canonical-in-top-5'),
+    'proportion-n-denominator-mismatch': (_make_metric(n=30, denominator=20), 'canonical-in-top-5'),
+    'count-negative-value': (_make_count(value=-1.0), 'dangling-pointers'),
+    'count-non-integral-value': (_make_count(value=5.5), 'dangling-pointers'),
+    'count-with-denominator': (_make_count(denominator=30), 'dangling-pointers'),
+    'tripwire-missing-items': (
+        {'metric_id': 'topic-canonical-present', 'kind': 'tripwire', 'value': 1.0, 'n': 2},
+        'topic-canonical-present',
+    ),
+    'tripwire-empty-items': (_make_tripwire(items=[], n=0, value=0.0), 'topic-canonical-present'),
+    # items hold exactly one failure, but value claims two.
+    'tripwire-value-disagrees-with-items': (_make_tripwire(value=2.0), 'topic-canonical-present'),
+    'tripwire-n-disagrees-with-items': (_make_tripwire(n=7), 'topic-canonical-present'),
+    'negative-n': (_make_count(n=-1), 'dangling-pointers'),
+    'empty-metric-id': (_make_count(metric_id=''), ''),
+    'unknown-extra-field': (_make_count(bogus_field=1), 'dangling-pointers'),
+}
+
+
+class TestMetricRejectedAtEmit:
+    """M1: a malformed metric is rejected AT EMIT TIME, not read time.
+
+    By the time the dashboard reads an artifact there is nobody left to tell,
+    so every one of these must fail inside the producing runner — which is what
+    ``validate_metric_series`` on the raw payload proves.
+    """
+
+    def test_error_type_is_a_value_error(self):
+        # Callers catch one exception type without importing pydantic.
+        assert issubclass(MetricSchemaError, ValueError)
+
+    @pytest.mark.parametrize(
+        ('metric', 'offender'),
+        list(_MALFORMED_METRICS.values()),
+        ids=list(_MALFORMED_METRICS),
+    )
+    def test_malformed_metric_is_rejected(self, metric, offender):
+        with pytest.raises(MetricSchemaError) as exc_info:
+            validate_metric_series(_make_series(metrics=[metric]))
+        # structured-facts-at-failure: the message names the offending metric.
+        assert repr(offender) in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        'metric', list(m for m, _ in _MALFORMED_METRICS.values()), ids=list(_MALFORMED_METRICS)
+    )
+    def test_malformed_metric_cannot_even_be_constructed(self, metric):
+        # The strict schema is what makes rejection unavoidable at emit: a
+        # producer cannot build the model and defer the failure to a reader.
+        with pytest.raises(ValidationError):
+            parse_metric_series(_make_series(metrics=[metric]))
+
+    def test_duplicate_metric_id_within_one_series_is_rejected(self):
+        payload = _make_series(metrics=[_make_count(), _make_count(value=6.0)])
+        with pytest.raises(MetricSchemaError) as exc_info:
+            validate_metric_series(payload)
+        assert repr('dangling-pointers') in str(exc_info.value)
+
+    def test_distinct_metric_ids_of_the_same_kind_are_fine(self):
+        payload = _make_series(
+            metrics=[_make_count(), _make_count(metric_id='superseded-above-successor')]
+        )
+        assert validate_metric_series(payload) is None
+
+    def test_valid_series_passes_validation(self):
+        assert validate_metric_series(_make_series()) is None
+
+    def test_validate_accepts_an_already_parsed_series(self):
+        series = parse_metric_series(_make_series())
+        assert validate_metric_series(series) is None
+
+    def test_error_chains_the_underlying_validation_error(self):
+        # `raise ... from exc` so the pydantic detail is not lost, while the
+        # public surface stays a single non-pydantic exception type.
+        with pytest.raises(MetricSchemaError) as exc_info:
+            validate_metric_series(_make_series(metrics=[_make_metric(value=1.4)]))
+        assert isinstance(exc_info.value.__cause__, ValidationError)
+
+    def test_series_level_shape_errors_are_also_rejected(self):
+        with pytest.raises(MetricSchemaError):
+            validate_metric_series({'schema_version': 1, 'eval_id': 'e1'})
