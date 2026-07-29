@@ -10758,8 +10758,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # steward_completion_timeout for every config that constructs at all,
         # and an operator who raises timeouts.steward widens the wait bound in
         # lockstep for free.
+        #
+        # The window is an IDLE deadline, not an overall one (review fix D2):
+        # it is refreshed whenever the steward is observably still working, so
+        # only a GENUINELY SILENT producer trips the give-up path.  A healthy
+        # steward can legitimately occupy several full invocation ceilings on
+        # ONE escalation — the timeout-kill path re-handles the still-pending
+        # record (steward.py:399-412) — and refreshing on the counter bounds
+        # each legitimate retry by its own window without hard-coding the
+        # steward_max_attempts + steward_max_timeouts_per_escalation multiplier.
         window = self.config.timeouts.steward + self.config.steward_completion_timeout
         deadline = asyncio.get_event_loop().time() + window
+        last_progress = self._steward_progress_counter()
         while True:
             pending_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
@@ -10773,6 +10783,28 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     raise TimeoutError  # noqa: TRY301 — uniform expiry handling
                 await asyncio.wait_for(self._escalation_event.wait(), remaining)
             except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
+                # Before giving up: is the steward observably still working?
+                # A counter that ADVANCED means one more invocation legitimately
+                # completed inside this window, so extend rather than fire.  A
+                # None counter (no steward, or a fake without metrics) means no
+                # signal is available and degrades to a plain fixed deadline; a
+                # counter that went backwards or non-monotonic is treated as no
+                # progress, never as an extension.
+                progress = self._steward_progress_counter()
+                if (
+                    progress is not None
+                    and last_progress is not None
+                    and progress > last_progress
+                ):
+                    logger.info(
+                        'Task %s: steward still working (invocations %d → %d) '
+                        '— extending the ESCALATED wait by another %.0fs idle '
+                        'window rather than giving up',
+                        self.task_id, last_progress, progress, window,
+                    )
+                    last_progress = progress
+                    deadline = asyncio.get_event_loop().time() + window
+                    continue
                 orphan_ids = [e.id for e in pending_l0]
                 logger.warning(
                     'Task %s: steward did not resolve %d level-0 escalation(s) '
@@ -13251,6 +13283,37 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return True
         channel = self._steward_outcome_channel
         return channel is not None and not channel.empty()
+
+    def _steward_progress_counter(self) -> int | None:
+        """Monotonic "the steward is still working" signal, or ``None`` when no
+        signal is available (task 3170, review fix D2).
+
+        Reads the public ``TaskSteward.metrics.invocations`` counter, which
+        increments after EVERY invocation returns (steward.py:597, and :948 on
+        the auto-escalate path) — so it advances once per completed invocation
+        including each timeout-kill retry.  That is exactly the "one more
+        invocation ceiling legitimately consumed" event
+        :meth:`_wait_for_resolution` needs in order to extend its idle window
+        without hard-coding the ``steward_max_attempts +
+        steward_max_timeouts_per_escalation`` multiplier.
+
+        Read through a defensive ``getattr`` chain: no steward, no ``metrics``,
+        or a non-``int`` all mean "no progress signal available" and return
+        ``None``, which degrades the caller to a plain fixed deadline rather
+        than breaking it.  ``bool`` is excluded explicitly — it is an ``int``
+        subclass, and a truthy flag masquerading as a counter would read as
+        progress exactly once and never again.
+        """
+        steward = self._steward
+        if steward is None:
+            return None
+        metrics = getattr(steward, 'metrics', None)
+        if metrics is None:
+            return None
+        value = getattr(metrics, 'invocations', None)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
 
     def _drain_steward_outcomes(self) -> StewardOutcome | None:
         """Non-blockingly empty the steward outcome channel and LOG what was
