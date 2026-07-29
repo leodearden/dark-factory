@@ -86,8 +86,38 @@ _MANUAL_LEAK = (
 )
 
 
-def _payload(content: str, key: str = 'data') -> dict:
-    return {key: content, 'category': 'observations_and_summaries', 'agent_id': 'claude-x'}
+def _payload(content: str, key: str = 'data', **overrides) -> dict:
+    """A REALISTIC raw Qdrant payload for one Mem0 memory.
+
+    Deliberately not minimal. The delete/re-add repair rebuilds the point from
+    scratch, so every key here is a key that can be LOST — and the caller
+    metadata keys (``task_id``, ``kind``, any ``x_*``) are the sole retrieval
+    axis for ``get_memories_by_metadata``/``count_memories_by_metadata``, which
+    match payload keys by equality via ``MatchValue`` (mem0_client.py:315-359).
+    A repair that drops them makes the memory invisible to every
+    metadata-scoped consumer that could previously find it.
+
+    The mem0-OWNED keys (``hash``/``created_at``/``updated_at``/``user_id``/
+    ``agent_id``/``run_id``) are present too, so the tests can pin that they are
+    NOT forged back into ``metadata=`` — mem0 re-derives them on write.
+    """
+    payload = {
+        key: content,
+        # mem0/Qdrant-owned or re-derived on write:
+        'category': 'observations_and_summaries',
+        'agent_id': 'claude-task-3083',
+        'run_id': 'r-1',
+        'user_id': 'dark_factory',
+        'hash': 'e3b0c44298fc1c14',
+        'created_at': '2026-07-27T00:00:00+00:00',
+        'updated_at': None,
+        # caller metadata — the only metadata-scoped retrieval axis:
+        'task_id': '3083',
+        'kind': 'observation',
+        'x_stage': 'stage1',
+    }
+    payload.update(overrides)
+    return payload
 
 
 class TestClassifyRecord:
@@ -282,17 +312,16 @@ class TestBuildParser:
 # cleanup-script test scope; the live --apply run is the operator close-out).
 # ===========================================================================
 
-def _match(memory_id: str, content: str, **payload_extra) -> dict:
+def _match(memory_id: str, content: str, *, payload: dict | None = None, **payload_extra) -> dict:
     """One scan_memory_content match. 'metadata' carries the RAW payload, which
     is where the full content lives (the 'excerpt' field is display-only and is
-    deliberately never used for classification or repair)."""
-    payload = {
-        'data': content,
-        'category': 'observations_and_summaries',
-        'agent_id': 'claude-task-3083',
-        'run_id': 'r-1',
-        **payload_extra,
-    }
+    deliberately never used for classification or repair).
+
+    Shares ``_payload``'s realistic shape so the pure classification tests and
+    the async repair tests judge the same payload, rather than the repair tests
+    quietly exercising a stripped-down one that cannot expose metadata loss.
+    """
+    payload = _payload(content, **payload_extra) if payload is None else payload
     return {
         'id': memory_id,
         'created_at': '2026-07-27T00:00:00+00:00',
@@ -714,3 +743,146 @@ class TestRunApplyPreflightCategoryGuard:
             record = _record_for(report, 'm')
             assert record['repaired'] is True, category
             assert 'skipped_not_mem0_routed' not in record, category
+
+
+class TestCarriedMetadata:
+    """``carried_metadata(payload, memory_id) -> (metadata, dropped)`` — pure.
+
+    The carry-over rule is ``payload keys - _MEM0_OWNED_KEYS``, plus the
+    ``x_repaired_from_memory_id`` provenance marker.
+    """
+
+    def test_caller_metadata_is_carried_through_unchanged(self):
+        metadata, _dropped = _mod.carried_metadata(_payload(_BODY), 'old-id')
+
+        assert metadata['task_id'] == '3083'
+        assert metadata['kind'] == 'observation'
+        assert metadata['x_stage'] == 'stage1'
+        assert metadata['x_repaired_from_memory_id'] == 'old-id'
+
+    def test_mem0_owned_keys_are_never_forged_into_metadata(self):
+        """mem0 re-derives each of these on write, and ``category`` is
+        overwritten by the service anyway (memory_service.py:2193)."""
+        metadata, _dropped = _mod.carried_metadata(_payload(_BODY), 'old-id')
+
+        for owned in (
+            'id', 'hash', 'data', 'memory', 'content', 'created_at', 'updated_at',
+            'user_id', 'agent_id', 'run_id', 'actor_id', 'role', 'category',
+        ):
+            assert owned not in metadata, owned
+
+    def test_dropped_names_only_the_keys_carried_nowhere(self):
+        """``data``/``category``/``agent_id``/``run_id`` are carried as ARGUMENTS,
+        so reporting them as dropped would be a false alarm that buries the real
+        ones."""
+        _metadata, dropped = _mod.carried_metadata(_payload(_BODY), 'old-id')
+
+        assert dropped == ['created_at', 'hash', 'updated_at', 'user_id']
+
+    def test_a_bare_payload_drops_and_preserves_nothing(self):
+        metadata, dropped = _mod.carried_metadata(
+            {'data': _BODY, 'category': 'observations_and_summaries'}, 'old-id'
+        )
+
+        assert dropped == []
+        assert metadata == {'x_repaired_from_memory_id': 'old-id'}
+
+    def test_the_callers_payload_is_not_mutated(self):
+        payload = _payload(_BODY)
+        before = dict(payload)
+
+        _mod.carried_metadata(payload, 'old-id')
+
+        assert payload == before
+
+
+class TestRunApplyPreservesMetadata:
+    """The repaired memory must stay findable by everything that could find it.
+
+    ``get_memories_by_metadata``/``count_memories_by_metadata`` match payload
+    KEYS by equality via ``MatchValue`` (mem0_client.py:315-359), so the payload
+    metadata is a repaired record's only metadata-scoped retrieval axis.
+    Rebuilding the point with a provenance marker alone would silently make it
+    invisible to every such consumer — a second, undisclosed mutation of stored
+    state layered on top of the harness's first, and flatly at odds with calling
+    the repair content-preserving.
+    """
+
+    @pytest.mark.asyncio
+    async def test_caller_metadata_survives_the_delete_and_readd(self):
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        await _mod.run(_args(apply=True), service)
+
+        metadata = service.add_memory.call_args[1]['metadata']
+        assert metadata['task_id'] == '3083'
+        assert metadata['kind'] == 'observation'
+        assert metadata['x_stage'] == 'stage1'
+        assert metadata['x_repaired_from_memory_id'] == 'b'
+
+    @pytest.mark.asyncio
+    async def test_mem0_owned_keys_are_not_forged_into_metadata(self):
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        await _mod.run(_args(apply=True), service)
+
+        metadata = service.add_memory.call_args[1]['metadata']
+        for owned in (
+            'id', 'hash', 'data', 'memory', 'content', 'created_at', 'updated_at',
+            'user_id', 'agent_id', 'run_id', 'category',
+        ):
+            assert owned not in metadata, owned
+
+    @pytest.mark.asyncio
+    async def test_scope_identities_are_threaded_as_arguments_not_metadata(self):
+        """mem0 writes its ``run_id`` payload key from ``Scope.session_id``
+        (mem0_client.py:124-126), so the original point's ``run_id`` has to go
+        back in through ``session_id=`` rather than being forged as metadata —
+        otherwise the repaired point lands with a null run_id."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        await _mod.run(_args(apply=True), service)
+
+        kwargs = service.add_memory.call_args[1]
+        assert kwargs['agent_id'] == 'claude-task-3083'
+        assert kwargs['session_id'] == 'r-1'
+
+    @pytest.mark.asyncio
+    async def test_the_report_makes_any_metadata_loss_auditable(self):
+        """The printed report is the whole investigation artifact, so what was
+        carried and what was not has to be readable from it alone."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        record = _record_for(report, 'b')
+        assert record['metadata_preserved'] == ['kind', 'task_id', 'x_stage']
+        assert record['metadata_dropped'] == ['created_at', 'hash', 'updated_at', 'user_id']
+
+    @pytest.mark.asyncio
+    async def test_a_bare_payload_still_repairs_with_empty_preserved_and_dropped(self):
+        bare = {'data': _TAIL_LEAK, 'category': 'observations_and_summaries'}
+        service = _service([_match('b', _TAIL_LEAK, payload=bare)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        record = _record_for(report, 'b')
+        assert record['repaired'] is True
+        assert record['metadata_preserved'] == []
+        assert record['metadata_dropped'] == []
+        assert service.add_memory.call_args[1]['metadata'] == {
+            'x_repaired_from_memory_id': 'b'
+        }
+
+    @pytest.mark.asyncio
+    async def test_metadata_audit_is_present_even_when_content_is_lost(self):
+        """Precisely when a hand restore is needed, the operator must be able to
+        rebuild the metadata too, not just the text."""
+        service = _service([_match('b', _TAIL_LEAK)])
+        service.add_memory = AsyncMock(side_effect=RuntimeError('embedding backend down'))
+
+        report = await _mod.run(_args(apply=True), service)
+
+        record = _record_for(report, 'b')
+        assert record['content_lost_in_flight'] is True
+        assert record['metadata_preserved'] == ['kind', 'task_id', 'x_stage']
