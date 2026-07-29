@@ -176,6 +176,20 @@ differs, and neither is a policy change:
   for reify the passed path is byte-identical to what the sibling default
   computes, and a project with no seed script gets no flag at all.
 
+  **A project with no seed script gets a WARNING instead of a flag.** That is
+  the fallback's own target case: a project carrying no warm-lane tooling is
+  why these copies exist, and there is nothing to name. The sibling default
+  then cannot resolve, so every non-disk-pressure Pass-1 lane reset fails
+  inside the script and counts as *preserved* while reclaiming nothing.
+  `_run_warm_lane_gc_reclaim` therefore logs, once per invocation and only
+  when the resolved origin is `dark-factory`, a WARNING naming the missing
+  `<project_root>/scripts/seed-warm-lane.sh` and stating that lane resets will
+  fail — reclaim degrades to orphan removal plus disk-pressure target removal.
+  Degraded is acceptable; degraded and silent is the accrete-to-ENOSPC failure
+  the wrapper exists to prevent. The warning is NOT emitted for a
+  project-origin gc copy: how a project arranges its own `SEED_SCRIPT` is its
+  business.
+
 - **`thin-warm-lane.sh`** has the same sibling default, but it is reachable
   ONLY under `--reseed`, which dark-factory never passes (PRD D3): the caller
   invokes it as `thin-warm-lane.sh <lane_dir>` and nothing else. It is
