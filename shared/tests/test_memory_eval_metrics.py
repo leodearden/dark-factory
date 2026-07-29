@@ -10,6 +10,7 @@ convention (see docs/prds/memory-eval-program.md §3 M1):
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from shared.memory_eval_metrics import (
     SCHEMA_VERSION,
@@ -121,16 +122,16 @@ class TestMetricSeriesSchema:
 
     def test_models_are_frozen(self):
         series = parse_metric_series(_make_series())
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             series.eval_id = 'other'  # type: ignore[misc]
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             series.metrics[0].value = 0.1  # type: ignore[misc]
 
     @pytest.mark.parametrize('bad_version', [0, 2, 99, '1'])
     def test_wrong_schema_version_is_a_validation_failure(self, bad_version):
         # Pinned as a Literal so a wrong version fails loudly rather than
         # taking a silent branch (capability_manifest.py:219 convention).
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             parse_metric_series(_make_series(schema_version=bad_version))
 
     def test_metric_constructs_directly(self):
