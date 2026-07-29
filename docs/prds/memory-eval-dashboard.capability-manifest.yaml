@@ -2,22 +2,21 @@ prd: docs/prds/memory-eval-dashboard.md
 schema_version: 1
 tasks:
 - label: alpha
-  task_id: null
+  task_id: 3215
   title: 'Memory-eval dashboard backend: artifact reader, verdict/escalation join,
     /api/v2/dashboard/memory-evals'
   capabilities:
   - name: m1-m2-exemplar-fixtures-upstream
     binding: capability→producer — the M1 metric-series exemplars, limits artifact
       and the dashboard-shaped reader boundary test are 3207's committed deliverables
-      (its task text pins shared/tests/fixtures/); 3207 is in-progress and wired
-      UPSTREAM of alpha (DAG-direction verified); the dep edge, not a grep, gates
-      dispatch
+      (its task text pins shared/tests/fixtures/); 3207 is in-progress and wired UPSTREAM
+      of alpha (DAG-direction verified); the dep edge, not a grep, gates dispatch
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the fixtures land with 3207, not this batch; binding is the wired
-        upstream dependency edge plus alpha's boundary test parsing the committed
-        exemplars once present
+      reason: the fixtures land with 3207, not this batch; binding is the wired upstream
+        dependency edge plus alpha's boundary test parsing the committed exemplars
+        once present
   - name: escalation-reader-reused-not-forked
     binding: INV-5 — the recon-queue read reuses load_queue_escalations (wired into
       the production Escalations endpoint at dashboard/src/dashboard/data/escalations.py:207-215
@@ -52,18 +51,18 @@ tasks:
       - dashboard/src/dashboard/data/
       expect: absent
 - label: beta
-  task_id: null
-  title: 'Memory-eval dashboard frontend: Memory-tab evals section with trends +
-    verdict badges'
+  task_id: 3216
+  title: 'Memory-eval dashboard frontend: Memory-tab evals section with trends + verdict
+    badges'
   capabilities:
   - name: chart-primitives-wired
-    binding: capability→producer — Sparkline/StepSpark/LineChart/StatTile et al.
-      exist in charts.jsx and are loaded before the tab scripts by index.html (load
-      order verified); no new chart library (2659 precedent)
+    binding: capability→producer — Sparkline/StepSpark/LineChart/StatTile et al. exist
+      in charts.jsx and are loaded before the tab scripts by index.html (load order
+      verified); no new chart library (2659 precedent)
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: 'function Sparkline'
+      pattern: function Sparkline
       paths:
       - dashboard/src/dashboard/static/redux/charts.jsx
       expect: present
@@ -100,22 +99,22 @@ tasks:
         a grep would pin a name the PRD deliberately leaves free; wiring + empty-state
         are pinned by beta's structural-contract tests in the test_tab_* idiom
 - label: gamma
-  task_id: null
+  task_id: 3217
   title: 'Memory-eval dashboard parity gate: verdict-escalation fingerprint-equality
     integration tests'
   capabilities:
   - name: verdicts-artifact-and-fingerprint-upstream
     binding: capability→producer — the verdicts artifact, its shared/tests/fixtures/
-      exemplar, and dedupe_fingerprint stamping are 3211's amended deliverables
-      (M2/M3 amendment 2026-07-29, commit 0ddaf23753, mirrored into 3211's description
-      + metadata.delivered_checks by verified readback); 3211 is pending and wired
-      UPSTREAM of gamma
+      exemplar, and dedupe_fingerprint stamping are 3211's amended deliverables (M2/M3
+      amendment 2026-07-29, commit 0ddaf23753, mirrored into 3211's description +
+      metadata.delivered_checks by verified readback); 3211 is pending and wired UPSTREAM
+      of gamma
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the artifact lands with 3211, not this batch; binding is the wired
-        upstream dependency edge plus gamma's re-verification against 3211's committed
-        exemplar fixture
+      reason: the artifact lands with 3211, not this batch; binding is the wired upstream
+        dependency edge plus gamma's re-verification against 3211's committed exemplar
+        fixture
   - name: dedupe-fingerprint-field-exists
     binding: capability→producer — the structured carrier the parity join keys on
       exists on the Escalation model on main today (escalation/models.py, 'content
