@@ -67,6 +67,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'Session is literally a ''Reconciliation Run Review'' prompt asking the recon agent to act as run-review judge and ''provide your verdict as JSON''. Stage reports show heavy LLM spend (15+16+23=54 calls) but near-total silent no-op output: memories_added/episodes_added/entities_merged/edges_updated/new_findings_filed all 0 across all three stages despite ''findings_verified:1.0'' being claimed, and ''Events processed: 0'' despite the run being trigger-fired on integrity_findings:1 and Journal Entries reporting 0 total. Matches the entry''s core pattern of run-review judge subsystems producing plausible-looking stats while doing effectively nothing verifiable.'
+  - date: '2026-07-28'
+    project: dark_factory
+    session: c268249d-4478-4a72-8a6b-7aa5feeb4e02
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 'Recon verification agent attempted to call grep_search and glob_search tools per verification contract, but these tools do not exist in its runtime (fatal ''No such tool available'' errors in 3 separate attempts, turns 11, 13, 15). Matches codebook pattern exactly: verifier prompts describe tool shims (grep_search specifically named) that the harness doesn''t provide.'
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -1453,6 +1459,13 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: "score: 10.0\nsignal_counts:\n  tool_error: 0\n  self_correct: 0\n  not_found: 0\n  df_guard: 0\n  interrupt: 0\n... (no body content follows; size_bytes: 294)"
+  - date: '2026-07-28'
+    project: dark_factory
+    session: c68fd507-b096-47be-9650-95562fb83f9e
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: score_assigned ∧ signal_counts_all_zero
+    note: Recon session assigned score=35.0 despite all signal counters at zero (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0) and minimal content (294 bytes); score generation decoupled from signal capture
 - id: entry-cand-20260722-21
   title: Digest-extraction pipeline embeds recursive/self-referential trickle-coder prompt content as a session's own 'User Correction'
   severity: medium
