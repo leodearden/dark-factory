@@ -206,35 +206,16 @@ class TestReconStageEscalationServerIdentity:
             'ReconciliationConfig.escalation_queue_dir.'
         )
 
-    # -- (c) the consequence: no mandated mcp__escalation__ absence probe ---
+    # -- (c) the consequence, deliberately NOT pinned by a test -------------
     #
-    # Deliberately NOT a cosmetic prose pin (this file's three original
-    # substring/non-empty meta-tests were deleted as exactly that).  This is a
-    # single NEGATIVE substring assertion, bundled with the two wiring facts
-    # above that make it meaningful — distinct queue dirs and ports, and the
-    # stage's only `escalation` server being the recon one — and it targets one
-    # specific mis-wired tool string proven wrong on disk, not a wording choice.
-
-    def test_guidance_does_not_mandate_the_unreachable_escalation_probe(self):
-        """The guidance must not name mcp__escalation__get_task_escalations.
-
-        Because (a) and (b) hold, a recon stage cannot query the orchestrator's
-        escalation queue at all.  Presenting
-        ``mcp__escalation__get_task_escalations`` as the disconfirming probe
-        would hand the auditor a call that resolves against the RECON queue,
-        returns [] for every orchestrator gate task, and — under a
-        "only an empty result THERE is evidence of absence" rule — sanctions
-        the exact 16-instance false positive this guidance exists to kill.
-        """
-        assert 'mcp__escalation__get_task_escalations' not in _GATE_CLOSURE_ARCHIVE_GUIDANCE, (
-            'The `escalation` MCP server in a recon stage config is backed by the '
-            'RECONCILIATION queue (data/reconciliation/escalations, port 8103); '
-            'orchestrator deterministic-gate records live in data/escalations '
-            '(port 8102), which no MCP server in that config is connected to. An '
-            'mcp__escalation__get_task_escalations call from a recon stage is '
-            'therefore UNINFORMATIVE about orchestrator gate records, not evidence '
-            'of absence. To legitimately re-introduce a mandated escalation probe, '
-            "expose the orchestrator's escalation server to recon stages as a "
-            "distinct `orch-escalation` MCP entry first (new ReconciliationConfig "
-            'field + harness plumbing into _build_mcp_config), then update this test.'
-        )
+    # The consequence of (a) and (b) — that the guidance must not present an
+    # `mcp__escalation__*` probe as the disconfirming lookup — is carried by
+    # the guidance PROSE itself (prompts/__init__.py), not by an assertion
+    # here.  A substring pin on that prose was tried and removed: the guidance
+    # deliberately RETAINS the bare token `get_task_escalations` (as the
+    # orchestrator-side lookup stages cannot reach) so that premise-registry
+    # source_assertion #2 keeps holding, which left the fully-qualified
+    # spelling as the only rejectable one — a reworded mis-instruction using
+    # the bare name passed green while a harmless qualified-name reword failed.
+    # If the guidance prose is wrong, fix the prose once, in
+    # prompts/__init__.py; do not re-add a wording pin here.
