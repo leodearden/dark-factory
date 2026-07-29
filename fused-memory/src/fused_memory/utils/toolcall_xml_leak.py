@@ -84,11 +84,27 @@ from typing import NamedTuple
 
 __all__ = [
     'LEAK_TAIL',
+    'PREFILTER_NEEDLES',
     'LeakHit',
     'detect_leak',
     'find_toolcall_xml_leak',
     'has_toolcall_xml_leak',
 ]
+
+# Literal substrings a store-side PREFILTER can search for cheaply. Every leak
+# necessarily contains one of these — they are the closing-tag alternation of
+# LEAK_TAIL — so OR-ing them is a strict SUPERSET of the real match set and can
+# never miss a leak the detector would find.
+#
+# They are a speed optimisation ONLY. The authoritative verdict is always
+# find_toolcall_xml_leak() re-run over each returned record, because a bare
+# closing tag is common in ordinary prose and matches nothing on its own.
+PREFILTER_NEEDLES = (
+    '\x3c/description>',
+    '\x3c/parameter>',
+    '\x3c/details>',
+    '\x3c/content>',
+)
 
 # Promoted verbatim from scripts/scan_task_toolcall_leaks.py (task 2939), with
 # exactly two generalizations for the Mem0 specimens (task 3083):
