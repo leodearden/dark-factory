@@ -105,10 +105,17 @@ Pending (non-blocking, confirmatory): the study's S/C control re-runs
 
 | Seam | Direction | Mechanism | Owner |
 |---|---|---|---|
-| merge-worktree-lifecycle (tasks 2924–2930) | consumes | one scratch chain worktree per round, provisioned OUTSIDE `.worktrees/` (crash-recovery deletes planless worktrees there) | **this PRD** owns its scratch lifecycle; reuses lifecycle primitives where convenient |
+| spec warm-lane pool (`git.merge_spec_warm_lane_pool`, live since reify 4941) | consumes | chain build + tip verify claim a pooled `_spec-N` lane via `acquire_spec_lane` (`merge_liveness.py:697-708`) — no bespoke scratch dir, pool owns worktree lifecycle/locking | pool machinery owns lanes; **this PRD** owns chain usage of one |
+| **DF 3003** (in flight 07-29): typed contended-DEFER on `reset_persistent_merge_worktree` | consumes + depends | the prefix-landing walk (δ) runs the terminal finalize path (incl. `warm_swap_worktree`, `merge_liveness.py:715`) k× per round and must inherit 3003's contended→DEFER classification, never the bare-RuntimeError→blocked path; γ/δ carry a task dep on 3003 | **3003** owns classification; **this PRD** consumes |
+| **DF 3071** (pending, ext-dep reify:5608): serial-head lane-lock admission gate | coordinates | chain dispatch is spec-lane-side and structurally exempt from the serial-head gate; but both edit `merge_liveness.py`/`merge_queue.py`/`config.py`/`defaults.yaml` (module-lock serialization), and δ's head-verify cancellation must release the verify lease cleanly or 3071's guard reads `_merge-verify` BUSY and defers the fleet | **3071** owns the gate; **this PRD** owns lease-clean cancellation (δ) |
+| merge-worktree-lifecycle (tasks 2924–2930) | consumes | lane/worktree lifecycle primitives (via the spec pool) | lifecycle PRD |
 | config-hot-reload PRD | extends | adds `merge_deep.chain_cap` to RELOADABLE_FIELDS | **this PRD** |
 | deep-speculative-verify-ahead analysis + replay study | consumes | evidence only; study's `build_stack` is the chain-builder reference | — |
 | speculation probe (task 2359, deactivated 07-23) | supersedes | probe stays inert (`probe_fraction=0`); `chain_items` replaces its broken depth labels | **this PRD** |
+
+Deep chains also *reduce* serial-head `_merge-verify` contention (fewer, batched
+verifies per landing), so this PRD, 3003, and 3071 attack the same incident
+class (reify esc-5354-4 / esc-5363-5) from complementary sides.
 
 ## Decomposition plan
 
@@ -128,16 +135,22 @@ Phase 1 — foundation:
 Phase 2 — vertical slice (minimum end-to-end):
 
 - **γ — deep-tip verify dispatch + halving state.** Modules: merge queue,
-  verify runner. Slot 2 dispatches onto the chain tip when cap>0 and
-  queue≥2; halving/reset state machine; emits `chain_items`. Signal:
-  integration — dispatch depths across scripted pass/fail sequences match
-  the policy; d=1 floor byte-identical to today's adjacent verify. Prereqs: β.
-- **δ — prefix landing on tip pass.** Modules: merge queue (CAS/finalize).
-  Cancel head verify, CAS-land links in order, per-item `merge_finalized`
-  done + `landed_via_chain`; stale-CAS abort semantics (decision 9). Signal:
-  integration — one passing tip lands k+1 items in order, main history
-  linear, conservation audits green; tip fail lands nothing via the chain
-  and head path proceeds untouched. Prereqs: γ.
+  merge_liveness (spec-lane dispatch seam), verify runner. Slot 2 claims a
+  `_spec-N` lane and dispatches onto the chain tip when cap>0 and queue≥2;
+  halving/reset state machine; emits `chain_items`. Signal: integration —
+  dispatch depths across scripted pass/fail sequences match the policy; d=1
+  floor byte-identical to today's adjacent verify. Prereqs: β, **DF 3003**
+  (out-of-batch: typed contended-DEFER must precede new dispatch logic on
+  the shared seam).
+- **δ — prefix landing on tip pass.** Modules: merge queue (CAS/finalize),
+  merge_liveness. Cancel head verify **with clean verify-lease release**
+  (3071's guard must read the lane IDLE afterward), CAS-land links in order
+  via the terminal finalize path (inheriting 3003's contended→DEFER
+  classification), per-item `merge_finalized` done + `landed_via_chain`;
+  stale-CAS abort semantics (decision 9). Signal: integration — one passing
+  tip lands k+1 items in order, main history linear, conservation audits
+  green, lane lock released post-cancel; tip fail lands nothing via the
+  chain and head path proceeds untouched. Prereqs: γ, **DF 3003**.
 - **ι — two-way boundary/integration gate (B+H).** Modules: orchestrator
   tests. The boundary-test sketch below, implemented against both the worker
   and the CAS/ledger sides. Signal: suite green in CI; this is the
@@ -207,6 +220,8 @@ Phase 3 — observability + rollout:
 | Head-fail + tip-pass | head verify red (flake), tip green | full prefix lands (tip authoritative), head verify cancelled |
 | Stale CAS aborts walk | main advanced externally mid-verify | walk aborts at first CAS failure; unlanded items requeue; next round rebuilds |
 | Kill switch byte-identity | cap=0 | dispatch/behavior identical to pre-PRD golden transcript |
+| Deep fails never feed thrash guard | 2 consecutive tip fails | zero blocked MergeOutcomes, `consecutive_merge_thrash` untouched (3003's signature class cannot recur via chains) |
+| Lease released on head-cancel | tip pass cancels in-flight head verify | `warm-lane-lock-guard.sh check` (3071's oracle) reads IDLE within one round |
 | Hot-reload | cap 0→6 via reload_config | next dispatch round builds a chain; no restart |
 | Timeout margin | 16-item chain (cap 32) | verify completes ≪ 7200 s or times out cleanly via existing path |
 
@@ -219,11 +234,15 @@ Phase 3 — observability + rollout:
 
 ## Open questions (tactical)
 
-1. **Scratch worktree provisioning** — dedicated persistent dir outside
-   `.worktrees/` vs claiming from the warm pool. Suggested: dedicated
-   reusable dir (study precedent). Decide in β.
+1. ~~Scratch worktree provisioning~~ **RESOLVED 07-29** (task-3071 scope
+   correction surfaced `merge_spec_warm_lane_pool` live since reify 4941):
+   chain build + verify claim a pooled `_spec-N` lane via
+   `acquire_spec_lane`; no bespoke scratch dir.
 2. **Head-verify cancellation mechanics** — cooperative cancel point vs
-   letting it finish and discarding the result. Decide in δ.
+   letting it finish and discarding the result. Hard requirement either
+   way: the verify lease / lane lock must be released promptly (3071's
+   admission guard and 3003's contended path both key on that inode).
+   Decide in δ using the existing `verify_cancel.py` machinery.
 3. **η1 predicate thresholds** — exact numeric gates derived from the first
    soak week's baseline; the script owns the comparison per the predicate
    contract. Decide when authoring η1's script.
