@@ -2055,9 +2055,11 @@ class TestContendedLeaseDefers:
         released = asyncio.Event()
         _real_release = worker._release_or_cleanup
 
-        async def _release_then_signal(*a: object, **k: object) -> object:
+        async def _release_then_signal(
+            merge_wt: Path | None, *, spec_warm: bool
+        ) -> None:
             try:
-                return await _real_release(*a, **k)
+                await _real_release(merge_wt, spec_warm=spec_warm)
             finally:
                 released.set()
 
@@ -2991,9 +2993,24 @@ class TestContendedLeaseDefers:
         real_acquire = mq_mod._acquire_warm_verify_worktree
         seen_due: list[bool] = []
 
-        async def _spy_acquire(*a: object, **k: object) -> object:
-            seen_due.append(bool(k.get('safety_valve_due')))
-            return await real_acquire(*a, **k)
+        async def _spy_acquire(
+            git_ops: GitOps,
+            req: MergeRequest,
+            merge_wt: Path | None,
+            merge_commit: str,
+            *,
+            safety_valve_due: bool,
+            speculative: bool = False,
+        ) -> tuple[Path | None, bool]:
+            seen_due.append(safety_valve_due)
+            return await real_acquire(
+                git_ops,
+                req,
+                merge_wt,
+                merge_commit,
+                safety_valve_due=safety_valve_due,
+                speculative=speculative,
+            )
 
         for i in range(every_n):
             req, item = await _make_merged_item(
