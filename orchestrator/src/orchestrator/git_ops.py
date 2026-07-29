@@ -3869,9 +3869,20 @@ class GitOps:
         """:meth:`_resolve_warm_lane_script`, plus the operator-facing log line.
 
         Shared by all six warm-lane wrappers so the message shape is identical
-        across them and one ``grep`` matches every site.
+        across them and one ``grep`` matches every site. Both outcomes are
+        logged from here rather than open-coded per wrapper precisely so the
+        two messages cannot drift apart into six dialects.
 
-        On failure emits a WARNING naming BOTH tried paths. WARNING, not the
+        On SUCCESS emits an INFO naming the resolved path and its origin,
+        immediately before the caller spawns it. **Unconditional per
+        invocation** — no memo, no once-per-process guard: PRD leaf ζ's
+        go/no-go reads this line off a live reclaim pass, which may be the
+        hundredth of the process, so suppressing repeats would make that read
+        silently empty. Pinned by
+        ``test_warm_lane_script_resolution.py::TestResolvedPathIsLoggedAtInfo::
+        test_info_line_is_emitted_on_every_invocation``.
+
+        On FAILURE emits a WARNING naming BOTH tried paths. WARNING, not the
         pre-relocation DEBUG: after leaf α dark-factory always ships its own
         copy, so "neither location" can only mean a genuinely broken
         deployment — rare in production, never routine noise — and a DEBUG
@@ -3885,7 +3896,7 @@ class GitOps:
 
         Args:
             name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
-            method: Calling method name, prefixed onto the log line.
+            method: Calling method name, prefixed onto both log lines.
 
         Returns:
             ``(resolved_path, origin)``, or ``None`` when neither location
@@ -3900,6 +3911,8 @@ class GitOps:
                 method, project_path, df_path,
             )
             return None
+        path, origin = resolved
+        logger.info('%s: resolved %s -> %s (%s)', method, name, path, origin)
         return resolved
 
     # ε: warm-lane disk-guard admission helpers --------------------------------
@@ -4100,6 +4113,18 @@ class GitOps:
         A TTL of ``0.0`` (e.g. monkeypatched in tests) disables the memo —
         the deadline never lies strictly in the future — so every call
         re-forks.
+
+        **Interaction with the resolved-path INFO line (task 3072).** That
+        line is emitted per *invocation of the wrapper*, and this memo
+        suppresses the wrapper itself on a cache hit — so a hit produces no
+        resolved-path line either. That is unchanged pre-existing behaviour,
+        not a rate-limit on the log: the memo has always suppressed the whole
+        subprocess, and α is observability-only. The line's
+        "every invocation" guarantee is about
+        :meth:`_run_warm_lane_audit` and the other five wrappers never
+        memoising it themselves; an operator reading resolution off a live
+        pass should use the reclaim path (:meth:`_run_warm_lane_gc_reclaim`),
+        which has no memo.
         """
         now = time.monotonic()
         cache = self._warm_lane_audit_cache
