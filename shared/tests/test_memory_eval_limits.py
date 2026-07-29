@@ -19,7 +19,12 @@ import math
 
 import pytest
 
-from shared.memory_eval_limits import binomial_two_sided_p, poisson_two_sided_p
+from shared.memory_eval_limits import (
+    LimitsConfig,
+    binomial_two_sided_p,
+    derive_alpha,
+    poisson_two_sided_p,
+)
 
 
 def _reference_binomial_two_sided_p(k: int, n: int, p0: float) -> float:
@@ -207,3 +212,83 @@ class TestPoissonExactTest:
     def test_out_of_range_arguments_raise(self, k, lam):
         with pytest.raises(ValueError):
             poisson_two_sided_p(k, lam)
+
+
+class TestDerivedAlpha:
+    """G6: significance is DERIVED from a declared false-alarm budget.
+
+    The module holds no a-priori significance constant. What it holds is a
+    BUDGET — "how many false alarms per quarter am I willing to be woken for?"
+    — and alpha falls out of it by division once the run cadence and the number
+    of metrics that can alarm are known.
+
+    Note on the behavioural half of G6: proving alpha reaches the COMPARISON
+    (not merely that ``derive_alpha`` is arithmetic) requires the evaluator, so
+    that assertion lives in ``TestBudgetMovesTheVerdict`` alongside the rule
+    kinds it exercises. The tests here pin the derivation itself.
+    """
+
+    def test_alpha_is_the_budget_quotient_exactly(self):
+        # budget=1/quarter, the D10 daily cadence (90 runs/quarter), 4 metrics
+        # eligible to alarm. Exact rational: no rounding, nothing tuned.
+        assert derive_alpha(1.0, 90, 4) == 1 / 360
+
+    def test_alpha_shrinks_as_more_metrics_can_alarm(self):
+        # The Bonferroni intent of M2: adding a metric spends from the SAME
+        # quarterly budget, so every metric's bar gets stricter. This is why
+        # alpha is recomputed per run rather than frozen at authoring time.
+        alphas = [derive_alpha(1.0, 90, count) for count in range(1, 9)]
+        assert alphas == sorted(alphas, reverse=True)
+        assert len(set(alphas)) == len(alphas)
+
+    def test_alpha_shrinks_as_the_run_rate_grows(self):
+        # Running an eval more often is more chances to be unlucky, and the
+        # budget is per QUARTER, not per run.
+        alphas = [derive_alpha(1.0, runs, 4) for runs in (1, 7, 30, 90, 365)]
+        assert alphas == sorted(alphas, reverse=True)
+        assert len(set(alphas)) == len(alphas)
+
+    def test_alpha_grows_with_the_declared_budget(self):
+        # Tolerating more false alarms buys a looser bar. This is the knob an
+        # operator actually turns, and it is stated in units they can reason
+        # about ("once a quarter"), not in units of p-value.
+        alphas = [derive_alpha(budget, 90, 4) for budget in (0.1, 0.5, 1.0, 4.0, 12.0)]
+        assert alphas == sorted(alphas)
+        assert len(set(alphas)) == len(alphas)
+
+    @pytest.mark.parametrize(
+        ('budget', 'runs', 'count'), [(1.0, 0, 4), (1.0, 90, 0), (1.0, -90, 4), (1.0, 90, -4)]
+    )
+    def test_zero_or_negative_divisors_raise(self, budget, runs, count):
+        # A zero divisor here means "nothing runs" or "nothing can alarm" — a
+        # caller bug. Raise rather than return an infinite (or negative) alpha
+        # that would silently make every run either an alarm or never one.
+        with pytest.raises(ValueError):
+            derive_alpha(budget, runs, count)
+
+    @pytest.mark.parametrize('budget', [0.0, -1.0])
+    def test_non_positive_budget_raises(self, budget):
+        # A budget of zero is not "be very strict", it is a contradiction: no
+        # finite alpha admits zero false alarms. Say so instead of returning 0.
+        with pytest.raises(ValueError):
+            derive_alpha(budget, 90, 4)
+
+    def test_config_defaults_to_one_false_alarm_per_quarter(self):
+        # The PRD-sanctioned default (M2) — a budget DECLARATION, not a
+        # significance threshold. Everything else must be declared explicitly.
+        config = LimitsConfig(runs_per_quarter=90, min_samples=10, baseline_window=3)
+        assert config.false_alarm_budget == 1.0
+
+    def test_config_is_frozen(self):
+        config = LimitsConfig(runs_per_quarter=90, min_samples=10, baseline_window=3)
+        with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError is a TypeError subclass
+            config.false_alarm_budget = 99.0  # type: ignore[misc]
+
+    def test_config_carries_the_derivation_inputs(self):
+        # alpha is not stored on the config: it depends on how many metrics
+        # alarm in THIS run, which the config cannot know. The config carries
+        # the two stable halves and the evaluator supplies the third.
+        config = LimitsConfig(
+            false_alarm_budget=2.0, runs_per_quarter=90, min_samples=10, baseline_window=3
+        )
+        assert derive_alpha(config.false_alarm_budget, config.runs_per_quarter, 4) == 2 / 360
