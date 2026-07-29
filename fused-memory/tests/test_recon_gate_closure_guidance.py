@@ -8,6 +8,11 @@ both branches of ``build_stage2_system_prompt``) rather than the prose — the
 same shape as the existing ``_STAGE1_/_STAGE2_GRAPHITI_QUEUED_GUIDANCE``
 constants.  Prose may be reworded freely; the wiring may not silently break.
 
+``TestReconStageEscalationServerIdentity`` pins the second wiring fact the
+guidance depends on: the ``escalation`` MCP server a recon stage holds is backed
+by the RECONCILIATION queue, not the orchestrator's, so no ``mcp__escalation__*``
+result available to a stage can establish that a gate record was never written.
+
 Background: a recon auditor probing a ``done`` ``task_kind='deterministic'``
 gate task with ``get_pending_escalations(task_id=...)`` gets ``[]`` once a human
 has resolved the born-at-L2 record (it moves to ``data/escalations/archive/``),
@@ -17,7 +22,6 @@ across 16 recorded instances.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -34,20 +38,6 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-
-# Mirrors _AGENT_CALLED_REPORT_TOOLS in test_recon_report_guidance_drift.py —
-# the tools whose call examples that suite requires to carry `run_id=`.
-_AGENT_CALLED_REPORT_TOOLS = (
-    'add_finding',
-    'set_stat',
-    'inc_stat',
-    'complete',
-    'cite_entity',
-    'cite_edge',
-    'cite_task',
-    'cite_memory',
-    'cite_run',
-)
 
 # The orchestrator's escalation queue — a DIFFERENT store from the
 # reconciliation one that recon stages are wired to.  Declared here so the
@@ -97,30 +87,7 @@ def _find_orchestrator_config() -> Path | None:
 class TestGateClosureArchiveGuidance:
     """_GATE_CLOSURE_ARCHIVE_GUIDANCE is a single shared constant wired into both stages."""
 
-    # -- (a) the constant exists ------------------------------------------
-
-    def test_constant_is_a_non_empty_string(self):
-        """The shared constant imports and carries real content."""
-        assert isinstance(_GATE_CLOSURE_ARCHIVE_GUIDANCE, str)
-        assert _GATE_CLOSURE_ARCHIVE_GUIDANCE.strip(), (
-            '_GATE_CLOSURE_ARCHIVE_GUIDANCE must not be empty — an empty '
-            'constant would satisfy the embedding assertions vacuously.'
-        )
-
-    # -- (b) it names the disconfirming tool -------------------------------
-
-    def test_names_the_disconfirming_tool(self):
-        """It must name `get_task_escalations` — the guidance is inert without it.
-
-        This is also the token the shipped recon_code_fix_premise_registry.yaml
-        entry asserts on, so retiring the tool self-corrects the guard.
-        """
-        assert 'get_task_escalations' in _GATE_CLOSURE_ARCHIVE_GUIDANCE, (
-            'The guidance must name the archive-inclusive lookup the auditor '
-            'is required to call; without it the rule cannot be followed.'
-        )
-
-    # -- (c)/(d) embedded verbatim in both stage prompts -------------------
+    # -- embedded verbatim in both stage prompts ---------------------------
 
     def test_embedded_verbatim_in_stage1_prompt(self):
         """Stage 1 — the stage that emits the flag — carries the guidance."""
@@ -136,7 +103,7 @@ class TestGateClosureArchiveGuidance:
             'verbatim (no re-wording, no partial copy).'
         )
 
-    # -- (e) survives both runtime builder branches ------------------------
+    # -- survives both runtime builder branches ----------------------------
 
     @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
     def test_survives_build_stage2_system_prompt(self, project_id: str):
@@ -152,29 +119,13 @@ class TestGateClosureArchiveGuidance:
             '_GATE_CLOSURE_ARCHIVE_GUIDANCE.'
         )
 
-    # -- (f) drift trap: no bare report-tool call examples ------------------
-
-    def test_no_report_tool_call_example_without_run_id(self):
-        """Keep test_recon_report_guidance_drift.py green.
-
-        That suite scans the ASSEMBLED stage prompts and requires every
-        recon-report tool call example to carry `run_id=`.  Since this constant
-        is interpolated into both stage prompts, a bare `add_finding(...)`
-        example written here would fail that suite from a surprising location.
-        """
-        for tool_name in _AGENT_CALLED_REPORT_TOOLS:
-            pattern = re.compile(
-                r'(?<![A-Za-z0-9_])(?:mcp__recon-report__)?'
-                + re.escape(tool_name)
-                + r'\(([^)]*)\)'
-            )
-            for m in pattern.finditer(_GATE_CLOSURE_ARCHIVE_GUIDANCE):
-                assert 'run_id' in m.group(1), (
-                    f'_GATE_CLOSURE_ARCHIVE_GUIDANCE contains a '
-                    f'`{tool_name}(...)` call example missing `run_id` — got: '
-                    f'{tool_name}({m.group(1)}). Describe the behaviour in prose '
-                    'instead, or add run_id= to the example.'
-                )
+    # The "no bare report-tool call example without run_id" drift trap is NOT
+    # duplicated here: test_recon_report_guidance_drift.py's
+    # TestReconReportRunIdGuardOverAssembledPrompts already scans all five
+    # assembled prompt texts (STAGE1/2/3_SYSTEM_PROMPT + both
+    # build_stage2_system_prompt branches), each of which embeds this constant
+    # verbatim by the very property the tests above assert — and it does so
+    # with correct balanced-paren argument extraction.
 
 
 class TestReconStageEscalationServerIdentity:
@@ -256,6 +207,13 @@ class TestReconStageEscalationServerIdentity:
         )
 
     # -- (c) the consequence: no mandated mcp__escalation__ absence probe ---
+    #
+    # Deliberately NOT a cosmetic prose pin (this file's three original
+    # substring/non-empty meta-tests were deleted as exactly that).  This is a
+    # single NEGATIVE substring assertion, bundled with the two wiring facts
+    # above that make it meaningful — distinct queue dirs and ports, and the
+    # stage's only `escalation` server being the recon one — and it targets one
+    # specific mis-wired tool string proven wrong on disk, not a wording choice.
 
     def test_guidance_does_not_mandate_the_unreachable_escalation_probe(self):
         """The guidance must not name mcp__escalation__get_task_escalations.
