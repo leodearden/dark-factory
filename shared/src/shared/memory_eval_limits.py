@@ -35,15 +35,42 @@ dependency of ``dark-factory-shared``, following the stdlib-only precedent of
 
 from __future__ import annotations
 
+import hashlib
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
+
+from shared.memory_eval_metrics import Metric
 
 __all__ = [
+    'Alarm',
     'LimitsConfig',
+    'MetricVerdict',
+    'RuleKind',
+    'VerdictStatus',
     'binomial_two_sided_p',
     'derive_alpha',
+    'evaluate_tripwire',
+    'grandfather_set_hash',
     'poisson_two_sided_p',
 ]
+
+RuleKind = Literal['tripwire', 'proportion', 'count', 'scalar']
+"""Which rule judged a metric. Deliberately the SAME vocabulary as ``MetricKind``.
+
+A second set of names for the same four things ("rule (a)", "structural") would
+be one more mapping for a reader of the artifact to hold, with no gain: the
+metric's kind fully determines its rule.
+"""
+
+VerdictStatus = Literal['baseline_snapshot', 'ok', 'alarm', 'insufficient_data']
+"""The four things a run can say about a metric.
+
+Only ``alarm`` wakes anyone. ``insufficient_data`` in particular is a REPORT
+STATUS, never an alarm — a thin sample is not evidence of a regression, and
+saying so is the canary's ``min_samples`` precedent.
+"""
 
 _PMF_TIE_SLACK = 1e-9
 """Relative slack when asking "is this outcome at most as probable as the observed one?".
@@ -249,3 +276,147 @@ def derive_alpha(
             '(nothing can alarm, so there is no alpha to derive).'
         )
     return false_alarm_budget / (runs_per_quarter * alarmed_metric_count)
+
+
+@dataclass(frozen=True)
+class Alarm:
+    """One thing worth waking someone for, with the numbers that justify it.
+
+    Never a bare boolean: whatever made this fire — the observed value, the
+    baseline it was judged against, and for a statistical rule the p-value and
+    the alpha it was compared to — travels attached to it, because the alarm
+    lands in an artifact that a human reads hours later with no other context.
+    """
+
+    metric_id: str
+    rule_kind: RuleKind
+    detail: str
+    item_key: str | None = None
+    """The specific probe that regressed, for rule (a). ``None`` for whole-metric rules."""
+    value: float | None = None
+    baseline: float | None = None
+    p_value: float | None = None
+    alpha: float | None = None
+
+
+@dataclass(frozen=True)
+class MetricVerdict:
+    """What this run concluded about one metric.
+
+    Following the canary (``canary.py`` ``MetricComparison``), the underlying
+    numbers are ALWAYS computed and exposed — including when the status is
+    ``ok`` or ``insufficient_data``. A verdict that only said "fine" would make
+    the interesting question ("fine, but how close was it?") unanswerable
+    without re-running the eval.
+    """
+
+    metric_id: str
+    rule_kind: RuleKind
+    status: VerdictStatus
+    value: float
+    n: int
+    alarms: tuple[Alarm, ...] = ()
+    baseline: float | None = None
+    """The comparison point: pooled baseline rate/proportion, or grandfathered failure count."""
+    p_value: float | None = None
+    """``None`` for structural rules, which measure a fact rather than a surprise."""
+    alpha: float | None = None
+    """The derived bar this run's p-value was judged against. Provenance, not config."""
+    baseline_run_stamps: tuple[str, ...] = ()
+    """Exactly which runs produced ``baseline`` — so a verdict can be re-derived by hand."""
+    detail: str = ''
+
+
+def grandfather_set_hash(keys: Iterable[str]) -> str:
+    """Stable digest of a grandfather set: sha256 over the sorted, newline-joined keys.
+
+    Sorted and de-duplicated first, so the digest is a property of the SET and
+    not of whatever order a caller happened to iterate in. That is what lets a
+    reader diff two runs' artifacts and conclude "the known-bad list did not
+    move" from one line instead of comparing two lists by eye.
+    """
+    joined = '\n'.join(sorted(set(keys)))
+    return hashlib.sha256(joined.encode('utf-8')).hexdigest()
+
+
+def evaluate_tripwire(
+    metric: Metric, grandfather: frozenset[str] | None
+) -> tuple[MetricVerdict, frozenset[str]]:
+    """Rule (a): grandfather pre-existing failures, alarm on regressions (D1).
+
+    Returns the verdict and the NEXT grandfather set, which the caller persists.
+
+    The rule is two lines, and both are load-bearing:
+
+    * **Alarm** exactly when an item fails and is not grandfathered.
+    * **Next set** is ``grandfather - {items that now pass}`` — items LEAVE by
+      being fixed, and nothing ever joins after the first run.
+
+    That asymmetry is the ratchet. Folding a newly-failing item into the set
+    (the obvious-looking symmetry) would let every alarm silence itself on the
+    following run by reclassifying the regression as known-bad — the exact
+    failure mode grandfathering exists to prevent. Because the set only
+    shrinks, "an item that was fixed and then regresses alarms again" holds by
+    construction rather than by vigilance.
+
+    A first run (``grandfather is None``) has nothing to regress against, so it
+    SNAPSHOTS today's failures as the starting line and reports
+    ``baseline_snapshot`` with no alarms. Those keys are the known-bad worklist,
+    not news.
+    """
+    if metric.kind != 'tripwire':
+        raise ValueError(
+            f'evaluate_tripwire: metric {metric.metric_id!r} has kind {metric.kind!r}, '
+            'not tripwire.'
+        )
+    items = metric.items or []
+    failing = frozenset(item.item_key for item in items if not item.passed)
+    passing = frozenset(item.item_key for item in items if item.passed)
+
+    if grandfather is None:
+        return (
+            MetricVerdict(
+                metric_id=metric.metric_id,
+                rule_kind='tripwire',
+                status='baseline_snapshot',
+                value=metric.value,
+                n=metric.n,
+                baseline=float(len(failing)),
+                detail=(
+                    f'First run: snapshotted {len(failing)} failing item(s) as known-bad. '
+                    'Regressions from here alarm.'
+                ),
+            ),
+            failing,
+        )
+
+    next_grandfather = grandfather - passing
+    alarms = tuple(
+        Alarm(
+            metric_id=metric.metric_id,
+            rule_kind='tripwire',
+            detail=f'Item {key!r} newly fails and is not grandfathered.',
+            item_key=key,
+            value=metric.value,
+            baseline=float(len(grandfather)),
+        )
+        # Sorted so the artifact's alarm list is a function of the failures and
+        # not of set iteration order — an unstable order would churn the diff.
+        for key in sorted(failing - grandfather)
+    )
+    return (
+        MetricVerdict(
+            metric_id=metric.metric_id,
+            rule_kind='tripwire',
+            status='alarm' if alarms else 'ok',
+            value=metric.value,
+            n=metric.n,
+            alarms=alarms,
+            baseline=float(len(grandfather)),
+            detail=(
+                f'{len(failing)} failing, {len(grandfather)} grandfathered, '
+                f'{len(alarms)} new; {len(grandfather - next_grandfather)} fixed and released.'
+            ),
+        ),
+        next_grandfather,
+    )
