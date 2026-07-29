@@ -971,6 +971,200 @@ class TestHealthyStewardIsNotForceDismissed:
         )
 
 
+def _make_progressing_steward(
+    queue: EscalationQueue,
+    task_id: str,
+    *,
+    tick: float,
+    ticks: int,
+    markers: list[str],
+    advance: bool = True,
+    resolved_by: str = 'steward-auto-dismissed',
+) -> type:
+    """A steward that publishes an observable liveness signal while it works.
+
+    Exposes ``metrics.invocations`` — the same public counter the real
+    ``TaskSteward`` bumps after EVERY invocation returns (steward.py:597, and
+    :948 on the auto-escalate path), including each timeout-kill retry — and
+    advances it once per *tick* for *ticks* ticks before dismissing its L0.
+
+    That spread is the point: with ``steward_max_attempts`` (1) plus
+    ``steward_max_timeouts_per_escalation`` (3), a HEALTHY steward can
+    legitimately occupy ~4 full invocation ceilings on ONE escalation, because
+    the timeout-kill path explicitly loops (steward.py:399-412 increments
+    ``_timeout_counts`` and leaves the record pending for re-handling).  A
+    single fixed window — even the derived one — still fires mid-retry.
+
+    *advance=False* is the negative control: byte-identical timing and
+    behaviour, but the counter never moves.  That is the genuinely-SILENT
+    producer the backstop exists for, and it must still be given up on —
+    otherwise "refresh on progress" would be trivially satisfiable by never
+    expiring at all.
+    """
+
+    class _Metrics:
+        def __init__(self) -> None:
+            self.invocations = 0
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+            self.metrics = _Metrics()
+            self.work_task: asyncio.Task | None = None
+            self.stop_count = 0
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def _work(self) -> None:
+            for _ in range(ticks):
+                await asyncio.sleep(tick)
+                if advance:
+                    self.metrics.invocations += 1
+            for esc in queue.get_by_task(task_id, status='pending', level=0):
+                queue.resolve(
+                    esc.id,
+                    'Auto-dismissed: steward interrupted (attempt_cap) with WIP '
+                    'present — resuming plan, not escalating',
+                    dismiss=True,
+                    resolved_by=resolved_by,
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardInterrupted('attempt_cap', wip_commits_present=True),
+                )
+
+        async def start(self) -> None:
+            self.work_task = asyncio.create_task(self._work())
+
+        async def stop(self) -> None:
+            self.stop_count += 1
+            markers.append('steward-stop')
+            if self.work_task is not None:
+                self.work_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.work_task
+
+    return _FakeSteward
+
+
+@pytest.mark.asyncio
+class TestObservableProgressRefreshesTheWait:
+    """Fix D2: a steward that is visibly WORKING must not be given up on.
+
+    A fixed window — even the derived one from fix D1 — is still wrong at the
+    tail, because the steward legitimately RETRIES and each retry gets its own
+    full ``timeouts.steward`` invocation.  The fix is to refresh the deadline
+    whenever the steward is observably still working, so only a GENUINELY
+    SILENT producer trips the backstop.  Both tests share one window and one
+    fake shape, differing ONLY in whether ``metrics.invocations`` advances.
+    """
+
+    async def test_steady_progress_extends_the_wait_past_a_full_window(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """~1.2s of steady progress against a 0.5s window."""
+        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        store = _RecordingEventStore()
+        workflow, _scheduler = _build_workflow(
+            local_config, git_ops, task_assignment, queue, wt, event_store=store,
+        )
+        _wire_resolve_callback(queue, workflow)
+        markers: list[str] = []
+        workflow._steward_factory = _make_progressing_steward(
+            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        workflow._invoke = _make_marking_invoke(markers)  # type: ignore[method-assign]
+
+        await asyncio.wait_for(workflow.run(), 10)
+
+        window = (
+            local_config.timeouts.steward + local_config.steward_completion_timeout
+        )
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'steward-auto-dismissed', (
+            f'the steward advanced metrics.invocations every 0.3s for ~1.2s — '
+            f'more than two full {window:.1f}s windows of visible progress — so '
+            f'the wait must have been refreshed rather than expired.  '
+            f'resolved_by={archived.resolved_by!r} means a fixed window fired '
+            f'mid-retry on a steward that was demonstrably working'
+        )
+        assert _steward_wait_timeouts(store) == [], (
+            'the backstop must trip only on a genuinely SILENT producer'
+        )
+        assert 'implementer-resumed' in markers, (
+            f'the steward\'s own dismissal must still unblock the wait; '
+            f'markers={markers}'
+        )
+        # See the sibling class: run()'s terminal-cleanup hook legitimately
+        # stops the steward once on the way out, so ORDER is the property.
+        assert markers.index('implementer-resumed') < markers.index('steward-stop'), (
+            f'the give-up path must not have stopped the steward; markers={markers}'
+        )
+
+    async def test_a_never_advancing_counter_is_still_given_up_on(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Negative control: identical fake, counter frozen → backstop fires.
+
+        Without this, "refresh on progress" would be satisfiable by an
+        implementation that simply never expires — which would re-open the
+        permanent strand this whole task exists to close.
+        """
+        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        store = _RecordingEventStore()
+        workflow, _scheduler = _build_workflow(
+            local_config, git_ops, task_assignment, queue, wt, event_store=store,
+        )
+        _wire_resolve_callback(queue, workflow)
+        markers: list[str] = []
+        workflow._steward_factory = _make_progressing_steward(
+            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            advance=False,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        workflow._invoke = _make_marking_invoke(markers)  # type: ignore[method-assign]
+
+        t0 = asyncio.get_running_loop().time()
+        await asyncio.wait_for(workflow.run(), 10)
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'auto-dismissed', (
+            f'a producer that never advances its liveness counter is exactly '
+            f'what the backstop is for; got resolved_by={archived.resolved_by!r}'
+        )
+        assert [e['escalation_ids'] for e in _steward_wait_timeouts(store)] == [
+            [esc.id],
+        ], (
+            'the give-up must stay loud and greppable — one escalation_resolved '
+            'event carrying outcome=steward_wait_timeout and the orphan id'
+        )
+        assert elapsed < 10 / 2, (
+            f'the silent producer must still be given up on promptly, not '
+            f'ride the test\'s own backstop; run() took {elapsed:.1f}s'
+        )
+
+
 def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
     """A steward that gives up to a human, exactly as ``_auto_escalate_to_human``.
 
