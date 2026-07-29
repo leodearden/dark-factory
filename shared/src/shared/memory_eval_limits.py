@@ -36,9 +36,12 @@ dependency of ``dark-factory-shared``, following the stdlib-only precedent of
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 __all__ = [
+    'LimitsConfig',
     'binomial_two_sided_p',
+    'derive_alpha',
     'poisson_two_sided_p',
 ]
 
@@ -178,3 +181,71 @@ def poisson_two_sided_p(k: int, lam: float) -> float:
         i += 1
 
     return min(1.0, math.fsum(terms))
+
+
+@dataclass(frozen=True, kw_only=True)
+class LimitsConfig:
+    """The declared inputs an operator actually reasons about.
+
+    Deliberately NOT a home for a significance threshold. ``false_alarm_budget``
+    is a BUDGET DECLARATION in units a human can hold — *expected false alarms
+    per quarter* — and alpha is derived from it by :func:`derive_alpha` (PRD M2,
+    D3, G6). Nothing here is a p-value, and alpha is not stored: it depends on
+    how many metrics are alarm-eligible in a given run, which this config
+    cannot know.
+
+    ``min_samples`` and ``baseline_window`` are SUFFICIENCY guards on the canary
+    precedent (``canary.py`` ``min_samples``), not thresholds on the statistic:
+    they decide whether there is enough data to say anything at all, and a run
+    that fails them reports ``insufficient_data`` rather than any verdict.
+    Keyword-only so a four-number call site can never silently transpose two of
+    them.
+    """
+
+    false_alarm_budget: float = 1.0
+    """Expected false alarms per quarter across the whole eval. PRD-sanctioned default."""
+
+    runs_per_quarter: int
+    """How often this eval runs — 90 for the D10 daily cadence."""
+
+    min_samples: int
+    """Fewest items in the current run before a verdict is meaningful."""
+
+    baseline_window: int
+    """How many trailing runs pool into the baseline the current run is judged against."""
+
+
+def derive_alpha(
+    false_alarm_budget: float, runs_per_quarter: int, alarmed_metric_count: int
+) -> float:
+    """Derive the per-metric significance level from the declared budget (G6).
+
+    ``alpha = budget / (runs_per_quarter * alarmed_metric_count)`` — a
+    Bonferroni split of one quarterly budget across every opportunity to spend
+    it. Each run of each alarm-eligible metric is one such opportunity, so at
+    this alpha the expected number of false alarms per quarter is exactly the
+    declared budget.
+
+    The consequence worth stating: alpha SHRINKS as metrics are added. That is
+    intended, and it is why the evaluator recomputes alpha per run from the
+    metrics actually present rather than resolving it once at authoring time —
+    a new metric must not quietly raise the whole eval's false-alarm rate.
+
+    Raises ``ValueError`` on a non-positive budget or a non-positive divisor.
+    Zero is not "be infinitely strict": no finite alpha admits zero false
+    alarms, and an alpha of 0.0 or infinity would silently turn every run into
+    either never-an-alarm or always-one. Fail loudly instead.
+    """
+    if false_alarm_budget <= 0:
+        raise ValueError(
+            f'derive_alpha: false_alarm_budget={false_alarm_budget} must be positive '
+            '(a budget of zero admits no finite alpha).'
+        )
+    if runs_per_quarter <= 0:
+        raise ValueError(f'derive_alpha: runs_per_quarter={runs_per_quarter} must be positive.')
+    if alarmed_metric_count <= 0:
+        raise ValueError(
+            f'derive_alpha: alarmed_metric_count={alarmed_metric_count} must be positive '
+            '(nothing can alarm, so there is no alpha to derive).'
+        )
+    return false_alarm_budget / (runs_per_quarter * alarmed_metric_count)
