@@ -79,6 +79,33 @@ which D1 says must be reported in the initial-state report and never alarmed on.
 window, so the exemplar the dashboard-shaped reader parses is valid by
 construction rather than by hand.
 
+Its exact recipe lives in one place — `evaluate_exemplar()` in
+`tests/test_memory_eval_boundary.py` — so the artifact is reproducible rather
+than a mystery blob: the **regression run** (`metrics-20260704T031500Z.json`)
+judged against the three baseline runs, resuming from a grandfather set seeded
+by the *first* baseline run's failures, under
+`LimitsConfig(false_alarm_budget=1.0, runs_per_quarter=90, min_samples=10,
+baseline_window=3)` — which derives α = 1/360 across 4 alarm-eligible metrics.
+That run was chosen because it exercises all three alarm paths at once (a
+proportion regression, a count regression and a newly-failing tripwire item)
+*and* the ratchet releasing `t-routing-ladder`, leaving the known-bad list at
+exactly `["t-recon-watcher-triage"]`. To regenerate:
+
+```python
+from pathlib import Path
+from shared.memory_eval_limits import limits_artifact_path, write_limits_artifact
+from test_memory_eval_boundary import evaluate_exemplar  # tests/ on sys.path
+
+result = evaluate_exemplar()
+write_limits_artifact(result, limits_artifact_path(Path('tests/fixtures/memory_eval'), result.eval_id))
+```
+
+`TestDashboardShapedReader` consumes it two ways that must agree: with plain
+`json.load` + dict access (no `shared.memory_eval_*` import at all, exactly as a
+dashboard would), and by regenerating it and asserting byte-identity. The first
+pins the published contract; the second stops the committed bytes drifting from
+what the writer emits.
+
 The `metrics-*.json` series files are hand-authored, but in the writer's exact
 canonical serialization: `json.dumps(..., indent=2, sort_keys=True,
 ensure_ascii=False)` plus a trailing newline, with `None`-valued optional

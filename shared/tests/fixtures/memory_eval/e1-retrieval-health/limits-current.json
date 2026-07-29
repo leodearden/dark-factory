@@ -1,0 +1,165 @@
+{
+  "alarmed_metric_count": 4,
+  "alarms": [
+    {
+      "alpha": 0.002777777777777778,
+      "baseline": 0.8,
+      "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278.",
+      "item_key": null,
+      "metric_id": "canonical-in-top-5",
+      "p_value": 1.8424481488582408e-06,
+      "rule_kind": "proportion",
+      "value": 0.4
+    },
+    {
+      "alpha": 0.002777777777777778,
+      "baseline": 5.0,
+      "detail": "20 against a baseline rate of 5 over 3 run(s). p=3.45e-07 < alpha=0.00278.",
+      "item_key": null,
+      "metric_id": "dangling-pointers",
+      "p_value": 3.452135820914455e-07,
+      "rule_kind": "count",
+      "value": 20.0
+    },
+    {
+      "alpha": null,
+      "baseline": 2.0,
+      "detail": "Item 't-worktree-lifecycle' newly fails and is not grandfathered.",
+      "item_key": "t-worktree-lifecycle",
+      "metric_id": "topic-canonical-present",
+      "p_value": null,
+      "rule_kind": "tripwire",
+      "value": 2.0
+    }
+  ],
+  "alpha": 0.002777777777777778,
+  "baseline_run_stamps": [
+    "20260701T031500Z",
+    "20260702T031500Z",
+    "20260703T031500Z"
+  ],
+  "baseline_window": 3,
+  "eval_id": "e1-retrieval-health",
+  "false_alarm_budget": 1.0,
+  "generator": "shared.memory_eval_limits",
+  "grandfather_set": [
+    "t-recon-watcher-triage"
+  ],
+  "grandfather_set_hash": "cc6c9e1dd1f3cef2d90009d3a28e068277b6e4dbeaf2e8e675403f410bbbd997",
+  "min_samples": 10,
+  "run_stamp": "20260704T031500Z",
+  "runs_per_quarter": 90,
+  "schema_version": 1,
+  "verdicts": [
+    {
+      "alarms": [
+        {
+          "alpha": 0.002777777777777778,
+          "baseline": 0.8,
+          "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278.",
+          "item_key": null,
+          "metric_id": "canonical-in-top-5",
+          "p_value": 1.8424481488582408e-06,
+          "rule_kind": "proportion",
+          "value": 0.4
+        }
+      ],
+      "alpha": 0.002777777777777778,
+      "baseline": 0.8,
+      "baseline_run_stamps": [
+        "20260701T031500Z",
+        "20260702T031500Z",
+        "20260703T031500Z"
+      ],
+      "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s).",
+      "metric_id": "canonical-in-top-5",
+      "n": 30,
+      "p_value": 1.8424481488582408e-06,
+      "rule_kind": "proportion",
+      "status": "alarm",
+      "value": 0.4
+    },
+    {
+      "alarms": [
+        {
+          "alpha": 0.002777777777777778,
+          "baseline": 5.0,
+          "detail": "20 against a baseline rate of 5 over 3 run(s). p=3.45e-07 < alpha=0.00278.",
+          "item_key": null,
+          "metric_id": "dangling-pointers",
+          "p_value": 3.452135820914455e-07,
+          "rule_kind": "count",
+          "value": 20.0
+        }
+      ],
+      "alpha": 0.002777777777777778,
+      "baseline": 5.0,
+      "baseline_run_stamps": [
+        "20260701T031500Z",
+        "20260702T031500Z",
+        "20260703T031500Z"
+      ],
+      "detail": "20 against a baseline rate of 5 over 3 run(s).",
+      "metric_id": "dangling-pointers",
+      "n": 30,
+      "p_value": 3.452135820914455e-07,
+      "rule_kind": "count",
+      "status": "alarm",
+      "value": 20.0
+    },
+    {
+      "alarms": [],
+      "alpha": 0.002777777777777778,
+      "baseline": 2.0,
+      "baseline_run_stamps": [
+        "20260701T031500Z",
+        "20260702T031500Z",
+        "20260703T031500Z"
+      ],
+      "detail": "2 against a baseline rate of 2 over 3 run(s).",
+      "metric_id": "superseded-above-successor",
+      "n": 30,
+      "p_value": 1.0,
+      "rule_kind": "count",
+      "status": "ok",
+      "value": 2.0
+    },
+    {
+      "alarms": [
+        {
+          "alpha": null,
+          "baseline": 2.0,
+          "detail": "Item 't-worktree-lifecycle' newly fails and is not grandfathered.",
+          "item_key": "t-worktree-lifecycle",
+          "metric_id": "topic-canonical-present",
+          "p_value": null,
+          "rule_kind": "tripwire",
+          "value": 2.0
+        }
+      ],
+      "alpha": null,
+      "baseline": 2.0,
+      "baseline_run_stamps": [],
+      "detail": "2 failing, 2 grandfathered, 1 new; 1 fixed and released.",
+      "metric_id": "topic-canonical-present",
+      "n": 8,
+      "p_value": null,
+      "rule_kind": "tripwire",
+      "status": "alarm",
+      "value": 2.0
+    },
+    {
+      "alarms": [],
+      "alpha": null,
+      "baseline": null,
+      "baseline_run_stamps": [],
+      "detail": "Scalar: reported for trend, no alarm rule attached (M2).",
+      "metric_id": "search-latency-p50-ms",
+      "n": 30,
+      "p_value": null,
+      "rule_kind": "scalar",
+      "status": "ok",
+      "value": 44.0
+    }
+  ]
+}
