@@ -279,7 +279,9 @@ class TestArtifactWriter:
         metrics_path, report_path = write_metric_series(_make_series(), root)
         assert metrics_path.is_file()
         assert report_path.is_file()
-        assert metrics_path == metrics_artifact_path(root, 'e1-retrieval-health', '20260701T031500Z')
+        assert metrics_path == metrics_artifact_path(
+            root, 'e1-retrieval-health', '20260701T031500Z'
+        )
         assert report_path == report_artifact_path(root, 'e1-retrieval-health', '20260701T031500Z')
 
     def test_written_json_reloads_to_an_equal_model(self, tmp_path):

@@ -29,11 +29,18 @@ a future schema version adds never break them.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'RUN_STAMP_ENV_VAR',
     'SCHEMA_VERSION',
     'Corpus',
     'Metric',
@@ -41,11 +48,35 @@ __all__ = [
     'MetricSchemaError',
     'MetricSeries',
     'TripwireItem',
+    'load_metric_series',
+    'load_series_window',
+    'metrics_artifact_path',
     'parse_metric_series',
+    'render_report',
+    'report_artifact_path',
+    'run_stamp',
+    'serialize_metric_series',
     'validate_metric_series',
+    'write_metric_series',
 ]
 
 SCHEMA_VERSION = 1
+
+RUN_STAMP_ENV_VAR = 'MEMORY_EVAL_RUN_STAMP'
+"""Env var overriding the per-run stamp (the ``CGL_RUN_STAMP`` idiom).
+
+Lets a caller pin every artifact of one logical run — several runners writing
+under one root — to the same stamp, and lets a test produce deterministic
+filenames without freezing the clock.
+"""
+
+_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
+"""Zero-padded UTC, so lexicographic filename order IS chronological order.
+
+That equivalence is what :func:`load_series_window` relies on to find the
+trailing baseline window by sorting filenames, the same string-comparison
+convention ``canary.load_window_rows`` uses.
+"""
 
 _WHOLE_NUMBER_TOL = 1e-9
 """Relative slack when asking "is this float a whole number?".
@@ -279,3 +310,157 @@ def parse_metric_series(data: dict) -> MetricSeries:
     :func:`validate_metric_series` instead.
     """
     return MetricSeries.model_validate(data)
+
+
+def run_stamp(*, env_var: str = RUN_STAMP_ENV_VAR) -> str:
+    """The stamp identifying this run's artifacts.
+
+    Honours *env_var* first (see :data:`RUN_STAMP_ENV_VAR`), else the current
+    UTC time in :data:`_STAMP_FORMAT`.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return override
+    return datetime.now(UTC).strftime(_STAMP_FORMAT)
+
+
+def metrics_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
+    """``<root>/<eval_id>/metrics-<STAMP>.json`` (M1 §3)."""
+    return Path(root) / eval_id / f'metrics-{stamp}.json'
+
+
+def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
+    """``<root>/<eval_id>/report-<STAMP>.txt`` — the human-readable companion.
+
+    M1 requires a "human-readable report beside it": the JSON is what the
+    evaluator and dashboard read, this is what an operator reads when an
+    escalation points them at a run.
+    """
+    return Path(root) / eval_id / f'report-{stamp}.txt'
+
+
+def serialize_metric_series(series: MetricSeries) -> str:
+    """Render *series* as the canonical artifact text.
+
+    ``sort_keys=True`` plus a trailing newline so two identical runs produce
+    byte-identical files and a real change diffs cleanly; ``exclude_none`` so an
+    unused optional field is absent rather than an explicit ``null``.
+    """
+    payload = series.model_dump(mode='json', exclude_none=True)
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
+def render_report(series: MetricSeries) -> str:
+    """Render the human-readable companion report for *series*."""
+    lines = [
+        f'memory-eval run: {series.eval_id}',
+        f'run_stamp:       {series.run_stamp}',
+        f'schema_version:  {series.schema_version}',
+        f'project_id:      {series.corpus.project_id}',
+    ]
+    if series.corpus.counts:
+        lines.append('corpus counts:')
+        lines.extend(f'  {k}: {v}' for k, v in sorted(series.corpus.counts.items()))
+    lines.append('')
+    lines.append(f'metrics ({len(series.metrics)}):')
+    for metric in series.metrics:
+        detail = f'value={metric.value} n={metric.n}'
+        if metric.denominator is not None:
+            detail += f' denominator={metric.denominator}'
+        lines.append(f'  [{metric.kind}] {metric.metric_id}: {detail}')
+        if metric.items:
+            failed = [item.item_key for item in metric.items if not item.passed]
+            lines.append(f'    failing items ({len(failed)}/{len(metric.items)}):')
+            lines.extend(f'      - {key}' for key in failed)
+        if metric.details_path is not None:
+            lines.append(f'    details: {metric.details_path}')
+    return '\n'.join(lines) + '\n'
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via temp-in-dir + os.replace.
+
+    Copied from ``shared.prompt_artifact._atomic_write_text`` rather than
+    imported (it is module-private there, and ``shared.safe_io`` has only a
+    lenient reader — there is no atomic writer in ``shared/`` to reuse). The
+    temp file comes from :func:`tempfile.mkstemp` — an OS-guaranteed fresh,
+    exclusively-created name — rather than a pid-derived one, because the
+    memory-eval runners (PRD leaves β/γ/δ) all write under a single artifact
+    root and a shared ``<name>.<pid>.tmp`` would let concurrent writers clobber
+    each other's in-flight write.
+
+    A reader never observes a half-written file: either the old contents (if
+    any) or the complete new contents. On any failure the temp is unlinked and
+    the exception re-raised, so a failed write leaves nothing behind.
+    """
+    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def write_metric_series(
+    series: MetricSeries | dict,
+    root: str | Path,
+    *,
+    stamp: str | None = None,
+) -> tuple[Path, Path]:
+    """Emit *series* under *root*, returning ``(metrics_path, report_path)``.
+
+    Validates BEFORE creating anything: a malformed series raises
+    :class:`MetricSchemaError` and leaves no directory, no partial artifact and
+    no temp file. That ordering is the M1 "rejected at emit time" guarantee made
+    operational — a runner that computed a bad metric must not leave a
+    half-artifact for the evaluator to trip over later.
+
+    *stamp* defaults to the series' own ``run_stamp``, so the filename and the
+    payload agree unless a caller deliberately overrides it.
+    """
+    model = _coerce_series(series)
+    effective_stamp = stamp if stamp is not None else model.run_stamp
+    metrics_path = metrics_artifact_path(root, model.eval_id, effective_stamp)
+    report_path = report_artifact_path(root, model.eval_id, effective_stamp)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(metrics_path, serialize_metric_series(model))
+    _atomic_write_text(report_path, render_report(model))
+    return metrics_path, report_path
+
+
+def load_metric_series(path: str | Path) -> MetricSeries:
+    """Load and validate one metrics artifact.
+
+    Errors propagate uncaught: a missing file raises ``FileNotFoundError``,
+    malformed JSON raises ``json.JSONDecodeError``, and a payload that does not
+    satisfy M1 raises :class:`MetricSchemaError`. An unreadable baseline run
+    must never be silently skipped — that would shorten the window the limits
+    evaluator reasons over without anyone noticing.
+    """
+    with open(path, encoding='utf-8') as fh:
+        data = json.load(fh)
+    return _coerce_series(data)
+
+
+def load_series_window(
+    root: str | Path,
+    eval_id: str,
+    *,
+    limit: int,
+) -> list[MetricSeries]:
+    """The trailing *limit* runs for *eval_id*, oldest first.
+
+    Sorted by filename, which is chronological because the stamp is zero-padded
+    UTC (see :data:`_STAMP_FORMAT`). A missing eval directory yields an empty
+    window rather than raising — "this eval has never run" is a legitimate state
+    the evaluator handles as ``insufficient_data``, not an error. A file that
+    exists but does not parse still raises (see :func:`load_metric_series`).
+    """
+    eval_dir = Path(root) / eval_id
+    if not eval_dir.is_dir():
+        return []
+    paths = sorted(eval_dir.glob('metrics-*.json'))
+    return [load_metric_series(p) for p in paths[-limit:]] if limit > 0 else []
