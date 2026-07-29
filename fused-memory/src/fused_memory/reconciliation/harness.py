@@ -111,8 +111,13 @@ except ImportError:
 # HAS_ESCALATION before using it.
 #
 # Escalation-closure contract (A7b / plans/afk-A7-recon-closure.md):
-#   - The reconciliation harness NEVER calls queue.resolve().
+#   - The reconciliation harness NEVER calls queue.resolve() ON THE RECON
+#     ESCALATION QUEUE (config.escalation_queue_dir).
 #   - The watcher session (port 8103) is the sole closer of recon escalations.
+#     Scope note (task 2998): the judge-halt record BacklogPolicy writes to
+#     <project_root>/data/escalations/ lives in a DIFFERENT queue and is closed
+#     by BacklogPolicy.on_judge_unhalt — write and close stay with the class
+#     that owns that record, so this invariant is not contradicted.
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
@@ -207,6 +212,15 @@ _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 # predicate and its guard are private to this module.
 _PLACEHOLDER_DROP_STORM_THRESHOLD = 5
 _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
+
+# Throttle window for the '_notify_judge_halt escalated to nothing' WARNING.
+# Task 2998 deliberately stopped burning the per-process dedupe token on a
+# failed write, so a halted project with no live orchestrator re-enters that
+# path on EVERY halted tick (~5s) — unthrottled that is ~17k WARNING
+# lines/day/project, drowning the signal it exists to raise. Matches the
+# BacklogPolicy rejection-branch throttle and the default escalation
+# rate-limit window; the first failure per halt always warns.
+_HALT_ESCALATION_WARN_INTERVAL_SECONDS = 900.0  # 15m
 
 # Stable finding identity for the placeholder-drop storm alarm — same
 # fingerprint-stability rationale as _DEAD_OWNER_STORM_FINDING above.
@@ -458,9 +472,25 @@ class ReconciliationHarness:
             dict(known_projects) if known_projects is not None
             else build_known_projects_map(self._project_root)
         )
+        # Task 2998 GAP A: seed the policy's project_root cache NOW, at
+        # construction.  Its only other writer is BacklogPolicy.check(), which
+        # runs on a mutating MCP call — so a halt rehydrated by
+        # Judge.initialize() fires _notify_judge_halt before any root has been
+        # registered, _route_over_limit falls to the rejection branch, and
+        # NOTHING is written (the 48h reify incident: 0 of 96 escalation files
+        # carried ReconciliationJudgeHalted, and no log line of any kind).
+        if self._backlog_policy is not None and self._known_projects:
+            self._backlog_policy.register_known_project_roots(self._known_projects)
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
+        # Throttle clock (monotonic) for the 'escalated to nothing' WARNING,
+        # per project. Cleared on a successful escalation and on unhalt, so the
+        # first failure of the NEXT halt is always loud.
+        self._halt_escalation_warn_ts: dict[str, float] = {}
+        # Task 2998: escalation ids closed by unhalts not yet reported to the
+        # MCP tool layer. Pop-once — see take_resolved_halt_escalations.
+        self._resolved_halt_escalations: dict[str, list[str]] = {}
 
         # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
         # DISTINCT dead-owner instance UUIDs among dead_owner_shielded
@@ -566,29 +596,106 @@ class ReconciliationHarness:
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
 
-        Routes to escalation when an orchestrator is live for this project;
-        otherwise the next mutating MCP call will surface the halt as a
-        structured rejection via :class:`BacklogPolicy`. Best-effort: a
-        failure here must not break the harness loop.
+        Routes to escalation when an orchestrator is live for this project.
+        When it does not — the rejection branch, or a rate-limited call that
+        wrote no file — the halt reaches NO caller: the ``ReconciliationJudgeHalted``
+        verdict returned here is not surfaced anywhere (the next mutating MCP
+        call runs ``BacklogPolicy.check()``, which re-evaluates the BACKLOG
+        condition and yields ``ReconciliationBacklogExceeded`` instead). The
+        only fallback is the retry below: the dedupe sentinel is claimed ONLY
+        on a verdict that actually wrote an escalation file, so a failed
+        attempt is retried on the next halted tick (~5s) rather than burning
+        the single per-process token (task 2998 GAP B / 2b).
+
+        Best-effort: a failure here must not break the harness loop.
         """
         if self._backlog_policy is None or project_id in self._halt_escalated:
             return
-        self._halt_escalated.add(project_id)
         try:
-            await self._backlog_policy.on_judge_halt(project_id, reason)
+            verdict = await self._backlog_policy.on_judge_halt(project_id, reason)
         except Exception:
             logger.exception(
                 'harness: backlog_policy.on_judge_halt raised for %s', project_id,
             )
+            return
 
-    def _on_judge_unhalt(self, project_id: str) -> None:
-        """Callback invoked by Judge.unhalt so a subsequent halt re-escalates.
+        if (
+            verdict is not None
+            and verdict.outcome == 'escalated'
+            and verdict.escalation_path is not None
+        ):
+            self._halt_escalated.add(project_id)
+            self._halt_escalation_warn_ts.pop(project_id, None)
+            return
 
-        Without clearing the escalation sentinel, a manual unhalt followed by
-        the halt re-firing (for whatever reason) would silently skip the
-        escalation path because _notify_judge_halt dedupes per-process.
+        # Throttled — see _HALT_ESCALATION_WARN_INTERVAL_SECONDS. The retry
+        # itself is NOT throttled (that is the whole point of GAP B); only the
+        # log line is, so a persistently-undeliverable halt stays visible
+        # without emitting one WARNING every 5 seconds forever.
+        outcome = getattr(verdict, 'outcome', None)
+        now = time.monotonic()
+        last_warned = self._halt_escalation_warn_ts.get(project_id)
+        if (
+            last_warned is None
+            or (now - last_warned) >= _HALT_ESCALATION_WARN_INTERVAL_SECONDS
+        ):
+            self._halt_escalation_warn_ts[project_id] = now
+            emit = logger.warning
+        else:
+            emit = logger.debug
+        emit(
+            'harness: judge halt for %s escalated to nothing (outcome=%s) — '
+            'will retry on next halted tick',
+            project_id, outcome,
+        )
+
+    async def _on_judge_unhalt(self, project_id: str) -> None:
+        """Callback invoked by Judge.unhalt. Two responsibilities:
+
+        1. Clear the escalation sentinel so a subsequent halt re-escalates.
+           Without this, a manual unhalt followed by the halt re-firing (for
+           whatever reason) would silently skip the escalation path because
+           _notify_judge_halt dedupes per-process.
+        2. Close the escalation the halt opened, via
+           ``BacklogPolicy.on_judge_unhalt`` — otherwise the
+           ``esc-reconciliation-halt-*.json`` stays pending forever and the
+           dashboard keeps showing a halt that no longer exists (task 2998).
+
+        Order matters: the sentinel is discarded FIRST, so a failure to close
+        the record can never leave a stale sentinel behind — that would
+        suppress the NEXT halt escalation entirely, which is strictly worse
+        than one un-closed record.
+
+        No Judge plumbing change is needed for the async signature:
+        ``UnhaltCallback`` is typed ``Callable[[str], Awaitable[None] | None]``
+        and ``Judge.unhalt`` already awaits an awaitable callback result.
         """
         self._halt_escalated.discard(project_id)
+        self._halt_escalation_warn_ts.pop(project_id, None)
+        if self._backlog_policy is None:
+            return
+        try:
+            resolved = await self._backlog_policy.on_judge_unhalt(project_id)
+        except Exception:
+            logger.exception(
+                'harness: backlog_policy.on_judge_unhalt raised for %s', project_id,
+            )
+            return
+        if resolved:
+            # ACCUMULATE rather than overwrite: an auto-unhalt-after-cooldown
+            # stages ids that nothing pops, so a plain assignment would drop an
+            # earlier unread close on the floor. Order-preserving dedupe keeps
+            # a repeat close from being reported twice.
+            staged = self._resolved_halt_escalations.setdefault(project_id, [])
+            staged.extend(esc_id for esc_id in resolved if esc_id not in staged)
+
+    def take_resolved_halt_escalations(self, project_id: str) -> list[str]:
+        """Pop the escalation ids closed by the most recent unhalt.
+
+        A pop-once handoff for the MCP tool layer (``unhalt_reconciliation``):
+        reading it clears it, so the same close is never reported twice.
+        """
+        return self._resolved_halt_escalations.pop(project_id, [])
 
     @property
     def project_root(self) -> str:
@@ -1948,8 +2055,11 @@ class ReconciliationHarness:
         """Submit an escalation to the queue (fire-and-forget).
 
         Routing contract (A7b):
-        - The harness NEVER calls queue.resolve() — the escalation-watcher
+        - The harness NEVER calls queue.resolve() **on the recon escalation
+          queue** (``config.escalation_queue_dir``) — the escalation-watcher
           session (port 8103) is the sole closer per plans/afk-A7-recon-closure.md.
+          The judge-halt record in ``<project_root>/data/escalations/`` is a
+          DIFFERENT queue, written and closed by BacklogPolicy (see task 2998).
         - Dedup folds only on the way IN, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
         - When finding is not None (a finding dict with category / affected_ids /
           description), the fingerprint is keyed on finding identity so the same
