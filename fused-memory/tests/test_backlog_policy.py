@@ -372,6 +372,108 @@ async def test_watchdog_wedge_does_not_fan_out_to_idle_startup_seeded_projects(
 
 
 @pytest.mark.asyncio
+async def test_watchdog_wedge_survives_count_buffered_failure(tmp_path, caplog):
+    """An unavailable buffered count must not SUPPRESS the wedge alert.
+
+    ``count_buffered`` raises when the db is not initialised and on any sqlite
+    error ('database is locked', disk I/O) — precisely the conditions under
+    which a drainer wedge fires. An unguarded raise propagates out of
+    ``on_watchdog_wedge`` (the watchdog's ``except Exception`` merely logs
+    'wedge_callback raised'), so ZERO escalations get written for ANY project,
+    including explicitly-registered active ones. Fail loud AND inclusive.
+    """
+    logger_name = 'fused_memory.reconciliation.backlog_policy'
+    roots = {}
+    for name in ('explicit', 'seeded'):
+        root = tmp_path / f'{name}_root'
+        root.mkdir()
+        roots[name] = root
+
+    broken_buffer = MagicMock()
+    broken_buffer.count_buffered = AsyncMock(
+        side_effect=RuntimeError('database is locked'),
+    )
+
+    policy = BacklogPolicy(broken_buffer, _StubQueue(queue_depth=5), lambda _: True)
+    policy.register_project_root('explicit', str(roots['explicit']))
+    policy.register_known_project_roots({'seeded': str(roots['seeded'])})
+
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        verdicts = await policy.on_watchdog_wedge({'stale_for_seconds': 180.0})
+
+    # Both projects are alerted — the seeded one is NOT dropped just because
+    # its count was unavailable.
+    assert {v.project_id for v in verdicts} == {'explicit', 'seeded'}
+    assert all(v.outcome == 'escalated' for v in verdicts)
+    for root in roots.values():
+        files = list((root / 'data' / 'escalations').iterdir())
+        assert len(files) == 1
+        # buffered is None → the escalation reports the global queue pressure
+        # alone (5) rather than a fabricated per-project count.
+        assert json.loads(files[0].read_text())['backlog'] == 5
+
+    text = '\n'.join(r.getMessage() for r in caplog.records if r.name == logger_name)
+    assert 'count_buffered failed' in text
+    assert 'database is locked' in text
+
+    # The count is taken ONCE per project (the wedge path reuses the filter's
+    # value instead of re-querying via current_backlog).
+    assert broken_buffer.count_buffered.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rejection_branch_warning_is_throttled(event_buffer, tmp_path, caplog):
+    """The rejection WARNING must not repeat on every ~5s halted tick.
+
+    GAP B deliberately stopped burning the dedupe token on a failed write, so
+    a halted project with no live orchestrator re-enters the rejection branch
+    every harness tick. Unthrottled that is ~17k WARNING lines/day/project,
+    which drowns the signal the line exists to raise. First rejection warns;
+    repeats inside the window are DEBUG; a rejection still happening a window
+    later warns again.
+    """
+    logger_name = 'fused_memory.reconciliation.backlog_policy'
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+
+    clock = {'t': 1000.0}
+    policy = BacklogPolicy(
+        event_buffer,
+        _StubQueue(),
+        lambda _: False,  # no live orchestrator → rejection branch
+        rate_limit_seconds=900.0,
+        time_provider=lambda: clock['t'],
+    )
+    policy.register_project_root('proj', str(project_root))
+
+    def _counts():
+        warns = [
+            r for r in caplog.records
+            if r.name == logger_name and r.levelno == logging.WARNING
+        ]
+        debugs = [
+            r for r in caplog.records
+            if r.name == logger_name and r.levelno == logging.DEBUG
+        ]
+        return len(warns), len(debugs)
+
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        for _ in range(4):
+            assert (await policy.on_judge_halt('proj', reason='r')).is_rejection
+        assert _counts() == (1, 3)
+
+        # A DIFFERENT fault kind keeps its own clock — a throttled halt must
+        # never mute a first backlog/wedge rejection.
+        await policy.on_watchdog_wedge({'stale_for_seconds': 180.0})
+        assert _counts() == (2, 3)
+
+        # Still rejecting a full window later → loud again.
+        clock['t'] += 901.0
+        assert (await policy.on_judge_halt('proj', reason='r')).is_rejection
+        assert _counts() == (3, 3)
+
+
+@pytest.mark.asyncio
 async def test_rejection_branch_logs_why_no_escalation_was_written(
     event_buffer, tmp_path, caplog,
 ):
@@ -888,6 +990,20 @@ async def test_backlog_escalation_detail_names_correct_probe(event_buffer, tmp_p
 # ── on_judge_unhalt: auto-close the halt escalation (task 2998 GAP 3) ──────
 
 
+def _persisted_record(esc_dir: Path, esc_id: str) -> dict:
+    """Read a record from disk after resolve() — root first, then the archive.
+
+    ``resolve()`` MOVES the file into ``<esc_dir>/archive/<date>/``, but leaves
+    it in the queue root when the archive move fails, so both are probed.
+    """
+    root = esc_dir / f'{esc_id}.json'
+    if root.exists():
+        return json.loads(root.read_text(encoding='utf-8'))
+    archived = sorted(esc_dir.glob(f'archive/*/{esc_id}.json'))
+    assert archived, f'{esc_id} not found under {esc_dir} or its archive'
+    return json.loads(archived[-1].read_text(encoding='utf-8'))
+
+
 class TestOnJudgeUnhalt:
     """Clearing a halt must close the escalation the halt opened.
 
@@ -969,6 +1085,19 @@ class TestOnJudgeUnhalt:
         assert other_id in still_pending
         assert halt_id not in still_pending
 
+        # The CLOSED record must still identify its project and fault kind.
+        # resolve() persists Escalation.to_json(), and from_dict keeps only
+        # dataclass fields, so without a re-merge these four policy-owned keys
+        # are destroyed on close — and the forensic query that diagnosed this
+        # incident ('which escalation files carry ReconciliationJudgeHalted')
+        # stops working against every auto-closed record.
+        persisted = _persisted_record(esc_dir, halt_id)
+        assert persisted['project_id'] == 'proj'
+        assert persisted['error_type'] == 'ReconciliationJudgeHalted'
+        assert 'backlog' in persisted
+        assert 'threshold' in persisted
+        assert persisted['status'] == 'resolved'
+
     @pytest.mark.asyncio
     async def test_second_unhalt_is_idempotent(self, event_buffer, tmp_path):
         policy, _esc_dir, halt_id, _backlog_id, _other = await self._setup(
@@ -977,6 +1106,60 @@ class TestOnJudgeUnhalt:
 
         assert await policy.on_judge_unhalt('proj') == [halt_id]
         assert await policy.on_judge_unhalt('proj') == []
+
+    @pytest.mark.asyncio
+    async def test_resolve_no_op_is_not_reported_as_closed(
+        self, event_buffer, tmp_path, caplog,
+    ):
+        """A resolve() that did NOT close anything must not be reported closed.
+
+        ``queue.resolve()`` returns None when the id cannot be located — e.g. a
+        record whose ``id`` key disagrees with its filename, since ``get()``
+        derives the path from the id. Appending unconditionally makes the MCP
+        tool tell the operator 'Auto-resolved 1 pending halt escalation(s)' for
+        a record that stays pending forever: the exact silent rot this feature
+        exists to remove, merely relabelled as success.
+        """
+        logger_name = 'fused_memory.reconciliation.backlog_policy'
+        project_root = tmp_path / 'proj_root'
+        esc_dir = project_root / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+
+        policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+        policy.register_project_root('proj', str(project_root))
+
+        # id key deliberately disagrees with the filename stem.
+        path = esc_dir / 'esc-reconciliation-halt-ONDISK.json'
+        path.write_text(
+            json.dumps({
+                'id': 'esc-reconciliation-halt-DIFFERENT',
+                'task_id': None,
+                'agent_role': 'fused-memory',
+                'severity': 'blocking',
+                'category': 'infra_issue',
+                'summary': 'Reconciliation HALTED for proj',
+                'detail': 'halt whose id does not match its filename',
+                'suggested_action': 'inspect_judge_halt',
+                'timestamp': '2026-07-28T00:00:00+00:00',
+                'status': 'pending',
+                'level': 1,
+                'workflow_state': 'infra',
+                'project_id': 'proj',
+                'error_type': 'ReconciliationJudgeHalted',
+            }, indent=2),
+            encoding='utf-8',
+        )
+
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            assert await policy.on_judge_unhalt('proj') == []
+
+        text = '\n'.join(
+            r.getMessage() for r in caplog.records if r.name == logger_name
+        )
+        assert 'no-op' in text
+        assert 'esc-reconciliation-halt-DIFFERENT' in text
+        # And the record on disk is still, in fact, pending.
+        assert json.loads(path.read_text())['status'] == 'pending'
 
     @pytest.mark.asyncio
     async def test_unregistered_project_returns_empty_and_logs(

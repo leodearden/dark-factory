@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -62,6 +62,16 @@ _ESC_ID_PREFIXES: dict[str, str] = {
     'judge_halt': 'esc-reconciliation-halt-',
     'wedge': 'esc-reconciliation-wedge-',
 }
+
+# Keys BacklogPolicy stamps onto its escalation records that are NOT
+# ``Escalation`` dataclass fields. ``EscalationQueue.resolve()`` rewrites the
+# file from ``Escalation.to_json()`` (== ``asdict(Escalation)``), so closing a
+# record DESTROYS them unless they are re-merged afterwards — and with
+# ``project_id``/``error_type`` gone the archived halt is no longer
+# attributable to a project, breaking the exact forensic query that diagnosed
+# the 48h reify incident ('0 of 96 escalation files carried
+# ReconciliationJudgeHalted'). See BacklogPolicy._restore_policy_keys.
+_POLICY_ONLY_KEYS: tuple[str, ...] = ('project_id', 'error_type', 'backlog', 'threshold')
 
 
 @dataclass(frozen=True)
@@ -143,6 +153,11 @@ class BacklogPolicy:
         # map rather than observed on a real mutating call.  See
         # register_known_project_roots for why the provenance is tracked.
         self._startup_seeded: set[str] = set()
+        # Throttle clock for the rejection-branch WARNING, keyed by
+        # (project_id, kind).  Deliberately NOT a _PolicyState field: writing
+        # one would setdefault a _state entry for an id that has no registered
+        # root, which _projects_with_backlog would then fan a wedge out to.
+        self._last_reject_log_ts: dict[tuple[str, str], float] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -202,6 +217,13 @@ class BacklogPolicy:
         state = self._state.get(project_id)
         return state.project_root if state else None
 
+    def _queue_pressure(self) -> int:
+        """Global (un-sharded) queue depth + retries in flight."""
+        if self._event_queue is None:
+            return 0
+        stats = self._event_queue.stats()
+        return int(stats.get('queue_depth') or 0) + int(stats.get('retry_in_flight') or 0)
+
     async def current_backlog(self, project_id: str) -> int:
         """Count buffered events + in-flight queue for ``project_id``.
 
@@ -211,13 +233,7 @@ class BacklogPolicy:
         trying to shard it. The binding signal is still per-project buffered.
         """
         db_count = await self._event_buffer.count_buffered(project_id)
-        queue_depth = 0
-        retry_in_flight = 0
-        if self._event_queue is not None:
-            stats = self._event_queue.stats()
-            queue_depth = int(stats.get('queue_depth') or 0)
-            retry_in_flight = int(stats.get('retry_in_flight') or 0)
-        return db_count + queue_depth + retry_in_flight
+        return db_count + self._queue_pressure()
 
     async def check(
         self, project_id: str, project_root: str | None = None,
@@ -302,7 +318,10 @@ class BacklogPolicy:
         ``queue.get_pending()`` unfilterable by project.
 
         Returns the ids actually resolved (empty when there is nothing to do),
-        so the caller can report them to the operator.
+        so the caller can report them to the operator. An id is reported ONLY
+        when ``queue.resolve()`` confirms the record reached a terminal status
+        — reporting a close that did not happen would be the same silent rot
+        this method exists to remove, merely relabelled as success.
         """
         project_root = self.project_root_for(project_id)
         if project_root is None:
@@ -339,7 +358,7 @@ class BacklogPolicy:
                 ):
                     continue
                 esc_id = record.get('id') or path.stem
-                queue.resolve(
+                closed = queue.resolve(
                     esc_id,
                     resolution=(
                         f'Reconciliation halt cleared for {project_id} '
@@ -347,6 +366,22 @@ class BacklogPolicy:
                     ),
                     resolved_by='fused-memory-judge-unhalt',
                 )
+                # resolve() returns None when the id cannot be located (its
+                # `id` key disagrees with the filename, or the `or path.stem`
+                # fallback landed on a stem that is not the id), and returns
+                # the UNCHANGED record when another resolver already moved it
+                # out of `pending`. Reporting either as a successful close
+                # tells the operator 'auto-resolved' about a record that stays
+                # pending forever — loud-over-silent inverted.
+                if closed is None or closed.status not in ('resolved', 'dismissed'):
+                    logger.warning(
+                        'backlog_policy: resolve() was a no-op for %s (%s) — '
+                        'record not closed (id/filename mismatch, or a '
+                        'non-terminal status: %s); NOT reporting it resolved',
+                        esc_id, path, getattr(closed, 'status', None),
+                    )
+                    continue
+                self._restore_policy_keys(esc_dir, esc_id, record)
             except (OSError, json.JSONDecodeError) as exc:
                 # One unreadable record must never block closing the rest.
                 logger.warning(
@@ -361,6 +396,64 @@ class BacklogPolicy:
             )
         return resolved
 
+    @staticmethod
+    def _locate_persisted(esc_dir: Path, esc_id: str) -> Path | None:
+        """Find a record on disk AFTER ``resolve()`` has run.
+
+        ``resolve()`` archives into ``<esc_dir>/archive/<YYYY-MM-DD>/<id>.json``
+        but deliberately leaves the file in the queue root when the archive
+        move fails (``_archive_resolved`` is best-effort), so both are probed —
+        root first, then the newest dated archive subdir.
+        """
+        root = esc_dir / f'{esc_id}.json'
+        if root.exists():
+            return root
+        # Dated subdir names sort chronologically, so the last match is newest.
+        archived = sorted(esc_dir.glob(f'archive/*/{esc_id}.json'))
+        return archived[-1] if archived else None
+
+    def _restore_policy_keys(
+        self, esc_dir: Path, esc_id: str, original: Mapping[str, Any],
+    ) -> None:
+        """Re-merge this policy's non-schema keys onto a just-closed record.
+
+        ``resolve()`` persists ``Escalation.to_json()``, and ``from_dict``
+        keeps only dataclass fields, so closing a halt silently strips
+        ``project_id``/``error_type``/``backlog``/``threshold`` — see
+        ``_POLICY_ONLY_KEYS``. Re-merging keeps an auto-closed halt
+        attributable to its project and its fault kind.
+
+        Best-effort by construction: every failure is logged and swallowed.
+        A record that IS closed but lost its forensic keys must never be
+        misreported as un-closed, so this can never fail the caller.
+        """
+        keys = {k: original[k] for k in _POLICY_ONLY_KEYS if k in original}
+        if not keys:
+            return
+        path = self._locate_persisted(esc_dir, esc_id)
+        if path is None:
+            logger.warning(
+                'backlog_policy: closed %s but could not locate the persisted '
+                'record under %s to restore %s — the archived record will not '
+                'identify its project',
+                esc_id, esc_dir, sorted(keys),
+            )
+            return
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+            stripped = {k: v for k, v in keys.items() if record.get(k) != v}
+            if not stripped:
+                return
+            record.update(stripped)
+            tmp = path.with_name(f'{path.name}.tmp')
+            tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
+            tmp.replace(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                'backlog_policy: could not restore %s on closed record %s: %s',
+                sorted(keys), path, exc,
+            )
+
     async def on_watchdog_wedge(self, payload: dict) -> list[BacklogVerdict]:
         """Invoked by :class:`SqliteWatchdog` when the drainer is wedged.
 
@@ -369,9 +462,15 @@ class BacklogPolicy:
         the verdicts produced, primarily for test introspection.
         """
         verdicts: list[BacklogVerdict] = []
-        project_ids = await self._projects_with_backlog()
-        for project_id in project_ids:
-            backlog = await self.current_backlog(project_id)
+        # One stats() snapshot for the whole fan-out, and the per-project
+        # buffered counts are REUSED from the filter below rather than
+        # re-queried by current_backlog — a wedge is exactly when sqlite is
+        # least able to serve 2N counts. ``buffered is None`` means the count
+        # raised: report the global pressure alone rather than dropping the
+        # alert (see _projects_with_backlog).
+        queue_pressure = self._queue_pressure()
+        for project_id, buffered in await self._projects_with_backlog():
+            backlog = queue_pressure + (buffered or 0)
             verdict = await self._route_over_limit(
                 project_id=project_id,
                 backlog=backlog,
@@ -388,8 +487,12 @@ class BacklogPolicy:
             verdicts.append(verdict)
         return verdicts
 
-    async def _projects_with_backlog(self) -> list[str]:
+    async def _projects_with_backlog(self) -> list[tuple[str, int | None]]:
         """Project ids a fleet-wide fault (e.g. a drainer wedge) should escalate.
+
+        Returns ``(project_id, buffered_count)`` pairs. The count is ``None``
+        when the per-project query FAILED (see the failure policy below); the
+        caller reuses it so the wedge path counts each project once, not twice.
 
         Every EXPLICITLY registered id (one observed on a real mutating call,
         via ``register_project_root``) is returned unconditionally, including
@@ -411,15 +514,33 @@ class BacklogPolicy:
         ``current_backlog(pid) >= outstanding > 0`` hold for EVERY project by
         construction, so the filter would be inert and the fan-out regression
         would be live.  The signal must be per-project only.
+
+        Failure policy — LOUD and INCLUSIVE.  ``count_buffered`` raises when
+        the db is not initialised and on any sqlite error ('database is
+        locked', disk I/O): precisely the conditions under which the drainer
+        wedge that calls this fires.  An unguarded raise would propagate out of
+        ``on_watchdog_wedge`` (whose caller's ``except Exception`` only logs
+        'wedge_callback raised') and write ZERO wedge escalations for ANY
+        project, including explicitly-registered active ones.  So a failed
+        count warns and KEEPS the project in the fan-out: an unavailable count
+        must never silently suppress a wedge alert.
         """
-        candidates: list[str] = []
+        candidates: list[tuple[str, int | None]] = []
         for project_id in sorted(self._state.keys()):
-            if (
-                project_id in self._startup_seeded
-                and await self._event_buffer.count_buffered(project_id) == 0
-            ):
+            buffered: int | None
+            try:
+                buffered = await self._event_buffer.count_buffered(project_id)
+            except Exception as exc:
+                logger.warning(
+                    'backlog_policy: count_buffered failed for %s (%s) — keeping '
+                    'it in the wedge fan-out; an unavailable count must not '
+                    'suppress the alert',
+                    project_id, exc,
+                )
+                buffered = None
+            if buffered == 0 and project_id in self._startup_seeded:
                 continue
-            candidates.append(project_id)
+            candidates.append((project_id, buffered))
         return candidates
 
     async def _route_over_limit(
@@ -464,13 +585,29 @@ class BacklogPolicy:
         # Loud-over-silent (task 2998): the reject branch writes no escalation
         # file, so without this line the drop is invisible — the defining
         # symptom of the 48h reify incident was NO backlog_policy log of any
-        # kind. One line per rejection: a halted tick retries every ~5s.
+        # kind.
+        #
+        # THROTTLED to the escalation rate-limit window, on the same
+        # per-(project, kind) granularity. The GAP-B fix deliberately stopped
+        # burning the dedupe token on a failed write, so a halted project with
+        # no live orchestrator now re-enters this branch every ~5s harness
+        # tick — unthrottled that is ~17k WARNING lines/day/project, which
+        # drowns the very signal this line exists to raise. The FIRST
+        # rejection always warns; the repeats inside the window drop to DEBUG,
+        # and a rejection that is still happening a window later warns again.
         cause = (
             'project_root not registered'
             if project_root is None
             else f'no live orchestrator for {project_root}'
         )
-        logger.warning(
+        now = self._now()
+        last_logged = self._last_reject_log_ts.get((project_id, kind))
+        if last_logged is None or (now - last_logged) >= self._rate_limit_seconds:
+            self._last_reject_log_ts[(project_id, kind)] = now
+            emit = logger.warning
+        else:
+            emit = logger.debug
+        emit(
             'backlog_policy: no escalation written for %s (kind=%s, '
             'error_type=%s, backlog=%d) — %s',
             project_id, kind, error_type, backlog, cause,
