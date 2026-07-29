@@ -35,18 +35,29 @@ dependency of ``dark-factory-shared``, following the stdlib-only precedent of
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import math
+import os
+import tempfile
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from shared.memory_eval_metrics import Metric, MetricSeries
 
 __all__ = [
     'Alarm',
+    'ARTIFACT_SCHEMA_VERSION',
     'EvaluationResult',
+    'GENERATOR',
+    'LimitsArtifact',
     'LimitsConfig',
+    'LimitsSchemaError',
     'MetricVerdict',
     'RuleKind',
     'VerdictStatus',
@@ -57,8 +68,15 @@ __all__ = [
     'evaluate_series',
     'evaluate_tripwire',
     'grandfather_set_hash',
+    'limits_artifact_path',
+    'load_limits_artifact',
     'poisson_two_sided_p',
+    'write_limits_artifact',
 ]
+
+ARTIFACT_SCHEMA_VERSION = 1
+GENERATOR = 'shared.memory_eval_limits'
+"""Who wrote a given artifact, recorded in it. Cheap now, invaluable at 3am later."""
 
 RuleKind = Literal['tripwire', 'proportion', 'count', 'scalar']
 """Which rule judged a metric. Deliberately the SAME vocabulary as ``MetricKind``.
@@ -717,3 +735,170 @@ def evaluate_series(
         grandfather_hash=grandfather_set_hash(next_grandfather),
         baseline_run_stamps=tuple(series.run_stamp for series in window),
     )
+
+
+class LimitsSchemaError(ValueError):
+    """A ``limits-current.json`` that does not match the artifact schema.
+
+    A ``ValueError`` subclass, and raised in place of ``pydantic.ValidationError``,
+    so a runner or dashboard can catch one exception type without taking a
+    pydantic import — the same contract ``MetricSchemaError`` offers for M1.
+    """
+
+
+class _AlarmRecord(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    metric_id: str = Field(min_length=1)
+    rule_kind: RuleKind
+    detail: str
+    item_key: str | None = None
+    value: float | None = None
+    baseline: float | None = None
+    p_value: float | None = None
+    alpha: float | None = None
+
+
+class _VerdictRecord(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    metric_id: str = Field(min_length=1)
+    rule_kind: RuleKind
+    status: VerdictStatus
+    value: float
+    n: int = Field(ge=0)
+    alarms: list[_AlarmRecord] = Field(default_factory=list)
+    baseline: float | None = None
+    p_value: float | None = None
+    alpha: float | None = None
+    baseline_run_stamps: list[str] = Field(default_factory=list)
+    detail: str = ''
+
+
+class LimitsArtifact(BaseModel):
+    """The persisted form of an :class:`EvaluationResult` — state AND alarm feed.
+
+    ONE file, deliberately, rather than separate evaluator-state and published-
+    alarms files. Two files would be two things that can disagree, and the
+    disagreement would be invisible: the dashboard would publish alarms derived
+    from limits the evaluator had already moved past. Keeping them the same
+    bytes makes "the dashboard's alarms are the same limits" true by
+    construction (INV-1/INV-5) rather than by a convention someone has to keep.
+
+    Strict at emit (``extra='forbid'``, pinned ``schema_version``) so a typo in
+    a producing runner is caught here; lenient at read for consumers, who need
+    only ``json.load`` and dict access and will not break on a field they do not
+    know about.
+    """
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    schema_version: Literal[1]
+    eval_id: str = Field(min_length=1)
+    run_stamp: str = Field(min_length=1)
+    generator: str = Field(min_length=1)
+
+    alpha: float
+    false_alarm_budget: float
+    runs_per_quarter: int
+    alarmed_metric_count: int
+    min_samples: int
+    baseline_window: int
+    baseline_run_stamps: list[str] = Field(default_factory=list)
+
+    grandfather_set: list[str] = Field(default_factory=list)
+    grandfather_set_hash: str = Field(min_length=1)
+
+    verdicts: list[_VerdictRecord] = Field(default_factory=list)
+    alarms: list[_AlarmRecord] = Field(default_factory=list)
+
+
+def limits_artifact_path(root: str | Path, eval_id: str) -> Path:
+    """``<root>/<eval_id>/limits-current.json``.
+
+    No run stamp in the name, unlike the metric series: this file is CURRENT
+    state, and there is exactly one current. The per-run history lives in the
+    stamped metrics artifacts beside it.
+    """
+    return Path(root) / eval_id / 'limits-current.json'
+
+
+def _artifact_from_result(result: EvaluationResult) -> LimitsArtifact:
+    return LimitsArtifact(
+        schema_version=ARTIFACT_SCHEMA_VERSION,
+        eval_id=result.eval_id,
+        run_stamp=result.run_stamp,
+        generator=GENERATOR,
+        alpha=result.alpha,
+        false_alarm_budget=result.config.false_alarm_budget,
+        runs_per_quarter=result.config.runs_per_quarter,
+        alarmed_metric_count=result.alarmed_metric_count,
+        min_samples=result.config.min_samples,
+        baseline_window=result.config.baseline_window,
+        baseline_run_stamps=list(result.baseline_run_stamps),
+        grandfather_set=sorted(result.grandfather),
+        grandfather_set_hash=result.grandfather_hash,
+        verdicts=[_VerdictRecord(**asdict(verdict)) for verdict in result.verdicts],
+        alarms=[_AlarmRecord(**asdict(alarm)) for alarm in result.alarms],
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via temp-in-dir + os.replace.
+
+    Copied from ``shared.prompt_artifact._atomic_write_text`` rather than
+    imported (it is module-private there, and ``shared.safe_io`` has only a
+    lenient reader — there is no atomic writer in ``shared/`` to reuse). The
+    temp comes from :func:`tempfile.mkstemp`, an OS-guaranteed fresh name,
+    rather than a pid-derived one, because the memory-eval runners all write
+    under a single artifact root and a shared ``<name>.<pid>.tmp`` would let
+    concurrent writers clobber each other mid-write.
+
+    This matters more here than for the metrics artifact: this file is
+    RESUMABLE STATE, so a torn write would take the grandfather set with it and
+    the next run would alarm on everything that was already known-bad. Either
+    the old contents survive intact or the new ones land whole.
+    """
+    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def write_limits_artifact(result: EvaluationResult, path: str | Path) -> Path:
+    """Persist *result* to *path* atomically, returning the path written.
+
+    ``sort_keys=True`` and a trailing newline so two runs that concluded the
+    same thing produce the same bytes — a committed artifact should diff to
+    nothing when nothing changed, which is what makes a real change legible.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    artifact = _artifact_from_result(result)
+    text = json.dumps(
+        artifact.model_dump(mode='json'), indent=2, sort_keys=True, ensure_ascii=False
+    )
+    _atomic_write_text(target, text + '\n')
+    return target
+
+
+def load_limits_artifact(path: str | Path) -> LimitsArtifact:
+    """Read and validate a ``limits-current.json``.
+
+    Raises :class:`LimitsSchemaError` (a ``ValueError``) if the file does not
+    match the schema, chaining the underlying validation error. Corrupt
+    resumable state is not something to recover from silently: continuing from
+    a half-understood grandfather set would either mute real alarms or fire
+    phantom ones, and both are worse than stopping.
+    """
+    target = Path(path)
+    raw = json.loads(target.read_text(encoding='utf-8'))
+    try:
+        return LimitsArtifact.model_validate(raw)
+    except ValidationError as exc:
+        raise LimitsSchemaError(f'{target}: not a valid limits artifact: {exc}') from exc
