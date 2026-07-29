@@ -10733,13 +10733,33 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if pending_high_sev:
             raise _StewardReescalated(pending_high_sev)
 
-        # Wait for level-0 pending escalations to clear, BOUNDED by
-        # steward_completion_timeout (task 3170, fix C).  See the method
-        # docstring for the disposition; the deadline shape mirrors
-        # _await_steward_completion so the two waiters bound themselves
-        # identically instead of inventing a second knob.
-        timeout = self.config.steward_completion_timeout
-        deadline = asyncio.get_event_loop().time() + timeout
+        # Wait for level-0 pending escalations to clear, BOUNDED by a derived
+        # window (task 3170, fix C + review fix D1).  See the method docstring
+        # for the disposition.  Both terms are load-bearing, neither is
+        # arbitrary:
+        #
+        #   timeouts.steward             the ENFORCED per-invocation ceiling —
+        #                                the longest a HEALTHY steward can
+        #                                legitimately be silent, since past it
+        #                                invoke_agent itself SIGTERM/SIGKILLs
+        #                                the process group (cli_invoke.py:
+        #                                2184-2206).  Any window shorter than
+        #                                this is guaranteed to fire on healthy
+        #                                stewards.
+        #   steward_completion_timeout   kept in its DOCUMENTED role
+        #                                (config.py:211-222, the post-invocation
+        #                                drain grace) as the slack for the
+        #                                steward to publish/dismiss after its
+        #                                invocation returns or is killed.
+        #
+        # Deliberately NO new config knob and NO new validator: the existing
+        # `timeouts.steward >= steward_completion_timeout` invariant
+        # (config.py:4071-4081) already forces this window to >= 2x
+        # steward_completion_timeout for every config that constructs at all,
+        # and an operator who raises timeouts.steward widens the wait bound in
+        # lockstep for free.
+        window = self.config.timeouts.steward + self.config.steward_completion_timeout
+        deadline = asyncio.get_event_loop().time() + window
         while True:
             pending_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
@@ -10756,9 +10776,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 orphan_ids = [e.id for e in pending_l0]
                 logger.warning(
                     'Task %s: steward did not resolve %d level-0 escalation(s) '
-                    'within steward_completion_timeout (%.0fs) — dismissing the '
+                    'within the ESCALATED wait window (%.0fs = timeouts.steward '
+                    '%.0fs + steward_completion_timeout %.0fs) — dismissing the '
                     'orphan(s) and unblocking the ESCALATED wait: %s',
-                    self.task_id, len(orphan_ids), timeout, ', '.join(orphan_ids),
+                    self.task_id, len(orphan_ids), window,
+                    self.config.timeouts.steward,
+                    self.config.steward_completion_timeout,
+                    ', '.join(orphan_ids),
                 )
                 if self.event_store:
                     self.event_store.emit(
@@ -10776,8 +10800,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 for esc in pending_l0:
                     self.escalation_queue.resolve(
                         esc.id,
-                        'Auto-dismissed: steward did not resolve within '
-                        'steward_completion_timeout — unblocking the '
+                        'Auto-dismissed: steward did not resolve within the '
+                        'ESCALATED wait window (timeouts.steward + '
+                        'steward_completion_timeout) — unblocking the '
                         'ESCALATED wait',
                         dismiss=True,
                         resolved_by='auto-dismissed',

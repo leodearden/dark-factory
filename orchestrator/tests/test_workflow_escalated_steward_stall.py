@@ -79,17 +79,26 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def config(git_repo: Path) -> OrchestratorConfig:
-    """Config with a SHORT ``steward_completion_timeout``.
+    """Config with a SHORT ESCALATED-wait window: 0.5 + 0.5 = 1.0s.
+
+    BOTH terms must be shrunk, because the ESCALATED wait is bounded by the
+    DERIVED window ``timeouts.steward + steward_completion_timeout`` (review
+    fix D1) — not by ``steward_completion_timeout`` alone.  Leaving
+    ``timeouts.steward`` at its stock 1800s would give the tests that assert
+    the backstop FIRES a ~1800s window, so they would blow their own
+    ``asyncio.wait_for`` guard instead of exercising expiry.
 
     Only ``timeouts.steward >= steward_completion_timeout`` is validated, and
-    the stock ``timeouts.steward`` (1800s) satisfies 0.5s comfortably.  Tests
-    that must NOT be satisfiable by the timeout (the cross-component
-    regression) raise it back up locally.
+    0.5 >= 0.5 satisfies it (the invariant is ``>=``, not strict ``>``).
+    Tests that must NOT be satisfiable by the backstop (the cross-component
+    regression) raise ``steward_completion_timeout`` back up locally, which
+    widens the derived window a fortiori.
     """
     return OrchestratorConfig(
         project_root=git_repo,
         max_concurrent_tasks=1,
         steward_completion_timeout=0.5,
+        timeouts=TimeoutsConfig(steward=0.5),
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
