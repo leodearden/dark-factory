@@ -7181,6 +7181,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Kept as a class attribute so tests can monkeypatch it small — or to 0.0
     # to opt out (mirrors the MAX_*/WARN_STREAK monkeypatch convention above).
     CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS: float = 30.0
+    # task 3003 (review fix 2): ELAPSED-TIME budget for an UNBROKEN
+    # contended-lane defer streak.  Past this, the defer converts to a terminal
+    # 'blocked' instead of re-queuing again — a contended-lane defer never
+    # escalates and never counts against the requeue cap, so without a bound a
+    # permanently wedged lane holder would defer one task forever.
+    #
+    # The default MUST stay above the longest LEGITIMATE holder.  The
+    # motivating incident is a 1–2 h merge-verify / speculative merge-ahead
+    # train holding the lane; a cap short enough to fire on THAT would
+    # re-create exactly the false-positive escalation this task removed.  4 h
+    # clears that class with margin while still bounding a genuinely wedged
+    # lane.
+    #
+    # ELAPSED time, not a raw defer COUNT: the effective re-attempt period
+    # differs per raiser (0 s for MergeVerifyLeaseHeld's immediate pre-check,
+    # 30 s for the reset acquire, 300 s for the lease acquire), so a count cap
+    # would mean a wildly different real-world budget depending on which one
+    # fired — and would shift again with any change to
+    # CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS above.  A time cap is invariant
+    # under both.  Class attribute so tests monkeypatch it small (mirrors
+    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
+    MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -7378,6 +7400,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # UNBROKEN contention (unlike the requeue itself, which never counts
         # against the requeue cap and never escalates on its own).
         self._contended_lease_requeues: dict[str, int] = {}
+        # task 3003 (review fix 2): per-task time.monotonic() stamp of the FIRST
+        # defer in the current unbroken contended-lane streak, set with
+        # setdefault on each defer.  Its elapsed span is compared against
+        # MAX_CONTENDED_LEASE_DEFER_SECS to convert an unbounded fail-safe
+        # requeue loop into a terminal 'blocked'.  monotonic (not time.time())
+        # because this is a pure duration reference — never persisted, never
+        # compared against a stored wall-clock value — so it must be immune to
+        # NTP/manual clock steps, which could otherwise false-'block' a healthy
+        # task on a forward step (same rationale recorded for the dead-verify
+        # progress budget below).  Popped in lockstep with
+        # _contended_lease_requeues at every reset site, so a verify that
+        # actually runs clears BOTH — a stale start stamp would otherwise make
+        # a much later, unrelated streak cap out on its very first defer.
+        self._contended_lease_first_defer_at: dict[str, float] = {}
         # Speculation-depth cap: one permit consumed by the Merger when it
         # prefetches a speculative item; released by the Verifier when it drains
         # that speculative item.  Symmetric accounting: acquire=prefetch,
@@ -13860,6 +13896,56 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # never counting against the requeue cap) becomes operator-visible.
             _contended_streak = self._contended_lease_requeues.get(req.task_id, 0) + 1
             self._contended_lease_requeues[req.task_id] = _contended_streak
+            # task 3003 (review fix 2): bound the streak in ELAPSED time. The
+            # stamp marks the START of the unbroken streak (setdefault), so the
+            # very first defer measures 0s and always defers.
+            _streak_started_at = self._contended_lease_first_defer_at.setdefault(
+                req.task_id, time.monotonic(),
+            )
+            _contended_elapsed = time.monotonic() - _streak_started_at
+            if _contended_elapsed >= self.MAX_CONTENDED_LEASE_DEFER_SECS:
+                # Terminal cap, shaped like the MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+                # busy-loop guard above. A contended-lane defer never escalates
+                # and never counts against the requeue cap, so a permanently
+                # wedged holder would otherwise defer this task forever with no
+                # terminal resolution at all.
+                #
+                # Pop BOTH per-task dicts: an operator-resolved re-submission of
+                # this task_id must get a FRESH budget rather than instantly
+                # re-capping on a stale start stamp, and neither dict may grow
+                # unboundedly for permanently-blocked tasks.
+                self._contended_lease_requeues.pop(req.task_id, None)
+                self._contended_lease_first_defer_at.pop(req.task_id, None)
+                await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                logger.error(
+                    'Task %s: merge-verify lane has been unavailable for %.0fs '
+                    'across %d consecutive deferred attempts (%s) — resolving '
+                    'BLOCKED instead of deferring again. This is a genuine lane '
+                    'pathology: inspect the merge-verify lane lock holder.',
+                    req.task_id, _contended_elapsed, _contended_streak, exc,
+                )
+                # Deliberately routed through the ordinary blocked-merge path
+                # rather than workflow.py's consecutive_merge_thrash ladder:
+                # that ladder means "the SAME mechanical merge failure
+                # repeated", which lane unavailability is not. And the reason
+                # deliberately carries the elapsed seconds AND the streak count
+                # — both vary between cap-outs, so two consecutive cap-outs
+                # never share a merge_outcome_signature and so cannot re-feed
+                # the very false-positive ladder walk this task removed. Do NOT
+                # round these to a coarser unit (hours at .1f would render
+                # '4.0h' both times, silently restoring the invariant
+                # signature).
+                err_outcome = MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'merge-verify lane unavailable for '
+                        f'{_contended_elapsed:.0f}s across {_contended_streak} '
+                        f'consecutive deferred attempts: {exc}'
+                    ),
+                )
+                if not req.result.done():
+                    req.result.set_result(err_outcome)
+                return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
             if _contended_streak >= self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
                 # task 3003: the "~N min of continuous contention" estimate is
                 # only meaningful for the two BOUNDED-WAIT raisers, which carry
@@ -13953,7 +14039,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._inflight_dead_verify_aborts.pop(req.task_id, None)
             # task 2828 amend: terminal 'blocked' exit — drop any contended-lease
             # streak so it never lingers stale for a task that will not re-verify.
+            # task 3003: the streak's start stamp is popped in lockstep, else a
+            # much later unrelated streak would inherit it and cap out on its
+            # very first defer.
             self._contended_lease_requeues.pop(req.task_id, None)
+            self._contended_lease_first_defer_at.pop(req.task_id, None)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
@@ -13970,7 +14060,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
         # task 2828 amend: the verify actually RAN (lease was acquired), so any
         # prior contended-lease requeue streak for this task is broken — reset it.
+        # task 3003: pop the streak's start stamp in lockstep, so the next
+        # streak measures its own elapsed span from its own first defer.
         self._contended_lease_requeues.pop(req.task_id, None)
+        self._contended_lease_first_defer_at.pop(req.task_id, None)
 
         if out is None:
             logger.info(
