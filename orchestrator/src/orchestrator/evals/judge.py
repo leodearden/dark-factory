@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -317,14 +317,43 @@ PLAN_QUALITY_RUBRIC: dict[str, Any] = {
 }
 
 
+def is_scorable_plan(plan: object) -> TypeGuard[dict]:
+    """THE single test for "does this artifact carry content worth scoring?".
+
+    A plan with no steps is not a plan — whether it is absent (``None``), empty
+    (``{}``), not a dict at all, or the header-only stub ``create_plan`` writes
+    on the architect's FIRST plan-tools call (``plan_tools._create_plan``: a
+    TRUTHY dict with ``task_id`` / ``title`` / ``analysis`` / ``files`` and
+    ``steps: []``).
+
+    Deliberately shared by :func:`score_plan_structure`'s ``0.0``
+    short-circuit and by ``run_architect_eval``'s cap-taint predicate. Those
+    were once two independent tests — raw dict truthiness in the runner versus
+    ``not plan.get('steps')`` here — and they disagreed exactly on the
+    header-only stub, so a session cap landing right after ``create_plan`` left
+    the cell UNtainted and then floored it to a fabricated ``0.0``. Making both
+    call sites literally this function makes that drift structurally impossible.
+
+    Note this is a different question from the ``has_steps`` RUBRIC criterion
+    (:func:`_plan_has_steps`), which is scored per-plan against a real plan; do
+    not conflate the two roles.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so it also carries
+    the ``isinstance`` narrowing the inline guard it replaced used to give
+    :func:`score_plan_structure`.
+    """
+    return isinstance(plan, dict) and bool(plan.get('steps'))
+
+
 def score_plan_structure(
     plan: dict | None, rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
 ) -> float:
     """Deterministic structural plan-quality score in ``[0, 1]``.
 
     Reads ONLY the produced plan dict — no LLM, no worktree, no transcript. A
-    plan with no steps (empty / ``None`` / empty ``steps`` list) is not a plan
-    and scores ``0.0`` outright. Otherwise returns the weight-weighted fraction
+    plan that is not :func:`is_scorable_plan` (empty / ``None`` / no steps /
+    the header-only ``create_plan`` stub) is not a plan and scores ``0.0``
+    outright. Otherwise returns the weight-weighted fraction
     of satisfied structural criteria,
     ``round(satisfied_weight / total_weight, 4)``, clamped to ``[0, 1]``.
 
@@ -336,7 +365,11 @@ def score_plan_structure(
     name, or a non-positive total weight — the rubric is code-owned, so a typo
     must fail loudly (structured-facts-at-failure / loud-over-silent).
     """
-    if not plan or not isinstance(plan, dict) or not plan.get('steps'):
+    # Exactly equivalent to the former inline
+    # ``not plan or not isinstance(plan, dict) or not plan.get('steps')``
+    # (an empty dict and a None both fail the steps test), now expressed via the
+    # ONE predicate the runner's taint decision also consults.
+    if not is_scorable_plan(plan):
         return 0.0
     criteria = rubric.get('criteria') or []
     if not criteria:
