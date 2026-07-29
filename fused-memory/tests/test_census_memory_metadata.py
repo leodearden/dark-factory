@@ -603,3 +603,122 @@ class TestBuildReportCoverage:
         report = _mod.build_report(cells, cov, top_n=50)
         assert report['coverage']['projects']['reify']['uncovered_points'] == 0
         assert report['coverage']['complete'] is True
+
+
+# ===========================================================================
+# Tests: render_markdown
+# ===========================================================================
+
+def _rich_report(top_n: int = 50, *, complete: bool = True) -> dict:
+    """A report exercising every section render_markdown must emit."""
+    cells = {
+        'dark_factory': {
+            OBS: _census([
+                {'kind': 'cycle_summary', 'topic': 'merge_lane', 'canonical': True},
+                {'kind': 'cycle_summary', 'supersedes': [UUID_A, 'abc123']},
+                {'source': 'stage1_flag_marker', 'parent_id': 'p1'},
+                {'source': 'stage1_flag_marker', 'supersedes': UUID_B},
+                {'canonical': 'yes'},
+            ]),
+            PROC: _census([{'kind': 'gotcha'}, {'supersedes': None}]),
+        },
+    }
+    scrolled_obs = 5 if complete else 2
+    cov = {
+        'dark_factory': _coverage(
+            'fused_dark_factory', 7, {OBS: (5, scrolled_obs), PROC: (2, 2)},
+        ),
+    }
+    return _mod.build_report(cells, cov, top_n=top_n, page_size=1000)
+
+
+class TestRenderMarkdownSections:
+    """Every section the artifact must carry, driven off the report dict."""
+
+    def test_header_names_the_prd_leaf(self):
+        md = _mod.render_markdown(_rich_report())
+        assert md.startswith('#')
+        assert 'memory-metadata-vocabulary' in md
+
+    def test_record_counts_per_project_and_category(self):
+        md = _mod.render_markdown(_rich_report())
+        assert 'dark_factory' in md
+        assert OBS in md
+        assert PROC in md
+
+    def test_key_population_table(self):
+        md = _mod.render_markdown(_rich_report())
+        assert 'key' in md.lower()
+        assert 'supersedes' in md
+
+    def test_kind_table_and_missing_count(self):
+        md = _mod.render_markdown(_rich_report())
+        assert 'cycle_summary' in md
+        assert 'gotcha' in md
+        assert 'kind' in md.lower()
+        assert 'missing' in md.lower()
+
+    def test_supersedes_shape_table_with_member_and_length_breakdowns(self):
+        md = _mod.render_markdown(_rich_report())
+        for label in ('absent', 'null', 'scalar', 'list'):
+            assert label in md
+        assert 'full_uuid' in md
+        assert 'short_hex' in md
+        assert 'length' in md.lower()
+
+    def test_topic_canonical_parent_id_occurrences(self):
+        md = _mod.render_markdown(_rich_report())
+        assert 'topic' in md.lower()
+        assert 'canonical' in md.lower()
+        assert 'parent_id' in md
+
+    def test_source_set_but_kind_missing_section_lists_offending_sources(self):
+        md = _mod.render_markdown(_rich_report())
+        assert 'stage1_flag_marker' in md
+        lowered = md.lower()
+        assert 'source' in lowered
+        # The drift section must name the condition, not just the value.
+        assert 'without' in lowered or 'missing' in lowered
+
+
+class TestRenderMarkdownDisclosure:
+    """Truncation and incomplete coverage must be visible in the markdown twin."""
+
+    def test_truncated_table_renders_its_disclosure(self):
+        md = _mod.render_markdown(_rich_report(top_n=1))
+        lowered = md.lower()
+        assert 'truncated' in lowered
+        assert 'distinct' in lowered
+
+    def test_untruncated_report_has_no_truncation_note(self):
+        md = _mod.render_markdown(_rich_report(top_n=500))
+        assert 'truncated' not in md.lower()
+
+    def test_incomplete_coverage_renders_a_warning_naming_the_deltas(self):
+        md = _mod.render_markdown(_rich_report(complete=False))
+        lowered = md.lower()
+        assert 'incomplete' in lowered or 'warning' in lowered
+        # The named delta itself, not just a flag.
+        assert 'category_shortfall' in md or '-3' in md
+        assert OBS in md
+
+    def test_complete_coverage_renders_no_warning(self):
+        md = _mod.render_markdown(_rich_report(complete=True))
+        assert 'category_shortfall' not in md
+        assert 'INCOMPLETE' not in md
+
+    def test_uncovered_points_residue_rendered(self):
+        cells = {'reify': {OBS: _census([])}}
+        cov = {'reify': _coverage('fused_reify', 100, {OBS: (20, 20)})}
+        md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
+        assert 'uncovered' in md.lower()
+        assert '80' in md
+
+
+class TestRenderMarkdownDeterminism:
+    def test_same_report_renders_identical_string_twice(self):
+        report = _rich_report()
+        assert _mod.render_markdown(report) == _mod.render_markdown(report)
+
+    def test_returns_a_string(self):
+        assert isinstance(_mod.render_markdown(_rich_report()), str)
