@@ -1035,3 +1035,159 @@ class TestCensusProjectCoverage:
         report = _mod.build_report({'dark_factory': cells}, {'dark_factory': coverage}, top_n=50)
         assert report['coverage']['complete'] is True
         assert report['projects']['dark_factory']['categories'][OBS]['records'] == 1
+
+
+# ===========================================================================
+# Tests: CLI band (_run / main)
+# ===========================================================================
+
+def _args(tmp_path, **overrides):
+    """argparse.Namespace matching the CLI's parser defaults."""
+    import argparse
+
+    defaults = {
+        'project_id': ['dark_factory'],
+        'page_size': 1000,
+        'top_n': 50,
+        'max_pages': _mod.DEFAULT_MAX_PAGES,
+        'json_out': str(tmp_path / 'census.json'),
+        'md_out': str(tmp_path / 'census.md'),
+        'config': None,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _census_project_stub(*, complete: bool = True):
+    """Stand-in for census_project returning one populated cell."""
+    async def _stub(backend, project_id, categories=None, page_size=1000, max_pages=200):
+        cells = {OBS: _census([{'kind': 'cycle_summary'}])}
+        coverage = _coverage('fused_x', 1 if complete else 9, {OBS: (1, 1)})
+        return cells, coverage
+    return _stub
+
+
+class TestCliArtifacts:
+    @pytest.mark.asyncio
+    async def test_writes_both_artifacts_to_the_given_paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        rc = await _mod._run(_args(tmp_path))
+        assert rc == 0
+        written = json.loads((tmp_path / 'census.json').read_text())
+        assert written['projects']['dark_factory']['categories'][OBS]['records'] == 1
+        assert (tmp_path / 'census.md').read_text().strip()
+
+    @pytest.mark.asyncio
+    async def test_creates_missing_parent_directories(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        nested = tmp_path / 'a' / 'b'
+        rc = await _mod._run(_args(
+            tmp_path, json_out=str(nested / 'c.json'), md_out=str(nested / 'c.md'),
+        ))
+        assert rc == 0
+        assert (nested / 'c.json').exists()
+        assert (nested / 'c.md').exists()
+
+    @pytest.mark.asyncio
+    async def test_honours_repeated_project_id(self, tmp_path, monkeypatch):
+        seen: list[str] = []
+
+        async def _stub(backend, project_id, categories=None, page_size=1000, max_pages=200):
+            seen.append(project_id)
+            return {OBS: _census([{}])}, _coverage('fused_x', 1, {OBS: (1, 1)})
+
+        monkeypatch.setattr(_mod, 'census_project', _stub)
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        await _mod._run(_args(tmp_path, project_id=['dark_factory', 'reify']))
+        assert seen == ['dark_factory', 'reify']
+
+
+class TestCliExitCodes:
+    @pytest.mark.asyncio
+    async def test_zero_when_coverage_complete(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub(complete=True))
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        assert await _mod._run(_args(tmp_path)) == 0
+
+    @pytest.mark.asyncio
+    async def test_nonzero_when_coverage_incomplete(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub(complete=False))
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        assert await _mod._run(_args(tmp_path)) != 0
+
+    @pytest.mark.asyncio
+    async def test_incomplete_run_still_writes_the_artifacts(self, tmp_path, monkeypatch):
+        # The evidence of the shortfall is IN the artifact -- a non-zero exit
+        # must not also suppress it.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub(complete=False))
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        await _mod._run(_args(tmp_path))
+        report = json.loads((tmp_path / 'census.json').read_text())
+        assert report['coverage']['complete'] is False
+        assert report['coverage']['deltas']
+
+    @pytest.mark.asyncio
+    async def test_nonzero_when_census_scan_incomplete_propagates(self, tmp_path, monkeypatch):
+        async def _boom(*a, **kw):
+            raise _mod.CensusScanIncomplete('truncated')
+
+        monkeypatch.setattr(_mod, 'census_project', _boom)
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        assert await _mod._run(_args(tmp_path)) != 0
+
+
+class TestCliCleanup:
+    @pytest.mark.asyncio
+    async def test_closes_the_backend(self, tmp_path, monkeypatch):
+        backend = AsyncMock()
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: backend)
+        await _mod._run(_args(tmp_path))
+        backend.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_closes_the_backend_even_when_census_raises(self, tmp_path, monkeypatch):
+        backend = AsyncMock()
+
+        async def _boom(*a, **kw):
+            raise _mod.CensusScanIncomplete('truncated')
+
+        monkeypatch.setattr(_mod, 'census_project', _boom)
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: backend)
+        await _mod._run(_args(tmp_path))
+        backend.close.assert_awaited_once()
+
+
+class TestCliParser:
+    def test_exposes_the_documented_flags(self):
+        parser = _mod._build_parser()
+        args = parser.parse_args([])
+        assert args.page_size == 1000
+        assert args.max_pages == _mod.DEFAULT_MAX_PAGES
+        assert isinstance(args.top_n, int)
+        assert args.config is None
+
+    def test_defaults_to_both_projects(self):
+        args = _mod._build_parser().parse_args([])
+        assert args.project_id == ['dark_factory', 'reify']
+
+    def test_default_artifact_paths_are_the_committed_ones(self):
+        args = _mod._build_parser().parse_args([])
+        assert args.json_out.endswith('plans/memory-metadata-census-report.json')
+        assert args.md_out.endswith('plans/memory-metadata-census-report.md')
+
+    def test_project_id_is_repeatable(self):
+        args = _mod._build_parser().parse_args(['--project-id', 'a', '--project-id', 'b'])
+        assert args.project_id == ['a', 'b']
+
+    def test_overrides_parse(self):
+        args = _mod._build_parser().parse_args([
+            '--page-size', '250', '--top-n', '7', '--max-pages', '3',
+            '--json-out', '/tmp/j.json', '--md-out', '/tmp/m.md', '--config', '/tmp/c.yaml',
+        ])
+        assert (args.page_size, args.top_n, args.max_pages) == (250, 7, 3)
+        assert args.json_out == '/tmp/j.json'
+        assert args.md_out == '/tmp/m.md'
+        assert args.config == '/tmp/c.yaml'
