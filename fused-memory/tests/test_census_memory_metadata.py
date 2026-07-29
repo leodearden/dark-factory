@@ -10,6 +10,7 @@ stand-ins throughout.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -350,3 +351,255 @@ class TestCategoryCensusMerge:
         a.merge(b)
         assert b.records == 1
         assert b.kind_counts['k'] == 1
+
+
+# ===========================================================================
+# Tests: build_report
+# ===========================================================================
+
+OBS = MemoryCategory.observations_and_summaries.value
+PROC = MemoryCategory.procedural_knowledge.value
+PREF = MemoryCategory.preferences_and_norms.value
+DEC = MemoryCategory.decisions_and_rationale.value
+
+
+def _census(payloads: list[dict]) -> object:
+    c = _mod.CategoryCensus()
+    for p in payloads:
+        c.add(p)
+    return c
+
+
+def _coverage(
+    collection: str,
+    collection_points: int,
+    categories: dict[str, tuple[int, int]],
+) -> dict:
+    """Build a per-project coverage record: {category: (expected, scrolled)}."""
+    return {
+        'collection': collection,
+        'collection_points': collection_points,
+        'categories': {
+            cat: {'expected': exp, 'scrolled': scr}
+            for cat, (exp, scr) in categories.items()
+        },
+    }
+
+
+def _entries(table: dict) -> list[tuple]:
+    return [(e['value'], e['count']) for e in table['entries']]
+
+
+class TestBuildReportShape:
+    """Serialisability, cells, and the generation-parameter block."""
+
+    def test_json_round_trips(self):
+        cells = {'dark_factory': {OBS: _census([{'kind': 'cycle_summary'}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert json.loads(json.dumps(report)) == report
+
+    def test_has_schema_version_and_params(self):
+        cells = {'dark_factory': {OBS: _census([{}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=7, page_size=250)
+        assert report['schema_version'] >= 1
+        assert report['params']['top_n'] == 7
+        assert report['params']['page_size'] == 250
+        assert report['params']['projects'] == ['dark_factory']
+        assert report['params']['categories'] == [OBS]
+
+    def test_cell_per_project_and_category(self):
+        cells = {
+            'dark_factory': {OBS: _census([{}, {}]), PROC: _census([{}])},
+            'reify': {OBS: _census([{}, {}, {}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 3, {OBS: (2, 2), PROC: (1, 1)}),
+            'reify': _coverage('fused_reify', 3, {OBS: (3, 3)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['projects']['dark_factory']['categories'][OBS]['records'] == 2
+        assert report['projects']['dark_factory']['categories'][PROC]['records'] == 1
+        assert report['projects']['reify']['categories'][OBS]['records'] == 3
+
+
+class TestBuildReportRollups:
+    """Per-project and grand-total counters equal the sum of their cells."""
+
+    def test_project_rollup_sums_its_cells(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'kind': 'cycle_summary'}, {'kind': 'cycle_summary'}]),
+                PROC: _census([{'kind': 'gotcha'}, {}]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 4, {OBS: (2, 2), PROC: (2, 2)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        total = report['projects']['dark_factory']['total']
+        assert total['records'] == 4
+        assert dict(_entries(total['kind'])) == {'cycle_summary': 2, 'gotcha': 1}
+        assert total['kind_missing'] == 1
+
+    def test_grand_total_sums_across_projects(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'kind': 'k'}])},
+            'reify': {OBS: _census([{'kind': 'k'}, {'kind': 'other'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 2, {OBS: (2, 2)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['grand_total']['records'] == 3
+        assert dict(_entries(report['grand_total']['kind'])) == {'k': 2, 'other': 1}
+
+
+class TestBuildReportDeterminism:
+    """A re-run must produce a byte-identical artifact."""
+
+    def test_value_tables_sorted_by_count_desc_then_value_asc(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census(
+                    [{'kind': 'b'}] * 3 + [{'kind': 'a'}] * 3 + [{'kind': 'c'}] * 5,
+                ),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 11, {OBS: (11, 11)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        table = report['projects']['dark_factory']['categories'][OBS]['kind']
+        assert _entries(table) == [('c', 5), ('a', 3), ('b', 3)]
+
+    def test_same_input_renders_identical_json_twice(self):
+        cells = {'dark_factory': {OBS: _census([{'kind': 'a'}, {'kind': 'b'}, {'topic': 't'}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 3, {OBS: (3, 3)})}
+        first = json.dumps(_mod.build_report(cells, cov, top_n=50), sort_keys=False)
+        second = json.dumps(_mod.build_report(cells, cov, top_n=50), sort_keys=False)
+        assert first == second
+
+
+class TestBuildReportTruncation:
+    """Capped value tables disclose the cap; a long tail is never mistaken
+    for a complete one."""
+
+    def test_long_table_truncated_with_disclosure(self):
+        payloads = [{'kind': f'k{i:02d}'} for i in range(10)]
+        cells = {'dark_factory': {OBS: _census(payloads)}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 10, {OBS: (10, 10)})}
+        report = _mod.build_report(cells, cov, top_n=3)
+        table = report['projects']['dark_factory']['categories'][OBS]['kind']
+        assert len(table['entries']) == 3
+        assert table['distinct_total'] == 10
+        assert table['truncated_values'] is True
+
+    def test_short_table_not_flagged_truncated(self):
+        cells = {'dark_factory': {OBS: _census([{'kind': 'a'}, {'kind': 'b'}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        table = report['projects']['dark_factory']['categories'][OBS]['kind']
+        assert table['distinct_total'] == 2
+        assert table['truncated_values'] is False
+        assert len(table['entries']) == 2
+
+    def test_table_exactly_at_top_n_is_not_flagged(self):
+        cells = {'dark_factory': {OBS: _census([{'kind': 'a'}, {'kind': 'b'}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        report = _mod.build_report(cells, cov, top_n=2)
+        table = report['projects']['dark_factory']['categories'][OBS]['kind']
+        assert table['truncated_values'] is False
+
+    def test_key_table_also_capped_and_disclosed(self):
+        payloads = [{f'key{i:02d}': 1 for i in range(10)}]
+        cells = {'dark_factory': {OBS: _census(payloads)}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=4)
+        table = report['projects']['dark_factory']['categories'][OBS]['keys']
+        assert len(table['entries']) == 4
+        assert table['distinct_total'] == 10
+        assert table['truncated_values'] is True
+
+
+class TestBuildReportCoverage:
+    """INV-2 no-silent-fail: every enumeration shortfall is named, never swallowed."""
+
+    def test_complete_when_every_cell_agrees_and_nothing_uncovered(self):
+        cells = {'dark_factory': {OBS: _census([{}, {}]), PROC: _census([{}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 3, {OBS: (2, 2), PROC: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['coverage']['complete'] is True
+        assert report['coverage']['deltas'] == []
+        assert report['coverage']['projects']['dark_factory']['uncovered_points'] == 0
+
+    def test_per_cell_expected_vs_scrolled_recorded(self):
+        cells = {'dark_factory': {OBS: _census([{}, {}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        cell_cov = report['coverage']['projects']['dark_factory']['categories'][OBS]
+        assert cell_cov['expected'] == 2
+        assert cell_cov['scrolled'] == 2
+        assert cell_cov['delta'] == 0
+        assert cell_cov['complete'] is True
+
+    def test_under_enumerated_cell_marks_incomplete_with_named_delta(self):
+        cells = {'dark_factory': {OBS: _census([{}, {}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 5, {OBS: (5, 2)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        coverage = report['coverage']
+        assert coverage['complete'] is False
+        cell_cov = coverage['projects']['dark_factory']['categories'][OBS]
+        assert cell_cov['expected'] == 5
+        assert cell_cov['scrolled'] == 2
+        assert cell_cov['delta'] == -3
+        assert cell_cov['complete'] is False
+        named = [d for d in coverage['deltas'] if d['kind'] == 'category_shortfall']
+        assert len(named) == 1
+        assert named[0]['project_id'] == 'dark_factory'
+        assert named[0]['category'] == OBS
+        assert named[0]['delta'] == -3
+
+    def test_uncovered_points_surfaced_for_the_measured_live_shape(self):
+        # Measured 2026-07-29: sum(three Mem0-primary categories) = 29,872 vs
+        # 29,951 points in fused_reify -- an 80-point dual-write residue that
+        # must be surfaced, not swallowed.
+        cells = {
+            'reify': {
+                OBS: _census([]),
+                PROC: _census([]),
+                PREF: _census([]),
+            },
+        }
+        cov = {
+            'reify': _coverage(
+                'fused_reify',
+                29951,
+                {OBS: (24408, 24408), PROC: (3981, 3981), PREF: (1483, 1483)},
+            ),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        coverage = report['coverage']
+        proj = coverage['projects']['reify']
+        assert proj['counted'] == 29872
+        assert proj['collection_points'] == 29951
+        assert proj['uncovered_points'] == 79
+        assert proj['complete'] is False
+        assert coverage['complete'] is False
+        named = [d for d in coverage['deltas'] if d['kind'] == 'uncovered_points']
+        assert len(named) == 1
+        assert named[0]['project_id'] == 'reify'
+        assert named[0]['delta'] == 79
+
+    def test_all_six_categories_close_the_residue(self):
+        # Adding the dual-write categories accounts for the remainder, and
+        # coverage goes complete.
+        cells = {'reify': {OBS: _census([]), PROC: _census([]), PREF: _census([]), DEC: _census([])}}
+        cov = {
+            'reify': _coverage(
+                'fused_reify',
+                100,
+                {OBS: (60, 60), PROC: (20, 20), PREF: (10, 10), DEC: (10, 10)},
+            ),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['coverage']['projects']['reify']['uncovered_points'] == 0
+        assert report['coverage']['complete'] is True
