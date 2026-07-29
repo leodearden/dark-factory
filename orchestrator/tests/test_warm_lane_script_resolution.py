@@ -267,6 +267,170 @@ class TestResolveWarmLaneScript:
         )
 
 
+def _write_origin_stub(path: Path, origin: str, log: Path) -> Path:
+    """Executable stub that records WHICH copy ran, then succeeds.
+
+    Appends ``<origin> <argv>`` to ``log``.  The log path is absolute and baked
+    in at write time rather than derived from ``$0`` (the idiom
+    ``test_warm_lane_disk_guard.py`` uses), because here the two stubs live in
+    unrelated directories — a project ``scripts/`` dir and a stand-in
+    dark-factory dir — and must nonetheless append to ONE ordered log so
+    "which copy ran" is answerable by reading it.
+
+    Emits a ``HEADROOM`` line so ``_run_warm_lane_audit`` — the one wrapper
+    that parses stdout — reaches its success path like the other five.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        f'echo "{origin} $*" >> "{log}"\n'
+        'echo "HEADROOM lanes=1 free=9000G"\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _origins(log: Path) -> list[str]:
+    """First token of each call-log line — which copy ran, in order."""
+    if not log.exists():
+        return []
+    return [line.split()[0] for line in log.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+class TestResolvedPathIsLoggedAtInfo:
+    """B7 — the project override wins, and the choice is visible at INFO.
+
+    Two halves, both required by the task's USER-OBSERVABLE SIGNAL:
+
+    * **Which copy ran** is proven by execution, not by inspecting the
+      resolver: both stubs append to one shared log, so "the project copy ran
+      and the dark-factory copy did not" is a statement about the log's
+      contents rather than about a return value.
+    * **The resolved path is logged at INFO on every invocation.**  Leaf ζ's
+      go/no-go reads this line off a live reclaim pass, so it must not be
+      memoised, rate-limited or first-call-only —
+      :meth:`test_info_line_is_emitted_on_every_invocation` pins that.
+
+    The origin is asserted in its parenthesised form ``(project)`` /
+    ``(dark-factory)``.  A bare substring check would be vacuous: the resolved
+    path is interpolated into the same record and ``tmp_path`` embeds the test
+    name, so ``'project' in message`` is true for reasons that have nothing to
+    do with the origin the resolver reported.
+    """
+
+    @pytest.fixture
+    def call_log(self, tmp_path: Path) -> Path:
+        """Shared ordered log both stubs append to."""
+        return tmp_path / 'which-copy-ran.log'
+
+    @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
+    async def test_project_override_runs_and_is_logged(
+        self,
+        wrapper: Wrapper,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        call_log: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Both copies present → the PROJECT copy executes and INFO says so."""
+        df_dir = df_warm_lane_script_dir()
+        project_script = _write_origin_stub(
+            project_root / 'scripts' / wrapper.script, 'project', call_log,
+        )
+        _write_origin_stub(df_dir / wrapper.script, 'dark-factory', call_log)
+        git_ops = _make_git_ops(project_root)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await wrapper.invoke(git_ops)
+
+        assert _origins(call_log) == ['project'], (
+            f'{wrapper.method} must execute the project override and NOT '
+            f"dark-factory's copy when both exist (PRD D3: dark-factory's copy "
+            f'is the floor, not the ceiling); call log: {_origins(call_log)!r}'
+        )
+        infos = _records(caplog, logging.INFO)
+        matching = [
+            m for m in infos if str(project_script) in m and '(project)' in m
+        ]
+        assert matching, (
+            f'{wrapper.method} must log the resolved path and origin at INFO.\n'
+            f'  expected path: {project_script}\n'
+            f'  expected origin marker: (project)\n'
+            f'  captured INFOs: {infos!r}'
+        )
+
+    @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
+    async def test_shipped_copy_runs_when_project_lacks_one(
+        self,
+        wrapper: Wrapper,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        call_log: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Only dark-factory's copy present → it executes and INFO says so."""
+        df_dir = df_warm_lane_script_dir()
+        df_script = _write_origin_stub(
+            df_dir / wrapper.script, 'dark-factory', call_log,
+        )
+        git_ops = _make_git_ops(project_root)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await wrapper.invoke(git_ops)
+
+        assert _origins(call_log) == ['dark-factory'], (
+            f'{wrapper.method} must fall back to the shipped copy when the '
+            f'project carries no override; call log: {_origins(call_log)!r}'
+        )
+        infos = _records(caplog, logging.INFO)
+        matching = [
+            m for m in infos if str(df_script) in m and '(dark-factory)' in m
+        ]
+        assert matching, (
+            f'{wrapper.method} must log the resolved path and origin at INFO.\n'
+            f'  expected path: {df_script}\n'
+            f'  expected origin marker: (dark-factory)\n'
+            f'  captured INFOs: {infos!r}'
+        )
+
+    async def test_info_line_is_emitted_on_every_invocation(
+        self,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        call_log: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Two reclaim passes → two INFO records, not one.
+
+        Leaf ζ's go/no-go reads the resolved-path line off a live reclaim pass,
+        which may be the hundredth of the process.  A memo or a
+        once-per-process guard would make that read silently empty, so the line
+        is unconditional per invocation and this test is what holds it there.
+        """
+        df_dir = df_warm_lane_script_dir()
+        df_script = _write_origin_stub(
+            df_dir / 'warm-lane-gc.sh', 'dark-factory', call_log,
+        )
+        git_ops = _make_git_ops(project_root)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await git_ops._run_warm_lane_gc_reclaim()
+            await git_ops._run_warm_lane_gc_reclaim()
+
+        assert _origins(call_log) == ['dark-factory', 'dark-factory'], (
+            f'Both reclaim passes must actually spawn the script; '
+            f'call log: {_origins(call_log)!r}'
+        )
+        resolved = [m for m in _records(caplog, logging.INFO) if str(df_script) in m]
+        assert len(resolved) == 2, (
+            f'The resolved-path INFO line must be emitted on EVERY invocation '
+            f'(no memo, no once-per-process guard) — leaf ζ reads it off an '
+            f'arbitrary reclaim pass; got {len(resolved)} record(s): {resolved!r}'
+        )
+
+
 @pytest.mark.asyncio
 class TestNeitherLocationIsLoud:
     """B8 — "no implementation at either location" is never a silent no-op.
