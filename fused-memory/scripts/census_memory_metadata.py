@@ -59,12 +59,20 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 logger = logging.getLogger('census_memory_metadata')
+
+# Page-budget backstop: 200 pages x the 1000-point default page size covers
+# 200k points, an order of magnitude above the largest measured collection
+# (fused_reify, 29,951). Hitting it means either the corpus grew hugely or
+# the paging loop is not advancing -- either way the scan raises rather than
+# returning a silently short stream.
+DEFAULT_MAX_PAGES = 200
 
 # All six categories, Mem0-primary first, derived from the shared enum --
 # never a restated literal list (INV-5 no-lockstep-duplication). The three
@@ -81,6 +89,16 @@ _FULL_UUID_RE = re.compile(
     re.IGNORECASE,
 )
 _SHORT_HEX_RE = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
+
+
+class CensusScanIncomplete(RuntimeError):
+    """A scroll could not enumerate its full result set.
+
+    Raised rather than returning a short stream: a truncated census is
+    indistinguishable from a census of a smaller corpus, and its consumer
+    (leaf beta's grandfather list) cannot tell the difference (INV-2
+    no-silent-fail-soft).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +439,69 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
         'deltas': deltas,
         'projects': projects,
     }
+
+
+# ---------------------------------------------------------------------------
+# Thin I/O band (mock-tested — no live services required)
+# ---------------------------------------------------------------------------
+
+async def scroll_all_payloads(
+    client: Any,
+    collection: str,
+    filters: dict[str, Any],
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield every payload matching *filters*, paging on Qdrant's ``next_offset``.
+
+    This is the paging loop ``Mem0Backend.scroll_by_metadata`` structurally
+    cannot perform -- it takes only ``limit`` and discards ``next_offset``
+    (mem0_client.py:395), so repeated calls re-read the same head of the
+    collection. ``consolidate_namespace_families.py:600-610`` documents that
+    same caveat as a known gap; this closes it for the census.
+
+    Payloads are yielded one at a time (never accumulated) so a caller
+    folding them into counters holds one page in memory regardless of corpus
+    size. The payload filter is built exactly as ``count_by_metadata`` builds
+    its own (mem0_client.py:386-394), so the cross-check count and this scroll
+    select the same points.
+
+    Raises:
+        CensusScanIncomplete: If *max_pages* is consumed while ``next_offset``
+            is still live -- the stream is truncated, so it raises instead of
+            ending short.
+    """
+    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+    must: list[Any] = [
+        qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+        for k, v in filters.items()
+    ]
+    scroll_filter = qmodels.Filter(must=must)
+
+    offset: Any = None
+    pages = 0
+    while True:
+        points, next_offset = await client.scroll(
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            with_payload=True,
+            limit=page_size,
+            offset=offset,
+        )
+        pages += 1
+        for point in points:
+            yield dict(point.payload or {})
+
+        if next_offset is None:
+            return
+        if pages >= max_pages:
+            raise CensusScanIncomplete(
+                f'scroll of collection={collection!r} filters={filters!r} exhausted its '
+                f'page budget after {pages} page(s) of {page_size} with next_offset still '
+                f'live — the scan is truncated. Raise --max-pages or --page-size.',
+            )
+        offset = next_offset
 
 
 def render_markdown(report: dict[str, Any]) -> str:
