@@ -3863,28 +3863,75 @@ class GitOps:
             _df_warm_lane_script_dir() / name,
         )
 
+    def _resolve_warm_lane_script_logged(
+        self, name: str, method: str,
+    ) -> tuple[Path, str] | None:
+        """:meth:`_resolve_warm_lane_script`, plus the operator-facing log line.
+
+        Shared by all six warm-lane wrappers so the message shape is identical
+        across them and one ``grep`` matches every site.
+
+        On failure emits a WARNING naming BOTH tried paths. WARNING, not the
+        pre-relocation DEBUG: after leaf α dark-factory always ships its own
+        copy, so "neither location" can only mean a genuinely broken
+        deployment — rare in production, never routine noise — and a DEBUG
+        line naming only one of two searched locations is actively misleading
+        to an operator asking why GC stopped.
+
+        Callers keep their own ``return <sentinel>`` on ``None`` because the
+        six sentinels differ (127 / None / False), and keep their
+        pre-resolution guards (merge-verify lease, pool storage) ahead of this
+        call so a skip stays attributable to the real cause.
+
+        Args:
+            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
+            method: Calling method name, prefixed onto the log line.
+
+        Returns:
+            ``(resolved_path, origin)``, or ``None`` when neither location
+            has the script (already logged).
+        """
+        resolved = self._resolve_warm_lane_script(name)
+        if resolved is None:
+            project_path, df_path = self._warm_lane_script_paths_tried(name)
+            logger.warning(
+                '%s: no warm-lane script implementation found at either '
+                'location — tried %s and %s',
+                method, project_path, df_path,
+            )
+            return None
+        return resolved
+
     # ε: warm-lane disk-guard admission helpers --------------------------------
 
     async def _run_warm_lane_disk_guard(self) -> int:
-        """Invoke ``<project_root>/scripts/warm-lane-disk-guard.sh check``.
+        """Invoke ``warm-lane-disk-guard.sh check``.
+
+        Located via :meth:`_resolve_warm_lane_script`:
+        ``<project_root>/scripts/warm-lane-disk-guard.sh`` first, then
+        dark-factory's own copy under ``orchestrator/scripts/warm-lane/``. A
+        project that carries its own warm-lane tooling keeps it (PRD
+        ``warm-lane-infra-repatriation-prd.md`` D3); dark-factory's copy is
+        the floor, not the ceiling.
 
         Mirrors the ``_seed_warm_lane``/``refresh_warm_base`` fail-soft helper
-        pattern: absent script → 127 sentinel; any unexpected exception → 127;
-        never raises.
+        pattern: no implementation at either location → 127 sentinel; any
+        unexpected exception → 127; never raises.
 
         Returns:
             0   — healthy (disk pressure below threshold).
             75  — disk pressure (EX_TEMPFAIL, admission should block).
-            127 — script absent or exception (fail-open sentinel).
+            127 — no implementation at either location, or exception
+                  (fail-open sentinel).
             other non-zero — script error (treated as fail-open by caller).
         """
         try:
-            script = self.project_root / 'scripts' / 'warm-lane-disk-guard.sh'
-            if not script.exists():
-                logger.debug(
-                    '_run_warm_lane_disk_guard: script absent at %s — no-op', script,
-                )
+            resolved = self._resolve_warm_lane_script_logged(
+                'warm-lane-disk-guard.sh', '_run_warm_lane_disk_guard',
+            )
+            if resolved is None:
                 return 127
+            script, _origin = resolved
             # NOTE: worktree_base may not exist yet on a fresh host where no lane
             # has been created.  In that case the real γ script will likely stat a
             # non-existent path and return a non-(0,75) exit code, which the caller
@@ -3915,7 +3962,11 @@ class GitOps:
     # θ: warm-lane PROACTIVE soft-floor throttle helpers (task 2443) --------
 
     async def _run_warm_lane_soft_guard(self) -> int:
-        """Invoke ``<project_root>/scripts/warm-lane-disk-guard.sh check --soft``.
+        """Invoke ``warm-lane-disk-guard.sh check --soft``.
+
+        Located via :meth:`_resolve_warm_lane_script` — project override
+        first, then dark-factory's own copy (PRD D3); see
+        :meth:`_run_warm_lane_disk_guard`.
 
         θ (task 2443, §9.5): the proactive soft-floor counterpart to
         :meth:`_run_warm_lane_disk_guard`, run BEFORE it's too late — a soft
@@ -3939,16 +3990,17 @@ class GitOps:
                   configuration with ε disabled — still backpressures rather
                   than failing open. See that method's docstring (amendment,
                   reviewer_comprehensive robustness).
-            127 — script absent or exception (fail-open sentinel).
+            127 — no implementation at either location, or exception
+                  (fail-open sentinel).
             other non-zero — script error (treated as fail-open by caller).
         """
         try:
-            script = self.project_root / 'scripts' / 'warm-lane-disk-guard.sh'
-            if not script.exists():
-                logger.debug(
-                    '_run_warm_lane_soft_guard: script absent at %s — no-op', script,
-                )
+            resolved = self._resolve_warm_lane_script_logged(
+                'warm-lane-disk-guard.sh', '_run_warm_lane_soft_guard',
+            )
+            if resolved is None:
                 return 127
+            script, _origin = resolved
             cmd = [
                 str(script), 'check',
                 '--mount', str(self.worktree_base),
@@ -3971,16 +4023,20 @@ class GitOps:
             return 127
 
     async def _run_warm_lane_audit(self) -> str | None:
-        """Invoke ``<project_root>/scripts/warm-lane-audit.sh --mount <worktree_base>``.
+        """Invoke ``warm-lane-audit.sh --mount <worktree_base>``.
+
+        Located via :meth:`_resolve_warm_lane_script` — project override
+        first, then dark-factory's own copy (PRD D3); see
+        :meth:`_run_warm_lane_disk_guard`.
 
         α (task 2443, §9.5 inv.12): OBSERVABILITY-ONLY. This wrapper never
         gates an admission decision — it exists solely to enrich the θ
         soft-floor defer journal line
         (:meth:`_warm_lane_soft_pressure_defer`) with pool headroom context.
         Mirrors the :meth:`warm_lane_ref_is_degenerate`/
-        :meth:`_run_thin_warm_lane` fail-soft wrapper pattern: absent
-        script, non-zero exit, or any exception all degrade to ``None``;
-        never raises.
+        :meth:`_run_thin_warm_lane` fail-soft wrapper pattern: no
+        implementation at either location, non-zero exit, or any exception
+        all degrade to ``None``; never raises.
 
         **Read-only (A1)**: invoked with ONLY ``--mount`` — no reset/reclaim
         subcommand or flag. reify's ``warm-lane-audit.sh`` is read-only by
@@ -3989,17 +4045,18 @@ class GitOps:
 
         Returns:
             The trailing ``HEADROOM ...`` summary line from the script's
-            default table-format stdout, or ``None`` if the script is
-            absent, exits non-zero, its stdout carries no line beginning
-            ``HEADROOM``, or an unexpected exception occurred.
+            default table-format stdout, or ``None`` if no implementation
+            exists at either location, the script exits non-zero, its stdout
+            carries no line beginning ``HEADROOM``, or an unexpected
+            exception occurred.
         """
         try:
-            script = self.project_root / 'scripts' / 'warm-lane-audit.sh'
-            if not script.exists():
-                logger.debug(
-                    '_run_warm_lane_audit: script absent at %s — no-op', script,
-                )
+            resolved = self._resolve_warm_lane_script_logged(
+                'warm-lane-audit.sh', '_run_warm_lane_audit',
+            )
+            if resolved is None:
                 return None
+            script, _origin = resolved
             cmd = [str(script), '--mount', str(self.worktree_base)]
             rc, out, err = await _run(cmd, cwd=self.project_root)
             if rc != 0:
@@ -4055,7 +4112,11 @@ class GitOps:
         return headroom
 
     async def _run_warm_lane_gc_reclaim(self) -> int:
-        """Invoke ``<project_root>/scripts/warm-lane-gc.sh reclaim``.
+        """Invoke ``warm-lane-gc.sh reclaim``.
+
+        Located via :meth:`_resolve_warm_lane_script` — project override
+        first, then dark-factory's own copy (PRD D3); see
+        :meth:`_run_warm_lane_disk_guard`.
 
         Fail-soft: absent script → 127 sentinel; any unexpected exception → 127;
         never raises.  A non-zero exit is logged at WARNING and treated as
@@ -4087,8 +4148,8 @@ class GitOps:
 
         Returns:
             0   — reclaim succeeded.
-            127 — script absent, pool storage absent, merge-verify lease
-                held, or exception (fail-soft sentinel).
+            127 — no implementation at either location, pool storage absent,
+                merge-verify lease held, or exception (fail-soft sentinel).
             other non-zero — reclaim script error (caller still re-checks).
         """
         if self._merge_verify_lease_active():
@@ -4100,12 +4161,12 @@ class GitOps:
         if not self._reconcile_pool_storage_before_sweep('_run_warm_lane_gc_reclaim'):
             return 127
         try:
-            script = self.project_root / 'scripts' / 'warm-lane-gc.sh'
-            if not script.exists():
-                logger.debug(
-                    '_run_warm_lane_gc_reclaim: script absent at %s — no-op', script,
-                )
+            resolved = self._resolve_warm_lane_script_logged(
+                'warm-lane-gc.sh', '_run_warm_lane_gc_reclaim',
+            )
+            if resolved is None:
                 return 127
+            script, _origin = resolved
             cmd = [
                 str(script), 'reclaim',
                 '--mount', str(self.worktree_base),
@@ -4123,7 +4184,11 @@ class GitOps:
             return 127
 
     async def warm_lane_ref_is_degenerate(self, task_id: str) -> bool:
-        """Invoke reify's ``<project_root>/scripts/warm-lane-degenerate-ref-check.sh``.
+        """Invoke ``warm-lane-degenerate-ref-check.sh`` for one task's ref.
+
+        Located via :meth:`_resolve_warm_lane_script` — project override
+        first, then dark-factory's own copy (PRD D3); see
+        :meth:`_run_warm_lane_disk_guard`.
 
         Task 2112: wraps reify's read-only classifier primitive (contract in
         reify ``docs/design/warm-lane-degenerate-ref-seam.md``, reify task
@@ -4142,18 +4207,19 @@ class GitOps:
             4 — landed (count==0 over main AND tip DOES cite task_id).
             5 — absent (ref does not exist).
 
-        **FAIL-SOFT contract**: returns True ONLY on exit 0. An absent
-        script, any other exit code (1/2/3/4/5/other), or any exception all
-        return False — so on any doubt this is a no-op and existing
-        behaviour is preserved. Read-only; never mutates refs. Never raises.
+        **FAIL-SOFT contract**: returns True ONLY on exit 0. No
+        implementation at either location, any other exit code
+        (1/2/3/4/5/other), or any exception all return False — so on any
+        doubt this is a no-op and existing behaviour is preserved.
+        Read-only; never mutates refs. Never raises.
         """
         try:
-            script = self.project_root / 'scripts' / 'warm-lane-degenerate-ref-check.sh'
-            if not script.exists():
-                logger.debug(
-                    'warm_lane_ref_is_degenerate: script absent at %s — no-op', script,
-                )
+            resolved = self._resolve_warm_lane_script_logged(
+                'warm-lane-degenerate-ref-check.sh', 'warm_lane_ref_is_degenerate',
+            )
+            if resolved is None:
                 return False
+            script, _origin = resolved
             cmd = [
                 str(script),
                 '--task', str(task_id),
@@ -4177,7 +4243,11 @@ class GitOps:
             return False
 
     async def _run_thin_warm_lane(self, lane_dir: Path) -> int:
-        """Invoke ``<project_root>/scripts/thin-warm-lane.sh <lane_dir>``.
+        """Invoke ``thin-warm-lane.sh <lane_dir>``.
+
+        Located via :meth:`_resolve_warm_lane_script` — project override
+        first, then dark-factory's own copy (PRD D3); see
+        :meth:`_run_warm_lane_disk_guard`.
 
         Task 2442 (§9.5 η): fail-soft, never-raise wrapper around reify δ's
         free-first target-reclaim primitive, modeled on
@@ -4259,8 +4329,8 @@ class GitOps:
                   re-acquired concurrently) — a BENIGN skip, never logged at
                   WARNING (§9.5 inv.11: release-thin is not an
                   escalation/fault).
-            127 — script absent, pool storage absent, or unexpected
-                  exception (fail-soft sentinel).
+            127 — no implementation at either location, pool storage absent,
+                  or unexpected exception (fail-soft sentinel).
 
         Never raises.
         """
@@ -4273,12 +4343,12 @@ class GitOps:
             self._note_pool_storage_absent()
             return 127
         try:
-            script = self.project_root / 'scripts' / 'thin-warm-lane.sh'
-            if not script.exists():
-                logger.debug(
-                    '_run_thin_warm_lane: script absent at %s — no-op', script,
-                )
+            resolved = self._resolve_warm_lane_script_logged(
+                'thin-warm-lane.sh', '_run_thin_warm_lane',
+            )
+            if resolved is None:
                 return 127
+            script, _origin = resolved
             cmd = [str(script), str(lane_dir)]
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc == 0:
