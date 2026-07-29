@@ -10,7 +10,24 @@ Lifecycle:
 - Each escalation either resumes the existing session or creates a fresh one.
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
 - Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
+- **Every give-up path dismisses its own L0 before publishing an outcome**
+  (task 3170) — via ``_auto_escalate_to_human`` when it files an L1, via
+  ``_dismiss_capped_l0`` when it deliberately does not (the wip-gated,
+  task-2060 resume-plan branches).  No pending L0 survives a steward give-up.
+- A capped escalation is TERMINAL for this steward: ``_mark_capped`` records
+  it and ``_handle_escalation`` becomes a no-op for that id.
 - Stopped by the workflow after task completion + grace period.
+
+The give-up contract is load-bearing for BOTH workflow waiters, which is why
+it lives here rather than in either consumer.  ``_mark_blocked`` →
+``_await_steward_completion`` reads the published outcome off the in-process
+channel; ``run()``'s ESCALATED branch → ``_wait_for_resolution`` is
+escalation-queue-only and is woken ONLY by the dismissal (``resolve`` →
+``_resolve_callback`` → ``harness._on_escalation_resolved`` →
+``_escalation_events[task_id].set()``).  A new early return that publishes
+without dismissing is therefore invisible to the second waiter — it parks the
+workflow forever while this steward re-handles the record at loop speed, which
+is exactly what task 2248 shipped.
 """
 
 from __future__ import annotations
@@ -404,6 +421,15 @@ class TaskSteward:
 
     async def _handle_escalation(self, escalation: Escalation) -> None:
         """Handle a single escalation via the persistent session.
+
+        **Every give-up path below dismisses its own L0 before publishing an
+        outcome** (task 3170) — ``_auto_escalate_to_human`` does it as part of
+        filing the L1, and the two wip-gated branches (which deliberately file
+        no L1, per task-2060 resume-plan semantics) do it via
+        ``_dismiss_capped_l0``.  No pending L0 may survive a give-up: the
+        ``run()``-ESCALATED waiter never reads the outcome channel, so a
+        publish-without-dismiss is invisible to it and strands the workflow.
+        Any NEW early return added here inherits that obligation.
 
         A capped escalation is TERMINAL for this steward (task 3170, fix B):
         once any guard below has fired, ``_mark_capped`` records the id and

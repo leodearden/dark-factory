@@ -10703,6 +10703,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         none is.  It deliberately does NOT call :meth:`_mark_blocked`, which
         would file a fresh L0 and could add a SECOND full grace window for
         what is a pure wait-timeout.
+
+        On BOTH exits it then calls :meth:`_drain_steward_outcomes`: whatever
+        the steward published while this waiter held the wait is never consumed
+        here, and would otherwise be replayed to a later ``_mark_blocked`` in
+        this same workflow as if freshly published.
         """
         if self.escalation_queue is None:
             logger.warning(
@@ -13014,7 +13019,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return await self.git_ops.worktree_has_unsaved_work(self.worktree, self.task_id)
 
     async def _ensure_steward_started(self) -> None:
-        """Start the steward lazily on first call, if factory was provided."""
+        """Start the steward lazily on first call, if factory was provided.
+
+        The channel wired below is read by ONE of this workflow's two steward
+        waiters.  :meth:`_await_steward_completion` (reached via
+        ``_mark_blocked``) consumes it; :meth:`_wait_for_resolution` (reached
+        via ``run()``'s ESCALATED branch) does not — it is escalation-queue-only
+        and is woken solely by the steward dismissing its L0.  Both therefore
+        depend on the SAME producer invariant (task 3170):
+
+            A steward give-up ALWAYS dismisses its own L0 before publishing an
+            outcome.  No pending L0 survives a steward give-up.
+
+        A new steward early return that publishes without dismissing is
+        invisible to the ESCALATED waiter and parks the workflow forever — see
+        ``TaskSteward._handle_escalation``, which owns that obligation.
+        """
         if self._steward is not None:
             return
         if not self._steward_factory or not self.worktree:
@@ -13235,6 +13255,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         event and the configured grace deadline — replaces the old
         escalation-queue file-polling loop entirely (no more re-reading
         ``_pending_l0()``; the channel is the sole synchronization signal).
+
+        This is ONE of the workflow's two steward waiters, and both rest on the
+        same producer invariant (task 3170): *a steward give-up ALWAYS dismisses
+        its own L0 before publishing an outcome*.  Its sibling
+        :meth:`_wait_for_resolution` (``run()``'s ESCALATED branch) never reads
+        this channel — the dismissal is the only thing that wakes it — so a new
+        steward early return that publishes without dismissing would satisfy
+        this waiter while stranding that one.  The dismissal loops on this path
+        (``_mark_blocked``'s, and the ``has_open_l1`` override's below) are
+        idempotent backstops over an already-dismissed record, not the primary
+        mechanism.
 
         A steward is only ever started (and the channel only ever created)
         by :meth:`_ensure_steward_started` when there is real pending work
