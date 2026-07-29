@@ -66,7 +66,23 @@ from typing import NamedTuple
 # corpus sweep, silently reopening the ambiguity the promotion closed. See that
 # module's docstring for the discriminator's rationale and the root-cause
 # finding. Fix any import problem here rather than re-inlining the pattern.
-from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL, detect_leak
+#
+# This is a standalone CLI: it must import cleanly when run by a bare
+# interpreter with no fused-memory venv active (the documented read-only sweep
+# is invoked straight from a shell), and it must resolve `fused_memory` to THIS
+# checkout rather than to whatever editable install happens to be on the path —
+# otherwise a worktree run silently tests the main checkout's copy of the
+# detector. Prepending our own src/ satisfies both: the fused-memory editable
+# install is an ordinary .pth path entry, so sys.path order decides the winner.
+# Mirrors the bootstrap convention in scripts/reviewer_redundancy_diagnostic.py.
+_FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
+if str(_FM_SRC) not in sys.path:
+    sys.path.insert(0, str(_FM_SRC))
+
+from fused_memory.utils.toolcall_xml_leak import (  # noqa: E402
+    LEAK_TAIL,
+    detect_leak,
+)
 
 __all__ = [
     "LEAK_TAIL",
