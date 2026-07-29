@@ -9,7 +9,7 @@
 The Mem0 corpus **converges instead of accreting**: an agent rediscovering a known gotcha lands its novel fragment on the canonical instead of minting duplicate #9, consolidation passes cannot strand or ratchet, and stale/corrupt entries are flagged mechanically instead of by heroic curator sessions. Observable surfaces:
 
 - **`add_memory` writers** (every `claude-task-*` agent, interactive sessions, recon stages) get a structured routing ack — `{routed: stored | restated | amended | contested, canonical_id?}` — instead of a silent store. Writers' briefings say "write freely; the server deduplicates" and nothing about pre-searching.
-- **Readers** (`search`, `get_memory_by_id`) see one grouped document per topic: canonical + amendment digests + sighting count — instead of N competing near-duplicates ranked by embedding luck. Search results carry full provenance (`agent_id`, `task_id`, `created_at`).
+- **Readers** (`search`, `get_memory_by_id`) see one grouped document per canonical — grouping key strictly `metadata.parent_id`, never `topic` (`docs/prds/memory-metadata-vocabulary.md` V2/D5): canonical + amendment digests + sighting count — instead of N competing near-duplicates ranked by embedding luck. Search results carry full provenance (`agent_id`, `task_id`, `created_at`).
 - **Stage-1 consolidation** runs through one transactional MCP op that proves closure (returns post-delete survivors); a failed pass can no longer net +1 entry. `delete_memory` on a truncated id fails loudly instead of `{status: deleted}`-no-op'ing.
 - **Operators** get a scheduled deterministic duplicate-cluster report; consolidation gates are filed from that report, with the LLM demoted from detector to adjudicator. Resolved consolidations auto-seed the topic-cluster guard — no manual hop.
 - **Boundary**: a write whose content contains raw MCP envelope markup (`</content>`, `<parameter name=`, `</invoke>`) is rejected with a structured error naming the pattern; an episode claiming "fix applied" against a non-matching task/git state is tagged unverified.
@@ -77,7 +77,7 @@ Five thrusts, decomposed as chains (§9):
 - **D1** Cosine is a candidate generator, never a judge. Bands calibrated from the labeled 89-entry curator dataset (retrieval recall@k + judge accuracy vs curator dispositions); no uncalibrated numeric floor appears in any leaf signal (G6).
 - **D2** Redirect supersedes reject: the 0.92 reject guard retires when triage enables; `allow_near_duplicate` becomes the force-store escape hatch.
 - **D3** Judge is sync-in-`add_memory`, fail-open, closed outputs, detect-not-adjudicate.
-- **D4** Amendments/sightings are add-only child records (3055-independent); reads are **server-side grouped** (canonical + digests + sighting count) — the reader is the consumer, the slice ends there.
+- **D4** Amendments/sightings are add-only child records (3055-independent); reads are **server-side grouped** (canonical + digests + sighting count) — the reader is the consumer, the slice ends there. Child records represent **triage attach outcomes**; the default *output of consolidation* (children vs retained topic-keyed peers) is owned by `docs/prds/memory-metadata-vocabulary.md` (provisional Option C, ratified at its E2 shape gate).
 - **D5** Topic-cluster auto-seeding lives inside `consolidate_memories` (not escalation plumbing): the op holds canonical + superseded texts, exactly the derivation input. Runtime store merged with config seeds; `reload_config` unaffected.
 - **D6** No hard dep edge from the Stage-1 rewire onto 3083's sweep (operator decision 2026-07-28); soft ordering note in C2.
 - **D7** roles.py inversion (ε) lands only after triage is live end-to-end (deps γ): capture stays eager; dedup is the server's job. The instruction gets *simpler*, not longer.
@@ -119,6 +119,9 @@ Five thrusts, decomposed as chains (§9):
 | Task-metadata citation repointing on consolidation deletes | DF 3108 (in-progress, from reify esc-5710-1) | θ's op does **not** claim citation repointing; 3108's sweep remains valid whether deletes go through θ or not |
 | Prompt-level UUID-resolution discipline (failed predecessor of η) | DF 1144 (done 2026-05-09; documentedly insufficient per stage1.py:113) | η is the API-level enforcement 1144 could not provide |
 | G7 invariants doc | `docs/legibility/design-invariants.md` (single normative copy) | contracts cite slugs, no restatement |
+| Retrieval anchoring (topic-anchored canonical recall at `MemoryService.search`) | DF 3111 (gated on the vocabulary PRD's shape gate) | β's "topic-tag-aware" candidate retrieval consumes it via the service seam — no second implementation (INV-5) |
+| Consolidation-gate end-state + mechanical closure | DF 3112 (gated on the vocabulary PRD's shape gate) | κ's report is detector/provenance input only, never the working list; pre-enumerated member lists are inert |
+| Metadata vocabulary (`topic`/`canonical`/`kind`/`parent_id`/`supersedes`), corpus-shape default, parent/orphan lifecycle | `docs/prds/memory-metadata-vocabulary.md` (2026-07-29) | δ's grouping key, θ's retain-vs-delete default, ζ's `topic_id` stamping, and κ's carve-out are bound by that PRD's contracts V1–V3 |
 
 ## 9. Decomposition plan (one bullet per leaf; signals are the G2 gate)
 

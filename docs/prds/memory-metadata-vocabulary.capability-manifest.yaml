@@ -1,0 +1,221 @@
+prd: docs/prds/memory-metadata-vocabulary.md
+schema_version: 1
+tasks:
+- label: alpha
+  task_id: 3194
+  title: 'Memory-metadata corpus census: key/kind/shape populations across all three
+    Mem0 categories'
+  capabilities:
+  - name: census-script-exists
+    binding: capability→producer — one-shot paginated scroll per category (scroll_by_metadata,
+      category always stamped), report artifact seeds beta's grandfather list
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: census_memory_metadata
+      paths:
+      - fused-memory/scripts/
+      expect: present
+- label: beta
+  task_id: 3195
+  title: Memory-metadata vocabulary module + service-seam validation (strict vocab
+    shapes, unknown-key census, storm escape)
+  capabilities:
+  - name: vocab-registry-wired-at-service
+    binding: capability→consumer (wired) — validation invoked from MemoryService.add_memory/add_system_record
+      (covers MCP + direct service callers; PRD D8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_metadata
+      paths:
+      - fused-memory/src/fused_memory/services/
+      expect: present
+  - name: structured-rejection-contract-fixed
+    binding: rejection-mechanism (INV-1/INV-2) — error type name contract-fixed by
+      PRD V1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MemoryMetadataValidationError
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: census-line-grep-anchor
+    binding: capability→producer — census line prefix contract-fixed by PRD V1 (grep-anchored,
+      never renamed)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_metadata\.schema_warning
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: warn-storm-escape
+    binding: rejection-mechanism (INV-4) — unknown-key warn storms raise a structured
+      escalation
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: counter/threshold naming implementation-chosen; behaviour pinned by
+        beta's storm test
+- label: gamma
+  task_id: 3196
+  title: 'supersedes normalization: list-shaped writer + shared normalize_supersedes()
+    read helper'
+  capabilities:
+  - name: normalize-helper-shared
+    binding: capability→producer — single shared helper consumed by targeted.py classifier
+      and exported for 3112's closure predicate (INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: normalize_supersedes
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: list-writer-migrated
+    binding: capability→producer — harness.py project_status_correction writer emits
+      list-of-UUIDs
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dict-literal shape grep is brittle; pinned by gamma's writer test
+- label: delta
+  task_id: 3197
+  title: 'Parent lifecycle: parent_id write-time liveness + delete_memory child-refusal
+    with explicit cascade'
+  capabilities:
+  - name: child-refusal-contract-fixed
+    binding: rejection-mechanism (INV-2/INV-3) — error type name contract-fixed by
+      PRD V3; live child re-count before refusal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ParentHasChildrenError
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: parent-liveness-at-write
+    binding: rejection-mechanism — dead parent_id rejected at the service seam
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: lookup-path naming implementation-chosen; pinned by delta's liveness
+        tests
+- label: epsilon
+  task_id: 3198
+  title: Canonical uniqueness + topic namespace unification (one slug constant across
+    memory and config)
+  capabilities:
+  - name: uniqueness-contract-fixed
+    binding: rejection-mechanism (INV-3) — live count re-check; error type contract-fixed
+      by PRD V1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CanonicalUniquenessViolation
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: shared-slug-constant
+    binding: capability→producer (INV-5) — one regex constant validates both metadata.topic
+      and ProceduralTopicCluster.topic_id; the 5 seeded cluster ids must pass
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: constant name implementation-chosen; pinned by epsilon's dual-namespace
+        tests
+- label: zeta
+  task_id: 3199
+  title: E2 storage-shape bake-off on seeded ephemeral stores + audit-script recall
+    measurement
+  capabilities:
+  - name: bakeoff-script-exists
+    binding: capability→producer — arms status-quo / C-peers / B-grouped / ±pin per
+      eval-design E2; isolation pattern test_recon_dedup_premise.py verified live
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: bake_off_storage_shape
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: decision-table-report-committed
+    binding: capability→consumer (wired) — eta's gate escalation cites this report
+      path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: e2-storage-shape-bakeoff-report
+      paths:
+      - plans/
+      expect: present
+  - name: audit-recall-measured
+    binding: 'capability→producer (PRD D10) — audit_duplicate_memories.py recall vs
+      alpha/3130 labeled fixture, reported not thresholded (G6: no uncalibrated bound
+      asserted)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a mechanical floor grep would encode an uncalibrated numeric bound (G6);
+        the number is reported for the gate to read
+- label: eta
+  task_id: 3200
+  title: '[MILESTONE] Corpus-shape ratification gate (deterministic, always_escalates,
+    reads zeta decision table)'
+  capabilities:
+  - name: pure-gate-shape-valid
+    binding: capability→producer — task-authoring pure-gate template (task_kind=deterministic
+      + always_escalates + no before_done); live exemplar task 3169; submit-guard-validated
+      at filing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pure human gate; no code artifact; the submit_task guard validates the
+        shape at write time
+- label: theta
+  task_id: 3201
+  title: Bounded retro topic/canonical stamping sweep over known consolidated clusters
+  capabilities:
+  - name: stamp-script-exists
+    binding: capability→producer — idempotent, bounded to PRD D11 cluster list, metadata-only
+      patch (no re-embed)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: retro_stamp_topics
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: update-memory-upstream
+    binding: capability→producer — producer:task-3088 upstream (dep wired); Mem0Backend.update
+      exists (backends/mem0_client.py:238-262), service/MCP layer is 3088's deliverable
+      per plans/mem0-in-place-update-decision.md
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 3088's own delivered_checks (update_memory greps from the 3055 decision
+        doc) mechanize this; duplicate greps here would drift (INV-5)
+- label: iota
+  task_id: 3202
+  title: Writer-instruction vocabulary section + registry↔prompt pinning drift test
+  capabilities:
+  - name: writer-instructions-name-vocabulary
+    binding: capability→consumer (wired) — _MEMORY_INSTRUCTIONS (roles.py, 5 roles)
+      gains the metadata vocabulary incl. supersedes; the word "metadata" is absent
+      from that block today (verified)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: supersedes
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: prompt-pinning-drift-test
+    binding: capability→producer (INV-5) — recon prompt-embedded filter examples (recon_self_model.py:288,467,488;
+      stage1/2/3 prompts) rendered from or pinned to the registry
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: drift-test naming implementation-chosen; the test itself is the mechanism
