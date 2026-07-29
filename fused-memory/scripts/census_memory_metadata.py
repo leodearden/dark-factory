@@ -58,6 +58,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Any
 
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
@@ -127,3 +129,116 @@ def classify_uuid_member(value: Any) -> str:
     if value and len(value) < 32 and _SHORT_HEX_RE.match(value):
         return 'short_hex'
     return 'other'
+
+
+@dataclass
+class CategoryCensus:
+    """Streaming accumulator for one (project, category) cell.
+
+    Payloads are folded in one at a time by :meth:`add` and never retained,
+    so peak memory is independent of corpus size (~49.4k entries measured
+    live). :meth:`merge` combines cells into the per-project and grand-total
+    rollups.
+
+    VALUE-level counting is confined to the bounded vocabulary axes the PRD's
+    V1 table names as load-bearing (``kind``, ``source``, ``topic``,
+    ``canonical``). Every other key is presence-counted only -- unbounded
+    value counting would put ~24k distinct ``task_id``/``run_id`` values into
+    a committed artifact. ``supersedes`` is censused by SHAPE only, never by
+    value, so no UUID pointers leak into the report either.
+    """
+
+    records: int = 0
+    # Presence count per top-level payload key. Deliberately unfiltered:
+    # mem0-managed keys (data/hash/created_at/user_id/...) are counted too.
+    key_counts: Counter[str] = field(default_factory=Counter)
+
+    kind_counts: Counter[str] = field(default_factory=Counter)
+    kind_missing: int = 0
+
+    source_counts: Counter[str] = field(default_factory=Counter)
+    # Per-source breakdown of the source-set-but-kind-missing drift
+    # documented at server/tools.py:1595-1597.
+    source_without_kind: Counter[str] = field(default_factory=Counter)
+
+    topic_present: int = 0
+    topic_values: Counter[str] = field(default_factory=Counter)
+    parent_id_present: int = 0
+
+    canonical_true: int = 0
+    canonical_false: int = 0
+    canonical_non_bool: int = 0
+
+    supersedes_shapes: Counter[str] = field(default_factory=Counter)
+    supersedes_member_shapes: Counter[str] = field(default_factory=Counter)
+    supersedes_list_lengths: Counter[int] = field(default_factory=Counter)
+
+    def add(self, payload: dict[str, Any]) -> None:
+        """Fold one Qdrant payload into the counters. Does not mutate *payload*.
+
+        Mem0 stores ``add_memory(metadata=...)`` fields as TOP-LEVEL payload
+        keys (mem0_client.py:309-311), so the payload dict *is* the metadata
+        namespace -- there is no nested 'metadata' to unwrap.
+        """
+        self.records += 1
+        for key in payload:
+            self.key_counts[key] += 1
+
+        kind = payload.get('kind')
+        has_kind = 'kind' in payload and kind is not None
+        if has_kind:
+            self.kind_counts[str(kind)] += 1
+        else:
+            self.kind_missing += 1
+
+        source = payload.get('source')
+        if 'source' in payload and source is not None:
+            self.source_counts[str(source)] += 1
+            if not has_kind:
+                self.source_without_kind[str(source)] += 1
+
+        if 'topic' in payload and payload['topic'] is not None:
+            self.topic_present += 1
+            self.topic_values[str(payload['topic'])] += 1
+        if 'parent_id' in payload and payload['parent_id'] is not None:
+            self.parent_id_present += 1
+
+        if 'canonical' in payload:
+            canonical = payload['canonical']
+            if isinstance(canonical, bool):
+                if canonical:
+                    self.canonical_true += 1
+                else:
+                    self.canonical_false += 1
+            elif canonical is not None:
+                self.canonical_non_bool += 1
+
+        shape = classify_supersedes(payload)
+        self.supersedes_shapes[shape] += 1
+        if shape == 'scalar':
+            # A bare string is one lone member -- counted so the scalar
+            # population's member shapes are visible alongside the list ones.
+            self.supersedes_member_shapes[classify_uuid_member(payload['supersedes'])] += 1
+        elif shape == 'list':
+            members = payload['supersedes']
+            self.supersedes_list_lengths[len(members)] += 1
+            for member in members:
+                self.supersedes_member_shapes[classify_uuid_member(member)] += 1
+
+    def merge(self, other: CategoryCensus) -> None:
+        """Fold *other* into self. Does not mutate *other*."""
+        self.records += other.records
+        self.key_counts.update(other.key_counts)
+        self.kind_counts.update(other.kind_counts)
+        self.kind_missing += other.kind_missing
+        self.source_counts.update(other.source_counts)
+        self.source_without_kind.update(other.source_without_kind)
+        self.topic_present += other.topic_present
+        self.topic_values.update(other.topic_values)
+        self.parent_id_present += other.parent_id_present
+        self.canonical_true += other.canonical_true
+        self.canonical_false += other.canonical_false
+        self.canonical_non_bool += other.canonical_non_bool
+        self.supersedes_shapes.update(other.supersedes_shapes)
+        self.supersedes_member_shapes.update(other.supersedes_member_shapes)
+        self.supersedes_list_lengths.update(other.supersedes_list_lengths)
