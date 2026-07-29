@@ -10805,6 +10805,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     last_progress = progress
                     deadline = asyncio.get_event_loop().time() + window
                     continue
+                # Give-up decided.  STOP THE STEWARD FIRST — before the event
+                # emit, before the orphan dismissal, before the break (review
+                # fix D3).  Ordering is load-bearing, not stylistic:
+                # TaskSteward invokes its agent with cwd = self.worktree
+                # (steward.py:542, 590), the SAME worktree the resumed
+                # implementer edits and commits in, so stopping first closes
+                # the two-agents-one-worktree window entirely rather than
+                # narrowing it.  stop() cancels the loop task (steward.py:
+                # 209-217) and on the stock `steward: "claude"` backend the
+                # resulting CancelledError propagates into
+                # cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
+                # terminates the agent's whole process group — so the in-flight
+                # agent genuinely stops writing rather than merely being
+                # detached from.  Clearing the reference (the existing
+                # stop-then-clear idiom, cf. :5319-5320 / :5363-5364) makes a
+                # later _mark_blocked build a FRESH steward through
+                # _ensure_steward_started instead of awaiting a cancelled loop
+                # that can never publish.  Suppressed because this is cleanup on
+                # an already-degraded path: a failing stop() must not convert a
+                # wait-timeout into a workflow crash.
+                if self._steward is not None:
+                    with contextlib.suppress(Exception):
+                        await self._steward.stop()
+                    self._steward = None
                 orphan_ids = [e.id for e in pending_l0]
                 logger.warning(
                     'Task %s: steward did not resolve %d level-0 escalation(s) '
