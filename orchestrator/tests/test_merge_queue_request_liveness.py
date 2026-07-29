@@ -1848,6 +1848,238 @@ class TestContendedLeaseDefers:
             f'absent. Got: {msg!r}'
         )
 
+    async def test_zero_wait_defer_is_throttled(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (1): a ZERO-WAIT defer must be THROTTLED.
+
+        ``MergeVerifyLeaseHeld`` is raised by an IMMEDIATE fail-CLOSED
+        pre-check at the top of ``reset_persistent_merge_worktree`` — before
+        any bounded wait.  So unlike the two contended raisers (which have
+        already burned 30 s / 300 s inside the acquire by the time they
+        surface), this one costs nothing to hit.  With a bare
+        ``_release_or_cleanup`` + ``put_nowait`` defer the merger would spin
+        dequeue → ``git worktree add`` + merge → instant refusal → cleanup →
+        requeue at whatever rate git allows, for the WHOLE 1–2 h holder
+        window.  The defer must therefore observe a minimum INTER-ATTEMPT
+        period.
+
+        RED on main: ``CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS`` does not exist
+        (strict ``monkeypatch.setattr`` → AttributeError) and no sleep is
+        performed.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+
+        async def _lease_held_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseHeld(warm_path, foreign_pgid)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'defer-throttle-a', 'dta.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        # STRICT setattr (raising=True): the throttle must be a real class
+        # attribute following the MAX_*/WARN_STREAK monkeypatch convention, not
+        # something this test invents on the instance.
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS', 0.25)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        loop = asyncio.get_running_loop()
+        with patch.object(
+            warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+        ):
+            t0 = loop.time()
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+            elapsed = loop.time() - t0
+
+        # A sleep can only ever OVERSHOOT its argument, so a lower bound
+        # slightly under the configured period is deterministic (no upper
+        # bound is asserted — that would be timing-fragile).
+        assert elapsed >= 0.2, (
+            f'a zero-wait MergeVerifyLeaseHeld defer must observe the minimum '
+            f'inter-attempt period (0.25s here) before re-queuing, else the '
+            f'merger hot-spins merge→refuse→cleanup→requeue for the whole '
+            f'holder window; returned after {elapsed:.3f}s'
+        )
+
+        # …and the throttle must not have cost us any of the defer contract:
+        assert result.status == InflightStatus.REQUEUED
+        assert result.outcome is None, 'requeue must carry no MergeOutcome'
+        assert result.merge_wt is None, 'merge_wt must be released on requeue'
+        assert not req.result.done(), (
+            'req.result must be left PENDING (deferred), never resolved'
+        )
+        assert not q.empty(), 'the request must be re-dispatched onto _queue'
+
+    async def test_self_throttling_raiser_is_not_slept_again(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (1), scope fence: the throttle is a minimum
+        inter-attempt PERIOD, not an unconditional extra sleep.
+
+        A raiser that already burned a bounded wait inside the acquire has
+        ALREADY paid the period — task 2828's lease waits 300 s
+        (``_MERGE_VERIFY_LEASE_WAIT_SECS``) and the reset path waits 30 s
+        (``_RESET_WARM_LANE_LOCK_WAIT_SECS``), both ≥ any sane minimum period.
+        Sleeping again on top of that would slow the ALREADY-throttled paths
+        for no benefit, so the backoff must be ``max(0, PERIOD - wait_secs)``.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        async def _lease_contended_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'defer-throttle-b', 'dtb.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS', 0.25)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        loop = asyncio.get_running_loop()
+        with patch.object(
+            warm_git_ops, 'reset_persistent_merge_worktree', _lease_contended_reset,
+        ):
+            t0 = loop.time()
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+            elapsed = loop.time() - t0
+
+        assert elapsed < 0.2, (
+            f'wait_secs=300.0 already exceeds the 0.25s minimum inter-attempt '
+            f'period, so the defer must sleep ZERO additional seconds — the '
+            f'backoff is max(0, PERIOD - wait_secs), not an unconditional '
+            f'extra sleep; took {elapsed:.3f}s'
+        )
+        assert result.status == InflightStatus.REQUEUED
+        assert result.outcome is None
+        assert not req.result.done()
+        assert not q.empty()
+
+    async def test_cancel_during_defer_backoff_still_requeues(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (1), safety: the backoff must be
+        cancellation-safe.
+
+        ``_run_inflight_verify`` runs as a background ``ensure_future`` task, so
+        a shutdown (or any cancellation) can land INSIDE the new backoff — a
+        window that sits between ``_release_or_cleanup`` (worktree already
+        gone) and ``put_nowait``.  If the requeue bookkeeping is not run on the
+        cancellation path the request is silently LOST: disk cleaned, future
+        still PENDING, nothing on the queue, nothing in the ledger.  The three
+        synchronous requeue calls must therefore run from a ``finally``.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.merge_queue import SpeculativeMergeWorker  # noqa: PLC0415
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+
+        async def _lease_held_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseHeld(warm_path, foreign_pgid)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'defer-cancel', 'dc.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        # Long enough that the cancellation below lands squarely inside it.
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS', 5.0)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        # Deterministic barrier: wait until the ephemeral worktree has actually
+        # been released before cancelling, so the cancellation provably lands in
+        # the backoff and not in the (unbounded, git-I/O) cleanup ahead of it.
+        # This also pins the ORDERING — the backoff must come AFTER the release,
+        # never hold a worktree and its disk across the wait.
+        released = asyncio.Event()
+        _real_release = worker._release_or_cleanup
+
+        async def _release_then_signal(*a: object, **k: object) -> object:
+            try:
+                return await _real_release(*a, **k)
+            finally:
+                released.set()
+
+        with patch.object(worker, '_release_or_cleanup', _release_then_signal), \
+                patch.object(
+                    warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+                ):
+            verify_fut = asyncio.ensure_future(
+                worker._run_inflight_verify(item, lease)
+            )
+            await asyncio.wait_for(released.wait(), timeout=10.0)
+            await asyncio.sleep(0.1)
+            assert not verify_fut.done(), (
+                'the defer must still be inside its backoff here — if it has '
+                'already returned there is no throttle to be cancelled during'
+            )
+            verify_fut.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await verify_fut
+
+        assert not q.empty(), (
+            'cancellation mid-backoff must NOT lose the request — the worktree '
+            'is already cleaned up, so a request that never reaches _queue is '
+            'gone for good (future PENDING forever, nothing to re-dispatch)'
+        )
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must still clear the ledger entry on the cancellation '
+            'path, else the parked request ages out and false-alarms'
+        )
+        assert not req.result.done(), (
+            'a cancelled defer must still leave req.result PENDING'
+        )
+
     async def test_contended_lease_requeues_and_leaves_result_pending(
         self,
         git_ops: GitOps,
