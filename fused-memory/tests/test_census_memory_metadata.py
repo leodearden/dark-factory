@@ -9,6 +9,7 @@ stand-ins throughout.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -134,6 +135,21 @@ class TestClassifyUuidMember:
         # Uppercase is still a canonical UUID rendering.
         assert _mod.classify_uuid_member('8F14E45F-CEEA-467A-9B2C-64E1A2B3C4D5') == 'full_uuid'
 
+    def test_hex32_uuid_is_not_lumped_in_with_garbage(self):
+        # uuid.UUID.hex / str(u).replace('-','') -- non-canonical but VALID.
+        # A consumer told to reject 'other' must not have to guess whether
+        # those members are malformed pointers or this rendering.
+        assert _mod.classify_uuid_member('8f14e45fceea467a9b2c64e1a2b3c4d5') == 'hex32_uuid'
+        assert _mod.classify_uuid_member('8F14E45FCEEA467A9B2C64E1A2B3C4D5') == 'hex32_uuid'
+
+    def test_hex32_is_checked_before_the_short_hex_branch(self):
+        # 32 hex chars must never fall through to short_hex (or to 'other').
+        thirty_two = 'a' * 32
+        assert _mod.classify_uuid_member(thirty_two) == 'hex32_uuid'
+        assert _mod.classify_uuid_member('a' * 31) == 'short_hex'
+        # 33+ hex chars is neither rendering.
+        assert _mod.classify_uuid_member('a' * 33) == 'other'
+
     def test_short_hex(self):
         # The malformed member shape PRD V1 says beta must reject.
         assert _mod.classify_uuid_member('8f14e45f') == 'short_hex'
@@ -150,9 +166,8 @@ class TestClassifyUuidMember:
         assert _mod.classify_uuid_member('') == 'other'
         assert _mod.classify_uuid_member('not-a-uuid-at-all') == 'other'
         assert _mod.classify_uuid_member('cycle_summary') == 'other'
-        # 32 hex chars unhyphenated is not the canonical rendering, and is not
-        # "shorter than 32 chars" either -- it falls to 'other'.
-        assert _mod.classify_uuid_member('8f14e45fceea467a9b2c64e1a2b3c4d5') == 'other'
+        # Hex-looking but not a UUID rendering: a hyphenated non-UUID.
+        assert _mod.classify_uuid_member('8f14e45f-ceea-467a-9b2c') == 'other'
 
 
 # ===========================================================================
@@ -376,15 +391,25 @@ def _census(payloads: list[dict]) -> object:
 def _coverage(
     collection: str,
     collection_points: int,
-    categories: dict[str, tuple[int, int]],
+    categories: dict[str, tuple[int, ...]],
 ) -> dict:
-    """Build a per-project coverage record: {category: (expected, scrolled)}."""
+    """Build a per-project coverage record.
+
+    ``{category: (expected, scrolled)}`` -- or ``(expected, scrolled, recount)``
+    to model a corpus that changed under the scan. Omitted, *recount* equals
+    *expected* (a stable corpus), which is what census_project records when
+    nothing was written mid-census.
+    """
     return {
         'collection': collection,
         'collection_points': collection_points,
         'categories': {
-            cat: {'expected': exp, 'scrolled': scr}
-            for cat, (exp, scr) in categories.items()
+            cat: {
+                'expected': counts[0],
+                'scrolled': counts[1],
+                'recount': counts[2] if len(counts) > 2 else counts[0],
+            }
+            for cat, counts in categories.items()
         },
     }
 
@@ -482,45 +507,65 @@ class TestBuildReportDeterminism:
         assert first == second
 
 
-class TestBuildReportTruncation:
-    """Capped value tables disclose the cap; a long tail is never mistaken
-    for a complete one."""
+class TestBuildReportNeverTruncatesTheJson:
+    """The JSON artifact carries the WHOLE population, whatever --top-n says.
 
-    def test_long_table_truncated_with_disclosure(self):
+    ``top_n`` is a markdown readability knob only. A capped JSON table would
+    orphan every in-use value in its tail (leaf beta's kind registry reads
+    this file) while ``coverage.complete`` still read ``true`` -- a silent
+    under-report in a different coordinate from a short scroll, but the same
+    failure (INV-2).
+    """
+
+    def test_long_kind_table_is_complete_despite_a_small_top_n(self):
         payloads = [{'kind': f'k{i:02d}'} for i in range(10)]
         cells = {'dark_factory': {OBS: _census(payloads)}}
         cov = {'dark_factory': _coverage('fused_dark_factory', 10, {OBS: (10, 10)})}
         report = _mod.build_report(cells, cov, top_n=3)
         table = report['projects']['dark_factory']['categories'][OBS]['kind']
-        assert len(table['entries']) == 3
+        assert len(table['entries']) == 10
         assert table['distinct_total'] == 10
-        assert table['truncated_values'] is True
+        assert {e['value'] for e in table['entries']} == {f'k{i:02d}' for i in range(10)}
 
-    def test_short_table_not_flagged_truncated(self):
-        cells = {'dark_factory': {OBS: _census([{'kind': 'a'}, {'kind': 'b'}])}}
-        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
-        report = _mod.build_report(cells, cov, top_n=50)
-        table = report['projects']['dark_factory']['categories'][OBS]['kind']
-        assert table['distinct_total'] == 2
-        assert table['truncated_values'] is False
-        assert len(table['entries']) == 2
-
-    def test_table_exactly_at_top_n_is_not_flagged(self):
-        cells = {'dark_factory': {OBS: _census([{'kind': 'a'}, {'kind': 'b'}])}}
-        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
-        report = _mod.build_report(cells, cov, top_n=2)
-        table = report['projects']['dark_factory']['categories'][OBS]['kind']
-        assert table['truncated_values'] is False
-
-    def test_key_table_also_capped_and_disclosed(self):
+    def test_key_table_is_complete_too(self):
         payloads = [{f'key{i:02d}': 1 for i in range(10)}]
         cells = {'dark_factory': {OBS: _census(payloads)}}
         cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
         report = _mod.build_report(cells, cov, top_n=4)
         table = report['projects']['dark_factory']['categories'][OBS]['keys']
-        assert len(table['entries']) == 4
+        assert len(table['entries']) == 10
         assert table['distinct_total'] == 10
-        assert table['truncated_values'] is True
+
+    def test_distinct_total_always_equals_the_entry_count(self):
+        payloads = [{'kind': f'k{i:02d}', 'source': f's{i:02d}'} for i in range(10)]
+        cells = {'dark_factory': {OBS: _census(payloads)}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 10, {OBS: (10, 10)})}
+        report = _mod.build_report(cells, cov, top_n=1)
+        cell = report['projects']['dark_factory']['categories'][OBS]
+        for axis in ('keys', 'kind', 'source', 'source_without_kind', 'topic',
+                     'supersedes_shapes', 'supersedes_member_shapes',
+                     'supersedes_list_lengths'):
+            table = cell[axis]
+            assert len(table['entries']) == table['distinct_total'], axis
+
+    def test_a_small_top_n_never_flips_coverage_incomplete(self):
+        # The bug this replaces: --top-n 50 against 327 distinct kinds left
+        # coverage.complete true while the artifact held 50 of them.
+        payloads = [{'kind': f'k{i:03d}'} for i in range(200)]
+        cells = {'dark_factory': {OBS: _census(payloads)}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 200, {OBS: (200, 200)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['coverage']['complete'] is True
+        assert report['projects']['dark_factory']['categories'][OBS]['kind'][
+            'distinct_total'] == 200
+        assert len(report['projects']['dark_factory']['categories'][OBS]['kind'][
+            'entries']) == 200
+
+    def test_top_n_is_recorded_in_params_for_the_markdown_render(self):
+        cells = {'dark_factory': {OBS: _census([{'kind': 'a'}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=9)
+        assert report['params']['top_n'] == 9
 
 
 class TestBuildReportCoverage:
@@ -561,10 +606,26 @@ class TestBuildReportCoverage:
         assert named[0]['category'] == OBS
         assert named[0]['delta'] == -3
 
+    def test_surplus_is_named_a_surplus_not_a_shortfall(self):
+        # Scrolling MORE than either count expected is a different diagnosis
+        # than scrolling fewer: nothing is missing. Calling it a shortfall
+        # sends a reader hunting for data that is not gone.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 100, {OBS: (100, 105, 100)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['complete'] is False
+        kinds = [d['kind'] for d in coverage['deltas']]
+        assert 'category_surplus' in kinds
+        assert 'category_shortfall' not in kinds
+        surplus = next(d for d in coverage['deltas'] if d['kind'] == 'category_surplus')
+        assert surplus['delta'] == 5
+        assert surplus['scrolled'] == 105
+
     def test_uncovered_points_surfaced_for_the_measured_live_shape(self):
         # Measured 2026-07-29: sum(three Mem0-primary categories) = 29,872 vs
-        # 29,951 points in fused_reify -- an 80-point dual-write residue that
-        # must be surfaced, not swallowed.
+        # 29,951 points in fused_reify -- a 79-point dual-write residue in
+        # THAT collection (80 across both, the extra point being in
+        # fused_dark_factory) that must be surfaced, not swallowed.
         cells = {
             'reify': {
                 OBS: _census([]),
@@ -608,6 +669,79 @@ class TestBuildReportCoverage:
         assert report['coverage']['complete'] is True
 
 
+class TestBuildReportChurn:
+    """A LIVE corpus moving under the scan is drift, not a truncated scroll.
+
+    project_root is written continuously by orchestrators, so count and
+    scroll are two unsynchronised reads. Treating every delta as a shortfall
+    made a healthy census intermittently report itself broken and exit 1.
+    """
+
+    def test_scroll_matching_the_post_scan_recount_is_complete(self):
+        # A write landed between the count and the scroll: expected 100,
+        # scrolled 101, and the re-count agrees at 101. Nothing is missing.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        cell = coverage['projects']['dark_factory']['categories'][OBS]
+        assert cell['complete'] is True
+        assert cell['churn'] is True
+        assert cell['recount'] == 101
+        assert [d for d in coverage['deltas'] if d.get('category') == OBS] == []
+
+    def test_churn_is_recorded_so_drift_is_distinguishable_from_truncation(self):
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        churn = _mod.build_report(cells, cov, top_n=50)['coverage']['churn']
+        assert len(churn) == 1
+        assert churn[0]['category'] == OBS
+        assert (churn[0]['expected'], churn[0]['recount'], churn[0]['scrolled']) == (
+            100, 101, 101)
+
+    def test_scroll_matching_the_pre_scan_count_is_also_complete(self):
+        # The write landed after the scroll passed that page: scrolled agrees
+        # with the pre-scan count even though the corpus has since grown.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 100, 101)})}
+        cell = _mod.build_report(cells, cov, top_n=50)['coverage'][
+            'projects']['dark_factory']['categories'][OBS]
+        assert cell['complete'] is True
+        assert cell['churn'] is True
+
+    def test_scroll_matching_NEITHER_count_is_still_a_shortfall(self):
+        # Churn tolerance must not swallow a genuinely truncated scan.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 100, {OBS: (100, 40, 101)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['complete'] is False
+        named = [d for d in coverage['deltas'] if d['kind'] == 'category_shortfall']
+        assert len(named) == 1
+        assert named[0]['recount'] == 101
+
+    def test_stable_corpus_reports_no_churn(self):
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 100, {OBS: (100, 100, 100)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['churn'] == []
+        assert coverage['projects']['dark_factory']['categories'][OBS]['churn'] is False
+
+    def test_missing_recount_falls_back_to_strict_equality(self):
+        # A coverage record without a recount (an older/partial caller) must
+        # not silently gain churn tolerance.
+        cov = {
+            'dark_factory': {
+                'collection': 'fused_dark_factory',
+                'collection_points': 100,
+                'categories': {OBS: {'expected': 100, 'scrolled': 90}},
+            },
+        }
+        coverage = _mod.build_report({'dark_factory': {}}, cov, top_n=50)['coverage']
+        cell = coverage['projects']['dark_factory']['categories'][OBS]
+        assert cell['recount'] is None
+        assert cell['complete'] is False
+        assert cell['churn'] is False
+
+
 # ===========================================================================
 # Tests: render_markdown
 # ===========================================================================
@@ -636,52 +770,74 @@ def _rich_report(top_n: int = 50, *, complete: bool = True) -> dict:
 
 
 class TestRenderMarkdownSections:
-    """Every section the artifact must carry, driven off the report dict."""
+    """Every section the artifact must carry, driven off the report dict.
+
+    Asserted on RENDERED STRUCTURE -- literal section headings and concrete
+    table rows -- not on bare words. A substring check like `'kind' in
+    md.lower()` passes on essentially any census markdown ('kind' is in the
+    preamble, 'key' in every header row), so it would stay green while the
+    section leaf beta reads was deleted outright.
+    """
 
     def test_header_names_the_prd_leaf(self):
         md = _mod.render_markdown(_rich_report())
-        assert md.startswith('#')
+        assert md.startswith('# Mem0 metadata corpus census')
         assert 'memory-metadata-vocabulary' in md
 
     def test_record_counts_per_project_and_category(self):
         md = _mod.render_markdown(_rich_report())
-        assert 'dark_factory' in md
-        assert OBS in md
-        assert PROC in md
+        assert '## Record counts' in md
+        assert '| project | category | records |' in md
+        assert f'| `dark_factory` | `{OBS}` | 5 |' in md
+        assert f'| `dark_factory` | `{PROC}` | 2 |' in md
+        assert '| `dark_factory` | **(all)** | **7** |' in md
 
     def test_key_population_table(self):
         md = _mod.render_markdown(_rich_report())
-        assert 'key' in md.lower()
-        assert 'supersedes' in md
+        assert '#### Top-level metadata key population' in md
+        assert '| key | count |' in md
+        # A concrete measured row: 'kind' appears on 3 of the 7 payloads.
+        assert '| `kind` | 3 |' in md
+        assert '| `supersedes` | 3 |' in md
 
     def test_kind_table_and_missing_count(self):
         md = _mod.render_markdown(_rich_report())
-        assert 'cycle_summary' in md
-        assert 'gotcha' in md
-        assert 'kind' in md.lower()
-        assert 'missing' in md.lower()
+        assert '#### `kind` values' in md
+        assert '| `cycle_summary` | 2 |' in md
+        assert '| `gotcha` | 1 |' in md
+        assert '`kind` missing: **3** record(s).' in md
 
     def test_supersedes_shape_table_with_member_and_length_breakdowns(self):
         md = _mod.render_markdown(_rich_report())
+        assert '#### `supersedes` shapes' in md
+        assert '#### `supersedes` member shapes' in md
+        assert '#### `supersedes` list lengths' in md
         for label in ('absent', 'null', 'scalar', 'list'):
-            assert label in md
-        assert 'full_uuid' in md
-        assert 'short_hex' in md
-        assert 'length' in md.lower()
+            assert f'| `{label}` |' in md
+        assert '| `full_uuid` | 2 |' in md
+        assert '| `short_hex` | 1 |' in md
+        # list-length distribution: one list of 2 members.
+        assert '| length | count |' in md
+        assert '| `2` | 1 |' in md
 
     def test_topic_canonical_parent_id_occurrences(self):
         md = _mod.render_markdown(_rich_report())
-        assert 'topic' in md.lower()
-        assert 'canonical' in md.lower()
-        assert 'parent_id' in md
+        assert '#### Occurrence axes' in md
+        assert '| `topic` present | 1 |' in md
+        assert '| `parent_id` present | 1 |' in md
+        assert '| `canonical` true | 1 |' in md
+        assert '| `canonical` false | 0 |' in md
+        assert '| `canonical` non-bool | 1 |' in md
+        assert '#### `topic` values' in md
+        assert '| `merge_lane` | 1 |' in md
 
     def test_source_set_but_kind_missing_section_lists_offending_sources(self):
         md = _mod.render_markdown(_rich_report())
-        assert 'stage1_flag_marker' in md
-        lowered = md.lower()
-        assert 'source' in lowered
-        # The drift section must name the condition, not just the value.
-        assert 'without' in lowered or 'missing' in lowered
+        assert '#### `source` values' in md
+        assert '#### `source` set but `kind` missing' in md
+        # Both stage1_flag_marker records lack a kind -- the tools.py:1595-1597
+        # drift, rendered as its own row rather than merely mentioned.
+        assert '| `stage1_flag_marker` | 2 |' in md
 
 
 class TestRenderMarkdownDisclosure:
@@ -689,13 +845,30 @@ class TestRenderMarkdownDisclosure:
 
     def test_truncated_table_renders_its_disclosure(self):
         md = _mod.render_markdown(_rich_report(top_n=1))
-        lowered = md.lower()
-        assert 'truncated' in lowered
-        assert 'distinct' in lowered
+        assert '_Showing top 1 of ' in md
+        assert 'distinct values' in md
+        assert '**truncated**' in md
+        # And it points at the copy that is NOT cut.
+        assert 'JSON artifact carries the full population' in md
 
     def test_untruncated_report_has_no_truncation_note(self):
         md = _mod.render_markdown(_rich_report(top_n=500))
-        assert 'truncated' not in md.lower()
+        assert '_Showing top ' not in md
+        assert '**truncated**' not in md
+
+    def test_markdown_cut_never_drops_a_value_from_the_json(self):
+        # The markdown is the readable twin; the JSON it renders from stays
+        # complete, so a cut row is always recoverable.
+        report = _rich_report(top_n=1)
+        md = _mod.render_markdown(report)
+        kind_table = report['projects']['dark_factory']['categories'][OBS]['kind']
+        assert kind_table['distinct_total'] == len(kind_table['entries'])
+        assert md.count('| `cycle_summary` | 2 |') >= 1
+
+    def test_top_n_zero_or_negative_renders_the_full_population(self):
+        md = _mod.render_markdown(_rich_report(top_n=0))
+        assert '_Showing top ' not in md
+        assert '| `cycle_summary` | 2 |' in md
 
     def test_incomplete_coverage_renders_a_warning_naming_the_deltas(self):
         md = _mod.render_markdown(_rich_report(complete=False))
@@ -866,6 +1039,48 @@ class TestScrollAllPayloadsBudget:
         assert issubclass(_mod.CensusScanIncomplete, Exception)
 
 
+class TestScrollAllPayloadsTimeout:
+    """A wedged connection must fail loudly, not hang the scan.
+
+    Every other Qdrant read on this path bounds itself with the backend's
+    ``_read_timeout`` (mem0_client.py:287, 331, 395). A ~30-round-trip census
+    is the most exposed caller of all: unbounded, a stalled socket produces
+    no artifact and no diagnostic, forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_hung_page_request_raises_instead_of_hanging(self):
+        async def _hang(**kwargs):
+            await asyncio.sleep(3600)
+
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=_hang)
+        with pytest.raises(TimeoutError):
+            await _drain(_mod.scroll_all_payloads(
+                client, 'c', {'category': OBS}, page_size=10, read_timeout=0.01,
+            ))
+
+    @pytest.mark.asyncio
+    async def test_timeout_applies_per_page_not_per_scan(self):
+        # Two quick pages must both complete under a short per-page bound.
+        client = _paging_client([
+            ([_record({'n': 1})], 'off-1'),
+            ([_record({'n': 2})], None),
+        ])
+        got = await _drain(_mod.scroll_all_payloads(
+            client, 'c', {'category': OBS}, page_size=1, read_timeout=5,
+        ))
+        assert got == [{'n': 1}, {'n': 2}]
+
+    @pytest.mark.asyncio
+    async def test_none_disables_the_bound(self):
+        client = _paging_client([([_record({'n': 1})], None)])
+        got = await _drain(_mod.scroll_all_payloads(
+            client, 'c', {'category': OBS}, page_size=1, read_timeout=None,
+        ))
+        assert got == [{'n': 1}]
+
+
 # ===========================================================================
 # Tests: census_project
 # ===========================================================================
@@ -977,19 +1192,44 @@ class TestCensusProjectCorroboration:
         assert log.index(('count', PROC)) < log.index(('scroll', PROC))
 
     @pytest.mark.asyncio
-    async def test_count_by_metadata_called_once_per_category_with_the_category_filter(self):
+    async def test_count_by_metadata_brackets_each_category_scroll(self):
+        # Counted before AND after: the second read is what tells corpus
+        # churn apart from a truncated scan on a live store.
         backend = _backend({OBS: [{}], PROC: [{}]})
         await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
-        assert backend.count_by_metadata.await_count == 2
+        assert backend.count_by_metadata.await_count == 4
         filters = [call.args[1] for call in backend.count_by_metadata.await_args_list]
-        assert filters == [{'category': OBS}, {'category': PROC}]
+        assert filters == [
+            {'category': OBS}, {'category': OBS},
+            {'category': PROC}, {'category': PROC},
+        ]
 
     @pytest.mark.asyncio
-    async def test_expected_and_scrolled_recorded_per_category(self):
+    async def test_the_second_count_happens_after_the_scroll(self):
+        log: list = []
+        backend = _backend({OBS: [{}]}, call_log=log)
+        await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert log == [('count', OBS), ('scroll', OBS), ('count', OBS)]
+
+    @pytest.mark.asyncio
+    async def test_expected_recount_and_scrolled_recorded_per_category(self):
         backend = _backend({OBS: [{}, {}]}, counts_by_category={OBS: 2})
         _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
         assert coverage['categories'][OBS]['expected'] == 2
+        assert coverage['categories'][OBS]['recount'] == 2
         assert coverage['categories'][OBS]['scrolled'] == 2
+
+    @pytest.mark.asyncio
+    async def test_churn_between_the_two_counts_is_not_called_a_shortfall(self):
+        # count says 2, the scroll yields 3, and the re-count agrees at 3 --
+        # a write landed mid-census. Nothing is missing.
+        counts = iter([2, 3])
+        backend = _backend({OBS: [{}, {}, {}]})
+        backend.count_by_metadata = AsyncMock(side_effect=lambda scope, f: next(counts))
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        cell = coverage['categories'][OBS]
+        assert (cell['expected'], cell['recount'], cell['scrolled']) == (2, 3, 3)
+        assert cell['complete'] is True
 
     @pytest.mark.asyncio
     async def test_under_enumeration_marks_the_cell_incomplete_with_the_delta(self):
@@ -1027,6 +1267,39 @@ class TestCensusProjectCoverage:
         _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
         report = _mod.build_report({'dark_factory': {}}, {'dark_factory': coverage}, top_n=50)
         assert report['coverage']['projects']['dark_factory']['uncovered_points'] == 1562
+
+    @pytest.mark.asyncio
+    async def test_passes_the_backends_read_timeout_to_every_scroll(self, monkeypatch):
+        seen: list = []
+
+        async def _fake_scroll(client, collection, filters, page_size=1000,
+                               max_pages=200, read_timeout=None):
+            seen.append(read_timeout)
+            return
+            yield  # pragma: no cover -- makes this an async generator
+
+        monkeypatch.setattr(_mod, 'scroll_all_payloads', _fake_scroll)
+        backend = _backend({OBS: []}, counts_by_category={OBS: 0})
+        backend._read_timeout = 7.5
+        await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert seen == [7.5]
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_read_timeout_degrades_to_unbounded(self, monkeypatch):
+        # A backend stand-in auto-creates _read_timeout as a Mock; passing
+        # that into asyncio.wait_for would TypeError mid-scan.
+        seen: list = []
+
+        async def _fake_scroll(client, collection, filters, page_size=1000,
+                               max_pages=200, read_timeout=None):
+            seen.append(read_timeout)
+            return
+            yield  # pragma: no cover -- makes this an async generator
+
+        monkeypatch.setattr(_mod, 'scroll_all_payloads', _fake_scroll)
+        backend = _backend({OBS: []}, counts_by_category={OBS: 0})
+        await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert seen == [None]
 
     @pytest.mark.asyncio
     async def test_coverage_feeds_build_report_unchanged(self):

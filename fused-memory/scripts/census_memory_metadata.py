@@ -26,17 +26,27 @@ Measured corpus facts that shape this script (live Qdrant, 2026-07-29):
 
   - Every Mem0 write is stamped with ``category`` (memory_service.py:2185-2190)
     and ``category``-absent measured 0 in both collections -- but the three
-    Mem0-primary categories still do NOT cover the corpus: an 80-point residue
-    carries a *Graphiti*-primary category from dual-write records. The census
-    therefore enumerates all six ``MemoryCategory`` values and reconciles the
-    sum against each collection's point count.
+    Mem0-primary categories still do NOT cover the corpus: a residue of 80
+    points ACROSS BOTH collections (79 in ``fused_reify``, 1 in
+    ``fused_dark_factory``) carries a *Graphiti*-primary category from
+    dual-write records. The census therefore enumerates all six
+    ``MemoryCategory`` values and reconciles the sum against each
+    collection's point count.
 
-Any enumeration shortfall -- scrolled < ``count_by_metadata``, page budget
-exhausted with a live ``next_offset``, or sum(per-category) < collection
-total -- sets ``coverage.complete=false``, names the deltas in both artifacts
-and exits non-zero. A census that under-reports is indistinguishable from a
-census of a smaller corpus, and its consumer cannot tell the difference
-(INV-2 structured-facts-at-failure / no-silent-fail-soft).
+Any enumeration shortfall -- scrolled matching neither the pre- nor the
+post-scroll ``count_by_metadata``, page budget exhausted with a live
+``next_offset``, or sum(per-category) < collection total -- sets
+``coverage.complete=false``, names the deltas in both artifacts and exits
+non-zero. A census that under-reports is indistinguishable from a census of
+a smaller corpus, and its consumer cannot tell the difference (INV-2
+structured-facts-at-failure / no-silent-fail-soft). Each category is counted
+BEFORE and AFTER its scroll so that corpus churn on a live store (a write
+landing mid-census) is reported as churn rather than as a fake shortfall.
+
+The JSON artifact's value tables are never capped: ``--top-n`` cuts the
+MARKDOWN view only. A capped JSON table would hide in-use ``kind`` values in
+its tail while ``coverage.complete`` still read ``true`` -- the same silent
+under-report in a different coordinate.
 
 READ-ONLY: this script never writes, updates or deletes a memory. It issues
 only Qdrant ``count`` and ``scroll`` calls, and writes two local report files.
@@ -50,7 +60,8 @@ Usage
   python scripts/census_memory_metadata.py --project-id dark_factory \\
       --json-out /tmp/census.json --md-out /tmp/census.md
 
-  # Larger pages / a longer value tail in the report.
+  # Larger pages / a longer value tail in the MARKDOWN view (the JSON
+  # artifact is complete either way).
   python scripts/census_memory_metadata.py --page-size 2000 --top-n 100
 """
 
@@ -92,7 +103,8 @@ DEFAULT_MAX_PAGES = 200
 # All six categories, Mem0-primary first, derived from the shared enum --
 # never a restated literal list (INV-5 no-lockstep-duplication). The three
 # Graphiti-primary categories are included because dual-write records land
-# them in the Mem0 collection too (80 points measured live); omitting them
+# them in the Mem0 collection too (80 points measured live across both
+# collections -- 79 in fused_reify, 1 in fused_dark_factory); omitting them
 # would leave a silently unenumerated slice of the corpus.
 CENSUS_CATEGORIES: tuple[MemoryCategory, ...] = (
     *sorted(MEM0_PRIMARY),
@@ -103,6 +115,9 @@ _FULL_UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
     re.IGNORECASE,
 )
+# ``uuid.UUID.hex`` / ``str(u).replace('-', '')`` -- an unhyphenated but
+# entirely VALID UUID rendering, kept distinct from genuine garbage.
+_HEX32_RE = re.compile(r'^[0-9a-f]{32}$', re.IGNORECASE)
 _SHORT_HEX_RE = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
 
 
@@ -150,15 +165,25 @@ def classify_supersedes(payload: dict[str, Any]) -> str:
 def classify_uuid_member(value: Any) -> str:
     """Classify the shape of a single ``supersedes`` member.
 
-    Returns ``'full_uuid'`` for the canonical 36-char hyphenated rendering,
-    ``'short_hex'`` for a bare hex string shorter than 32 characters (the
-    malformed member shape PRD V1 says beta must reject), and ``'other'`` for
-    a non-string or any other string.
+    Returns:
+        ``'full_uuid'`` for the canonical 36-char hyphenated rendering;
+        ``'hex32_uuid'`` for the unhyphenated 32-hex-char rendering
+        (``uuid.UUID.hex``) -- non-canonical but a VALID pointer, so beta can
+        normalise it rather than reject it; ``'short_hex'`` for a bare hex
+        string shorter than 32 characters (the malformed member shape PRD V1
+        says beta must reject); ``'other'`` for a non-string or any other
+        string.
+
+    ``hex32_uuid`` is separated from ``other`` deliberately: a consumer told
+    to reject ``'other'`` must not be forced to guess whether those members
+    are malformed pointers or a legitimate alternate rendering.
     """
     if not isinstance(value, str):
         return 'other'
     if _FULL_UUID_RE.match(value):
         return 'full_uuid'
+    if _HEX32_RE.match(value):
+        return 'hex32_uuid'
     if value and len(value) < 32 and _SHORT_HEX_RE.match(value):
         return 'short_hex'
     return 'other'
@@ -285,41 +310,45 @@ def _value_sort_key(value: Any) -> tuple[int, Any]:
     return (1, str(value))
 
 
-def _table(counter: Counter[Any], top_n: int) -> dict[str, Any]:
-    """Render a Counter as a capped, deterministically ordered table.
+def _table(counter: Counter[Any]) -> dict[str, Any]:
+    """Render a Counter as a COMPLETE, deterministically ordered table.
 
     Sorted by count descending, then by value ascending -- so a re-run over
-    an unchanged corpus produces a byte-identical artifact. Truncation
-    discloses itself (``distinct_total`` + ``truncated_values``) so a capped
-    long tail is never mistaken for a complete one.
+    an unchanged corpus produces a byte-identical artifact.
+
+    Never capped. ``--top-n`` bounds the MARKDOWN view only (:func:`_render_table`):
+    the JSON artifact is the machine-readable input to leaf beta's ``kind``
+    registry and grandfather list, and a capped table there would silently
+    orphan every in-use value in the tail -- the exact failure this census
+    exists to prevent -- while ``coverage.complete`` still read ``true``.
+    Truncation is therefore structurally impossible in the JSON rather than
+    merely disclosed, so ``distinct_total`` always equals ``len(entries)``.
     """
     ordered = sorted(counter.items(), key=lambda kv: (-kv[1], _value_sort_key(kv[0])))
-    distinct_total = len(ordered)
     return {
-        'entries': [{'value': v, 'count': c} for v, c in ordered[:top_n]],
-        'distinct_total': distinct_total,
-        'truncated_values': distinct_total > top_n,
+        'entries': [{'value': v, 'count': c} for v, c in ordered],
+        'distinct_total': len(ordered),
     }
 
 
-def _census_to_dict(census: CategoryCensus, top_n: int) -> dict[str, Any]:
+def _census_to_dict(census: CategoryCensus) -> dict[str, Any]:
     """Render one CategoryCensus (cell or rollup) as a JSON-serialisable dict."""
     return {
         'records': census.records,
-        'keys': _table(census.key_counts, top_n),
-        'kind': _table(census.kind_counts, top_n),
+        'keys': _table(census.key_counts),
+        'kind': _table(census.kind_counts),
         'kind_missing': census.kind_missing,
-        'source': _table(census.source_counts, top_n),
-        'source_without_kind': _table(census.source_without_kind, top_n),
+        'source': _table(census.source_counts),
+        'source_without_kind': _table(census.source_without_kind),
         'topic_present': census.topic_present,
-        'topic': _table(census.topic_values, top_n),
+        'topic': _table(census.topic_values),
         'parent_id_present': census.parent_id_present,
         'canonical_true': census.canonical_true,
         'canonical_false': census.canonical_false,
         'canonical_non_bool': census.canonical_non_bool,
-        'supersedes_shapes': _table(census.supersedes_shapes, top_n),
-        'supersedes_member_shapes': _table(census.supersedes_member_shapes, top_n),
-        'supersedes_list_lengths': _table(census.supersedes_list_lengths, top_n),
+        'supersedes_shapes': _table(census.supersedes_shapes),
+        'supersedes_member_shapes': _table(census.supersedes_member_shapes),
+        'supersedes_list_lengths': _table(census.supersedes_list_lengths),
     }
 
 
@@ -334,9 +363,11 @@ def build_report(
     Args:
         cells: ``{project_id: {category_value: CategoryCensus}}``.
         coverage: ``{project_id: {'collection', 'collection_points',
-            'categories': {category: {'expected', 'scrolled'}}}}`` as
-            returned by :func:`census_project`.
-        top_n: Cap on entries per value/key table.
+            'categories': {category: {'expected', 'recount', 'scrolled'}}}}``
+            as returned by :func:`census_project`.
+        top_n: Cap on rendered rows per table in the MARKDOWN twin, recorded
+            in ``params`` for :func:`render_markdown`. It does NOT cap the
+            JSON tables -- those are always the complete population.
         page_size: Scroll page size, recorded in ``params`` so a future
             re-run is comparable.
 
@@ -361,24 +392,29 @@ def build_report(
             if category not in category_order:
                 category_order.append(category)
             census = project_cells[category]
-            rendered[category] = _census_to_dict(census, top_n)
+            rendered[category] = _census_to_dict(census)
             project_total.merge(census)
         grand_total.merge(project_total)
         projects[project_id] = {
-            'total': _census_to_dict(project_total, top_n),
+            'total': _census_to_dict(project_total),
             'categories': rendered,
         }
 
     return {
-        'schema_version': 1,
+        # v2: value tables are the complete population (v1 capped them at
+        # top_n, which could truncate the JSON while coverage read complete);
+        # top_n is now the markdown render cap only. Coverage cells gained
+        # 'recount'/'churn'.
+        'schema_version': 2,
         'params': {
             'projects': sorted(cells),
             'categories': category_order,
             'page_size': page_size,
+            # Markdown render cap only — the tables below are complete.
             'top_n': top_n,
         },
         'projects': projects,
-        'grand_total': _census_to_dict(grand_total, top_n),
+        'grand_total': _census_to_dict(grand_total),
         'coverage': _build_coverage(coverage),
     }
 
@@ -392,8 +428,19 @@ def _ordered_categories(project_cells: dict[str, CategoryCensus]) -> list[str]:
 
 def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Reconcile expected vs scrolled per cell and per-category sums vs the
-    collection point total, naming every shortfall."""
+    collection point total, naming every shortfall.
+
+    The corpus is LIVE -- orchestrators write to it while the census runs --
+    so ``count_by_metadata`` and the page-scroll are two unsynchronised reads.
+    A cell is therefore complete when the scroll agrees with EITHER the
+    pre-scroll count (``expected``) or the post-scroll re-count (``recount``):
+    a memory landing between the two reads is corpus churn, not a truncated
+    scan, and the two must not be reported alike. Churn is still recorded
+    (``churn`` per cell, ``coverage.churn`` overall) so a reader can see the
+    corpus moved rather than infer it from a silent discrepancy.
+    """
     deltas: list[dict[str, Any]] = []
+    churn: list[dict[str, Any]] = []
     projects: dict[str, Any] = {}
     overall_complete = True
 
@@ -406,22 +453,39 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
         for category, counts in record.get('categories', {}).items():
             expected = int(counts.get('expected', 0))
             scrolled = int(counts.get('scrolled', 0))
+            raw_recount = counts.get('recount')
+            recount = None if raw_recount is None else int(raw_recount)
             delta = scrolled - expected
             counted += expected
-            cell_complete = delta == 0
+            cell_complete = delta == 0 or (recount is not None and scrolled == recount)
+            cell_churn = recount is not None and recount != expected
             per_category[category] = {
                 'expected': expected,
+                'recount': recount,
                 'scrolled': scrolled,
                 'delta': delta,
                 'complete': cell_complete,
+                'churn': cell_churn,
             }
-            if not cell_complete:
-                project_complete = False
-                deltas.append({
-                    'kind': 'category_shortfall',
+            if cell_churn:
+                churn.append({
                     'project_id': project_id,
                     'category': category,
                     'expected': expected,
+                    'recount': recount,
+                    'scrolled': scrolled,
+                })
+            if not cell_complete:
+                project_complete = False
+                # A SURPLUS is a different diagnosis than a shortfall: nothing
+                # is missing, the corpus grew or a page double-yielded. Naming
+                # them alike sends a reader hunting for data that is not gone.
+                deltas.append({
+                    'kind': 'category_shortfall' if delta < 0 else 'category_surplus',
+                    'project_id': project_id,
+                    'category': category,
+                    'expected': expected,
+                    'recount': recount,
                     'scrolled': scrolled,
                     'delta': delta,
                 })
@@ -452,6 +516,7 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {
         'complete': overall_complete,
         'deltas': deltas,
+        'churn': churn,
         'projects': projects,
     }
 
@@ -466,6 +531,7 @@ async def scroll_all_payloads(
     filters: dict[str, Any],
     page_size: int = 1000,
     max_pages: int = DEFAULT_MAX_PAGES,
+    read_timeout: float | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield every payload matching *filters*, paging on Qdrant's ``next_offset``.
 
@@ -481,10 +547,19 @@ async def scroll_all_payloads(
     its own (mem0_client.py:386-394), so the cross-check count and this scroll
     select the same points.
 
+    Each page request is bounded by *read_timeout* (the backend's
+    ``_read_timeout``, as every other Qdrant read on this path is --
+    mem0_client.py:287, 331, 395), so a wedged connection fails loudly instead
+    of hanging a ~30-page scan forever with no artifact and no diagnostic.
+    ``None`` disables the bound.
+
     Raises:
         CensusScanIncomplete: If *max_pages* is consumed while ``next_offset``
             is still live -- the stream is truncated, so it raises instead of
             ending short.
+        TimeoutError: If a single page request exceeds *read_timeout*. Not
+            swallowed: a census that skipped a page would under-report
+            silently (INV-2 no-silent-fail-soft).
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
@@ -497,13 +572,16 @@ async def scroll_all_payloads(
     offset: Any = None
     pages = 0
     while True:
-        points, next_offset = await client.scroll(
+        page = client.scroll(
             collection_name=collection,
             scroll_filter=scroll_filter,
             with_payload=True,
             limit=page_size,
             offset=offset,
         )
+        if read_timeout is not None:
+            page = asyncio.wait_for(page, timeout=read_timeout)
+        points, next_offset = await page
         pages += 1
         for point in points:
             yield dict(point.payload or {})
@@ -528,17 +606,22 @@ async def census_project(
 ) -> tuple[dict[str, CategoryCensus], dict[str, Any]]:
     """Census one project's Mem0 collection, category by category.
 
-    For each category: COUNT first (``count_by_metadata``), then page-scroll
-    and fold every payload into a :class:`CategoryCensus`. Counting before
-    scrolling is what makes an under-enumerated scroll detectable at all
-    (INV-3 corroborate-before-acting) -- the two figures come from
-    independent Qdrant calls and must agree.
+    For each category: COUNT first (``count_by_metadata``), page-scroll and
+    fold every payload into a :class:`CategoryCensus`, then COUNT AGAIN.
+    Counting before scrolling is what makes an under-enumerated scroll
+    detectable at all (INV-3 corroborate-before-acting) -- the two figures
+    come from independent Qdrant calls and must agree. Counting again after
+    it brackets the scan against a LIVE corpus: orchestrators write while the
+    census runs, so a scroll that matches the post-scan count rather than the
+    pre-scan one saw corpus churn, not truncation, and ``_build_coverage``
+    must be able to tell those apart instead of calling a healthy census
+    broken.
 
     Returns:
         ``(cells, coverage)`` where *cells* maps category value ->
         CategoryCensus, and *coverage* is the per-project record consumed by
         :func:`build_report`: collection name, collection point total, and
-        per-category expected/scrolled/delta/complete.
+        per-category expected/recount/scrolled/delta/complete.
     """
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
@@ -548,6 +631,16 @@ async def census_project(
     scope = Scope(project_id=project_id)
     collection = scope.mem0_collection_name(backend.config.mem0.collection_prefix)
     client = await backend._get_async_qdrant()
+    # Same per-read bound every other Qdrant call on this path uses, so a
+    # wedged socket is never mistaken for a slow one. Guarded by type: a
+    # backend without a numeric bound scrolls unbounded rather than blowing
+    # up inside asyncio.wait_for.
+    raw_timeout = getattr(backend, '_read_timeout', None)
+    read_timeout = (
+        float(raw_timeout)
+        if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool)
+        else None
+    )
 
     cells: dict[str, CategoryCensus] = {}
     per_category: dict[str, Any] = {}
@@ -559,27 +652,40 @@ async def census_project(
         census = CategoryCensus()
         async for payload in scroll_all_payloads(
             client, collection, filters, page_size=page_size, max_pages=max_pages,
+            read_timeout=read_timeout,
         ):
             census.add(payload)
+
+        # Re-count AFTER the scroll: the corpus is live, so a delta against
+        # the pre-scroll count alone cannot distinguish a truncated scan from
+        # a write that landed mid-census.
+        recount = await backend.count_by_metadata(scope, filters)
 
         scrolled = census.records
         delta = scrolled - expected
         cells[category] = census
         per_category[category] = {
             'expected': expected,
+            'recount': recount,
             'scrolled': scrolled,
             'delta': delta,
-            'complete': delta == 0,
+            'complete': delta == 0 or scrolled == recount,
         }
         logger.info(
-            'censused project=%s category=%s expected=%d scrolled=%d',
-            project_id, category, expected, scrolled,
+            'censused project=%s category=%s expected=%d scrolled=%d recount=%d',
+            project_id, category, expected, scrolled, recount,
         )
-        if delta != 0:
+        if delta != 0 and scrolled == recount:
+            logger.info(
+                'CORPUS CHURN project=%s category=%s: count moved %d → %d while scrolling; '
+                'the scroll agrees with the re-count, so the scan is complete.',
+                project_id, category, expected, recount,
+            )
+        elif delta != 0:
             logger.warning(
-                'UNDER-ENUMERATED project=%s category=%s: scrolled %d of %d expected '
-                '(delta %+d) — this census is a LOWER BOUND for that cell.',
-                project_id, category, scrolled, expected, delta,
+                'UNDER-ENUMERATED project=%s category=%s: scrolled %d, count said %d before '
+                'and %d after (delta %+d) — this census is a LOWER BOUND for that cell.',
+                project_id, category, scrolled, expected, recount, delta,
             )
 
     collection_points = await backend.count(scope)
@@ -602,7 +708,13 @@ def render_markdown(report: dict[str, Any]) -> str:
     Driven ENTIRELY off *report* -- there is no second traversal of the raw
     payloads, so the two artifacts cannot disagree. Deterministic: the same
     report dict renders the identical string every time.
+
+    This is the READABLE twin: long value tables are cut to
+    ``report.params.top_n`` rows so a human-facing document stays legible.
+    Every cut says so, and the JSON artifact it was rendered from carries the
+    full population -- the markdown is never the only copy of a value.
     """
+    top_n = report.get('params', {}).get('top_n')
     lines: list[str] = [
         '# Mem0 metadata corpus census',
         '',
@@ -620,7 +732,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f'- schema_version: `{report.get("schema_version")}`',
         f'- projects: {_inline_list(params.get("projects", []))}',
         f'- categories: {_inline_list(params.get("categories", []))}',
-        f'- page_size: `{params.get("page_size")}` · top_n: `{params.get("top_n")}`',
+        f'- page_size: `{params.get("page_size")}` · top_n: `{params.get("top_n")}` '
+        '(markdown row cap only — the JSON artifact carries every value)',
         '',
     ]
 
@@ -630,15 +743,15 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines += _render_record_counts(report)
 
     lines += ['## Grand total', '']
-    lines += _render_census_sections(report.get('grand_total', {}))
+    lines += _render_census_sections(report.get('grand_total', {}), top_n)
 
     for project_id in sorted(report.get('projects', {})):
         project = report['projects'][project_id]
         lines += [f'## Project `{project_id}`', '', '### All categories', '']
-        lines += _render_census_sections(project.get('total', {}))
+        lines += _render_census_sections(project.get('total', {}), top_n)
         for category, cell in project.get('categories', {}).items():
             lines += [f'### `{project_id}` / `{category}`', '']
-            lines += _render_census_sections(cell)
+            lines += _render_census_sections(cell, top_n)
 
     return '\n'.join(lines).rstrip() + '\n'
 
@@ -679,26 +792,62 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
     lines.append('')
 
     lines += [
-        '| project | category | expected | scrolled | delta |',
-        '| --- | --- | ---: | ---: | ---: |',
+        '| project | category | expected | recount | scrolled | delta |',
+        '| --- | --- | ---: | ---: | ---: | ---: |',
     ]
     for project_id in sorted(coverage.get('projects', {})):
         for category, c in coverage['projects'][project_id].get('categories', {}).items():
+            recount = c.get('recount')
+            recount_cell = '—' if recount is None else f'{recount:,}'
             lines.append(
                 f'| `{project_id}` | `{category}` | {c.get("expected", 0):,} | '
-                f'{c.get("scrolled", 0):,} | {c.get("delta", 0):+,} |',
+                f'{recount_cell} | {c.get("scrolled", 0):,} | {c.get("delta", 0):+,} |',
             )
-    lines.append('')
+    lines += [
+        '',
+        'The corpus is LIVE: `expected` is counted before the scroll and `recount` after '
+        'it, so a small non-zero `delta` on a cell whose `scrolled` matches `recount` is '
+        'corpus churn (a write landed mid-census), NOT a truncated scan — such a cell is '
+        'still complete. Only a `scrolled` that matches neither count is a shortfall.',
+        '',
+    ]
+
+    churn = coverage.get('churn', [])
+    if churn:
+        lines += ['### Corpus churn during the scan', '']
+        lines += [
+            '_Not a defect: the count moved while the census ran. Recorded so a reader '
+            'can tell drift from truncation._',
+            '',
+        ]
+        for entry in churn:
+            lines.append(
+                f'- `{entry.get("project_id")}` / `{entry.get("category")}`: count moved '
+                f'{entry.get("expected", 0):,} → {entry.get("recount", 0):,} while '
+                f'scrolling; scrolled {entry.get("scrolled", 0):,}.',
+            )
+        lines.append('')
 
     deltas = coverage.get('deltas', [])
     if deltas:
         lines += ['### Named shortfalls', '']
         for d in deltas:
-            if d.get('kind') == 'category_shortfall':
+            kind = d.get('kind')
+            if kind == 'category_shortfall':
                 lines.append(
                     f'- `category_shortfall` — `{d.get("project_id")}` / '
                     f'`{d.get("category")}`: scrolled {d.get("scrolled", 0):,} of '
-                    f'{d.get("expected", 0):,} expected (delta {d.get("delta", 0):+,}).',
+                    f'{d.get("expected", 0):,} expected (delta {d.get("delta", 0):+,}) — '
+                    f'points are MISSING from this cell.',
+                )
+            elif kind == 'category_surplus':
+                # A surplus is a different diagnosis: nothing is missing.
+                lines.append(
+                    f'- `category_surplus` — `{d.get("project_id")}` / '
+                    f'`{d.get("category")}`: scrolled {d.get("scrolled", 0):,}, '
+                    f'{abs(d.get("delta", 0)):,} MORE than either count expected '
+                    f'({d.get("expected", 0):,} before, {d.get("recount", 0)} after) — '
+                    f'concurrent writes or duplicate pages, not missing data.',
                 )
             else:
                 lines.append(
@@ -727,23 +876,28 @@ def _render_record_counts(report: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_census_sections(census: dict[str, Any]) -> list[str]:
+def _render_census_sections(census: dict[str, Any], top_n: int | None = None) -> list[str]:
     """Render one cell/rollup: every table plus the scalar occurrence axes."""
     if not census:
         return ['_(no data)_', '']
 
     lines = [f'Records: **{census.get("records", 0):,}**', '']
 
-    lines += _render_table('Top-level metadata key population', census.get('keys'), 'key')
-    lines += _render_table('`kind` values', census.get('kind'), 'kind')
+    lines += _render_table(
+        'Top-level metadata key population', census.get('keys'), 'key', top_n,
+    )
+    lines += _render_table('`kind` values', census.get('kind'), 'kind', top_n)
     lines += [f'`kind` missing: **{census.get("kind_missing", 0):,}** record(s).', '']
 
-    lines += _render_table('`supersedes` shapes', census.get('supersedes_shapes'), 'shape')
     lines += _render_table(
-        '`supersedes` member shapes', census.get('supersedes_member_shapes'), 'member shape',
+        '`supersedes` shapes', census.get('supersedes_shapes'), 'shape', top_n,
     )
     lines += _render_table(
-        '`supersedes` list lengths', census.get('supersedes_list_lengths'), 'length',
+        '`supersedes` member shapes', census.get('supersedes_member_shapes'),
+        'member shape', top_n,
+    )
+    lines += _render_table(
+        '`supersedes` list lengths', census.get('supersedes_list_lengths'), 'length', top_n,
     )
 
     lines += ['#### Occurrence axes', '', '| axis | count |', '| --- | ---: |']
@@ -755,29 +909,44 @@ def _render_census_sections(census: dict[str, Any]) -> list[str]:
         f'| `canonical` non-bool | {census.get("canonical_non_bool", 0):,} |',
         '',
     ]
-    lines += _render_table('`topic` values', census.get('topic'), 'topic')
+    lines += _render_table('`topic` values', census.get('topic'), 'topic', top_n)
 
-    lines += _render_table('`source` values', census.get('source'), 'source')
+    lines += _render_table('`source` values', census.get('source'), 'source', top_n)
     lines += _render_table(
-        '`source` set but `kind` missing', census.get('source_without_kind'), 'source',
+        '`source` set but `kind` missing', census.get('source_without_kind'),
+        'source', top_n,
     )
     return lines
 
 
-def _render_table(title: str, table: dict[str, Any] | None, value_header: str) -> list[str]:
+def _render_table(
+    title: str,
+    table: dict[str, Any] | None,
+    value_header: str,
+    top_n: int | None = None,
+) -> list[str]:
+    """Render one value table, cut to *top_n* rows for readability.
+
+    The cut is a MARKDOWN-only concern: the JSON table this is rendered from
+    is complete, and any row omitted here says so and says where the rest is.
+    ``None`` or a non-positive *top_n* renders the whole population.
+    """
     resolved = table or {}
     lines = [f'#### {title}', '']
     entries = resolved.get('entries', [])
     if not entries:
         lines += ['_(none)_', '']
         return lines
+    shown = entries if not top_n or top_n <= 0 else entries[:top_n]
+    distinct_total = resolved.get('distinct_total', len(entries))
     lines += [f'| {value_header} | count |', '| --- | ---: |']
-    lines += [f'| `{e["value"]}` | {e["count"]:,} |' for e in entries]
+    lines += [f'| `{e["value"]}` | {e["count"]:,} |' for e in shown]
     lines.append('')
-    if resolved.get('truncated_values'):
+    if len(shown) < distinct_total:
         lines += [
-            f'_Showing top {len(entries)} of {resolved.get("distinct_total", 0):,} distinct '
-            f'values — **truncated**; raise `--top-n` for the full tail._',
+            f'_Showing top {len(shown):,} of {distinct_total:,} distinct values — this '
+            f'markdown view is **truncated**; the JSON artifact carries the full '
+            f'population, and `--top-n` widens this view._',
             '',
         ]
     return lines
@@ -896,7 +1065,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--top-n', dest='top_n', type=int, default=50,
-        help='Max entries per value/key table before truncation (default: 50)',
+        help=(
+            'Max rows per value/key table in the MARKDOWN report (default: 50). '
+            'The JSON report always carries every value; 0 or less renders the '
+            'full population in the markdown too.'
+        ),
     )
     parser.add_argument(
         '--max-pages', dest='max_pages', type=int, default=DEFAULT_MAX_PAGES,
