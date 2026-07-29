@@ -360,6 +360,7 @@ Read operations:
 - search: Unified search across both stores with automatic routing
 - get_entity: Direct entity lookup in the knowledge graph
 - get_episodes: Retrieve raw episode history
+- scan_memory_content: Literal substring scan over Mem0 memory TEXT (deterministic, not semantic) — use when search cannot find a string because it carries no semantic signal
 
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
@@ -1562,6 +1563,90 @@ def create_mcp_server(
             run_id=run_id,
             stage=stage,
         )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def scan_memory_content(
+        project_id: str,
+        needles: list[str] | None = None,
+        filters: dict | None = None,
+        exhaustive: bool = False,
+        limit: int | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Scan memory TEXT for literal substrings (deterministic substring match, not semantic).
+
+        Complements ``search`` and ``get_memories_by_metadata`` by covering the
+        third axis: ``search`` ranks by EMBEDDING SIMILARITY, and
+        ``get_memories_by_metadata`` matches payload KEYS by equality — neither can
+        find a literal string embedded inside a memory's text. That is not a
+        theoretical gap: a leaked serialized tool-call XML fragment carries almost no
+        semantic signal, so a live 2026-07-26 semantic probe for the known corrupted
+        records returned ZERO, and the corpus was structurally unsweepable until this
+        tool existed (task 3083).
+
+        Every record returned by the store-side prefilter is RE-VERIFIED in Python
+        with the shared detector (``fused_memory.utils.toolcall_xml_leak``), which is
+        the authoritative verdict — the prefilter is a speed optimisation only.
+
+        **Mem0/Qdrant-only scope:** This tool scans only memories stored in the
+        Mem0/Qdrant backend (categories: observations_and_summaries,
+        preferences_and_norms, procedural_knowledge). It does NOT scan Graphiti
+        episodes or edges; a leaked episode must be found and remediated separately.
+
+        **No silent caps:** the walk paginates to the end of the collection. When an
+        explicit *limit* stops it early, the response self-discloses this via
+        ``truncated`` (bool) alongside ``scanned`` (the number of records actually
+        examined, and the correct denominator for an incidence rate).
+
+        Example call:
+            scan_memory_content(
+                project_id="dark_factory",
+                exhaustive=True,
+            )
+
+        This tool is intentionally read-only and is NOT included in any DISALLOW_*
+        list, so it is auto-allowed in Stage 3's read-only integrity-check mode (the
+        same property ``get_memories_by_metadata`` documents).
+
+        Args:
+            project_id: Project scope (required)
+            needles: Literal substrings for the store-side prefilter. Omit (None) to
+                use the shared tool-call-leak sentinels. Ignored when *exhaustive*.
+            filters: Optional exact metadata key-value pairs narrowing the scan
+                (e.g. {'category': 'procedural_knowledge'}). Applies in both modes.
+            exhaustive: Skip the prefilter and walk every record. Slower, but the
+                answer then depends on nothing but the Python detector — use this
+                when establishing a true incidence rate.
+            limit: Maximum records to WALK (default: no limit).
+
+        Returns:
+            {'matches': [{'id', 'created_at', 'matched_fragments', 'excerpt',
+            'metadata'}, ...], 'scanned': int, 'truncated': bool, 'exhaustive': ...,
+            'limit': ..., 'project_id': ...} on success, or {'error': ...,
+            'error_type': ...} on failure. An empty ``matches`` list is a SUCCESSFUL
+            scan of a clean corpus, not an error.
+        """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        result = await memory_service.scan_memory_content(
+            project_id=project_id,
+            needles=needles,
+            filters=filters,
+            exhaustive=exhaustive,
+            limit=limit,
+        )
+        return {
+            'matches': result.get('matches', []),
+            'scanned': result.get('scanned', 0),
+            'truncated': result.get('truncated', False),
+            'exhaustive': exhaustive,
+            'limit': limit,
+            'project_id': project_id,
+        }
 
     @mcp.tool()
     @mcp_tool_errors()

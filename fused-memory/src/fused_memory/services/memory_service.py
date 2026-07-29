@@ -3302,6 +3302,47 @@ class MemoryService:
         _normalize_task_id_metadata(filters)
         return await self.mem0.count_by_metadata(scope, filters)
 
+    async def scan_memory_content(
+        self,
+        project_id: str,
+        needles: list[str] | None = None,
+        *,
+        filters: dict | None = None,
+        exhaustive: bool = False,
+        limit: int | None = None,
+    ) -> dict:
+        """Literal substring scan over Mem0 payload TEXT (task 3083, WORK b).
+
+        Thin passthrough to ``Mem0Backend.scan_payload_text``. Neither semantic
+        (``search``) nor metadata equality
+        (``count_memories_by_metadata``/``get_memories_by_metadata``) — it
+        matches the memory TEXT itself, which is the capability whose absence
+        made the tool-call XML leak corpus unsweepable: a leaked serialized
+        fragment carries almost no semantic signal, so a live 2026-07-26
+        semantic probe for it returned zero.
+
+        *needles* and *filters* of ``None`` are passed through AS ``None``;
+        the backend supplies the default needle set from
+        ``fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`` so the
+        sentinels are defined in exactly one place. The caller's collections
+        are copied before use and never mutated.
+
+        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool}``.
+
+        A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
+        returned as an empty match list — a timed-out scan must never be
+        mistaken for a clean corpus — and is surfaced at the MCP boundary as
+        ``{'error', 'error_type': 'TimeoutError'}`` by ``@mcp_tool_errors``.
+        """
+        scope = Scope(project_id=project_id)
+        return await self.mem0.scan_payload_text(
+            scope=scope,
+            needles=list(needles) if needles is not None else None,
+            filters=dict(filters) if filters is not None else None,
+            exhaustive=exhaustive,
+            limit=limit,
+        )
+
     async def get_memories_by_metadata(
         self,
         project_id: str,
