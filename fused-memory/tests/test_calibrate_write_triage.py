@@ -966,6 +966,59 @@ curator:
   enabled: true
 """
 
+# config/config.yaml's actual convention: a run of COLUMN-0 comment lines,
+# preceded by a blank separator, is the header for the section that FOLLOWS
+# it -- see the 6-line block before `summary_rebuild:` at config.yaml:213-218,
+# and the same shape before `taskmaster:`, `task_metadata:` and `task_status:`.
+WITH_BLOCK_THEN_COLUMN0_HEADER = """\
+# Leading comment that must survive.
+server:
+  host: localhost
+
+write_triage:
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+
+# Periodic entity-summary rebuild -- scheduled staleness backstop.
+# Disabled by default; costs nothing until an operator opts in.
+summary_rebuild:
+  enabled: false
+  interval_seconds: 3600
+"""
+
+WITH_BLOCK_AT_EOF = """\
+# Leading comment that must survive.
+server:
+  host: localhost
+
+write_triage:
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+
+def _without_write_triage_block(text: str) -> list[str]:
+    """Every line NOT belonging to a ``write_triage:`` block.
+
+    The block is the ``write_triage:`` line plus its INDENTED body; a blank
+    or column-0 line ends it. What survives is exactly the surrounding
+    config, so two such lists are comparable across a replacement.
+    """
+    kept: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        if line.startswith('write_triage:'):
+            in_block = True
+            continue
+        if in_block:
+            if line[:1].isspace():
+                continue
+            in_block = False
+        kept.append(line)
+    return kept
+
 
 def _call(text: str, t_high=0.87, t_low=0.61, path='calibration/r.json') -> str:
     return _mod().write_triage_config_block(text, t_high, t_low, path)
@@ -1049,6 +1102,61 @@ class TestWriteTriageConfigBlock:
         with pytest.raises(ValueError):
             _mod().write_triage_config_block(WITH_BLOCK, None, None, 'r.json')
         assert 'write_triage' in WITH_BLOCK and '0.11' in WITH_BLOCK, 'input untouched'
+
+
+class TestWriteTriageConfigBlockSpanScan:
+    """Byte-exact regression guard on the span scan's boundaries.
+
+    Every assertion here compares line LISTS, never ``yaml.safe_load`` and
+    never an ``in`` substring check. Both of those are blind to the two
+    defects this class exists to pin: a swallowed column-0 comment header
+    parses fine and still contains every section, and a duplicated blank
+    line is invisible to both. Only same-content-same-order-same-COUNT
+    equality catches them.
+    """
+
+    def test_a_column0_comment_header_for_the_next_section_is_not_swallowed(self) -> None:
+        """A run of column-0 comments introduces the FOLLOWING section.
+
+        config.yaml uses this shape throughout, so treating it as
+        block-internal deletes an operator-facing section header on every
+        recalibration run.
+        """
+        out = _call(WITH_BLOCK_THEN_COLUMN0_HEADER)
+        assert _without_write_triage_block(out) == _without_write_triage_block(
+            WITH_BLOCK_THEN_COLUMN0_HEADER,
+        )
+
+    def test_the_indented_comment_shape_still_round_trips_byte_exact(self) -> None:
+        """An indented comment genuinely belongs to the block it sits in.
+
+        Pins the blank-line accounting too: one blank separator in must be
+        exactly one blank separator out.
+        """
+        out = _call(WITH_BLOCK)
+        assert _without_write_triage_block(out) == _without_write_triage_block(WITH_BLOCK)
+
+    def test_a_block_at_end_of_file_is_unaffected(self) -> None:
+        """Nothing follows the block, so the scan has nothing to reclaim."""
+        out = _call(WITH_BLOCK_AT_EOF)
+        assert _without_write_triage_block(out) == _without_write_triage_block(
+            WITH_BLOCK_AT_EOF,
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [WITH_BLOCK_THEN_COLUMN0_HEADER, WITH_BLOCK, WITH_BLOCK_AT_EOF],
+        ids=['column0-header', 'indented-comment', 'at-eof'],
+    )
+    def test_the_block_is_actually_replaced(self, text: str) -> None:
+        """Guards the preservation assertions above from passing vacuously:
+        an implementation that returned its input unchanged would satisfy
+        every byte-exact check while writing no threshold at all."""
+        parsed = yaml.safe_load(_call(text))
+        assert parsed['write_triage'] == {
+            't_high': 0.87, 't_low': 0.61, 'calibration_report_path': 'calibration/r.json',
+        }
+        assert '0.11' not in _call(text), 'the stale body must be gone'
 
 
 # ---------------------------------------------------------------------------
