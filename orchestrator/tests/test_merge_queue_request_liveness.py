@@ -3336,3 +3336,344 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
         assert fake_eq.submitted == [], (
             f'a clean abort-and-re-drain must not escalate: {fake_eq.submitted!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-9: end-to-end — a dead-verify abort SELF-HEALS, and every
+# user-observable surface tells the truth while it does.
+#
+# This is the consolidated guard against the whole class recurring through a
+# DIFFERENT trigger.  Steps 2/4/6/8 fix the four mechanisms; this class pins
+# the seven observable surfaces the task enumerates, mapped 1:1 in the
+# assertions below.
+#
+# Deliberately NOT asserted: "landings resume" / queue throughput.  The
+# task's corrected OPERATIONAL NOTE measured landings_total advancing 4->7
+# while the zombie sat, with other tasks verifying on the same host
+# afterwards.  The queue was never wedged — the defect is observability
+# integrity plus the LATENT frozen-prefix wedge (surface 7).  Asserting
+# throughput would pin a property that never broke.
+# ---------------------------------------------------------------------------
+
+
+def _assert_quiescent_registry(
+    worker,
+    main_sha: str,
+    requests: list[MergeRequest],
+) -> None:
+    """Assert the registry/ledger/two-layer quiescence surfaces for *worker*.
+
+    Copied and narrowed from test_merge_queue_invariant_integration_gate.py's
+    ``_assert_quiescent`` (:510-586) — per-file duplication convention, see
+    this module's docstring.  The permit/worktree sub-checks (b)/(c) are
+    dropped deliberately: both short-circuit to ``[]`` on a stopped worker,
+    and this class asserts AFTER ``worker.stop()``, so including them would
+    be vacuous rather than meaningful.
+
+    Retained, because each is meaningful post-stop:
+      (a) every request resolved — no dangling in-flight work.
+      (d) the request-liveness ledger is empty AFTER ``sweep_resolved()``.
+          Resolution is detected PASSIVELY (RequestLedger has no on-resolve
+          hook), so sweeping first is required, not optional.
+      (e) ``two_layer_invariants(main_sha) == []`` — *main_sha* MUST be a
+          REAL sha, never the ``'unknown'`` sentinel: the base-chain and
+          verify-base sub-checks are silently SKIPPED for 'unknown', which
+          would make this pass vacuously.
+      (f) ``set(worker._lifecycle.non_terminal_items()) == set()`` — no
+          ItemLifecycle registry leak survives quiescence.  This is the
+          surface a phantom finalize head corrupts.
+    """
+    for req in requests:
+        assert req.result.done() or req.result.cancelled(), (
+            f'request {req.request_id!r} (task {req.task_id!r}) still pending at quiescence'
+        )
+
+    worker._request_ledger.sweep_resolved()
+    assert worker._request_ledger.is_empty(), (
+        f'request-liveness ledger non-empty at quiescence: '
+        f'{worker._request_ledger.open_request_ids()!r}'
+    )
+
+    assert main_sha and main_sha != 'unknown', (
+        f'this helper requires a REAL main_sha (the "unknown" sentinel silently '
+        f'skips the frozen-prefix sub-checks), got {main_sha!r}'
+    )
+    tli = worker.two_layer_invariants(main_sha)
+    assert tli == [], (
+        f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli!r}'
+    )
+
+    registry_ids = set(worker._lifecycle.non_terminal_items())
+    assert registry_ids == set(), (
+        f'ItemLifecycle registry non-terminal at quiescence: {registry_ids!r}'
+    )
+
+
+class _HangThenPassVerify:
+    """Stateful ``run_scoped_verification`` stub: HANGS once, then PASSES.
+
+    Call 1 blocks on a never-set Event (mirrors ``_dead_gate_never_returns``
+    above) so trigger 3's no-progress budget fires and the request is
+    RE-QUEUED.  Call 2 returns a pass, so the re-dispatched merge actually
+    lands.  ``.calls`` is the surface-1 assertion: it must reach 2, proving
+    the re-queued request genuinely re-entered the pipeline rather than being
+    swallowed by ``_coalesce_reentrant_drain``.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.first_entered = asyncio.Event()
+
+    async def __call__(self, *args: object, **kwargs: object) -> MagicMock:
+        self.calls += 1
+        if self.calls == 1:
+            self.first_entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError('unreachable — never set')  # pragma: no cover
+        return MagicMock(
+            passed=True, summary='ok', test_output='ok',
+            lint_output='', type_output='', category='',
+            timed_out=False, verify_skipped=False,
+        )
+
+
+@pytest.mark.asyncio
+class TestDeadVerifyAbortSelfHealsEndToEnd:
+    """A dead-verify no-progress abort must SELF-HEAL through the live queue,
+    leaving every user-observable surface truthful (task 3082 step-9).
+
+    Modelled on ``TestWedgedVerifyIntegration`` (:412) — the only class in
+    this file that runs a real ``asyncio.create_task(worker.run())`` loop and
+    feeds it via ``await q.put(req)``.  Unlike that class (which observes a
+    verify that stays wedged), this one lets the abort fire and then asserts
+    the recovery.
+
+    May already be green after steps 2/4/6/8 — expected and fine.  Its job is
+    to be the consolidated cross-surface guard, not a fresh RED signal.
+    """
+
+    async def _drive_abort_then_land(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Run one abort-then-land cycle on a real ``worker.run()`` loop.
+
+        Returns ``(worker, req, outcome, gate, fake_eq, main_sha, snap_after)``.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, 'x = 1\n')
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+
+        # Same small instance-level constants step-5 uses — REAL wall clock,
+        # no monkeypatched time.*, and small enough for the 60s per-test
+        # timeout (timeout_method='thread').
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        req = _make_request(branch, branch, wt, config)
+        gate = _HangThenPassVerify()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with patch('orchestrator.merge_queue.run_scoped_verification', gate):
+                worker_task = asyncio.create_task(worker.run())
+                try:
+                    await q.put(req)
+                    # Wait for the DEAD first verify to be entered, so the
+                    # no-progress budget is genuinely armed before we wait on
+                    # the recovery.
+                    await asyncio.wait_for(gate.first_entered.wait(), timeout=20.0)
+                    outcome = await asyncio.wait_for(req.result, timeout=40.0)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(worker.stop(), timeout=10.0)
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(worker_task, timeout=10.0)
+
+        main_sha = await git_ops.get_main_sha()
+        return worker, req, outcome, gate, fake_eq, main_sha, worker.snapshot()
+
+    async def test_abort_then_redispatch_delivers_the_true_outcome_and_a_clean_queue(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The seven surfaces from the task's REGRESSION COVERAGE list."""
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+
+        worker, req, outcome, gate, fake_eq, main_sha, snap = (
+            await self._drive_abort_then_land(
+                git_ops, config, 'df3082-e2e-selfheal', 'selfheal.py', caplog,
+            )
+        )
+        rid = req.request_id
+        messages = [r.getMessage() for r in caplog.records]
+
+        # ── (1) the request ACTUALLY re-enters the live queue and is
+        #        re-dispatched — not swallowed by _coalesce_reentrant_drain.
+        assert gate.calls == 2, (
+            f'expected the abort to be followed by a genuine RE-DISPATCH '
+            f'(run_scoped_verification called twice), got {gate.calls} call(s) — '
+            f'a single call means the re-queued request was dropped before '
+            f're-dispatch'
+        )
+        drop_warnings = [
+            m for m in messages
+            if 'dropping duplicate/re-entrant merge submission' in m
+        ]
+        assert drop_warnings == [], (
+            f'the re-queued request must never be coalesce-dropped: {drop_warnings!r}'
+        )
+
+        # ── (2) the entry never remains finalizing / position 0 / head_of_line
+        #        past its abort point.
+        assert worker._finalizing_head_entry() is None, (
+            f'a phantom finalize head survived the abort: '
+            f'{worker._finalizing_head_entry()!r}'
+        )
+        finalizing = [e for e in snap['entries'] if e['state'] == 'finalizing']
+        assert finalizing == [], (
+            f"no snapshot entry may report state='finalizing' once quiescent: "
+            f'{finalizing!r}'
+        )
+        assert snap['depth'] == 0, (
+            f"snapshot depth must be 0 once quiescent, got {snap['depth']} "
+            f"with entries {snap['entries']!r}"
+        )
+        assert snap['head_of_line'] is None, (
+            f"head_of_line must be None once quiescent, got {snap['head_of_line']!r}"
+        )
+        assert snap['verify_in_progress'] is None, (
+            f"verify_in_progress must be None once quiescent, got "
+            f"{snap['verify_in_progress']!r}"
+        )
+        _live = worker._live_items.get(rid)
+        assert not isinstance(_live, InflightEntry), (
+            f'a non-TERMINAL InflightEntry survived in _live_items for {rid}: {_live!r}'
+        )
+        _cur = worker._lifecycle.current(rid)
+        assert _cur in (None, ItemLifecycleState.TERMINAL), (
+            f'the landed request must end TERMINAL (or be retired), registry '
+            f'reads {_cur!r}'
+        )
+
+        # ── (3) the waiter's future is NOT resolved to already_merged by the
+        #        abort path — it receives the TRUE outcome.
+        assert outcome.status == 'done', (
+            f'the waiter must receive the TRUE outcome of the re-dispatched '
+            f'merge, got {outcome!r}'
+        )
+        assert outcome.status != 'already_merged', (
+            f'the abort path must never fabricate already_merged for the real '
+            f'waiter: {outcome!r}'
+        )
+
+        # ── (4) occupancy.by_host must NOT report a host busy for the
+        #        aborted/requeued entry.  by_host merges the FINALIZE HEAD's
+        #        lease in HEAD-FIRST over the _inflight leases, so a phantom
+        #        head injects a stale lease for an actually-free host — the
+        #        surface that made this class look like a stuck host slot on
+        #        three separate days.
+        occ = snap['occupancy']
+        assert req.task_id not in occ['by_host'].values(), (
+            f'the aborted/requeued task must not be reported as occupying a '
+            f"host: by_host={occ['by_host']!r}"
+        )
+        assert occ['hosts_busy'] == 0, (
+            f"hosts_busy must be 0 once quiescent, got {occ['hosts_busy']} "
+            f"(by_host={occ['by_host']!r})"
+        )
+
+        # ── (6) two_layer_invariants + registry/ledger quiescence, against the
+        #        REAL post-merge main SHA (never the 'unknown' sentinel).
+        _assert_quiescent_registry(worker, main_sha, [req])
+
+        # ── (7) the aborted/requeued entry is ABSENT from the frozen prefix
+        #        and never becomes its tip.  _frozen_inflight_entries appends
+        #        the finalize head whenever its phase is in
+        #        {verifying, gate_reverify, finalizing}, so a phantom head puts
+        #        a DEAD merge commit at the frozen-prefix tip and every later
+        #        real-verify dispatch mismatches it.  Survivable today only
+        #        because _warn_if_verify_base_not_frozen_tip is log-only —
+        #        pinning it here is what lets the separate eps=1890
+        #        enforcement-flip task proceed without this class re-poisoning it.
+        fp = worker.frozen_prefix()
+        assert rid not in fp, (
+            f'the aborted/requeued request must not sit in the frozen prefix: {fp!r}'
+        )
+        assert fp == (), (
+            f'the frozen prefix must be empty once quiescent, got {fp!r}'
+        )
+        tip = worker.frozen_prefix_tip(main_sha)
+        assert tip == main_sha, (
+            f'with an empty frozen prefix the tip must be the REAL main sha '
+            f'{main_sha!r}, not a dead merge commit: {tip!r}'
+        )
+
+        # ── Plus: no rejected-transition escalation, and no accretion WARNING.
+        rejected = [
+            e for e in fake_eq.submitted
+            if e.category == 'merge_lifecycle_transition_rejected'
+        ]
+        assert rejected == [], (
+            f'a legitimate dead-verify abort must not fire a rejected-transition '
+            f'L1: {[(e.category, e.summary) for e in rejected]!r}'
+        )
+        accretion = [
+            m for m in messages
+            if 'Invariant violation:' in m or 'extra InflightEntry object(s)' in m
+        ]
+        assert accretion == [], (
+            f'_finalizing_head_entry must not report accretion: {accretion!r}'
+        )
+
+    async def test_recovery_is_internal_to_the_abort_path_not_operator_driven(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Recovery must need NO operator action of any kind.
+
+        Pins the task's OPERATIONAL NOTE: a live zombie of this class cannot
+        be cleared by ``merge_cancel`` (proved three times in the field),
+        because the zombie lives in the ORCHESTRATOR's ``_live_items``, not
+        the escalation server's waiter registry — only a process restart
+        clears it.  So the recovery MUST be internal to the abort path.
+
+        This test therefore calls NO cancel API, no ``merge_cancel``, no
+        ``_cancel_request``, no halt/unhalt, and no ``_retire_item`` — the
+        drive is purely: put the request on the queue and wait.
+        """
+        worker, req, outcome, gate, fake_eq, main_sha, snap = (
+            await self._drive_abort_then_land(
+                git_ops, config, 'df3082-e2e-nooperator', 'nooperator.py', caplog,
+            )
+        )
+
+        assert gate.calls == 2, (
+            f'the abort path must re-dispatch on its own, with no operator '
+            f'intervention; run_scoped_verification saw {gate.calls} call(s)'
+        )
+        assert outcome.status == 'done', (
+            f'the request must land unaided, got {outcome!r}'
+        )
+        assert not worker._operator_halt.is_set(), (
+            'recovery must not depend on (or leave behind) an operator halt'
+        )
+        assert not worker.is_wip_halted, (
+            'recovery must not depend on (or leave behind) a WIP halt'
+        )
+        assert not req.result.cancelled(), (
+            'the waiter must be resolved by the re-dispatch, never cancelled'
+        )
+        _assert_quiescent_registry(worker, main_sha, [req])
