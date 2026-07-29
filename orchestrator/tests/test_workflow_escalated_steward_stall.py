@@ -38,6 +38,8 @@ from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -235,3 +237,169 @@ def _make_evrl_returner(returns: list[WorkflowOutcome]):
         return q[0] if q else WorkflowOutcome.DONE
 
     return AsyncMock(side_effect=fake_evrl), state
+
+
+def _make_silent_steward() -> type:
+    """A steward that publishes NOTHING and leaves its L0 pending.
+
+    The general "producer went silent" shape — the failure mode fix C must
+    bound REGARDLESS of which producer bug caused it. Deliberately does not
+    model the task-2248 bug specifically: fix C has to hold for any future
+    early return that forgets to dismiss, not just the two known ones.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
+def _submit_l1(queue: EscalationQueue, task_id: str) -> Escalation:
+    """Submit a pending LEVEL-1 escalation (severity 'blocking', not born-at-L2).
+
+    Severity matters: a critical/urgent L1 would trip
+    ``_wait_for_resolution``'s born-at-L2 stop-the-line check BEFORE the wait
+    loop, so the test would pass without exercising the bounded wait at all.
+    """
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='steward',
+        severity='blocking',
+        category='task_failure',
+        summary='steward gave up',
+        detail='pre-existing L1',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+@pytest.mark.asyncio
+class TestEscalatedWaitIsBounded:
+    """Fix C: the run()-ESCALATED wait must not be strandable.
+
+    ``_wait_for_resolution``'s loop is ``while True: ... await
+    self._escalation_event.wait()`` with no deadline, so a producer that
+    leaves an L0 pending and never fires the resolve callback parks the
+    workflow forever. Its sibling waiter ``_await_steward_completion``
+    already bounds itself by ``steward_completion_timeout``; this pins the
+    same knob, the same semantics, on this path.
+
+    Each test wraps ``run()`` in ``asyncio.wait_for`` so a regression fails
+    as a bounded test failure rather than hanging the whole suite.
+    """
+
+    async def test_bounded_wait_dismisses_orphan_l0_and_resumes(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """No L1 open → the task LEAVES phase escalated and resumes."""
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_silent_steward()
+        evrl_mock, state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        t0 = asyncio.get_running_loop().time()
+        await asyncio.wait_for(workflow.run(), 10)
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        assert elapsed < 5, (
+            f'the wait must be bounded by steward_completion_timeout '
+            f'({config.steward_completion_timeout}s), not by the test\'s own '
+            f'10s backstop; run() took {elapsed:.1f}s. (run() swallows the '
+            f'wait_for cancellation and returns, so an unbounded wait shows '
+            f'up here rather than as a TimeoutError.)'
+        )
+        assert queue.get_by_task(
+            task_assignment.task_id, status='pending', level=0,
+        ) == [], (
+            'the orphan L0 must be dismissed on the way out — leaving it '
+            'pending would re-strand the next ESCALATED entry on the same '
+            'record for another full timeout window'
+        )
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'auto-dismissed', (
+            f'the dismissal must be attributed so archived records stay '
+            f'greppable by the same signature as every other auto-dismissal; '
+            f'got resolved_by={archived.resolved_by!r}'
+        )
+        assert not queue.has_open_l1(task_assignment.task_id), (
+            'a pure wait-timeout must not file an L1 by itself'
+        )
+        roles = [c.args[0] for c in invoke_mock.await_args_list]
+        assert IMPLEMENTER in roles, (
+            f'the implementer must be resumed — i.e. the task LEFT phase '
+            f'escalated rather than parking there; invoked roles: '
+            f'{[r.name for r in roles]}'
+        )
+        assert state['count'] >= 1
+
+    async def test_bounded_wait_with_open_l1_blocks_without_duplicating_it(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """An L1 already open → BLOCKED via the EXISTING tail, no duplicate L1.
+
+        This is the other half of the acceptance disjunction, and it is why
+        the timeout disposition falls through to the unchanged
+        ``has_open_l1`` check rather than calling ``_mark_blocked`` directly:
+        ``_mark_blocked`` would file a fresh L0 and could add a SECOND full
+        ``steward_completion_timeout`` grace window.
+        """
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        _submit_l1(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_silent_steward()
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        result = await asyncio.wait_for(workflow.run(), 10)
+
+        assert result.outcome == WorkflowOutcome.BLOCKED, (
+            f'an open L1 must route through _StewardReescalated → '
+            f'_mark_blocked(skip_escalation=True); got {result.outcome!r}'
+        )
+        assert queue.get_by_task(
+            task_assignment.task_id, status='pending', level=0,
+        ) == [], 'the orphan L0 must be dismissed even on the blocking path'
+        assert queue.get(esc.id).resolved_by == 'auto-dismissed'
+        assert len(
+            queue.get_by_task(task_assignment.task_id, status='pending', level=1),
+        ) == 1, 'skip_escalation=True must not duplicate the existing L1'
+        roles = [c.args[0] for c in invoke_mock.await_args_list]
+        assert IMPLEMENTER not in roles, (
+            'the implementer must NOT be resumed when an L1 is open'
+        )
