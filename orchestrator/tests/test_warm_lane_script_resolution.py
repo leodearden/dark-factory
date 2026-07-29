@@ -431,6 +431,111 @@ class TestResolvedPathIsLoggedAtInfo:
         )
 
 
+def _argv(log: Path) -> list[list[str]]:
+    """Argv of each logged call, with the leading origin token stripped."""
+    if not log.exists():
+        return []
+    return [
+        line.split()[1:] for line in log.read_text().splitlines() if line.strip()
+    ]
+
+
+@pytest.mark.asyncio
+class TestGcReclaimPassesProjectSeedScript:
+    """The PRD §5 seed primitive is named explicitly, not left to a sibling default.
+
+    ``warm-lane-gc.sh`` defaults ``SEED_SCRIPT`` to ``$SCRIPT_DIR/
+    seed-warm-lane.sh`` and invokes it UNCONDITIONALLY on the Pass-1 lane-reset
+    path.  ``seed-warm-lane.sh`` is one of the two genuinely toolchain-bound
+    primitives that PRD §5 deliberately keeps in the project, so it does NOT
+    travel to ``orchestrator/scripts/warm-lane/`` with the policy script.
+
+    Left alone, dark-factory's relocated copy would therefore compute a sibling
+    path that does not exist and fail EVERY lane reset at cutover (leaf ζ/κ) —
+    a silently-stopped GC accreting the pool to ENOSPC, exactly the failure
+    class this leaf exists to remove.  ``gc.sh`` already exposes
+    ``--seed-script PATH``, so naming the project's primitive explicitly is
+    resolution wiring, not a policy change.
+
+    It is also a strict no-op TODAY, which is what these tests pin: for a
+    reify-shaped project_root the passed path is byte-identical to the one
+    gc.sh's own default computes, and for a project with no seed script the
+    flag is omitted so argv is unchanged.  Patching the relocated script's
+    default instead would make dark-factory guess at a project-owned path,
+    violating PRD invariant C-1.
+    """
+
+    @pytest.fixture
+    def call_log(self, tmp_path: Path) -> Path:
+        """Ordered log of the gc stub's argv."""
+        return tmp_path / 'gc-argv.log'
+
+    @pytest.mark.parametrize('origin', ['project', 'dark-factory'])
+    async def test_seed_script_is_passed_for_both_origins(
+        self,
+        origin: str,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        call_log: Path,
+    ) -> None:
+        """Present project seed script → --seed-script names it, whichever gc ran.
+
+        Parametrised over both resolution origins because the failure this
+        prevents is origin-dependent (dark-factory's copy has the wrong
+        sibling) while the FIX must not be: a reify-shaped project_root, which
+        resolves gc.sh to its own copy, must receive exactly the path that
+        copy's sibling default would have computed.  That identity is what
+        makes the change a no-op for reify today.
+        """
+        df_dir = df_warm_lane_script_dir()
+        gc_dir = (
+            project_root / 'scripts' if origin == 'project' else df_dir
+        )
+        _write_origin_stub(gc_dir / 'warm-lane-gc.sh', origin, call_log)
+        seed = _write_stub(project_root / 'scripts' / 'seed-warm-lane.sh')
+
+        await _make_git_ops(project_root)._run_warm_lane_gc_reclaim()
+
+        assert _origins(call_log) == [origin], (
+            f'Expected the {origin} gc copy to run; got {_origins(call_log)!r}'
+        )
+        argv = _argv(call_log)[0]
+        assert '--seed-script' in argv, (
+            f"gc.sh must be told where the project's PRD §5 seed primitive "
+            f'lives — its own sibling default does not survive the relocation. '
+            f'argv: {argv!r}'
+        )
+        assert argv[argv.index('--seed-script') + 1] == str(seed), (
+            f'--seed-script must name <project_root>/scripts/seed-warm-lane.sh '
+            f'({seed}); argv: {argv!r}'
+        )
+
+    async def test_argv_is_unchanged_when_project_has_no_seed_script(
+        self,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        call_log: Path,
+    ) -> None:
+        """Absent project seed script → argv byte-identical to pre-relocation.
+
+        dark-factory must not invent a path for a primitive the project does
+        not have; omitting the flag leaves gc.sh's own default in charge,
+        exactly as before this leaf.
+        """
+        df_dir = df_warm_lane_script_dir()
+        _write_origin_stub(df_dir / 'warm-lane-gc.sh', 'dark-factory', call_log)
+        git_ops = _make_git_ops(project_root)
+
+        await git_ops._run_warm_lane_gc_reclaim()
+
+        assert _argv(call_log) == [
+            ['reclaim', '--mount', str(git_ops.worktree_base)],
+        ], (
+            'With no project seed script the reclaim argv must be byte-identical '
+            f'to today — no invented --seed-script; got {_argv(call_log)!r}'
+        )
+
+
 @pytest.mark.asyncio
 class TestNeitherLocationIsLoud:
     """B8 — "no implementation at either location" is never a silent no-op.
