@@ -19,9 +19,14 @@ The converged contract these tests pin:
     A steward give-up ALWAYS dismisses its own L0 before publishing an
     outcome.  No pending L0 survives a steward give-up.
 
-Both waiters observe that single producer invariant, and the ESCALATED wait is
-additionally bounded by ``steward_completion_timeout`` so a future producer bug
-degrades into a loud, bounded unblock instead of a permanent strand.
+Both waiters observe that single producer invariant.  The ESCALATED wait is
+additionally bounded, so a future producer bug degrades into a loud, bounded
+unblock instead of a permanent strand — by an IDLE window of
+``timeouts.steward + steward_completion_timeout``, refreshed while the steward
+is observably working and stopping the steward before it resumes anything.
+(The two waiters share the PRODUCER invariant but deliberately diverge on their
+bound: the sibling's ``steward_completion_timeout`` is a post-completion drain
+grace, which is far too short for a steward that is actively working.)
 
 Modelled on ``test_workflow_status_on_resume.py`` — the only existing module
 that drives ``run()``'s ESCALATED branch deterministically.
