@@ -1574,6 +1574,128 @@ class TestRequeuedSentinelNeverRecordedAsFinalizing:
 
 
 # ---------------------------------------------------------------------------
+# task 3082 step-3 RED / step-4 GREEN: neither sentinel exit may leave
+# `_live_items` residue.
+#
+# The DROPPED/REQUEUED sentinel branch returns with no registry disposition at
+# all, so an InflightEntry that reached it stays in `_live_items` and
+# `_finalizing_head_entry()` keeps returning it — the phantom head, plus one
+# accreted 'extra InflightEntry object(s)' WARNING per occurrence. The two
+# sentinels need DIFFERENT dispositions: a DROPPED item's sole waiter is gone
+# and nothing will ever re-enter (retire), while a REQUEUED item is sitting on
+# `_queue` and MUST re-enter through the drain (bounce to QUEUED, never
+# retire).
+# ---------------------------------------------------------------------------
+
+
+def _accretion_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The ``_finalizing_head_entry`` at-most-one-mid-finalize accretion
+    WARNINGs in *caplog* (merge_queue.py:8005-8014) — the signal the field
+    journal emitted repeatedly while a phantom head sat in ``_live_items``.
+    """
+    return [
+        r.getMessage() for r in caplog.records
+        if 'Invariant violation:' in r.getMessage()
+        or 'extra InflightEntry object(s)' in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestSentinelExitLeavesNoLiveItemsResidue:
+    """``_finalize_inflight``'s DROPPED and REQUEUED sentinel exits must each
+    dispose of the entry explicitly — no ``_live_items`` residue, no phantom
+    finalize head, and no accretion WARNING (task 3082 step-3 RED / step-4
+    GREEN).
+
+    RED until step-4 gives the branch its two dispositions: DROPPED ->
+    ``_retire_item``, REQUEUED -> idempotent ``_note_requeue``.
+    """
+
+    async def test_dropped_sentinel_retires_the_entry(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The sole-waiter-gave-up exit: nothing will ever re-enter the
+        pipeline for this request_id, so TERMINAL + a ``_live_items`` pop is
+        the only correct end state.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-dropped', 'df3082_dr.py', 'd = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.DROPPED,
+        )
+        rid = req.request_id
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            advanced = await worker._finalize_inflight(entry)
+            head = worker._finalizing_head_entry()
+
+        assert advanced is False, f'a DROPPED sentinel must not advance main: {advanced!r}'
+        assert head is None, f'dropped entry left as the finalize head: {head!r}'
+        assert rid not in worker._live_items, (
+            f'dropped entry left in _live_items: {worker._live_items.get(rid)!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.TERMINAL, (
+            f'a dropped request must be retired to TERMINAL; registry reads {current!r}'
+        )
+        assert _accretion_warnings(caplog) == [], (
+            f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
+            f'{_accretion_warnings(caplog)!r}'
+        )
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'retiring a dropped request must not escalate: {fake_eq.submitted!r}'
+        )
+
+    async def test_requeued_sentinel_leaves_no_inflight_entry_residue(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A requeue site that skipped ``_note_requeue`` (today's trigger 3):
+        the chokepoint must repair it to QUEUED with the MergeRequest back in
+        ``_live_items`` — the object swap, not the state change, is what clears
+        the finalize head.  It must NOT retire: the request is on ``_queue``
+        and has to re-enter through the drain.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeued-residue', 'df3082_rr.py', 'r = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            advanced = await worker._finalize_inflight(entry)
+            head = worker._finalizing_head_entry()
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        assert head is None, f'requeued entry left as the finalize head: {head!r}'
+        assert worker._live_items[rid] is req, (
+            f'_live_items must hold the MergeRequest, not the InflightEntry: '
+            f'{worker._live_items.get(rid)!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.QUEUED, (
+            f'a requeued request must be left at QUEUED so _buffer_owned_request '
+            f'buffers it normally; registry reads {current!r}'
+        )
+        assert _accretion_warnings(caplog) == [], (
+            f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
+            f'{_accretion_warnings(caplog)!r}'
+        )
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'the chokepoint repair must not escalate: {fake_eq.submitted!r}'
+        )
+        assert not req.result.done(), (
+            'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-11 RED / step-12 GREEN: wiring-completeness proof (BEFORE repoint) —
 # every dequeued request_id must reach TERMINAL with no leaks across the
 # stop() drains, the two abandon/detach-drop sites, coalesce-superseded, and
