@@ -982,11 +982,11 @@ class TestScoperTrailingClausePreservation:
     def test_shell_construct_is_never_split_mid_construct(self, raw):
         """HAZARD GUARD: an `&&` inside `$(...)`/backticks/`(...)` is not a chain op.
 
-        The tail gate's control-flow rejection is token-EQUALITY based, so it
-        sees `(` only when ``shlex`` isolates it as its own whitespace-
-        separated token. A command substitution or an unspaced subshell hides
-        its `&&` from that check while ``split_top_level_and`` — which tracks
-        quote state only — still splits there. Carrying a tail out of one
+        The tail gate's token check is EQUALITY based, so it sees `(` only
+        when ``shlex`` isolates it as its own whitespace-separated token. A
+        command substitution or an unspaced subshell hides its `&&` from that
+        check while ``split_top_level_and`` — which tracks quote state only —
+        still splits there. Carrying a tail out of one
         truncates the head mid-construct and emits an unbalanced shell string
         (a stray `)`, an unpaired backtick), which bash rejects outright: a
         spurious RED verify, strictly worse than the missed sibling checker
@@ -995,6 +995,7 @@ class TestScoperTrailingClausePreservation:
         these, restoring the byte-identical pre-feature output.
         """
         scoped = verify._scope_to_keyword(raw, 'ruff check', self._FILES)
+        assert scoped is not None  # `raw` is a str, so the None passthrough is unreachable
         expected = (
             raw
             if raw.startswith('(')  # keyword not in segment 0 -> untouched
